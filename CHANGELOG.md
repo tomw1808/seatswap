@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- `seatswap status --help` names the fields of the JSON output as they are: `views`, `active`
+  and `suggestion`. It said "the active id", which is not a field.
+
 ## [1.0.6] - 2026-11-14
 
 ### Fixed

@@ -147,7 +147,8 @@ enum Command {
 
     /// Print the live account and its binding limit.
     Status {
-        /// Print the account views, the active id and the suggestion as JSON.
+        /// Print JSON: `views` (every account), `active` (the id of the account in use) and
+        /// `suggestion` (where to switch, or null).
         #[arg(long, conflicts_with_all = ["waybar", "i3blocks"])]
         json: bool,
 

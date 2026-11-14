@@ -6,3 +6,4 @@ phase0/.tripwire.json
 /.briefs
 *.seatswap-backup
 .flash-agents.json
+/specs
