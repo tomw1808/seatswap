@@ -16,7 +16,7 @@ A tray app + CLI for Linux and Windows that switches Claude Code between several
 - CLI only (no GUI): `cargo build --offline -p seatswap --no-default-features`
 - Lints: `cargo clippy --offline --workspace --all-targets -- -D warnings`
 
-Always pass `--offline`: workers have no network, and every crate the project uses is already downloaded. Do not add dependencies; if a task truly needs one that is not in a `Cargo.toml`, stop and report it. New dependencies need Andreas' approval and are fetched by the lead session, never by a worker.
+Always pass `--offline`: every crate the project uses is already downloaded, and a build must not fetch anything. A worker's shell can reach the network; no code, test or command may use it. Do not add dependencies; if a task truly needs one that is not in a `Cargo.toml`, stop and report it. New dependencies need Andreas' approval and are fetched by the lead session, never by a worker.
 
 ## Hard rules
 
