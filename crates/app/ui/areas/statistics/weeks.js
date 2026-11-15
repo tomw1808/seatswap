@@ -22,6 +22,7 @@ import {
   shortDate,
   shortPercent,
   tokens,
+  valueTip,
   weekdayIndex,
 } from "../../common.js";
 import { grid, lines } from "../../charts.js";
@@ -91,19 +92,35 @@ export async function show(container, env) {
 
   function summaryCard() {
     const summary = state.summary;
+    const reason = summary.moneyMissing;
+    const missingTitle = typeof reason === "string" ? reason : undefined;
+    const usedPercent = h("span", {
+      class: "stats-kpi-value",
+      text:
+        typeof summary.usedPercentOfPaid === "number"
+          ? percentText(summary.usedPercentOfPaid)
+          : "—",
+      title: missingTitle,
+    });
+    const usedMoney = amountNode(summary.used, env.currency);
+    const expiredMoney = amountNode(summary.expired, env.currency);
+    if (missingTitle) {
+      usedMoney.title = missingTitle;
+      expiredMoney.title = missingTitle;
+    }
     const card = h("div", { class: "stats-detail-body" });
     const kpis = h("div", { class: "stats-mini-kpis" });
     kpis.appendChild(
       h("div", { class: "stats-mini-kpi" }, [
         h("span", { class: "stats-kpi-label", text: "Used" }),
-        h("span", { class: "stats-kpi-value", text: percentText(summary.usedPercentOfPaid) }),
-        h("span", { class: "stats-kpi-sub" }, [amountNode(summary.used, env.currency)]),
+        usedPercent,
+        h("span", { class: "stats-kpi-sub" }, [usedMoney]),
       ])
     );
     kpis.appendChild(
       h("div", { class: "stats-mini-kpi" }, [
         h("span", { class: "stats-kpi-label", text: "Expired" }),
-        h("span", { class: "stats-kpi-value" }, [amountNode(summary.expired, env.currency)]),
+        h("span", { class: "stats-kpi-value" }, [expiredMoney]),
         h("span", { class: "stats-kpi-sub", text: "quota left at the resets" }),
       ])
     );
@@ -116,6 +133,9 @@ export async function show(container, env) {
     );
     card.appendChild(kpis);
 
+    const apiValue = amountNode(summary.values.api, summary.values.apiCurrency);
+    apiValue.title = valueTip(summary.values, "api", "in this week");
+    const beforeTitle = missingTitle || undefined;
     const list = h("dl", { class: "stats-kv" });
     for (const [term, value] of [
       ["Switches", switchLine(summary.switches)],
@@ -125,12 +145,18 @@ export async function show(container, env) {
           summary.tokens.cr
         )} · written ${tokens(summary.tokens.cw)}`,
       ],
-      ["API value", amountNode(summary.apiValue, env.currency)],
+      ["API value", apiValue],
       [
         "Week before",
-        typeof summary.usedChangePercent !== "number"
-          ? "—"
-          : `${summary.usedChangePercent >= 0 ? "+" : ""}${percentText(summary.usedChangePercent)}`,
+        h("span", {
+          text:
+            typeof summary.usedChangePercent !== "number"
+              ? "—"
+              : `${summary.usedChangePercent >= 0 ? "+" : ""}${percentText(
+                  summary.usedChangePercent
+                )}`,
+          title: beforeTitle,
+        }),
       ],
     ]) {
       list.appendChild(h("dt", { text: term }));

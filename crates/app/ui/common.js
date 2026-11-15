@@ -632,6 +632,24 @@ function amountTip(value, currency) {
   return text;
 }
 
+// The tip of one `Values` half (spec §1.4, §3.6). `scope` names the span the
+// number covers ("in the range", "in this hour"), so two numbers of different
+// spans never look alike. A missing half carries the struct's own reason; a
+// missing currency carries the settings' reason. The pages draw the number
+// itself with `amountNode(values.api, values.apiCurrency)` and the other half
+// with `values.currency`.
+function valueTip(values, unit, scope) {
+  const span = scope ? ` ${scope}` : "";
+  const label = unit === "api" ? "API value" : "Subscription value";
+  const missing = unit === "api" ? values.apiMissing : values.subscriptionMissing;
+  if (missing !== null && missing !== undefined) {
+    return `${label}${span}: — (${missing})`;
+  }
+  const amount = unit === "api" ? values.api : values.subscription;
+  const currency = unit === "api" ? values.apiCurrency : values.currency;
+  return `${label}${span}: ${amountTip(amount, currency)}`;
+}
+
 // The snapshot's account view for an id, or null when the snapshot has none.
 function accountView(views, id) {
   if (!Array.isArray(views)) return null;
@@ -916,6 +934,7 @@ export {
   amountText,
   amountNode,
   amountTip,
+  valueTip,
   accountView,
   accountLabel,
   accountNameText,

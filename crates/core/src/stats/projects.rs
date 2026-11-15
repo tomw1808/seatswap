@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::history::{AccountRef, Hosts, Range, TokenRecord};
+use crate::live_sessions::Values;
 use crate::money::{Missing, Valuer};
 use crate::project::ProjectKey;
 use crate::projects::{Project, ProjectId};
@@ -17,9 +18,9 @@ use crate::store::Account;
 use crate::transcripts::Tokens;
 
 use super::{
-    account_abbr, account_chosen, account_id, account_position, account_weeks_valued, join_names,
-    money_text, output_by_account_week, percent_text, range_of, thousands, week_start, Ctx, Query,
-    StatsError,
+    account_abbr, account_chosen, account_id, account_position, account_weeks_valued,
+    add_opt_value, add_value, join_names, money_text, output_by_account_week, percent_text,
+    range_of, thousands, week_start, windows_span, Ctx, Query, StatsError,
 };
 
 /// The level of a row of the tree.
@@ -47,11 +48,9 @@ pub struct Node {
     /// This node's API value as a share of the page's API value, in %; 0 when
     /// the page has no API value.
     pub share: f64,
-    /// The subscription value of the node's records; `None` when none of them
-    /// has one.
-    pub subscription: Option<f64>,
-    /// The API value of the node's records; `None` when none of them has one.
-    pub api: Option<f64>,
+    /// The two values of the node's records, built with [`Values::of`]: a
+    /// missing half names its reason, and the API half names its currency.
+    pub values: Values,
     /// Each account's share of this node's API value, in %, largest first;
     /// `None` is a record without a known account.
     pub by_account: Vec<(Option<String>, f64)>,
@@ -87,8 +86,9 @@ pub struct Matrix {
     pub orgs: Vec<String>,
     /// The chosen stored accounts' ids, in [`Ctx::accounts`]' order.
     pub accounts: Vec<String>,
-    /// The subscription value per organization and account: `cells[org][account]`.
-    pub cells: Vec<Vec<f64>>,
+    /// The subscription value per organization and account:
+    /// `cells[org][account]`; `None` when a record has no subscription value.
+    pub cells: Vec<Vec<Option<f64>>>,
     pub sentences: Vec<String>,
 }
 
@@ -103,8 +103,8 @@ pub struct ProjectDetail {
     pub agent_share: f64,
     /// Each host's share of the API value, in %, largest first.
     pub hosts: Vec<(String, f64)>,
-    pub subscription: Option<f64>,
-    pub api: Option<f64>,
+    /// The two values of the project's records, built with [`Values::of`].
+    pub values: Values,
     /// The output tokens per calendar week and model, weeks oldest first and
     /// models by tokens.
     pub weekly_by_model: WeeklyByModel,
@@ -153,6 +153,7 @@ pub(crate) fn projects_page_in(
         if !account_chosen(ctx, q, value.account.as_ref()) {
             continue;
         }
+        let values = Values::of(std::slice::from_ref(&value), ctx.settings);
         let project = ctx
             .projects
             .of(&ProjectId::of(&hosted.record.project, &hosted.host));
@@ -162,21 +163,18 @@ pub(crate) fn projects_page_in(
             host: &hosted.host,
             record: &hosted.record,
             value,
+            values,
             root: root.clone(),
         };
         sums.entry(root).or_default().add(&entry);
         entries.push(entry);
     }
 
-    let mut api_total = 0.0;
-    let mut has_api = false;
-    for entry in &entries {
-        if let Some(api) = entry.value.api {
-            api_total += api;
-            has_api = true;
-        }
-    }
-    let page_api = has_api.then_some(api_total);
+    let page_values = {
+        let parts: Vec<&Values> = entries.iter().map(|entry| &entry.values).collect();
+        Values::sum(&parts)
+    };
+    let page_api = page_values.api;
 
     // The organizations with records, by API value, the unassigned ones last.
     let mut org_members: BTreeMap<Option<String>, Vec<ProjectId>> = BTreeMap::new();
@@ -205,7 +203,7 @@ pub(crate) fn projects_page_in(
         a.identity
             .is_none()
             .cmp(&b.identity.is_none())
-            .then_with(|| api_order(a.sums.api, b.sums.api))
+            .then_with(|| api_order(a.sums.api(), b.sums.api()))
             .then_with(|| a.name.cmp(&b.name))
     });
 
@@ -280,7 +278,7 @@ pub(crate) fn projects_page_in(
                 }
                 let mut names: Vec<String> = folders.keys().cloned().collect();
                 names.sort_by(|a, b| {
-                    api_order(folders[a].api, folders[b].api).then_with(|| a.cmp(b))
+                    api_order(folders[a].api(), folders[b].api()).then_with(|| a.cmp(b))
                 });
                 for name in names {
                     nodes.push(node_from(
@@ -299,15 +297,29 @@ pub(crate) fn projects_page_in(
         }
     }
 
+    // The ratios divide each window by its own span, which can reach past the
+    // range; the reads that serve them cover every chosen window whole.
+    let week_span = windows_span(&weeks, range);
+    let week_tokens = ctx.history.read::<TokenRecord>(&week_span, &Hosts::All)?;
+    let mut week_records: Vec<(AccountRef, &TokenRecord)> = Vec::new();
+    for hosted in &week_tokens.records {
+        if q.host.as_ref().is_some_and(|host| host != &hosted.host) {
+            continue;
+        }
+        let value = valuer.value(&hosted.host, &hosted.record);
+        let Some(account) = value.account else {
+            continue;
+        };
+        if !account_chosen(ctx, q, Some(&account)) {
+            continue;
+        }
+        week_records.push((account, &hosted.record));
+    }
     let output_by_week = output_by_account_week(
         &weeks,
-        entries.iter().filter_map(|entry| {
-            entry
-                .value
-                .account
-                .as_ref()
-                .map(|account| (account, entry.record))
-        }),
+        week_records
+            .iter()
+            .map(|(account, record)| (account, *record)),
     );
     let mut tokens_per_percent = Vec::new();
     for account in &chosen_accounts {
@@ -467,29 +479,25 @@ pub(crate) fn project_detail_in(
     let mut sums = Sums::default();
     let mut answers = 0u64;
     let mut agent_answers = 0u64;
-    let mut hosts: BTreeMap<String, f64> = BTreeMap::new();
-    let mut host_api_total = 0.0;
-    let mut has_host_api = false;
+    let mut hosts: BTreeMap<String, Values> = BTreeMap::new();
     let mut weekly: BTreeMap<DateTime<Utc>, BTreeMap<String, u64>> = BTreeMap::new();
     for hosted in matching {
         let value = valuer.value(&hosted.host, &hosted.record);
         if !account_chosen(ctx, q, value.account.as_ref()) {
             continue;
         }
+        let values = Values::of(std::slice::from_ref(&value), ctx.settings);
         let entry = Entry {
             host: &hosted.host,
             record: &hosted.record,
             value,
+            values,
             root: ProjectId::of(&hosted.record.project, &hosted.host),
         };
         sums.add(&entry);
         answers += u64::from(hosted.record.answers);
         agent_answers += u64::from(hosted.record.agent_answers);
-        if let Some(api) = entry.value.api {
-            *hosts.entry(hosted.host.clone()).or_insert(0.0) += api;
-            host_api_total += api;
-            has_host_api = true;
-        }
+        add_value(&mut hosts, hosted.host.clone(), &entry.values);
         *weekly
             .entry(week_start(hosted.record.t, ctx.offset))
             .or_default()
@@ -497,13 +505,16 @@ pub(crate) fn project_detail_in(
             .or_insert(0) += hosted.record.out;
     }
 
-    let mut host_shares: Vec<(String, f64)> = if has_host_api && host_api_total > 0.0 {
-        hosts
-            .into_iter()
-            .map(|(host, api)| (host, api / host_api_total * 100.0))
-            .collect()
-    } else {
-        Vec::new()
+    let host_values = {
+        let parts: Vec<&Values> = hosts.values().collect();
+        Values::sum(&parts)
+    };
+    let mut host_shares: Vec<(String, f64)> = match host_values.api {
+        Some(total) if total > 0.0 => hosts
+            .iter()
+            .filter_map(|(host, values)| values.api.map(|api| (host.clone(), api / total * 100.0)))
+            .collect(),
+        _ => Vec::new(),
     };
     host_shares.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
@@ -525,8 +536,7 @@ pub(crate) fn project_detail_in(
             0.0
         },
         hosts: host_shares,
-        subscription: sums.subscription,
-        api: sums.api,
+        values: sums.values(),
         weekly_by_model,
         sessions: sums.sessions.len() as u32,
     })
@@ -536,19 +546,21 @@ pub(crate) fn project_detail_in(
 struct Entry<'a> {
     host: &'a str,
     record: &'a TokenRecord,
+    /// The record's two values, from [`Values::of`].
     value: crate::money::Valued,
+    values: Values,
     /// The project the record belongs to after the log's joins.
     root: ProjectId,
 }
 
-/// The sums of some records.
+/// The sums of some records: every half is a [`Values`] sum, so a missing part
+/// makes it unknown with its reason and two currencies are never added.
 #[derive(Default)]
 struct Sums {
     tokens: Tokens,
-    api: Option<f64>,
-    subscription: Option<f64>,
-    api_by_account: BTreeMap<Option<AccountRef>, f64>,
-    sub_by_account: BTreeMap<AccountRef, f64>,
+    values: Option<Values>,
+    api_by_account: BTreeMap<Option<AccountRef>, Values>,
+    sub_by_account: BTreeMap<AccountRef, Values>,
     sessions: BTreeSet<String>,
 }
 
@@ -557,36 +569,40 @@ impl Sums {
         let record = entry.record;
         self.tokens += Tokens::from(record);
         self.sessions.insert(record.session.clone());
-        if let Some(api) = entry.value.api {
-            *self.api.get_or_insert(0.0) += api;
-            *self
-                .api_by_account
-                .entry(entry.value.account.clone())
-                .or_insert(0.0) += api;
-        }
-        if let Some(subscription) = entry.value.subscription {
-            *self.subscription.get_or_insert(0.0) += subscription;
-            if let Some(account) = &entry.value.account {
-                *self.sub_by_account.entry(account.clone()).or_insert(0.0) += subscription;
-            }
+        add_opt_value(&mut self.values, &entry.values);
+        add_value(
+            &mut self.api_by_account,
+            entry.value.account.clone(),
+            &entry.values,
+        );
+        if let Some(account) = &entry.value.account {
+            add_value(&mut self.sub_by_account, account.clone(), &entry.values);
         }
     }
 
     fn merge(&mut self, other: &Sums) {
         self.tokens += other.tokens;
-        if let Some(api) = other.api {
-            *self.api.get_or_insert(0.0) += api;
+        if let Some(values) = &other.values {
+            add_opt_value(&mut self.values, values);
         }
-        if let Some(subscription) = other.subscription {
-            *self.subscription.get_or_insert(0.0) += subscription;
+        for (account, values) in &other.api_by_account {
+            add_value(&mut self.api_by_account, account.clone(), values);
         }
-        for (account, value) in &other.api_by_account {
-            *self.api_by_account.entry(account.clone()).or_insert(0.0) += *value;
-        }
-        for (account, value) in &other.sub_by_account {
-            *self.sub_by_account.entry(account.clone()).or_insert(0.0) += *value;
+        for (account, values) in &other.sub_by_account {
+            add_value(&mut self.sub_by_account, account.clone(), values);
         }
         self.sessions.extend(other.sessions.iter().cloned());
+    }
+
+    fn values(&self) -> Values {
+        match &self.values {
+            Some(values) => values.clone(),
+            None => Values::sum(&[]),
+        }
+    }
+
+    fn api(&self) -> Option<f64> {
+        self.values().api
     }
 }
 
@@ -612,6 +628,7 @@ fn node_from(ctx: &Ctx, label: NodeLabel, sums: &Sums, page_api: Option<f64>) ->
         NodeKind::Project => 1,
         NodeKind::Folder => 2,
     };
+    let values = sums.values();
     Node {
         kind: label.kind,
         level,
@@ -619,9 +636,8 @@ fn node_from(ctx: &Ctx, label: NodeLabel, sums: &Sums, page_api: Option<f64>) ->
         key: label.key,
         org_accounts: label.org_accounts,
         tokens: sums.tokens,
-        share: share_of(sums.api, page_api),
-        subscription: sums.subscription,
-        api: sums.api,
+        share: share_of(values.api, page_api),
+        values,
         by_account: by_account(ctx, sums),
         sessions: sums.sessions.len() as u32,
     }
@@ -630,17 +646,19 @@ fn node_from(ctx: &Ctx, label: NodeLabel, sums: &Sums, page_api: Option<f64>) ->
 /// Each account's share of the node's API value, largest first; an account no
 /// longer stored sorts after the stored ones.
 fn by_account(ctx: &Ctx, sums: &Sums) -> Vec<(Option<String>, f64)> {
-    let Some(api) = sums.api.filter(|api| *api > 0.0) else {
+    let Some(api) = sums.api().filter(|api| *api > 0.0) else {
         return Vec::new();
     };
     let mut shares: Vec<(Option<String>, f64)> = sums
         .api_by_account
         .iter()
-        .map(|(account, value)| {
-            (
-                account.as_ref().map(|account| account_id(ctx, account)),
-                value / api * 100.0,
-            )
+        .filter_map(|(account, values)| {
+            values.api.map(|value| {
+                (
+                    account.as_ref().map(|account| account_id(ctx, account)),
+                    value / api * 100.0,
+                )
+            })
         })
         .collect();
     shares.sort_by(|a, b| {
@@ -664,17 +682,16 @@ fn share_of(api: Option<f64>, page_api: Option<f64>) -> f64 {
 }
 
 /// The subscription value of the chosen accounts in one organization, in the
-/// accounts' order.
-fn org_cells(org: &OrgRow, accounts: &[&Account]) -> Vec<f64> {
+/// accounts' order; an account with no record there has a measured zero.
+fn org_cells(org: &OrgRow, accounts: &[&Account]) -> Vec<Option<f64>> {
     accounts
         .iter()
-        .map(|account| {
-            org.sums
-                .sub_by_account
-                .get(&AccountRef::of(account))
-                .copied()
-                .unwrap_or(0.0)
-        })
+        .map(
+            |account| match org.sums.sub_by_account.get(&AccountRef::of(account)) {
+                Some(values) => values.subscription,
+                None => Some(0.0),
+            },
+        )
         .collect()
 }
 
@@ -689,14 +706,22 @@ fn org_sentences(ctx: &Ctx, org: &OrgRow, orgs: &[OrgRow], currency: Option<&str
     if known.accounts.is_empty() {
         return Vec::new();
     }
-    let Some(total) = org.sums.subscription else {
+    let Some(total) = org.sums.values().subscription else {
         return Vec::new();
     };
     let own: BTreeSet<AccountRef> = known.accounts.iter().cloned().collect();
-    let own_sub: f64 = own
+    let own_parts: Vec<&Values> = own
         .iter()
-        .map(|account| org.sums.sub_by_account.get(account).copied().unwrap_or(0.0))
-        .sum();
+        .filter_map(|account| org.sums.sub_by_account.get(account))
+        .collect();
+    let own_sub = if own_parts.is_empty() {
+        0.0
+    } else {
+        match Values::sum(&own_parts).subscription {
+            Some(value) => value,
+            None => return Vec::new(),
+        }
+    };
     let share = if total > 0.0 {
         own_sub / total * 100.0
     } else {
@@ -722,16 +747,29 @@ fn org_sentences(ctx: &Ctx, org: &OrgRow, orgs: &[OrgRow], currency: Option<&str
 
     if share < 100.0 {
         if let Some(currency) = currency {
-            let mut others: Vec<(&AccountRef, f64)> = org
+            let others: Vec<(&AccountRef, &Values)> = org
                 .sums
                 .sub_by_account
                 .iter()
-                .filter(|(account, value)| !own.contains(*account) && **value > 0.0)
-                .map(|(account, value)| (account, *value))
+                .filter(|(account, _)| !own.contains(*account))
                 .collect();
-            others.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-            let amount: f64 = others.iter().map(|(_, value)| *value).sum();
-            if !others.is_empty() && amount > 0.0 {
+            let other_parts: Vec<&Values> = others.iter().map(|(_, values)| *values).collect();
+            let amount = if other_parts.is_empty() {
+                Some(0.0)
+            } else {
+                Values::sum(&other_parts).subscription
+            };
+            if let Some(amount) = amount.filter(|amount| *amount > 0.0) {
+                let mut others: Vec<(&AccountRef, f64)> = others
+                    .iter()
+                    .filter_map(|(account, values)| {
+                        values
+                            .subscription
+                            .filter(|value| *value > 0.0)
+                            .map(|value| (*account, value))
+                    })
+                    .collect();
+                others.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
                 let names: Vec<String> = others
                     .iter()
                     .map(|(account, _)| account_abbr(ctx, account))
@@ -746,27 +784,40 @@ fn org_sentences(ctx: &Ctx, org: &OrgRow, orgs: &[OrgRow], currency: Option<&str
     }
 
     if let Some(currency) = currency {
-        let mut carried = 0.0;
         let mut other_orgs: Vec<String> = Vec::new();
+        let mut carried_parts: Vec<&Values> = Vec::new();
         for other in orgs {
             if other.identity == org.identity {
                 continue;
             }
-            let value: f64 = own
+            let parts: Vec<&Values> = own
                 .iter()
-                .filter_map(|account| other.sums.sub_by_account.get(account).copied())
-                .sum();
-            if value > 0.0 {
-                carried += value;
-                other_orgs.push(other.name.clone());
+                .filter_map(|account| other.sums.sub_by_account.get(account))
+                .collect();
+            if parts.is_empty() {
+                continue;
+            }
+            match Values::sum(&parts).subscription {
+                Some(value) if value > 0.0 => {
+                    carried_parts.extend(parts);
+                    other_orgs.push(other.name.clone());
+                }
+                _ => {}
             }
         }
-        if carried > 0.0 && !other_orgs.is_empty() {
-            sentences.push(format!(
-                "The other way round: {names} carried {} of work for {}.",
-                money_text(carried, currency),
-                join_names(&other_orgs)
-            ));
+        let carried = if carried_parts.is_empty() {
+            Some(0.0)
+        } else {
+            Values::sum(&carried_parts).subscription
+        };
+        if let Some(carried) = carried.filter(|carried| *carried > 0.0) {
+            if !other_orgs.is_empty() {
+                sentences.push(format!(
+                    "The other way round: {names} carried {} of work for {}.",
+                    money_text(carried, currency),
+                    join_names(&other_orgs)
+                ));
+            }
         }
     }
     sentences
@@ -788,7 +839,7 @@ fn org_name(ctx: &Ctx, identity: &Option<String>) -> String {
 }
 
 fn api_of(sums: &BTreeMap<ProjectId, Sums>, key: &ProjectId) -> Option<f64> {
-    sums.get(key).and_then(|sums| sums.api)
+    sums.get(key).and_then(|sums| sums.api())
 }
 
 /// Largest API value first, a node without one last.
@@ -946,8 +997,8 @@ mod tests {
         assert_eq!(atlas.kind, NodeKind::Project);
         assert_eq!(atlas.level, 1);
         assert_eq!(atlas.key, Some(self::atlas()));
-        assert_eq!(atlas.api, Some(120.0));
-        assert!(close(atlas.subscription.unwrap(), 103.846));
+        assert_eq!(atlas.values.api, Some(120.0));
+        assert!(close(atlas.values.subscription.unwrap(), 103.846));
         assert!(close(atlas.share, 85.714));
         assert_eq!(atlas.sessions, 3);
 
@@ -955,14 +1006,14 @@ mod tests {
         assert_eq!(engine.kind, NodeKind::Folder);
         assert_eq!(engine.level, 2);
         assert_eq!(engine.key, None);
-        assert_eq!(engine.api, Some(60.0));
+        assert_eq!(engine.values.api, Some(60.0));
         let frontend = node(&page, "frontend");
-        assert_eq!(frontend.api, Some(60.0));
+        assert_eq!(frontend.values.api, Some(60.0));
 
         let acme_kb = node(&page, "acme-kb");
         assert_eq!(acme_kb.kind, NodeKind::Project);
         assert_eq!(acme_kb.level, 1);
-        assert!(close(acme_kb.subscription.unwrap(), 16.154));
+        assert!(close(acme_kb.values.subscription.unwrap(), 16.154));
         assert_eq!(acme_kb.sessions, 1);
     }
 
@@ -1003,7 +1054,7 @@ mod tests {
             matrix.accounts,
             vec![tiny.lb().id.clone(), tiny.ac().id.clone()]
         );
-        let cell = |org: &str, account: &str| -> f64 {
+        let cell = |org: &str, account: &str| -> Option<f64> {
             let org = matrix
                 .orgs
                 .iter()
@@ -1016,10 +1067,19 @@ mod tests {
                 .expect("the account");
             matrix.cells[org][account]
         };
-        assert!(close(cell("sam", &tiny.lb().id), 74.769));
-        assert!(close(cell("sam", &tiny.ac().id), 29.077));
-        assert!(close(cell("acme", &tiny.ac().id), 16.154));
-        assert_eq!(cell("acme", &tiny.lb().id), 0.0);
+        assert!(close(
+            cell("sam", &tiny.lb().id).expect("LB's cell"),
+            74.769
+        ));
+        assert!(close(
+            cell("sam", &tiny.ac().id).expect("AC's cell"),
+            29.077
+        ));
+        assert!(close(
+            cell("acme", &tiny.ac().id).expect("AC's acme cell"),
+            16.154
+        ));
+        assert_eq!(cell("acme", &tiny.lb().id), Some(0.0));
     }
 
     #[test]
@@ -1076,7 +1136,14 @@ mod tests {
         let page = projects_page_in(&tiny.ctx(), &range, &all()).unwrap();
         let atlas = node(&page, "atlas");
         assert_eq!(atlas.tokens.out, 7_000_000);
-        assert!(close(atlas.subscription.unwrap(), 103.846));
+        assert_eq!(
+            atlas.values.subscription, None,
+            "the record without an account makes the subscription sum unknown"
+        );
+        assert_eq!(
+            atlas.values.subscription_missing.as_deref(),
+            Some("no account was in use at that time")
+        );
         assert_eq!(page.unknown_account_tokens.out, 1_000_000);
         assert!(
             page.notes
@@ -1106,14 +1173,17 @@ mod tests {
         assert_eq!(page.without_price, vec!["claude-x".to_string()]);
         let atlas = node(&page, "atlas");
         assert_eq!(atlas.tokens.out, 7_000_000);
-        assert_eq!(atlas.api, Some(120.0));
-        // AC's window of 9 Nov also holds the unpriced model, so none of that
-        // window's records has a subscription value: atlas keeps LB's
-        // 41.538 + 33.231 and loses AC's 29.077.
-        assert!(
-            close(atlas.subscription.unwrap(), 74.769),
-            "atlas subscription {:?}",
-            atlas.subscription
+        assert_eq!(
+            atlas.values.api, None,
+            "one record without a price makes the sum unknown"
+        );
+        assert_eq!(
+            atlas.values.api_missing.as_deref(),
+            Some("no price for claude-x")
+        );
+        assert_eq!(
+            atlas.values.subscription, None,
+            "the unpriced record's week has no subscription value either"
         );
         assert!(
             page.notes.iter().any(|note| note
@@ -1132,8 +1202,8 @@ mod tests {
         assert_eq!(detail.tokens.out, 6_000_000);
         assert_eq!(detail.hosts, vec![("atlas".to_string(), 100.0)]);
         assert_eq!(detail.sessions, 3);
-        assert!(close(detail.subscription.unwrap(), 103.846));
-        assert_eq!(detail.api, Some(120.0));
+        assert!(close(detail.values.subscription.unwrap(), 103.846));
+        assert_eq!(detail.values.api, Some(120.0));
 
         assert_eq!(detail.weekly_by_model.len(), 2);
         assert_eq!(
@@ -1180,7 +1250,7 @@ mod tests {
             page.nodes.iter().map(|node| &node.name).collect::<Vec<_>>()
         );
         let atlas = node(&page, "atlas");
-        assert_eq!(atlas.api, Some(60.0));
+        assert_eq!(atlas.values.api, Some(60.0));
     }
 
     // ---- proof tests of the review ----
@@ -1226,7 +1296,7 @@ mod tests {
             "the tree counts the joined record"
         );
         assert_eq!(
-            atlas_row.api,
+            atlas_row.values.api,
             Some(140.0),
             "the tree counts the joined record"
         );
@@ -1237,9 +1307,55 @@ mod tests {
             "the detail of the project counts the records of the key joined into it"
         );
         assert_eq!(
-            detail.api,
+            detail.values.api,
             Some(140.0),
             "the detail counts the joined record"
+        );
+    }
+    /// A ratio divides a window by its own span: Last week with AC's window
+    /// reaching two days past the range counts the record of 17 Nov too.
+    #[test]
+    fn tokens_per_percent_count_the_whole_window() {
+        let tiny = tiny();
+        tiny.history
+            .append(&crate::history::WindowRecord {
+                account: tiny.ac_ref(),
+                k: crate::api::LimitKind::WeeklyAll,
+                m: None,
+                start: Some(utc("2026-11-11T00:00:00Z")),
+                end: utc("2026-11-18T00:00:00Z"),
+                final_percent: 100.0,
+                lost: Some(0.0),
+                last_sample: utc("2026-11-17T23:58:00Z"),
+                plan: Some("Team 5x".to_string()),
+                uncertain: false,
+            })
+            .expect("AC's window reaching past the range");
+        tiny.history
+            .append(&record(
+                "2026-11-17T10:00:00Z",
+                "s7",
+                "/home/sam/projects/atlas/engine",
+                atlas(),
+                "claude-opus-5-5",
+                2_000_000,
+            ))
+            .expect("the record after the range's end");
+        let last_week = Range {
+            from: utc("2026-11-09T00:00:00Z"),
+            to: utc("2026-11-16T00:00:00Z"),
+        };
+
+        let page = projects_page_in(&tiny.ctx(), &last_week, &all()).unwrap();
+        let ac = page
+            .tokens_per_percent
+            .iter()
+            .find(|(id, _)| id == &tiny.ac().id)
+            .expect("AC's tokens per percent");
+        assert!(
+            close(ac.1, 5_000_000.0 / 100.0),
+            "AC's 100 % window counts the 3 M of 14 Nov and the 2 M of 17 Nov: {}",
+            ac.1
         );
     }
 }

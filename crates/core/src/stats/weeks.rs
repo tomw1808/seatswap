@@ -11,6 +11,7 @@ use crate::api::LimitKind;
 use crate::history::{
     same_reset, AccountRef, By, Event, EventKind, Hosted, Hosts, Range, Sample, WindowRecord,
 };
+use crate::live_sessions::Values;
 use crate::money::Valuer;
 use crate::projects::ProjectId;
 use crate::transcripts::Tokens;
@@ -82,26 +83,31 @@ pub struct Curve {
 #[serde(rename_all = "camelCase")]
 pub struct WeekSummary {
     pub week: DateTime<Utc>,
-    /// `used / paid × 100` of the priced account weeks; 0.0 when the week has
-    /// no priced account week.
-    pub used_percent_of_paid: f64,
-    /// Money used of the priced account weeks.
-    pub used: f64,
-    /// Money expired of the priced account weeks.
-    pub expired: f64,
+    /// `used / paid × 100` of the priced account weeks; `None` when the week
+    /// has no priced finished window, with `money_missing` saying why.
+    pub used_percent_of_paid: Option<f64>,
+    /// Money used of the priced account weeks; `None` like
+    /// `used_percent_of_paid`.
+    pub used: Option<f64>,
+    /// Money expired of the priced account weeks; `None` like
+    /// `used_percent_of_paid`.
+    pub expired: Option<f64>,
+    /// Why `used_percent_of_paid`, `used` and `expired` are `None`.
+    pub money_missing: Option<String>,
     /// The working hours blocked in the week.
     pub blocked_hours: f64,
     pub switches: SwitchCounts,
     /// The money used per account id, priced account weeks only.
     pub per_account: Vec<(String, f64)>,
     /// The projects' share in % of the week's API value, the three largest
-    /// then `other`; empty when `api_value` is `None`.
+    /// then `other`; empty when `values.api` is `None`.
     pub top_projects: Vec<(String, f64)>,
     /// The tokens of the chosen records whose own time lies in the week.
     pub tokens: Tokens,
-    /// The chosen records' API value; `None` when a record of the week has
-    /// none, or the week has no chosen record.
-    pub api_value: Option<f64>,
+    /// The two values of the chosen records whose own time lies in the week,
+    /// built with [`Values::of`]; a missing half names its reason and the API
+    /// half names its currency.
+    pub values: Values,
     /// The change of `used` against the week before, in percent; `None` when
     /// the week itself has no priced account week (a running week has no
     /// finished window) or the week before has none.
@@ -378,21 +384,36 @@ pub fn week_summary(ctx: &Ctx, q: &Query, week: DateTime<Utc>) -> Result<WeekSum
     let mut paid = 0.0;
     let mut expired = 0.0;
     let mut used_priced = false;
+    let mut missing_reason: Option<String> = None;
     let mut used_by_account: BTreeMap<AccountRef, f64> = BTreeMap::new();
     for account_week in weeks
         .iter()
         .filter(|account_week| account_week.week == week)
     {
-        if let Some(money) = money_of(account_week) {
-            used += money.used;
-            paid += money.paid;
-            expired += money.expired;
-            used_priced = true;
-            *used_by_account
-                .entry(account_week.account.clone())
-                .or_insert(0.0) += money.used;
+        match money_of(account_week) {
+            Some(money) => {
+                used += money.used;
+                paid += money.paid;
+                expired += money.expired;
+                used_priced = true;
+                *used_by_account
+                    .entry(account_week.account.clone())
+                    .or_insert(0.0) += money.used;
+            }
+            None if missing_reason.is_none() => {
+                missing_reason = account_week.price_missing.as_ref().map(ToString::to_string);
+            }
+            None => {}
         }
     }
+    let money_missing = if used_priced {
+        None
+    } else {
+        Some(
+            missing_reason
+                .unwrap_or_else(|| "no finished, priced weekly window in this week".to_string()),
+        )
+    };
 
     let mut before = 0.0;
     let mut before_priced = false;
@@ -427,37 +448,47 @@ pub fn week_summary(ctx: &Ctx, q: &Query, week: DateTime<Utc>) -> Result<WeekSum
         .history
         .read::<crate::history::TokenRecord>(&week_range, &Hosts::All)?;
     let mut tokens = Tokens::default();
-    let mut api_total = 0.0;
-    let mut records_seen = false;
-    let mut api_missing = false;
-    let mut by_project: BTreeMap<String, f64> = BTreeMap::new();
+    let mut values: Option<Values> = None;
+    let mut by_project: BTreeMap<String, Values> = BTreeMap::new();
     for hosted in &token_read.records {
+        if q.host.as_ref().is_some_and(|host| host != &hosted.host) {
+            continue;
+        }
         let record = &hosted.record;
         let value = valuer.value(&hosted.host, record);
         if !account_chosen(ctx, q, value.account.as_ref()) {
             continue;
         }
-        records_seen = true;
         tokens += Tokens::from(record);
-        match value.api {
-            Some(api) => {
-                api_total += api;
-                let name = ctx
-                    .projects
-                    .of(&ProjectId::of(&record.project, &hosted.host))
-                    .name;
-                *by_project.entry(name).or_insert(0.0) += api;
+        let record_values = Values::of(std::slice::from_ref(&value), ctx.settings);
+        match &mut values {
+            Some(values) => {
+                let sum = Values::sum(&[&*values, &record_values]);
+                *values = sum;
             }
-            None => api_missing = true,
+            None => values = Some(record_values.clone()),
+        }
+        let name = ctx
+            .projects
+            .of(&ProjectId::of(&record.project, &hosted.host))
+            .name;
+        match by_project.get_mut(&name) {
+            Some(project) => {
+                let sum = Values::sum(&[&*project, &record_values]);
+                *project = sum;
+            }
+            None => {
+                by_project.insert(name, record_values);
+            }
         }
     }
-    let api_value = (records_seen && !api_missing).then_some(api_total);
+    let values = values.unwrap_or_else(|| Values::sum(&[]));
     // A share of nothing is no share: a week without API value lists none.
-    let top_projects = match api_value {
+    let top_projects = match values.api {
         Some(total) if total > 0.0 => top_three(
             by_project
                 .into_iter()
-                .map(|(name, value)| (name, value / total * 100.0))
+                .filter_map(|(name, values)| values.api.map(|value| (name, value / total * 100.0)))
                 .collect(),
         ),
         _ => Vec::new(),
@@ -478,7 +509,7 @@ pub fn week_summary(ctx: &Ctx, q: &Query, week: DateTime<Utc>) -> Result<WeekSum
     } else {
         None
     };
-    let used_percent_of_paid = if paid > 0.0 { used / paid * 100.0 } else { 0.0 };
+    let used_percent_of_paid = (paid > 0.0).then_some(used / paid * 100.0);
 
     let mut conclusion = Vec::new();
     if blocked_hours <= 0.0 {
@@ -516,14 +547,15 @@ pub fn week_summary(ctx: &Ctx, q: &Query, week: DateTime<Utc>) -> Result<WeekSum
     Ok(WeekSummary {
         week,
         used_percent_of_paid,
-        used,
-        expired,
+        used: used_priced.then_some(used),
+        expired: used_priced.then_some(expired),
+        money_missing,
         blocked_hours,
         switches,
         per_account,
         top_projects,
         tokens,
-        api_value,
+        values,
         used_change_percent,
         conclusion,
     })
@@ -581,13 +613,18 @@ pub fn window_detail(
     account_id: &str,
     end: DateTime<Utc>,
 ) -> Result<WindowDetail, StatsError> {
-    let account = ctx
-        .accounts
-        .iter()
-        .find(|account| account.id == account_id)
-        .ok_or_else(|| unknown_window(account_id, end, true))?;
-    let reference = AccountRef::of(account);
+    // An account the store no longer holds is named by the id `account_id`
+    // gives its window's account: the page shows that id's first 8 characters.
     let finished = ctx.history.finished_windows(&Range::ALL, &Hosts::All)?;
+    let reference = match ctx.accounts.iter().find(|account| account.id == account_id) {
+        Some(account) => AccountRef::of(account),
+        None => finished
+            .iter()
+            .map(|hosted| &hosted.record.account)
+            .find(|reference| super::account_id(ctx, reference) == account_id)
+            .cloned()
+            .ok_or_else(|| unknown_window(account_id, end, true))?,
+    };
     let kept = finished
         .iter()
         .find(|hosted| {
@@ -695,7 +732,7 @@ pub fn window_detail(
         .collect();
 
     Ok(WindowDetail {
-        id: account_id.to_string(),
+        id: super::account_id(ctx, &reference),
         end: window.end,
         used: window.final_percent,
         used_money: money.map(|money| money.used),
@@ -893,15 +930,19 @@ mod tests {
         let summary = week_summary(&tiny.ctx(), &all(), utc("2026-11-09T00:00:00Z")).unwrap();
 
         assert_eq!(summary.week, utc("2026-11-09T00:00:00Z"));
-        assert!(close(summary.used, 62.308), "used {}", summary.used);
         assert!(
-            close(summary.expired, 11.538),
-            "expired {}",
+            close(summary.used.expect("a priced week"), 62.308),
+            "used {:?}",
+            summary.used
+        );
+        assert!(
+            close(summary.expired.expect("a priced week"), 11.538),
+            "expired {:?}",
             summary.expired
         );
         assert!(
-            close(summary.used_percent_of_paid, 84.375),
-            "used percent {}",
+            close(summary.used_percent_of_paid.expect("a priced week"), 84.375),
+            "used percent {:?}",
             summary.used_percent_of_paid
         );
         assert_eq!(summary.blocked_hours, 0.0);
@@ -910,7 +951,8 @@ mod tests {
         assert_eq!(summary.switches.agent, 1);
         assert_eq!(summary.top_projects, vec![("atlas".to_string(), 100.0)]);
         assert_eq!(summary.tokens.out, 4_000_000);
-        assert_eq!(summary.api_value, Some(80.0));
+        assert_eq!(summary.values.api, Some(80.0));
+        assert_eq!(summary.values.api_currency.as_deref(), Some("EUR"));
         assert!(
             close(summary.used_change_percent.expect("the change"), 8.0),
             "change {:?}",
@@ -997,15 +1039,19 @@ mod tests {
         let summary = week_summary(&tiny.ctx(), &all(), utc("2026-10-05T00:00:00Z")).unwrap();
 
         assert_eq!(summary.week, utc("2026-10-05T00:00:00Z"));
-        assert_eq!(summary.used, 0.0);
-        assert_eq!(summary.expired, 0.0);
-        assert_eq!(summary.used_percent_of_paid, 0.0);
+        assert_eq!(summary.used, None);
+        assert_eq!(summary.expired, None);
+        assert_eq!(summary.used_percent_of_paid, None);
+        assert_eq!(
+            summary.money_missing.as_deref(),
+            Some("no finished, priced weekly window in this week")
+        );
         assert_eq!(summary.blocked_hours, 0.0);
         assert_eq!(summary.switches, SwitchCounts::default());
         assert!(summary.per_account.is_empty());
         assert!(summary.top_projects.is_empty());
         assert_eq!(summary.tokens, Tokens::default());
-        assert_eq!(summary.api_value, None);
+        assert_eq!(summary.values.api, None);
         assert_eq!(summary.used_change_percent, None);
         assert_eq!(summary.conclusion, vec!["No hour blocked.".to_string()]);
     }
@@ -1066,14 +1112,21 @@ mod tests {
         );
     }
 
-    /// A running week has no finished window, so it has no priced account week
-    /// and no change against the week before.
+    /// A running week has no finished window, so it has no priced account week:
+    /// its money is missing with the reason, not a made-up zero, and it has no
+    /// change against the week before.
     #[test]
     fn a_running_week_has_no_change() {
         let tiny = tiny();
         let summary = week_summary(&tiny.ctx(), &all(), utc("2026-11-16T00:00:00Z")).unwrap();
 
-        assert_eq!(summary.used, 0.0);
+        assert_eq!(summary.used, None);
+        assert_eq!(summary.expired, None);
+        assert_eq!(summary.used_percent_of_paid, None);
+        assert_eq!(
+            summary.money_missing.as_deref(),
+            Some("no finished, priced weekly window in this week")
+        );
         assert_eq!(summary.used_change_percent, None);
     }
 
@@ -1134,8 +1187,8 @@ mod tests {
         let summary = week_summary(&tiny.ctx(), &query, utc("2026-11-02T00:00:00Z")).unwrap();
 
         assert!(
-            close(summary.used, 57.692),
-            "the money of the week is found outside the range: {}",
+            close(summary.used.expect("a priced week"), 57.692),
+            "the money of the week is found outside the range: {:?}",
             summary.used
         );
         assert!(
@@ -1160,8 +1213,8 @@ mod tests {
         let summary = week_summary(&tiny.ctx(), &query, utc("2026-11-09T00:00:00Z")).unwrap();
 
         assert!(
-            close(summary.used, 33.231),
-            "LB's money of the week of 9 Nov: {}",
+            close(summary.used.expect("a priced week"), 33.231),
+            "LB's money of the week of 9 Nov: {:?}",
             summary.used
         );
         assert_eq!(
@@ -1169,7 +1222,7 @@ mod tests {
             "LB's tokens of the week of 9 Nov"
         );
         assert_eq!(
-            summary.api_value,
+            summary.values.api,
             Some(20.0),
             "LB's API value of the week of 9 Nov"
         );
@@ -1292,8 +1345,8 @@ mod tests {
 
         let summary = week_summary(&tiny.ctx(), &all(), utc("2026-11-02T00:00:00Z")).unwrap();
         assert!(
-            close(summary.used, 41.077),
-            "the money of the week counts one window of LB: {}",
+            close(summary.used.expect("a priced week"), 41.077),
+            "the money of the week counts one window of LB: {:?}",
             summary.used
         );
         assert!(
@@ -1301,5 +1354,77 @@ mod tests {
             "LB's money of the week: {}",
             summary.per_account[0].1
         );
+    }
+    /// The host filter applies to the summary's tokens, API value and top
+    /// projects: host vega has neither of atlas's records, so none of atlas's
+    /// tokens is in the week.
+    #[test]
+    fn the_summary_honours_the_host_filter() {
+        let tiny = tiny();
+        let query = Query {
+            range: RangeKey::All,
+            accounts: Vec::new(),
+            host: Some("vega".to_string()),
+        };
+
+        let summary = week_summary(&tiny.ctx(), &query, utc("2026-11-09T00:00:00Z")).unwrap();
+
+        assert_eq!(
+            summary.tokens,
+            Tokens::default(),
+            "atlas's tokens of the week are not vega's"
+        );
+        assert_eq!(summary.values.api, None);
+        assert!(summary.top_projects.is_empty());
+        assert!(
+            summary.used.is_some(),
+            "the week's windows are not a host's"
+        );
+    }
+
+    /// A window of an account the store no longer holds answers with the id
+    /// `account_id` gives it, instead of an error.
+    #[test]
+    fn the_detail_of_a_removed_accounts_window_answers() {
+        let tiny = tiny();
+        tiny.history
+            .append(&Event {
+                t: utc("2026-11-15T00:00:00Z"),
+                kind: EventKind::AccountRemoved {
+                    account: tiny.ac_ref(),
+                },
+            })
+            .expect("AC's removal");
+        let accounts = vec![tiny.accounts[0].clone()];
+        let ctx = Ctx {
+            accounts: &accounts,
+            ..tiny.ctx()
+        };
+
+        let detail =
+            window_detail(&ctx, &tiny.ac().account_uuid, utc("2026-11-16T02:00:00Z")).unwrap();
+
+        assert_eq!(detail.id, tiny.ac().account_uuid);
+        assert_eq!(detail.used, 90.0);
+        assert_eq!(
+            detail.used_money, None,
+            "a removed account has no stored price to value its window"
+        );
+    }
+
+    /// Without a dollar rate the API value is in USD, not in the settings'
+    /// currency; the summary carries that currency instead of relabelling it.
+    #[test]
+    fn without_a_rate_the_summary_api_value_is_in_usd() {
+        let mut tiny = tiny();
+        tiny.settings.usd_rate = None;
+        tiny.fx = crate::money::Fx::default();
+
+        let summary = week_summary(&tiny.ctx(), &all(), utc("2026-11-09T00:00:00Z")).unwrap();
+
+        assert_eq!(summary.values.api, Some(80.0));
+        assert_eq!(summary.values.api_currency.as_deref(), Some("USD"));
+        assert_eq!(summary.values.currency.as_deref(), Some("EUR"));
+        assert_eq!(summary.top_projects, vec![("atlas".to_string(), 100.0)]);
     }
 }

@@ -23,6 +23,7 @@ import {
   readChoice,
   shortDate,
   tokens,
+  valueTip,
   weekdayIndex,
   writeChoice,
 } from "../../common.js";
@@ -88,22 +89,6 @@ function tokensTip(counts) {
   return `input ${tokens(counts.input)} · output ${tokens(counts.out)} · cache write ${tokens(
     counts.cw
   )} · cache read ${tokens(counts.cr)}`;
-}
-
-// The tip of one `Values` half. `scope` names the span the number covers ("in
-// the range", "in this hour"), so two numbers of different spans never look
-// alike. A missing half carries the struct's own reason; a missing currency
-// carries the settings' reason.
-function valueTip(values, unit, scope) {
-  const span = scope ? ` ${scope}` : "";
-  const label = unit === "api" ? "API value" : "Subscription value";
-  const missing = unit === "api" ? values.apiMissing : values.subscriptionMissing;
-  if (missing !== null && missing !== undefined) {
-    return `${label}${span}: — (${missing})`;
-  }
-  const amount = unit === "api" ? values.api : values.subscription;
-  const currency = unit === "api" ? values.apiCurrency : values.currency;
-  return `${label}${span}: ${amountTip(amount, currency)}`;
 }
 
 // Which of the struct's numbers the hour's bar measures. Tokens are per model;

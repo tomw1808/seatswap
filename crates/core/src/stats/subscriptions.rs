@@ -12,12 +12,14 @@ use crate::burn::plan::Policy;
 use crate::burn::replay::{replay, ReplayResult};
 use crate::burn::wu_hours;
 use crate::history::{AccountRef, Event, EventKind, Hosts, Range, Sample, TokenRecord};
+use crate::live_sessions::Values;
 use crate::money::{window_money, Valuer};
 
 use super::{
     account_abbr, account_chosen, account_id, account_weeks_valued, accounts_without_price,
-    blocked_by_week, blocked_spans, hours_text, lost_percent, money_of, output_by_account_week,
-    range_of, stored_account, week_columns, working_rhythm, AccountWeek, Ctx, Query, StatsError,
+    add_value, blocked_by_week, blocked_spans, hours_text, lost_percent, money_of,
+    output_by_account_week, range_of, stored_account, week_columns, week_of_record, windows_span,
+    working_rhythm, AccountWeek, Ctx, Query, StatsError,
 };
 
 /// One period of one account's subscription: from its `AccountAdded` (or its
@@ -70,12 +72,16 @@ pub struct SubRow {
     pub full_weeks: u32,
     /// The working hours blocked while it was the account in use.
     pub blocked_hours_on_it: f64,
-    /// The API value of its records of the range; `None` when it has no record
-    /// or one of them has no API value.
-    pub api_value: Option<f64>,
-    /// `api_value` over the paid money of its weeks; `None` when either is
-    /// missing or one of its weeks has no price.
+    /// The two values of its records in its finished weekly windows, built
+    /// with [`Values::of`]; the running week's records count in neither this
+    /// value nor the paid money beside it.
+    pub values: Values,
+    /// The API value over the paid money of the same finished weeks; `None`
+    /// with `times_paid_missing` when either is missing, a week has no price,
+    /// or the API value is not in the settings' currency.
     pub times_paid: Option<f64>,
+    /// Why `times_paid` is `None`.
+    pub times_paid_missing: Option<String>,
     pub verdict: Verdict,
     /// The output tokens per final percent of each account week, oldest first.
     pub tokens_per_percent: Vec<(DateTime<Utc>, f64)>,
@@ -138,7 +144,10 @@ pub(crate) fn subscriptions_in(
     let weeks = account_weeks_valued(ctx, range, q, &valuer)?;
     let spans = blocked_spans(ctx, range, q)?;
     let histories = account_histories(ctx)?;
-    let tokens = ctx.history.read::<TokenRecord>(range, &Hosts::All)?;
+    // A ratio divides each window by its own span, which can reach past the
+    // range; the reads that serve it cover every chosen window whole.
+    let week_span = windows_span(&weeks, range);
+    let tokens = ctx.history.read::<TokenRecord>(&week_span, &Hosts::All)?;
 
     let mut all_periods: BTreeMap<AccountRef, Vec<Period>> = BTreeMap::new();
     for (reference, history) in &histories {
@@ -179,11 +188,10 @@ pub(crate) fn subscriptions_in(
         periods.extend(account_periods.iter().cloned());
     }
 
-    // The chosen records of the range, each valued once: their API value per
-    // account and the output tokens of the window their time falls in.
-    let mut api_total: BTreeMap<AccountRef, f64> = BTreeMap::new();
-    let mut api_seen: BTreeSet<AccountRef> = BTreeSet::new();
-    let mut api_missing: BTreeSet<AccountRef> = BTreeSet::new();
+    // The chosen records in the account's finished windows, each valued once:
+    // their values per account and the output tokens of the window their time
+    // falls in. The running week counts in neither.
+    let mut values_by_account: BTreeMap<AccountRef, Values> = BTreeMap::new();
     let mut record_refs: Vec<(AccountRef, &TokenRecord)> = Vec::new();
     for hosted in &tokens.records {
         if q.host.as_ref().is_some_and(|host| host != &hosted.host) {
@@ -193,16 +201,14 @@ pub(crate) fn subscriptions_in(
         if !account_chosen(ctx, q, value.account.as_ref()) {
             continue;
         }
-        let Some(account) = value.account else {
+        let Some(account) = value.account.clone() else {
             continue;
         };
-        api_seen.insert(account.clone());
-        match value.api {
-            Some(api) => *api_total.entry(account.clone()).or_insert(0.0) += api,
-            None => {
-                api_missing.insert(account.clone());
-            }
+        if week_of_record(&weeks, &account, hosted.record.t).is_none() {
+            continue;
         }
+        let record_values = Values::of(std::slice::from_ref(&value), ctx.settings);
+        add_value(&mut values_by_account, account.clone(), &record_values);
         record_refs.push((account, &hosted.record));
     }
     let output_by_week = output_by_account_week(&weeks, record_refs.iter().map(|(a, r)| (a, *r)));
@@ -234,7 +240,8 @@ pub(crate) fn subscriptions_in(
                 .map(Vec::as_slice)
                 .unwrap_or(&[]),
             blocked_hours_on_it: blocked_hours_on(&spans, &reference),
-            api_value: api_value_of(&reference, &api_seen, &api_missing, &api_total),
+            values: values_of(&reference, &values_by_account),
+            currency: ctx.settings.currency.as_deref(),
             output: &output_by_week,
             since: all_periods
                 .get(&reference)
@@ -281,7 +288,8 @@ pub(crate) fn subscriptions_in(
                 .map(Vec::as_slice)
                 .unwrap_or(&[]),
             blocked_hours_on_it: blocked_hours_on(&spans, &reference),
-            api_value: api_value_of(&reference, &api_seen, &api_missing, &api_total),
+            values: values_of(&reference, &values_by_account),
+            currency: ctx.settings.currency.as_deref(),
             output: &output_by_week,
             since,
             fallback_plan: histories
@@ -474,7 +482,8 @@ struct RowFacts<'a> {
     weeks: Vec<&'a AccountWeek>,
     periods: &'a [Period],
     blocked_hours_on_it: f64,
-    api_value: Option<f64>,
+    values: Values,
+    currency: Option<&'a str>,
     output: &'a OutputByWeek,
     since: DateTime<Utc>,
     fallback_plan: Option<String>,
@@ -488,7 +497,8 @@ fn row_for(facts: RowFacts<'_>) -> Result<SubRow, StatsError> {
         weeks,
         periods,
         blocked_hours_on_it,
-        api_value,
+        values,
+        currency,
         output,
         since,
         fallback_plan,
@@ -527,10 +537,7 @@ fn row_for(facts: RowFacts<'_>) -> Result<SubRow, StatsError> {
     } else {
         None
     };
-    let times_paid = match (api_value, paid) {
-        (Some(api), Some(paid)) if paid > 0.0 => Some(api / paid),
-        _ => None,
-    };
+    let (times_paid, times_paid_missing) = times_paid_of(&values, paid, currency, weeks_count);
 
     let mut tokens_per_percent: Vec<(DateTime<Utc>, f64)> = Vec::new();
     for week in &weeks {
@@ -563,8 +570,9 @@ fn row_for(facts: RowFacts<'_>) -> Result<SubRow, StatsError> {
         expired,
         full_weeks,
         blocked_hours_on_it,
-        api_value,
+        values,
         times_paid,
+        times_paid_missing,
         verdict,
         tokens_per_percent,
     })
@@ -583,18 +591,63 @@ fn verdict(weeks: u32, avg_used: Option<f64>, full_weeks: u32) -> Verdict {
     }
 }
 
-/// The API value of `reference`: `None` when it has no record or one of its
-/// records has no API value.
-fn api_value_of(
-    reference: &AccountRef,
-    seen: &BTreeSet<AccountRef>,
-    missing: &BTreeSet<AccountRef>,
-    total: &BTreeMap<AccountRef, f64>,
-) -> Option<f64> {
-    if !seen.contains(reference) || missing.contains(reference) {
-        return None;
+/// The values of `reference`'s records in its finished windows; an account
+/// without one has both halves missing with [`Values::sum`]'s empty reason.
+fn values_of(reference: &AccountRef, values: &BTreeMap<AccountRef, Values>) -> Values {
+    match values.get(reference) {
+        Some(values) => values.clone(),
+        None => Values::sum(&[]),
     }
-    Some(total.get(reference).copied().unwrap_or(0.0))
+}
+
+/// The API value over the paid money of the same finished weeks, with the
+/// reason when it cannot be a ratio in the settings' currency.
+fn times_paid_of(
+    values: &Values,
+    paid: Option<f64>,
+    currency: Option<&str>,
+    weeks: u32,
+) -> (Option<f64>, Option<String>) {
+    if weeks == 0 {
+        return (
+            None,
+            Some("no finished weekly window in the range".to_string()),
+        );
+    }
+    let Some(api) = values.api else {
+        return (None, values.api_missing.clone());
+    };
+    let Some(api_currency) = values.api_currency.as_deref() else {
+        return (
+            None,
+            values
+                .api_missing
+                .clone()
+                .or_else(|| Some("the API value has no currency".to_string())),
+        );
+    };
+    if Some(api_currency) != currency {
+        return (
+            None,
+            Some(format!(
+                "the API value is in {api_currency}, not in the settings' currency {}",
+                currency.unwrap_or("(none set)")
+            )),
+        );
+    }
+    let Some(paid) = paid else {
+        return (
+            None,
+            Some("one of its finished weeks has no price".to_string()),
+        );
+    };
+    if paid <= 0.0 {
+        return (
+            None,
+            Some("the paid money of its finished weeks is zero".to_string()),
+        );
+    }
+    (Some(api / paid), None)
 }
 
 /// The working hours blocked while `reference` was the account in use.
@@ -987,7 +1040,8 @@ mod tests {
         );
         assert_eq!(lb.full_weeks, 1);
         assert!(close(lb.blocked_hours_on_it, 2.0));
-        assert_eq!(lb.api_value, Some(60.0));
+        assert_eq!(lb.values.api, Some(60.0));
+        assert_eq!(lb.values.api_currency.as_deref(), Some("EUR"));
         assert!(
             close(lb.times_paid.expect("LB's value and price"), 0.722),
             "LB times paid {:?}",
@@ -1012,7 +1066,8 @@ mod tests {
             ac.expired
         );
         assert_eq!(ac.full_weeks, 0);
-        assert_eq!(ac.api_value, Some(80.0));
+        assert_eq!(ac.values.api, Some(80.0));
+        assert_eq!(ac.values.api_currency.as_deref(), Some("EUR"));
         assert!(
             close(ac.times_paid.expect("AC's value and price"), 1.238),
             "AC times paid {:?}",
@@ -1215,6 +1270,10 @@ mod tests {
         let ac = row(&page, &tiny.ac().id);
         assert_eq!(ac.expired, None);
         assert_eq!(ac.times_paid, None);
+        assert_eq!(
+            ac.times_paid_missing.as_deref(),
+            Some("one of its finished weeks has no price")
+        );
     }
 
     #[test]
@@ -1228,7 +1287,7 @@ mod tests {
         };
         let removed = format!(
             "{} is no longer stored, so this range cannot be replayed.",
-            tiny.ac().account_uuid
+            &tiny.ac().account_uuid[..8]
         );
 
         let what = what_if_in(&ctx, &two_weeks(), &all(), &tiny.lb().id).unwrap();
@@ -1324,6 +1383,130 @@ mod tests {
             what.blocked_hours_was.is_sign_positive(),
             "blocked hours {}",
             what.blocked_hours_was
+        );
+    }
+    /// An account added later averages only its own weeks: AC from week 2 has
+    /// one week, and its mean is that week's 90 %.
+    #[test]
+    fn an_account_added_later_averages_only_its_own_weeks() {
+        let tiny = tiny();
+        tiny.history
+            .append(&Event {
+                t: utc("2026-11-09T00:00:00Z"),
+                kind: EventKind::AccountAdded {
+                    account: tiny.ac_ref(),
+                    plan: Some("Team 5x".to_string()),
+                },
+            })
+            .expect("AC's later addition");
+        let range = Range {
+            from: utc("2026-11-09T00:00:00Z"),
+            to: utc("2026-11-16T00:00:00Z"),
+        };
+
+        let page = subscriptions_in(&tiny.ctx(), &range, &all()).unwrap();
+        let ac = row(&page, &tiny.ac().id);
+
+        assert_eq!(ac.weeks, 1);
+        assert!(
+            ac.avg_used.is_some_and(|avg| close(avg, 90.0)),
+            "AC used {:?}",
+            ac.avg_used
+        );
+    }
+
+    /// Without a dollar rate the API value is in USD: the page must show that
+    /// currency, and `times_paid` must not divide USD by the EUR paid money.
+    #[test]
+    fn without_a_rate_times_paid_is_missing_with_its_reason() {
+        let mut tiny = tiny();
+        tiny.settings.usd_rate = None;
+        tiny.fx = crate::money::Fx::default();
+
+        let page = subscriptions_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        let lb = row(&page, &tiny.lb().id);
+
+        assert_eq!(lb.values.api, Some(60.0));
+        assert_eq!(lb.values.api_currency.as_deref(), Some("USD"));
+        assert_eq!(lb.values.currency.as_deref(), Some("EUR"));
+        assert_eq!(lb.times_paid, None);
+        let reason = lb.times_paid_missing.as_deref().expect("the reason");
+        assert!(
+            reason.contains("USD") && reason.contains("EUR"),
+            "the reason names both currencies: {reason}"
+        );
+    }
+
+    /// `times_paid` divides the API value of the finished windows by the paid
+    /// money of the same windows: work of the running week counts in neither.
+    #[test]
+    fn times_paid_counts_only_finished_windows() {
+        let tiny = tiny();
+        tiny.history
+            .append(&record("2026-11-19T09:00:00Z", 2_000_000))
+            .expect("work of the running week");
+        let ctx = tiny.ctx();
+        let range = crate::stats::range_of(crate::stats::RangeKey::Days30, &ctx).unwrap();
+        let query = Query {
+            range: crate::stats::RangeKey::Days30,
+            accounts: Vec::new(),
+            host: None,
+        };
+
+        let page = subscriptions_in(&ctx, &range, &query).unwrap();
+        let ac = row(&page, &tiny.ac().id);
+
+        assert_eq!(
+            ac.values.api,
+            Some(80.0),
+            "the running week's work is not in the finished windows"
+        );
+        assert!(
+            close(ac.times_paid.expect("AC's value and price"), 1.238),
+            "AC times paid {:?}",
+            ac.times_paid
+        );
+    }
+
+    /// The tokens per percent of a window count the whole window, also the
+    /// records after the range's end when the window reaches past it.
+    #[test]
+    fn tokens_per_percent_count_the_whole_window() {
+        let tiny = tiny();
+        tiny.history
+            .append(&WindowRecord {
+                account: tiny.ac_ref(),
+                k: LimitKind::WeeklyAll,
+                m: None,
+                start: Some(utc("2026-11-11T00:00:00Z")),
+                end: utc("2026-11-18T00:00:00Z"),
+                final_percent: 100.0,
+                lost: Some(0.0),
+                last_sample: utc("2026-11-17T23:58:00Z"),
+                plan: Some("Team 5x".to_string()),
+                uncertain: false,
+            })
+            .expect("AC's window reaching past the range");
+        tiny.history
+            .append(&record("2026-11-17T10:00:00Z", 2_000_000))
+            .expect("the record after the range's end");
+        let range = Range {
+            from: utc("2026-11-09T00:00:00Z"),
+            to: utc("2026-11-16T00:00:00Z"),
+        };
+
+        let page = subscriptions_in(&tiny.ctx(), &range, &all()).unwrap();
+        let ac = row(&page, &tiny.ac().id);
+        let ratio = ac
+            .tokens_per_percent
+            .iter()
+            .find(|(week, _)| *week == utc("2026-11-09T00:00:00Z"))
+            .expect("AC's week of 9 Nov");
+
+        assert!(
+            close(ratio.1, 5_000_000.0 / 100.0),
+            "AC's 100 % window counts the 3 M of 14 Nov and the 2 M of 17 Nov: {}",
+            ratio.1
         );
     }
 }

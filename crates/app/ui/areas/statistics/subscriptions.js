@@ -20,6 +20,7 @@ import {
   percentText,
   shortDate,
   tokens,
+  valueTip,
   weekdayIndex,
 } from "../../common.js";
 import { bars, lines } from "../../charts.js";
@@ -246,19 +247,17 @@ export async function show(container, env) {
     }
     node.appendChild(h("span", { class: "n", text: `${row.fullWeeks} of ${row.weeks}` }));
     node.appendChild(h("span", { class: "n", text: hoursText(row.blockedHoursOnIt) }));
+    const times = typeof row.timesPaid === "number" ? row.timesPaid.toFixed(1) : "—";
+    const timesReason =
+      typeof row.timesPaidMissing === "string" ? ` (${row.timesPaidMissing})` : "";
+    const apiValue = amountNode(row.values.api, row.values.apiCurrency);
+    apiValue.title = valueTip(row.values, "api", "in its finished weeks");
     const api = h("span", {
       class: "n",
-      title:
-        row.apiValue === null || row.timesPaid === null
-          ? "the API value or a priced week of this subscription is missing"
-          : `${amountTip(row.apiValue, currency)} at API prices over the paid money of its weeks`,
+      title: `${apiValue.title} · × paid: ${times}${timesReason}`,
     });
-    api.appendChild(amountNode(row.apiValue, currency));
-    api.appendChild(
-      document.createTextNode(
-        ` · × ${typeof row.timesPaid === "number" ? row.timesPaid.toFixed(1) : "—"}`
-      )
-    );
+    api.appendChild(apiValue);
+    api.appendChild(document.createTextNode(` · × ${times}`));
     node.appendChild(api);
     node.appendChild(h("span", {}, [verdictTag(row.verdict)]));
     node.addEventListener("click", () => void selectRow(row));

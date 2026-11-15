@@ -12,6 +12,7 @@ use crate::history::{
     AccountRef, By, Event, EventKind, HistoryDir, HistoryError, Hosted, Hosts, Range, Record,
     Sample, SessionRecord, TokenRecord, UpRecord, WindowRecord,
 };
+use crate::live_sessions::Values;
 use crate::money::{window_money, Fx, Missing, MoneyError, Prices, Valuer, WindowMoney};
 use crate::projects::{Projects, ProjectsLogRecord};
 use crate::store::{Account, Settings};
@@ -34,6 +35,39 @@ pub enum StatsError {
     /// A value the statistics cannot compute; the text says what is missing.
     #[error("{0}")]
     Message(String),
+}
+
+/// Add `next` to a value that may not exist yet, through [`Values::sum`].
+pub(crate) fn add_opt_value(current: &mut Option<Values>, next: &Values) {
+    let sum = match current {
+        Some(current) => Values::sum(&[current, next]),
+        None => next.clone(),
+    };
+    *current = Some(sum);
+}
+
+/// Add `next` to one key's value, through [`Values::sum`].
+pub(crate) fn add_value<K: Ord>(values: &mut BTreeMap<K, Values>, key: K, next: &Values) {
+    match values.get_mut(&key) {
+        Some(current) => {
+            let sum = Values::sum(&[current, next]);
+            *current = sum;
+        }
+        None => {
+            values.insert(key, next.clone());
+        }
+    }
+}
+
+/// The range that covers every account week whole, widened from `range` so a
+/// ratio divides a window by its own span.
+pub(crate) fn windows_span(weeks: &[AccountWeek], range: &Range) -> Range {
+    let mut span = *range;
+    for week in weeks {
+        span.from = span.from.min(week.window.weekly_start());
+        span.to = span.to.max(week.window.end);
+    }
+    span
 }
 
 /// The range switch of the statistics area.
@@ -403,11 +437,13 @@ pub(crate) fn account_chosen(ctx: &Ctx, q: &Query, account: Option<&AccountRef>)
 }
 
 /// The abbreviation a page writes for `reference`: the stored account's, or the
-/// reference's account id when it is no longer stored.
+/// first 8 characters of the id `account_id` gives it when it is no longer
+/// stored (the rule `crates/app/ui/common.js` uses for an unknown account).
 pub(crate) fn account_abbr(ctx: &Ctx, reference: &AccountRef) -> String {
-    stored_account(ctx, reference)
-        .map(|account| account.abbr.clone())
-        .unwrap_or_else(|| reference.acc.clone())
+    match stored_account(ctx, reference) {
+        Some(account) => account.abbr.clone(),
+        None => reference.acc.chars().take(8).collect(),
+    }
 }
 
 /// Where an account id stands in the stored accounts' order; an id that is no

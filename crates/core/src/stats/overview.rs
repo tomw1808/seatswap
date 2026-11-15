@@ -222,6 +222,9 @@ pub(crate) fn overview_in(ctx: &Ctx, range: &Range, q: &Query) -> Result<Overvie
 
     let mut project_sums: BTreeMap<DateTime<Utc>, BTreeMap<String, f64>> = BTreeMap::new();
     for hosted in &tokens.records {
+        if q.host.as_ref().is_some_and(|host| host != &hosted.host) {
+            continue;
+        }
         let value = valuer.value(&hosted.host, &hosted.record);
         let (Some(account), Some(subscription)) = (value.account, value.subscription) else {
             continue;
@@ -375,8 +378,9 @@ fn finding_expired(
         .get(&AccountRef::of(account))
         .copied()
         .unwrap_or(0);
+    let noun = if weeks == 1 { "week" } else { "weeks" };
     Some(format!(
-        "{} is where most money expired: {} in {weeks} weeks.",
+        "{} is where most money expired: {} in {weeks} {noun}.",
         account.abbr,
         money_text(*expired, currency)
     ))
@@ -387,8 +391,9 @@ fn finding_blocked(kpis: &Kpis, weeks: &[OverviewWeek]) -> Option<String> {
     if kpis.blocked_hours <= 0.0 || weeks.is_empty() {
         return None;
     }
+    let noun = if weeks.len() == 1 { "week" } else { "weeks" };
     Some(format!(
-        "You were blocked {} in {} weeks; {} of them while other quota expired.",
+        "You were blocked {} in {} {noun}; {} of them while other quota expired.",
         hours_text(kpis.blocked_hours),
         weeks.len(),
         hours_text(kpis.avoidable_hours)
@@ -499,8 +504,9 @@ fn finding_full(ctx: &Ctx, finished: &[AccountWeek]) -> Option<String> {
         }
     }
     let (account, full, total) = fullest?;
+    let noun = if total == 1 { "week" } else { "weeks" };
     Some(format!(
-        "{} was full in {full} of {total} weeks.",
+        "{} was full in {full} of {total} {noun}.",
         account.abbr
     ))
 }
@@ -619,6 +625,28 @@ mod tests {
         assert!(close(second[0].1, 62.308), "atlas W2 {}", second[0].1);
     }
 
+    /// The week's project bars follow the host filter: vega has none of atlas's
+    /// records, so its week has no project bar.
+    #[test]
+    fn projects_per_week_follow_the_host_filter() {
+        let tiny = tiny();
+        let query = Query {
+            range: RangeKey::All,
+            accounts: Vec::new(),
+            host: Some("vega".to_string()),
+        };
+
+        let page = overview_in(&tiny.ctx(), &two_weeks(), &query).unwrap();
+
+        for week in &page.weeks {
+            assert!(
+                week.projects.is_empty(),
+                "vega has no project bar: {:#?}",
+                week.projects
+            );
+        }
+    }
+
     #[test]
     fn findings_are_worded_exactly() {
         let tiny = tiny();
@@ -645,6 +673,32 @@ mod tests {
             page.findings
         );
         assert_eq!(page.findings.len(), 3, "findings: {:#?}", page.findings);
+    }
+
+    /// A sentence that counts one week says "week", not "weeks".
+    #[test]
+    fn a_sentence_counting_one_week_is_singular() {
+        let tiny = tiny();
+        let one_week = Range {
+            from: utc("2026-11-02T00:00:00Z"),
+            to: utc("2026-11-09T00:00:00Z"),
+        };
+        let page = overview_in(&tiny.ctx(), &one_week, &all()).unwrap();
+
+        assert!(
+            page.findings
+                .iter()
+                .any(|text| text == "AC is where most money expired: 16 EUR in 1 week."),
+            "findings: {:#?}",
+            page.findings
+        );
+        assert!(
+            page.findings
+                .iter()
+                .any(|text| text == "LB was full in 1 of 1 week."),
+            "findings: {:#?}",
+            page.findings
+        );
     }
 
     #[test]

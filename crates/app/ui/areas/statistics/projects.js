@@ -20,6 +20,7 @@ import {
   modelName,
   percentText,
   tokens,
+  valueTip,
 } from "../../common.js";
 import { lines } from "../../charts.js";
 
@@ -178,8 +179,12 @@ export async function show(container, env) {
         h("i", { style: { width: `${Math.min(100, Math.max(0, node.share))}%` } })
       );
       row.appendChild(usage);
-      row.appendChild(h("span", { class: "n" }, [amountNode(node.subscription, env.currency)]));
-      row.appendChild(h("span", { class: "n mf" }, [amountNode(node.api, env.currency)]));
+      const subscription = amountNode(node.values.subscription, node.values.currency);
+      subscription.title = valueTip(node.values, "subscription", "in the range");
+      const api = amountNode(node.values.api, node.values.apiCurrency);
+      api.title = valueTip(node.values, "api", "in the range");
+      row.appendChild(h("span", { class: "n" }, [subscription]));
+      row.appendChild(h("span", { class: "n mf" }, [api]));
       row.appendChild(splitBar(node, env));
       row.appendChild(h("span", { class: "n", text: String(node.sessions) }));
 
@@ -334,14 +339,15 @@ export async function show(container, env) {
         h("span", { class: "stats-kpi-sub", text: `written ${tokens(detail.tokens.cw)}` }),
       ])
     );
+    const subscription = amountNode(detail.values.subscription, detail.values.currency);
+    subscription.title = valueTip(detail.values, "subscription", "in the range");
+    const api = amountNode(detail.values.api, detail.values.apiCurrency);
+    api.title = valueTip(detail.values, "api", "in the range");
     kpis.appendChild(
       h("div", { class: "stats-mini-kpi" }, [
         h("span", { class: "stats-kpi-label", text: "Value" }),
-        h("span", { class: "stats-kpi-value" }, [amountNode(detail.subscription, env.currency)]),
-        h("span", { class: "stats-kpi-sub" }, [
-          "at API prices ",
-          amountNode(detail.api, env.currency),
-        ]),
+        h("span", { class: "stats-kpi-value" }, [subscription]),
+        h("span", { class: "stats-kpi-sub" }, ["at API prices ", api]),
       ])
     );
     card.appendChild(kpis);

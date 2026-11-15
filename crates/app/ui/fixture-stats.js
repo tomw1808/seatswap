@@ -343,7 +343,8 @@ function findingExpired(indexes, chosen, currency) {
   const account = accountById(id);
   if (!account) return null;
   const weeks = indexes.filter((index) => account.used[index] !== null).length;
-  return `${account.abbr} is where most money expired: ${fixtureMoney(amount, currency)} in ${weeks} weeks.`;
+  const noun = weeks === 1 ? "week" : "weeks";
+  return `${account.abbr} is where most money expired: ${fixtureMoney(amount, currency)} in ${weeks} ${noun}.`;
 }
 
 function weekMoney(week, chosen) {
@@ -361,7 +362,8 @@ function weekMoney(week, chosen) {
 
 function findingBlocked(indexes, blockedHours, avoidableHours) {
   if (blockedHours <= 0 || indexes.length === 0) return null;
-  return `You were blocked ${fixtureHours(blockedHours)} in ${indexes.length} weeks; ${fixtureHours(avoidableHours)} of them while other quota expired.`;
+  const noun = indexes.length === 1 ? "week" : "weeks";
+  return `You were blocked ${fixtureHours(blockedHours)} in ${indexes.length} ${noun}; ${fixtureHours(avoidableHours)} of them while other quota expired.`;
 }
 
 function findingAutoBurn(indexes, chosen) {
@@ -409,7 +411,8 @@ function findingFull(indexes, chosen) {
     if (best === null || full > best.full) best = { account, full, weeks };
   }
   if (best === null) return null;
-  return `${best.account.abbr} was full in ${best.full} of ${best.weeks} weeks.`;
+  const noun = best.weeks === 1 ? "week" : "weeks";
+  return `${best.account.abbr} was full in ${best.full} of ${best.weeks} ${noun}.`;
 }
 
 function overview(query) {
@@ -580,15 +583,16 @@ function weekSummary(query, week) {
   }
   return {
     week: weekIso(index),
-    usedPercentOfPaid: paid > 0 ? (used / paid) * 100 : 0,
-    used,
-    expired,
+    usedPercentOfPaid: paid > 0 ? (used / paid) * 100 : null,
+    used: paid > 0 ? used : null,
+    expired: paid > 0 ? expired : null,
+    moneyMissing: paid > 0 ? null : "no finished, priced weekly window in this week",
     blockedHours: BLOCKED[index],
     switches,
     perAccount: accounts.map((account) => [account.id, account.used ?? 0]),
     topProjects: topProjects(index, used, true),
     tokens,
-    apiValue: out > 0 ? (out / 1000000) * API_PER_M : null,
+    values: fixtureValues(out > 0 ? (out / 1000000) * API_PER_M : null, null),
     usedChangePercent,
     conclusion,
   };
@@ -752,8 +756,7 @@ function projects(query) {
       orgAccounts,
       tokens: tokenCounts(out),
       share: entry.share,
-      subscription: (entry.share / 100) * usedTotal,
-      api: (entry.share / 100) * apiTotal,
+      values: fixtureValues((entry.share / 100) * apiTotal, (entry.share / 100) * usedTotal),
       byAccount: chosenSplit(entry, chosen),
       sessions: Math.round(entry.sessions * keptFraction),
     };
@@ -816,8 +819,10 @@ function projectDetail(query, key) {
     tokens: tokenCounts(out),
     agentShare: entry.name === "ledger" ? 44 : 58,
     hosts,
-    subscription: (entry.share / 100) * sum(chosen.map((account) => accountUsedTotal(account, indexes))),
-    api: (entry.share / 100) * ((keptOutTotal / 1000000) * API_PER_M),
+    values: fixtureValues(
+      (entry.share / 100) * ((keptOutTotal / 1000000) * API_PER_M),
+      (entry.share / 100) * sum(chosen.map((account) => accountUsedTotal(account, indexes)))
+    ),
     weeklyByModel,
     sessions: Math.round(entry.sessions * (indexes.length / WEEKS.length)),
   };
@@ -904,8 +909,16 @@ function subscriptions(query) {
       blockedHoursOnIt: round1(
         BLOCKED_BY_ACCOUNT[account.abbr] * (sum(BLOCKED) > 0 ? blockedTotal / sum(BLOCKED) : 0)
       ),
-      apiValue,
+      values: fixtureValues(apiValue, null),
       timesPaid: apiValue !== null && paid > 0 ? apiValue / paid : null,
+      timesPaidMissing:
+        apiValue !== null && paid > 0
+          ? null
+          : weeks === 0
+            ? "no finished weekly window in the range"
+            : apiValue === null
+              ? "no API value in this answer"
+              : "the paid money of its finished weeks is zero",
       verdict: verdictFor(weeks, average, fullWeeks),
       tokensPerPercent: windows.map((index) => [weekIso(index), TOKENS_PER_PERCENT[account.abbr]]),
     };
@@ -1075,6 +1088,20 @@ function valuesOfMillion(millions) {
     subscription: millions * subscriptionPerMillion(),
     currency: "EUR",
     subscriptionMissing: null,
+  };
+}
+
+// A `Values` object for an answer whose two halves are already in money: the
+// fixture has no missing half and no second currency.
+function fixtureValues(api, subscription) {
+  return {
+    api,
+    apiCurrency: api === null ? null : "EUR",
+    apiMissing: null,
+    subscription,
+    currency: "EUR",
+    subscriptionMissing:
+      subscription === null ? "the fixture has no subscription value here" : null,
   };
 }
 
