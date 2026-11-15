@@ -25,8 +25,20 @@ All notable changes to this project are documented here. The format follows
   regime, the lazy plan, and a replay of recorded work for the lazy and eager policies.
 - `slackHours` in every `status --json` view while known, and `autoBurn` and `next` at the top
   level.
+- A large window with the Settings area: every setting, the account editor (abbreviation, colour,
+  label, price, auto-burn) and the History and hosts view, with each control saving at once.
+- Money: a currency, each account's monthly price, API prices from models.dev and the dollar rate
+  from Frankfurter, both kept with their dates; *Look up prices and the dollar rate* switches both
+  look-ups off.
+- Projects and organizations: names, joins for the same project seen in two places, and
+  organizations, kept in a project log that travels with the history folder.
+- The plan level on every account, such as "Team 5x".
+- `seatswap window [AREA]` for the large window, `seatswap prices [--refresh]` for the stored API
+  prices, and `seatswap history export --format csv|json` / `seatswap history import <folder>`.
 
 ### Changed
+- Settings and the account editor moved from the pop-up to the large window; the gear, `,` and an
+  account's badge or ✎ open it there.
 - A per-model limit blocks an account only while a session on that model is open.
 - `seatswap status --json`: `suggestion` has a new shape, `{toId, text}` instead of the old
   `{fromId, toId, fromPercent, toPercent, fromResetsAt}`, so the target and the whole sentence are

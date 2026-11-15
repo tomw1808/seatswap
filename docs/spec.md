@@ -222,7 +222,7 @@ Config folder (Rust `dirs` crate):
   "accounts": [
     { "id": "6f1c…", "accountUuid": "…", "organizationUuid": "…",
       "label": "Acme", "abbr": "AC", "color": "#3b82f6",
-      "email": "…", "orgName": "…", "plan": "Team",
+      "email": "…", "orgName": "…", "plan": "Team 5x", "price": 180.0,
       "oauthAccount": { "...": "copy of ~/.claude.json oauthAccount" },
       "addedAt": "2026-11-10T12:00:00Z", "lastUsedAt": "…" },
     { "id": "a92d…", "label": "Private", "abbr": "P", "color": "#f59e0b", "...": "…" }
@@ -242,9 +242,11 @@ They use the `keyring` crate, with service `seatswap` and the account `id` as th
 
 **Usage cache.** `usage-cache.json` holds the last response per account and when it was fetched. The pop-up opens at once from the cache and refreshes in the background.
 
+**Money.** `prices.json` holds the API prices with their dates; `fx.json` the dollar rate with its dates. Both are written under the app lock, atomically and with mode 0600; their shapes are in §11.5.
+
 **History.** seatswap keeps what it saw and did in a folder of its own: `<data folder>/history` (`historyDir` names another one). Every host writes only into its own subfolder `<host>/`, and only appends, so several hosts can share one synced folder without producing a conflict. `<host>/host.json` holds the id of the machine that writes there; when it names another machine, seatswap refuses to write into that subfolder and says why.
 
-The history has six kinds of file, one JSON object per line, one file per month and kind: `samples-YYYY-MM.jsonl` (one line per usage answer the tray app receives, per account, when a number or a reset time changed, and at least once an hour while the app runs), `windows-YYYY-MM.jsonl` (a window that ended), `events-YYYY-MM.jsonl` (a switch; a limit crossing 100 %, as `blocked`, `unblocked`, `allBlocked` or `anyUsable`; an `accountAdded` or `accountRemoved` when the CLI or the tray app creates or removes an account; a `loginEnded` or `loginRenewed` when the tray app's poll sees an account's login end or work again; `live`; an `agentCall`; a wait), `tokens-YYYY-MM.jsonl` (what the sessions used, one line per session, hour and model), `sessions-YYYY-MM.jsonl` (a session's summary when it changes and when it closes, also for a session that is seen in a transcript but no longer runs), and `up-YYYY-MM.jsonl` (at most one line per 5 minutes while seatswap runs on this host). The CLI writes the account events (`accountAdded`, `accountRemoved`); the tray app's engine writes the login events (`loginEnded`, `loginRenewed`) with the poll's time. `planChanged` is defined but not written yet.
+The history has seven kinds of file, one JSON object per line, one file per month and kind: `samples-YYYY-MM.jsonl` (one line per usage answer the tray app receives, per account, when a number or a reset time changed, and at least once an hour while the app runs), `windows-YYYY-MM.jsonl` (a window that ended), `events-YYYY-MM.jsonl` (a switch; a limit crossing 100 %, as `blocked`, `unblocked`, `allBlocked` or `anyUsable`; an `accountAdded` or `accountRemoved` when the CLI or the tray app creates or removes an account; a `loginEnded` or `loginRenewed` when the tray app's poll sees an account's login end or work again; a `planChanged` when the plan label changes; a `priceChanged` when an account's monthly price changes; `live`; an `agentCall`; a wait), `tokens-YYYY-MM.jsonl` (what the sessions used, one line per session, hour and model), `sessions-YYYY-MM.jsonl` (a session's summary when it changes and when it closes, also for a session that is seen in a transcript but no longer runs), `projects-YYYY-MM.jsonl` (the project log: one line per rename, join, unjoin, organization assignment or organization edit, §11.6), and `up-YYYY-MM.jsonl` (at most one line per 5 minutes while seatswap runs on this host). The CLI writes the account events (`accountAdded`, `accountRemoved`); the tray app's engine writes the login events (`loginEnded`, `loginRenewed`) with the poll's time, and the app writes `planChanged` and `priceChanged` when it stores a login or a price edit changes them.
 
 A line is at most 4096 bytes; a longer record is an error, never cut. Times are UTC, RFC 3339; a reset time is rounded up to the full minute before it is stored. An account is named by `acc` (its `accountUuid`) and `org` (its `organizationUuid`), never by seatswap's local account id. A token line carries the project's identity as it was found at that moment, so it stays right after a folder is moved or its transcript is deleted. The transcript offsets move past an answer only after its token line was written: a pass without a working history reads the same answers again instead of losing them.
 
@@ -689,7 +691,7 @@ agent call itself is recorded as usual. A person's `next` still switches.
 ### 8.2 Abbreviations
 
 - **Up to 2 characters**, so the label stays legible at 16 px (the Windows tray at 100 % scaling). Three characters don't fit in a 16–22 px disc at a readable size. Allowed: letters A–Z and digits, stored in upper case. One character is drawn larger.
-- Default: the first letters of the first two words of the label ("Acme Team" → `AT`), or the first two letters of a one-word label ("Acme" → `AC`, "Private" → `PR`). The examples in this spec show `P` for the private account; that one was shortened by hand in the editor (§11.3).
+- Default: the first letters of the first two words of the label ("Acme Team" → `AT`), or the first two letters of a one-word label ("Acme" → `AC`, "Private" → `PR`). The examples in this spec show `P` for the private account; that one was shortened by hand in the editor (§11.4).
 - Two accounts can't share an abbreviation (checked when editing).
 - **Fallback at 16 px:** if a measured glyph width doesn't fit, the font becomes condensed, never smaller than 9 px. The colour still tells the accounts apart at a glance.
 
@@ -785,8 +787,17 @@ They give real click handling and exact placement on those desktops. They're not
 | `notifyUsableAgain` | on | the "usable again" notification (§7.5) |
 | `notifyWaiting` | on | the "waiting for you" notification (§7.5) |
 | `notifyWaitingHosts` | `thisHost` | `thisHost` · `allHosts`: whose waiting sessions notify; only this host's are known yet |
-| `agentsRead` | on | agents may run `list`, `status`, `burn plan` and `burn simulate` (§6.6, §7.7) |
+| `notifyLoginEnds` | on | the login warnings at 5 days, 1 day and when a login ended (§7.5). `bool`; Settings → Notifications, "A login ends" |
+| `currency` | none | `null` or three capital letters (`"EUR"`); `Option<String>`; the currency every amount is shown in. Until it is set, amounts in money stay missing (§11.5). Settings → General, section Money, "Currency" |
+| `usdRate` | none | `null` or a number above 0: units of `currency` per 1 USD; `Option<f64>`; an entered rate wins over the looked-up one (§11.5). Settings → General, Money, "Use my own rate" |
+| `lookUpPrices` | on | `bool`; whether seatswap may ask models.dev for API prices and Frankfurter for the dollar rate (§11.5). Off, neither host is contacted and `prices --refresh` refuses; stored values stay. Settings → General, Money, "Look up prices and the dollar rate" |
+| `price` per account | none | `null` or a number above 0: what the subscription costs per month, in `currency`; `Option<f64>`. Without one the account is left out of every sum in money and the page says so (§11.5). Settings → Accounts, column "Price / month" |
+| `plan` per account | from the login | read-only `Option<String>`: the identity's `planDisplayName`, else the capitalised `subscriptionType` with its level from `rateLimitTier` ("Team 5x"; a tier seatswap cannot read as a multiplier in parentheses, "Team (team_premium)"). Shown in the pop-up, Settings → Accounts and `seatswap list` |
+| `agentsRead` | on | agents may run `list`, `status`, `burn plan`, `burn simulate`, `prices` and `history export` (§6.6, §7.7) |
 | `agentsSwitch` | off | agents may run `use` and `next` (§6.6); an agent's `next` does nothing while auto-burn is on (§7.8) |
+
+Every setting above is edited in the large window's Settings area (§11.4); the last column names the
+group and the row. The pop-up has no settings view any more (§11.3).
 
 The former `suggestAt` and `suggestTargetBelow` (the fixed 90 % / 50 % suggestion) are gone. An
 older `accounts.json` that still has them loads: unknown keys are ignored, and the two settings
@@ -815,7 +826,7 @@ The target is somewhere between the macOS Control Centre and Raycast: one floati
 - **Active account:** at the bottom. The card is raised (slightly lighter), with a subtle ring in the account colour and an "Active" pill.
 - **Closing:** Esc, the × in the header, a click anywhere else (the pop-up loses focus), or a second left click on the tray icon. The pop-up must actually get the keyboard focus when it opens, or none of the first three work (on Cinnamon it did not at first, §17).
 - **Motion:** after a switch, the cards trade places with a 250 ms spring animation. The ticking reset countdowns ("1h12m") update every minute without flicker. All animation is off when the system asks for reduced motion.
-- **Keyboard:** ↑/↓ moves between accounts, Enter switches, 1–9 switch directly, `,` opens settings, Esc closes. The cursor (a blue ring) appears only with the first ↑/↓, starting from the account in use, and is gone again each time the pop-up opens; until then Enter does nothing. Clicking a card does not move it.
+- **Keyboard:** ↑/↓ moves between accounts, Enter switches, 1–9 switch directly, `,` opens the settings in the large window, Esc closes. The cursor (a blue ring) appears only with the first ↑/↓, starting from the account in use, and is gone again each time the pop-up opens; until then Enter does nothing. Clicking a card does not move it.
 
 **Sessions line.** In the footer next to "+ Add account" the pop-up reads `9 sessions · 2 busy` (the mock-up shows it without a waiting session), and while someone waits ` · 1 waiting for you` in the warning colour. With `readSessions` off there is no line. When the session files cannot be read, their reason stands there muted instead; a newer Claude Code adds a small ⚠ whose tooltip is the warning text. The numbers do not depend on the pop-up being open.
 
@@ -842,26 +853,282 @@ The target is somewhere between the macOS Control Centre and Raycast: one floati
 ╰──────────────────────────────────────────────────────╯
 ```
 
-### 11.3 Account editor (inline, opens on clicking the badge or the ✎ next to the label)
+### 11.3 Account editor and settings have moved
 
-The ✎ shows while the pointer is on the card or the card has the keyboard focus. The ⚙ in the header is hidden while settings are open.
+The pop-up has no account editor and no settings view any more. Its gear, and `,` on the keyboard,
+open the large window at its Settings area. A click on an account's badge, or on its ✎, opens the
+large window at Accounts with that account's editor open. The editor and every setting row are in
+§11.4; `docs/implementation.md` has the page and command contracts.
 
-- Label (free text).
-- Abbreviation: two boxes, live preview of the tray icon at 16, 22 and 32 px.
-- Colour: 10 preset swatches plus a custom hex value.
-- "Remove account", which asks first. It deletes the account from the keyring and list. The live login is never touched.
+---
 
-### 11.4 Settings view
+## 11.4 The large window
 
-The gear opens the settings in the same card, in the same style, with the existing setting rows:
+seatswap has a second window next to the pop-up: label `main`, title "seatswap", 1280 × 800 at
+start, resizable, decorated, in the taskbar and not always on top. It is one more Tauri webview
+window with its own page (`window.html`); both windows can exist at the same time and both receive
+the app's `snapshot`.
 
-- **History.** "Name of this host" (text; empty = the machine's name), "History folder" (text; empty = seatswap's own folder), "Read Claude Code's session files" (switch; sub-text "model, busy or idle, tokens per folder · never message text").
-  - Note under the group: "Takes effect after restarting seatswap."
-- **Notifications.** "An account is usable again" (switch), "A session is waiting for you" (switch).
-- **Auto-burn.** "Auto-burn" (switch), "Suggest switches" (switch) with "while auto-burn is off"
-  under it. The account editor also carries "Auto-burn may use this account"; the same switch is on
-  the account card in the pop-up.
-- **Agents.** "Agents may read usage" (switch), "Agents may switch accounts" (switch), and under them the text of §6.6.
+**How it is opened.**
+- The pop-up's gear (or `,`): the Settings area.
+- An account's badge or ✎ in the pop-up: Accounts, with that account's editor open
+  (`settings/accounts?<account id>`).
+- The tray menu: "Settings…" opens Settings, "Open seatswap…" opens Sessions.
+- `seatswap window [AREA]` asks the running tray app; without an area it opens `sessions`.
+  `seatswap panel settings` sends the same line as `seatswap window settings`.
+- A page's `open_window` command, which takes the same target.
+
+A target is an area, optionally followed by `/<sub>` and optionally `?<item>`: `settings`,
+`settings/accounts`, `settings/accounts?<account id>`, `statistics/forecast`. The areas are
+`sessions`, `statistics`, `statusline` and `settings`; a sub-area and an item may hold only `a-z`,
+`0-9` and `-`, and there is at most one `/`. Anything else is refused with the reason, which
+`seatswap window` prints as a usage error. A newly created window loads `window.html#<target>`; an
+already open one is shown, un-minimized, focused and sent `open-area`. The pop-up keeps its own
+`navigate` event, because an event reaches every window.
+
+**The areas.** Four tabs at the top left, in this order: Sessions · Statistics · Status line ·
+Settings. An empty address opens Sessions. In this version only Settings has a page; the other
+three say "Comes with a later version." The area's title and its subtitle stand above the card, and
+the snapshot's error is a banner above both. The theme follows the `theme` setting and the system,
+as in the pop-up.
+
+**Settings.** Seven groups on the left, the chosen group's card on the right:
+General · Accounts · Auto-burn · Notifications · Projects · Agents · History and hosts. The address
+names the group, with an alias accepted (`gen`, `acc`, `autoburn`/`burn`, `noti`, `proj`, `hist`),
+and an optional item that opens a row's editor. A click on a group writes the new address, so Back
+returns to the previous group.
+
+Every control saves at once; there is no Save button. A refused save shows its error under the row
+and puts the control back to the saved value. Saves run one after another, each built from the
+settings the one before left, so a quick second change never carries a stale copy; while a save is
+pending, an incoming snapshot does not overwrite the page's own copy.
+
+- **General.**
+  - *Money*: the currency; "Look up prices and the dollar rate"; the dollar rate with its date or
+    "my own rate"; "Use my own rate"; the API prices row with how many models have a price, when
+    they were checked, what the last look-up changed, and a price list. In the price list each
+    model's four prices are fields: changing one saves it as that model's own price, and a button
+    puts the looked-up price back; a model whose price depends on the prompt size is marked and
+    uses its base price (§11.5).
+  - *Look*: theme, tray text, which limit the tray ring shows.
+  - *Start and polling*: start at login; how often the active account and the inactive accounts are
+    read.
+  - *Claude Code*: the config folder; read the session files; copy the live login at once; refresh
+    inactive logins.
+- **Accounts.** One row per account: the chip (abbreviation and colour), the label (editable), the
+  account's e-mail, its plan, its price per month in the currency, "Auto-burn may use it", its
+  organization, and when its login ends. A click on the chip opens the editor: one or two letters,
+  ten colour swatches and a hex field, a live preview of the tray icon at 16, 22 and 32 px, and
+  Remove with a confirmation that says the live login is not touched. Account and plan come from
+  the login and are read-only. The organization is chosen from the organizations of §11.6 or
+  created there.
+- **Auto-burn.** The switch, "Suggest switches", and the read-only lines of the auto-burn view: how
+  early it switches, what was measured, what it would do now, what a switch by you costs, and
+  whether a session would lose its thinking. There is nothing to tune here.
+- **Notifications.** "A session is waiting for you" and whether this host's or all hosts' waiting
+  sessions notify; "An account is usable again"; "All accounts are full" (always on); "Every
+  automatic switch"; "A switch by an agent" (always on); a link to the suggested switches under
+  Auto-burn; "A login ends", the 5-day, 1-day and ended warnings.
+- **Projects.** §11.6.
+- **Agents.** "Agents may read usage" and "Agents may switch accounts", with the text of §6.6; the
+  skill's state, an install and a remove button; the last 20 calls by agents, newest first, with
+  their folder and whether they were allowed.
+- **History and hosts.** This host's name and its history folder; every host folder with its last
+  record, its first record and its size; export and import. A changed host name or folder takes
+  effect after a restart, and the row says so when the saved value differs from the one in effect.
+  Export writes CSV or JSON to a file the person names (an existing file is refused); import copies
+  another history folder's host folders in by hand and never writes this host's own folder or a
+  same-named folder of another machine.
+
+---
+
+## 11.5 Money: API prices, the dollar rate and the value of tokens
+
+Usage is a percent of each account's own week. Money is the common unit that adds accounts up and
+says what a token or a subscription was worth. Amounts are shown with the currency code after the
+number: `1,234 EUR`, and below 10 with two decimals, `6.47 EUR`.
+
+- **One currency.** `currency` is the currency every amount is shown in. There is no default: until
+  it is set, amounts in money stay missing and the page asks for it.
+- **A price per account.** An account's `price` is what its subscription costs per month, in that
+  currency. Without a price the account is left out of every sum in money, and the window says so;
+  it is never assumed.
+- **The dollar rate.** API prices are in dollars; a rate turns them into the chosen currency. A rate
+  entered by hand (`usdRate`) wins over the looked-up one. `USD` itself is always 1, with no
+  looked-up rate. Without a rate an API value has no value in the currency, and the value says its
+  rate is missing; the code never assumes a rate.
+- **The value of one percent** of an account's week is `monthly price × 12 / 52 / 100`: 180 EUR a
+  month is 41.54 EUR a week and 0.415 EUR per percent.
+
+**API prices from models.dev.** The list is read for three providers: `anthropic`, `openai` and
+`ollama-cloud`. A model's key is `<provider>/<model id>`; its price has four parts, in USD per
+million tokens: `input`, `output`, `cacheWrite` and `cacheRead`. A model whose `cost.tiers` makes
+the price depend on the prompt size is marked `tiered` and counted at its base price. A model that
+lacks an input or an output price is left out; a missing cache price counts as 0. A negative or
+non-finite price, a provider without a model list, an answer that is not the expected model list,
+and an answer with none of the three providers are errors naming the model or the answer, and
+nothing is stored.
+
+**Prices are kept with their dates.** Each looked-up price that differs from the stored one starts a
+new point at the look-up's time; the tokens of a past day keep the price of that day. `prices.json`
+holds the points per key, the last look-up's `checkedAt`, its `etag`, the last change and the own
+prices. The price of a key at a time is its own price if there is one, else the last point at or
+before that time, else the first point. A model missing from a later list keeps its points; it is
+reported as removed once, not on every list that still lacks it. The settings page's price list and
+`seatswap prices` show the price in effect.
+
+**The dollar rate from Frankfurter.** `fx.json` holds one currency and its dated points. The rate of
+a day is the last point at or before it, else the first point. A looked-up rate that is not a
+finite number above 0 is an error and nothing is saved. On the next look-up after the currency
+changes, the old currency's points are replaced by a new file for the new currency.
+
+**The two look-ups and the switch.** `lookUpPrices` (default on) is the one switch. Both requests go
+through `api`, both carry the User-Agent `seatswap/<version>` and nothing about the user, an account
+or this machine:
+
+| What | Request | When |
+|---|---|---|
+| API prices | `GET https://models.dev/api.json`, with `If-None-Match: <etag>` when a list is stored | at the tray app's start, then every hour while `lookUpPrices` is on; on a Money setting's save; and with `seatswap prices --refresh` |
+| The dollar rate | `GET https://api.frankfurter.dev/v1/latest?base=USD&symbols=<currency>` | at the tray app's start and then in the hourly round, once per local day, only when `lookUpPrices` is on and the currency is set and not `USD` |
+
+"Not modified" only moves `checkedAt`; the stored prices stay. A look-up that fails saves nothing:
+the last values stay with their age, the error is shown under "API prices" or at the rate, and no
+number is zeroed or replaced. After a failed rate request the next round tries again; an answer for
+today is not asked for again that day, so a weekend with no new ECB rate does not cause an hourly
+request. With `lookUpPrices` off neither host is contacted and `seatswap prices --refresh` refuses;
+the stored values keep being shown. Nothing else on the machine is contacted for money.
+
+**What a failure means for a value.** A token record whose model has no price gets no API value and
+the model's name is recorded as the reason, never a guessed price. A record without a rate gets no
+value in the currency and says the rate is missing. The value of a subscription is left out when
+the account has no price, or when the week's used part or its API value is unknown.
+
+**How a value is computed.**
+- One token record's API value in USD is
+  `(input × input price + output × output price + cache write × cacheWrite price + cache read ×
+  cacheRead price) / 1,000,000`, at the price of the record's day. A token record's model is priced
+  as an Anthropic model (`anthropic/<model>`), the provider Claude Code's transcripts come from.
+  The value in the currency is that USD amount times the rate of the record's day.
+- A token record belongs to the account that the history's live and switch events say was in use on
+  its host at its time.
+- The value of a subscription for a week: the account's used percent of that weekly window (a
+  finished window's final percent, or the latest sample's percent for a running week) times
+  `percent_value(price)`, split among the account's token records of that week in proportion to
+  their API value. So a record's subscription value is
+  `its API USD / the week's API USD × used percent × percent_value(monthly price)`.
+- The price used is the account's price at the record's time: the last `priceChanged` at or before
+  it, before the first one the first one, or, when the account has no such event, the price stored
+  in `accounts.json`. A price entered in another currency than the current `currency` is not used,
+  and the value is left out. So is a record whose week has no reading, or whose account's records
+  in that week have no API value to split.
+
+`priceChanged` is written to the history when an account's price changes; it carries the new
+`amount` and the `currency` in effect at that moment. A plan change is `planChanged`.
+
+**The files.**
+
+`<data folder>/prices.json`, pretty JSON, atomic, mode 0600:
+
+```json
+{
+  "version": 1,
+  "checkedAt": "2026-11-15T09:41:12Z",
+  "etag": "W/\"1a2b3c\"",
+  "lastChange": {
+    "at": "2026-11-15T09:41:12Z",
+    "added": ["anthropic/claude-opus-5-5"],
+    "changed": [],
+    "removed": []
+  },
+  "models": {
+    "anthropic/claude-opus-5-5": [
+      { "from": "2026-11-14T08:00:00Z",
+        "price": { "input": 4.0, "output": 20.0, "cacheWrite": 5.0, "cacheRead": 0.2, "tiered": false } }
+    ]
+  },
+  "overrides": {
+    "anthropic/claude-haiku-5-5": { "input": 0.1, "output": 0.5, "cacheWrite": 0.125, "cacheRead": 0.01, "tiered": false }
+  },
+  "missing": ["openai/gpt-6"]
+}
+```
+
+`<data folder>/fx.json`, the same way:
+
+```json
+{ "version": 1, "currency": "EUR",
+  "points": [ { "date": "2026-11-13", "rate": 0.90481 } ] }
+```
+
+`checkedAt`, `etag` and `lastChange` are left out of the file rather than written as null;
+`models`, `overrides` and `missing` are always present, empty when nothing is there. A file of
+another `version` is refused with its path, never replaced.
+
+---
+
+## 11.6 Projects and organizations
+
+A project is a repository, or a folder that has none. Organizations group projects and the accounts
+that pay for them. Both are the same on every host once the hosts' project logs have met.
+
+**What names a project.** seatswap reads only `.git` and the git `config` of the folders Claude Code
+reports; it executes nothing. From a folder it walks up to the repository root and reads the
+`origin` remote. The project's identity is that address, normalised: host lower-cased, no protocol,
+no user or token, no port, no `.git`, no trailing `/` (`github.com/acme/atlas`). Without a remote it
+is the repository's folder name; outside a repository, the first folder under the home folder, or
+`~` for the home folder itself. The key is `repo:<host/path>` or `folder:<name>`.
+
+**Names.** A project's default name is the repository's last path part (`atlas`), the folder's name,
+or `~ (home folder)` for `~`. A rename is 1 to 40 characters and may not be only spaces. A renamed
+project keeps its key, so a later rename wins and the past keeps counting under the same project.
+
+**Organizations.** A project's default organization is the repository's owner (`acme` for
+`github.com/acme/atlas`); a folder has none. An account's first organization is its login's
+`orgName`; without one it has none. An account sits in exactly one organization: naming it in an
+organization's account list moves it there and out of the one it was in. Organizations have an
+identity, which a rename does not change, and a shown name, which starts as that identity.
+Organizations can be joined like projects; their accounts and projects then count for the
+organization they were joined into.
+
+**Sessions and folders.** A project's folders per host and its session count come from the session
+records of every host, over all time: distinct session ids, and the folders the sessions ran in. A
+key that no session ever named is not a row of the Projects group. A project seen on two hosts in
+two folders is one project; the folders are listed per host.
+
+**The shared project log.** Every edit is one line in the host's own
+`projects-YYYY-MM.jsonl` under the history root, appended and never rewritten. Every host reads all
+hosts' files; the later record wins, by its time, ties broken by host name and then by the file's
+line order. A join follows its chain; a cycle keeps the later of the records that form it and drops
+the earlier one. Because the log travels with the history folder (§1.5), the same names, joins and
+organizations appear on every host once the folder has synced. A refused edit appends nothing; the
+row shows the reason.
+
+| `edit` | Fields | Meaning |
+|---|---|---|
+| `rename` | `key`, `name` | the project's shown name |
+| `join` | `key`, `into` | `key`'s tokens count for `into`; `key` gets no row of its own |
+| `unjoin` | `key` | undo a join |
+| `assign` | `key`, `org` (a name, or `null` for none) | the project's organization; creating an organization is an `assign` with a new name |
+| `orgRename` | `org`, `name` | an organization's shown name; `org` stays its identity |
+| `orgJoin` | `org`, `into` | `org`'s accounts and projects count for `into` |
+| `orgAccounts` | `org`, `accounts` | the organization's whole account list |
+
+A name is 1 to 40 characters and not only spaces; an organization name is not empty; a project or
+an organization cannot be joined into itself. The Projects group shows each project with its
+repository, its folders per host, its organization (chosen from the list or created in place), its
+session count and the keys joined into it, each with an undo. Under it, the organizations with
+their accounts and project counts. Changes apply to the past too, because the history stores the
+repository's identity, not the shown name.
+
+**The file.** One line per edit, camelCase, the project key as `{"kind":"repo","id":"…"}` or
+`{"kind":"folder","id":"…"}`:
+
+```json
+{"t":"2026-11-15T12:25:05Z","edit":"join","key":{"kind":"folder","id":"atlas-old"},"into":{"kind":"repo","id":"github.com/acme/atlas"}}
+{"t":"2026-11-15T12:30:00Z","edit":"assign","key":{"kind":"repo","id":"github.com/acme/atlas"},"org":"acme"}
+{"t":"2026-11-15T12:31:00Z","edit":"orgRename","org":"acme","name":"Acme"}
+{"t":"2026-11-15T12:32:00Z","edit":"orgAccounts","org":"acme","accounts":[{"acc":"6f1c2a9e-…","org":"a92d7b31-…"}]}
+```
 
 ---
 
@@ -880,7 +1147,11 @@ The gear opens the settings in the same card, in the same style, with the existi
 ## 13. Security and privacy
 
 - Logins go only into the OS keyring, or a `0600` file if there is none. They are never logged; log lines print the account ID and the token's last 4 characters at most.
-- Network traffic goes only to `api.anthropic.com` and `platform.claude.com`. No telemetry, no update pings unless enabled.
+- Network traffic goes only to `api.anthropic.com` and `platform.claude.com` for an account's usage
+  and login, and — only while `lookUpPrices` is on — to `models.dev` for API prices and
+  `api.frankfurter.dev` for the dollar rate (§11.5). The two look-ups send the User-Agent
+  `seatswap/<version>` and no account, token or machine data. No telemetry, no update pings unless
+  enabled.
 - Every write to Claude Code's files is atomic (temp file + rename) and keeps the original file mode.
 - The status line reads Claude Code's JSON, seatswap's settings and its usage cache; its only write
   is `<data folder>/feed.json` (mode 0600). It prints no token and sends none.

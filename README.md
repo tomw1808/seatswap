@@ -34,9 +34,26 @@ read or write that yet.
 
 - **One-click switch** from the tray menu or the pop-up, or `seatswap use AC`. Running Claude
   Code sessions pick up the new login on their next request.
+- **A large window with Settings.** The gear in the pop-up (or `,`) opens a full window: Sessions,
+  Statistics, Status line and Settings. Settings is there now — every setting, plus the account
+  editor that used to sit in the pop-up; the other three areas come with a later version.
+  `seatswap window [AREA]` opens it from a terminal, and so do the tray's *Settings…* and *Open
+  seatswap…*. Every control saves at once.
+- **Money.** seatswap shows what tokens and subscriptions are worth: API prices from
+  [models.dev](https://models.dev) and the dollar rate from
+  [Frankfurter](https://frankfurter.dev), each kept with its dates, so past days keep the price of
+  that day. Set a currency and each account's monthly price; the weekly percentage then has a money
+  value. One switch, *Look up prices and the dollar
+  rate*, turns both look-ups off. They send a User-Agent and nothing else — no account, token or
+  machine data — and with the switch off neither site is contacted.
+- **Projects and organizations.** seatswap groups the folders Claude Code works in into projects
+  (a repository, or a folder), with names you choose, joins for the same project seen in two
+  places, and organizations. The project log travels with the history folder, so every host shows
+  the same names once the folder has synced. History can be exported as CSV or JSON, and another
+  history folder's files imported by hand.
 - **Usage at a glance.** The icon ring shows the active account's binding limit, coloured green,
   amber or red. The pop-up shows every account's session (5 h) and weekly limits, with the time
-  until each one resets.
+  until each one resets — and its plan, such as "Team 5x".
 - **Auto-burn.** Switched on, seatswap moves between accounts by itself so that as little work as
   possible is blocked; it switches before an account is full only when the measured gain is worth
   the switch. Switched off, it suggests the same switch instead.
@@ -124,17 +141,19 @@ On both, seatswap adds itself to the programs started at login (switch it off un
 3. Log in to the next account in Claude Code (`/login`) and save it the same way.
 4. Switch with a left click on the icon (pop-up) or from the menu, or `seatswap use <abbr>`.
 
-Each account gets a one- or two-letter abbreviation and a colour, both editable in the pop-up
-(the ✎ next to an account's name, or its badge) or with `seatswap edit <account> --abbr XY --color '#3b82f6'`.
+Each account gets a one- or two-letter abbreviation and a colour, both editable in the large
+window (*Settings → Accounts*, the ✎ or the badge) or with `seatswap edit <account> --abbr XY --color '#3b82f6'`.
+Clicking an account's badge or ✎ in the pop-up opens that editor.
 
 ## Usage
 
 | Action | Effect |
 |---|---|
 | Left click on the icon | Open or close the pop-up |
-| Right click | Menu: one entry per account (click to switch), *Open panel…*, *Add account…*, *Settings…*, *Quit* |
+| Right click | Menu: one entry per account (click to switch), *Open panel…*, *Add account…*, *Settings…* (the large window), *Quit* |
 | Hover | Tooltip with the active account's session and weekly usage |
-| In the pop-up | ↑/↓ move, Enter switches, 1–9 switch directly, `,` settings, Esc closes |
+| In the pop-up | ↑/↓ move, Enter switches, 1–9 switch directly, `,` settings in the large window, Esc closes |
+| Account badge or ✎ | That account's editor in the large window (*Settings → Accounts*) |
 
 There is no built-in global shortcut yet. On Linux, bind `seatswap panel` to a key in your
 desktop's keyboard settings (Ctrl+Alt+C, for example). On Windows the command for such a shortcut
@@ -198,7 +217,12 @@ seatswap statusline             Claude Code's status line (reads its JSON from s
 seatswap burn plan [--json]     the early-switching regime and the lazy plan
 seatswap burn simulate --from YYYY-MM-DD --to YYYY-MM-DD [--without ABBR]
                                 replay the recorded work for the lazy and eager policies
-seatswap panel [main|add|settings]   open the running app's pop-up
+seatswap panel [main|add|settings]   open the running app's pop-up; settings opens the large window
+seatswap window [AREA]          open or focus the large window (sessions|statistics|statusline|settings)
+seatswap prices [--refresh]     the stored API prices, USD per million tokens; --refresh asks models.dev
+seatswap history export --format csv|json [--from YYYY-MM-DD] [--to YYYY-MM-DD]
+                                write the history to standard output (UTC days, --to inclusive)
+seatswap history import <folder>   copy another history folder's host folders in
 seatswap agent-skill install|uninstall [--force]   add or remove the skill for agents
 ```
 
@@ -229,7 +253,9 @@ the tray app, and `seatswap.exe` for everything you want to read in a terminal.
   (`HKCU\Software\Classes\AppUserModelId\dev.seatswap.app`).
 - **Network:** the usage endpoint (`api.anthropic.com/api/oauth/usage`) and Claude Code's token
   endpoint (`platform.claude.com/v1/oauth/token`, with Claude Code's own client id) to refresh
-  stored logins. Nothing else, and never anywhere but Anthropic.
+  stored logins. And, only while *Look up prices and the dollar rate* is on, `models.dev` for API
+  prices and `api.frankfurter.dev` for the dollar rate; those two send a User-Agent and nothing
+  about you, your accounts or this machine. Nothing else.
 - **Logs and output** never contain a token; at most the last four characters of a refresh token.
 - **Locks:** a switch holds Claude Code's own lock files (the renewal locks of the main and the two
   secondary logins, credentials write, identity write) and its own app lock, so it never

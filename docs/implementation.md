@@ -922,7 +922,7 @@ of one event kind never clears the other kind's failure.
 | `add [--label L]` | `ops::save_live_login` (`sync_live` with create): saves the live login as a new account or updates the stored copy; a new account writes `accountAdded` with its plan. Prints the account. |
 | `rm <KEY> [--yes]` | `ops::remove_account` (writes `accountRemoved`); without `--yes` asks "Remove AC — Acme? [y/N]" on a terminal, refuses when stdin is not a terminal. |
 | `edit <KEY> [--label L] [--abbr A] [--color #rrggbb]` | `edit_account`. |
-| `panel [main\|add\|settings]` | Asks the running tray app to open its pop-up (§ app: GUI, single instance). Not running → exit 1 "seatswap is not running". This is the hotkey on Linux v1: the person binds it in the desktop's keyboard settings (no global-shortcut crate is available). |
+| `panel [main\|add\|settings]` | Asks the running tray app to open its pop-up (§ app: GUI, single instance); `settings` sends `window settings` and opens the large window instead, because the pop-up has no settings view (step C1). Not running → exit 1 "seatswap is not running". This is the hotkey on Linux v1: the person binds it in the desktop's keyboard settings (no global-shortcut crate is available). |
 | `agent-skill install\|uninstall [--force]` | `agent_skill`: `<claude config dir>/skills/seatswap/SKILL.md` from the bundled text, through `atomic::ensure_private_dir` and `atomic::write_atomic` (0600). Install prints "already installed: <path>" when the file is identical, refuses a differing file without `--force`, else prints the path. Uninstall prints "not installed: <path>" when absent, refuses a differing file without `--force`, else prints "removed <path>" and removes the folder when it is empty. |
 | `status` | The live account in one line: `AC 97% · 1h12m` (binding limit, time to its reset; format §11: `35m`, `1h05m`, `1d18h`, beyond 48 h `Sun 02:00` — `format::format_reset_at`; reset times are rounded up to the full minute first, `format::reset_minute`). `--json` prints `views` + `active` + `suggestion` + `autoBurn` + `next` + `burnError` (§7.8 of the spec); each view carries `usable`, the one definition of §7.2, and `slackHours` when known. `--waybar` prints one JSON line `{"text":"AC 97%","tooltip":"…","class":"fine|close|critical|locked|none","percentage":97}`; `--i3blocks` prints three lines (full text, short text, colour). `--refresh` polls first (PollReason::Timer). Only `--json` reads the history. |
 | `statusline` | Claude Code's status line: reads its JSON from stdin, prints the one line and exits 0 (even when it prints `seatswap: <reason>`). Never gated, never recorded, no lock, no network. |
@@ -1020,7 +1020,7 @@ Event `navigate` (payload `"main"|"add"|"settings"`) when the panel is shown for
 
 **Autostart** (`autostart.rs`, one entry point `apply_autostart(enabled, arguments)`): at start and on `save_settings`. The entry is text: a program path or folder argument that is not valid Unicode is `AutostartError::NotUnicode` on both platforms (the one `path_text`), never a path with replaced characters. Linux: `startAtLogin` on → write `autostart_file($XDG_CONFIG_HOME or ~/.config)` with `Exec=<current_exe>` via `write_atomic` (`Access::Shared`); off → remove it if present. Windows: on → the string value `seatswap` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` = `"<folder of current_exe>\seatswap-tray.exe" "<arg>" …` (each part in double quotes, `"` written `\"`, a run of backslashes before a `"` or at the end doubled); a missing `seatswap-tray.exe` (`NoTrayProgram`), a path that is not valid Unicode (`NotUnicode`) or a command over 260 UTF-16 units (`CommandTooLong`) is an error, never shortened; off → delete the value (missing is fine). `gui/registry.rs` (Windows only) is the one module that names `winreg`: `set_string`, `get_string` (tests only), `delete_value`, all under `HKEY_CURRENT_USER`.
 
-**Panel UI** (`ui/`, plain HTML/CSS/JS, no build step, `window.__TAURI__` with `app.withGlobalTauri: true`): §11.1–11.4. Views `main`, `add` (the §6.1 steps; shows the unknown live login with a label field and "Save" when there is one), `settings` (the settings of §11.4, including auto-burn). The main view's footer carries the sessions line of §11.1 from `snapshot.sessions`. Every time on the page (reset countdowns, the header's poll age, a card's "usage 5 min ago") is an element with `data-time` + `data-time-style` whose text comes from the command `time_texts([{at, style}]) → [text]` (`countdown` → `format_reset_at`, `clock` → `format_reset_clock`, `age` → `format_age`), asked after each render and every second, so the page has no copy of these rules. Without `window.__TAURI__` it runs on a built-in fixture snapshot so it can be opened in a browser; there `time_texts` answers with stand-ins (the plain clock time, "a moment ago").
+**Panel UI** (`ui/`, plain HTML/CSS/JS, no build step, `window.__TAURI__` with `app.withGlobalTauri: true`): §11.1–11.2. Views `main` and `add` (the §6.1 steps; shows the unknown live login with a label field and "Save" when there is one); a `settings` request now opens the large window at Settings (step C1), because the pop-up has no settings view. The main view's footer carries the sessions line of §11.1 from `snapshot.sessions`. Every time on the page (reset countdowns, the header's poll age, a card's "usage 5 min ago") is an element with `data-time` + `data-time-style` whose text comes from the command `time_texts([{at, style}]) → [text]` (`countdown` → `format_reset_at`, `clock` → `format_reset_clock`, `age` → `format_age`), asked after each render and every second, so the page has no copy of these rules. Without `window.__TAURI__` it runs on a built-in fixture snapshot so it can be opened in a browser; there `time_texts` answers with stand-ins (the plain clock time, "a moment ago").
 
 ## app: sessions thread (`gui/sessions_rt.rs`) — step A
 
@@ -1673,3 +1673,467 @@ Resume button.
 - **History samples**: a merged feed writes a `sample` line with `"src":"statusline"`; its limits,
   account and time are the same shape a poll writes.
 
+
+## Step C1: the large window, Settings, money and projects
+
+The new modules, each with one job:
+
+| Module | Job |
+|---|---|
+| `app::gui::window` | the large window's label, areas, target grammar and opener |
+| `app::gui::lookup_rt` | the look-up thread: models.dev and Frankfurter, the money view, own prices |
+| `core::money` | API prices with dates, the dollar rate, the look-ups, the value of token records |
+| `core::projects` | projects, joins and organizations from the session records and the shared project log |
+| `app::ui::common.js` | the page helpers both windows use |
+| `app::ui::window.js`, `areas/settings.js` | the window's tabs and areas, the Settings page |
+
+## gui/window.rs and the page helpers (step C1)
+
+```rust
+#[cfg(feature = "gui")]
+pub(crate) const WINDOW_LABEL: &str = "main";
+pub(crate) const AREAS: [&str; 4] = ["sessions", "statistics", "statusline", "settings"];
+
+/// "<area>" or "<area>/<sub>", the sub optionally "<name>?<item>"; a-z, 0-9 and '-' only.
+pub(crate) fn parse_target(target: &str) -> Result<(&str, Option<&str>), String>;
+
+/// Create (1280 × 800, resizable, decorated, in the taskbar, not always on top) or focus
+/// the window, and send it the target as `open-area` (an existing window) or as its
+/// address `window.html#<target>` (a new one). A refused target is the error text.
+#[cfg(feature = "gui")]
+pub(crate) fn show(app: &AppHandle, target: &str) -> Result<(), String>;
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub(crate) fn open_window(app: AppHandle, target: String) -> Result<(), String>;
+```
+
+`parse_target` accepts `settings`, `settings/accounts`, `settings/accounts?<id>`; it refuses an
+unknown area, an empty sub (`settings/`), a second `/`, a character outside `a-z 0-9 -` (also in the
+item after `?`), and an empty item. `show` refuses the same targets before it touches a window.
+The pop-up keeps the event name `navigate`; the large window has `open-area`, because `emit`
+reaches every window.
+
+The CLI and the IPC use the same grammar: `ipc::window_line(target)` is `window <target>`;
+`ipc::send_window` writes that line and `parse_command` accepts it only when `parse_target` does.
+`Command::Window { target: Option<String> }` defaults to `sessions` and validates before sending.
+`seatswap panel settings` sends `window settings` (`cli::panel_settings_line`); the tray menu's
+"Settings…" and "Open seatswap…" call `show(app, "settings")` and `show(app, "sessions")`.
+
+`crates/app/ui/common.js` is the pop-up's helpers moved out of `panel.js`, plus the controls both
+pages use. Exported: `PALETTE`, `TRAY_GREY`, `LEVEL_COLORS`, `TAURI_GLOBAL`, `HAS_TAURI`, `isObject`,
+`clamp`, `clone`, `errorMessage`, `isColor`, `hexToRgb`, `rgba`, `rgbToHex`, `mixHex`,
+`relativeLuminance`, `contrastText`, `limitLevel`, `shortPercent`, `clear`, `setStyles`, `applyProps`,
+`appendChildren`, `h`, `banner`, `applyTheme`, `invoke`, `listen`, `money`, `tokens`, `textInput`,
+`selectInput`, `switchButton`, `sanitizeAbbrChar`, `abbrLetterBoxes`, `colorSwatches`, `hexField`,
+`iconPreview`. `money(amount, currency)` gives `"1,234 EUR"` for `(1234, "EUR")` and two decimals
+below 10, `"6.47 EUR"`, and throws on a negative or non-finite amount or a currency that is not
+three capital letters; `tokens(n)` returns `"12.4 M"`, `"845 k"` or `"0"` and throws on an invalid
+count. `window.html`, `window.css` and `window.js` are the second page; `window.js` reads the area
+from `location.hash`, draws the tabs, imports `./areas/<area>.js` on demand and calls its
+`render(container, { sub, snapshot, invoke, listen })`. A module that does not exist yet shows
+"Comes with a later version."; a module that throws shows its error in the area. `crates/app/
+capabilities/default.json` names both windows: `"windows": ["panel", "main"]`.
+
+## The Settings page and its save queue (step C1)
+
+`areas/settings.js` exports `render(container, context)`; the seven groups are `general`,
+`accounts`, `auto-burn`, `notifications`, `projects`, `agents`, `history`. The address is
+`settings/<group>[?<item>]`, with `groupFrom` accepting the aliases `gen`, `acc`, `autoburn`/`burn`,
+`noti`, `proj`, `hist`; an item opens that account's editor. A group click writes
+`settings/<group>` and the `hashchange` redraws it.
+
+The save queue is the page's one write path, in this order:
+
+```js
+function queuedSave(run)            // every save runs on `state.saving`, one after another
+function saveField(field, value)    // a setting: invokes save_settings with a clone of state.settings and sets one key
+function saveAccount(account, patch, field) // invokes edit_account { key, ...patch }; the patch is one of label, abbr, color, autoBurn, price
+async function saveNow(field, value) // refuses without state.settings; keeps the server's error text
+```
+
+`state.pendingSaves` counts the queued and running saves. `takeSettings(snapshot)` ignores the
+snapshot's settings while it is above 0, so a poll cannot undo a save that has not answered yet.
+`saveNow` updates `state.settings` and `state.snapshot.settings` only after `save_settings`
+succeeded; a "settings saved; start at login could not be set: …" answer keeps the saved values
+and shows that text, because only the autostart entry failed. A refused save leaves the error under
+its row (`fieldError`) and the caller puts the control back to `savedValue(field)`. `label`, the
+chip's letters and colour, `autoBurn` and `price` save through `edit_account`; `price` is sent as a
+number, `null` to clear it, or left out to keep it.
+
+The page loads its extra views through the commands: `loadMoney` (and `listenMoney` for
+`UiEvent::Money`) for the Money section and the price list, `loadProjects` for Accounts and
+Projects, `loadHistory` when the History group opens or a host setting is saved. Each keeps a
+request token so a slow reply cannot overwrite a newer one (`moneyToken`, `projectsToken`,
+`historyToken`). The Money section's price list is read only when "Show…" is pressed
+(`price_list`); an own price saves through `set_price_override` and refreshes the view.
+
+## store.rs additions — plan, price and the money settings (step C1)
+
+```rust
+pub struct Account {
+    // …
+    pub plan: Option<String>,   // plan_label(login, identity); serde default missing = None
+    #[serde(default)]
+    pub price: Option<f64>,     // per month, in Settings.currency; missing = None
+}
+pub struct Settings {
+    // …
+    #[serde(default = "default_notify_login_ends")] pub notify_login_ends: bool, // true
+    #[serde(default)] pub currency: Option<String>,                             // None
+    #[serde(default)] pub usd_rate: Option<f64>,                                // None
+    #[serde(default = "default_look_up_prices")] pub look_up_prices: bool,      // true
+}
+
+pub struct LoginNote { pub changed: bool, pub plan_changed: bool, pub previous_plan: Option<String> }
+impl Account { pub fn note_stored_login(&mut self, login: &Login) -> LoginNote; }
+
+/// The identity's planDisplayName, else subscriptionType capitalised plus its level:
+/// "_<n>x" → " <n>x" ("Team 5x"); another tier → " (<tier without default_claude_>)";
+/// no tier → nothing.
+pub fn plan_label(login: &Login, identity: &OAuthAccount) -> Option<String>;
+/// A price is None or a finite number above 0; anything else is StoreError::InvalidPrice.
+pub fn validate_price(price: Option<f64>) -> Result<Option<f64>, StoreError>;
+```
+
+`Settings::validate` refuses a currency that is not three capital letters and a `usdRate` that is
+not finite and above 0. An older `accounts.json` without `price`, `notifyLoginEnds`, `currency`,
+`usdRate` or `lookUpPrices` loads with `None`, `true`, `None`, `None`, `true`.
+
+`switcher::edit_account` takes the price as `Option<Option<f64>>` (`None` keeps it, `Some(None)`
+clears it, `Some(Some(v))` sets it after `validate_price`) and returns
+`Edited { account, price_changed }`. The panel sends `price` as JSON: absent, `null`, or a number,
+because `Option<Option<f64>>` cannot tell absent from null over JSON. The worker writes
+`EventKind::PriceChanged { account, amount, currency }` only when `price_changed`, with the currency
+in effect at that moment. `ops::record_plan_change` writes `EventKind::PlanChanged` from a
+`switcher::PlanChange { account, from, to }` after a switch (CLI or app), a live sync or the mirror.
+
+## api.rs additions (step C1)
+
+```rust
+pub const MODELS_DEV_URL: &str = "https://models.dev/api.json";
+pub const FRANKFURTER_URL: &str = "https://api.frankfurter.dev/v1/latest";
+const MAX_MODELS_DEV_BYTES: usize = 32 * 1024 * 1024;
+
+pub enum Fetched<T> { NotModified, New { etag: Option<String>, body: T } }
+
+impl Api {
+    /// GET the list with `If-None-Match: <etag>` when there is one; 200 → New with the reply's
+    /// ETag; 304 → NotModified; a body over 32 MiB (Content-Length or read) is ApiError::Decode.
+    pub fn models_dev(&self, etag: Option<&str>) -> Result<Fetched<serde_json::Value>, ApiError>;
+    /// GET "<base>?base=USD&symbols=<currency>" and read {date, rates:{<currency>: rate}}.
+    /// A currency that is not three capital letters, a missing date or rate is ApiError::Decode.
+    pub fn usd_rate(&self, currency: &str) -> Result<(NaiveDate, f64), ApiError>;
+    /// Tests only: point the two look-up URLs at a local server.
+    pub fn with_lookup_urls(mut self, models_dev: &str, frankfurter: &str) -> Api;
+}
+```
+
+Both requests carry `User-Agent: seatswap/<version>` and no other header of the account's; the
+look-ups never send a token or any user data. All HTTP still goes through `Api`.
+
+## money (step C1)
+
+```rust
+const PRICE_PROVIDERS: [&str; 3] = ["anthropic", "openai", "ollama-cloud"];
+const MONEY_VERSION: u32 = 1;
+
+pub enum MoneyError { Io { path, source }, Json { path, source }, UnsupportedVersion { path, version },
+    ModelsDev(String), Api(ApiError), Lock(LockError), BadRate { currency: String, rate: f64 },
+    History(HistoryError) }
+
+/// USD per million tokens.
+pub struct ModelPrice { pub input: f64, pub output: f64, pub cache_write: f64,
+    pub cache_read: f64, pub tiered: bool }
+pub struct PricePoint { pub from: DateTime<Utc>, pub price: ModelPrice }
+pub struct PriceChange { pub at: DateTime<Utc>, pub added: Vec<String>,
+    pub changed: Vec<String>, pub removed: Vec<String> }
+pub struct CurrentPrice { pub key: String, pub price: ModelPrice, pub own: bool,
+    pub since: Option<DateTime<Utc>> }
+
+pub struct Prices { pub version: u32, pub checked_at: Option<DateTime<Utc>>,
+    pub etag: Option<String>, pub last_change: Option<PriceChange>,
+    pub models: BTreeMap<String, Vec<PricePoint>>,           // key → points in time order
+    pub overrides: BTreeMap<String, ModelPrice>,             // own prices, win over points
+    pub missing: BTreeSet<String> }                          // reported removed once
+impl Prices {
+    pub fn load(app: &AppPaths) -> Result<Prices, MoneyError>; // missing = empty; bad/other version = error
+    pub fn save(&self, app: &AppPaths) -> Result<(), MoneyError>; // pretty, atomic, mode 0600
+    pub fn at(&self, key: &str, at: DateTime<Utc>) -> Option<&ModelPrice>; // override, last point ≤ at, first
+    pub fn current(&self) -> Vec<CurrentPrice>;               // override else last point, sorted
+    pub fn take(&mut self, list: BTreeMap<String, ModelPrice>, at: DateTime<Utc>) -> Option<PriceChange>;
+}
+
+pub struct FxPoint { pub date: NaiveDate, pub rate: f64 } // units of the file's currency per 1 USD
+pub struct Fx { pub version: u32, pub currency: String, pub points: Vec<FxPoint> }
+impl Fx { pub fn load(app) -> Result<Fx, MoneyError>; pub fn save(&self, app) -> Result<(), MoneyError>;
+          pub fn take(&mut self, date: NaiveDate, rate: f64); // replace that day, else insert in order
+          pub fn at(&self, date: NaiveDate) -> Option<f64>; } // last point ≤ date, else first
+
+pub struct Rate { pub value: f64, pub date: Option<NaiveDate>, pub own: bool }
+/// settings.usd_rate wins; "USD" is 1.0 with no date; else Fx::at(date). None without a currency.
+pub fn usd_rate(settings: &Settings, fx: &Fx, date: NaiveDate) -> Option<Rate>;
+
+pub enum Looked { NotModified, Taken(Option<PriceChange>) }
+/// Models.dev → prices.json. Load for the ETag, request, take the app lock, load again (an own
+/// price written meanwhile is kept), take the list, store the ETag and checkedAt. NotModified
+/// moves checkedAt only. Any error saves nothing.
+pub fn look_up_prices(api: &Api, app: &AppPaths, now: DateTime<Utc>) -> Result<Looked, MoneyError>;
+/// Frankfurter → fx.json under the app lock. "USD" sends nothing and returns None; a rate that is
+/// not finite and above 0 is BadRate; a file for another currency starts empty for this one.
+pub fn look_up_rate(api: &Api, app: &AppPaths, currency: &str) -> Result<Option<FxPoint>, MoneyError>;
+
+/// models.dev's body → the three providers' prices. No provider of the three = error; a model
+/// without id is skipped; input and output are required; cache_write/cache_read default to 0;
+/// a cost that is negative, non-finite or not a number is an error naming the key; tiers = tiered.
+pub fn prices_from_models_dev(body: &serde_json::Value) -> Result<BTreeMap<String, ModelPrice>, MoneyError>;
+pub fn price_key(provider: &str, model_id: &str) -> String; // "<provider>/<model id>"
+
+/// One record at API prices, in USD; None when its model has no price. Anthropic/<model>.
+pub fn api_usd(record: &TokenRecord, prices: &Prices) -> Option<f64>;
+pub fn percent_value(monthly_price: f64) -> f64; // monthly × 12 / 52 / 100
+
+pub struct Valued { pub api: Option<f64>, pub subscription: Option<f64>,
+    pub account: Option<AccountRef>, pub missing_price_for: Option<String>, pub missing_rate: bool }
+
+pub struct Valuer { … }
+impl Valuer {
+    /// Reads samples, windows and tokens of the range widened by 7 days, and every event over all
+    /// history (a record's account and price are the last Live/Switch/PriceChanged at or before it).
+    pub fn build(history: &HistoryDir, range: &Range, prices: &Prices, fx: &Fx,
+                 settings: &Settings, accounts: &[Account]) -> Result<Valuer, MoneyError>;
+    /// api = api_usd × rate of the record's day (None when either is missing);
+    /// subscription = usd / the week's api_sum × used × percent_value(price), None without a
+    /// window, a reading, a price or a positive api_sum; missing_price_for = the model when it has
+    /// no price; missing_rate = there is a price but no rate.
+    pub fn value(&self, host: &str, record: &TokenRecord) -> Valued;
+}
+```
+
+`Prices::take` adds a point only for a new model or one whose price differs from its last point; a
+model missing from the list keeps its points and enters `missing` once; a model that comes back
+leaves it. `Prices::at` never looks into the future: before the first point it uses the first point,
+so the oldest price counts for the past. A price entered before a currency was set (`currency:
+None`) still counts for the subscription value; a price entered in another currency does not.
+
+## lookup_rt (step C1)
+
+```rust
+const PRICE_EVERY: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Serialize)] pub(crate) struct MoneyView {
+    pub currency: Option<String>, pub rate: Option<Rate>, pub look_up: bool,
+    pub models_with_price: u32, pub prices_checked_at: Option<DateTime<Utc>>,
+    pub last_change: Option<PriceChange>, pub last_error: Option<String> }
+
+#[derive(Serialize)] pub(crate) struct PriceRow {
+    pub key: String, pub price: ModelPrice, pub own: bool, pub tiered: bool,
+    pub since: Option<DateTime<Utc>> }
+
+pub(crate) struct LookupClient { … }
+impl LookupClient {
+    pub(crate) fn view(&self) -> Result<MoneyView, String>;   // the last round's view
+    pub(crate) fn now(&self) -> Result<MoneyView, String>;    // one round now, answered by the thread
+    pub(crate) fn set_override(&self, key: String, price: Option<ModelPrice>) -> Result<(), String>;
+}
+pub(crate) fn spawn(app: AppPaths, api: Api, ui: Sender<UiEvent>) -> Result<LookupHandle, String>;
+pub(crate) struct LookupRuntime { … }
+impl LookupRuntime {
+    pub(crate) fn round(&mut self, settings: &Settings, now: DateTime<Utc>) -> MoneyView;
+    pub(crate) fn settings_failed(&mut self, error: String) -> MoneyView; // no request
+    pub(crate) fn view(&self) -> MoneyView;
+}
+pub(crate) fn price_rows(app: &AppPaths) -> Result<Vec<PriceRow>, MoneyError>;
+```
+
+The thread reads `accounts.json` at every round, so `lookUpPrices` counts without a restart. With
+it on, a round asks models.dev and then, when the currency is set and not `USD` and the newest
+`fx.json` point is older than today's local day, asks Frankfurter once; `last_rate_day` remembers a
+successful answer for `(day, currency)`, so a weekend's old ECB date does not cause an hourly
+request, while a failure is tried again next round. With `lookUpPrices` off no request is made and
+the view still shows what is stored. The runtime's constructor fills the view from the files before
+the first round, so the page never shows zero prices while `prices.json` holds some. Every changed
+view is sent as `UiEvent::Money(view)`; the main thread emits it to both windows. `set_override`
+takes the app lock, changes `prices.json` through `Prices`, and rebuilds the view; a price that is
+negative, non-finite or not a number is refused.
+
+## projects (step C1)
+
+```rust
+#[serde(tag = "edit", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum ProjectEdit {
+    Rename { key: ProjectKey, name: String },
+    Join { key: ProjectKey, into: ProjectKey },
+    Unjoin { key: ProjectKey },
+    Assign { key: ProjectKey, org: Option<String> },
+    OrgRename { org: String, name: String },
+    OrgJoin { org: String, into: String },
+    OrgAccounts { org: String, accounts: Vec<AccountRef> },
+}
+impl ProjectEdit { pub fn validate(&self) -> Result<(), ProjectsError>; }
+// project and organization names: 1..=40 characters, not only spaces; an organization name not empty;
+// a project or organization cannot be joined into itself.
+
+pub enum ProjectsError { NameLength { what, length }, NameBlank { what }, EmptyOrg,
+    JoinIntoItself { what }, History(HistoryError) }
+
+pub struct ProjectsLogRecord { pub t: DateTime<Utc>, #[serde(flatten)] pub edit: ProjectEdit }
+impl Record for ProjectsLogRecord { const KIND: Kind = Kind::Projects; } // "projects"
+
+pub struct Project { pub key: ProjectKey, pub name: String, pub repo: Option<String>,
+    pub org: Option<String>, pub joined: Vec<JoinedKey>, pub folders: BTreeMap<String, Vec<String>>,
+    pub sessions: u32 }
+pub struct JoinedKey { pub key: ProjectKey, pub name: String } // the key's default name
+pub struct Org { pub id: String, pub name: String, pub accounts: Vec<AccountRef>, pub projects: u32 }
+pub struct AccountEntry { pub id: String, pub account: AccountRef } // the store's id and its AccountRef
+pub struct Projects { pub projects: Vec<Project>, pub orgs: Vec<Org>,
+    pub account_refs: Vec<AccountEntry>, /* names, assigned, joins, org_join: private */ }
+
+impl Projects {
+    pub fn resolve(log: &[Hosted<ProjectsLogRecord>], sessions: &[Hosted<SessionRecord>],
+                   accounts: &[Account]) -> Projects;
+    pub fn of(&self, key: &ProjectKey) -> Project; // a key that is not a row, with the log's names/joins
+}
+```
+
+`resolve` first collects each session key's folders per host and its distinct session ids. It then
+applies the log in time order, ties by host name and then by line order: `Rename` and `Assign` for
+the same key replace the previous; `Join` follows the chain and, when it would close a cycle, drops
+the earliest record of that cycle; `Unjoin` removes the key's join; `OrgRename` and `OrgJoin` work
+the same for organizations. Keys are grouped under their join root; a group with no session is not
+a row. A project's name is the last rename of its root or the root's default name; its organization
+is the last assignment of the root or the root's default (the repository owner); its `joined` keys
+carry their default names, because a joined key's own rename is not shown. Organization identities
+come from every project's organization, every account's `org_name`, every `OrgRename` and every
+`OrgAccounts` organization, and both ends of every `OrgJoin`, joined by `OrgJoin`; `OrgAccounts`
+lists are applied in log order, and for each account the last list that names it decides its
+organization, so an account sits in exactly one. `Projects::of` uses the same maps for a key
+without a row.
+
+## app: history additions — hosts, import and export (step C1)
+
+```rust
+pub struct HostInfo { pub host: String, pub this_host: bool, pub first_record: Option<DateTime<Utc>>,
+    pub last_record: Option<DateTime<Utc>>, pub bytes: u64 }
+impl HistoryDir {
+    /// One entry per host folder under the root, this host's own included when it is still
+    /// empty, sorted by host. `first_record` is the first record of the oldest file of any kind;
+    /// `last_record` the newest `up` or `samples` line; `bytes` the folder's size.
+    pub fn host_infos(&self) -> Result<Vec<HostInfo>, HistoryError>;
+    /// Copy every file of `from`'s host folders that is missing here or longer there; keep a
+    /// longer file; never read or write this host's folder; refuse this folder and a folder
+    /// without a host folder; a host whose `host.json` names another machine is HostConflict.
+    /// Returns the hosts at least one file was copied for, sorted.
+    pub fn import(&self, from: &Path) -> Result<Vec<String>, HistoryError>;
+}
+pub fn export_csv(history: &HistoryDir, range: &Range, out: &mut dyn Write) -> Result<(), HistoryError>;
+pub fn export_json(history: &HistoryDir, range: &Range, out: &mut dyn Write) -> Result<(), HistoryError>;
+```
+
+The export has one row per `WindowRecord` (`kind: "window"`, account, org, limit, model, start, end,
+percent) and one per UTC day and project key (`kind: "tokens"`, `dayUtc`, `project` as
+`repo:<id>`/`folder:<id>`, input, output, cacheWrite, cacheRead). CSV writes the header
+`kind,account,org,limit,model,start,end,percent,day_utc,project,input,output,cache_write,cache_read`
+and then the rows, quoting per RFC 4180; JSON writes `{"windows":[…],"dailyTokens":[…]}` with
+camelCase fields. A project's shown name is never exported; a name changes, the key does not.
+
+## app: panel commands (step C1)
+
+New and changed `#[tauri::command]`s; all return the error text as `String`.
+
+```rust
+// money
+async fn money_view(state) -> Result<MoneyView, String>;
+async fn price_list(state) -> Result<Vec<PriceRow>, String>;
+async fn set_price_override(state, key: String, price: Option<ModelPrice>) -> Result<(), String>;
+async fn lookup_now(state) -> Result<MoneyView, String>;
+// accounts: changed, `price` is absent / null / a number
+async fn edit_account(state, key: String, label: Option<String>, abbr: Option<String>,
+    color: Option<String>, auto_burn: Option<bool>, price: Option<serde_json::Value>) -> Result<(), String>;
+// projects
+async fn projects_view(state) -> Result<Projects, String>;
+async fn projects_edit(state, edit: ProjectEdit) -> Result<Projects, String>;
+// agents
+struct AgentCallRow { at: DateTime<Utc>, command: String, cwd: Option<String>, allowed: bool }
+struct SkillRow { path: String, installed: bool, differs: bool }
+async fn agent_calls(state, limit: u32) -> Result<Vec<AgentCallRow>, String>;
+async fn skill_status(state) -> Result<SkillRow, String>;
+async fn skill_install(state, force: bool) -> Result<SkillRow, String>;
+// history
+struct HistoryView { host: String, dir: String, hosts: Vec<HostInfo>, bytes: u64,
+    saved_host: Option<String>, saved_dir: Option<String> }
+struct ImportResult { copied: Vec<String>, view: HistoryView }
+async fn history_view(state) -> Result<HistoryView, String>;
+async fn history_import(state, from: String) -> Result<ImportResult, String>;
+async fn history_export(state, format: String, to: String,
+    from: Option<DateTime<Utc>>, until: Option<DateTime<Utc>>) -> Result<(), String>;
+```
+
+The commands use the history folder the tray app opened at startup (`state.history`), never one from
+a newer snapshot, until a restart; `history_view`'s `saved_host` and `saved_dir` are the saved values
+that a restart would use. Paths from the page are expanded with `~` and must be absolute.
+`history_export` refuses an existing file and writes through `atomic` with mode 0600.
+`projects_from` reads all hosts' `ProjectsLogRecord` and `SessionRecord` over all time, prints torn
+lines' warnings on stderr and writes each folder with `~`; `edit_projects` validates first, appends
+to this host's own log only, then returns the new resolution.
+
+`worker.rs`: `Snapshot.accounts: Vec<AccountRow>` carries the stored fields the cards do not
+(`plan`, `price`, `orgName`, `autoBurn`, login end); `UiEvent` gains `Money(MoneyView)`;
+`Worker.lookup: Option<LookupHandle>` is the thread; `Worker.history` is the one `HistoryDir`.
+`AccountRow { id, label, abbr, color, email, orgName, plan, price, autoBurn, loginEndsAtMs,
+loginDaysLeft, isActive }`. `save_settings` validates the whole `Settings`, takes the app lock,
+writes `accounts.json`, then writes the one history event of a change (only `AutoBurnSet` for
+`autoBurn` today) and applies the autostart entry; an autostart failure answers
+`settings saved; start at login could not be set: <error>`.
+
+## app: CLI — `window`, `prices` and `history` (step C1)
+
+```rust
+pub(crate) enum Command {
+    // …
+    Window { target: Option<String> },              // default "sessions"
+    Prices { refresh: bool },
+    History { #[command(subcommand)] action: HistoryAction },
+}
+pub(crate) enum HistoryAction {
+    Export { #[arg(long, value_enum)] format: ExportFormat,
+             #[arg(long)] from: Option<String>, #[arg(long)] to: Option<String> },
+    Import { folder: String },
+}
+pub(crate) enum ExportFormat { Csv, Json }
+```
+
+- `seatswap window [AREA]`: validates the target with `window::parse_target`, then sends
+  `window <target>` to the running app; no app running is the IPC module's error.
+- `seatswap prices [--refresh]`: with `--refresh`, refuses when `lookUpPrices` is off
+  ("look-ups are off (lookUpPrices); turn them on in the settings to refresh"), otherwise calls
+  `money::look_up_prices`; then prints the stored prices as a table: `USD per million tokens`,
+  then `key`, `input`, `output`, `cache write`, `cache read`; a tiered key has ` *` and a closing
+  note that the base price is shown. No prices prints "no prices yet: run `seatswap prices
+  --refresh` while online.".
+- `seatswap history export --format csv|json [--from YYYY-MM-DD] [--to YYYY-MM-DD]`: writes to
+  standard output; the days are UTC days, `--to` inclusive (the range ends at the next midnight),
+  either end open when absent, `--from` after `--to` is a usage error.
+- `seatswap history import <folder>`: `~` is expanded, the folder must be absolute; prints
+  `copied <host>` per host at least one file was copied for, or `nothing new`.
+
+The gate for an agent: `window` is refused like `panel` (`AGENTS_MAY_NOT_CHANGE`); `prices` follows
+`agentsRead`, and `--refresh` is refused even with it on (it writes `prices.json`); `history export`
+follows `agentsRead`, `history import` is refused (`AGENTS_MAY_NOT_CHANGE`). `seatswap panel
+settings` sends `window settings` instead of a pop-up view.
+
+## Files step C1 writes
+
+- **`<data folder>/prices.json`** (§11.5): pretty JSON, atomic, mode 0600, written under the app
+  lock by the look-up thread and by `seatswap prices --refresh`, and by an own price
+  (`set_price_override`). `version`, optional `checkedAt`, `etag`, `lastChange`, `models` (key →
+  dated points), `overrides` (key → price) and `missing` (keys reported removed once). A file of
+  another version is refused, never replaced.
+- **`<data folder>/fx.json`** (§11.5): `{"version":1,"currency":"EUR","points":[{"date":"…",
+  "rate":0.90481}]}`, the same way, only while the currency is set and not `USD`.
+- **`<history root>/<host>/projects-YYYY-MM.jsonl`** (§11.6): one line per project or organization
+  edit, `{"t":"…","edit":"join","key":{…},"into":{…}}`; append-only, this host's own file only,
+  atomic through `atomic::append_lines`.
+- **History events**: `{"t":"…","type":"priceChanged","account":{"acc":"…","org":"…"},
+  "amount":180.0,"currency":"EUR"}` when an account's price changes (amount and currency omitted
+  when null); `{"t":"…","type":"planChanged","account":{…},"from":"Team","to":"Team 5x"}` when a
+  stored login changes the plan label.
