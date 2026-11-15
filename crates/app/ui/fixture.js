@@ -3,6 +3,7 @@
 // Moved out of panel.js unchanged; its state lives here, not in either page.
 
 import { PALETTE, clone, contrastText, hexToRgb, isObject } from "./common.js";
+import { fixtureStats } from "./fixture-stats.js";
 
 const DEFAULT_SETTINGS = {
   trayText: "percent",
@@ -1369,6 +1370,7 @@ function fixtureSessionsView(args) {
 
 export async function fixtureInvoke(command, args) {
   console.log(`[fixture] ${command}`, args);
+  if (String(command).startsWith("stats_")) return fixtureStats(command, args);
   const fixture = currentFixture();
   if (!fixture && command !== "fit_panel" && command !== "hide_panel") {
     throw new Error("fixture is not ready");

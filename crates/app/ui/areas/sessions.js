@@ -15,7 +15,9 @@ import {
   isActiveView,
   isObject,
   money,
+  readChoice,
   tokens,
+  writeChoice,
 } from "../common.js";
 
 const CLOSED_KEY = "seatswap.sessions.closed";
@@ -102,31 +104,8 @@ const state = {
 };
 
 // ---------------------------------------------------------------------------
-// the three kept choices
+// the three kept choices (the one reader and writer live in common.js)
 // ---------------------------------------------------------------------------
-
-function readChoice(key, allowed, fallback) {
-  try {
-    const value = localStorage.getItem(key);
-    if (value === null) return fallback;
-    if (!allowed.includes(value)) {
-      localStorage.removeItem(key);
-      return fallback;
-    }
-    return value;
-  } catch (error) {
-    console.warn(`[sessions] cannot read ${key}`, error);
-    return fallback;
-  }
-}
-
-function writeChoice(key, value) {
-  try {
-    localStorage.setItem(key, value);
-  } catch (error) {
-    console.warn(`[sessions] cannot store ${key}`, error);
-  }
-}
 
 function readChoices() {
   state.choices.closed = readChoice(

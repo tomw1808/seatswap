@@ -409,6 +409,134 @@ function hexField(value, handlers) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// the kept choices of an area
+// ---------------------------------------------------------------------------
+
+// Which area a `seatswap.<area>.<choice>` key belongs to, for the warning text.
+function choiceArea(key) {
+  const match = /^seatswap\.([a-z0-9-]+)\./.exec(String(key));
+  return match ? match[1] : "window";
+}
+
+// A choice kept in localStorage, checked against the values the page allows.
+// A value that is not allowed is dropped and named in a console warning; it is
+// never quietly replaced by another value. `allowed` is a list or a predicate.
+function readChoice(key, allowed, fallback) {
+  try {
+    const value = localStorage.getItem(key);
+    if (value === null) return fallback;
+    const ok = typeof allowed === "function" ? allowed(value) : allowed.includes(value);
+    if (!ok) {
+      localStorage.removeItem(key);
+      console.warn(
+        `[${choiceArea(key)}] dropped the unknown choice ${JSON.stringify(value)} for ${key}`
+      );
+      return fallback;
+    }
+    return value;
+  } catch (error) {
+    console.warn(`[${choiceArea(key)}] cannot read ${key}`, error);
+    return fallback;
+  }
+}
+
+function writeChoice(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch (error) {
+    console.warn(`[${choiceArea(key)}] cannot store ${key}`, error);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// times and statistics numbers: one way to write them on every page
+// ---------------------------------------------------------------------------
+
+// "Mon 9 Nov" in this computer's local time, as the statistics pages write a
+// date. A bad time is an error, never a made-up date.
+function dateText(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    throw new Error(`invalid time ${JSON.stringify(value)}`);
+  }
+  return date.toLocaleDateString("en-GB", {
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+  });
+}
+
+// "Mon 9 Nov 10:00".
+function dateTimeText(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    throw new Error(`invalid time ${JSON.stringify(value)}`);
+  }
+  const time = date.toLocaleTimeString("en-GB", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  return `${dateText(date)} ${time}`;
+}
+
+// "2 h" or "1.5 h", one decimal only when the value has one.
+function hoursText(value) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new Error(`invalid hour count ${String(value)}: use a finite number of 0 or more`);
+  }
+  const rounded = Math.round(value * 10) / 10;
+  return Number.isInteger(rounded) ? `${rounded} h` : `${rounded.toFixed(1)} h`;
+}
+
+// "27 %" or "21.9 %", one decimal only when the value has one.
+function percentText(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(`invalid percent ${String(value)}: use a finite number`);
+  }
+  const rounded = Math.round(value * 10) / 10;
+  return Number.isInteger(rounded) ? `${rounded} %` : `${rounded.toFixed(1)} %`;
+}
+
+// A money value, or "—" when the value or the page's currency is missing.
+function amountText(value, currency) {
+  if (value === null || value === undefined) return "—";
+  if (typeof currency !== "string" || !/^[A-Z]{3}$/.test(currency)) return "—";
+  return money(value, currency);
+}
+
+// The snapshot's account view for an id, or null when the snapshot has none.
+function accountView(views, id) {
+  if (!Array.isArray(views)) return null;
+  return views.find((view) => isObject(view) && view.id === id) || null;
+}
+
+// The name of an account on the statistics pages: its abbreviation in the
+// account's colour, with its label as the title. An id the snapshot does not
+// know (an account no longer stored) is shown as its first eight characters,
+// with the full id as the title.
+function accountName(views, id) {
+  if (typeof id !== "string" || id === "") {
+    throw new Error(`an account name needs an account id, not ${JSON.stringify(id)}`);
+  }
+  const view = accountView(views, id);
+  const known = isObject(view);
+  const abbr = known && typeof view.abbr === "string" && view.abbr !== "" ? view.abbr : null;
+  const label = known && typeof view.label === "string" && view.label !== "" ? view.label : null;
+  const color = known && isColor(view.color) ? view.color : null;
+  const title = known ? [abbr, label].filter(Boolean).join(" · ") || id : id;
+  const style = color
+    ? { background: color, color: contrastText(color) }
+    : { background: "var(--button-bg)", color: "var(--text)" };
+  return h("span", {
+    class: "stats-acc",
+    text: abbr || id.slice(0, 8),
+    title,
+    style,
+  });
+}
+
 function bytesOf(value) {
   if (Array.isArray(value)) return value;
   if (value instanceof Uint8Array || value instanceof Uint8ClampedArray) return value;
@@ -628,6 +756,15 @@ export {
   listen,
   money,
   tokens,
+  readChoice,
+  writeChoice,
+  dateText,
+  dateTimeText,
+  hoursText,
+  percentText,
+  amountText,
+  accountView,
+  accountName,
   textInput,
   selectInput,
   switchButton,
