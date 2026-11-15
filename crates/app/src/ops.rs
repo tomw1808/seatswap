@@ -28,16 +28,21 @@ pub(crate) fn record_switch(
     sessions: Option<SessionCounts>,
     at: DateTime<Utc>,
 ) -> Result<(), HistoryError> {
+    // Try both lines even when the first fails, and return the first error: a
+    // failed `accountAdded` must not lose the switch.
+    let mut first_error = None;
     if let Some(account) = saved_new {
-        recorder.event(
+        if let Err(error) = recorder.event(
             at,
             EventKind::AccountAdded {
                 account: AccountRef::of(account),
                 plan: account.plan.clone(),
             },
-        )?;
+        ) {
+            first_error = Some(error);
+        }
     }
-    recorder.event(
+    if let Err(error) = recorder.event(
         at,
         EventKind::Switch {
             from,
@@ -48,7 +53,15 @@ pub(crate) fn record_switch(
             sessions,
             waited_secs: None,
         },
-    )
+    ) {
+        if first_error.is_none() {
+            return Err(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// The one place an account is removed, for the CLI and the GUI. The remove
@@ -507,5 +520,47 @@ mod tests {
         assert_eq!(value["type"], "switch");
         assert_eq!(value["by"], "user");
         assert_eq!(value["to"]["acc"], ACCOUNT_UUID);
+    }
+
+    /// A failed `accountAdded` write must not lose the switch line: both lines
+    /// are tried, and the first error is returned.
+    #[test]
+    fn a_failed_account_added_write_still_writes_the_switch() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let (mut account, _) = save_live_login(
+            &fixture.claude,
+            &store,
+            None,
+            Some("Acme".to_string()),
+            Utc::now(),
+        )
+        .expect("the live login is saved");
+        // A plan long enough to make the accountAdded line too long for the
+        // history, while the switch line stays short.
+        account.plan = Some("p".repeat(5000));
+        let history = tempfile::tempdir().expect("history folder");
+        let recorder = Recorder::new(HistoryDir::at(history.path(), "atlas"));
+
+        let error = record_switch(
+            &recorder,
+            None,
+            AccountRef::of(&account),
+            Some(&account),
+            By::User,
+            None,
+            None,
+            None,
+            Utc::now(),
+        )
+        .expect_err("the accountAdded line is too long");
+        assert!(
+            matches!(error, HistoryError::LineTooLong { .. }),
+            "{error:?}"
+        );
+
+        let events = event_values(history.path());
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["type"], "switch");
     }
 }

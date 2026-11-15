@@ -205,6 +205,24 @@ impl ScanState {
         Ok(state)
     }
 
+    /// The one way to remember the session record written from `session`: it
+    /// sets [`SessionSeen::recorded`] and marks the session's project folder
+    /// changed, so the record reaches the state file even when the transcript
+    /// did not grow. A session not in the state is not changed.
+    pub fn set_recorded(&mut self, session: &str, recorded: RecordedSession) {
+        let Some(seen) = self.sessions.get_mut(session) else {
+            return;
+        };
+        seen.recorded = Some(recorded);
+        let folder = seen.folder.clone();
+        self.mark_changed(&folder);
+    }
+
+    /// Mark one project folder for the next [`save`](Self::save).
+    pub fn mark_changed(&mut self, folder: &str) {
+        self.changed.insert(folder.to_string());
+    }
+
     /// Write the state files of the project folders that changed since the last
     /// save, and return how many were written or deleted.
     pub fn save(
@@ -314,10 +332,6 @@ impl ScanState {
         Ok(written)
     }
 
-    fn touch(&mut self, folder: &str) {
-        self.changed.insert(folder.to_string());
-    }
-
     /// The entries of one project folder, as its state file holds them.
     fn state_of(&self, folder: &str) -> StateFile {
         let mut state = StateFile {
@@ -358,6 +372,23 @@ impl Scan {
     /// to. `token_records` needs it to name a session's folder.
     pub fn state(&self) -> &ScanState {
         &self.next
+    }
+
+    /// The project folders this scan changed; empty after [`save`](Self::save).
+    pub fn changed_folders(&self) -> Vec<String> {
+        self.next.changed.iter().cloned().collect()
+    }
+
+    /// Write this scan's changed folders, before its answers' token lines.
+    /// A failed save leaves the caller's [`ScanState`] as it was; it must not be
+    /// committed, or a restart would read the same answers again.
+    pub fn save(
+        &mut self,
+        claude: &ClaudePaths,
+        app: &AppPaths,
+        now: DateTime<Utc>,
+    ) -> Result<u32, TranscriptError> {
+        self.next.save(claude, app, now)
     }
 
     /// Move the scan state past what this scan read. Call it only after the
@@ -756,7 +787,7 @@ impl ScanRun<'_> {
         self.apply_events(&candidate.session, file_scan.events);
         if self.state.files.get(&candidate.key) != Some(&file_state) {
             self.state.files.insert(candidate.key.clone(), file_state);
-            self.state.touch(&candidate.folder);
+            self.state.mark_changed(&candidate.folder);
         }
         Ok(Outcome {
             consumed,
@@ -779,7 +810,7 @@ impl ScanRun<'_> {
         ));
         stored.offset = last_whole_line_end(file, &candidate.path)?;
         self.state.files.insert(candidate.key.clone(), stored);
-        self.state.touch(&candidate.folder);
+        self.state.mark_changed(&candidate.folder);
         Ok(Outcome {
             consumed: 0,
             budget_hit: false,
@@ -961,7 +992,7 @@ impl ScanRun<'_> {
         if at > seen.last {
             seen.last = at;
         }
-        self.state.touch(reading.folder);
+        self.state.mark_changed(reading.folder);
     }
 
     /// Apply a file's answers and user turns to its session, in the order they

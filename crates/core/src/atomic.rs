@@ -6,7 +6,7 @@
 //! target, and (Unix) the folder is fsynced. On Unix an existing file keeps its
 //! mode and a new one gets the mode of `access_if_new`; on Windows a file gets
 //! the permissions of its folder, and the rename is retried briefly while
-//! another program holds the target open. An append is one write of the line
+//! another program holds the target open. An append is one write of every line
 //! and its newline, then fsynced; a new file gets the mode of `access_if_new`,
 //! an existing one keeps its mode.
 
@@ -87,36 +87,53 @@ pub fn write_atomic(path: &Path, bytes: &[u8], access_if_new: Access) -> io::Res
     result
 }
 
-/// The longest line, with its newline, that `append_line` accepts.
+/// The longest line, with its newline, that `append_line` and `append_lines`
+/// accept.
 pub const MAX_LINE_BYTES: usize = 4096;
 
-/// Append `line` plus '\n' as one write to `path` (created with `access_if_new`
-/// when missing), then fsync. `line` must not contain '\n' and, with the
-/// newline, must fit in `MAX_LINE_BYTES`: otherwise `InvalidInput` with a text
-/// that says what is wrong. The line is checked before the file is opened, so a
-/// rejected line leaves no file and changes no existing one. When the file is
-/// not empty and its last byte is not '\n' (a crash left a torn last line), the
-/// write starts with a '\n', so the torn part stays a line of its own and the
-/// new record is a whole line; that leading newline does not count toward
+/// Append `line` plus '\n' as one write to `path`; see [`append_lines`].
+pub fn append_line(path: &Path, line: &str, access_if_new: Access) -> io::Result<()> {
+    append_lines(path, &[line], access_if_new)
+}
+
+/// Append every line of `lines`, each plus '\n', as one write to `path`
+/// (created with `access_if_new` when missing), then fsync. No line may contain
+/// '\n' and, with its newline, each must fit in `MAX_LINE_BYTES`: otherwise
+/// `InvalidInput` with a text that says what is wrong. Every line is checked
+/// before the file is opened, so a rejected line leaves no file and changes no
+/// existing one, and a write that fails leaves none of the lines. When the file
+/// is not empty and its last byte is not '\n' (a crash left a torn last line),
+/// the write starts with a '\n', so the torn part stays a line of its own and
+/// the new records are whole lines; that leading newline does not count toward
 /// `MAX_LINE_BYTES`. An existing file keeps its mode (Unix); a new one gets the
 /// mode of `access_if_new`.
-pub fn append_line(path: &Path, line: &str, access_if_new: Access) -> io::Result<()> {
-    if line.contains('\n') {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "the line contains a newline",
-        ));
+pub fn append_lines<S: AsRef<str>>(
+    path: &Path,
+    lines: &[S],
+    access_if_new: Access,
+) -> io::Result<()> {
+    if lines.is_empty() {
+        return Ok(());
     }
-    let len = line.len() + 1;
-    if len > MAX_LINE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("the line is {len} bytes with its newline, more than {MAX_LINE_BYTES}"),
-        ));
+    let mut bytes = Vec::new();
+    for line in lines {
+        let line = line.as_ref();
+        if line.contains('\n') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the line contains a newline",
+            ));
+        }
+        let len = line.len() + 1;
+        if len > MAX_LINE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("the line is {len} bytes with its newline, more than {MAX_LINE_BYTES}"),
+            ));
+        }
+        bytes.extend_from_slice(line.as_bytes());
+        bytes.push(b'\n');
     }
-    let mut bytes = Vec::with_capacity(len + 1);
-    bytes.extend_from_slice(line.as_bytes());
-    bytes.push(b'\n');
 
     let mut options = OpenOptions::new();
     options.read(true).append(true).create_new(true);
@@ -441,6 +458,27 @@ mod tests {
             fs::read(&p).unwrap(),
             b"{\"t\":\"2026-11-14T1\n{\"t\":\"2026-11-15T10:00:00Z\"}\n"
         );
+    }
+
+    #[test]
+    fn append_lines_writes_every_line_at_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("tokens.jsonl");
+        fs::write(&p, b"a\n").unwrap();
+        let lines = vec!["b".to_string(), "c".to_string()];
+        append_lines(&p, &lines, Access::Private).unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"a\nb\nc\n");
+    }
+
+    #[test]
+    fn append_lines_rejects_every_line_before_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("tokens.jsonl");
+        fs::write(&p, b"a\n").unwrap();
+        let lines = vec!["b".to_string(), format!("{}\nc", "x".repeat(10))];
+        let err = append_lines(&p, &lines, Access::Private).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(fs::read(&p).unwrap(), b"a\n");
     }
 
     #[test]

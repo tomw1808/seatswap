@@ -779,6 +779,9 @@ struct ActionRuntime {
     latest_sessions: Arc<Mutex<Option<SessionsSummary>>>,
     /// The last account seen live, so an external switch has a `from`.
     live: Option<AccountRef>,
+    /// The history read warnings this run has already printed, so a torn line
+    /// is not printed again at every live-account change.
+    printed_warnings: PrintedWarnings,
 }
 
 impl ActionRuntime {
@@ -807,6 +810,7 @@ impl ActionRuntime {
             history,
             latest_sessions: Arc::new(Mutex::new(None)),
             live,
+            printed_warnings: PrintedWarnings::new(),
         }
     }
 
@@ -1136,9 +1140,10 @@ impl ActionRuntime {
                         if current != self.live {
                             if let Some(to) = &current {
                                 let counts = self.session_counts();
-                                match self.recorder() {
+                                match &self.history {
                                     Ok(recorder) => match record_external_switch(
                                         recorder,
+                                        &mut self.printed_warnings,
                                         self.live.clone(),
                                         to,
                                         counts,
@@ -1183,6 +1188,39 @@ fn report_history_error(error: &str) {
     notify::send_error(error);
 }
 
+/// The history read warnings this run of the app has already printed. A month
+/// file is read again at every live-account change, so its torn lines would
+/// otherwise be printed again each time.
+#[derive(Debug, Default)]
+struct PrintedWarnings {
+    seen: BTreeSet<String>,
+}
+
+impl PrintedWarnings {
+    fn new() -> PrintedWarnings {
+        PrintedWarnings {
+            seen: BTreeSet::new(),
+        }
+    }
+
+    /// The warnings in `warnings` this run has not printed yet; they are
+    /// remembered so the next call returns none of them.
+    fn new_texts(&mut self, warnings: &[String]) -> Vec<String> {
+        let mut texts = Vec::new();
+        for warning in warnings {
+            if self.seen.insert(warning.clone()) {
+                texts.push(warning.clone());
+            }
+        }
+        texts
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.seen.len()
+    }
+}
+
 /// What [`record_external_switch`] found: it wrote a new external switch, or a
 /// switch to the same account is already in this host's last 15 s.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1193,9 +1231,11 @@ enum RecentSwitch {
 
 /// Write `Switch{by: External}` for a live account, unless this host's events
 /// already hold a switch to the same account in the last 15 s; that event's
-/// `by` and `cwd` are returned so an agent's switch can be announced.
+/// `by` and `cwd` are returned so an agent's switch can be announced. The
+/// month file's read warnings are printed once per run through `printed`.
 fn record_external_switch(
     recorder: &Recorder,
+    printed: &mut PrintedWarnings,
     from: Option<AccountRef>,
     to: &AccountRef,
     sessions: Option<SessionCounts>,
@@ -1208,7 +1248,7 @@ fn record_external_switch(
         },
         &Hosts::One(recorder.dir().host().to_string()),
     )?;
-    for warning in &read.warnings {
+    for warning in printed.new_texts(&read.warnings) {
         eprintln!("seatswap: history: {warning}");
     }
     let already = read
@@ -1881,8 +1921,15 @@ mod tests {
         )
         .expect("the CLI switch is written");
         assert_eq!(
-            record_external_switch(&recorder, None, &account, None, now)
-                .expect("the events can be read"),
+            record_external_switch(
+                &recorder,
+                &mut PrintedWarnings::new(),
+                None,
+                &account,
+                None,
+                now
+            )
+            .expect("the events can be read"),
             RecentSwitch::Already {
                 by: By::Cli,
                 cwd: None
@@ -1893,8 +1940,15 @@ mod tests {
         let second = HistoryDir::at(&tmp.path().join("second"), "atlas");
         let recorder = Recorder::new(HistoryDir::at(second.root(), "atlas"));
         assert_eq!(
-            record_external_switch(&recorder, None, &account, None, now)
-                .expect("the external switch is written"),
+            record_external_switch(
+                &recorder,
+                &mut PrintedWarnings::new(),
+                None,
+                &account,
+                None,
+                now
+            )
+            .expect("the external switch is written"),
             RecentSwitch::Written
         );
         let read = second
@@ -1920,6 +1974,38 @@ mod tests {
             }
             other => panic!("expected a switch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_read_warning_is_printed_once_per_run() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let account = AccountRef {
+            acc: ACCOUNT_UUID.to_string(),
+            org: ORG_UUID.to_string(),
+        };
+        let now = Utc::now();
+        let dir = HistoryDir::at(&tmp.path().join("history"), "atlas");
+        let host_dir = dir.root().join("atlas");
+        fs::create_dir_all(&host_dir).expect("history folder");
+        // A torn last line: reading the month file warns about it every time.
+        fs::write(
+            host_dir.join(format!("events-{}.jsonl", now.format("%Y-%m"))),
+            b"{\"t\":",
+        )
+        .expect("the torn event line");
+        let recorder = Recorder::new(dir);
+        let mut printed = PrintedWarnings::new();
+
+        record_external_switch(&recorder, &mut printed, None, &account, None, now)
+            .expect("the events can be read");
+        assert_eq!(printed.len(), 1, "the torn line is one warning");
+        record_external_switch(&recorder, &mut printed, None, &account, None, now)
+            .expect("the events can be read again");
+        assert_eq!(
+            printed.len(),
+            1,
+            "the same warning text is remembered, not printed again"
+        );
     }
 
     #[test]

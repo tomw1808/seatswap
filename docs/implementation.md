@@ -92,6 +92,9 @@ pub fn write_atomic(path: &Path, bytes: &[u8], access_if_new: Access) -> io::Res
 /// in MAX_LINE_BYTES: otherwise io::ErrorKind::InvalidInput.
 pub const MAX_LINE_BYTES: usize = 4096;
 pub fn append_line(path: &Path, line: &str, access_if_new: Access) -> io::Result<()>;
+/// Append every line plus '\n' as one write, after checking every line; a rejected line leaves the
+/// file unchanged. `append_line` is this with one line.
+pub fn append_lines<S: AsRef<str>>(path: &Path, lines: &[S], access_if_new: Access) -> io::Result<()>;
 
 /// Copy `path` to `<path>.seatswap-backup` (Access::Private) unless that backup exists.
 pub fn backup_once(path: &Path) -> io::Result<bool>;
@@ -482,7 +485,11 @@ pub struct CacheEntry {
     /// Serde default: an old cache loads with None and the first poll seeds it without a line.
     pub recorded_login: Option<LoginState>,
 }
-#[derive(… Serialize, Deserialize)] pub struct UsageCache { pub version: u32 /* 1 */, pub entries: BTreeMap<String, CacheEntry> }
+/// The allBlocked / anyUsable state the history last has. Serde default: an old cache loads with
+/// None, so the first poll may write AllBlocked. It moves only when its event was written.
+pub struct RecordedUsable { pub all_blocked: bool, pub any_usable: bool }
+#[derive(… Serialize, Deserialize)] pub struct UsageCache { pub version: u32 /* 1 */, pub entries: BTreeMap<String, CacheEntry>,
+    #[serde(default)] pub recorded_usable: Option<RecordedUsable> }
 impl UsageCache { pub fn load(app: &AppPaths) -> Result<UsageCache, EngineError>; pub fn save(&self, app: &AppPaths) -> Result<(), EngineError>; }
 // Missing file → empty. Corrupt → EngineError::CacheCorrupt (the caller may delete it; never silently).
 
@@ -676,6 +683,8 @@ impl HistoryDir {
     pub fn root(&self) -> &Path;
     pub fn hosts(&self) -> Result<Vec<String>, HistoryError>;    // subfolders holding host.json, sorted
     pub fn append<R: Record>(&self, record: &R) -> Result<(), HistoryError>;
+    /// Several records; all lines of one month file with one append, every line checked first.
+    pub fn append_many<R: Record>(&self, records: &[R]) -> Result<(), HistoryError>;
     pub fn read<R: Record>(&self, range: &Range, hosts: &Hosts) -> Result<Read<R>, HistoryError>;
 }
 pub struct Range { pub from: DateTime<Utc>, pub to: DateTime<Utc> }   // from inclusive, to exclusive
@@ -715,6 +724,7 @@ impl Recorder {
     pub fn event(&self, at: DateTime<Utc>, kind: EventKind) -> Result<(), HistoryError>;
     pub fn up(&mut self, at: DateTime<Utc>) -> Result<(), HistoryError>;   // at most once per 5 min
     pub fn tokens(&self, records: &[TokenRecord]) -> Result<(), HistoryError>;
+                                    // all lines of one month file with one append
     pub fn session(&self, record: &SessionRecord) -> Result<(), HistoryError>;
     /// The warnings of the lines `reading` read back (a torn last line, a line of a shape this
     /// version does not know), each returned once; the app prints them, core never does.
@@ -722,11 +732,15 @@ impl Recorder {
 }
 pub fn sample_of(account: &AccountRef, usage: &Usage, at: DateTime<Utc>, src: Source) -> Sample;
 /// A limit (matched by k and m) has ended when prev.r is Some(end) and next.t >= end, or next has
-/// the limit with next.r > end + 60 s. A limit missing from next, or with r None, ends nothing.
+/// the limit with next.r > end + RESET_JITTER. A limit missing from next, or with r None, ends nothing.
 /// end = prev.r, final = prev.p, lastSample = prev.t, uncertain = end - prev.t > 1 h;
 /// start = end - 7 d for weekly kinds, end - 5 h for session, None otherwise;
 /// lost = max(0, 100 - final) for weekly kinds, None otherwise.
 pub fn closed_windows(prev: &Sample, next: &Sample, plan: Option<&str>) -> Vec<WindowRecord>;
+/// The one reset-jitter rule: |a - b| <= RESET_JITTER (60 s). The two one-sided comparisons in
+/// `write.rs` use RESET_JITTER directly to keep their one-sided meaning.
+pub const RESET_JITTER: i64;
+pub fn same_reset(a: DateTime<Utc>, b: DateTime<Utc>) -> bool;
 ```
 
 ## project.rs — from a folder to the project's identity (step A)
@@ -798,6 +812,12 @@ pub struct RecordedSession { pub last: DateTime<Utc>, pub closed: bool }
 // an old state file means none.
 impl ScanState {
     pub fn load(app: &AppPaths) -> Result<ScanState, TranscriptError>;  // missing folder = default
+    /// The one way to remember the session record written from `session`: sets `recorded` and marks
+    /// the session's project folder changed, so it reaches the state file even when its transcript
+    /// did not grow. A session not in the state is not changed.
+    pub fn set_recorded(&mut self, session: &str, recorded: RecordedSession);
+    /// Mark one project folder for the next save.
+    pub fn mark_changed(&mut self, folder: &str);
     /// Writes only the project folders that changed, as <folder>.json; before writing, drops the
     /// recent ids of a file that has not grown for 24 h, and removes entries whose transcript is gone.
     pub fn save(&mut self, claude: &ClaudePaths, app: &AppPaths, now: DateTime<Utc>)
@@ -807,6 +827,11 @@ pub struct Scan { pub answers: Vec<Answer>, pub user_turns: Vec<UserTurn>, pub c
     pub warnings: Vec<String> /* private: the state after this scan */ }
 impl Scan {
     pub fn state(&self) -> &ScanState;              // for token_records
+    /// The project folders this scan changed; empty after save.
+    pub fn changed_folders(&self) -> Vec<String>;
+    /// Write this scan's changed folders, before its answers' token lines.
+    pub fn save(&mut self, claude: &ClaudePaths, app: &AppPaths, now: DateTime<Utc>)
+        -> Result<u32, TranscriptError>;
     /// Moves the state past what this scan read; call it only after the answers' token lines were
     /// written. A scan that is not committed leaves the old offsets, so the next pass reads the same
     /// lines again and nothing is counted twice.
@@ -856,7 +881,9 @@ no reset wins over one with a time); on a tie Week comes before Model, Model bef
 plan to the recorder; a history error becomes the account's `last_error`, never a failed poll. An
 account blocked by a limit is due once 30 s after that reset whatever the interval, if its last
 success and last attempt are both before that moment. After a poll the engine writes `AllBlocked` when
-`all_blocked` becomes true, and `AnyUsable` when some view becomes usable after none was. An account
+`all_blocked` becomes true, and `AnyUsable` when some view becomes usable after none was; it remembers
+both in `UsageCache.recorded_usable`, which moves only when its event was written, so a restart during
+a block writes no second `AllBlocked`. An account
 whose usage is unknown is not usable but not blocked either, so it never makes `all_blocked` true and
 losing the last working login is not "usable again".
 
@@ -935,7 +962,7 @@ Drawing (tiny-skia, anti-aliased): transparent background; ring of width max(2, 
 
 ## app: GUI (§8, §9, §11) — wave 3, `gui` feature
 
-Files: `crates/app/src/gui/{mod.rs, worker.rs, tray.rs, panel.rs, notify.rs, autostart.rs, ipc.rs, registry.rs}` (`registry.rs` on Windows only), `crates/app/ui/{index.html, panel.css, panel.js}`, `crates/app/capabilities/default.json`. The code is the library `seatswap` (`src/lib.rs`, `pub fn run() -> ExitCode`); two programs call it: `seatswap` (`src/main.rs`) and `seatswap-tray` (`src/bin/seatswap-tray.rs`, built without a console window on Windows for autostart and the Start menu; Linux builds it but does not install it). No subcommand → `gui::run(app: AppPaths, claude_override: Option<PathBuf>, data_override: Option<PathBuf>) -> ExitCode` (the same path resolution as the CLI, one function; the overrides are passed on so `seatswap panel` and autostart start the app with the same flags). Actions both front ends must take the same way live in `crates/app/src/ops.rs`: `save_live_login(claude, store, recorder: Option<&Recorder>, label, now) -> Result<(Account, Option<String>), String>` (a missing, ended or unknown login saved nothing and is an error; the `Option<String>` is the history error, never a failed add, and `accountAdded` is written only when `sync_live` returned `Synced::Added`), `remove_account(store, key, recorder: Option<&Recorder>, now) -> Result<(Account, Option<String>), String>` (the same shape for `accountRemoved`), `switch_message(store, account_id) -> Result<String, String>` ("Switched to AC — Acme"; an unreadable store or unknown id is an error, never the raw id) and `switched_without_list(error) -> String`.
+Files: `crates/app/src/gui/{mod.rs, worker.rs, tray.rs, panel.rs, notify.rs, autostart.rs, ipc.rs, registry.rs}` (`registry.rs` on Windows only), `crates/app/ui/{index.html, panel.css, panel.js}`, `crates/app/capabilities/default.json`. The code is the library `seatswap` (`src/lib.rs`, `pub fn run() -> ExitCode`); two programs call it: `seatswap` (`src/main.rs`) and `seatswap-tray` (`src/bin/seatswap-tray.rs`, built without a console window on Windows for autostart and the Start menu; Linux builds it but does not install it). No subcommand → `gui::run(app: AppPaths, claude_override: Option<PathBuf>, data_override: Option<PathBuf>) -> ExitCode` (the same path resolution as the CLI, one function; the overrides are passed on so `seatswap panel` and autostart start the app with the same flags). Actions both front ends must take the same way live in `crates/app/src/ops.rs`: `save_live_login(claude, store, recorder: Option<&Recorder>, label, now) -> Result<(Account, Option<String>), String>` (a missing, ended or unknown login saved nothing and is an error; the `Option<String>` is the history error, never a failed add, and `accountAdded` is written only when `sync_live` returned `Synced::Added`), `remove_account(store, key, recorder: Option<&Recorder>, now) -> Result<(Account, Option<String>), String>` (the same shape for `accountRemoved`), `switch_message(store, account_id) -> Result<String, String>` ("Switched to AC — Acme"; an unreadable store or unknown id is an error, never the raw id) and `switched_without_list(error) -> String`. The action thread's external-switch check keeps the history read warnings it printed, so a torn month-file line is printed once per run, not at every live-account change.
 
 **Threads.**
 - *Main thread:* Tauri event loop, tray, menu, panel window.
@@ -999,8 +1026,9 @@ pub(crate) fn spawn(app: AppPaths, claude: ClaudePaths, settings: Settings,
 /// One wake, without the thread: the sessions, new transcript answers, token lines, session lines
 /// and waits. `state_error` is the load error that keeps this pass from saving the state; it is
 /// shown in the summary. A pass that did not finish asks for a wake in one second.
-pub(crate) fn run_pass(claude: &ClaudePaths, probe: &dyn Liveness, recorder: Option<&Recorder>,
-                       state: &mut ScanState, memory: &mut SessionMemory, now: DateTime<Utc>,
+pub(crate) fn run_pass(app: &AppPaths, claude: &ClaudePaths, probe: &dyn Liveness,
+                       recorder: Option<&Recorder>, state: &mut ScanState,
+                       memory: &mut SessionMemory, now: DateTime<Utc>,
                        state_error: Option<&str>) -> PassOutcome;
 /// run_pass, then state.save; a save failure is a warning on the summary. The thread's start is
 /// load_state(app) + SessionMemory::new(home) + one_pass, which is what the backfill test does.
@@ -1014,16 +1042,21 @@ fn one_pass(app: &AppPaths, claude: &ClaudePaths, probe: &dyn Liveness, recorder
 one closing record when it is gone. A session seen in a transcript whose session file is not running
 gets one closed record too (a short `claude -p` session, every session the backfill read); a later
 scan that adds answers writes a new closed record, and `SessionSeen.recorded` keeps a restart from
-writing the same one again. Token records are written on every pass from the answers that pass read
-(`transcripts::token_records`) and the scan state is committed only when they were written; without
-a recorder or after a failed write the offsets stay, so the next pass with a working history reads
-the same answers and nothing is counted twice. Waits are kept in memory: a wait that ended writes
+writing the same one again. `SessionMemory.closed` remembers only a session already pruned from the
+state, which `recorded` cannot cover. Token records are written on every pass from the answers that
+pass read (`transcripts::token_records`). When there are token lines, the scanned state is saved
+first; if that save fails no token line is written and nothing is committed (the next pass tries
+again). If the token write fails, the old state's folders are saved back and nothing is committed.
+A crash between the two steps loses those answers but never counts them twice. Without a recorder
+the offsets stay, so the next pass with a working history reads the same answers. Waits are kept in
+memory: a wait that ended writes
 `EventKind::Waited { session, project, secs }` with the whole seconds (never 0 from a backwards
 clock). Only "the session files cannot be read" is `SessionsSummary.unavailable` (the counts are
 then 0); a history error, a state that cannot be read or written, an unknown `statusUpdatedAt`, a
 count that does not fit u32 and a transcript read error are `SessionsSummary.warning`, with the
 history error first and then the state. The thread keeps running. The app prints the recorder's read
-warnings once on stderr as `seatswap: history: <warning>`.
+warnings once on stderr as `seatswap: history: <warning>`; the action thread does the same for the
+warnings of the month file `record_external_switch` reads.
 
 ## app: worker, ops and notifications additions — step A
 
@@ -1044,6 +1077,7 @@ pub(crate) fn record_switch(recorder: &Recorder, from: Option<AccountRef>, to: A
     saved_new: Option<&Account>, by: By, reason: Option<String>, cwd: Option<String>,
     sessions: Option<SessionCounts>, at: DateTime<Utc>) -> Result<(), HistoryError>;
 // saved_new = the account SwitchOutcome.saved_new created: its accountAdded is written before the switch.
+// Both lines are tried even when the first fails; the first error is returned.
 
 // notify.rs
 pub(crate) enum Notification { Suggestion(..), LoginWarning(..), UnknownLogin { .. },

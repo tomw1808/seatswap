@@ -13,7 +13,7 @@ use crate::api::{LimitKind, Usage};
 use super::read::{month_start, months_of_kind};
 use super::{
     reset_minute, AccountRef, Event, EventKind, HistoryDir, HistoryError, Hosts, Kind, LimitSample,
-    Sample, SessionRecord, Source, TokenRecord, UpRecord, WindowRecord,
+    Sample, SessionRecord, Source, TokenRecord, UpRecord, WindowRecord, RESET_JITTER,
 };
 
 /// Turns usage answers into history lines. Per account it keeps the last written
@@ -233,7 +233,7 @@ impl Recorder {
             let key = LimitKey::of(limit);
             let mut limit = limit.clone();
             if let (Some(end), Some(r)) = (closed.get(&key), limit.r) {
-                if r <= *end + chrono::Duration::seconds(60) {
+                if r <= *end + chrono::Duration::seconds(RESET_JITTER) {
                     limit.r = Some(*end);
                 }
             }
@@ -277,10 +277,7 @@ impl Recorder {
     }
 
     pub fn tokens(&self, records: &[TokenRecord]) -> Result<(), HistoryError> {
-        for record in records {
-            self.dir.append(record)?;
-        }
-        Ok(())
+        self.dir.append_many(records)
     }
 
     pub fn session(&self, record: &SessionRecord) -> Result<(), HistoryError> {
@@ -391,7 +388,7 @@ pub fn closed_windows(prev: &Sample, next: &Sample, plan: Option<&str>) -> Vec<W
         let Some(end) = limit.r else { continue };
         let same_later = find_limit(next, limit)
             .and_then(|current| current.r)
-            .map(|new_end| new_end > end + chrono::Duration::seconds(60))
+            .map(|new_end| new_end > end + chrono::Duration::seconds(RESET_JITTER))
             .unwrap_or(false);
         if next.t >= end || same_later {
             windows.push(window_of(prev, limit, end, plan));

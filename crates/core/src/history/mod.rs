@@ -2,6 +2,7 @@
 //! range and merging several hosts. One subfolder per host, one JSON Lines
 //! file per kind and month; [`read`](HistoryDir::read) owns the reading side.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -476,42 +477,33 @@ impl HistoryDir {
     /// of `record.at()` in UTC. A line over [`atomic::MAX_LINE_BYTES`] is an
     /// error before the folder or file is made.
     pub fn append<R: Record>(&self, record: &R) -> Result<(), HistoryError> {
-        let host_dir = self.root.join(&self.host);
-        let name = format!("{}-{}.jsonl", R::KIND.stem(), record.at().format("%Y-%m"));
-        let path = host_dir.join(&name);
-        let line = serde_json::to_string(record).map_err(|e| HistoryError::Io {
-            path: path.clone(),
-            source: io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("cannot encode a {} record: {e}", R::KIND.stem()),
-            ),
-        })?;
-        // Every optional field is left out when it is `None`, so a `null` in the
-        // serialized record can only be a non-finite number, which would read
-        // back as a wrong value.
-        let value: serde_json::Value =
-            serde_json::from_str(&line).map_err(|e| HistoryError::Io {
-                path: path.clone(),
-                source: io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "cannot read back the encoded {} record: {e}",
-                        R::KIND.stem()
-                    ),
-                ),
-            })?;
-        if holds_null(&value) {
-            return Err(HistoryError::NotFinite { kind: R::KIND });
+        self.append_many(std::slice::from_ref(record))
+    }
+
+    /// Append several records, one line each. Every line of one month file is
+    /// written with one append, so a failure leaves none of that file's new
+    /// lines; every line is checked before any file is opened.
+    pub fn append_many<R: Record>(&self, records: &[R]) -> Result<(), HistoryError> {
+        if records.is_empty() {
+            return Ok(());
         }
-        if line.len() + 1 > atomic::MAX_LINE_BYTES {
-            return Err(HistoryError::LineTooLong { kind: R::KIND });
+        let host_dir = self.root.join(&self.host);
+        let mut by_file: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
+        for record in records {
+            let name = format!("{}-{}.jsonl", R::KIND.stem(), record.at().format("%Y-%m"));
+            let path = host_dir.join(name);
+            let line = encode::<R>(record, &path)?;
+            by_file.entry(path).or_default().push(line);
         }
         atomic::ensure_private_dir(&host_dir).map_err(|source| HistoryError::Io {
             path: host_dir,
             source,
         })?;
-        atomic::append_line(&path, &line, Access::Private)
-            .map_err(|source| HistoryError::Io { path, source })
+        for (path, lines) in by_file {
+            atomic::append_lines(&path, &lines, Access::Private)
+                .map_err(|source| HistoryError::Io { path, source })?;
+        }
+        Ok(())
     }
 
     fn check_or_write_marker(
@@ -618,8 +610,50 @@ pub fn reset_minute(resets_at: DateTime<Utc>) -> DateTime<Utc> {
     }
 }
 
+/// Reset times within this many seconds of each other name the same window;
+/// the server's reset times move by a little between answers.
+pub const RESET_JITTER: i64 = 60;
+
+/// Whether two reset times name the same window: they differ by at most
+/// [`RESET_JITTER`] seconds. The one rule for a reset time's jitter; callers
+/// that need a one-sided comparison write it with [`RESET_JITTER`].
+pub fn same_reset(a: DateTime<Utc>, b: DateTime<Utc>) -> bool {
+    (a - b).abs() <= chrono::Duration::seconds(RESET_JITTER)
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+/// One record as its JSON line, with the checks every history write makes.
+fn encode<R: Record>(record: &R, path: &Path) -> Result<String, HistoryError> {
+    let line = serde_json::to_string(record).map_err(|e| HistoryError::Io {
+        path: path.to_path_buf(),
+        source: io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("cannot encode a {} record: {e}", R::KIND.stem()),
+        ),
+    })?;
+    // Every optional field is left out when it is `None`, so a `null` in the
+    // serialized record can only be a non-finite number, which would read
+    // back as a wrong value.
+    let value: serde_json::Value = serde_json::from_str(&line).map_err(|e| HistoryError::Io {
+        path: path.to_path_buf(),
+        source: io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "cannot read back the encoded {} record: {e}",
+                R::KIND.stem()
+            ),
+        ),
+    })?;
+    if holds_null(&value) {
+        return Err(HistoryError::NotFinite { kind: R::KIND });
+    }
+    if line.len() + 1 > atomic::MAX_LINE_BYTES {
+        return Err(HistoryError::LineTooLong { kind: R::KIND });
+    }
+    Ok(line)
 }
 
 /// Whether a serialized record holds a `null` anywhere. All optional fields of
@@ -981,6 +1015,28 @@ mod tests {
             reset_minute(utc("2026-11-14T01:00:00Z")),
             utc("2026-11-14T01:00:00Z")
         );
+    }
+
+    #[test]
+    fn same_reset_accepts_a_minute_of_jitter() {
+        let reset = utc("2026-11-16T16:00:00Z");
+        assert!(same_reset(reset, reset));
+        assert!(same_reset(
+            reset,
+            reset + chrono::Duration::seconds(RESET_JITTER)
+        ));
+        assert!(same_reset(
+            reset,
+            reset - chrono::Duration::seconds(RESET_JITTER)
+        ));
+        assert!(!same_reset(
+            reset,
+            reset + chrono::Duration::seconds(RESET_JITTER + 1)
+        ));
+        assert!(!same_reset(
+            reset,
+            reset - chrono::Duration::seconds(RESET_JITTER + 1)
+        ));
     }
 
     #[test]

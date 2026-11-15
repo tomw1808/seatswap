@@ -51,7 +51,9 @@ pub(crate) struct SessionMemory {
     waiting: HashMap<String, WaitingMemory>,
     /// The last session record written for each session.
     records: HashMap<String, SessionRecord>,
-    /// Sessions whose one closing record has been written.
+    /// Sessions whose one closing record has been written and whose entry is
+    /// already pruned from the [`ScanState`], so `SessionSeen.recorded` cannot
+    /// remember them. A session still in the state uses `recorded`, never this.
     closed: HashSet<String>,
 }
 
@@ -324,7 +326,16 @@ fn one_pass(
     state_error: Option<&str>,
     history_error: Option<&str>,
 ) -> PassOutcome {
-    let mut outcome = run_pass(claude, probe, recorder, state, memory, now, state_error);
+    let mut outcome = run_pass(
+        app,
+        claude,
+        probe,
+        recorder,
+        state,
+        memory,
+        now,
+        state_error,
+    );
     if let Some(error) = history_error {
         // The order the pop-up shows: the history error first, then the state.
         prepend_warning(&mut outcome.summary, error.to_string());
@@ -335,7 +346,9 @@ fn one_pass(
 
 /// One pass: running sessions, transcripts, tokens, session records, waits.
 /// The thread calls it with [`SystemProbe`]; the tests call it with a fake probe.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_pass(
+    app: &AppPaths,
     claude: &ClaudePaths,
     probe: &dyn Liveness,
     recorder: Option<&Recorder>,
@@ -490,26 +503,66 @@ pub(crate) fn run_pass(
             Ok(mut scan) => {
                 scan_complete = scan.complete;
                 let tokens = transcripts::token_records(&scan.answers, scan.state(), &memory.home);
-                let tokens_written = match recorder {
-                    Some(recorder) => match recorder.tokens(&tokens) {
-                        Ok(()) => true,
-                        Err(error) => {
-                            add_history_error(&mut summary, error);
-                            false
-                        }
-                    },
+                if tokens.is_empty() {
+                    // No token line can be lost, so the offsets move at once;
+                    // the caller's save writes the state and its pruning.
+                    scan.commit(state);
+                } else if recorder.is_none() {
                     // Without a recorder the token lines are not written. The
                     // offsets stay where they were, so a later pass with a
                     // working history reads these answers again.
-                    None => tokens.is_empty(),
-                };
-                if tokens_written {
-                    scan.commit(state);
-                } else {
-                    // Retrying at once would read the same bytes again and make
-                    // no progress until the history works: wait for the regular
-                    // wake instead.
                     scan_complete = true;
+                } else {
+                    // Put the scanned offsets on disk before the token lines: a
+                    // crash between the two steps loses those answers (the disk
+                    // says they were read, but their lines were never written),
+                    // never counts them twice. The other order counted them
+                    // twice when the save failed.
+                    let folders = scan.changed_folders();
+                    match scan.save(claude, app, now) {
+                        Ok(_) => {
+                            let tokens_written = match recorder {
+                                Some(recorder) => match recorder.tokens(&tokens) {
+                                    Ok(()) => true,
+                                    Err(error) => {
+                                        add_history_error(&mut summary, error);
+                                        false
+                                    }
+                                },
+                                None => true,
+                            };
+                            if tokens_written {
+                                scan.commit(state);
+                            } else {
+                                // The token lines are not written: put the old
+                                // offsets back on disk, so a restart reads the
+                                // same answers again and nothing is counted
+                                // twice.
+                                for folder in &folders {
+                                    state.mark_changed(folder);
+                                }
+                                if let Err(error) = state.save(claude, app, now) {
+                                    add_warning(
+                                        &mut summary,
+                                        format!(
+                                            "the transcript state cannot be written back: {error}"
+                                        ),
+                                    );
+                                }
+                                // Retrying at once would read the same bytes
+                                // again and make no progress until the history
+                                // works: wait for the regular wake instead.
+                                scan_complete = true;
+                            }
+                        }
+                        Err(error) => {
+                            add_warning(
+                                &mut summary,
+                                format!("the transcript state cannot be written: {error}"),
+                            );
+                            scan_complete = true;
+                        }
+                    }
                 }
             }
             Err(error) => {
@@ -555,14 +608,16 @@ pub(crate) fn run_pass(
         if let Some(recorder) = recorder {
             match recorder.session(&record) {
                 Ok(()) => {
+                    let last = record.last;
                     memory.records.insert(record.session.clone(), record);
                     memory.closed.remove(&session.session_id);
-                    if let Some(seen) = state.sessions.get_mut(&session.session_id) {
-                        seen.recorded = Some(RecordedSession {
-                            last: seen.last,
+                    state.set_recorded(
+                        &session.session_id,
+                        RecordedSession {
+                            last,
                             closed: false,
-                        });
-                    }
+                        },
+                    );
                 }
                 Err(error) => add_history_error(&mut summary, error),
             }
@@ -610,10 +665,7 @@ pub(crate) fn run_pass(
                 match recorder.session(&record) {
                     Ok(()) => {
                         memory.records.insert(session.clone(), record);
-                        memory.closed.insert(session.clone());
-                        if let Some(seen) = state.sessions.get_mut(&session) {
-                            seen.recorded = Some(RecordedSession { last, closed: true });
-                        }
+                        state.set_recorded(&session, RecordedSession { last, closed: true });
                     }
                     Err(error) => add_history_error(&mut summary, error),
                 }
@@ -959,6 +1011,7 @@ mod tests {
         let mut state = ScanState::default();
         let mut memory = SessionMemory::new(tmp.path().to_path_buf());
         let outcome = run_pass(
+            &_app,
             &claude,
             &probe(&[100, 101, 102]),
             None,
@@ -993,6 +1046,7 @@ mod tests {
         let mut state = ScanState::default();
         let mut memory = SessionMemory::new(tmp.path().to_path_buf());
         let outcome = run_pass(
+            &_app,
             &claude,
             &probe(&[200]),
             None,
@@ -1030,6 +1084,7 @@ mod tests {
         let mut state = ScanState::default();
         let mut memory = SessionMemory::new(tmp.path().to_path_buf());
         run_pass(
+            &_app,
             &claude,
             &probe(&[300]),
             Some(&recorder),
@@ -1053,6 +1108,7 @@ mod tests {
             ),
         );
         run_pass(
+            &_app,
             &claude,
             &probe(&[300]),
             Some(&recorder),
@@ -1124,6 +1180,7 @@ mod tests {
         );
         let mut memory = SessionMemory::new(tmp.path().to_path_buf());
         run_pass(
+            &_app,
             &claude,
             &probe(&[500]),
             Some(&recorder),
@@ -1137,6 +1194,7 @@ mod tests {
         fs::write(claude.sessions_dir().join("500.json"), "{\"pid\":500,").unwrap();
         let second = time("2026-11-14T10:00:00Z");
         run_pass(
+            &_app,
             &claude,
             &probe(&[500]),
             Some(&recorder),
@@ -1187,6 +1245,7 @@ mod tests {
         let mut state = ScanState::default();
         let mut memory = SessionMemory::new(tmp.path().to_path_buf());
         run_pass(
+            &_app,
             &claude,
             &probe(&[600]),
             Some(&recorder),
@@ -1211,6 +1270,7 @@ mod tests {
             ),
         );
         run_pass(
+            &_app,
             &claude,
             &probe(&[600]),
             Some(&recorder),
@@ -1276,6 +1336,7 @@ mod tests {
         );
         let mut memory = SessionMemory::new(tmp.path().to_path_buf());
         run_pass(
+            &_app,
             &claude,
             &probe(&[400]),
             Some(&recorder),
@@ -1288,6 +1349,7 @@ mod tests {
         fs::remove_file(claude.sessions_dir().join("400.json")).unwrap();
         let second = time("2026-11-14T10:00:00Z");
         run_pass(
+            &_app,
             &claude,
             &probe(&[400]),
             Some(&recorder),
@@ -1298,6 +1360,7 @@ mod tests {
         );
         let third = time("2026-11-14T10:02:00Z");
         run_pass(
+            &_app,
             &claude,
             &probe(&[400]),
             Some(&recorder),
@@ -1902,6 +1965,7 @@ mod tests {
         );
         let mut memory = SessionMemory::new(claude.home().to_path_buf());
         let outcome = run_pass(
+            &_app,
             &claude,
             &probe(&[700, 701]),
             None,
@@ -2015,5 +2079,188 @@ mod tests {
         assert!(read.records.iter().all(|hosted| hosted.record.closed));
         assert_eq!(read.records[0].record.last, time("2026-11-14T09:41:00Z"));
         assert_eq!(read.records[1].record.last, time("2026-11-14T09:42:00Z"));
+    }
+
+    /// A session that closed gets one closing record, and no second one after
+    /// a restart. `SessionSeen.recorded` is what remembers the closing record,
+    /// so it has to reach the state file: the project folder of a session that
+    /// only ends (its transcript does not grow) is not written by the scan.
+    #[test]
+    fn a_closed_session_gets_no_second_record_after_a_restart() {
+        let (tmp, claude, app) = fixture();
+        let recorder = Recorder::new(history(&tmp.path().join("history")));
+        let folder = claude.projects_dir().join("-home-sam-projects-atlas");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(
+            folder.join(format!("{SESSION}.jsonl")),
+            format!(
+                "{}\n",
+                transcript_line(
+                    SESSION,
+                    "msg_01QmB7xT",
+                    time("2026-11-14T09:41:07Z"),
+                    "/home/sam/projects/atlas",
+                    "claude-opus-5-5",
+                    (2, 166, 26_173, 28_126),
+                )
+            ),
+        )
+        .unwrap();
+
+        // 10:00 the session runs and has answered.
+        write_session(
+            &claude,
+            100,
+            &session_json(
+                100,
+                SESSION,
+                "/home/sam/projects/atlas",
+                Some("atlas-a6"),
+                "busy",
+                time("2026-11-14T10:00:00Z").timestamp_millis(),
+            ),
+        );
+        let (mut state, _) = load_state(&app);
+        let mut memory = SessionMemory::new(claude.home().to_path_buf());
+        one_pass(
+            &app,
+            &claude,
+            &probe(&[100]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            time("2026-11-14T10:00:00Z"),
+            None,
+            None,
+        );
+
+        // 10:05 it ends: its session file is gone and its transcript did not
+        // grow, so the scan writes nothing and the project folder is not
+        // touched.
+        fs::remove_file(claude.sessions_dir().join("100.json")).unwrap();
+        one_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            time("2026-11-14T10:05:00Z"),
+            None,
+            None,
+        );
+
+        // The app restarts: the state comes from the file, the memory is empty.
+        let (mut state, state_error) = load_state(&app);
+        assert_eq!(state_error, None);
+        let mut memory = SessionMemory::new(claude.home().to_path_buf());
+        one_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            time("2026-11-14T10:10:00Z"),
+            None,
+            None,
+        );
+
+        let file = tmp
+            .path()
+            .join("history")
+            .join("atlas")
+            .join("sessions-2026-11.jsonl");
+        let text = fs::read_to_string(&file).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "one open and one closing record, not a second closing one: {text}"
+        );
+    }
+
+    /// One answer is counted once. The state that remembers it is written
+    /// after the token lines, so a state that cannot be written leaves the
+    /// offsets on the disk where they were: the next start reads the same
+    /// answer again and counts it a second time.
+    #[test]
+    #[cfg(unix)]
+    fn tokens_written_while_the_state_cannot_be_saved_are_not_counted_twice() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (tmp, claude, app) = fixture();
+        let recorder = Recorder::new(history(&tmp.path().join("history")));
+        let folder = claude.projects_dir().join("-home-sam-projects-atlas");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(
+            folder.join(format!("{SESSION}.jsonl")),
+            format!(
+                "{}\n",
+                transcript_line(
+                    SESSION,
+                    "msg_01QmB7xT",
+                    time("2026-11-14T09:41:07Z"),
+                    "/home/sam/projects/atlas",
+                    "claude-opus-5-5",
+                    (2, 166, 26_173, 28_126),
+                )
+            ),
+        )
+        .unwrap();
+
+        // The state folder cannot be written: the offsets stay on the disk.
+        let state_dir = app.transcripts_state_dir();
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let (mut state, _) = load_state(&app);
+        let mut memory = SessionMemory::new(claude.home().to_path_buf());
+        one_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            time("2026-11-14T10:00:00Z"),
+            None,
+            None,
+        );
+
+        // The state folder works again, and the app restarts: the state on the
+        // disk knows nothing about the answer that was read while the save
+        // failed.
+        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let (mut state, state_error) = load_state(&app);
+        assert_eq!(state_error, None);
+        let mut memory = SessionMemory::new(claude.home().to_path_buf());
+        one_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            time("2026-11-14T10:05:00Z"),
+            None,
+            None,
+        );
+
+        let read = recorder
+            .dir()
+            .read::<seatswap_core::history::TokenRecord>(
+                &Range {
+                    from: time("2026-11-01T00:00:00Z"),
+                    to: time("2026-12-01T00:00:00Z"),
+                },
+                &Hosts::One("atlas".to_string()),
+            )
+            .unwrap();
+        assert_eq!(
+            read.records.len(),
+            1,
+            "one answer is counted once, not once per start"
+        );
     }
 }

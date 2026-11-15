@@ -130,12 +130,26 @@ pub struct CacheEntry {
     pub recorded_login: Option<LoginState>,
 }
 
+/// The `allBlocked` / `anyUsable` state the history last has for this engine's
+/// accounts. It moves only when its event was written, so a restart during a
+/// block writes no second `allBlocked`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordedUsable {
+    pub all_blocked: bool,
+    pub any_usable: bool,
+}
+
 /// `usage-cache.json`: the last usage reply per account id.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageCache {
     pub version: u32,
     pub entries: BTreeMap<String, CacheEntry>,
+    /// The usable-state events the history last has; absent in an old cache
+    /// means none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_usable: Option<RecordedUsable>,
 }
 
 impl Default for UsageCache {
@@ -143,6 +157,7 @@ impl Default for UsageCache {
         UsageCache {
             version: CACHE_VERSION,
             entries: BTreeMap::new(),
+            recorded_usable: None,
         }
     }
 }
@@ -287,8 +302,6 @@ pub struct Engine<R: Remote> {
     cache: UsageCache,
     recorder: Option<Recorder>,
     models_in_use: Option<BTreeSet<String>>,
-    last_all_blocked: Option<bool>,
-    last_any_usable: Option<bool>,
 }
 
 impl<R: Remote> Engine<R> {
@@ -302,8 +315,6 @@ impl<R: Remote> Engine<R> {
             cache,
             recorder: None,
             models_in_use: None,
-            last_all_blocked: None,
-            last_any_usable: None,
         })
     }
 
@@ -779,25 +790,27 @@ impl<R: Remote> Engine<R> {
     }
 
     /// Write allBlocked / anyUsable when [`all_blocked`] or "some account is
-    /// usable" changed. A write error becomes the target entry's `last_error`
-    /// only when that entry has no other error; it never hides one. Returns
-    /// whether the cache changed (so the caller saves it again).
+    /// usable" changed, and remember that state in the cache so a restart writes
+    /// no second event. The remembered state moves only when its event was
+    /// written; without a recorder nothing moves. A write error becomes the
+    /// target entry's `last_error` only when that entry has no other error; it
+    /// never hides one. Returns whether the cache changed (so the caller saves
+    /// it again).
     fn note_usable_state(&mut self, views: &[AccountView], now: DateTime<Utc>) -> bool {
         if self.recorder.is_none() {
             return false;
         }
         let all_blocked_now = all_blocked(views);
         let any_usable_now = views.iter().any(|view| view.usable);
-        let event = if all_blocked_now && self.last_all_blocked != Some(true) {
+        let recorded = self.cache.recorded_usable;
+        let event = if all_blocked_now && recorded.map(|state| state.all_blocked) != Some(true) {
             Some(EventKind::AllBlocked)
-        } else if any_usable_now && self.last_any_usable == Some(false) {
+        } else if any_usable_now && recorded.map(|state| state.any_usable) == Some(false) {
             Some(EventKind::AnyUsable)
         } else {
             None
         };
         let Some(event) = event else {
-            self.last_all_blocked = Some(all_blocked_now);
-            self.last_any_usable = Some(any_usable_now);
             return false;
         };
         let written = match self.recorder.as_ref() {
@@ -809,10 +822,12 @@ impl<R: Remote> Engine<R> {
                 // The folder writes again: clear exactly the event texts a
                 // failed event write left behind, never a reading error and
                 // never any other error.
-                let cleared = self.clear_history_errors(HistoryErrorKind::Event);
-                self.last_all_blocked = Some(all_blocked_now);
-                self.last_any_usable = Some(any_usable_now);
-                cleared
+                let _ = self.clear_history_errors(HistoryErrorKind::Event);
+                self.cache.recorded_usable = Some(RecordedUsable {
+                    all_blocked: all_blocked_now,
+                    any_usable: any_usable_now,
+                });
+                true
             }
             Err(error) => self.note_history_error(views, HistoryErrorKind::Event, &error),
         }
@@ -3340,6 +3355,38 @@ mod tests {
             state_event_types(&root),
             Vec::<String>::new(),
             "allBlocked means no usable account because limits are full; none is"
+        );
+    }
+
+    /// The engine remembers "all accounts are blocked" only in its own memory,
+    /// so a restart writes a second `allBlocked` event although the history
+    /// already holds one for the same block.
+    #[test]
+    fn a_restart_writes_no_second_all_blocked_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = Fixture::new(&tmp);
+        let (root, dir) = history_at(&tmp);
+        let (app, fake, engine) = fixture.into_engine();
+        let claude = ClaudePaths::for_config_dir(&tmp.path().join("cfg"), tmp.path());
+        let mut engine = engine.with_recorder(Recorder::new(dir));
+        let blocked = || usage_with(100.0, Some(at(3600)));
+        cache_usage(&mut engine, A_ID, blocked(), t0());
+        cache_usage(&mut engine, B_ID, blocked(), t0());
+
+        engine.poll(PollReason::Timer, t0()).unwrap();
+        assert_eq!(state_event_types(&root), vec!["allBlocked"]);
+
+        // The app restarts: a new engine reads the same cache and the same
+        // history, and nothing changed in between.
+        let store = Store::new(app.clone(), Box::new(FileSecrets::new(app.secrets_dir())));
+        let mut engine = Engine::new(claude, store, fake)
+            .unwrap()
+            .with_recorder(Recorder::new(HistoryDir::at(&root, "vega")));
+        engine.poll(PollReason::Timer, at(60)).unwrap();
+        assert_eq!(
+            state_event_types(&root),
+            vec!["allBlocked"],
+            "a restart writes no second event for the same block"
         );
     }
 }
