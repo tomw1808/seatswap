@@ -395,7 +395,12 @@ impl Usage {
 }
 /// §7.3: < 70 Fine, 70–89 Close, ≥ 90 or Critical severity → Critical, ≥ 100 → Locked.
 pub enum LoadLevel { Fine, Close, Critical, Locked }
-impl Limit { pub fn level(&self) -> LoadLevel; }
+impl Limit {
+    /// Whether this limit blocks at `now` (spec §2.7, §7.2): at 100 % or more and, for a session
+    /// limit, its reset is after `now`. A week is read as 0 % after its reset by the callers.
+    pub fn is_full_at(&self, now: DateTime<Utc>) -> bool;
+    pub fn level(&self) -> LoadLevel;
+}
 impl LoadLevel { pub fn color(&self) -> &'static str; } // "#22c55e" "#f59e0b" "#ef4444" "#ef4444"
 ```
 
@@ -1080,9 +1085,20 @@ pub(crate) struct SessionsSummary { pub running: u32, pub busy: u32, pub tied: u
 pub(crate) struct Waiting { pub session: String, pub label: String, pub project: String,
     pub since: DateTime<Utc> }
 pub(crate) struct Snapshot { … pub burn: Option<BurnView>, pub sessions: Option<SessionsSummary> /* None = readSessions off */ … }
-pub(crate) enum EngineCommand { Poll(PollReason), Publish, ModelsInUse(Option<BTreeSet<String>>),
-    Feed, HistoryChanged, Shutdown }
+pub(crate) enum EngineCommand { Poll(PollReason), Publish,
+    ModelsInUse { models: Option<BTreeSet<String>>, tied_busy: u32 }, Feed, HistoryChanged, Shutdown }
 pub(crate) enum UiEvent { Snapshot(Snapshot), Sessions(SessionsSummary) }
+
+/// The timer poll as a fixed deadline: a command never moves it; `advance` jumps over `now`.
+struct TickDeadline { next: Instant }
+impl TickDeadline { fn new(now: Instant) -> TickDeadline; fn wait(&self, now: Instant) -> Duration;
+                    fn due(&self, now: Instant) -> bool; fn advance(&mut self, now: Instant); }
+
+/// History-read warnings already printed this run. The tray app keeps one set; the auto-burn
+/// runtime uses the same type rather than a second set.
+pub(crate) struct PrintedWarnings { seen: BTreeSet<String> }
+impl PrintedWarnings { pub(crate) fn new() -> PrintedWarnings;
+                       pub(crate) fn new_texts(&mut self, warnings: &[String]) -> Vec<String>; }
 
 // ops.rs
 pub(crate) fn open_history(app: &AppPaths, settings: &Settings) -> Result<Recorder, String>;
@@ -1138,7 +1154,7 @@ The new modules, each with one job:
 | Module | Job |
 |---|---|
 | `core::feed` | the status line's live numbers: the feed file, its account, merging into the cache |
-| `core::burn::{rates, plan, decide, tied, cost, replay, live}` | auto-burn: rhythm and rates, slack and the two plans, the decision, thinking across a switch, switch cost, replay, and one read of the history into the plan's inputs |
+| `core::burn::{rates, plan, decide, tied, cost, replay, live, burn_next}` | auto-burn: rhythm and rates, slack and the two plans, the decision, thinking across a switch, switch cost, replay, one read of the history into the plan's inputs, and the status line's next-account file |
 | `app::statusline` (`mod`, `render`, `width`) | Claude Code's payload, the line's facts, rendering and terminal width |
 | `app::burn_text` | every word auto-burn shows, for the tray app and the CLI |
 | `app::gui::burn_rt` | the tray app's auto-burn loop: learn, decide, switch, view |
@@ -1198,8 +1214,9 @@ pub fn read(app: &AppPaths) -> io::Result<Option<Feed>>;
 /// feed.seven_day.resets_at. None without a seven_day, or when none or more than one matches.
 pub fn account_for(feed: &Feed, cache: &UsageCache, accounts: &[Account]) -> Option<String>;
 /// usage with the session and weekly-all numbers taken from the feed when it is not older: the
-/// session when its reset is new or the same window's percent is not lower; the weekly percent when
-/// it is not lower. The week's reset, per-model limits and flags stay.
+/// session when its reset is new or the same window's percent is not lower, and never when its
+/// reset is at or before feed.at; the weekly percent when it is not lower. The week's reset,
+/// per-model limits and flags stay.
 pub fn merged(usage: &Usage, feed: &Feed) -> Usage;
 ```
 
@@ -1221,6 +1238,10 @@ pub const MIN_GAIN_H: f64 = 0.5;       // early switching must save at least thi
 pub const GAIN_FACTOR: f64 = 2.0;      // and at least this many times its extra switches' cost
 pub const MIN_COST_SAMPLES: u32 = 3;   // a measured switch cost needs this many switches
 pub const FRESH_MIN: i64 = 20;         // a decision needs readings at most this old
+pub const SWITCH_RELEARN_MIN: i64 = 1; // a switch event that lands late is learned at the next tick
+pub const STALE_ASK_SECS: i64 = 60;    // stale readings ask for a poll at most this often
+pub const LEARN_RETRY_MIN: i64 = 5;    // a failed history read is tried again this much later
+pub const SWITCH_RETRY_MIN: i64 = 10;  // the same switch decision is sent again this much later
 
 const OUTPUT_WEIGHT: f64 = 5.0;        // the four weights of a work unit, nowhere else
 const CACHE_WRITE_WEIGHT: f64 = 1.25;
@@ -1228,11 +1249,30 @@ const CACHE_READ_WEIGHT: f64 = 0.1;
 const HOURS: usize = 168;
 
 pub fn work_units(input: u64, output: u64, cache_write: u64, cache_read: u64) -> f64;
+/// Work units as hours at `typical_wu`; None when that is 0.0. The one conversion
+/// used by the regime, `burn status`, `burn plan` and `burn_text::hours`.
+pub fn wu_hours(wu: f64, typical_wu: f64) -> Option<f64>;
 #[derive(Debug, Clone, PartialEq)] pub struct Rhythm { pub wu: [f64; HOURS] }
 impl Rhythm { pub fn at(&self, t: DateTime<Utc>, offset: FixedOffset) -> f64;
               pub fn typical_hour(&self) -> f64; } // mean over hours with wu > 0; 0.0 if none
 #[derive(Debug, Clone, Copy)] pub struct Rates { pub c: f64, pub s: Option<f64> }
 ```
+
+## burn/burn_next.rs — the status line's next account (step B)
+
+```rust
+pub const REWRITE_AFTER_MIN: i64 = FRESH_MIN / 2;
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)] #[serde(rename_all = "camelCase")]
+pub struct BurnNext { pub account: String, pub at: DateTime<Utc>, pub written: DateTime<Utc> }
+pub fn write(app: &AppPaths, next: &BurnNext) -> io::Result<()>; // atomic, private, mode 0600
+pub fn read(app: &AppPaths, now: DateTime<Utc>) -> io::Result<Option<BurnNext>>;
+pub fn remove(app: &AppPaths) -> io::Result<()>;                 // a missing file is success
+```
+
+`AppPaths::burn_next_file()` is `<data_dir>/burn-next.json`. `read` returns `None` when the file is
+missing or its `written` is older than `FRESH_MIN`; an unparsable file is `InvalidData`, which the
+status line prints as its `seatswap: <reason>` line. `REWRITE_AFTER_MIN` is the tray app's
+heartbeat: it rewrites the same account and time at least this often so a running app stays fresh.
 
 ## burn/rates.rs — rhythm, live account, rates (step B)
 
@@ -1275,6 +1315,7 @@ pub fn choose(inputs: &Inputs, at: DateTime<Utc>) -> Option<String>;
     pub blocked_wu: f64, pub switches: u32, pub left_at_reset: BTreeMap<String, f64>,
     pub full_at: BTreeMap<String, DateTime<Utc>>, pub full_by: BTreeMap<String, Fill> }
 pub fn follow(inputs: &Inputs, policy: Policy) -> Plan;
+pub(super) fn rhythm_walk(inputs: &Inputs) -> Walk<'_>; // the plan and `decide::latest_reaching`
 ```
 
 `follow` plays 168 h in 15-minute steps. Lazy stays on the current account until it is not usable,
@@ -1292,9 +1333,9 @@ window first, then the rest, each by earlier reset and id).
 #[derive(Debug, Clone, Copy, PartialEq)] pub struct SwitchCost { pub wu: f64, pub samples: u32 }
 #[derive(Clone)] pub struct Situation { pub inputs: Inputs, pub cost: Option<SwitchCost>,
     pub last_switch_at: Option<DateTime<Utc>>, pub manual_hold_until: Option<DateTime<Utc>>,
-    pub tied_busy: u32, pub oldest_reading: DateTime<Utc> }
+    pub tied_busy: u32, pub oldest_reading: DateTime<Utc>, pub sessions_off: bool }
 impl Situation { pub fn check(&self) -> Result<(), PlanError>; }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum RegimeWhy { Learning, NoCostYet, NotWorthIt, Pays }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum RegimeWhy { Learning, SessionsOff, NoCostYet, NotWorthIt, Pays }
 #[derive(Debug, Clone, PartialEq)] pub struct Regime { pub early: bool, pub why: RegimeWhy,
     pub lazy_blocked_h: f64, pub eager_blocked_h: f64, pub extra_switches: u32, pub cost_h: Option<f64> }
 pub fn regime(situation: &Situation) -> Regime;
@@ -1315,7 +1356,9 @@ passed → `Switch` (`WindowOpen` when the target has a 5 h limit, else `ResetNe
 a thinking-tied session is busy and the target still has slack; otherwise `Stay`. A target slack of
 0 or less switches at once. `regime.early` is `why == Pays`; it needs rates for every account
 auto-burn may use, a typical hour, at least `MIN_COST_SAMPLES`, and both gain rules of
-`docs/spec.md` §7.4.1.
+`docs/spec.md` §7.4.1. When no rates were learned because `readSessions` is off, `why` is
+`SessionsOff`, not `Learning`; the fact travels in `Situation.sessions_off`. `latest_reaching`
+walks `plan::rhythm_walk`, so the waiting time and the plan cannot count work differently.
 
 ## burn/tied.rs — thinking across a switch (step B)
 
@@ -1368,23 +1411,30 @@ recorded hours with work (0.0 when none); the reads' warnings are kept for the c
 ```rust
 #[derive(Debug, Clone)] pub struct Learned { pub rhythm: Rhythm,
     pub rates: BTreeMap<AccountRef, Rates>, pub cost: Option<SwitchCost>,
-    pub warnings: Vec<String>, pub events: Vec<Hosted<Event>>, pub host: String }
+    pub warnings: Vec<String>, pub events: Vec<Hosted<Event>>, pub host: String,
+    pub sessions_off: bool }
 pub enum Readiness { Ready(Situation), Unread { accounts: Vec<String> }, NoAccounts }
 pub fn learn(history: &HistoryDir, now: DateTime<Utc>, offset: FixedOffset,
-             accounts: &[Account]) -> Result<Learned, HistoryError>;
+             accounts: &[Account], read_sessions: bool) -> Result<Learned, HistoryError>;
 pub fn situation(learned: &Learned, views: &[AccountView], accounts: &[Account],
                  active: Option<&str>, now: DateTime<Utc>, offset: FixedOffset,
                  tied_busy: u32) -> Result<Readiness, PlanError>;
 pub fn next_account(situation: &Situation, decision: &Decision, plan: &Plan) -> Option<String>;
+pub struct Assessment { pub situation: Situation, pub regime: Regime, pub decision: Decision,
+                        pub plan: Plan, pub next: Option<String> }
+/// regime → decide → follow(Lazy) → next. `cached_regime` is an earlier regime; None computes one.
+pub fn assess(situation: Situation, cached_regime: Option<&Regime>) -> Assessment;
 ```
 
 `learn` reads 4 weeks of samples and tokens and 14 days of events from all hosts, computes the
-rhythm, the rates of `accounts` and the switch cost. `situation` puts every account with a reading
+rhythm, the rates of `accounts` and the switch cost; `read_sessions` off means no rates are learned
+and `sessions_off` is set. `situation` puts every account with a reading
 into `Inputs` (`may_use` = the account's `auto_burn`, `login_ok` = `loginState == "ok"`), and returns
 `Unread` when an account auto-burn may use, or the active one, has no reading and is not logged
 out. The manual hold
-is the latest of a user/CLI switch's `MANUAL_HOLD_H` and an `autoBurn` pause; a resume clears the
-manual hold; a manual hold ends early when its target is blocked. `next_account` is the target of a
+is the latest of any non-auto switch's `MANUAL_HOLD_H` and an `autoBurn` pause; a resume clears the
+manual hold; a manual hold ends at the first block of the account switched to, from the history or
+the state now, and stays ended. `next_account` is the target of a
 `Switch`/`Wait`, otherwise the first account of the lazy plan other than the active one.
 
 ## engine.rs additions — feed, stale poll, 30 s near full (step B)
@@ -1419,8 +1469,9 @@ pub(crate) fn parse(stdin: &[u8]) -> Payload;                 // any parse error
 pub(crate) fn feed_from_payload(payload: &Payload, now: DateTime<Utc>) -> Option<Feed>;
 pub(crate) fn publish_feed(app: &AppPaths, settings: &Settings, payload: &Payload,
                            now: DateTime<Utc>) -> Result<(), String>;
-pub(crate) fn facts(payload: &Payload, file: &AccountsFile, live: &LiveState, cache: &UsageCache,
-                    home: &Path, user: String, now: DateTime<Utc>) -> Result<Facts, String>;
+pub(crate) fn facts(app: &AppPaths, payload: &Payload, file: &AccountsFile, live: &LiveState,
+                    cache: &UsageCache, home: &Path, user: String,
+                    now: DateTime<Utc>) -> Result<Facts, String>;
 
 pub(crate) struct Facts { pub user: String, pub host: String, pub home: String,
     pub now: DateTime<Utc>, pub account: Option<AccountFacts>, pub five_hour: Option<Limit2>,
@@ -1432,18 +1483,25 @@ pub(crate) struct Limit2 { pub percent: f64, pub resets_at: Option<DateTime<Utc>
 pub(crate) fn render<Tz: TimeZone>(config: &StatuslineConfig, payload: &Payload, facts: &Facts,
     width: Option<u16>, tz: &Tz) -> String where Tz::Offset: Display;
 pub(crate) fn visible_width(text: &str) -> usize;
-pub(crate) fn compact_left(seconds: i64, week: bool) -> String;
+pub(crate) fn compact_left(seconds: i64, week: bool) -> String; // also used by burn_text::duration
+pub(crate) fn clock(at: DateTime<Utc>, now: DateTime<Utc>, offset: FixedOffset) -> String; // §7.4.5
+pub(crate) fn weekday_clock(at: DateTime<Utc>, offset: FixedOffset) -> String;            // §7.4.5
 pub(crate) fn git_branch(cwd: &Path) -> Option<String>;
 pub(crate) fn terminal_width() -> Option<u16>;
 ```
 
 `facts` shows the payload's numbers only when the feed belongs to the live account; without a
-matching feed it shows the cache. `burn_next` is always `None` in this build, so an `AutoBurn`
-segment prints nothing. `publish_feed` does nothing when `statusline_feed` is off or the payload
+matching feed it shows the cache. `burn_next` comes from `burn_next::read(app, now)` mapped through
+the stored accounts to their abbreviations: a missing file, an unknown account id or an old `written`
+is `None`, and an unreadable file is the line's error. `publish_feed` does nothing when
+`statusline_feed` is off or the payload
 has no `rate_limits`/`seven_day`; when `write_if_due` wrote, it sends `feed` to the tray app (no
 socket is not an error). `render` is pure; `facts` is the one part that reads `.git/HEAD`. `width`
 walks the `/proc` ancestors' pseudo-terminals (Linux, `rustix::termios::tcgetwinsize`) and falls
-back to `$COLUMNS`, else `None`.
+back to `$COLUMNS`, else `None`. `format::clock` is the local `HH:MM` today and `Mon HH:MM` when not
+today; `weekday_clock` is always `Mon HH:MM`; both are the §7.4.5 texts and moved here from
+`burn_text` so the line and the auto-burn words share them. `compact_left` rounds minutes up and
+drops a zero smaller unit (`2h`, not `2h00m`); `week` chooses days/hours, otherwise hours/minutes.
 
 ## app: burn_text (step B)
 
@@ -1453,6 +1511,8 @@ back to `$COLUMNS`, else `None`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)] #[serde(rename_all = "camelCase")]
 pub struct SwitchSuggestion { pub to: String, pub text: String }
 pub fn abbr(views: &[AccountView], id: &str) -> Result<String, TextError>;
+pub fn unread_line(views: &[AccountView], accounts: &[String]) -> Result<String, TextError>;
+pub fn no_accounts_line() -> &'static str;
 pub fn why(why: RegimeWhy) -> &'static str;
 pub fn segment_line(account: Option<&str>, views: &[AccountView], from: DateTime<Utc>,
                     to: DateTime<Utc>, now: DateTime<Utc>, offset: FixedOffset) -> Result<String, TextError>;
@@ -1470,7 +1530,10 @@ pub fn suggestion(decision: &Decision, plan: &Plan, active: Option<&str>, views:
 ```
 
 Every text is here; the tray app and the CLI do not keep a second copy. Missing values are
-`TextError`, never a guessed abbreviation or time. `suggestion` returns `Some` only for `Switch`
+`TextError`, never a guessed abbreviation or time. `unread_line` is
+`Waiting for a first reading of AC, LB.` in account order; `no_accounts_line` is the fixed
+`No account auto-burn may use has a working login.` `why(SessionsOff)` is
+`reading sessions is off: no rates are learned`. `suggestion` returns `Some` only for `Switch`
 and `Wait`, and adds the "Staying on … is expected to let … expire" sentence only when the lazy
 plan leaves more than 1 % of the target's week at its reset.
 
@@ -1484,9 +1547,10 @@ pub(crate) struct BurnView { pub on: bool, pub paused_until: Option<DateTime<Utc
     pub early: bool, pub why: String, pub learning: Vec<String>, pub line: Option<String>,
     pub planned: BTreeMap<String, DateTime<Utc>>, pub waiting: Option<WaitingSwitch>,
     pub suggestion: Option<SwitchSuggestion> }
-pub(crate) struct BurnTick<'a> { pub history: Option<&'a HistoryDir>, pub views: &'a [AccountView],
-    pub accounts: &'a [Account], pub settings: &'a Settings, pub active: Option<&'a str>,
-    pub now: DateTime<Utc>, pub offset: FixedOffset, pub tied_busy: u32 }
+pub(crate) struct BurnTick<'a> { pub app: &'a AppPaths, pub history: Option<&'a HistoryDir>,
+    pub views: &'a [AccountView], pub accounts: &'a [Account], pub settings: &'a Settings,
+    pub active: Option<&'a str>, pub now: DateTime<Utc>, pub offset: FixedOffset,
+    pub tied_busy: u32 }
 #[derive(Debug, Default)] pub(crate) struct BurnReport { pub view: Option<BurnView>,
     pub error: Option<String>, pub warnings: Vec<String>, pub notification: Option<String> }
 pub(crate) struct BurnRuntime { /* learned, last learn/regime, last sent switch, view */ }
@@ -1498,13 +1562,21 @@ impl BurnRuntime {
 ```
 
 `after_snapshot` learns at the first tick, once an hour, after a switch, after a pause, when the
-active account changes, and 5 minutes after a failed read. It then builds the situation, decides
-and acts. Only `auto_burn` on sends `ActionCommand::Switch { by: By::Auto, reason: Some(text) }`;
-`Wait` fills `view.waiting`; `AllFull` is left to the step A notification; `Stale` (and an
-`Unread` situation) asks `EngineCommand::Poll(PollReason::Stale)`, at most once per
-`STALE_ASK_SECS = 60`. With `auto_burn` off and `suggest_switches` on, `Switch` and `Wait` fill
-`view.suggestion`. The switch is retried after `SWITCH_RETRY_MIN = 10` minutes; the notification is
-shown only after the reply says the switch landed. `BurnView` is part of `Snapshot.burn`; the
+active account changes, and `LEARN_RETRY_MIN` minutes after a failed read. It then builds the
+situation and calls `live::assess` with the cached regime when the regime is not due, so the tray
+app, `burn status` and `burn plan` take the same steps in the same order. Only `auto_burn` on sends
+`ActionCommand::Switch { by: By::Auto, reason: Some(text) }`;
+`Wait` fills `view.waiting`; `AllFull` is left to the step A notification; `Stale` asks
+`EngineCommand::Poll(PollReason::Stale)`, at most once per `STALE_ASK_SECS`. An `Unread` situation
+keeps the strip with `burn_text::unread_line` as its line and still asks the stale poll;
+`NoAccounts` keeps it with `burn_text::no_accounts_line`. With `auto_burn` off and
+`suggest_switches` on, `Switch` and `Wait` fill `view.suggestion`. The switch is retried after
+`SWITCH_RETRY_MIN` minutes; the notification is shown only after the reply says the switch landed.
+`publish_next` writes `<data>/burn-next.json` (`Switch`: `to` and now; `Wait`: `to` and `latest`;
+otherwise the lazy plan's next account and its first use), removes it when auto-burn is off,
+paused or nothing is planned, and rewrites at least every `burn_next::REWRITE_AFTER_MIN` minutes.
+The runtime remembers the warnings it printed with `worker::PrintedWarnings`, shared rather than a
+second `BTreeSet`. `BurnView` is part of `Snapshot.burn`; the
 settings toggle calls `worker::save_settings` and writes `EventKind::AutoBurnSet`, the pause calls
 `ActionCommand::PauseBurn { hours }` and writes `EventKind::AutoBurn`.
 
@@ -1513,11 +1585,12 @@ settings toggle calls `worker::save_settings` and writes `EventKind::AutoBurnSet
 `seatswap statusline` is handled before the context is opened: it never opens the store's secret
 backend, takes no lock and writes no history. The other additions:
 
-- `seatswap status --json` reads the history once through `live::learn` and `live::situation`; a
-  history or planner error becomes `burnError`, never a failed command. The plain, waybar and
-  i3blocks forms do not read the history.
-- `seatswap burn plan [--json]` uses the same read with `tied_busy = 0` (the CLI has no session
-  count). An account auto-burn may use (or the active one) with a login and no reading is an error
+- `seatswap status --json` reads the history once through `live::learn` and `live::situation` and
+  assembles through `live::assess`; a history or planner error becomes `burnError`, never a failed
+  command. The plain, waybar and i3blocks forms do not read the history.
+- `seatswap burn plan [--json]` uses the same read and `live::assess` with `tied_busy = 0` (the CLI
+  has no session count). Blocked hours come from `wu_hours` on the lazy and eager `blocked_wu`. An
+  account auto-burn may use (or the active one) with a login and no reading is an error
   `no reading for …`; no account at all is `no account has a login with a reading`.
 - `seatswap burn simulate --from D --to D [--without ABBR]…` maps the two local days to a range
   ending at the local midnight after `--to`, learns the rates from the history as of now, and
@@ -1583,6 +1656,10 @@ Resume button.
 - **`<data folder>/feed.json`** (§7.6): atomic, mode 0600, written by `seatswap statusline` only
   when `statuslineFeed` is on, the payload has a week, and the numbers changed or the file is 10 s
   old. The tray app only reads it.
+- **`<data folder>/burn-next.json`** (§7.6): atomic, mode 0600, written by the tray app's auto-burn
+  loop with `{"account","at","written"}`; rewritten at least every 10 minutes while a switch is
+  planned, and removed when auto-burn is off, paused or nothing is planned. `seatswap statusline`
+  only reads it.
 - **History events** in `<root>/<host>/events-YYYY-MM.jsonl`:
   - `{"t":"…","type":"autoBurn","on":true,"pausedUntil":"2026-11-15T13:10:00Z"}` for a pause;
     `pausedUntil` is absent (not null) for a resume. `on` is the setting at that moment.

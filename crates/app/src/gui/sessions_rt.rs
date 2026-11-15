@@ -41,7 +41,6 @@ const RECORD_EVERY_SECS: i64 = 10 * 60;
 pub(crate) struct PassOutcome {
     pub summary: SessionsSummary,
     pub models: Option<BTreeSet<String>>,
-    pub tied: u32,
     pub tied_busy: u32,
     pub wake_soon: bool,
 }
@@ -245,7 +244,6 @@ fn run(
                 PassOutcome {
                     summary,
                     models: None,
-                    tied: 0,
                     tied_busy: 0,
                     wake_soon: false,
                 }
@@ -265,7 +263,6 @@ fn run(
         if engine
             .send(EngineCommand::ModelsInUse {
                 models: outcome.models,
-                tied: outcome.tied,
                 tied_busy: outcome.tied_busy,
             })
             .is_err()
@@ -386,7 +383,6 @@ pub(crate) fn run_pass(
             return PassOutcome {
                 summary,
                 models: None,
-                tied: 0,
                 tied_busy: 0,
                 wake_soon: false,
             };
@@ -400,7 +396,6 @@ pub(crate) fn run_pass(
             return PassOutcome {
                 summary,
                 models: None,
-                tied: 0,
                 tied_busy: 0,
                 wake_soon: false,
             };
@@ -418,7 +413,6 @@ pub(crate) fn run_pass(
             return PassOutcome {
                 summary,
                 models: None,
-                tied: 0,
                 tied_busy: 0,
                 wake_soon: false,
             };
@@ -728,11 +722,10 @@ pub(crate) fn run_pass(
     }
 
     let models = models_in_use(&running.sessions, state);
-    let (tied, tied_busy) = tied_sessions(&running.sessions, state);
+    let (_, tied_busy) = tied_sessions(&running.sessions, state);
     PassOutcome {
         summary,
         models,
-        tied,
         tied_busy,
         wake_soon: !scan_complete,
     }

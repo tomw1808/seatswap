@@ -78,7 +78,7 @@ struct PreviousView {
 }
 
 /// The rules of docs/implementation.md and spec §4:
-/// - a suggestion once per account and reset window;
+/// - a suggestion once per target account and hour;
 /// - a login warning once per account and level per run;
 /// - an unknown live login once per identity per run;
 /// - "usable again" once per account and reset;

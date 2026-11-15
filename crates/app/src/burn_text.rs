@@ -58,6 +58,26 @@ fn view<'a>(views: &'a [AccountView], id: &str) -> Option<&'a AccountView> {
     views.iter().find(|view| view.id == id)
 }
 
+/// The line while an account auto-burn may use, or the active one, has a login
+/// and no reading yet: its abbreviation, in the order `accounts` gives.
+#[cfg(feature = "gui")]
+pub fn unread_line(views: &[AccountView], accounts: &[String]) -> Result<String, TextError> {
+    let names = accounts
+        .iter()
+        .map(|id| abbr(views, id))
+        .collect::<Result<Vec<_>, _>>()?
+        .join(", ");
+    Ok(format!("Waiting for a first reading of {names}."))
+}
+
+/// The line when no account auto-burn may use (nor the active one) has a
+/// working login and a reading: every such login ended, or auto-burn may use
+/// no account.
+#[cfg(feature = "gui")]
+pub fn no_accounts_line() -> &'static str {
+    "No account auto-burn may use has a working login."
+}
+
 /// The target's weekly reset, in the words a reason needs.
 fn weekly_reset(views: &[AccountView], id: &str) -> Result<DateTime<Utc>, TextError> {
     view(views, id)
@@ -73,48 +93,11 @@ fn weekly_reset(views: &[AccountView], id: &str) -> Result<DateTime<Utc>, TextEr
         })
 }
 
-/// `HH:MM` when the time is today, `Mon HH:MM` otherwise, in `offset`.
-fn clock(at: DateTime<Utc>, now: DateTime<Utc>, offset: FixedOffset) -> String {
-    let local = at.with_timezone(&offset);
-    if local.date_naive() == now.with_timezone(&offset).date_naive() {
-        local.format("%H:%M").to_string()
-    } else {
-        local.format("%a %H:%M").to_string()
-    }
-}
-
-/// The local weekday and clock, as in "resets on Mon 02:00".
-fn weekday_clock(at: DateTime<Utc>, offset: FixedOffset) -> String {
-    at.with_timezone(&offset).format("%a %H:%M").to_string()
-}
-
-#[cfg(feature = "gui")]
-/// The compact time to a switch: `35m`, `2h`, `2h05m`, `1d3h`.
-fn duration(seconds: i64) -> String {
-    if seconds <= 0 {
-        return "0m".to_string();
-    }
-    let minutes = (seconds + 59) / 60;
-    if minutes < 60 {
-        return format!("{minutes}m");
-    }
-    if minutes < 24 * 60 {
-        let hours = minutes / 60;
-        let rest = minutes % 60;
-        if rest == 0 {
-            return format!("{hours}h");
-        }
-        return format!("{hours}h{rest:02}m");
-    }
-    let days = minutes / (24 * 60);
-    let hours = minutes % (24 * 60) / 60;
-    format!("{days}d{hours}h")
-}
-
 /// Why early switching is on or off (spec §2.5).
 pub fn why(why: RegimeWhy) -> &'static str {
     match why {
         RegimeWhy::Learning => "learning",
+        RegimeWhy::SessionsOff => "reading sessions is off: no rates are learned",
         RegimeWhy::NoCostYet => "no switch measured yet",
         RegimeWhy::NotWorthIt => "switching before 100 % does not pay",
         RegimeWhy::Pays => "switching before 100 % pays",
@@ -139,8 +122,8 @@ pub fn segment_line(
     };
     Ok(format!(
         "{}–{}  {name}",
-        clock(from, now, offset),
-        clock(to, now, offset)
+        format::clock(from, now, offset),
+        format::clock(to, now, offset)
     ))
 }
 
@@ -156,10 +139,9 @@ pub fn policy_name(policy: Policy) -> &'static str {
 /// typical working hour. A typical hour of 0 means the hours are not known:
 /// they are said so, never divided by zero.
 fn hours(wu: f64, typical_wu: f64) -> String {
-    if typical_wu > 0.0 {
-        format!("{:.1} h", wu / typical_wu)
-    } else {
-        "not known".to_string()
+    match seatswap_core::burn::wu_hours(wu, typical_wu) {
+        Some(hours) => format!("{hours:.1} h"),
+        None => "not known".to_string(),
     }
 }
 
@@ -207,18 +189,18 @@ pub fn reason(
             match until {
                 Some(until) => Ok(format!(
                     "{who} is full until {}",
-                    clock(*until, now, offset)
+                    format::clock(*until, now, offset)
                 )),
                 None => Ok(format!("{who} is full")),
             }
         }
         Reason::WindowOpen => Ok(format!(
             "its 5 h window is open and its week resets on {}",
-            weekday_clock(weekly_reset(views, target)?, offset)
+            format::weekday_clock(weekly_reset(views, target)?, offset)
         )),
         Reason::ResetNear => Ok(format!(
             "its week resets on {}",
-            weekday_clock(weekly_reset(views, target)?, offset)
+            format::weekday_clock(weekly_reset(views, target)?, offset)
         )),
     }
 }
@@ -280,7 +262,7 @@ pub fn line(
             Ok(Some(format!(
                 "On {} until its {limit} is full, about {}. Then {}.",
                 abbr(views, current)?,
-                duration(seconds),
+                format::compact_left(seconds, seconds >= 24 * 60 * 60),
                 abbr(views, next_id)?
             )))
         }
@@ -324,7 +306,7 @@ pub fn switch_notification(
         (Reason::ActiveFull { until: Some(until) }, Some(from)) => Ok(Some(format!(
             "Auto-burn: now on {to_name}. {} is full until {}.",
             abbr(views, from)?,
-            clock(*until, now, offset)
+            format::clock(*until, now, offset)
         ))),
         _ => Ok(Some(format!(
             "Auto-burn: now on {to_name}: {}.",
@@ -546,6 +528,23 @@ mod tests {
             "Switch to AC now: its 5 h window is open and its week resets on Mon 02:00.",
             "AC has no session limit in its view; the decision's reason wins"
         );
+    }
+
+    #[test]
+    fn sessions_off_says_why() {
+        assert_eq!(
+            why(RegimeWhy::SessionsOff),
+            "reading sessions is off: no rates are learned"
+        );
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn the_unread_line_names_the_accounts() {
+        let views = vec![view("lb", "LB", 20.0, false), view("ac", "AC", 10.0, true)];
+        let line = unread_line(&views, &["lb".to_string(), "ac".to_string()])
+            .expect("both accounts have a view");
+        assert_eq!(line, "Waiting for a first reading of LB, AC.");
     }
 
     #[cfg(feature = "gui")]

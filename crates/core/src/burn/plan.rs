@@ -232,7 +232,8 @@ pub fn slack(account: &AccountState, inputs: &Inputs) -> Option<f64> {
 
 /// The walk of the learned rhythm: every step carries a quarter of the work of
 /// the clock hour that holds its start, over the plan's [`HORIZON_H`] hours.
-fn rhythm_walk(inputs: &Inputs) -> Walk<'_> {
+/// [`crate::burn::decide`] uses it for the waiting switch's latest time too.
+pub(super) fn rhythm_walk(inputs: &Inputs) -> Walk<'_> {
     Walk::new(
         Work::Rhythm {
             rhythm: &inputs.rhythm,

@@ -4,6 +4,7 @@
 
 use chrono::{DateTime, Datelike, FixedOffset, Timelike, Utc};
 
+pub mod burn_next;
 pub mod cost;
 pub mod decide;
 pub mod live;
@@ -43,6 +44,12 @@ pub const FRESH_MIN: i64 = 20;
 /// A switch event that lands after the files it names is learned again after at
 /// most this many minutes (spec §5.3: the CLI writes the files before the event).
 pub const SWITCH_RELEARN_MIN: i64 = 1;
+/// A decision asks for a poll of old readings at most this often (spec §7.4.6).
+pub const STALE_ASK_SECS: i64 = 60;
+/// A failed history read is tried again after this many minutes (spec §7.4.6).
+pub const LEARN_RETRY_MIN: i64 = 5;
+/// The same switch decision is sent again after this many minutes (spec §2.5).
+pub const SWITCH_RETRY_MIN: i64 = 10;
 
 /// One output token against one input token (spec §2.3).
 const OUTPUT_WEIGHT: f64 = 5.0;
@@ -71,6 +78,13 @@ pub fn work_units(input: u64, output: u64, cache_write: u64, cache_read: u64) ->
         + CACHE_WRITE_WEIGHT * cache_write as f64
         + CACHE_READ_WEIGHT * cache_read as f64)
         / 1_000_000.0
+}
+
+/// Work units as hours at `typical_wu` work units per typical working hour;
+/// `None` when `typical_wu` is 0.0, because no hours can be computed then. The
+/// one work-units-to-hours conversion (spec §2.3, §2.4).
+pub fn wu_hours(wu: f64, typical_wu: f64) -> Option<f64> {
+    (typical_wu > 0.0).then(|| wu / typical_wu)
 }
 
 /// Work units per clock hour of the week, in the local time of the offset the

@@ -397,7 +397,7 @@ What the settings page says about the two switches:
 - On an HTTP 429 or 5xx, back off exponentially up to 30 min and show the time of the last fetch.
 - On a 401: for the active account, read the live file again (Claude Code may have renewed it). For an inactive account, refresh (§6.3).
 - An account that a limit blocks is polled once 30 s after that limit's reset time, whatever its interval, so a notification does not wait for the 15-minute poll of inactive accounts.
-- While the active account's binding limit is at 90 % or more and below 100 %, it is polled every 30 s; at 100 % the reset poll above applies. The status line's feed (§7.6) can make the numbers newer still, without a request.
+- While the active account's binding limit is at 90 % or more and below 100 %, it is polled every 30 s; at 100 % the reset poll above applies. The status line's feed (§7.6) can make the numbers newer still, without a request. The feed never moves a timer poll: the poll schedule keeps its times whatever the feed does.
 - No polling while the machine sleeps. Poll once on wake.
 
 ### 7.2 What the app derives from the response
@@ -452,6 +452,9 @@ no modes and no tuning settings: every threshold is a constant in the code (see 
   auto-burn stays on it: S3 is reached only when the active account is blocked (or there is none)
   and `choose` finds no usable account. An active account auto-burn may not use is also not a
   reason for S2.
+- **Going back restores a session's earlier thinking, but this is not built yet.** Choosing
+  between two accounts whose slack is within 2 typical working hours by which one has more
+  running-session thinking on it is not implemented; the build decides on slack alone.
 
 #### 7.4.1 The regime
 
@@ -466,7 +469,9 @@ one switch per 30 minutes. Early switching (S2) is on only when all of these hol
 - those saved hours are at least twice the extra switches' cost (extra switches × the measured
   cost of one switch, in working hours).
 
-While any of these is missing, auto-burn switches only when the active account is full. The
+While any of these is missing, auto-burn switches only when the active account is full. With
+`readSessions` off there are no work units: no rates are learned, the regime says `reading
+sessions is off: no rates are learned`, and auto-burn switches only when the active account is full. The
 regime's words are `learning`, `no switch measured yet`, `switching before 100 % does not pay` or
 `switching before 100 % pays`.
 
@@ -484,9 +489,10 @@ With `readSessions` off there is no session count and S2 does not wait.
 
 #### 7.4.3 Working by hand
 
-- **Manual switch while auto-burn is on.** A switch by a person (`seatswap use`, `next` or the
-  pop-up) holds S2 back for 4 hours, or until the account switched to is blocked, whichever comes
-  first. S1 is not held back.
+- **Manual switch while auto-burn is on.** A switch auto-burn did not make — by a person
+  (`seatswap use`, `next` or the pop-up), the CLI, an agent, or Claude Code's `/login` — holds S2
+  back for 4 hours, or until the account switched to is blocked, whichever comes first. The hold
+  ends for good at that first block and does not come back. S1 is not held back.
 - **Pause.** "Pause 4 h" in the pop-up writes an `autoBurn` event with `pausedUntil`; "Resume"
   writes one with no end. The pop-up shows `Auto-burn paused until 18:10 · Resume`. A pause holds
   S2 like a manual switch; a resume also ends a manual hold. Turning `autoBurn` on or off in the
@@ -519,10 +525,9 @@ Times are local `HH:MM`, or `Mon HH:MM` when not today; durations are `35m`, `2h
 
 #### 7.4.6 How old a reading may be
 
-A decision needs a reading at most 20 minutes old for every account whose login still works,
-whether or not auto-burn may use it; the oldest of those readings is the one tested. An account
-that auto-burn may use, or the active one, with a login but no reading at all also stops a
-decision. The reading's age is the later of its
+A decision needs a reading at most 20 minutes old for every account auto-burn may use, plus the
+active account; the oldest of those readings is the one tested. An account in that set with a
+login but no reading at all also stops a decision. The reading's age is the later of its
 poll and its feed (`fetchedAt` in the cache). When the oldest is older than 20 minutes, auto-burn
 does not switch or suggest: it asks for a poll, at most once a minute, and the engine polls only
 the accounts whose last reading or attempt is older than 20 minutes. The status line feed (§7.6)
@@ -565,8 +570,8 @@ from its cache, and prints one line.
   free text and a separator. Each segment has an optional colour rule (fixed, by load with two
   thresholds, by model family, by effort, or the account's colour), prefix, suffix and drop order;
   reset segments can use the compact time left, seatswap's own format (§7.2) or a clock time. The
-  `autoBurn` segment has no value in this build: the next account is in `status --json` (`next`)
-  and in the pop-up, not in the line.
+  `autoBurn` segment shows the next account and the planned switch time, like the reset segments
+  show their times; it has no value when the tray app plans no switch (§7.6).
 
 **The feed.** When `statuslineFeed` is on (default) and the payload has `rate_limits` with a
 `seven_day`, the command writes the live numbers to `<data folder>/feed.json`, atomic and mode
@@ -588,13 +593,29 @@ from its cache, and prints one line.
   socket; no tray app running is not an error, the file waits. The tray app reads the file, merges
   it into that account's cache entry only when `at` is later than both the poll's `fetchedAt` and
   the last feed, and writes a usage sample with `src: statusline` like a poll. The 5 h percent and
-  its reset follow the feed when its window is new or the same window is not lower; the weekly
+  its reset follow the feed when its window is new or the same window is not lower; a 5 h window
+  whose reset is at or before the feed's `at` is ignored, so a window that has already ended cannot
+  come back after a poll replaced it. The weekly
   percent follows it only when it is not lower, and the weekly reset stays the cache's. Per-model
   limits stay the cache's. The polls stay as they are: they bring the per-model limits and the
   inactive accounts.
 - **Effect:** the active account's numbers are seconds old instead of up to 2 minutes, without an
   extra request to Anthropic; auto-burn sees 100 % sooner. With `statuslineFeed` off the command
   writes no feed file and sends nothing.
+
+**The next account.** The tray app writes `<data folder>/burn-next.json`, atomic and mode 0600:
+
+```json
+{"account":"<account id>","at":"2026-11-15T14:40:00Z","written":"2026-11-15T09:41:12Z"}
+```
+
+`at` is the planned switch in UTC and `written` is when the app wrote the file. The app writes it
+when the next account or time changes and at least every 10 minutes as its heartbeat; it removes
+the file when auto-burn is off, paused, or nothing is planned. The `autoBurn` segment reads the
+file without a lock: a missing file shows nothing, an account id that is no longer stored shows
+nothing, and a `written` older than 20 minutes shows nothing because the tray app is not running.
+A file that cannot be parsed is the line's `seatswap: <reason>` error. The polls keep their times
+whatever this file says.
 
 ### 7.7 `seatswap burn plan` and `seatswap burn simulate`
 

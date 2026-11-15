@@ -16,8 +16,8 @@ use crate::history::{
 use crate::store::{Account, LoginState};
 
 use super::cost::switch_cost;
-use super::decide::{Decision, Situation};
-use super::plan::{blocked, AccountState, Inputs, Plan, PlanError, SessionState};
+use super::decide::{decide, regime, Decision, Regime, Situation};
+use super::plan::{blocked, follow, AccountState, Inputs, Plan, PlanError, Policy, SessionState};
 use super::rates::{rates, rhythm};
 use super::{Rates, Rhythm, MANUAL_HOLD_H, RATES_DAYS, RHYTHM_WEEKS};
 
@@ -34,6 +34,9 @@ pub struct Learned {
     pub events: Vec<Hosted<Event>>,
     /// This history folder's host. Only its switch events hold auto-burn back.
     pub host: String,
+    /// `readSessions` is off: no rates were learned from the sessions
+    /// (spec §2.3). The regime says so with [`super::decide::RegimeWhy::SessionsOff`].
+    pub sessions_off: bool,
 }
 
 /// What [`situation`] found: a checked `Situation`, or the accounts that have a
@@ -110,6 +113,7 @@ pub fn learn(
         warnings,
         events: events.records,
         host: history.host().to_string(),
+        sessions_off: !read_sessions,
     })
 }
 
@@ -190,6 +194,7 @@ pub fn situation(
         manual_hold_until,
         tied_busy,
         oldest_reading,
+        sessions_off: learned.sessions_off,
     };
     situation.check()?;
     Ok(Readiness::Ready(situation))
@@ -212,6 +217,37 @@ pub fn next_account(situation: &Situation, decision: &Decision, plan: &Plan) -> 
                 }
             })
         }
+    }
+}
+
+/// The whole shared assembly after [`situation`]: the regime, the decision, the
+/// lazy plan and the account the plan names next. The tray app and both CLI
+/// commands use it, so they cannot take the steps in a different order.
+pub struct Assessment {
+    pub situation: Situation,
+    pub regime: Regime,
+    pub decision: Decision,
+    pub plan: Plan,
+    pub next: Option<String>,
+}
+
+/// Assemble one decision from a checked situation: regime → decide →
+/// follow(Lazy) → next. `cached_regime` is a regime an earlier call computed;
+/// `None` computes a new one. Keeping that cache is the tray app's own job.
+pub fn assess(situation: Situation, cached_regime: Option<&Regime>) -> Assessment {
+    let regime = match cached_regime {
+        Some(regime) => regime.clone(),
+        None => regime(&situation),
+    };
+    let decision = decide(&situation, &regime);
+    let plan = follow(&situation.inputs, Policy::Lazy);
+    let next = next_account(&situation, &decision, &plan);
+    Assessment {
+        situation,
+        regime,
+        decision,
+        plan,
+        next,
     }
 }
 
@@ -428,6 +464,7 @@ mod tests {
             warnings: Vec::new(),
             events,
             host: host.to_string(),
+            sessions_off: false,
         }
     }
 

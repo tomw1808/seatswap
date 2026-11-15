@@ -3,7 +3,7 @@
 //! The CLI and the tray must show the same percentages, reset times and
 //! tooltips, so there is exactly one copy of each format here.
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, FixedOffset, TimeZone, Utc};
 
 use seatswap_core::api::{LimitKind, LoadLevel, Usage};
 use seatswap_core::engine::AccountView;
@@ -114,7 +114,9 @@ where
 }
 
 /// The tooltip's reset time is a local clock time as in the spec's example
-/// (`resets 14:40`); above 24 h the weekday joins it.
+/// (`resets 14:40`); above 24 h the weekday joins it. This follows the
+/// tooltip's own rule (spec §8.1), not §7.4.5's today/not-today rule:
+/// [`clock`] follows §7.4.5 and keeps its two forms apart.
 pub(crate) fn format_reset_clock<Tz: TimeZone>(
     resets_at: DateTime<Utc>,
     now: DateTime<Utc>,
@@ -129,6 +131,53 @@ where
         resets_at.with_timezone(tz).format("%a %H:%M").to_string()
     } else {
         resets_at.with_timezone(tz).format("%H:%M").to_string()
+    }
+}
+
+/// A local time in auto-burn's words (spec §7.4.5): `HH:MM` when it is today,
+/// `Mon HH:MM` otherwise. [`weekday_clock`] is the always-weekday form.
+pub(crate) fn clock(at: DateTime<Utc>, now: DateTime<Utc>, offset: FixedOffset) -> String {
+    let local = at.with_timezone(&offset);
+    if local.date_naive() == now.with_timezone(&offset).date_naive() {
+        local.format("%H:%M").to_string()
+    } else {
+        local.format("%a %H:%M").to_string()
+    }
+}
+
+/// The local weekday and clock (spec §7.4.5), as in "resets on Mon 02:00".
+pub(crate) fn weekday_clock(at: DateTime<Utc>, offset: FixedOffset) -> String {
+    at.with_timezone(&offset).format("%a %H:%M").to_string()
+}
+
+/// The compact duration of `seconds`: `35m`, `2h`, `2h05m`, `1d3h` (spec
+/// §7.4.5), the status line's compact time left too (spec §5.1). The larger
+/// unit only when it is not zero; minutes round up, so 30 s reads `1m`. `week`
+/// makes the larger unit a day and the smaller an hour; otherwise they are an
+/// hour and a minute.
+pub(crate) fn compact_left(seconds: i64, week: bool) -> String {
+    if seconds <= 0 {
+        return "0m".to_string();
+    }
+    let minutes = (seconds + 59) / 60;
+    if week {
+        let days = minutes / (24 * 60);
+        let hours = minutes % (24 * 60) / 60;
+        if days == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{days}d{hours}h")
+        }
+    } else {
+        let hours = minutes / 60;
+        let rest = minutes % 60;
+        if hours == 0 {
+            format!("{rest}m")
+        } else if rest == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h{rest:02}m")
+        }
     }
 }
 

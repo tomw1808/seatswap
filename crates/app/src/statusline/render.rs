@@ -13,7 +13,8 @@ use seatswap_core::store::{ColorRule, Segment, SegmentKind, StatuslineConfig, Ti
 
 use super::Payload;
 use crate::format::{
-    format_reset_at, format_reset_clock, integer_percent, letter_color, parse_color, with_tilde,
+    compact_left, format_reset_at, format_reset_clock, integer_percent, letter_color, parse_color,
+    with_tilde,
 };
 
 /// The green / yellow / red (and bright) SGR prefixes of the colour rules.
@@ -228,30 +229,6 @@ fn in_ranges(ranges: &[(u32, u32)], code: u32) -> bool {
     ranges
         .iter()
         .any(|(first, last)| (*first..=*last).contains(&code))
-}
-
-/// Time left to a reset in the script's short form (spec §5.1): `4h45m` for the
-/// 5 h window, `3d16h` for the week; the larger unit only when it is not zero.
-pub(crate) fn compact_left(seconds: i64, week: bool) -> String {
-    if seconds <= 0 {
-        return "0m".to_string();
-    }
-    let (big, small) = if week {
-        (seconds / 86_400, seconds % 86_400 / 3_600)
-    } else {
-        (seconds / 3_600, seconds % 3_600 / 60)
-    };
-    if big == 0 {
-        if week {
-            format!("{small}h")
-        } else {
-            format!("{small}m")
-        }
-    } else if week {
-        format!("{big}d{small}h")
-    } else {
-        format!("{big}h{small:02}m")
-    }
 }
 
 /// The branch of the repository at `cwd`, from `.git/HEAD`; a detached HEAD

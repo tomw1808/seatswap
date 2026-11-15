@@ -5,12 +5,12 @@
 use chrono::{DateTime, Duration, Utc};
 
 use super::plan::{
-    blocked, choose, follow, rates_known, slack, usable_again, Inputs, PlanError, Policy, Walk,
-    Work,
+    blocked, choose, follow, rates_known, rhythm_walk, slack, usable_again, Inputs, PlanError,
+    Policy,
 };
 use super::{
-    FRESH_MIN, GAIN_FACTOR, HORIZON_H, MIN_COST_SAMPLES, MIN_DWELL_MIN, MIN_GAIN_H, SLACK_MARGIN_H,
-    STEP_MIN,
+    wu_hours, FRESH_MIN, GAIN_FACTOR, HORIZON_H, MIN_COST_SAMPLES, MIN_DWELL_MIN, MIN_GAIN_H,
+    SLACK_MARGIN_H, STEP_MIN,
 };
 
 /// The measured cost of one switch (spec §2.13): the extra work units and the
@@ -32,6 +32,8 @@ pub struct Situation {
     pub manual_hold_until: Option<DateTime<Utc>>,
     pub tied_busy: u32,
     pub oldest_reading: DateTime<Utc>,
+    /// `readSessions` is off, so no rates were learned (spec §2.3).
+    pub sessions_off: bool,
 }
 
 impl Situation {
@@ -62,6 +64,8 @@ impl Situation {
 pub enum RegimeWhy {
     /// Not every account auto-burn may use has rates, or no typical hour is known.
     Learning,
+    /// No rates were learned because `readSessions` is off (spec §2.3).
+    SessionsOff,
     /// No switch has been measured, or too few of them.
     NoCostYet,
     /// The eager plan does not save enough for its extra switches.
@@ -136,20 +140,18 @@ pub fn regime(situation: &Situation) -> Regime {
     let typical = inputs.rhythm.typical_hour();
     let lazy = follow(inputs, Policy::Lazy);
     let eager = follow(inputs, Policy::Eager);
-    let hours = |wu: f64| if typical > 0.0 { wu / typical } else { 0.0 };
-    let lazy_blocked_h = hours(lazy.blocked_wu);
-    let eager_blocked_h = hours(eager.blocked_wu);
+    let lazy_blocked_h = wu_hours(lazy.blocked_wu, typical).unwrap_or(0.0);
+    let eager_blocked_h = wu_hours(eager.blocked_wu, typical).unwrap_or(0.0);
     let extra_switches = eager.switches.saturating_sub(lazy.switches);
-    let cost_h = match situation.cost {
-        Some(cost) if typical > 0.0 => Some(cost.wu / typical),
-        _ => None,
-    };
+    let cost_h = situation.cost.and_then(|cost| wu_hours(cost.wu, typical));
     let learning = typical == 0.0
         || inputs
             .accounts
             .iter()
             .any(|account| account.may_use && !rates_known(account));
-    let why = if learning {
+    let why = if learning && situation.sessions_off {
+        RegimeWhy::SessionsOff
+    } else if learning {
         RegimeWhy::Learning
     } else {
         match (situation.cost, cost_h) {
@@ -312,15 +314,8 @@ fn next_free(inputs: &Inputs) -> Option<(String, DateTime<Utc>)> {
 /// (the decision is taken again at every reading).
 fn latest_reaching(inputs: &Inputs, target_wu: f64) -> DateTime<Utc> {
     let step = Duration::minutes(STEP_MIN);
-    let walk = Walk::new(
-        Work::Rhythm {
-            rhythm: &inputs.rhythm,
-            offset: inputs.offset,
-        },
-        inputs.now + Duration::hours(HORIZON_H),
-    );
     let mut sum = 0.0;
-    for (at, work) in walk.steps_from(inputs.now) {
+    for (at, work) in rhythm_walk(inputs).steps_from(inputs.now) {
         sum += work;
         if sum >= target_wu {
             return at + step;
@@ -347,6 +342,7 @@ mod tests {
             manual_hold_until: None,
             tied_busy: 0,
             oldest_reading: now() - Duration::minutes(1),
+            sessions_off: false,
         }
     }
 
@@ -483,6 +479,19 @@ mod tests {
         assert_eq!(state.why, RegimeWhy::Learning);
         assert!(!state.early);
         assert_eq!(decide(&situation, &state), Decision::Stay);
+    }
+
+    #[test]
+    fn sessions_off_is_the_regime_why() {
+        let mut inputs = inputs();
+        for account in &mut inputs.accounts {
+            account.rates = None;
+        }
+        let mut situation = situation(inputs);
+        situation.sessions_off = true;
+        let state = regime(&situation);
+        assert_eq!(state.why, RegimeWhy::SessionsOff);
+        assert!(!state.early);
     }
 
     #[test]

@@ -188,6 +188,11 @@ impl AppPaths {
     pub fn feed_file(&self) -> PathBuf {
         self.data_dir.join("feed.json")
     }
+    /// The next account auto-burn plans to switch to, for the status line
+    /// (spec §7.6).
+    pub fn burn_next_file(&self) -> PathBuf {
+        self.data_dir.join("burn-next.json")
+    }
     /// seatswap's own lock, keeps two seatswap processes apart.
     pub fn switch_lock(&self) -> PathBuf {
         self.data_dir.join("switch.lock")

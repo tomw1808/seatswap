@@ -16,10 +16,10 @@ use serde::Serialize;
 
 use seatswap_core::api::{Api, Usage};
 use seatswap_core::atomic::{self, Access};
-use seatswap_core::burn::decide::{decide, regime};
 use seatswap_core::burn::live::{self, Readiness};
 use seatswap_core::burn::plan::{follow, slack, Policy};
 use seatswap_core::burn::replay::replay;
+use seatswap_core::burn::wu_hours;
 use seatswap_core::engine::{AccountView, Engine, PollReason, UsageCache};
 use seatswap_core::history::{AccountRef, By, EventKind, HistoryDir, Range, Recorder};
 use seatswap_core::paths::{self, AppPaths, ClaudePaths, PathsError};
@@ -592,6 +592,7 @@ fn statusline_line(cli: &Cli, stdin: &[u8], now: DateTime<Utc>) -> Result<String
     let cache = UsageCache::load(&app).map_err(|error| error.to_string())?;
     let live = switcher::live_state(&claude, &file).map_err(|error| error.to_string())?;
     let facts = statusline::facts(
+        &app,
         &payload,
         &file,
         &live,
@@ -1272,25 +1273,31 @@ fn burn_status(
     let Readiness::Ready(situation) = readiness else {
         return status;
     };
-    status.paused_until = situation.manual_hold_until.filter(|until| *until > now);
-    let regime = regime(&situation);
-    let decision = decide(&situation, &regime);
-    let plan = follow(&situation.inputs, Policy::Lazy);
-    status.next = live::next_account(&situation, &decision, &plan);
+    let assessment = live::assess(situation, None);
+    status.paused_until = assessment
+        .situation
+        .manual_hold_until
+        .filter(|until| *until > now);
+    status.next = assessment.next.clone();
 
-    let typical = situation.inputs.rhythm.typical_hour();
-    if typical > 0.0 {
-        for account in &situation.inputs.accounts {
-            if let Some(slack_wu) = slack(account, &situation.inputs) {
-                status
-                    .slack_hours
-                    .insert(account.id.clone(), slack_wu / typical);
+    let typical = assessment.situation.inputs.rhythm.typical_hour();
+    for account in &assessment.situation.inputs.accounts {
+        if let Some(slack_wu) = slack(account, &assessment.situation.inputs) {
+            if let Some(hours) = wu_hours(slack_wu, typical) {
+                status.slack_hours.insert(account.id.clone(), hours);
             }
         }
     }
 
     if !settings.auto_burn && settings.suggest_switches {
-        match burn_text::suggestion(&decision, &plan, active, views, now, offset) {
+        match burn_text::suggestion(
+            &assessment.decision,
+            &assessment.plan,
+            active,
+            views,
+            now,
+            offset,
+        ) {
             Ok(suggestion) => {
                 status.suggestion = suggestion.map(|suggestion| SuggestionJson {
                     to_id: suggestion.to,
@@ -1382,17 +1389,18 @@ fn burn_plan(context: Context, json: bool) -> Result<String, CliError> {
             ))
         }
     };
-    let regime = regime(&situation);
-    let plan = follow(&situation.inputs, Policy::Lazy);
+    let assessment = live::assess(situation, None);
+    let regime = &assessment.regime;
+    let plan = &assessment.plan;
     if json {
-        let typical = situation.inputs.rhythm.typical_hour();
-        let hours = |value: f64| if typical > 0.0 { Some(value) } else { None };
+        let typical = assessment.situation.inputs.rhythm.typical_hour();
+        let eager = follow(&assessment.situation.inputs, Policy::Eager);
         let output = BurnPlanJson {
             regime: BurnRegimeJson {
                 early: regime.early,
                 why: burn_text::why(regime.why).to_string(),
-                blocked_lazy_h: hours(regime.lazy_blocked_h),
-                blocked_eager_h: hours(regime.eager_blocked_h),
+                blocked_lazy_h: wu_hours(plan.blocked_wu, typical),
+                blocked_eager_h: wu_hours(eager.blocked_wu, typical),
                 extra_switches: regime.extra_switches,
                 cost_h: regime.cost_h,
             },
@@ -1405,7 +1413,7 @@ fn burn_plan(context: Context, json: bool) -> Result<String, CliError> {
                     to: segment.to,
                 })
                 .collect(),
-            left_at_reset: plan.left_at_reset,
+            left_at_reset: plan.left_at_reset.clone(),
         };
         return Ok(serde_json::to_string(&output)?);
     }
@@ -3094,6 +3102,28 @@ pub(crate) mod tests {
         assert!(segments[0]["from"].is_string());
         assert!(segments[0]["to"].is_string());
         assert!(value["leftAtReset"].is_object());
+    }
+
+    #[test]
+    fn burn_plan_text_names_sessions_off() {
+        let fixture = Fixture::new();
+        fixture.add_account(0);
+        let account = fixture.account(0);
+        fixture.set_reading(&account, 10.0, false);
+        let store = fixture.store();
+        let mut file = store.load().expect("accounts");
+        file.settings.read_sessions = false;
+        store.save(&file).expect("settings saved");
+        let context = open_context(&fixture.cli(Command::Burn {
+            action: BurnAction::Plan { json: false },
+        }))
+        .expect("the context opens");
+
+        let text = burn_plan(context, false).expect("the plan is written");
+        assert!(
+            text.starts_with("reading sessions is off: no rates are learned"),
+            "{text}"
+        );
     }
 
     #[test]

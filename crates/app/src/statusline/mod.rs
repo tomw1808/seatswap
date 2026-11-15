@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use seatswap_core::api::Usage;
+use seatswap_core::burn::burn_next;
 use seatswap_core::engine::UsageCache;
 use seatswap_core::feed::{self, Feed, FeedLimit};
 use seatswap_core::paths::{self, AppPaths};
@@ -147,7 +148,9 @@ fn cached_limit(limit: &seatswap_core::api::Limit) -> Limit2 {
 /// its limits, and the branch of the session's folder. A live login that
 /// matches no stored account shows no account (and no limits from the cache);
 /// no live login at all is an error the command prints as its one line.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn facts(
+    app: &AppPaths,
     payload: &Payload,
     file: &AccountsFile,
     live: &LiveState,
@@ -219,6 +222,23 @@ pub(crate) fn facts(
         .as_ref()
         .and_then(|workspace| workspace.current_dir.as_deref())
         .and_then(|folder| git_branch(std::path::Path::new(folder)));
+    // The tray app's next account. A file it wrote names an account in this
+    // same accounts.json; an id that is no longer there is no value, never a
+    // guessed abbreviation.
+    let burn_next = match burn_next::read(app, now) {
+        Ok(Some(next)) => file
+            .accounts
+            .iter()
+            .find(|account| account.id == next.account)
+            .map(|account| (account.abbr.clone(), next.at)),
+        Ok(None) => None,
+        Err(error) => {
+            return Err(format!(
+                "cannot read {}: {error}",
+                app.burn_next_file().display()
+            ))
+        }
+    };
     Ok(Facts {
         user,
         host,
@@ -228,8 +248,7 @@ pub(crate) fn facts(
         five_hour,
         week,
         model_limits,
-        // Auto-burn is built in step B, Tasks 4–8; there is no next account yet.
-        burn_next: None,
+        burn_next,
         git_branch,
     })
 }
@@ -300,7 +319,9 @@ mod tests {
 
     use seatswap_core::api::{Limit, LimitKind, Severity};
     use seatswap_core::engine::CacheEntry;
-    use seatswap_core::store::{LoginState, StatuslineConfig};
+    use seatswap_core::store::{
+        ColorRule, LoginState, Segment, SegmentKind, StatuslineConfig, TimeFormat,
+    };
     use seatswap_core::types::OAuthAccount;
 
     const LB_ID: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
@@ -362,6 +383,9 @@ mod tests {
     #[test]
     fn the_numbers_of_another_account_are_not_shown() {
         let now = at("2026-11-14T14:00:00.336716Z");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data = tmp.path().join("data");
+        let app = AppPaths::at(&data);
         let lb_reset = at("2026-11-16T17:00:00.336716Z");
         let ac_reset = at("2026-11-16T02:00:00.336716Z");
         let mut file = AccountsFile::default();
@@ -395,6 +419,7 @@ mod tests {
         );
 
         let facts = facts(
+            &app,
             &payload,
             &file,
             &LiveState::Known {
@@ -427,6 +452,9 @@ mod tests {
     #[test]
     fn the_live_accounts_feed_is_shown_merged() {
         let now = at("2026-11-14T14:00:00.336716Z");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data = tmp.path().join("data");
+        let app = AppPaths::at(&data);
         let ac_reset = at("2026-11-16T02:00:00.336716Z");
         let session_reset = at("2026-11-14T19:30:00.336716Z");
         let mut file = AccountsFile::default();
@@ -450,6 +478,7 @@ mod tests {
         );
 
         let facts = facts(
+            &app,
             &payload,
             &file,
             &LiveState::Known {
@@ -476,6 +505,95 @@ mod tests {
             "the newer week is on the line: {line}"
         );
         assert!(!line.contains("40%"), "the cached week is replaced: {line}");
+    }
+
+    #[test]
+    fn the_auto_burn_segment_shows_the_next_account() {
+        let now = at("2026-11-14T14:00:00Z");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data = tmp.path().join("data");
+        let app = AppPaths::at(&data);
+        let mut file = AccountsFile::default();
+        file.accounts.push(account(AC_ID, "AC", AC_UUID));
+        let switch_at = at("2026-11-14T16:05:00Z");
+        burn_next::write(
+            &app,
+            &burn_next::BurnNext {
+                account: AC_ID.to_string(),
+                at: switch_at,
+                written: now,
+            },
+        )
+        .expect("burn-next.json");
+
+        let payload = parse(README_PAYLOAD.as_bytes());
+        let facts = facts(
+            &app,
+            &payload,
+            &file,
+            &LiveState::Known {
+                account_id: AC_ID.to_string(),
+            },
+            &UsageCache::default(),
+            std::path::Path::new("/home/sam"),
+            "sam".to_string(),
+            now,
+        )
+        .expect("the facts of the live account");
+        assert_eq!(facts.burn_next, Some(("AC".to_string(), switch_at)));
+
+        let config = StatuslineConfig {
+            left: Vec::new(),
+            right: vec![Segment {
+                kind: SegmentKind::AutoBurn,
+                color: ColorRule::None,
+                prefix: String::new(),
+                suffix: String::new(),
+                drop: None,
+                time_format: Some(TimeFormat::Seatswap),
+                text: None,
+            }],
+            margin: 0,
+        };
+        assert_eq!(
+            render::render(&config, &payload, &facts, None, &Utc),
+            "AC 2h05m"
+        );
+    }
+
+    #[test]
+    fn an_old_next_file_shows_nothing() {
+        let now = at("2026-11-14T14:00:00Z");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data = tmp.path().join("data");
+        let app = AppPaths::at(&data);
+        let mut file = AccountsFile::default();
+        file.accounts.push(account(AC_ID, "AC", AC_UUID));
+        burn_next::write(
+            &app,
+            &burn_next::BurnNext {
+                account: AC_ID.to_string(),
+                at: now + chrono::Duration::hours(2),
+                written: now - chrono::Duration::minutes(21),
+            },
+        )
+        .expect("burn-next.json");
+
+        let payload = parse(README_PAYLOAD.as_bytes());
+        let facts = facts(
+            &app,
+            &payload,
+            &file,
+            &LiveState::Known {
+                account_id: AC_ID.to_string(),
+            },
+            &UsageCache::default(),
+            std::path::Path::new("/home/sam"),
+            "sam".to_string(),
+            now,
+        )
+        .expect("the facts of the live account");
+        assert_eq!(facts.burn_next, None, "the tray app is not running");
     }
 
     #[test]

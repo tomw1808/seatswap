@@ -29,7 +29,8 @@ All notable changes to this project are documented here. The format follows
 ### Changed
 - A per-model limit blocks an account only while a session on that model is open.
 - `seatswap status --json`: `suggestion` has a new shape, `{toId, text}` instead of the old
-  account id, so the target and the whole sentence are both there.
+  `{fromId, toId, fromPercent, toPercent, fromResetsAt}`, so the target and the whole sentence are
+  both there.
 
 ### Removed
 - Settings `suggestAt` and `suggestTargetBelow`: the fixed 90 % / 50 % suggestion is replaced by

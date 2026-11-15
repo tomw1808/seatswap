@@ -3,22 +3,26 @@
 //! words come from [`crate::burn_text`]; the reading and the inputs come from
 //! `seatswap_core::burn::live`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
 use chrono::{DateTime, Duration, FixedOffset, Utc};
 use serde::Serialize;
 
-use seatswap_core::burn::decide::{decide, regime, Decision, Regime, Situation};
+use seatswap_core::burn::burn_next::{self, BurnNext};
+use seatswap_core::burn::decide::{Decision, Regime, RegimeWhy, Situation};
 use seatswap_core::burn::live::{self, Learned, Readiness};
-use seatswap_core::burn::plan::{follow, rates_known, Plan, Policy};
-use seatswap_core::burn::{FRESH_MIN, SWITCH_RELEARN_MIN};
+use seatswap_core::burn::plan::{rates_known, Plan};
+use seatswap_core::burn::{
+    FRESH_MIN, LEARN_RETRY_MIN, STALE_ASK_SECS, SWITCH_RELEARN_MIN, SWITCH_RETRY_MIN,
+};
 use seatswap_core::engine::{AccountView, PollReason};
 use seatswap_core::history::{AccountRef, By, EventKind, HistoryDir};
+use seatswap_core::paths::AppPaths;
 use seatswap_core::store::{Account, Settings};
 use seatswap_core::switcher::UnsavedPolicy;
 
-use super::worker::{ActionCommand, ActionReply, EngineCommand};
+use super::worker::{ActionCommand, ActionReply, EngineCommand, PrintedWarnings};
 use crate::burn_text::{self, SwitchSuggestion};
 
 /// A switch that is waiting for a quiet moment; the panel shows its latest
@@ -49,6 +53,7 @@ pub(crate) struct BurnView {
 
 /// One snapshot's worth of inputs for [`BurnRuntime::after_snapshot`].
 pub(crate) struct BurnTick<'a> {
+    pub app: &'a AppPaths,
     pub history: Option<&'a HistoryDir>,
     pub views: &'a [AccountView],
     pub accounts: &'a [Account],
@@ -82,13 +87,6 @@ struct SentSwitch {
     error: Option<String>,
 }
 
-/// The longest age of a reading that still allows a decision (spec §2.5).
-const STALE_ASK_SECS: i64 = 60;
-/// A failed history read is tried again this many minutes later.
-const LEARN_RETRY_MIN: i64 = 5;
-/// The same switch decision is sent again after this many minutes.
-const SWITCH_RETRY_MIN: i64 = 10;
-
 pub(crate) struct BurnRuntime {
     learned: Option<Learned>,
     /// The last learn attempt and whether it failed; a failure is retried after
@@ -110,7 +108,10 @@ pub(crate) struct BurnRuntime {
     /// The time of the last stale poll ask (at most one per [`STALE_ASK_SECS`]).
     last_stale_ask: Option<DateTime<Utc>>,
     view: Option<BurnView>,
-    warned: BTreeSet<String>,
+    printed_warnings: PrintedWarnings,
+    /// The `burn-next.json` content this runtime wrote last, or `None` when
+    /// it removed the file (or never wrote it in this run).
+    next_written: Option<BurnNext>,
     force_learn: bool,
     action: Sender<ActionCommand>,
     engine: Sender<EngineCommand>,
@@ -132,7 +133,8 @@ impl BurnRuntime {
             last_sent: None,
             last_stale_ask: None,
             view: None,
-            warned: BTreeSet::new(),
+            printed_warnings: PrintedWarnings::new(),
+            next_written: None,
             force_learn: false,
             action,
             engine,
@@ -152,6 +154,11 @@ impl BurnRuntime {
 
     fn tick(&mut self, tick: &BurnTick<'_>) -> BurnReport {
         let mut report = BurnReport::default();
+        if !tick.settings.auto_burn {
+            if let Some(error) = self.clear_next(tick.app) {
+                append_error(&mut report, error);
+            }
+        }
         self.read_switch_reply(tick.views, &mut report);
 
         let failed_due = self.learn_error.is_some()
@@ -180,11 +187,9 @@ impl BurnRuntime {
                     tick.settings.read_sessions,
                 ) {
                     Ok(learned) => {
-                        for warning in &learned.warnings {
-                            if self.warned.insert(warning.clone()) {
-                                report.warnings.push(warning.clone());
-                            }
-                        }
+                        report
+                            .warnings
+                            .extend(self.printed_warnings.new_texts(&learned.warnings));
                         self.learned = Some(learned);
                         self.learn_error = None;
                     }
@@ -198,11 +203,8 @@ impl BurnRuntime {
                 }
             }
         }
-        if let Some(error) = &self.learn_error {
-            report.error = Some(match report.error.take() {
-                Some(previous) => format!("{previous}; {error}"),
-                None => error.clone(),
-            });
+        if let Some(error) = self.learn_error.clone() {
+            append_error(&mut report, error);
         }
 
         let Some(learned) = &self.learned else {
@@ -226,14 +228,28 @@ impl BurnRuntime {
         let situation = match readiness {
             Readiness::Ready(situation) => situation,
             Readiness::Unread { accounts } => {
+                let mut view = waiting_view(tick.settings, accounts.clone());
+                match burn_text::unread_line(tick.views, &accounts) {
+                    Ok(line) => view.line = Some(line),
+                    Err(error) => append_error(&mut report, text_error(error)),
+                }
+                self.view = Some(view.clone());
+                report.view = Some(view);
                 // The same behaviour as `Decision::Stale`: poll, never switch.
-                let _ = accounts;
                 self.ask_stale(tick.now);
+                if let Some(error) = self.clear_next(tick.app) {
+                    append_error(&mut report, error);
+                }
                 return report;
             }
             Readiness::NoAccounts => {
-                // Nothing to decide from: no view at all.
-                self.view = None;
+                let mut view = waiting_view(tick.settings, Vec::new());
+                view.line = Some(burn_text::no_accounts_line().to_string());
+                self.view = Some(view.clone());
+                report.view = Some(view);
+                if let Some(error) = self.clear_next(tick.app) {
+                    append_error(&mut report, error);
+                }
                 return report;
             }
         };
@@ -246,19 +262,32 @@ impl BurnRuntime {
                     .regime_at
                     .is_none_or(|at| tick.now - at >= Duration::hours(1))
                 || self.regime_basis.as_ref() != Some(&basis));
+        let cached_regime = if regime_due {
+            None
+        } else {
+            self.regime.as_ref()
+        };
+        if !fresh && cached_regime.is_none() {
+            self.ask_stale(tick.now);
+            return report;
+        }
+        let assessment = live::assess(situation, cached_regime);
         if regime_due {
-            self.regime = Some(regime(&situation));
+            self.regime = Some(assessment.regime.clone());
             self.regime_at = Some(tick.now);
             self.regime_basis = Some(basis);
         }
-        let Some(regime) = self.regime.clone() else {
-            if !fresh {
-                self.ask_stale(tick.now);
-            }
-            return report;
-        };
-        let decision = decide(&situation, &regime);
-        let plan = follow(&situation.inputs, Policy::Lazy);
+        let live::Assessment {
+            situation,
+            regime,
+            decision,
+            plan,
+            next,
+        } = assessment;
+        if let Some(error) = self.publish_next(tick, &situation, &decision, &plan, next.as_deref())
+        {
+            append_error(&mut report, error);
+        }
         let outcome = self.apply_decision(
             decision,
             &situation,
@@ -270,6 +299,71 @@ impl BurnRuntime {
             tick.offset,
         );
         merge(report, outcome)
+    }
+
+    /// Write or remove `<data>/burn-next.json` for the status line (spec §7.6).
+    /// `None` is success; `Some` is the error the snapshot shows. The file is
+    /// rewritten when the account or time changes, and at least every
+    /// [`burn_next::REWRITE_AFTER_MIN`] minutes as the tray app's heartbeat.
+    fn publish_next(
+        &mut self,
+        tick: &BurnTick<'_>,
+        situation: &Situation,
+        decision: &Decision,
+        plan: &Plan,
+        next: Option<&str>,
+    ) -> Option<String> {
+        let paused = situation
+            .manual_hold_until
+            .is_some_and(|until| until > tick.now);
+        let desired = if tick.settings.auto_burn && !paused {
+            planned_next(decision, plan, next, tick.now)
+        } else {
+            None
+        };
+        let Some((account, at)) = desired else {
+            return self.clear_next(tick.app);
+        };
+        let due = match &self.next_written {
+            Some(previous) => {
+                previous.account != account
+                    || previous.at != at
+                    || tick.now - previous.written
+                        >= Duration::minutes(burn_next::REWRITE_AFTER_MIN)
+            }
+            None => true,
+        };
+        if !due {
+            return None;
+        }
+        let document = BurnNext {
+            account,
+            at,
+            written: tick.now,
+        };
+        match burn_next::write(tick.app, &document) {
+            Ok(()) => {
+                self.next_written = Some(document);
+                None
+            }
+            Err(error) => Some(format!(
+                "auto-burn: cannot write {}: {error}",
+                tick.app.burn_next_file().display()
+            )),
+        }
+    }
+
+    /// Remove the status line's next account and forget it. `None` is success;
+    /// `Some` is the error the snapshot shows.
+    fn clear_next(&mut self, app: &AppPaths) -> Option<String> {
+        self.next_written = None;
+        match burn_next::remove(app) {
+            Ok(()) => None,
+            Err(error) => Some(format!(
+                "auto-burn: cannot remove {}: {error}",
+                app.burn_next_file().display()
+            )),
+        }
     }
 
     /// Read the switch's reply, if one arrived: the notification after it
@@ -365,10 +459,15 @@ impl BurnRuntime {
         now: DateTime<Utc>,
         offset: FixedOffset,
     ) -> BurnReport {
-        let decision = decide(situation, regime);
-        let plan = follow(&situation.inputs, Policy::Lazy);
+        let live::Assessment {
+            situation,
+            regime,
+            decision,
+            plan,
+            ..
+        } = live::assess(situation.clone(), Some(regime));
         self.apply_decision(
-            decision, situation, &plan, regime, views, settings, now, offset,
+            decision, &situation, &plan, &regime, views, settings, now, offset,
         )
     }
 
@@ -404,11 +503,7 @@ impl BurnRuntime {
             on: settings.auto_burn,
             paused_until: situation.manual_hold_until.filter(|until| *until > now),
             early: regime.early,
-            why: if settings.read_sessions {
-                burn_text::why(regime.why).to_string()
-            } else {
-                "reading sessions is off: no rates are learned".to_string()
-            },
+            why: burn_text::why(regime.why).to_string(),
             learning: learning.clone(),
             line,
             planned: burn_text::planned(plan, active),
@@ -529,6 +624,54 @@ fn newest_switch_target(learned: &Learned, now: DateTime<Utc>) -> Option<&Accoun
         })
         .max_by_key(|(at, _)| *at)
         .map(|(_, to)| to)
+}
+
+/// A view with no decision behind it: the strip keeps its switch and Pause and
+/// shows `line` (spec §7.4.6's unread and no-account cases).
+fn waiting_view(settings: &Settings, learning: Vec<String>) -> BurnView {
+    BurnView {
+        on: settings.auto_burn,
+        paused_until: None,
+        early: false,
+        why: burn_text::why(RegimeWhy::Learning).to_string(),
+        learning,
+        line: None,
+        planned: BTreeMap::new(),
+        waiting: None,
+        suggestion: None,
+    }
+}
+
+/// The next account and when its switch is planned: now for a switch, the
+/// waiting switch's latest time, or the first future use of the plan's next
+/// account.
+fn planned_next(
+    decision: &Decision,
+    plan: &Plan,
+    next: Option<&str>,
+    now: DateTime<Utc>,
+) -> Option<(String, DateTime<Utc>)> {
+    match decision {
+        Decision::Switch { to, .. } => Some((to.clone(), now)),
+        Decision::Wait { to, latest, .. } => Some((to.clone(), *latest)),
+        Decision::Stay | Decision::Stale | Decision::AllFull { .. } => {
+            let id = next?;
+            let at = plan
+                .segments
+                .iter()
+                .find(|segment| segment.account.as_deref() == Some(id))?
+                .from;
+            Some((id.to_string(), at))
+        }
+    }
+}
+
+/// Add `error` to the report's error, joined with an earlier one.
+fn append_error(report: &mut BurnReport, error: String) {
+    report.error = Some(match report.error.take() {
+        Some(previous) => format!("{previous}; {error}"),
+        None => error,
+    });
 }
 
 fn text_error(error: burn_text::TextError) -> String {
@@ -700,6 +843,7 @@ mod tests {
             manual_hold_until: None,
             tied_busy: 0,
             oldest_reading: now - Duration::minutes(1),
+            sessions_off: false,
         }
     }
 
@@ -769,6 +913,7 @@ mod tests {
         let now = utc("2026-11-10T12:00:00Z");
         let tmp = tempfile::tempdir().expect("a temp folder");
         let history = HistoryDir::at(tmp.path(), "atlas");
+        let app = AppPaths::at(tmp.path());
         let (action_tx, action_rx) = mpsc::channel();
         let (engine_tx, _engine_rx) = mpsc::channel();
         let mut runtime = BurnRuntime::new(action_tx, engine_tx);
@@ -785,6 +930,7 @@ mod tests {
             ..Settings::default()
         };
         let tick = BurnTick {
+            app: &app,
             history: Some(&history),
             views: &views,
             accounts: &accounts,
@@ -948,6 +1094,7 @@ mod tests {
         let now = utc("2026-11-10T12:00:00Z");
         let tmp = tempfile::tempdir().expect("a temp folder");
         let history = HistoryDir::at(tmp.path(), "atlas");
+        let app = AppPaths::at(tmp.path());
         let (mut runtime, action, _engine) = runtime();
         let accounts = vec![
             account("pr", "PR", PR_ACC, true),
@@ -966,6 +1113,7 @@ mod tests {
             ..Settings::default()
         };
         let tick = BurnTick {
+            app: &app,
             history: Some(&history),
             views: &views,
             accounts: &accounts,
@@ -991,6 +1139,7 @@ mod tests {
         let now = utc("2026-11-10T12:00:00Z");
         let tmp = tempfile::tempdir().expect("a temp folder");
         let history = HistoryDir::at(tmp.path(), "atlas");
+        let app = AppPaths::at(tmp.path());
         let (mut runtime, _action, engine) = runtime();
         let accounts = vec![
             account("pr", "PR", PR_ACC, true),
@@ -1005,6 +1154,7 @@ mod tests {
             ..Settings::default()
         };
         let tick = |at: DateTime<Utc>| BurnTick {
+            app: &app,
             history: Some(&history),
             views: &views,
             accounts: &accounts,
@@ -1036,6 +1186,7 @@ mod tests {
         let now = utc("2026-11-10T12:00:00Z");
         let tmp = tempfile::tempdir().expect("a temp folder");
         let history = HistoryDir::at(tmp.path(), "atlas");
+        let app = AppPaths::at(tmp.path());
         let (mut runtime, action, engine) = runtime();
         let accounts = vec![
             account("pr", "PR", PR_ACC, true),
@@ -1053,6 +1204,7 @@ mod tests {
             no_reading,
         ];
         let first_tick = BurnTick {
+            app: &app,
             history: Some(&history),
             views: &first,
             accounts: &accounts,
@@ -1063,7 +1215,13 @@ mod tests {
             tied_busy: 0,
         };
         let first_report = runtime.after_snapshot(&first_tick);
-        assert!(first_report.view.is_none(), "unread shows no view");
+        let burn_view = first_report.view.expect("unread keeps the strip");
+        assert_eq!(
+            burn_view.line.as_deref(),
+            Some("Waiting for a first reading of AC."),
+            "the strip says which account is unread"
+        );
+        assert!(burn_view.on, "the switch stays usable");
         assert!(matches!(
             engine.try_recv().expect("a poll"),
             EngineCommand::Poll(PollReason::Stale)
@@ -1074,6 +1232,7 @@ mod tests {
             view("ac", "AC", 10.0, false, now),
         ];
         let second_tick = BurnTick {
+            app: &app,
             history: Some(&history),
             views: &second,
             accounts: &accounts,
@@ -1101,6 +1260,7 @@ mod tests {
         let root = tmp.path().join("history");
         std::fs::write(&root, b"not a history folder").expect("a file where the root belongs");
         let history = HistoryDir::at(&root, "atlas");
+        let app = AppPaths::at(tmp.path());
         let (mut runtime, _action, _engine) = runtime();
         let accounts = vec![
             account("pr", "PR", PR_ACC, true),
@@ -1115,6 +1275,7 @@ mod tests {
             ..Settings::default()
         };
         let tick = |at: DateTime<Utc>| BurnTick {
+            app: &app,
             history: Some(&history),
             views: &views,
             accounts: &accounts,
@@ -1147,6 +1308,7 @@ mod tests {
         let now = utc("2026-11-10T12:00:00Z");
         let tmp = tempfile::tempdir().expect("a temp folder");
         let history = HistoryDir::at(tmp.path(), "atlas");
+        let app = AppPaths::at(tmp.path());
         let (mut runtime, action, _engine) = runtime();
         let accounts = vec![
             account("pr", "PR", PR_ACC, true),
@@ -1161,6 +1323,7 @@ mod tests {
             ..Settings::default()
         };
         let tick = |at: DateTime<Utc>| BurnTick {
+            app: &app,
             history: Some(&history),
             views: &views,
             accounts: &accounts,
@@ -1201,6 +1364,7 @@ mod tests {
         let now = utc("2026-11-10T12:00:00Z");
         let tmp = tempfile::tempdir().expect("a temp folder");
         let history = HistoryDir::at(tmp.path(), "atlas");
+        let app = AppPaths::at(tmp.path());
         let (mut runtime, action, _engine) = runtime();
         let accounts = vec![
             account("pr", "PR", PR_ACC, true),
@@ -1215,6 +1379,7 @@ mod tests {
             ..Settings::default()
         };
         let tick = |at: DateTime<Utc>| BurnTick {
+            app: &app,
             history: Some(&history),
             views: &views,
             accounts: &accounts,
@@ -1288,6 +1453,7 @@ mod tests {
             warnings: Vec::new(),
             events: vec![event],
             host: "atlas".to_string(),
+            sessions_off: false,
         };
         let views = vec![
             view("pr", "PR", 10.0, true, now - Duration::minutes(1)),
@@ -1408,6 +1574,7 @@ mod tests {
         let now = utc("2026-11-10T12:00:00Z");
         let tmp = tempfile::tempdir().expect("a temp folder");
         let history = HistoryDir::at(tmp.path(), "atlas");
+        let app = AppPaths::at(tmp.path());
         let (mut runtime, action, _engine) = runtime();
         let accounts = vec![
             account("pr", "PR", PR_ACC, true),
@@ -1422,6 +1589,7 @@ mod tests {
             ..Settings::default()
         };
         let tick = |at: DateTime<Utc>, active: &'static str| BurnTick {
+            app: &app,
             history: Some(&history),
             views: &views,
             accounts: &accounts,
@@ -1500,6 +1668,7 @@ mod tests {
         let now = utc("2026-11-10T12:00:00Z");
         let tmp = tempfile::tempdir().expect("a temp folder");
         let history = HistoryDir::at(tmp.path(), "atlas");
+        let app = AppPaths::at(tmp.path());
         let (mut runtime, _action, engine) = runtime();
         let accounts = vec![
             account("pr", "PR", PR_ACC, true),
@@ -1514,6 +1683,7 @@ mod tests {
             ..Settings::default()
         };
         let tick = BurnTick {
+            app: &app,
             history: Some(&history),
             views: &views,
             accounts: &accounts,
@@ -1537,6 +1707,7 @@ mod tests {
         let now = utc("2026-11-10T12:00:00Z");
         let tmp = tempfile::tempdir().expect("a temp folder");
         let history = HistoryDir::at(tmp.path(), "atlas");
+        let app = AppPaths::at(tmp.path());
         let (mut runtime, _action, _engine) = runtime();
         let mut accounts = vec![
             account("pr", "PR", PR_ACC, true),
@@ -1551,6 +1722,7 @@ mod tests {
             ..Settings::default()
         };
         let first = BurnTick {
+            app: &app,
             history: Some(&history),
             views: &views,
             accounts: &accounts,
@@ -1565,6 +1737,7 @@ mod tests {
 
         accounts[1].auto_burn = true;
         let second = BurnTick {
+            app: &app,
             history: Some(&history),
             views: &views,
             accounts: &accounts,
@@ -1587,6 +1760,7 @@ mod tests {
         let now = utc("2026-11-10T12:00:00Z");
         let tmp = tempfile::tempdir().expect("a temp folder");
         let history = HistoryDir::at(tmp.path(), "atlas");
+        let app = AppPaths::at(tmp.path());
         let recorder = Recorder::new(HistoryDir::at(history.root(), history.host()));
         let accounts = vec![
             account("pr", "PR", PR_ACC, true),
@@ -1616,6 +1790,7 @@ mod tests {
             ..Settings::default()
         };
         let tick = |at: DateTime<Utc>| BurnTick {
+            app: &app,
             history: Some(&history),
             views: &views,
             accounts: &accounts,
@@ -1652,5 +1827,93 @@ mod tests {
             Some(&AccountRef::of(&accounts[1])),
             "the event that landed late is learned at the next tick"
         );
+    }
+
+    #[test]
+    fn an_unread_account_keeps_the_strip_and_says_why() {
+        let now = utc("2026-11-10T12:00:00Z");
+        let tmp = tempfile::tempdir().expect("a temp folder");
+        let history = HistoryDir::at(tmp.path(), "atlas");
+        let app = AppPaths::at(tmp.path());
+        let (mut runtime, _action, _engine) = runtime();
+        let accounts = vec![
+            account("lb", "LB", PR_ACC, true),
+            account("ac", "AC", AC_ACC, true),
+        ];
+        let mut lb = view("lb", "LB", 20.0, false, now);
+        lb.usage = None;
+        lb.fetched_at = None;
+        let mut ac = view("ac", "AC", 10.0, true, now);
+        ac.usage = None;
+        ac.fetched_at = None;
+        let views = vec![lb, ac];
+        let settings = Settings {
+            auto_burn: true,
+            ..Settings::default()
+        };
+        let tick = BurnTick {
+            app: &app,
+            history: Some(&history),
+            views: &views,
+            accounts: &accounts,
+            settings: &settings,
+            active: None,
+            now,
+            offset: offset(),
+            tied_busy: 0,
+        };
+
+        let report = runtime.after_snapshot(&tick);
+        let view = report.view.expect("the strip stays for an unread account");
+        assert!(view.on, "the auto-burn switch still works");
+        assert_eq!(
+            view.line.as_deref(),
+            Some("Waiting for a first reading of LB, AC."),
+            "the strip names the unread accounts in account order"
+        );
+    }
+
+    #[test]
+    fn the_next_account_is_written_for_the_status_line() {
+        let now = utc("2026-11-10T12:00:00Z");
+        let tmp = tempfile::tempdir().expect("a temp folder");
+        let history = HistoryDir::at(tmp.path(), "atlas");
+        let app = AppPaths::at(tmp.path());
+        let (mut runtime, action, _engine) = runtime();
+        let accounts = vec![
+            account("pr", "PR", PR_ACC, true),
+            account("ac", "AC", AC_ACC, true),
+        ];
+        let views = vec![
+            view("pr", "PR", 100.0, false, now - Duration::minutes(1)),
+            view("ac", "AC", 10.0, true, now - Duration::minutes(1)),
+        ];
+        let settings = Settings {
+            auto_burn: true,
+            ..Settings::default()
+        };
+        let tick = BurnTick {
+            app: &app,
+            history: Some(&history),
+            views: &views,
+            accounts: &accounts,
+            settings: &settings,
+            active: Some("pr"),
+            now,
+            offset: offset(),
+            tied_busy: 0,
+        };
+
+        runtime.after_snapshot(&tick);
+        match action.try_recv().expect("the switch") {
+            ActionCommand::Switch { key, .. } => assert_eq!(key, "ac"),
+            _ => panic!("not a switch"),
+        }
+        let written = burn_next::read(&app, now)
+            .expect("burn-next.json is readable")
+            .expect("the next account is written");
+        assert_eq!(written.account, "ac");
+        assert_eq!(written.at, now, "the switch is planned now");
+        assert_eq!(written.written, now);
     }
 }

@@ -221,9 +221,6 @@ pub(crate) enum EngineCommand {
     /// is tied to the account (spec §2.11).
     ModelsInUse {
         models: Option<BTreeSet<String>>,
-        /// Kept for the pop-up's tied count; burn only needs the busy ones.
-        #[allow(dead_code)]
-        tied: u32,
         tied_busy: u32,
     },
     /// A pause or resume was written to the history; learn it before deciding.
@@ -866,6 +863,7 @@ impl EngineRuntime {
             .and_then(|engine| engine.recorder())
             .map(|recorder| recorder.dir());
         let tick = BurnTick {
+            app: &self.app,
             history,
             views: &self.snapshot.views,
             accounts: &accounts,
@@ -1444,12 +1442,12 @@ fn settings_change_event(previous: &Settings, next: &Settings) -> Option<EventKi
 /// file is read again at every live-account change, so its torn lines would
 /// otherwise be printed again each time.
 #[derive(Debug, Default)]
-struct PrintedWarnings {
+pub(crate) struct PrintedWarnings {
     seen: BTreeSet<String>,
 }
 
 impl PrintedWarnings {
-    fn new() -> PrintedWarnings {
+    pub(crate) fn new() -> PrintedWarnings {
         PrintedWarnings {
             seen: BTreeSet::new(),
         }
@@ -1457,7 +1455,7 @@ impl PrintedWarnings {
 
     /// The warnings in `warnings` this run has not printed yet; they are
     /// remembered so the next call returns none of them.
-    fn new_texts(&mut self, warnings: &[String]) -> Vec<String> {
+    pub(crate) fn new_texts(&mut self, warnings: &[String]) -> Vec<String> {
         let mut texts = Vec::new();
         for warning in warnings {
             if self.seen.insert(warning.clone()) {
