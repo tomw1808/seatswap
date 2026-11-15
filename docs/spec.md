@@ -2,7 +2,7 @@
 name: seatswap — specification
 status: Draft
 created: 2026-11-10
-updated: 2026-11-11
+updated: 2026-11-15
 tags: [seatswap, spec, claude-code, tray, linux, macos, windows]
 ---
 
@@ -39,11 +39,12 @@ The endpoints are undocumented and belong to Claude Code's own login. Anthropic 
 5. Give each account a short label of one or two characters, and a colour.
 6. Run on Linux (as many desktops as possible), macOS and Windows.
 7. Show when every account's login ends and warn in good time before it does. A login has a fixed end date that nothing can move (see §6.3).
+8. Switch by itself, when auto-burn is switched on, so that as little work as possible is blocked, and say what it would do when it is off (see §7.4).
 
 **Non-goals (v1)**
 - Switching the **Claude Desktop** app. Its login is a Chromium cookie, stored encrypted in `~/.config/Claude` (Linux) or the matching folder elsewhere, so swapping files is not reliable there. Revisit later (see §12).
 - Switching claude.ai in the browser. Browser profiles already do that.
-- Choosing the account automatically. v1 only *suggests* a switch (see §7.4).
+- Choosing the account automatically **without being asked**. Auto-burn is a switch (§7.4); off, seatswap only *suggests* a switch.
 - API-key accounts (Console billing). Only subscription logins (Pro, Max, Team, Enterprise) in v1.
 - A different account per terminal. A switch is global: every Claude Code session on the machine follows it (§6.5). Claude Code has a built-in way to pin one terminal to one account (`claude setup-token` makes a 1-year token, used through the `CLAUDE_CODE_OAUTH_TOKEN` variable). Those tokens only carry the `user:inference` permission *(code)*, so the usage display would most likely not work with them. Not part of v1.
 
@@ -396,6 +397,7 @@ What the settings page says about the two switches:
 - On an HTTP 429 or 5xx, back off exponentially up to 30 min and show the time of the last fetch.
 - On a 401: for the active account, read the live file again (Claude Code may have renewed it). For an inactive account, refresh (§6.3).
 - An account that a limit blocks is polled once 30 s after that limit's reset time, whatever its interval, so a notification does not wait for the 15-minute poll of inactive accounts.
+- While the active account's binding limit is at 90 % or more and below 100 %, it is polled every 30 s; at 100 % the reset poll above applies. The status line's feed (§7.6) can make the numbers newer still, without a request.
 - No polling while the machine sleeps. Poll once on wake.
 
 ### 7.2 What the app derives from the response
@@ -419,12 +421,112 @@ For each account it shows:
 | ≥ 90 % or `severity: critical` | red `#ef4444` | about to hit the limit |
 | 100 % / locked | red + lock glyph | limit reached, shows the time until reset |
 
-### 7.4 Switch suggestion
+### 7.4 Auto-burn and switch suggestions
 
-- When the active account's binding limit crosses **90 %** (setting) and another account is under **50 %**, send a desktop notification: "AC is at 97 % (resets 14:40). Switch to P (12 %)?" with a [Switch] action.
-- If the platform's notifications don't support actions, clicking the notification opens the pop-up.
-- A click on the notification's text opens the pop-up. A notification that times out or is dismissed does nothing.
-- One notification per account per reset window.
+Auto-burn is one switch, `autoBurn`, off by default. On, seatswap switches by itself; off, with
+`suggestSwitches` on (default), it says what it would do and why, with a [Switch] button. There are
+no modes and no tuning settings: every threshold is a constant in the code (see below and
+`docs/implementation.md`).
+
+| # | Trigger | What happens |
+|---|---|---|
+| S1 | The active account is blocked, or there is none | switch at once to the usable account with the least slack |
+| S2 | Another usable account has clearly less slack | only while early switching is on: switch to it at a quiet moment (below) |
+| S3 | Nothing is usable | no switch; the "All accounts are full" notification of §7.5, and the reset poll of §7.1 |
+
+- **Blocked** means the week or the 5 h window is at 100 % or more, the login has ended, or a
+  per-model limit at 100 % blocks the account while a session on that model is open (§7.2).
+- **Least slack** is the work the account can still take before its weekly reset minus the work
+  needed to empty it. A capped account can only take a window's worth at a time, so its remaining
+  5 h windows count, not just its percent. An account whose rates are not learned yet is played
+  like one without rates: the fixed order is used instead, capped accounts with an open window
+  first, then the others, each by the earlier weekly reset and then the account id.
+- **S2** needs another usable account whose slack is at least 2 typical working hours below the
+  active account's, and at least 30 minutes since the last switch of any kind. It switches only
+  when the expected saved hours are worth it (below).
+- **Seeing 100 % quickly:** the active account is polled every 30 s while its binding limit is at
+  90 % or more and below 100 % (§7.1), and the status line feed (§7.6) brings the live numbers
+  without a request.
+- An account with `autoBurn` off is never a target and is never suggested. When it is the active
+  account and gets blocked, S1 still leaves it (§7.4.4). While such an account is not blocked,
+  auto-burn stays on it: S3 is reached only when the active account is blocked (or there is none)
+  and `choose` finds no usable account. An active account auto-burn may not use is also not a
+  reason for S2.
+
+#### 7.4.1 The regime
+
+Once an hour seatswap plans the next 7 days twice: the **lazy** plan stays on an account until it
+is blocked and then takes the one with the least slack; the **eager** plan also takes the usable
+account with the least slack when it has at least 2 typical working hours less slack, with at most
+one switch per 30 minutes. Early switching (S2) is on only when all of these hold:
+
+- every account auto-burn may use has learned rates, and the rhythm has a typical working hour;
+- the measured cost of a switch has at least 3 samples;
+- the eager plan blocks at least 0.5 typical working hours less than the lazy plan;
+- those saved hours are at least twice the extra switches' cost (extra switches × the measured
+  cost of one switch, in working hours).
+
+While any of these is missing, auto-burn switches only when the active account is full. The
+regime's words are `learning`, `no switch measured yet`, `switching before 100 % does not pay` or
+`switching before 100 % pays`.
+
+#### 7.4.2 Quiet moments
+
+A switch makes a running session send its conversation again, and on some models it continues
+without its earlier thinking (`thinking_tied` in `docs/implementation.md`). S2 therefore waits
+while sessions on such a model are busy: the decision is a *waiting switch* to the target, with the
+latest time at which the rhythm's work from now reaches the target's slack (the end of the 7-day
+horizon when it never does). The pop-up
+shows `A switch to AC is waiting: 2 sessions on a model that would lose its thinking are busy. At
+the latest 18:40.` and the switch happens when those sessions are no longer busy, or at the latest
+time. A target with no slack left is switched to at once instead of waiting. S1 and S3 never wait.
+With `readSessions` off there is no session count and S2 does not wait.
+
+#### 7.4.3 Working by hand
+
+- **Manual switch while auto-burn is on.** A switch by a person (`seatswap use`, `next` or the
+  pop-up) holds S2 back for 4 hours, or until the account switched to is blocked, whichever comes
+  first. S1 is not held back.
+- **Pause.** "Pause 4 h" in the pop-up writes an `autoBurn` event with `pausedUntil`; "Resume"
+  writes one with no end. The pop-up shows `Auto-burn paused until 18:10 · Resume`. A pause holds
+  S2 like a manual switch; a resume also ends a manual hold. Turning `autoBurn` on or off in the
+  settings writes `autoBurnSet`, which is neither a pause nor a resume and leaves both alone.
+
+#### 7.4.4 Per account
+
+An account carries `autoBurn` ("Auto-burn may use this account"), default on. Off, auto-burn never
+switches to it and never suggests it. If it is the active account and gets blocked, S1 still
+leaves it; if every other account is also unusable, S3 applies.
+
+#### 7.4.5 The texts
+
+Times are local `HH:MM`, or `Mon HH:MM` when not today; durations are `35m`, `2h`, `2h05m`,
+`1d3h`.
+
+- **The line under the switch:** `On PR until its week is full, about 2h. Then AC.`, `On AC until
+  its 5 h window is full, about 1h30m. Then LB.`, `On PR. No switch planned this week.` While
+  rates are missing: `Learning how fast AC, LB are used. Until then: switch only when full.`
+- **An automatic switch** (when `notifyOnSwitch` is on): `Auto-burn: now on PR. AC is full until
+  14:40.` or `Auto-burn: now on PR: its week resets on Mon 02:00.`
+- **A suggestion** (auto-burn off): `Switch to AC now: its 5 h window is open and its week resets
+  on Mon 02:00.` When the lazy plan expects more than 1 % of the target's week to be left unused
+  at its reset, it adds ` Staying on PR is expected to let 12 % of AC expire.` The pop-up shows
+  the same sentence and a [Switch] button; the desktop notification is sent once per target and
+  hour.
+- **The reason of a switch:** `AC is full until 14:40`, `its 5 h window is open and its week
+  resets on Mon 02:00`, `its week resets on Mon 02:00`, or `no account was in use`.
+- While auto-burn is on, no suggestions are sent: it would ask for what auto-burn does anyway.
+
+#### 7.4.6 How old a reading may be
+
+A decision needs a reading at most 20 minutes old for every account whose login still works,
+whether or not auto-burn may use it; the oldest of those readings is the one tested. An account
+that auto-burn may use, or the active one, with a login but no reading at all also stops a
+decision. The reading's age is the later of its
+poll and its feed (`fetchedAt` in the cache). When the oldest is older than 20 minutes, auto-burn
+does not switch or suggest: it asks for a poll, at most once a minute, and the engine polls only
+the accounts whose last reading or attempt is older than 20 minutes. The status line feed (§7.6)
+is a reading too, so a running session can keep the numbers fresh without a request.
 
 ### 7.5 Notifications about limits and waiting
 
@@ -432,6 +534,111 @@ For each account it shows:
 - **All accounts are full.** When every account whose login still works is blocked by a limit, and the previous snapshot had a usable account, seatswap sends `All accounts are full. Next: AC at 14:40.` once; without a next reset time it is `All accounts are full.` An account whose usage is not known yet is not usable but not blocked either, so it does not count as full. Only accounts whose login still works count.
 - **Waiting for you.** A session that is still waiting 15 s after it entered `waiting` sends `acme-kb-dd is waiting for you (acme-kb, on atlas).` The label is the session's name, or `<project>-<first two hex digits of the session id>` when the session has no name. The host part is left out when this host's name cannot be read: `acme-kb-dd is waiting for you (acme-kb).` It is sent once per session and wait, and only while `notifyWaiting` is on. When the session stops waiting, its notification is withdrawn.
 - A waiting notification does not time out where the desktop allows that (Linux). On Windows it follows the system's rules; the pop-up keeps the count either way. A click opens the pop-up.
+
+### 7.6 `seatswap statusline` and the feed
+
+`seatswap statusline` is the command Claude Code runs every 2 seconds instead of a shell script. It
+reads Claude Code's JSON from standard input, seatswap's layout from its settings, and the usage
+from its cache, and prints one line.
+
+- **What it reads from Claude Code:** `workspace.current_dir`, `model.id`, `model.display_name`,
+  `effort.level`, and `rate_limits.five_hour` and `.seven_day`, each with `used_percentage` and
+  `resets_at` in seconds since the epoch. Unknown keys are ignored. A missing key, or a `null`
+  whole object such as `"five_hour": null`, is absent; a `null` inside a limit makes the whole
+  payload malformed. Anything that is not a JSON object of this shape is treated as an empty
+  payload: a malformed payload must not hide the line.
+- **What it prints:** the layout `statusline: {left, right, margin}`. The preset "My current line"
+  is `sam@atlas:~/projects/atlas Fable 5.2 high` on the left and `AC 12% 4h45m  48% 3d16h` on the
+  right. A segment without a value prints nothing, with its prefix and suffix. The right part is
+  flush with the terminal's right edge minus the margin; when the line does not fit, segments are
+  dropped by their `drop` number (1 first) until it does, and when nothing is left to drop it is
+  printed anyway. Without a width the right part follows the left after two spaces.
+- **The width** is the terminal of the nearest ancestor process that has one, else `$COLUMNS`,
+  else none.
+- **Never slow, never a failure:** it uses no network, takes no lock that can wait, does not build
+  the engine or the HTTP client, and always exits 0. Any error becomes the line itself:
+  `seatswap: <reason>`, because a non-zero exit makes Claude Code hide the whole line. `CLAUDECODE`
+  may be set; the command is never gated and writes no `agentCall` event.
+- **The preset and the segments:** the preset reproduces the old script. The layout can also hold
+  the account (abbreviation in its colour), plan, 5 h percent and reset, week percent and reset,
+  per-model percent, auto-burn, model, effort, folder (`~` short), git branch, `user@host`, clock,
+  free text and a separator. Each segment has an optional colour rule (fixed, by load with two
+  thresholds, by model family, by effort, or the account's colour), prefix, suffix and drop order;
+  reset segments can use the compact time left, seatswap's own format (§7.2) or a clock time. The
+  `autoBurn` segment has no value in this build: the next account is in `status --json` (`next`)
+  and in the pop-up, not in the line.
+
+**The feed.** When `statuslineFeed` is on (default) and the payload has `rate_limits` with a
+`seven_day`, the command writes the live numbers to `<data folder>/feed.json`, atomic and mode
+0600:
+
+```json
+{"at":"2026-11-15T09:41:12Z","fiveHour":{"percent":12.0,"resetsAt":"2026-11-15T14:30:00Z"},
+ "sevenDay":{"percent":48.0,"resetsAt":"2026-11-16T01:00:00Z"},"model":"claude-fable-5-2"}
+```
+
+- It rewrites the file only when the numbers changed or the file is at least 10 seconds old, and
+  never writes a partial feed: a payload without `seven_day` writes nothing.
+- **Which account do the numbers belong to?** The payload does not name the account. A session
+  that has not sent a request since a switch still carries the old account's numbers. The numbers
+  are therefore accepted only for the one stored account whose cached weekly reset is within 60
+  seconds of `sevenDay.resetsAt`; none or more than one match means they are dropped. They are
+  never stored for the new account because a session still carries the old one.
+- **The tray app takes it.** After a write the command sends `feed` on the existing single-instance
+  socket; no tray app running is not an error, the file waits. The tray app reads the file, merges
+  it into that account's cache entry only when `at` is later than both the poll's `fetchedAt` and
+  the last feed, and writes a usage sample with `src: statusline` like a poll. The 5 h percent and
+  its reset follow the feed when its window is new or the same window is not lower; the weekly
+  percent follows it only when it is not lower, and the weekly reset stays the cache's. Per-model
+  limits stay the cache's. The polls stay as they are: they bring the per-model limits and the
+  inactive accounts.
+- **Effect:** the active account's numbers are seconds old instead of up to 2 minutes, without an
+  extra request to Anthropic; auto-burn sees 100 % sooner. With `statuslineFeed` off the command
+  writes no feed file and sends nothing.
+
+### 7.7 `seatswap burn plan` and `seatswap burn simulate`
+
+Both commands only read; for an agent they follow `agentsRead` like `status` and `list`.
+
+- **`seatswap burn plan [--json]`** prints the early-switching regime and the lazy plan, read the
+  same way the tray app reads them (with no session count, so `tied_busy` is 0). The text form is
+  the regime's words, then one line per segment: `Mon 08:00–Mon 10:00  AC`, or `… nothing usable`.
+  `--json` prints one object with the regime (`early`, `why`, `blockedLazyH`, `blockedEagerH`,
+  `extraSwitches`, `costH`), the segments (`account`, `from`, `to`; `account` is null when nothing
+  is usable) and `leftAtReset` (week percent left at each account's first reset). An account
+  auto-burn may use (or the active one) with a login but no reading, or no account with a login
+  and a reading, is an error: there is nothing to plan from.
+- **`seatswap burn simulate --from YYYY-MM-DD --to YYYY-MM-DD [--without ABBR]…`** replays the
+  recorded work of those local days (both inclusive) once for each of the two policies, **lazy**
+  and **eager**, and prints for each the hours worked, the hours blocked, the number of switches,
+  and the week percent that expired at each account's reset. `--without` leaves an account out.
+  The replay starts at the first sample of each account in the range, starts with no active
+  account, and uses the recorded work hour by hour; an account without learned rates never fills.
+  The rates are learned from the history as the tray app learns them. Warnings from a torn history
+  line go to standard error.
+
+### 7.8 `status --json` and agents
+
+`seatswap status --json` prints one object:
+
+- `views[]`: every account, with `id`, `label`, `abbr`, `color`, `email`, `plan`, `autoBurn`,
+  `isActive`, `loginState`, `loginEndsAtMs`, `loginDaysLeft`, `usage`, `usable`, `blockedUntil`,
+  `fetchedAt` and `lastError`, plus `slackHours` while it is known (the working hours the account
+  can be left alone and still be emptied before its reset).
+- `active`: the id of the live account, or null.
+- `suggestion`: `{toId, text}` or null. It is the same suggestion as §7.4.5, only while auto-burn
+  is off and `suggestSwitches` is on.
+- `autoBurn`: `{on, pausedUntil}`, where `pausedUntil` is null when there is no pause or manual
+  hold.
+- `next`: the id auto-burn would switch to (the target of a switch or a waiting switch, otherwise
+  the first account of the lazy plan other than the active one), or null.
+- `burnError`: a history or planner error as text, or null. When it is set, `next` is null and the
+  views have no `slackHours`; the command still answers.
+
+Only the JSON form reads the history; `--waybar` and `--i3blocks` do not, because they run every
+few seconds. With auto-burn on, `seatswap next` called by an agent prints
+`seatswap: auto-burn is on and decides` and exits 0 without switching or touching a login; the
+agent call itself is recorded as usual. A person's `next` still switches.
 
 ---
 
@@ -536,11 +743,14 @@ They give real click handling and exact placement on those desktops. They're not
 
 | Setting | Default | |
 |---|---|---|
-| `abbr`, `label`, `color` per account | from the account | edited in the pop-up |
+| `abbr`, `label`, `color`, `autoBurn` per account | from the account | `autoBurn`: auto-burn may use this account, §7.4.4 |
 | `trayText` | `percent` | `percent` · `percent+reset` · `off` |
 | `iconLimit` | `binding` | which limit the ring shows: `binding` · `session` · `week` |
 | `pollActive` / `pollInactive` | 120 s / 900 s | |
-| `suggestAt` / `suggestTargetBelow` | 90 % / 50 % | switch suggestion, §7.4 |
+| `autoBurn` | off | auto-burn switches by itself, §7.4 |
+| `suggestSwitches` | on | when auto-burn is off, say what it would do, §7.4 |
+| `statuslineFeed` | on | `seatswap statusline` writes the live numbers to `feed.json`, §7.6 |
+| `statusline` | "My current line" | the status line layout: `left`, `right`, `margin`, §7.6 |
 | `notifyOnSwitch` | on | |
 | `mirrorLive` | on | §6.4 |
 | `refreshInactive` | on | refresh the logins of inactive accounts (§6.3). Off: inactive accounts show their last known usage with its age |
@@ -554,8 +764,12 @@ They give real click handling and exact placement on those desktops. They're not
 | `notifyUsableAgain` | on | the "usable again" notification (§7.5) |
 | `notifyWaiting` | on | the "waiting for you" notification (§7.5) |
 | `notifyWaitingHosts` | `thisHost` | `thisHost` · `allHosts`: whose waiting sessions notify; only this host's are known yet |
-| `agentsRead` | on | agents may run `list` and `status` (§6.6) |
-| `agentsSwitch` | off | agents may run `use` and `next` (§6.6) |
+| `agentsRead` | on | agents may run `list`, `status`, `burn plan` and `burn simulate` (§6.6, §7.7) |
+| `agentsSwitch` | off | agents may run `use` and `next` (§6.6); an agent's `next` does nothing while auto-burn is on (§7.8) |
+
+The former `suggestAt` and `suggestTargetBelow` (the fixed 90 % / 50 % suggestion) are gone. An
+older `accounts.json` that still has them loads: unknown keys are ignored, and the two settings
+default to auto-burn off and suggestions on.
 
 ---
 
@@ -623,6 +837,9 @@ The gear opens the settings in the same card, in the same style, with the existi
 - **History.** "Name of this host" (text; empty = the machine's name), "History folder" (text; empty = seatswap's own folder), "Read Claude Code's session files" (switch; sub-text "model, busy or idle, tokens per folder · never message text").
   - Note under the group: "Takes effect after restarting seatswap."
 - **Notifications.** "An account is usable again" (switch), "A session is waiting for you" (switch).
+- **Auto-burn.** "Auto-burn" (switch), "Suggest switches" (switch) with "while auto-burn is off"
+  under it. The account editor also carries "Auto-burn may use this account"; the same switch is on
+  the account card in the pop-up.
 - **Agents.** "Agents may read usage" (switch), "Agents may switch accounts" (switch), and under them the text of §6.6.
 
 ---
@@ -631,9 +848,10 @@ The gear opens the settings in the same card, in the same style, with the existi
 
 - In-app login for new accounts (OAuth PKCE), so `/login` in Claude Code is no longer needed.
 - Claude Desktop: research whether its login can be switched safely (separate `--user-data-dir` per account and swapping which one the launcher uses is the likely route).
-- Auto-switch, opt-in: switch by itself when the active account hits 100 % and no session is mid-turn.
 - Usage history: a small sparkline per account across the last 7 days, from the poll cache.
-- `seatswap statusline`: a short segment for the Claude Code status line (`AC 97%`).
+- The status line builder: a button that writes the `statusLine` key into Claude Code's
+  `settings.json`, with the change shown first and a restore. Until then the line is set by hand
+  (§7.6).
 - Native Cinnamon, GNOME and KDE front ends (§9.3).
 
 ---
@@ -643,6 +861,8 @@ The gear opens the settings in the same card, in the same style, with the existi
 - Logins go only into the OS keyring, or a `0600` file if there is none. They are never logged; log lines print the account ID and the token's last 4 characters at most.
 - Network traffic goes only to `api.anthropic.com` and `platform.claude.com`. No telemetry, no update pings unless enabled.
 - Every write to Claude Code's files is atomic (temp file + rename) and keeps the original file mode.
+- The status line reads Claude Code's JSON, seatswap's settings and its usage cache; its only write
+  is `<data folder>/feed.json` (mode 0600). It prints no token and sends none.
 - Before seatswap first writes to them, it backs up `.credentials.json` and `.claude.json` once as `*.seatswap-backup`.
 - seatswap records the Claude Code version it was tested with. If the installed version is newer, the pop-up shows a warning, because the rules in §2.6 may have changed.
 - Each account must be a licence the user holds. The app moves the user's own logins between the user's own slots and shares nothing.

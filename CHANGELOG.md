@@ -15,9 +15,25 @@ All notable changes to this project are documented here. The format follows
 - Settings for agents ("Agents may read usage", "Agents may switch accounts") and
   `seatswap agent-skill install|uninstall`.
 - `usable` in `seatswap status --json`: whether an account can be used right now.
+- `seatswap statusline`: Claude Code's status line, with the account and its live limits.
+- Live numbers from the status line: the command feeds Claude Code's 5 h and weekly numbers into
+  seatswap's usage cache, so the active account is seconds old instead of up to 2 minutes.
+- Auto-burn: one switch that lets seatswap move between accounts by itself, with switch
+  suggestions while it is off, a quiet moment for sessions on a model that would lose its
+  thinking, a manual hold, a pause, and a per-account "Auto-burn may use this account".
+- `seatswap burn plan` and `seatswap burn simulate` (`--json` for the plan): the early-switching
+  regime, the lazy plan, and a replay of recorded work for the lazy and eager policies.
+- `slackHours` in every `status --json` view while known, and `autoBurn` and `next` at the top
+  level.
 
 ### Changed
 - A per-model limit blocks an account only while a session on that model is open.
+- `seatswap status --json`: `suggestion` has a new shape, `{toId, text}` instead of the old
+  account id, so the target and the whole sentence are both there.
+
+### Removed
+- Settings `suggestAt` and `suggestTargetBelow`: the fixed 90 % / 50 % suggestion is replaced by
+  auto-burn. An older `accounts.json` with them still loads; the keys are ignored.
 
 ### Fixed
 - `seatswap status --help` names the fields of the JSON output as they are: `views`, `active`

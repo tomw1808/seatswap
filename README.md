@@ -37,8 +37,12 @@ read or write that yet.
 - **Usage at a glance.** The icon ring shows the active account's binding limit, coloured green,
   amber or red. The pop-up shows every account's session (5 h) and weekly limits, with the time
   until each one resets.
-- **Switch suggestion.** When the active account passes 90 % and another one is under 50 %, the
-  pop-up (and a desktop notification) offers the switch.
+- **Auto-burn.** Switched on, seatswap moves between accounts by itself so that as little work as
+  possible is blocked; it switches before an account is full only when the measured gain is worth
+  the switch. Switched off, it suggests the same switch instead.
+- **Status line for Claude Code.** `seatswap statusline` prints the live account and its limits in
+  Claude Code's status line, and hands the live numbers back to the tray app without an extra
+  request.
 - **History.** Every usage reading, finished window, switch and agent call is kept in an
   append-only history folder, one JSON Lines file per month and kind, with tokens per project and
   hour. Several hosts can share it through a synced folder; each writes only its own subfolder.
@@ -136,6 +140,49 @@ There is no built-in global shortcut yet. On Linux, bind `seatswap panel` to a k
 desktop's keyboard settings (Ctrl+Alt+C, for example). On Windows the command for such a shortcut
 is `seatswap-tray.exe panel`, which opens no console window.
 
+## Status line and auto-burn
+
+**Set the status line by hand for now.** Add this top-level key to Claude Code's `settings.json`
+(`~/.claude/settings.json`; on Windows `%USERPROFILE%\.claude\settings.json`):
+
+```json
+"statusLine": {"type": "command", "command": "seatswap statusline", "refreshInterval": 2}
+```
+
+Claude Code then runs `seatswap statusline` every 2 seconds. The command reads Claude Code's JSON
+from standard input and prints one line with the account, its 5 h and weekly numbers and the reset
+times. It never uses the network, never waits on a lock and always exits 0; any error is the line
+`seatswap: <reason>`. The layout comes from seatswap's settings (the preset reproduces the old
+script); a button that writes this key comes later, so seatswap does not change Claude Code's
+settings file.
+
+**What auto-burn does.** One switch in the settings, `Auto-burn`, off by default.
+
+- On, seatswap switches accounts by itself; off, with `Suggest switches` on, the pop-up and a
+  notification say what it would do, with a Switch button.
+- It never leaves the active account blocked while another one is usable; when the active account
+  is blocked and every account is full, it says when the next one resets.
+- It switches before an account is full only after it has measured the accounts' rates and what a
+  switch costs, and only when that is expected to save at least 0.5 working hours and twice its
+  extra switches' cost.
+- A switch that would make busy sessions lose their earlier thinking waits for a quiet moment; a
+  manual switch holds early switching back for 4 hours, and Pause 4 h suspends it.
+- Every account has "Auto-burn may use this account"; off, it is never a target. Each switch is
+  written to the history with its reason.
+
+The plan is visible before it runs: `seatswap burn plan` prints the regime and the lazy plan as
+time ranges, and `seatswap burn plan --json` prints the same as one object.
+
+To see what the two policies would have done with recorded work:
+
+```sh
+seatswap burn simulate --from 2026-11-09 --to 2026-11-15
+seatswap burn simulate --from 2026-11-09 --to 2026-11-15 --without LB
+```
+
+It prints, for **lazy** and **eager**, the hours worked and blocked, the number of switches and the
+percent that expired at each account's reset. Both commands only read.
+
 ## Command line
 
 ```
@@ -147,6 +194,10 @@ seatswap add [--label TEXT]     save the live login as an account
 seatswap edit <account> [--label TEXT] [--abbr XY] [--color '#rrggbb']
 seatswap rm <account>           remove an account and its stored login
 seatswap status [--json | --waybar | --i3blocks] [--refresh]
+seatswap statusline             Claude Code's status line (reads its JSON from stdin)
+seatswap burn plan [--json]     the early-switching regime and the lazy plan
+seatswap burn simulate --from YYYY-MM-DD --to YYYY-MM-DD [--without ABBR]
+                                replay the recorded work for the lazy and eager policies
 seatswap panel [main|add|settings]   open the running app's pop-up
 seatswap agent-skill install|uninstall [--force]   add or remove the skill for agents
 ```
@@ -170,7 +221,8 @@ the tray app, and `seatswap.exe` for everything you want to read in a terminal.
   Manager on Windows). If no keyring is available, in files in the data folder, and the pop-up
   says so. On Linux those files have mode `0600`; on Windows they are protected only by the
   permissions of your user folder.
-- **What else it writes:** its own data folder, and the entry that starts it at login
+- **What else it writes:** its own data folder (including `feed.json`, the status line's live
+  numbers), and the entry that starts it at login
   (`~/.config/autostart/seatswap.desktop` on Linux, the value `seatswap` under
   `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` on Windows). On Windows it also registers
   the name its notifications are shown under
