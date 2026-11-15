@@ -44,13 +44,16 @@ const NO_STORED_LOGIN_MESSAGE: &str = "no stored login — log in again";
 const READING_HISTORY_ERROR_PREFIX: &str = "cannot write the history: ";
 /// The prefix of a history error about an AllBlocked/AnyUsable event.
 const EVENT_HISTORY_ERROR_PREFIX: &str = "cannot write an event to the history: ";
+/// The prefix of a history error about a loginEnded/loginRenewed event.
+const LOGIN_HISTORY_ERROR_PREFIX: &str = "cannot write a login event to the history: ";
 
-/// What a history error was about; the two texts must stay distinct so a
-/// successful event write never clears a failing reading (and the reverse).
+/// What a history error was about; the texts must stay distinct so a
+/// successful write of one kind never clears a failing write of another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HistoryErrorKind {
     Reading,
     Event,
+    LoginEvent,
 }
 
 /// Everything the engine can fail with. Only failures that affect every account
@@ -120,6 +123,11 @@ pub struct CacheEntry {
     pub failures: u32,
     /// No poll before this time (transient back-off, spec §7.1).
     pub backoff_until: Option<DateTime<Utc>>,
+    /// The login state the history last has for this account (`loginEnded` /
+    /// `loginRenewed`). `None` until the first poll with a recorder; an old
+    /// cache loads with `None`.
+    #[serde(default)]
+    pub recorded_login: Option<LoginState>,
 }
 
 /// `usage-cache.json`: the last usage reply per account id.
@@ -279,6 +287,7 @@ pub struct Engine<R: Remote> {
     cache: UsageCache,
     recorder: Option<Recorder>,
     models_in_use: Option<BTreeSet<String>>,
+    last_all_blocked: Option<bool>,
     last_any_usable: Option<bool>,
 }
 
@@ -293,6 +302,7 @@ impl<R: Remote> Engine<R> {
             cache,
             recorder: None,
             models_in_use: None,
+            last_all_blocked: None,
             last_any_usable: None,
         })
     }
@@ -357,7 +367,9 @@ impl<R: Remote> Engine<R> {
 
         self.cache.save(self.store.app_paths())?;
         let views = self.views(now)?;
-        if self.note_usable_state(&views, now) {
+        let mut changed = self.note_usable_state(&views, now);
+        changed |= self.note_login_states(now)?;
+        if changed {
             self.cache.save(self.store.app_paths())?;
             return self.views(now);
         }
@@ -766,28 +778,26 @@ impl<R: Remote> Engine<R> {
         }
     }
 
-    /// Write AllBlocked / AnyUsable when "some account is usable" changed.
-    /// A write error becomes the target entry's `last_error` only when that
-    /// entry has no other error; it never hides one. Returns whether the cache
-    /// changed (so the caller saves it again).
+    /// Write allBlocked / anyUsable when [`all_blocked`] or "some account is
+    /// usable" changed. A write error becomes the target entry's `last_error`
+    /// only when that entry has no other error; it never hides one. Returns
+    /// whether the cache changed (so the caller saves it again).
     fn note_usable_state(&mut self, views: &[AccountView], now: DateTime<Utc>) -> bool {
         if self.recorder.is_none() {
             return false;
         }
-        if !views
-            .iter()
-            .any(|view| view.login_state != LoginState::LoggedOut)
-        {
-            return false;
-        }
-        let any = views.iter().any(|view| view.usable);
-        let event = match (self.last_any_usable, any) {
-            (None, false) | (Some(true), false) => Some(EventKind::AllBlocked),
-            (Some(false), true) => Some(EventKind::AnyUsable),
-            _ => None,
+        let all_blocked_now = all_blocked(views);
+        let any_usable_now = views.iter().any(|view| view.usable);
+        let event = if all_blocked_now && self.last_all_blocked != Some(true) {
+            Some(EventKind::AllBlocked)
+        } else if any_usable_now && self.last_any_usable == Some(false) {
+            Some(EventKind::AnyUsable)
+        } else {
+            None
         };
         let Some(event) = event else {
-            self.last_any_usable = Some(any);
+            self.last_all_blocked = Some(all_blocked_now);
+            self.last_any_usable = Some(any_usable_now);
             return false;
         };
         let written = match self.recorder.as_ref() {
@@ -799,39 +809,118 @@ impl<R: Remote> Engine<R> {
                 // The folder writes again: clear exactly the event texts a
                 // failed event write left behind, never a reading error and
                 // never any other error.
-                let mut cleared = false;
-                for entry in self.cache.entries.values_mut() {
-                    if entry
-                        .last_error
-                        .as_deref()
-                        .is_some_and(|text| text.starts_with(EVENT_HISTORY_ERROR_PREFIX))
-                    {
-                        entry.last_error = None;
-                        cleared = true;
-                    }
-                }
-                self.last_any_usable = Some(any);
+                let cleared = self.clear_history_errors(HistoryErrorKind::Event);
+                self.last_all_blocked = Some(all_blocked_now);
+                self.last_any_usable = Some(any_usable_now);
                 cleared
             }
-            Err(error) => {
-                let text = history_error_text(HistoryErrorKind::Event, &error);
-                // The active account, else the first account still logged in.
-                let target = views.iter().find(|view| view.is_active).or_else(|| {
-                    views
-                        .iter()
-                        .find(|view| view.login_state != LoginState::LoggedOut)
-                });
-                let Some(target) = target else {
-                    return false;
-                };
-                let entry = self.cache.entries.entry(target.id.clone()).or_default();
-                if entry.last_error.is_some() {
-                    return false;
-                }
-                entry.last_error = Some(text);
-                true
+            Err(error) => self.note_history_error(views, HistoryErrorKind::Event, &error),
+        }
+    }
+
+    /// Put a history write failure on a view's entry exactly as the event writer
+    /// does: never hide another error, and prefer the active account, else the
+    /// first account still logged in. Returns whether the cache changed.
+    fn note_history_error(
+        &mut self,
+        views: &[AccountView],
+        kind: HistoryErrorKind,
+        error: &HistoryError,
+    ) -> bool {
+        let text = history_error_text(kind, error);
+        let target = views.iter().find(|view| view.is_active).or_else(|| {
+            views
+                .iter()
+                .find(|view| view.login_state != LoginState::LoggedOut)
+        });
+        let Some(target) = target else {
+            return false;
+        };
+        let entry = self.cache.entries.entry(target.id.clone()).or_default();
+        if entry.last_error.is_some() {
+            return false;
+        }
+        entry.last_error = Some(text);
+        true
+    }
+
+    /// Clear exactly the entries a failed write of `kind` left behind, never
+    /// another kind and never any other error. Returns whether anything changed.
+    fn clear_history_errors(&mut self, kind: HistoryErrorKind) -> bool {
+        let prefix = match kind {
+            HistoryErrorKind::Reading => READING_HISTORY_ERROR_PREFIX,
+            HistoryErrorKind::Event => EVENT_HISTORY_ERROR_PREFIX,
+            HistoryErrorKind::LoginEvent => LOGIN_HISTORY_ERROR_PREFIX,
+        };
+        let mut cleared = false;
+        for entry in self.cache.entries.values_mut() {
+            if entry
+                .last_error
+                .as_deref()
+                .is_some_and(|text| text.starts_with(prefix))
+            {
+                entry.last_error = None;
+                cleared = true;
             }
         }
+        cleared
+    }
+
+    /// Write `loginEnded` / `loginRenewed` for every stored account whose login
+    /// state the history does not have yet. `None` is seeded without a line (an
+    /// old cache or a new account). `recorded_login` moves only when its event
+    /// was written: a failed write is retried on the next poll, and a CLI engine
+    /// without a recorder moves nothing. Returns whether the cache changed.
+    fn note_login_states(&mut self, now: DateTime<Utc>) -> Result<bool, EngineError> {
+        if self.recorder.is_none() {
+            return Ok(false);
+        }
+        let file = self.store.load()?;
+        let views = self.views(now)?;
+        let mut changed = false;
+        for account in &file.accounts {
+            let current = account.login_state;
+            let id = account.id.clone();
+            let recorded = self
+                .cache
+                .entries
+                .get(&id)
+                .and_then(|entry| entry.recorded_login);
+            let Some(recorded) = recorded else {
+                self.cache.entries.entry(id).or_default().recorded_login = Some(current);
+                changed = true;
+                continue;
+            };
+            if recorded == current {
+                continue;
+            }
+            let kind = match (recorded, current) {
+                (LoginState::Ok, LoginState::LoggedOut) => EventKind::LoginEnded {
+                    account: AccountRef::of(account),
+                },
+                (LoginState::LoggedOut, LoginState::Ok) => EventKind::LoginRenewed {
+                    account: AccountRef::of(account),
+                },
+                _ => continue,
+            };
+            let written = match self.recorder.as_ref() {
+                Some(recorder) => recorder.event(now, kind),
+                None => return Ok(changed),
+            };
+            match written {
+                Ok(()) => {
+                    self.cache.entries.entry(id).or_default().recorded_login = Some(current);
+                    changed = true;
+                    changed |= self.clear_history_errors(HistoryErrorKind::LoginEvent);
+                }
+                Err(error) => {
+                    if self.note_history_error(&views, HistoryErrorKind::LoginEvent, &error) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+        Ok(changed)
     }
 
     fn set_last_error(&mut self, id: &str, message: String) {
@@ -884,6 +973,19 @@ impl<R: Remote> Engine<R> {
 /// that model, or, when the models are unknown, while the server calls it active.
 pub fn blocker(usage: &Usage, models_in_use: Option<&BTreeSet<String>>) -> Option<Blocker> {
     blocking_limit(usage, models_in_use).map(|(_, blocker)| blocker)
+}
+
+/// True when at least one view has a working login and every view with a
+/// working login has a [`Blocker`]. An account whose usage is unknown is not
+/// usable, but it is not blocked either, so it never makes this true (spec §4).
+pub fn all_blocked(views: &[AccountView]) -> bool {
+    let mut working = views
+        .iter()
+        .filter(|view| view.login_state == LoginState::Ok);
+    let Some(first) = working.next() else {
+        return false;
+    };
+    first.blocker.is_some() && working.all(|view| view.blocker.is_some())
 }
 
 /// The blocking limit that wins and why. The latest reset wins, a limit with no
@@ -968,6 +1070,7 @@ fn history_error_text(kind: HistoryErrorKind, error: &HistoryError) -> String {
     let prefix = match kind {
         HistoryErrorKind::Reading => READING_HISTORY_ERROR_PREFIX,
         HistoryErrorKind::Event => EVENT_HISTORY_ERROR_PREFIX,
+        HistoryErrorKind::LoginEvent => LOGIN_HISTORY_ERROR_PREFIX,
     };
     format!("{prefix}{error}")
 }
@@ -2486,6 +2589,14 @@ mod tests {
             cache.entries.get("a").and_then(|entry| entry.attempted_at),
             None
         );
+        assert_eq!(
+            cache
+                .entries
+                .get("a")
+                .and_then(|entry| entry.recorded_login),
+            None,
+            "an old cache without recordedLogin loads with None"
+        );
     }
 
     #[test]
@@ -2604,6 +2715,194 @@ mod tests {
             })
             .filter(|kind| kind == "allBlocked" || kind == "anyUsable")
             .collect()
+    }
+
+    fn login_event_types(root: &std::path::Path) -> Vec<String> {
+        let path = root.join("vega/events-2026-11.jsonl");
+        if !path.exists() {
+            return Vec::new();
+        }
+        read_json_lines(&path)
+            .into_iter()
+            .filter_map(|value| {
+                value
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .filter(|kind| kind == "loginEnded" || kind == "loginRenewed")
+            .collect()
+    }
+
+    #[test]
+    fn a_login_that_ends_and_renews_is_written_once_each() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = Fixture::new(&tmp);
+        let fake = fixture.fake.clone();
+        let fresh_b = login(
+            &b_new_access(),
+            &b_new_refresh_token(),
+            t0_ms() + 8 * HOUR_MS,
+            t0_ms() + 20 * DAY,
+            B_ORG,
+        );
+        fake.script_usage_ok(&live_access(), 10.0);
+        fake.script_refresh_ok(&b_refresh_token(), fresh_b.clone());
+        fake.script_usage_ok(&b_new_access(), 20.0);
+        let (root, dir) = history_at(&tmp);
+        let (_app, fake, engine) = fixture.into_engine();
+        let mut engine = engine.with_recorder(Recorder::new(dir));
+
+        engine.poll(PollReason::Timer, t0()).unwrap();
+        assert_eq!(
+            login_event_types(&root),
+            Vec::<String>::new(),
+            "the first poll seeds the state without a line"
+        );
+
+        // B's stored login is old again and its renewal is refused.
+        engine
+            .store()
+            .secrets()
+            .set(B_ID, &b_stored_login())
+            .unwrap();
+        fake.script_usage_ok(&live_access(), 10.0);
+        fake.script_refresh(
+            &b_refresh_token(),
+            Err(ApiError::InvalidGrant(
+                "Refresh token not found or invalid".to_string(),
+            )),
+        );
+        engine.poll(PollReason::Wake, at(60)).unwrap();
+        assert_eq!(login_event_types(&root), vec!["loginEnded"]);
+        assert_eq!(
+            engine.cache.entries.get(B_ID).unwrap().recorded_login,
+            Some(LoginState::LoggedOut)
+        );
+
+        fake.script_usage_ok(&live_access(), 10.0);
+        engine.poll(PollReason::Wake, at(120)).unwrap();
+        assert_eq!(
+            login_event_types(&root),
+            vec!["loginEnded"],
+            "an unchanged login state writes no second line"
+        );
+
+        // A fresh login makes B usable again.
+        engine.store().secrets().set(B_ID, &fresh_b).unwrap();
+        let mut file = engine.store().load().unwrap();
+        file.accounts[1].login_state = LoginState::Ok;
+        engine.store().save(&file).unwrap();
+        fake.script_usage_ok(&live_access(), 10.0);
+        fake.script_usage_ok(&b_new_access(), 20.0);
+        engine.poll(PollReason::Wake, at(180)).unwrap();
+        assert_eq!(login_event_types(&root), vec!["loginEnded", "loginRenewed"]);
+        assert_eq!(
+            engine.cache.entries.get(B_ID).unwrap().recorded_login,
+            Some(LoginState::Ok)
+        );
+
+        fake.script_usage_ok(&live_access(), 10.0);
+        fake.script_usage_ok(&b_new_access(), 20.0);
+        engine.poll(PollReason::Wake, at(240)).unwrap();
+        assert_eq!(
+            login_event_types(&root),
+            vec!["loginEnded", "loginRenewed"],
+            "a renewed login is written once"
+        );
+    }
+
+    #[test]
+    fn a_cache_without_recorded_login_writes_nothing_on_its_first_poll() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fixture = Fixture::new(&tmp);
+        fixture.file.accounts[1].login_state = LoginState::LoggedOut;
+        fixture.save_file();
+        let fake = fixture.fake.clone();
+        fake.script_usage_ok(&live_access(), 42.0);
+        let (root, dir) = history_at(&tmp);
+        let (_app, _fake, engine) = fixture.into_engine();
+        let mut engine = engine.with_recorder(Recorder::new(dir));
+
+        engine.poll(PollReason::Timer, t0()).unwrap();
+
+        assert_eq!(login_event_types(&root), Vec::<String>::new());
+        assert_eq!(
+            engine.cache.entries.get(A_ID).unwrap().recorded_login,
+            Some(LoginState::Ok)
+        );
+        assert_eq!(
+            engine.cache.entries.get(B_ID).unwrap().recorded_login,
+            Some(LoginState::LoggedOut),
+            "an old cache or a new account is seeded without an event"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_failed_login_event_write_leaves_recorded_login_and_is_retried() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fixture = Fixture::new(&tmp);
+        fixture.file.accounts[1].login_state = LoginState::LoggedOut;
+        fixture.save_file();
+        let root = tmp.path().join("history");
+        let host_dir = root.join("vega");
+        fs::create_dir_all(&host_dir).unwrap();
+        fs::set_permissions(&host_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let (_app, fake, engine) = fixture.into_engine();
+        let mut engine = engine.with_recorder(Recorder::new(HistoryDir::at(&root, "vega")));
+        cache_usage(&mut engine, A_ID, usage_with(10.0, None), t0());
+        engine
+            .cache
+            .entries
+            .entry(B_ID.to_string())
+            .or_default()
+            .recorded_login = Some(LoginState::Ok);
+
+        let views = engine.poll(PollReason::Timer, t0()).unwrap();
+
+        assert_eq!(login_event_types(&root), Vec::<String>::new());
+        assert_eq!(
+            engine.cache.entries.get(B_ID).unwrap().recorded_login,
+            Some(LoginState::Ok),
+            "a failed write must not move the recorded state"
+        );
+        let a = views.iter().find(|view| view.id == A_ID).unwrap();
+        let error = a.last_error.as_deref().expect("the event write error");
+        assert!(
+            error.starts_with("cannot write a login event to the history: "),
+            "got {error}"
+        );
+
+        fs::set_permissions(&host_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        fake.script_usage_ok(&live_access(), 10.0);
+        engine.poll(PollReason::Timer, at(60)).unwrap();
+
+        assert_eq!(login_event_types(&root), vec!["loginEnded"]);
+        assert_eq!(
+            engine.cache.entries.get(B_ID).unwrap().recorded_login,
+            Some(LoginState::LoggedOut)
+        );
+        let events = read_json_lines(&root.join("vega/events-2026-11.jsonl"));
+        let ended = events
+            .iter()
+            .find(|value| value["type"] == json!("loginEnded"))
+            .expect("the loginEnded line");
+        assert_eq!(
+            ended["t"],
+            json!(at(60)),
+            "the event carries the poll's now"
+        );
+
+        fake.script_usage_ok(&live_access(), 10.0);
+        engine.poll(PollReason::Timer, at(120)).unwrap();
+        assert_eq!(
+            login_event_types(&root),
+            vec!["loginEnded"],
+            "the retried write is not written a second time"
+        );
     }
 
     #[test]
@@ -3016,5 +3315,31 @@ mod tests {
             "got {error}"
         );
         fs::set_permissions(&host_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn unknown_usage_is_not_all_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fixture = Fixture::new(&tmp);
+        fixture.file.accounts[1].login_state = LoginState::LoggedOut;
+        fixture.save_file();
+        let fake = fixture.fake.clone();
+        // The server is down at the first poll: no usage is known yet.
+        fake.script_usage(&live_access(), Err(ApiError::Server(503)));
+        let (root, dir) = history_at(&tmp);
+        let (_app, _fake, engine) = fixture.into_engine();
+        let mut engine = engine.with_recorder(Recorder::new(dir));
+
+        let views = engine.poll(PollReason::Timer, t0()).unwrap();
+
+        assert!(
+            views.iter().all(|view| view.blocker.is_none()),
+            "no limit blocks any account"
+        );
+        assert_eq!(
+            state_event_types(&root),
+            Vec::<String>::new(),
+            "allBlocked means no usable account because limits are full; none is"
+        );
     }
 }

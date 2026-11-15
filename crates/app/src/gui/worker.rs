@@ -616,6 +616,21 @@ impl EngineRuntime {
         }
     }
 
+    /// The recorder's read warnings (spec §1.2): a torn last line, a line this
+    /// version does not know. The app prints each one once; core never prints.
+    fn print_history_warnings(&mut self) {
+        let warnings = self
+            .engine
+            .as_mut()
+            .and_then(|engine| engine.recorder())
+            .map(|recorder| recorder.take_warnings());
+        if let Some(warnings) = warnings {
+            for warning in warnings {
+                eprintln!("seatswap: history: {warning}");
+            }
+        }
+    }
+
     fn poll(&mut self, reason: PollReason) {
         if self.engine.is_none() && !self.open() {
             self.capture(Vec::new(), self.snapshot.last_poll_at);
@@ -628,6 +643,7 @@ impl EngineRuntime {
             Some(engine) => engine.poll(reason, now),
             None => return,
         };
+        self.print_history_warnings();
         // The heartbeat belongs to the engine thread: it runs with
         // readSessions off too. Its error is the thread's history state, not
         // the engine's open error, so `publish()` cannot clear it.
@@ -811,7 +827,7 @@ impl ActionRuntime {
         latest.as_ref().map(|summary| SessionCounts {
             running: summary.running,
             busy: summary.busy,
-            tied: 0,
+            tied: None,
         })
     }
 
@@ -850,15 +866,30 @@ impl ActionRuntime {
         }
     }
 
-    fn store(&mut self) -> Result<&Store, String> {
+    fn ensure_store(&mut self) -> Result<(), String> {
         if self.store.is_none() {
             let (store, _warning) =
                 store::open_store(self.app.clone()).map_err(|e| e.to_string())?;
             self.store = Some(store);
         }
+        Ok(())
+    }
+
+    fn store(&mut self) -> Result<&Store, String> {
+        self.ensure_store()?;
         self.store
             .as_ref()
             .ok_or_else(|| "the store is not open".to_string())
+    }
+
+    /// The recorder for one action and, when there is none, the reason. The
+    /// reason is reported even when the action's record was not attempted, so
+    /// a history that cannot be opened is never silently dropped.
+    fn history_for_action(&self) -> (Option<&Recorder>, Option<String>) {
+        match &self.history {
+            Ok(recorder) => (Some(recorder), None),
+            Err(error) => (None, Some(error.clone())),
+        }
     }
 
     fn switch(&mut self, key: &str, unsaved: UnsavedPolicy, label: Option<String>) -> ActionReply {
@@ -897,12 +928,15 @@ impl ActionRuntime {
                                 .as_deref()
                                 .and_then(|id| file.find(id))
                                 .map(AccountRef::of);
+                            let saved_new =
+                                outcome.saved_new.as_deref().and_then(|id| file.find(id));
                             match self.recorder() {
                                 Ok(recorder) => {
                                     if let Err(error) = ops::record_switch(
                                         recorder,
                                         from,
                                         target,
+                                        saved_new,
                                         By::User,
                                         None,
                                         None,
@@ -969,13 +1003,20 @@ impl ActionRuntime {
     }
 
     fn save_current(&mut self, label: Option<String>) -> ActionReply {
+        if let Err(error) = self.ensure_store() {
+            return ActionReply::Failed(error);
+        }
         let claude = self.claude.clone();
-        let result = match self.store() {
-            Ok(store) => ops::save_live_login(&claude, store, label, Utc::now()),
-            Err(error) => return ActionReply::Failed(error),
+        let Some(store) = self.store.as_ref() else {
+            return ActionReply::Failed("the store is not open".to_string());
         };
+        let (history, open_error) = self.history_for_action();
+        let result = ops::save_live_login(&claude, store, history, label, Utc::now());
         match result {
-            Ok(_) => {
+            Ok((_, history_error)) => {
+                if let Some(error) = history_error.or(open_error) {
+                    report_history_error(&error);
+                }
                 let _ = self.engine.send(EngineCommand::Publish);
                 ActionReply::Done
             }
@@ -1010,16 +1051,22 @@ impl ActionRuntime {
     }
 
     fn remove(&mut self, key: &str) -> ActionReply {
-        let result = match self.store() {
-            Ok(store) => switcher::remove_account(store, key),
-            Err(error) => return ActionReply::Failed(error),
+        if let Err(error) = self.ensure_store() {
+            return ActionReply::Failed(error);
+        }
+        let Some(store) = self.store.as_ref() else {
+            return ActionReply::Failed("the store is not open".to_string());
         };
-        match result {
-            Ok(_) => {
+        let (history, open_error) = self.history_for_action();
+        match ops::remove_account(store, key, history, Utc::now()) {
+            Ok((_, history_error)) => {
+                if let Some(error) = history_error.or(open_error) {
+                    report_history_error(&error);
+                }
                 let _ = self.engine.send(EngineCommand::Publish);
                 ActionReply::Done
             }
-            Err(error) => ActionReply::Failed(error.to_string()),
+            Err(error) => ActionReply::Failed(error),
         }
     }
 
@@ -1128,6 +1175,14 @@ impl ActionRuntime {
     }
 }
 
+/// Report a history write failure from an action that still succeeded: the same
+/// way the switch's failed record is reported, as a notification and one line
+/// on standard error, never as a failed action.
+fn report_history_error(error: &str) {
+    eprintln!("seatswap: {error}");
+    notify::send_error(error);
+}
+
 /// What [`record_external_switch`] found: it wrote a new external switch, or a
 /// switch to the same account is already in this host's last 15 s.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1153,6 +1208,9 @@ fn record_external_switch(
         },
         &Hosts::One(recorder.dir().host().to_string()),
     )?;
+    for warning in &read.warnings {
+        eprintln!("seatswap: history: {warning}");
+    }
     let already = read
         .records
         .iter()
@@ -1173,6 +1231,7 @@ fn record_external_switch(
         recorder,
         from,
         to.clone(),
+        None,
         By::External,
         None,
         None,
@@ -1813,6 +1872,7 @@ mod tests {
             &recorder,
             None,
             account.clone(),
+            None,
             By::Cli,
             None,
             None,

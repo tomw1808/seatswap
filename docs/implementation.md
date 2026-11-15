@@ -442,12 +442,16 @@ pub fn live_state(claude: &ClaudePaths, file: &AccountsFile) -> Result<LiveState
 /// login + identity; known account → store the login if it differs from the stored one, update
 /// oauth_account / login_ends_at_ms / login_state Ok; unknown → create it with
 /// store::new_account(label) only when `create_unknown` is true. Returns the resulting LiveState
-/// and whether anything was written.
+/// and Synced::{Unchanged, Updated, Added}: Added only when this call created the account (the
+/// caller that writes the history uses it for `accountAdded`; every other caller tests
+/// `!= Synced::Unchanged`).
+pub enum Synced { Unchanged, Updated, Added }
 pub fn sync_live(claude: &ClaudePaths, store: &Store, create_unknown: Option<Option<String>>,
-                 now: DateTime<Utc>) -> Result<(LiveState, bool), SwitchError>;
+                 now: DateTime<Utc>) -> Result<(LiveState, Synced), SwitchError>;
 // create_unknown: None = never create; Some(label) = create with that label (None = default label).
 
 /// Remove an account from the list and its login from the secrets. Never touches Claude's files.
+/// The CLI and the GUI call ops::remove_account instead, which adds the `accountRemoved` line.
 pub fn remove_account(store: &Store, key: &str) -> Result<Account, SwitchError>;
 
 /// Change label / abbr / colour, validated by store's validators.
@@ -474,6 +478,9 @@ pub struct CacheEntry {
     pub last_error: Option<String>,          // human text, never a token
     pub failures: u32,                       // consecutive transient failures
     pub backoff_until: Option<DateTime<Utc>>,
+    /// The login state the history last has for this account (loginEnded / loginRenewed).
+    /// Serde default: an old cache loads with None and the first poll seeds it without a line.
+    pub recorded_login: Option<LoginState>,
 }
 #[derive(… Serialize, Deserialize)] pub struct UsageCache { pub version: u32 /* 1 */, pub entries: BTreeMap<String, CacheEntry> }
 impl UsageCache { pub fn load(app: &AppPaths) -> Result<UsageCache, EngineError>; pub fn save(&self, app: &AppPaths) -> Result<(), EngineError>; }
@@ -595,6 +602,7 @@ pub fn load_accounts(app: &AppPaths) -> Result<AccountsFile, StoreError>;
 impl ClaudePaths {
     pub fn sessions_dir(&self) -> PathBuf;    // <config_dir>/sessions
     pub fn projects_dir(&self) -> PathBuf;    // <config_dir>/projects
+    pub fn skills_dir(&self) -> PathBuf;      // <config_dir>/skills
 }
 impl AppPaths {
     pub fn history_dir(&self) -> PathBuf;          // <data_dir>/history
@@ -633,7 +641,10 @@ pub struct WindowRecord { #[serde(flatten)] pub account: AccountRef, pub k: Limi
     pub lost: Option<f64>, #[serde(rename = "lastSample")] pub last_sample: DateTime<Utc>,
     pub plan: Option<String>, pub uncertain: bool }
 pub enum By { User, Cli, Auto, Agent, External }
-pub struct SessionCounts { pub running: u32, pub busy: u32, pub tied: u32 }
+pub struct SessionCounts { pub running: u32, pub busy: u32, pub tied: Option<u32> }
+// `tied` (sessions on a model whose thinking is tied to the account, spec §2.11) is written only
+// when known and left out of the line when None; until step B measures it, it is None. An old line
+// with "tied":0 still reads.
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum EventKind {
     Switch { from, to, by, reason, cwd, sessions, waited_secs },
@@ -682,8 +693,16 @@ this version does not know with a warning, and makes other broken lines an error
 more than 1 % of a file's lines. `Hosts::All` is every folder with a `host.json` plus this dir's own
 host, merged by `at()` and then host.
 
+**Who writes which record.** The CLI writes the records that depend only on the command it just ran:
+`switch`, `agentCall`, `accountAdded` and `accountRemoved`. Records that depend on what was written
+before — samples, windows, blocked/unblocked, allBlocked/anyUsable, loginEnded/loginRenewed — are
+written only by the tray app's engine. A second process's recorder does not see the other's lines and
+would write a window or a blocked event twice. So `status --refresh` and `list --refresh` build their
+engine without a recorder, and a CLI engine never moves `CacheEntry.recorded_login`.
+
 ```rust
-pub struct Recorder { /* dir, per-account last line and remembered limits, written windows, last up */ }
+pub struct Recorder { /* dir, per-account last line and remembered limits, written windows, last up,
+                          read warnings */ }
 impl Recorder {
     pub fn new(dir: HistoryDir) -> Recorder;
     pub fn dir(&self) -> &HistoryDir;
@@ -697,6 +716,9 @@ impl Recorder {
     pub fn up(&mut self, at: DateTime<Utc>) -> Result<(), HistoryError>;   // at most once per 5 min
     pub fn tokens(&self, records: &[TokenRecord]) -> Result<(), HistoryError>;
     pub fn session(&self, record: &SessionRecord) -> Result<(), HistoryError>;
+    /// The warnings of the lines `reading` read back (a torn last line, a line of a shape this
+    /// version does not know), each returned once; the app prints them, core never does.
+    pub fn take_warnings(&mut self) -> Vec<String>;
 }
 pub fn sample_of(account: &AccountRef, usage: &Usage, at: DateTime<Utc>, src: Source) -> Sample;
 /// A limit (matched by k and m) has ended when prev.r is Some(end) and next.t >= end, or next has
@@ -769,7 +791,11 @@ pub struct FileState { pub offset: u64, pub grew: DateTime<Utc>, pub recent: Vec
     pub last_answer: Option<DateTime<Utc>> }
 pub struct SessionSeen { pub folder: String, pub cwd: String, pub first: DateTime<Utc>,
     pub last: DateTime<Utc>, pub last_model: Option<String>, pub last_user_turn: Option<DateTime<Utc>>,
-    pub thinking_since_user: u32 }
+    pub thinking_since_user: u32, pub recorded: Option<RecordedSession> }
+pub struct RecordedSession { pub last: DateTime<Utc>, pub closed: bool }
+// `recorded` is the last session record written from this session: the answer time it covers and
+// whether it was the closing one. It keeps a restart from writing the same record again; absent in
+// an old state file means none.
 impl ScanState {
     pub fn load(app: &AppPaths) -> Result<ScanState, TranscriptError>;  // missing folder = default
     /// Writes only the project folders that changed, as <folder>.json; before writing, drops the
@@ -778,14 +804,22 @@ impl ScanState {
         -> Result<u32, TranscriptError>;
 }
 pub struct Scan { pub answers: Vec<Answer>, pub user_turns: Vec<UserTurn>, pub complete: bool,
-    pub warnings: Vec<String> }
+    pub warnings: Vec<String> /* private: the state after this scan */ }
+impl Scan {
+    pub fn state(&self) -> &ScanState;              // for token_records
+    /// Moves the state past what this scan read; call it only after the answers' token lines were
+    /// written. A scan that is not committed leaves the old offsets, so the next pass reads the same
+    /// lines again and nothing is counted twice.
+    pub fn commit(&mut self, state: &mut ScanState);
+}
 /// Reads what is new in <folder>/<session>.jsonl and <folder>/<session>/subagents/agent-<id>.jsonl,
 /// at most budget_bytes; only whole lines, and the offset stops after the last '\n'. A shorter file
 /// is read again from 0 (warning); its recent ids keep answers from counting twice. A file that had
 /// stopped growing and was replaced is not counted again, and the warning says so. Other line
 /// types are skipped quietly. A user line counts only as a real user message whose origin is
 /// absent or "human". An answer counts once per file by message id; "<synthetic>" is skipped.
-pub fn scan(claude: &ClaudePaths, state: &mut ScanState, budget_bytes: u64)
+/// The caller's state is not changed; the result carries the state to `commit`.
+pub fn scan(claude: &ClaudePaths, state: &ScanState, budget_bytes: u64)
     -> Result<Scan, TranscriptError>;
 pub fn agents_of(claude: &ClaudePaths, session: &str) -> Vec<AgentMeta>;
 /// One TokenRecord per (session, hour, model); an agent's answers go to its parent session and use
@@ -811,6 +845,8 @@ pub enum Blocker { Week, Session, Model(String) }
 /// Model(m): a weekly_scoped limit of m >= 100 and a model in use contains m lower-cased; with
 /// models_in_use None, only while the server marks that limit active.
 pub fn blocker(usage: &Usage, models_in_use: Option<&BTreeSet<String>>) -> Option<Blocker>;
+/// At least one view has a working login, and every view with a working login has a Blocker.
+pub fn all_blocked(views: &[AccountView]) -> bool;
 // AccountView gains:  pub usable: bool, pub blocked_until: Option<DateTime<Utc>>
 ```
 
@@ -819,8 +855,19 @@ no reset wins over one with a time); on a tie Week comes before Model, Model bef
 `blocked_until` is that limit's reset time. `record_success` passes the account's `AccountRef` and
 plan to the recorder; a history error becomes the account's `last_error`, never a failed poll. An
 account blocked by a limit is due once 30 s after that reset whatever the interval, if its last
-success and last attempt are both before that moment. After a poll the engine writes `AllBlocked` or
-`AnyUsable` when "some account is usable" changed since the previous poll.
+success and last attempt are both before that moment. After a poll the engine writes `AllBlocked` when
+`all_blocked` becomes true, and `AnyUsable` when some view becomes usable after none was. An account
+whose usage is unknown is not usable but not blocked either, so it never makes `all_blocked` true and
+losing the last working login is not "usable again".
+
+The same poll compares every stored account's login state with `CacheEntry.recorded_login`: `None`
+is seeded without a line (an old cache or a new account); `Ok` that is now `LoggedOut` writes
+`loginEnded`; `LoggedOut` that is now `Ok` writes `loginRenewed`. The event carries the poll's `now`.
+The field moves only when its event was written, so a failed write is retried by the next poll and
+an engine without a recorder moves nothing (the next tray-app engine writes it). A failed login-event
+write becomes a `last_error` through the same helper as a failed `AllBlocked`/`AnyUsable` write, so it
+never hides another error and never fails the poll; it carries its own prefix, so a successful write
+of one event kind never clears the other kind's failure.
 
 ## app: CLI (§4)
 
@@ -831,8 +878,8 @@ success and last attempt are both before that moment. After a poll the engine wr
 | `list` | One line per account: `*` for the live one, abbr, label, email, plan, session %, week %, "login ends in N d", "LOGGED OUT" when so. Usage from the cache, with its age ("5 min ago"); `--refresh` polls first (PollReason::PanelOpened). |
 | `use <KEY>` | `switch_to`. KEY = id or abbr. When the live login is not saved: `--save-current [LABEL]` saves it first, `--discard-current` drops it; without either, exit 2 with the message "the current login (<email>) is not saved; rerun with --save-current or --discard-current". After the switch: "Switched to P — Private". |
 | `next` | Switch to the next Ok account after the live one in list order (wraps), same unsaved handling as `use`. |
-| `add [--label L]` | `sync_live` with create: saves the live login as a new account or updates the stored copy. Prints the account. |
-| `rm <KEY> [--yes]` | `remove_account`; without `--yes` asks "Remove AC — Acme? [y/N]" on a terminal, refuses when stdin is not a terminal. |
+| `add [--label L]` | `ops::save_live_login` (`sync_live` with create): saves the live login as a new account or updates the stored copy; a new account writes `accountAdded` with its plan. Prints the account. |
+| `rm <KEY> [--yes]` | `ops::remove_account` (writes `accountRemoved`); without `--yes` asks "Remove AC — Acme? [y/N]" on a terminal, refuses when stdin is not a terminal. |
 | `edit <KEY> [--label L] [--abbr A] [--color #rrggbb]` | `edit_account`. |
 | `panel [main\|add\|settings]` | Asks the running tray app to open its pop-up (§ app: GUI, single instance). Not running → exit 1 "seatswap is not running". This is the hotkey on Linux v1: the person binds it in the desktop's keyboard settings (no global-shortcut crate is available). |
 | `agent-skill install\|uninstall [--force]` | `agent_skill`: `<claude config dir>/skills/seatswap/SKILL.md` from the bundled text, through `atomic::ensure_private_dir` and `atomic::write_atomic` (0600). Install prints "already installed: <path>" when the file is identical, refuses a differing file without `--force`, else prints the path. Uninstall prints "not installed: <path>" when absent, refuses a differing file without `--force`, else prints "removed <path>" and removes the folder when it is empty. |
@@ -888,7 +935,7 @@ Drawing (tiny-skia, anti-aliased): transparent background; ring of width max(2, 
 
 ## app: GUI (§8, §9, §11) — wave 3, `gui` feature
 
-Files: `crates/app/src/gui/{mod.rs, worker.rs, tray.rs, panel.rs, notify.rs, autostart.rs, ipc.rs, registry.rs}` (`registry.rs` on Windows only), `crates/app/ui/{index.html, panel.css, panel.js}`, `crates/app/capabilities/default.json`. The code is the library `seatswap` (`src/lib.rs`, `pub fn run() -> ExitCode`); two programs call it: `seatswap` (`src/main.rs`) and `seatswap-tray` (`src/bin/seatswap-tray.rs`, built without a console window on Windows for autostart and the Start menu; Linux builds it but does not install it). No subcommand → `gui::run(app: AppPaths, claude_override: Option<PathBuf>, data_override: Option<PathBuf>) -> ExitCode` (the same path resolution as the CLI, one function; the overrides are passed on so `seatswap panel` and autostart start the app with the same flags). Actions both front ends must take the same way live in `crates/app/src/ops.rs`: `save_live_login(claude, store, label, now) -> Result<Account, String>` (a missing, ended or unknown login saved nothing and is an error), `switch_message(store, account_id) -> Result<String, String>` ("Switched to AC — Acme"; an unreadable store or unknown id is an error, never the raw id) and `switched_without_list(error) -> String`.
+Files: `crates/app/src/gui/{mod.rs, worker.rs, tray.rs, panel.rs, notify.rs, autostart.rs, ipc.rs, registry.rs}` (`registry.rs` on Windows only), `crates/app/ui/{index.html, panel.css, panel.js}`, `crates/app/capabilities/default.json`. The code is the library `seatswap` (`src/lib.rs`, `pub fn run() -> ExitCode`); two programs call it: `seatswap` (`src/main.rs`) and `seatswap-tray` (`src/bin/seatswap-tray.rs`, built without a console window on Windows for autostart and the Start menu; Linux builds it but does not install it). No subcommand → `gui::run(app: AppPaths, claude_override: Option<PathBuf>, data_override: Option<PathBuf>) -> ExitCode` (the same path resolution as the CLI, one function; the overrides are passed on so `seatswap panel` and autostart start the app with the same flags). Actions both front ends must take the same way live in `crates/app/src/ops.rs`: `save_live_login(claude, store, recorder: Option<&Recorder>, label, now) -> Result<(Account, Option<String>), String>` (a missing, ended or unknown login saved nothing and is an error; the `Option<String>` is the history error, never a failed add, and `accountAdded` is written only when `sync_live` returned `Synced::Added`), `remove_account(store, key, recorder: Option<&Recorder>, now) -> Result<(Account, Option<String>), String>` (the same shape for `accountRemoved`), `switch_message(store, account_id) -> Result<String, String>` ("Switched to AC — Acme"; an unreadable store or unknown id is an error, never the raw id) and `switched_without_list(error) -> String`.
 
 **Threads.**
 - *Main thread:* Tauri event loop, tray, menu, panel window.
@@ -964,12 +1011,19 @@ fn one_pass(app: &AppPaths, claude: &ClaudePaths, probe: &dyn Liveness, recorder
 
 `WAKE` = 60 s, `AFTER_INCOMPLETE` = 1 s, `SCAN_BUDGET` = 64 MiB per pass, `RECORD_EVERY_SECS` =
 10 min: a running session's record is written when its summary changes and at most that often, and
-one closing record when it is gone. Token records are written on every pass from the answers that
-pass read (`transcripts::token_records`), so one answer is counted once even when it arrives over
-two passes. Waits are kept in memory: a wait that ended writes `EventKind::Waited { session,
-project, secs }` with the whole seconds (never 0 from a backwards clock). A session file that
-cannot be read, a count that does not fit u32, or a transcript state error is shown in
-`SessionsSummary.unavailable` / `warning`; the thread keeps running.
+one closing record when it is gone. A session seen in a transcript whose session file is not running
+gets one closed record too (a short `claude -p` session, every session the backfill read); a later
+scan that adds answers writes a new closed record, and `SessionSeen.recorded` keeps a restart from
+writing the same one again. Token records are written on every pass from the answers that pass read
+(`transcripts::token_records`) and the scan state is committed only when they were written; without
+a recorder or after a failed write the offsets stay, so the next pass with a working history reads
+the same answers and nothing is counted twice. Waits are kept in memory: a wait that ended writes
+`EventKind::Waited { session, project, secs }` with the whole seconds (never 0 from a backwards
+clock). Only "the session files cannot be read" is `SessionsSummary.unavailable` (the counts are
+then 0); a history error, a state that cannot be read or written, an unknown `statusUpdatedAt`, a
+count that does not fit u32 and a transcript read error are `SessionsSummary.warning`, with the
+history error first and then the state. The thread keeps running. The app prints the recorder's read
+warnings once on stderr as `seatswap: history: <warning>`.
 
 ## app: worker, ops and notifications additions — step A
 
@@ -986,9 +1040,10 @@ pub(crate) enum UiEvent { Snapshot(Snapshot), Sessions(SessionsSummary) }
 // ops.rs
 pub(crate) fn open_history(app: &AppPaths, settings: &Settings) -> Result<Recorder, String>;
 pub(crate) fn history_unwritable(error: &dyn std::fmt::Display) -> String;
-pub(crate) fn record_switch(recorder: &Recorder, from: Option<AccountRef>, to: AccountRef, by: By,
-    reason: Option<String>, cwd: Option<String>, sessions: Option<SessionCounts>,
-    at: DateTime<Utc>) -> Result<(), HistoryError>;
+pub(crate) fn record_switch(recorder: &Recorder, from: Option<AccountRef>, to: AccountRef,
+    saved_new: Option<&Account>, by: By, reason: Option<String>, cwd: Option<String>,
+    sessions: Option<SessionCounts>, at: DateTime<Utc>) -> Result<(), HistoryError>;
+// saved_new = the account SwitchOutcome.saved_new created: its accountAdded is written before the switch.
 
 // notify.rs
 pub(crate) enum Notification { Suggestion(..), LoginWarning(..), UnknownLogin { .. },
@@ -1011,9 +1066,11 @@ impl WaitingHandle { pub(crate) fn withdraw(self); }
 ```
 
 `Notification::UsableAgain` needs `notifyUsableAgain` on, the account now usable, not active, and
-the previous snapshot naming a blocker; it is remembered by (account id, previous reset minute), so
-one per account and reset. `AllFull` only when the previous snapshot had a usable account and every
-account whose login still works is now blocked; the next is the earliest `blocked_until`. `Waiting`
+the previous snapshot naming a blocker whose `blocked_until` is at or before `now` (the block ended
+because its reset passed); it is remembered by (account id, previous reset minute), so one per
+account and reset. A block that ends earlier sends nothing and does not use that key. `AllFull` only
+when the previous snapshot had a usable account and `engine::all_blocked` says every account whose
+login still works is now blocked; the next is the earliest `blocked_until`. `Waiting`
 only after 15 s (`waiting.since` to `now`), once per session and wait; turning `notifyWaiting` off
 withdraws the shown ones and sends nothing new; a session that stops waiting gets `WaitingOver`,
 which withdraws its notification. The texts come from one place each: `usable_again_text` =

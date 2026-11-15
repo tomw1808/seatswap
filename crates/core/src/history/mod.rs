@@ -203,7 +203,11 @@ pub enum By {
 pub struct SessionCounts {
     pub running: u32,
     pub busy: u32,
-    pub tied: u32,
+    /// How many sessions run on a model whose thinking is tied to the account
+    /// (spec §2.11). Step B measures it; until then it is `None` and left out
+    /// of the file. An old line with `"tied":0` still reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tied: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -746,7 +750,7 @@ mod tests {
                 sessions: Some(SessionCounts {
                     running: 2,
                     busy: 1,
-                    tied: 0,
+                    tied: None,
                 }),
                 waited_secs: None,
             },
@@ -759,6 +763,58 @@ mod tests {
 
         let read = history.read::<Event>(&wide_range(), &Hosts::All).unwrap();
         assert_eq!(read.records.len(), 1);
+    }
+
+    #[test]
+    fn a_tied_count_is_left_out_until_it_is_known() {
+        let dir = tempdir().unwrap();
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let event = Event {
+            t: utc("2026-11-14T14:02:11Z"),
+            kind: EventKind::Switch {
+                from: None,
+                to: atlas_account(),
+                by: By::User,
+                reason: None,
+                cwd: None,
+                sessions: Some(SessionCounts {
+                    running: 2,
+                    busy: 1,
+                    tied: None,
+                }),
+                waited_secs: None,
+            },
+        };
+        history.append(&event).unwrap();
+        let path = dir.path().join("atlas/events-2026-11.jsonl");
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("\"tied\""),
+            "a count step B has not measured is not written: {text}"
+        );
+
+        // A line written by an older seatswap with `"tied":0` still reads.
+        let old = format!(
+            "{{\"t\":\"2026-11-14T14:03:11Z\",\"type\":\"switch\",\"to\":{},\"by\":\"user\",\"sessions\":{{\"running\":2,\"busy\":1,\"tied\":0}}}}\n",
+            serde_json::to_string(&atlas_account()).unwrap()
+        );
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(old.as_bytes()).unwrap();
+        drop(file);
+
+        let read = history.read::<Event>(&wide_range(), &Hosts::All).unwrap();
+        let tied: Vec<Option<u32>> = read
+            .records
+            .iter()
+            .filter_map(|hosted| match &hosted.record.kind {
+                EventKind::Switch {
+                    sessions: Some(counts),
+                    ..
+                } => Some(counts.tied),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tied, vec![None, Some(0)]);
     }
 
     #[test]

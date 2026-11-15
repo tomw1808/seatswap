@@ -28,6 +28,9 @@ pub struct Recorder {
     state: HashMap<AccountRef, AccountState>,
     windows: HashSet<WindowKey>,
     last_up: Option<DateTime<Utc>>,
+    /// Warnings from the lines this recorder read back (spec §1.2), each
+    /// returned once by [`take_warnings`](Self::take_warnings).
+    warnings: Vec<String>,
 }
 
 /// What one account's readings have shown so far.
@@ -105,11 +108,19 @@ impl Recorder {
             state: HashMap::new(),
             windows: HashSet::new(),
             last_up: None,
+            warnings: Vec::new(),
         }
     }
 
     pub fn dir(&self) -> &HistoryDir {
         &self.dir
+    }
+
+    /// The warnings of the lines the recorder read back since the last call
+    /// (spec §1.2): a torn last line, a line of a shape this version does not
+    /// know. Each one is returned once, so the app can print it once.
+    pub fn take_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.warnings)
     }
 
     /// One usage answer. Appends a Sample if a number or a reset time differs
@@ -294,6 +305,7 @@ impl Recorder {
         let mut holds_every_limit = false;
         for range in months_of_kind(&host_dir, Kind::Samples)? {
             let read = self.dir.read::<Sample>(&range, &own)?;
+            self.warnings.extend(read.warnings);
             let mut lines: Vec<Sample> = read
                 .records
                 .into_iter()
@@ -330,6 +342,7 @@ impl Recorder {
                     continue;
                 }
                 let read = self.dir.read::<WindowRecord>(&range, &own)?;
+                self.warnings.extend(read.warnings);
                 for hosted in read.records {
                     if &hosted.record.account == account {
                         self.windows.insert(WindowKey::of(&hosted.record));
@@ -428,6 +441,7 @@ mod tests {
 
     use std::fs;
     use std::io;
+    use std::io::Write;
     use std::path::Path;
 
     use tempfile::tempdir;
@@ -900,6 +914,50 @@ mod tests {
             .unwrap();
 
         assert_eq!(sample_lines(dir.path()), 1);
+    }
+
+    #[test]
+    fn load_once_warnings_reach_the_caller() {
+        let dir = tempdir().unwrap();
+        let mut first = Recorder::new(history(dir.path()));
+        first
+            .reading(
+                &atlas_account(),
+                None,
+                &weekly(75.0, Some(utc("2026-11-16T16:00:00Z"))),
+                utc("2026-11-14T14:02:11Z"),
+                Source::Poll,
+            )
+            .unwrap();
+        drop(first);
+
+        // A crash left a torn last line (spec §1.2): reading names it.
+        let path = dir.path().join("atlas/samples-2026-11.jsonl");
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"{\"t\":\"2026-11-14T15").unwrap();
+        drop(file);
+
+        let mut restarted = Recorder::new(history(dir.path()));
+        restarted
+            .reading(
+                &atlas_account(),
+                None,
+                &weekly(76.0, Some(utc("2026-11-16T16:00:00Z"))),
+                utc("2026-11-14T14:04:11Z"),
+                Source::Poll,
+            )
+            .unwrap();
+
+        let warnings = restarted.take_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("samples-2026-11.jsonl"),
+            "the warning names the file: {warnings:?}"
+        );
+        assert!(
+            restarted.take_warnings().is_empty(),
+            "a warning is returned once"
+        );
     }
 
     #[test]

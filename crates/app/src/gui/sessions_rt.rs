@@ -21,7 +21,7 @@ use seatswap_core::paths::{AppPaths, ClaudePaths};
 use seatswap_core::project::{self, ProjectKey};
 use seatswap_core::sessions::{self, Liveness, SessionFile, SessionStatus, SystemProbe};
 use seatswap_core::store::Settings;
-use seatswap_core::transcripts::{self, ScanState, SessionSeen};
+use seatswap_core::transcripts::{self, RecordedSession, ScanState, SessionSeen};
 use seatswap_core::watcher::{watch_folder, FolderWatch, WatchError};
 
 use super::worker::{EngineCommand, SessionsSummary, UiEvent, Waiting};
@@ -214,7 +214,7 @@ fn run(
                     running: 0,
                     busy: 0,
                     waiting: Vec::new(),
-                    unavailable: state_error.clone(),
+                    unavailable: None,
                     warning: None,
                 };
                 add_unavailable(
@@ -222,7 +222,11 @@ fn run(
                     format!("running sessions cannot be read: {error}"),
                 );
                 if let Some(error) = &history_error {
-                    add_unavailable(&mut summary, error.clone());
+                    // The order the pop-up shows: the history error first, then the state.
+                    add_warning(&mut summary, error.clone());
+                }
+                if let Some(error) = &state_error {
+                    add_warning(&mut summary, error.clone());
                 }
                 save_state(
                     &app,
@@ -298,7 +302,7 @@ fn save_state(
         return;
     }
     if let Err(error) = state.save(claude, app, now) {
-        add_unavailable(
+        add_warning(
             summary,
             format!("the transcript state cannot be written: {error}"),
         );
@@ -322,7 +326,8 @@ fn one_pass(
 ) -> PassOutcome {
     let mut outcome = run_pass(claude, probe, recorder, state, memory, now, state_error);
     if let Some(error) = history_error {
-        add_unavailable(&mut outcome.summary, error.to_string());
+        // The order the pop-up shows: the history error first, then the state.
+        prepend_warning(&mut outcome.summary, error.to_string());
     }
     save_state(app, claude, state, now, state_error, &mut outcome.summary);
     outcome
@@ -343,8 +348,8 @@ pub(crate) fn run_pass(
         running: 0,
         busy: 0,
         waiting: Vec::new(),
-        unavailable: state_error.map(str::to_string),
-        warning: None,
+        unavailable: None,
+        warning: state_error.map(str::to_string),
     };
     let running = match sessions::running(claude, probe) {
         Ok(running) => running,
@@ -364,7 +369,7 @@ pub(crate) fn run_pass(
     summary.running = match count_u32(running.sessions.len(), "the running session count") {
         Ok(count) => count,
         Err(error) => {
-            add_unavailable(&mut summary, error);
+            add_warning(&mut summary, error);
             return PassOutcome {
                 summary,
                 models: None,
@@ -380,7 +385,7 @@ pub(crate) fn run_pass(
     summary.busy = match count_u32(busy, "the busy session count") {
         Ok(count) => count,
         Err(error) => {
-            add_unavailable(&mut summary, error);
+            add_warning(&mut summary, error);
             return PassOutcome {
                 summary,
                 models: None,
@@ -391,10 +396,13 @@ pub(crate) fn run_pass(
     for session in &running.sessions {
         if let Some(version) = &session.version {
             if sessions::newer_than_tested(version) {
-                summary.warning = Some(format!(
-                    "Claude Code {version} is newer than the version seatswap was tested with ({}). Session data may be incomplete.",
-                    sessions::TESTED_CLAUDE_CODE
-                ));
+                add_warning(
+                    &mut summary,
+                    format!(
+                        "Claude Code {version} is newer than the version seatswap was tested with ({}). Session data may be incomplete.",
+                        sessions::TESTED_CLAUDE_CODE
+                    ),
+                );
                 break;
             }
         }
@@ -418,7 +426,7 @@ pub(crate) fn run_pass(
             continue;
         }
         let Some(since) = DateTime::<Utc>::from_timestamp_millis(session.status_updated_at) else {
-            add_unavailable(
+            add_warning(
                 &mut summary,
                 format!(
                     "session {} has an invalid statusUpdatedAt {}",
@@ -450,7 +458,7 @@ pub(crate) fn run_pass(
             let secs = match u64::try_from((now - wait.since).num_seconds()) {
                 Ok(secs) => secs,
                 Err(_) => {
-                    add_unavailable(
+                    add_warning(
                         &mut summary,
                         format!(
                             "a wait of session {session} ended before it began (the clock moved back); it is not recorded"
@@ -479,18 +487,34 @@ pub(crate) fn run_pass(
     let mut scan_complete = true;
     if state_error.is_none() {
         match transcripts::scan(claude, state, SCAN_BUDGET) {
-            Ok(scan) => {
+            Ok(mut scan) => {
                 scan_complete = scan.complete;
-                let tokens = transcripts::token_records(&scan.answers, state, &memory.home);
-                if let Some(recorder) = recorder {
-                    if let Err(error) = recorder.tokens(&tokens) {
-                        add_history_error(&mut summary, error);
-                    }
+                let tokens = transcripts::token_records(&scan.answers, scan.state(), &memory.home);
+                let tokens_written = match recorder {
+                    Some(recorder) => match recorder.tokens(&tokens) {
+                        Ok(()) => true,
+                        Err(error) => {
+                            add_history_error(&mut summary, error);
+                            false
+                        }
+                    },
+                    // Without a recorder the token lines are not written. The
+                    // offsets stay where they were, so a later pass with a
+                    // working history reads these answers again.
+                    None => tokens.is_empty(),
+                };
+                if tokens_written {
+                    scan.commit(state);
+                } else {
+                    // Retrying at once would read the same bytes again and make
+                    // no progress until the history works: wait for the regular
+                    // wake instead.
+                    scan_complete = true;
                 }
             }
             Err(error) => {
                 scan_complete = false;
-                add_unavailable(
+                add_warning(
                     &mut summary,
                     format!("the transcripts cannot be read: {error}"),
                 );
@@ -510,10 +534,18 @@ pub(crate) fn run_pass(
         let Some(seen) = state.sessions.get(&session.session_id) else {
             continue;
         };
-        let record = match session_record(claude, session, seen, memory, now) {
+        let record = match session_record(
+            claude,
+            &session.session_id,
+            seen,
+            session.entrypoint.clone(),
+            false,
+            memory,
+            now,
+        ) {
             Ok(record) => record,
             Err(error) => {
-                add_unavailable(&mut summary, error);
+                add_warning(&mut summary, error);
                 continue;
             }
         };
@@ -525,20 +557,81 @@ pub(crate) fn run_pass(
                 Ok(()) => {
                     memory.records.insert(record.session.clone(), record);
                     memory.closed.remove(&session.session_id);
+                    if let Some(seen) = state.sessions.get_mut(&session.session_id) {
+                        seen.recorded = Some(RecordedSession {
+                            last: seen.last,
+                            closed: false,
+                        });
+                    }
                 }
                 Err(error) => add_history_error(&mut summary, error),
             }
         }
     }
 
-    // A session that left the running list gets one closing record, with the
-    // values of its last record. When a session file could not be read this
-    // pass, the thread cannot tell which session left: write no closing record.
+    // Every session seen in a transcript whose session file is not running gets
+    // one closed record: a `claude -p` session that started and ended between
+    // two wakes, and every session the backfill read. `recorded` remembers what
+    // was written, so a restart writes no second record for an unchanged
+    // session. When a session file could not be read this pass, the thread
+    // cannot tell which session ended: write no closed record.
+    if running.skipped.is_empty() {
+        let stopped: Vec<String> = state
+            .sessions
+            .keys()
+            .filter(|session| !running_ids.contains(*session))
+            .cloned()
+            .collect();
+        for session in stopped {
+            let Some(seen) = state.sessions.get(&session) else {
+                continue;
+            };
+            let last = seen.last;
+            if seen
+                .recorded
+                .as_ref()
+                .is_some_and(|recorded| recorded.closed && recorded.last == last)
+            {
+                continue;
+            }
+            let entrypoint = memory
+                .records
+                .get(&session)
+                .and_then(|record| record.entrypoint.clone());
+            let record = match session_record(claude, &session, seen, entrypoint, true, memory, now)
+            {
+                Ok(record) => record,
+                Err(error) => {
+                    add_warning(&mut summary, error);
+                    continue;
+                }
+            };
+            if let Some(recorder) = recorder {
+                match recorder.session(&record) {
+                    Ok(()) => {
+                        memory.records.insert(session.clone(), record);
+                        memory.closed.insert(session.clone());
+                        if let Some(seen) = state.sessions.get_mut(&session) {
+                            seen.recorded = Some(RecordedSession { last, closed: true });
+                        }
+                    }
+                    Err(error) => add_history_error(&mut summary, error),
+                }
+            }
+        }
+    }
+
+    // A session that left the running list whose transcript entry is already
+    // pruned still gets one closing record, with the values of its last record.
     if running.skipped.is_empty() {
         let gone: Vec<String> = memory
             .records
             .keys()
-            .filter(|session| !running_ids.contains(*session) && !memory.closed.contains(*session))
+            .filter(|session| {
+                !running_ids.contains(*session)
+                    && !state.sessions.contains_key(*session)
+                    && !memory.closed.contains(*session)
+            })
             .cloned()
             .collect();
         for session in gone {
@@ -574,37 +667,33 @@ pub(crate) fn run_pass(
 
 fn session_record(
     claude: &ClaudePaths,
-    session: &SessionFile,
+    session: &str,
     seen: &SessionSeen,
+    entrypoint: Option<String>,
+    closed: bool,
     memory: &mut SessionMemory,
     now: DateTime<Utc>,
 ) -> Result<SessionRecord, String> {
-    let agents = transcripts::agents_of(claude, &session.session_id);
+    let agents = transcripts::agents_of(claude, session);
     let started = count_u32(
         agents.len(),
-        &format!(
-            "the number of agents started in session {}",
-            session.session_id
-        ),
+        &format!("the number of agents started in session {session}"),
     )?;
     let finished = count_u32(
         agents.iter().filter(|agent| agent.finished).count(),
-        &format!(
-            "the number of agents finished in session {}",
-            session.session_id
-        ),
+        &format!("the number of agents finished in session {session}"),
     )?;
     Ok(SessionRecord {
         t: now,
-        session: session.session_id.clone(),
+        session: session.to_string(),
         cwd: seen.cwd.clone(),
         project: memory.project_for(&seen.cwd),
-        entrypoint: session.entrypoint.clone(),
+        entrypoint,
         first: seen.first,
         last: seen.last,
         agents_started: started,
         agents_finished: finished,
-        closed: false,
+        closed,
     })
 }
 
@@ -639,13 +728,19 @@ fn same_summary(first: &SessionRecord, second: &SessionRecord) -> bool {
         && first.closed == second.closed
 }
 
+/// The models of the running sessions that have one (lower-case ids). A session
+/// without an answer yet adds nothing; only a pass that cannot read the session
+/// files has no set at all.
 fn models_in_use(running: &[SessionFile], state: &ScanState) -> Option<BTreeSet<String>> {
     let mut models = BTreeSet::new();
     for session in running {
-        let model = state
+        let Some(model) = state
             .sessions
             .get(&session.session_id)
-            .and_then(|seen| seen.last_model.as_deref())?;
+            .and_then(|seen| seen.last_model.as_deref())
+        else {
+            continue;
+        };
         models.insert(model.to_lowercase());
     }
     Some(models)
@@ -680,8 +775,17 @@ fn add_warning(summary: &mut SessionsSummary, text: String) {
     });
 }
 
+/// Put a warning before the ones already on the summary: the history error is
+/// shown before the state error.
+fn prepend_warning(summary: &mut SessionsSummary, text: String) {
+    summary.warning = Some(match summary.warning.take() {
+        Some(next) => format!("{text}; {next}"),
+        None => text,
+    });
+}
+
 fn add_history_error(summary: &mut SessionsSummary, error: seatswap_core::history::HistoryError) {
-    add_unavailable(summary, ops::history_unwritable(&error));
+    add_warning(summary, ops::history_unwritable(&error));
 }
 
 #[cfg(test)]
@@ -1015,6 +1119,7 @@ mod tests {
                 last_model: Some("claude-opus-5-5".to_string()),
                 last_user_turn: None,
                 thinking_since_user: 0,
+                recorded: None,
             },
         );
         let mut memory = SessionMemory::new(tmp.path().to_path_buf());
@@ -1166,6 +1271,7 @@ mod tests {
                 last_model: Some("claude-opus-5-5".to_string()),
                 last_user_turn: None,
                 thinking_since_user: 0,
+                recorded: None,
             },
         );
         let mut memory = SessionMemory::new(tmp.path().to_path_buf());
@@ -1224,19 +1330,19 @@ mod tests {
             folder.join(format!("{SESSION}.jsonl")),
             format!(
                 "{}\n",
-                transcript_line(
-                    SESSION,
-                    "msg_01QmB7xT",
-                    time("2026-11-14T09:56:00Z"),
-                    "/home/sam/projects/atlas",
-                    "claude-opus-5-5",
-                    (2_400, 260, 17_000, 31_000),
-                )
+                serde_json::json!({
+                    "type": "user",
+                    "timestamp": "2026-11-14T09:56:00Z",
+                    "sessionId": SESSION,
+                    "cwd": "/home/sam/projects/atlas",
+                    "message": {"role": "user", "content": "fix the failing tests"},
+                })
             ),
         )
         .unwrap();
-        // The state loads while its folder is still a folder. The transcript
-        // above changes the state, so the save tries to write that folder.
+        // The state loads while its folder is still a folder. The user line
+        // above changes the state and holds no tokens, so the save tries to
+        // write that folder without a recorder.
         let (mut state, state_error) = load_state(&app);
         assert_eq!(state_error, None);
         fs::write(app.transcripts_state_dir(), "not a folder").unwrap();
@@ -1268,15 +1374,16 @@ mod tests {
             state_error.as_deref(),
             Some(history_error.as_str()),
         );
-        let unavailable = outcome
-            .summary
-            .unavailable
-            .expect("both errors are reported");
+        let warning = outcome.summary.warning.expect("both errors are reported");
         assert!(
-            unavailable.starts_with(&format!(
+            warning.starts_with(&format!(
                 "{history_error}; the transcript state cannot be written: "
             )),
-            "{unavailable}"
+            "{warning}"
+        );
+        assert_eq!(
+            outcome.summary.unavailable, None,
+            "the counts stay visible: only unreadable session files are unavailable"
         );
     }
 
@@ -1519,5 +1626,394 @@ mod tests {
             before,
             "a second start adds no line to any history file"
         );
+    }
+
+    #[test]
+    fn tokens_read_while_the_history_is_closed_are_not_lost() {
+        let (tmp, claude, app) = fixture();
+        let folder = claude.projects_dir().join("-home-sam-projects-atlas");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(
+            folder.join(format!("{SESSION}.jsonl")),
+            format!(
+                "{}\n",
+                transcript_line(
+                    SESSION,
+                    "msg_01QmB7xT",
+                    time("2026-11-14T09:41:07Z"),
+                    "/home/sam/projects/atlas",
+                    "claude-opus-5-5",
+                    (2, 166, 26_173, 28_126),
+                )
+            ),
+        )
+        .unwrap();
+
+        // First start: the history cannot be opened (say HostTaken), so there
+        // is no recorder; the pass still runs and saves the scan state.
+        let (mut state, _) = load_state(&app);
+        let mut memory = SessionMemory::new(claude.home().to_path_buf());
+        one_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            None,
+            &mut state,
+            &mut memory,
+            time("2026-11-14T10:00:00Z"),
+            None,
+            Some("the history cannot be written: host atlas is taken"),
+        );
+
+        // The owner fixes hostName and restarts: now there is a recorder.
+        let recorder = Recorder::new(history(&tmp.path().join("history")));
+        let (mut state, _) = load_state(&app);
+        let mut memory = SessionMemory::new(claude.home().to_path_buf());
+        one_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            time("2026-11-14T10:05:00Z"),
+            None,
+            None,
+        );
+
+        let read = recorder
+            .dir()
+            .read::<seatswap_core::history::TokenRecord>(
+                &Range {
+                    from: time("2026-11-01T00:00:00Z"),
+                    to: time("2026-12-01T00:00:00Z"),
+                },
+                &Hosts::One("atlas".to_string()),
+            )
+            .unwrap();
+        assert_eq!(
+            read.records.len(),
+            1,
+            "the answer read while the history was closed must still reach tokens-…"
+        );
+    }
+
+    #[test]
+    fn a_history_error_keeps_the_counts_visible() {
+        let (tmp, claude, app) = fixture();
+        write_session(
+            &claude,
+            100,
+            &session_json(
+                100,
+                SESSION,
+                "/home/sam/projects/atlas",
+                Some("atlas-a6"),
+                "busy",
+                time("2026-11-14T09:56:00Z").timestamp_millis(),
+            ),
+        );
+        let recorder = Recorder::new(history(&tmp.path().join("history")));
+        let (mut state, _) = load_state(&app);
+        let mut memory = SessionMemory::new(claude.home().to_path_buf());
+        let outcome = one_pass(
+            &app,
+            &claude,
+            &probe(&[100]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            time("2026-11-14T10:00:00Z"),
+            None,
+            Some("the history cannot be written: host atlas is taken"),
+        );
+        assert_eq!(outcome.summary.running, 1);
+        // panel.js renderFooter shows `unavailable` *instead of* the counts.
+        assert!(
+            outcome.summary.unavailable.is_none(),
+            "unavailable hides `1 sessions · 1 busy` in the footer: {:?}",
+            outcome.summary.unavailable
+        );
+        assert_eq!(
+            outcome.summary.warning.as_deref(),
+            Some("the history cannot be written: host atlas is taken"),
+            "the history error is a warning beside the counts"
+        );
+    }
+
+    #[test]
+    fn a_state_that_cannot_be_read_is_a_warning_beside_the_counts() {
+        let (_tmp, claude, app) = fixture();
+        write_session(
+            &claude,
+            100,
+            &session_json(
+                100,
+                SESSION,
+                "/home/sam/projects/atlas",
+                Some("atlas-a6"),
+                "busy",
+                time("2026-11-14T09:56:00Z").timestamp_millis(),
+            ),
+        );
+        let (mut state, _) = load_state(&app);
+        let mut memory = SessionMemory::new(claude.home().to_path_buf());
+        let state_error = "the transcript state cannot be read: not a state file";
+        let outcome = one_pass(
+            &app,
+            &claude,
+            &probe(&[100]),
+            None,
+            &mut state,
+            &mut memory,
+            time("2026-11-14T10:00:00Z"),
+            Some(state_error),
+            None,
+        );
+        assert_eq!(outcome.summary.running, 1);
+        assert_eq!(
+            outcome.summary.unavailable, None,
+            "the state is not the session files; the counts stay visible"
+        );
+        assert_eq!(outcome.summary.warning.as_deref(), Some(state_error));
+    }
+
+    #[test]
+    fn a_short_session_gets_a_session_record() {
+        let (tmp, claude, app) = fixture();
+        let recorder = Recorder::new(history(&tmp.path().join("history")));
+        let (mut state, _) = load_state(&app);
+        let mut memory = SessionMemory::new(claude.home().to_path_buf());
+        // 10:00:00.5 a `claude -p` session has just started: no answer yet.
+        write_session(
+            &claude,
+            100,
+            &session_json(
+                100,
+                SESSION,
+                "/home/sam/projects/atlas",
+                None,
+                "busy",
+                time("2026-11-14T10:00:00Z").timestamp_millis(),
+            ),
+        );
+        one_pass(
+            &app,
+            &claude,
+            &probe(&[100]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            time("2026-11-14T10:00:01Z"),
+            None,
+            None,
+        );
+        // It answers and ends cleanly (its file is removed) before the next wake.
+        let folder = claude.projects_dir().join("-home-sam-projects-atlas");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(
+            folder.join(format!("{SESSION}.jsonl")),
+            format!(
+                "{}\n",
+                transcript_line(
+                    SESSION,
+                    "msg_01QmB7xT",
+                    time("2026-11-14T10:00:09Z"),
+                    "/home/sam/projects/atlas",
+                    "claude-opus-5-5",
+                    (2, 166, 26_173, 28_126)
+                )
+            ),
+        )
+        .unwrap();
+        fs::remove_file(claude.sessions_dir().join("100.json")).unwrap();
+        one_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            time("2026-11-14T10:00:20Z"),
+            None,
+            None,
+        );
+        let read = recorder
+            .dir()
+            .read::<SessionRecord>(
+                &Range {
+                    from: time("2026-11-01T00:00:00Z"),
+                    to: time("2026-12-01T00:00:00Z"),
+                },
+                &Hosts::One("atlas".to_string()),
+            )
+            .unwrap();
+        assert!(
+            !read.records.is_empty(),
+            "the session used tokens but has no sessions-… line"
+        );
+    }
+
+    /// A session without an answer yet must not turn the whole set of models
+    /// into "not known": that would switch a per-model limit to the server's
+    /// `is_active` view for one wake.
+    #[test]
+    fn models_in_use_keeps_the_models_of_the_sessions_that_have_one() {
+        const SECOND: &str = "2b7d9c1e-5a4f-4c3b-9e8d-7f6a5b4c3d2e";
+        let (_tmp, claude, _app) = fixture();
+        let at = time("2026-11-14T10:00:00Z");
+        write_session(
+            &claude,
+            700,
+            &session_json(
+                700,
+                SESSION,
+                "/home/sam/projects/atlas",
+                None,
+                "busy",
+                at.timestamp_millis(),
+            ),
+        );
+        write_session(
+            &claude,
+            701,
+            &session_json(
+                701,
+                SECOND,
+                "/home/sam/projects/ledger",
+                None,
+                "busy",
+                at.timestamp_millis(),
+            ),
+        );
+        let mut state = ScanState::default();
+        state.sessions.insert(
+            SESSION.to_string(),
+            SessionSeen {
+                folder: "-home-sam-projects-atlas".to_string(),
+                cwd: "/home/sam/projects/atlas".to_string(),
+                first: at,
+                last: at,
+                last_model: Some("claude-opus-5-5".to_string()),
+                last_user_turn: None,
+                thinking_since_user: 0,
+                recorded: None,
+            },
+        );
+        let mut memory = SessionMemory::new(claude.home().to_path_buf());
+        let outcome = run_pass(
+            &claude,
+            &probe(&[700, 701]),
+            None,
+            &mut state,
+            &mut memory,
+            at,
+            None,
+        );
+        assert_eq!(
+            outcome.models,
+            Some(BTreeSet::from(["claude-opus-5-5".to_string()])),
+            "the session without an answer adds nothing and does not clear the set"
+        );
+    }
+
+    /// A closed session that answers again gets one new closed record; an
+    /// unchanged one gets none.
+    #[test]
+    fn a_closed_session_that_answers_again_gets_a_new_closed_record() {
+        let (tmp, claude, app) = fixture();
+        let recorder = Recorder::new(history(&tmp.path().join("history")));
+        let folder = claude.projects_dir().join("-home-sam-projects-atlas");
+        fs::create_dir_all(&folder).unwrap();
+        let path = folder.join(format!("{SESSION}.jsonl"));
+        fs::write(
+            &path,
+            format!(
+                "{}\n",
+                transcript_line(
+                    SESSION,
+                    "msg_01",
+                    time("2026-11-14T09:41:00Z"),
+                    "/home/sam/projects/atlas",
+                    "claude-opus-5-5",
+                    (2, 166, 26_173, 28_126),
+                )
+            ),
+        )
+        .unwrap();
+        let (mut state, state_error) = load_state(&app);
+        let mut memory = SessionMemory::new(claude.home().to_path_buf());
+        one_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            time("2026-11-14T10:00:00Z"),
+            state_error.as_deref(),
+            None,
+        );
+
+        let mut text = fs::read_to_string(&path).unwrap();
+        text.push_str(&format!(
+            "{}\n",
+            transcript_line(
+                SESSION,
+                "msg_02",
+                time("2026-11-14T09:42:00Z"),
+                "/home/sam/projects/atlas",
+                "claude-opus-5-5",
+                (2, 170, 26_201, 28_150),
+            )
+        ));
+        fs::write(&path, text).unwrap();
+        let (mut state, state_error) = load_state(&app);
+        let mut memory = SessionMemory::new(claude.home().to_path_buf());
+        let outcome = one_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            time("2026-11-14T10:01:00Z"),
+            state_error.as_deref(),
+            None,
+        );
+        assert_eq!(outcome.summary.unavailable, None);
+        // No new answer: no third record.
+        let (mut state, state_error) = load_state(&app);
+        let mut memory = SessionMemory::new(claude.home().to_path_buf());
+        one_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            time("2026-11-14T10:02:00Z"),
+            state_error.as_deref(),
+            None,
+        );
+
+        let read = recorder
+            .dir()
+            .read::<SessionRecord>(
+                &Range {
+                    from: time("2026-11-01T00:00:00Z"),
+                    to: time("2026-12-01T00:00:00Z"),
+                },
+                &Hosts::One("atlas".to_string()),
+            )
+            .unwrap();
+        assert_eq!(
+            read.records.len(),
+            2,
+            "one closed record per batch of answers"
+        );
+        assert!(read.records.iter().all(|hosted| hosted.record.closed));
+        assert_eq!(read.records[0].record.last, time("2026-11-14T09:41:00Z"));
+        assert_eq!(read.records[1].record.last, time("2026-11-14T09:42:00Z"));
     }
 }

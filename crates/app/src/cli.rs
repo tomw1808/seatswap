@@ -16,7 +16,7 @@ use serde::Serialize;
 use seatswap_core::api::{Api, Usage};
 use seatswap_core::atomic::{self, Access};
 use seatswap_core::engine::{suggestion, AccountView, Engine, PollReason, Suggestion, UsageCache};
-use seatswap_core::history::{AccountRef, By, EventKind};
+use seatswap_core::history::{AccountRef, By, EventKind, Recorder};
 use seatswap_core::paths::{self, AppPaths, ClaudePaths, PathsError};
 use seatswap_core::store::{self, Account, AccountsFile, LoginState, Settings, Store, StoreError};
 use seatswap_core::switcher::{self, LiveState, SwitchError, UnsavedPolicy};
@@ -840,12 +840,13 @@ fn record_cli_switch(
             .as_deref()
             .and_then(|id| file.find(id))
             .map(AccountRef::of);
+        let saved_new = outcome.saved_new.as_deref().and_then(|id| file.find(id));
         let recorder = ops::open_history(context.store.app_paths(), &context.settings)?;
-        ops::record_switch(&recorder, from, to, by, None, cwd, None, at)
+        ops::record_switch(&recorder, from, to, saved_new, by, None, cwd, None, at)
             .map_err(|error| error.to_string())
     })();
     if let Err(error) = result {
-        eprintln!("warning: the switch was not written to the history: {error}");
+        eprintln!("seatswap: warning: the switch was not written to the history: {error}");
     }
 }
 
@@ -878,8 +879,18 @@ fn next_account(
             UnsavedPolicy::Save { label } => {
                 // Saving first turns the live login into an account, so "next
                 // after the live one" has a position in the list.
-                ops::save_live_login(&context.claude, &context.store, label.clone(), now)
-                    .map_err(CliError::Message)?;
+                let recorder = cli_history(&context);
+                let (_, history_error) = ops::save_live_login(
+                    &context.claude,
+                    &context.store,
+                    recorder.as_ref(),
+                    label.clone(),
+                    now,
+                )
+                .map_err(CliError::Message)?;
+                if let Some(error) = history_error {
+                    eprintln!("seatswap: warning: {error}");
+                }
                 file = context.store.load()?;
                 live = switcher::live_state(&context.claude, &file)?;
             }
@@ -898,10 +909,32 @@ fn next_account(
     Ok(())
 }
 
+/// The CLI's history recorder, or `None` with the reason printed once. The
+/// command itself never fails because the history cannot be opened.
+fn cli_history(context: &Context) -> Option<Recorder> {
+    match ops::open_history(context.store.app_paths(), &context.settings) {
+        Ok(recorder) => Some(recorder),
+        Err(error) => {
+            eprintln!("seatswap: warning: {error}");
+            None
+        }
+    }
+}
+
 fn add(context: Context, label: Option<String>) -> Result<(), CliError> {
-    let account = ops::save_live_login(&context.claude, &context.store, label, Utc::now())
-        .map_err(CliError::Message)?;
+    let recorder = cli_history(&context);
+    let (account, history_error) = ops::save_live_login(
+        &context.claude,
+        &context.store,
+        recorder.as_ref(),
+        label,
+        Utc::now(),
+    )
+    .map_err(CliError::Message)?;
     println!("Saved {} — {}", account.abbr, account.label);
+    if let Some(error) = history_error {
+        eprintln!("seatswap: warning: {error}");
+    }
     Ok(())
 }
 
@@ -914,8 +947,14 @@ fn remove(context: Context, key: &str, yes: bool) -> Result<(), CliError> {
         println!("Not removed.");
         return Ok(());
     }
-    let removed = switcher::remove_account(&context.store, key)?;
+    let recorder = cli_history(&context);
+    let (removed, history_error) =
+        ops::remove_account(&context.store, key, recorder.as_ref(), Utc::now())
+            .map_err(CliError::Message)?;
     println!("Removed {} — {}", removed.abbr, removed.label);
+    if let Some(error) = history_error {
+        eprintln!("seatswap: warning: {error}");
+    }
     Ok(())
 }
 
@@ -963,7 +1002,7 @@ fn edit(
 /// `<claude config dir>/skills/seatswap/`. Nothing outside these two commands
 /// writes to Claude Code's config folder.
 fn agent_skill(context: &Context, action: SkillAction) -> Result<(), CliError> {
-    let folder = context.claude.config_dir.join("skills").join("seatswap");
+    let folder = context.claude.skills_dir().join("seatswap");
     let path = folder.join("SKILL.md");
     match action {
         SkillAction::Install { force } => install_skill(&folder, &path, force),
@@ -1331,6 +1370,8 @@ mod tests {
     const FIRST_ORG_UUID: &str = "e2a6c9d1-7f4b-4a3e-8c5d-1b9f0a7e3c62";
     const SECOND_ACCOUNT_UUID: &str = "8e1d5b7a-6c3f-4a2b-9d8e-1f2a3b4c5d6e";
     const SECOND_ORG_UUID: &str = "5f2c8a1b-9d4e-4f6a-8b3c-7e2d1a9c4b5e";
+    const THIRD_ACCOUNT_UUID: &str = "2b7e9c4d-1a3f-4c5e-8b6d-7f0a1c2e3d4b";
+    const THIRD_ORG_UUID: &str = "9a1c3e5f-7b9d-4f2a-8c6e-0d1b3a5c7e9f";
 
     struct Fixture {
         _tmp: tempfile::TempDir,
@@ -1451,6 +1492,7 @@ mod tests {
             ops::save_live_login(
                 &self.claude(),
                 &self.store(),
+                None,
                 Some(label.to_string()),
                 Utc::now(),
             )
@@ -1999,7 +2041,7 @@ mod tests {
     #[test]
     fn skill_install_writes_the_bundled_text() {
         let fixture = Fixture::new();
-        let path = fixture.config_dir.join("skills/seatswap/SKILL.md");
+        let path = fixture.claude().skills_dir().join("seatswap/SKILL.md");
 
         fixture
             .run(
@@ -2079,7 +2121,7 @@ mod tests {
     #[test]
     fn skill_uninstall_removes_the_file_and_the_empty_folder() {
         let fixture = Fixture::new();
-        let folder = fixture.config_dir.join("skills/seatswap");
+        let folder = fixture.claude().skills_dir().join("seatswap");
         let path = folder.join("SKILL.md");
         fixture
             .run(
@@ -2106,7 +2148,7 @@ mod tests {
     #[test]
     fn skill_uninstall_keeps_an_edited_file_unless_forced() {
         let fixture = Fixture::new();
-        let folder = fixture.config_dir.join("skills/seatswap");
+        let folder = fixture.claude().skills_dir().join("seatswap");
         let path = folder.join("SKILL.md");
         fs::create_dir_all(&folder).expect("the skill folder");
         fs::write(&path, "my own skill").expect("an edited skill");
@@ -2149,7 +2191,7 @@ mod tests {
     fn a_skill_file_error_names_its_path() {
         // `skills` is a file, not a folder.
         let fixture = Fixture::new();
-        let skills = fixture.config_dir.join("skills");
+        let skills = fixture.claude().skills_dir();
         fs::write(&skills, "not a folder").expect("a file where the folder goes");
         for action in [
             SkillAction::Install { force: false },
@@ -2164,7 +2206,7 @@ mod tests {
 
         // `SKILL.md` is a folder, not a file.
         let fixture = Fixture::new();
-        let path = fixture.config_dir.join("skills/seatswap/SKILL.md");
+        let path = fixture.claude().skills_dir().join("seatswap/SKILL.md");
         fs::create_dir_all(&path).expect("a folder where the skill goes");
         for action in [
             SkillAction::Install { force: false },
@@ -2176,6 +2218,124 @@ mod tests {
             let text = error.to_string();
             assert!(text.contains(&path.display().to_string()), "{text}");
         }
+    }
+
+    #[test]
+    fn add_writes_one_account_added_with_the_plan() {
+        let fixture = Fixture::new();
+
+        fixture
+            .run(
+                Command::Add {
+                    label: Some("Acme".to_string()),
+                },
+                Caller::Person,
+            )
+            .expect("the live login is saved");
+
+        let events = fixture.events();
+        let added: Vec<&Value> = events
+            .iter()
+            .filter(|event| event["type"] == json!("accountAdded"))
+            .collect();
+        assert_eq!(added.len(), 1, "{events:?}");
+        assert_eq!(added[0]["account"]["acc"], json!(FIRST_ACCOUNT_UUID));
+        assert_eq!(added[0]["account"]["org"], json!(FIRST_ORG_UUID));
+        assert_eq!(added[0]["plan"], json!("Team"));
+
+        // Saving the same login again is an update, not a second account.
+        fixture
+            .run(Command::Add { label: None }, Caller::Person)
+            .expect("the stored copy is updated");
+        let events = fixture.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == json!("accountAdded"))
+                .count(),
+            1,
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn rm_yes_writes_one_account_removed() {
+        let fixture = Fixture::new();
+        fixture.add_account(0);
+
+        fixture
+            .run(
+                Command::Rm {
+                    key: "AC".to_string(),
+                    yes: true,
+                },
+                Caller::Person,
+            )
+            .expect("the account is removed");
+
+        let events = fixture.events();
+        let removed: Vec<&Value> = events
+            .iter()
+            .filter(|event| event["type"] == json!("accountRemoved"))
+            .collect();
+        assert_eq!(removed.len(), 1, "{events:?}");
+        assert_eq!(removed[0]["account"]["acc"], json!(FIRST_ACCOUNT_UUID));
+        assert_eq!(removed[0]["account"]["org"], json!(FIRST_ORG_UUID));
+        assert!(fixture
+            .store()
+            .load()
+            .expect("accounts")
+            .accounts
+            .is_empty());
+    }
+
+    #[test]
+    fn a_switch_that_saves_the_unsaved_login_writes_account_added_first() {
+        let fixture = Fixture::new();
+        fixture.add_account(0);
+        fixture.write_live(1);
+        fixture.add_account(1);
+        // A third, unsaved live login is what the switch must save.
+        fs::write(
+            fixture.config_dir.join(".credentials.json"),
+            credentials_json(THIRD_ORG_UUID),
+        )
+        .expect("third credentials");
+        fs::write(
+            fixture.config_dir.join(".claude.json"),
+            identity_json(
+                THIRD_ACCOUNT_UUID,
+                THIRD_ORG_UUID,
+                "three@example.com",
+                "Atlas",
+            ),
+        )
+        .expect("third identity");
+
+        fixture
+            .run(
+                Command::Use {
+                    key: "AC".to_string(),
+                    save_current: Some(Some("Third".to_string())),
+                    discard_current: false,
+                },
+                Caller::Person,
+            )
+            .expect("the unsaved login is saved and the switch is done");
+
+        let events = fixture.events();
+        let added = events
+            .iter()
+            .position(|event| event["type"] == json!("accountAdded"))
+            .expect("the saved account's accountAdded line");
+        let switched = events
+            .iter()
+            .position(|event| event["type"] == json!("switch"))
+            .expect("the switch line");
+        assert!(added < switched, "{events:?}");
+        assert_eq!(events[added]["account"]["acc"], json!(THIRD_ACCOUNT_UUID));
+        assert_eq!(events[added]["plan"], json!("Team"));
+        assert_eq!(events[switched]["to"]["acc"], json!(FIRST_ACCOUNT_UUID));
     }
 
     #[test]

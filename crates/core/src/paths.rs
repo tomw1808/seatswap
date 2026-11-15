@@ -143,6 +143,11 @@ impl ClaudePaths {
     pub fn projects_dir(&self) -> PathBuf {
         self.config_dir.join("projects")
     }
+
+    /// Claude Code's skill folder: `<config_dir>/skills`.
+    pub fn skills_dir(&self) -> PathBuf {
+        self.config_dir.join("skills")
+    }
 }
 
 /// seatswap's own files (spec §5).
@@ -391,6 +396,7 @@ mod tests {
         let p = ClaudePaths::for_config_dir(Path::new("/x/c"), Path::new("/x"));
         assert_eq!(p.sessions_dir(), Path::new("/x/c/sessions"));
         assert_eq!(p.projects_dir(), Path::new("/x/c/projects"));
+        assert_eq!(p.skills_dir(), Path::new("/x/c/skills"));
     }
 
     #[test]

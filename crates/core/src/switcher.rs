@@ -137,6 +137,17 @@ pub struct SwitchOutcome {
     pub already_active: bool,
 }
 
+/// Whether [`sync_live`] wrote anything, and whether it created the account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Synced {
+    /// Nothing was written: the stored copy already matched.
+    Unchanged,
+    /// The stored login or identity was updated.
+    Updated,
+    /// The live login was stored as a new account.
+    Added,
+}
+
 /// What the live login is, compared with the store. Read-only; takes no lock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiveState {
@@ -449,7 +460,7 @@ pub fn sync_live(
     store: &Store,
     create_unknown: Option<Option<String>>,
     now: DateTime<Utc>,
-) -> Result<(LiveState, bool), SwitchError> {
+) -> Result<(LiveState, Synced), SwitchError> {
     let _app_lock = locks::acquire_app_lock(store.app_paths(), APP_LOCK_TIMEOUT)?;
     // Claude Code is mid-renewal: do not read the files at all, the caller retries.
     if locks::claude_locks_busy(claude) {
@@ -469,14 +480,14 @@ pub fn sync_live(
     );
 
     let Some(login) = live else {
-        return Ok((LiveState::NoLogin, false));
+        return Ok((LiveState::NoLogin, Synced::Unchanged));
     };
 
     // An ended login is never copied over a stored one. The account it still
     // names is marked logged out instead.
     if login.is_ended() {
         let Some(account_id) = account_id else {
-            return Ok((LiveState::Ended { account_id: None }, false));
+            return Ok((LiveState::Ended { account_id: None }, Synced::Unchanged));
         };
         let index = file
             .accounts
@@ -488,7 +499,7 @@ pub fn sync_live(
                 LiveState::Ended {
                     account_id: Some(account_id),
                 },
-                false,
+                Synced::Unchanged,
             ));
         }
         file.accounts[index].login_state = LoginState::LoggedOut;
@@ -497,7 +508,7 @@ pub fn sync_live(
             LiveState::Ended {
                 account_id: Some(account_id),
             },
-            true,
+            Synced::Updated,
         ));
     }
 
@@ -525,7 +536,14 @@ pub fn sync_live(
         if written {
             store.save(&file)?;
         }
-        return Ok((LiveState::Known { account_id }, written));
+        return Ok((
+            LiveState::Known { account_id },
+            if written {
+                Synced::Updated
+            } else {
+                Synced::Unchanged
+            },
+        ));
     }
 
     let email = identity
@@ -537,7 +555,7 @@ pub fn sync_live(
         .and_then(|identity| identity.organization_name())
         .map(str::to_string);
     match create_unknown {
-        None => Ok((LiveState::Unknown { email, org_name }, false)),
+        None => Ok((LiveState::Unknown { email, org_name }, Synced::Unchanged)),
         Some(label) => {
             let identity = identity
                 .as_ref()
@@ -550,7 +568,7 @@ pub fn sync_live(
             let account_id = account.id.clone();
             file.accounts.push(account);
             store.save(&file)?;
-            Ok((LiveState::Known { account_id }, true))
+            Ok((LiveState::Known { account_id }, Synced::Added))
         }
     }
 }
@@ -1447,28 +1465,32 @@ mod tests {
     fn sync_live_updates_a_known_account_once() {
         let w = World::new();
 
-        let (state, written) = sync_live(&w.paths, &w.store, None, now()).unwrap();
+        let (state, synced) = sync_live(&w.paths, &w.store, None, now()).unwrap();
         assert_eq!(
             state,
             LiveState::Known {
                 account_id: w.a_id.clone()
             }
         );
-        assert!(written);
+        assert_eq!(synced, Synced::Updated);
         assert_eq!(
             w.store.secrets().get(&w.a_id).unwrap(),
             Some(w.a_live_login.clone())
         );
 
         let before_accounts = w.accounts_bytes();
-        let (state, written) = sync_live(&w.paths, &w.store, None, now()).unwrap();
+        let (state, synced) = sync_live(&w.paths, &w.store, None, now()).unwrap();
         assert_eq!(
             state,
             LiveState::Known {
                 account_id: w.a_id.clone()
             }
         );
-        assert!(!written, "the same tokens must not be written again");
+        assert_eq!(
+            synced,
+            Synced::Unchanged,
+            "the same tokens must not be written again"
+        );
         assert_eq!(w.accounts_bytes(), before_accounts);
     }
 
@@ -1479,7 +1501,7 @@ mod tests {
         let before_accounts = w.accounts_bytes();
         let before_secrets = w.secrets_snapshot();
 
-        let (state, written) = sync_live(&w.paths, &w.store, None, now()).unwrap();
+        let (state, synced) = sync_live(&w.paths, &w.store, None, now()).unwrap();
 
         assert_eq!(
             state,
@@ -1488,7 +1510,7 @@ mod tests {
                 org_name: Some("Other GmbH".to_string()),
             }
         );
-        assert!(!written);
+        assert_eq!(synced, Synced::Unchanged);
         assert_eq!(w.accounts_bytes(), before_accounts);
         assert_eq!(w.secrets_snapshot(), before_secrets);
     }
@@ -1498,13 +1520,13 @@ mod tests {
         let w = World::new();
         w.set_live(&w.c_login, &w.c_identity);
 
-        let (state, written) =
+        let (state, synced) =
             sync_live(&w.paths, &w.store, Some(Some("Work".to_string())), now()).unwrap();
 
         let LiveState::Known { account_id } = state else {
             panic!("the created account becomes known, got {state:?}");
         };
-        assert!(written);
+        assert_eq!(synced, Synced::Added);
         let file = w.account_file();
         let account = file.find(&account_id).unwrap();
         assert_eq!(account.label, "Work");
@@ -1528,7 +1550,7 @@ mod tests {
             .insert("refreshToken".to_string(), Value::String(String::new()));
         w.set_live(&ended, &w.a_identity);
 
-        let (state, written) = sync_live(&w.paths, &w.store, None, now()).unwrap();
+        let (state, synced) = sync_live(&w.paths, &w.store, None, now()).unwrap();
 
         assert_eq!(
             state,
@@ -1536,7 +1558,7 @@ mod tests {
                 account_id: Some(w.a_id.clone())
             }
         );
-        assert!(written);
+        assert_eq!(synced, Synced::Updated);
         assert_eq!(
             w.account_file().find(&w.a_id).unwrap().login_state,
             LoginState::LoggedOut

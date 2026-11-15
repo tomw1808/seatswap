@@ -19,7 +19,7 @@ use notify_rust::NotificationResponse;
 #[cfg(all(unix, not(target_os = "macos")))]
 use notify_rust::Timeout;
 
-use seatswap_core::engine::{Blocker, LoginWarning, Suggestion};
+use seatswap_core::engine::{all_blocked, Blocker, LoginWarning, Suggestion};
 use seatswap_core::store::LoginState;
 use seatswap_core::switcher::UnsavedPolicy;
 
@@ -148,7 +148,7 @@ impl Deduper {
 
         let any_usable = snapshot.views.iter().any(|view| view.usable);
         if self.initialized {
-            self.usable_again(snapshot, &mut due);
+            self.usable_again(snapshot, now, &mut due);
             self.all_full(snapshot, &mut due);
         }
         self.waiting(snapshot, now, &mut due);
@@ -197,7 +197,12 @@ impl Deduper {
         earliest
     }
 
-    fn usable_again(&mut self, snapshot: &Snapshot, due: &mut Vec<Notification>) {
+    fn usable_again(
+        &mut self,
+        snapshot: &Snapshot,
+        now: DateTime<Utc>,
+        due: &mut Vec<Notification>,
+    ) {
         if !snapshot
             .settings
             .as_ref()
@@ -218,10 +223,14 @@ impl Deduper {
             if previous.usable {
                 continue;
             }
-            let key = (
-                view.id.clone(),
-                previous.blocked_until.map(|reset| reset.timestamp() / 60),
-            );
+            // Only a reset that has passed ends a block. A per-model block whose
+            // last session closed, or one the server lifted early, is no reset:
+            // it sends nothing and leaves the (account, reset minute) key free
+            // for the real reset (spec §4).
+            let Some(reset) = previous.blocked_until.filter(|reset| *reset <= now) else {
+                continue;
+            };
+            let key = (view.id.clone(), Some(reset.timestamp() / 60));
             if self.usable_again.insert(key) {
                 due.push(Notification::UsableAgain {
                     id: view.id.clone(),
@@ -232,20 +241,11 @@ impl Deduper {
     }
 
     /// "All accounts are full" only when the previous snapshot had a usable
-    /// view and every account whose login still works is blocked by a limit.
-    /// An account without a working login counts neither way (spec §4).
+    /// view and [`all_blocked`] says every account whose login still works is
+    /// blocked by a limit. An account whose usage is unknown is not usable, but
+    /// it is not blocked either, so it does not count (spec §4).
     fn all_full(&self, snapshot: &Snapshot, due: &mut Vec<Notification>) {
-        if !self.previous_any_usable {
-            return;
-        }
-        let mut working = snapshot
-            .views
-            .iter()
-            .filter(|view| view.login_state == LoginState::Ok);
-        let Some(first) = working.next() else {
-            return;
-        };
-        if first.blocker.is_none() || working.any(|view| view.blocker.is_none()) {
+        if !self.previous_any_usable || !all_blocked(&snapshot.views) {
             return;
         }
         let mut next: Option<(String, DateTime<Utc>)> = None;
@@ -1438,5 +1438,115 @@ mod tests {
             }],
             "a shown notification must be withdrawn when the wait is over"
         );
+    }
+
+    #[test]
+    fn a_model_block_that_ends_with_its_session_is_not_a_reset() {
+        let reset = utc("2026-11-16T16:00:00Z");
+        let active = view("lb-id", "LB", true, None, true);
+        let blocked = || {
+            snapshot_of(vec![
+                active.clone(),
+                blocked_view(
+                    "ac-id",
+                    "AC",
+                    Some(reset),
+                    false,
+                    Blocker::Model("Fable".to_string()),
+                ),
+            ])
+        };
+        let usable = || snapshot_of(vec![active.clone(), view("ac-id", "AC", true, None, false)]);
+        let mut deduper = Deduper::new();
+
+        // 10:00 a Fable session is open; 10:05 it closed (no reset happened).
+        deduper.due(&blocked(), utc("2026-11-14T10:00:00Z"));
+        let closed = deduper.due(&usable(), utc("2026-11-14T10:05:00Z"));
+        assert!(
+            closed.is_empty(),
+            "a block that ends before its reset is not a reset: {closed:?}"
+        );
+
+        // A Fable session opens again; at 16:00:30 the week really resets.
+        deduper.due(&blocked(), utc("2026-11-14T11:00:00Z"));
+        let after_reset = deduper.due(&usable(), utc("2026-11-16T16:00:30Z"));
+        assert!(
+            after_reset
+                .iter()
+                .any(|n| matches!(n, Notification::UsableAgain { .. })),
+            "the real reset must notify: {after_reset:?}"
+        );
+    }
+
+    /// An account whose usage is unknown is not usable, but no limit is full
+    /// either, so it does not make "all accounts are full" true.
+    #[test]
+    fn unknown_usage_on_every_account_is_not_all_full() {
+        let mut deduper = Deduper::new();
+        let now = utc("2026-11-10T14:00:00Z");
+
+        let some_usable = with_views(
+            vec![view("AC", "AC", true, None, true)],
+            None,
+            Some(Settings::default()),
+        );
+        assert!(deduper.due(&some_usable, now).is_empty());
+
+        let all_unknown = with_views(
+            vec![
+                view("AC", "AC", false, None, true),
+                view("LB", "LB", false, None, false),
+            ],
+            None,
+            Some(Settings::default()),
+        );
+        assert!(
+            deduper
+                .due(&all_unknown, now + chrono::Duration::minutes(1))
+                .is_empty(),
+            "an account with unknown usage is not blocked, so not all accounts are full"
+        );
+    }
+
+    /// A per-model block whose reset time passes while the session that caused
+    /// it is still running is a real reset: it sends "usable again" once.
+    #[test]
+    fn a_model_block_notifies_once_when_its_reset_passes_with_the_session_still_running() {
+        let reset = utc("2026-11-16T16:00:00Z");
+        let active = view("lb-id", "LB", true, None, true);
+        let blocked = || {
+            snapshot_of(vec![
+                active.clone(),
+                blocked_view(
+                    "ac-id",
+                    "AC",
+                    Some(reset),
+                    false,
+                    Blocker::Model("Fable".to_string()),
+                ),
+            ])
+        };
+        let usable = || snapshot_of(vec![active.clone(), view("ac-id", "AC", true, None, false)]);
+        let mut deduper = Deduper::new();
+
+        deduper.due(&blocked(), utc("2026-11-16T15:59:00Z"));
+        assert_eq!(
+            deduper.due(&usable(), utc("2026-11-16T16:00:30Z")),
+            vec![Notification::UsableAgain {
+                id: "ac-id".to_string(),
+                reason: "its Fable week reset".to_string(),
+            }],
+            "the reset happened while the Fable session still ran"
+        );
+        assert!(
+            deduper
+                .due(&usable(), utc("2026-11-16T16:01:00Z"))
+                .is_empty(),
+            "once per account and reset minute"
+        );
+    }
+
+    fn snapshot_of(views: Vec<AccountView>) -> Snapshot {
+        with_views(views, None, Some(Settings::default()))
     }
 }

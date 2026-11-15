@@ -121,10 +121,24 @@ pub struct SessionSeen {
     pub last_model: Option<String>,
     pub last_user_turn: Option<DateTime<Utc>>,
     pub thinking_since_user: u32,
+    /// The session record last written from this session, so a restart does not
+    /// write the same record again. Absent in an old state file means none.
+    #[serde(default)]
+    pub recorded: Option<RecordedSession>,
+}
+
+/// The session record last written from a [`SessionSeen`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordedSession {
+    /// The `last` answer time the record covers.
+    pub last: DateTime<Utc>,
+    /// Whether that record was the closing one (`closed: true`).
+    pub closed: bool,
 }
 
 /// Everything remembered between two scans.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanState {
     pub version: u32,
@@ -325,36 +339,55 @@ impl ScanState {
     }
 }
 
-/// What one scan found.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+/// What one scan found, including the state it read into. The state is staged:
+/// [`commit`](Scan::commit) moves it into the caller's [`ScanState`] once the
+/// answers' token lines were written. A scan that is dropped leaves the old
+/// state, so the next scan reads the same lines again.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scan {
     pub answers: Vec<Answer>,
     pub user_turns: Vec<UserTurn>,
     pub complete: bool,
     pub warnings: Vec<String>,
+    /// The state after this scan; [`commit`](Scan::commit) moves it out.
+    next: ScanState,
 }
 
-/// Read what is new in every transcript under `projects_dir`.
+impl Scan {
+    /// The state after this scan: the sessions it saw and the offsets it read
+    /// to. `token_records` needs it to name a session's folder.
+    pub fn state(&self) -> &ScanState {
+        &self.next
+    }
+
+    /// Move the scan state past what this scan read. Call it only after the
+    /// answers' token lines were written: a scan that is not committed reads
+    /// the same lines again next time, and its answers are counted again then.
+    pub fn commit(&mut self, state: &mut ScanState) {
+        *state = std::mem::take(&mut self.next);
+    }
+}
+
+/// Read what is new in every transcript under `projects_dir`. The [`ScanState`]
+/// is not changed; the result carries the state to [`commit`](Scan::commit)
+/// once the answers' token lines are written.
 pub fn scan(
     claude: &ClaudePaths,
-    state: &mut ScanState,
+    state: &ScanState,
     budget_bytes: u64,
 ) -> Result<Scan, TranscriptError> {
+    let mut next = state.clone();
     let projects = claude.projects_dir();
     let mut files = candidates(&projects)?;
     // A file whose length equals its stored offset has nothing new: it is not opened.
     files.retain(|candidate| {
-        candidate.len
-            != state
-                .files
-                .get(&candidate.key)
-                .map_or(0, |file| file.offset)
+        candidate.len != next.files.get(&candidate.key).map_or(0, |file| file.offset)
     });
     // Running sessions come before a backlog.
     files.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.key.cmp(&b.key)));
 
     let mut run = ScanRun {
-        state,
+        state: &mut next,
         budget: budget_bytes,
         used: 0,
         answers: Vec::new(),
@@ -376,11 +409,18 @@ pub fn scan(
             break;
         }
     }
+    let ScanRun {
+        answers,
+        user_turns,
+        warnings,
+        ..
+    } = run;
     Ok(Scan {
-        answers: run.answers,
-        user_turns: run.user_turns,
+        answers,
+        user_turns,
         complete,
-        warnings: run.warnings,
+        warnings,
+        next,
     })
 }
 
@@ -905,6 +945,7 @@ impl ScanRun<'_> {
                 last_model: model.map(str::to_string),
                 last_user_turn: None,
                 thinking_since_user: 0,
+                recorded: None,
             });
         if at >= seen.last {
             if let Some(cwd) = cwd {
@@ -1543,8 +1584,15 @@ mod tests {
 
     fn scan_run(claude: &ClaudePaths) -> (ScanState, Scan) {
         let mut state = ScanState::default();
-        let scan = scan(claude, &mut state, BUDGET).unwrap();
+        let scan = scan_commit(claude, &mut state, BUDGET);
         (state, scan)
+    }
+
+    /// One scan and its commit, as a pass that wrote its token lines does.
+    fn scan_commit(claude: &ClaudePaths, state: &mut ScanState, budget: u64) -> Scan {
+        let mut scan = scan(claude, state, budget).unwrap();
+        scan.commit(state);
+        scan
     }
 
     #[test]
@@ -1637,7 +1685,7 @@ mod tests {
                 USAGE,
             ),
         );
-        let second = scan(&claude, &mut state, BUDGET).unwrap();
+        let second = scan_commit(&claude, &mut state, BUDGET);
 
         assert_eq!(second.answers.len(), 1, "{:?}", second.answers);
         assert_eq!(second.answers[0].message_id, "msg_b");
@@ -1666,7 +1714,7 @@ mod tests {
         assert_eq!(first.answers[0].message_id, "msg_a");
 
         fs::write(&path, format!("{first_line}\n{second_line}\n")).unwrap();
-        let second = scan(&claude, &mut state, BUDGET).unwrap();
+        let second = scan_commit(&claude, &mut state, BUDGET);
 
         assert_eq!(second.answers.len(), 1, "{:?}", second.answers);
         assert_eq!(second.answers[0].message_id, "msg_b");
@@ -1695,7 +1743,7 @@ mod tests {
         let bytes = fs::read(&path).unwrap();
         let cut = first_line.len() + 1 + second_line.len() / 2;
         fs::write(&path, &bytes[..cut]).unwrap();
-        let second = scan(&claude, &mut state, BUDGET).unwrap();
+        let second = scan_commit(&claude, &mut state, BUDGET);
 
         assert!(second.answers.is_empty(), "{:?}", second.answers);
         assert_eq!(second.warnings.len(), 1, "{:?}", second.warnings);
@@ -1916,9 +1964,9 @@ mod tests {
         }
 
         let mut state = ScanState::default();
-        let first = scan(&claude, &mut state, 1200).unwrap();
+        let first = scan_commit(&claude, &mut state, 1200);
         assert!(!first.complete, "the budget stops the first scan");
-        let second = scan(&claude, &mut state, 1200).unwrap();
+        let second = scan_commit(&claude, &mut state, 1200);
         assert!(second.complete, "the second scan reads the rest");
 
         let mut seen: Vec<String> = first
@@ -1954,7 +2002,7 @@ mod tests {
             )],
         );
         let mut state = ScanState::default();
-        scan(&claude, &mut state, BUDGET).unwrap();
+        scan_commit(&claude, &mut state, BUDGET);
         assert_eq!(state.save(&claude, &app, Utc::now()).unwrap(), 2);
 
         let state_dir = app.transcripts_state_dir();
@@ -1988,7 +2036,7 @@ mod tests {
                 USAGE,
             ),
         );
-        scan(&claude, &mut state, BUDGET).unwrap();
+        scan_commit(&claude, &mut state, BUDGET);
         assert_eq!(state.save(&claude, &app, Utc::now()).unwrap(), 1);
 
         assert_eq!(fs::read(&other_file).unwrap(), other_bytes);
@@ -2040,7 +2088,7 @@ mod tests {
         let bytes = fs::read(&path).unwrap();
         let half = bytes.len() / 2;
         fs::write(&path, &bytes[..half]).unwrap();
-        let second = scan(&claude, &mut state, BUDGET).unwrap();
+        let second = scan_commit(&claude, &mut state, BUDGET);
 
         assert!(second.answers.is_empty(), "{:?}", second.answers);
         assert_eq!(
@@ -2232,7 +2280,7 @@ mod tests {
         assert_eq!(first.answers.len(), 1);
 
         fs::write(&path, format!("{user}\n")).unwrap();
-        let second = scan(&claude, &mut state, BUDGET).unwrap();
+        let second = scan_commit(&claude, &mut state, BUDGET);
 
         assert!(second.user_turns.is_empty(), "{:?}", second.user_turns);
         assert!(second.answers.is_empty(), "{:?}", second.answers);
@@ -2252,7 +2300,7 @@ mod tests {
         );
 
         let mut state = ScanState::default();
-        let scan = scan(&claude, &mut state, 1000).unwrap();
+        let scan = scan_commit(&claude, &mut state, 1000);
 
         assert_eq!(scan.answers.len(), 1, "{:?}", scan.answers);
         assert!(scan.complete, "one long line is read whole");
@@ -2381,7 +2429,7 @@ mod tests {
             (text.len() as u64) < old_offset,
             "the file is shorter than its offset"
         );
-        let second = scan(&claude, &mut state, BUDGET).unwrap();
+        let second = scan_commit(&claude, &mut state, BUDGET);
 
         assert!(second.answers.is_empty(), "{:?}", second.answers);
         assert_eq!(second.warnings.len(), 1, "{:?}", second.warnings);
@@ -2469,7 +2517,7 @@ mod tests {
             "the old offset falls inside a line"
         );
 
-        let second = scan(&claude, &mut state, BUDGET).unwrap();
+        let second = scan_commit(&claude, &mut state, BUDGET);
 
         let mut ids: Vec<&str> = second
             .answers
@@ -2574,7 +2622,7 @@ mod tests {
             "the file is shorter than its offset"
         );
         fs::write(&path, text.as_bytes()).unwrap();
-        let second = scan(&claude, &mut state, BUDGET).unwrap();
+        let second = scan_commit(&claude, &mut state, BUDGET);
 
         let mut ids: Vec<&str> = second
             .answers
@@ -2616,12 +2664,12 @@ mod tests {
         fs::write(&path, &bytes[..half]).unwrap();
         assert_ne!(bytes[half - 1], b'\n', "the new file ends inside a line");
 
-        let second = scan(&claude, &mut state, BUDGET).unwrap();
+        let second = scan_commit(&claude, &mut state, BUDGET);
         assert!(second.answers.is_empty(), "{:?}", second.answers);
         assert_eq!(second.warnings.len(), 1, "{:?}", second.warnings);
         assert_eq!(state.files[KEY].offset, 0, "no whole line was read");
 
-        let third = scan(&claude, &mut state, BUDGET).unwrap();
+        let third = scan_commit(&claude, &mut state, BUDGET);
         assert!(third.answers.is_empty(), "{:?}", third.answers);
         assert!(third.warnings.is_empty(), "{:?}", third.warnings);
     }
@@ -2671,7 +2719,7 @@ mod tests {
         );
         fs::write(&path, text.as_bytes()).unwrap();
 
-        let second = scan(&claude, &mut state, BUDGET).unwrap();
+        let second = scan_commit(&claude, &mut state, BUDGET);
         assert!(second.answers.is_empty(), "{:?}", second.answers);
         assert_eq!(second.warnings.len(), 1, "{:?}", second.warnings);
         assert!(
@@ -2685,7 +2733,7 @@ mod tests {
             "the offset is the end of the last whole line"
         );
 
-        let third = scan(&claude, &mut state, BUDGET).unwrap();
+        let third = scan_commit(&claude, &mut state, BUDGET);
         assert!(third.answers.is_empty(), "{:?}", third.answers);
         assert!(third.warnings.is_empty(), "{:?}", third.warnings);
     }

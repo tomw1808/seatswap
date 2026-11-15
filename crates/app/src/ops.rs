@@ -11,20 +11,32 @@ use seatswap_core::paths::{AppPaths, ClaudePaths};
 #[cfg(feature = "gui")]
 use seatswap_core::store::AccountsFile;
 use seatswap_core::store::{Account, Settings, Store};
-use seatswap_core::switcher::{self, LiveState};
+use seatswap_core::switcher::{self, LiveState, Synced};
 
 /// The one place a switch is written to the history, for the CLI and the GUI.
+/// A switch that saved the unsaved login writes that account's `accountAdded`
+/// first, so a reader never sees a switch to an account it does not know yet.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_switch(
     recorder: &Recorder,
     from: Option<AccountRef>,
     to: AccountRef,
+    saved_new: Option<&Account>,
     by: By,
     reason: Option<String>,
     cwd: Option<String>,
     sessions: Option<SessionCounts>,
     at: DateTime<Utc>,
 ) -> Result<(), HistoryError> {
+    if let Some(account) = saved_new {
+        recorder.event(
+            at,
+            EventKind::AccountAdded {
+                account: AccountRef::of(account),
+                plan: account.plan.clone(),
+            },
+        )?;
+    }
     recorder.event(
         at,
         EventKind::Switch {
@@ -37,6 +49,30 @@ pub(crate) fn record_switch(
             waited_secs: None,
         },
     )
+}
+
+/// The one place an account is removed, for the CLI and the GUI. The remove
+/// happens first; a history that cannot be written is returned beside the
+/// removed account and never fails the remove.
+pub(crate) fn remove_account(
+    store: &Store,
+    key: &str,
+    recorder: Option<&Recorder>,
+    now: DateTime<Utc>,
+) -> Result<(Account, Option<String>), String> {
+    let removed = switcher::remove_account(store, key).map_err(|error| error.to_string())?;
+    let history_error = recorder.and_then(|recorder| {
+        recorder
+            .event(
+                now,
+                EventKind::AccountRemoved {
+                    account: AccountRef::of(&removed),
+                },
+            )
+            .err()
+            .map(|error| history_unwritable(&error))
+    });
+    Ok((removed, history_error))
 }
 
 /// The one sentence the app uses when the history cannot be written.
@@ -73,17 +109,38 @@ pub(crate) fn live_account_ref(live: &LiveState, file: &AccountsFile) -> Option<
 pub(crate) fn save_live_login(
     claude: &ClaudePaths,
     store: &Store,
+    recorder: Option<&Recorder>,
     label: Option<String>,
     now: DateTime<Utc>,
-) -> Result<Account, String> {
-    let (state, _) =
+) -> Result<(Account, Option<String>), String> {
+    let (state, synced) =
         switcher::sync_live(claude, store, Some(label), now).map_err(|error| error.to_string())?;
     match state {
         LiveState::Known { account_id } => {
             let file = store.load().map_err(|error| error.to_string())?;
-            file.find(&account_id)
+            let account = file
+                .find(&account_id)
                 .cloned()
-                .ok_or_else(|| format!("the store has no account {account_id}"))
+                .ok_or_else(|| format!("the store has no account {account_id}"))?;
+            // Only a newly created account gets `accountAdded`; saving the
+            // stored copy again is an update, not an addition.
+            let history_error = if synced == Synced::Added {
+                recorder.and_then(|recorder| {
+                    recorder
+                        .event(
+                            now,
+                            EventKind::AccountAdded {
+                                account: AccountRef::of(&account),
+                                plan: account.plan.clone(),
+                            },
+                        )
+                        .err()
+                        .map(|error| history_unwritable(&error))
+                })
+            } else {
+                None
+            };
+            Ok((account, history_error))
         }
         LiveState::Ended { .. } => {
             Err("the live login has ended; log in again in Claude Code".to_string())
@@ -206,13 +263,15 @@ mod tests {
     fn save_live_login_returns_the_stored_account() {
         let fixture = Fixture::new();
         let store = fixture.store();
-        let account = save_live_login(
+        let (account, history_error) = save_live_login(
             &fixture.claude,
             &store,
+            None,
             Some("Acme".to_string()),
             Utc::now(),
         )
         .expect("the live login is saved");
+        assert_eq!(history_error, None);
         assert_eq!(account.abbr, "AC");
         assert_eq!(account.label, "Acme");
         assert_eq!(account.email.as_deref(), Some(EMAIL));
@@ -225,7 +284,7 @@ mod tests {
         let fixture = Fixture::new();
         fs::remove_file(&fixture.claude.credentials_file).expect("remove credentials");
         let store = fixture.store();
-        let error = save_live_login(&fixture.claude, &store, None, Utc::now())
+        let error = save_live_login(&fixture.claude, &store, None, None, Utc::now())
             .expect_err("nothing to save");
         assert!(error.contains("no live login"), "{error}");
     }
@@ -239,7 +298,7 @@ mod tests {
         )
         .expect("ended credentials");
         let store = fixture.store();
-        let error = save_live_login(&fixture.claude, &store, None, Utc::now())
+        let error = save_live_login(&fixture.claude, &store, None, None, Utc::now())
             .expect_err("the login ended");
         assert!(error.contains("ended"), "{error}");
     }
@@ -248,7 +307,7 @@ mod tests {
     fn a_switch_message_never_uses_a_raw_id() {
         let fixture = Fixture::new();
         let store = fixture.store();
-        let account = save_live_login(&fixture.claude, &store, None, Utc::now())
+        let (account, _) = save_live_login(&fixture.claude, &store, None, None, Utc::now())
             .expect("the live login is saved");
         assert_eq!(
             switch_message(&store, &account.id),
@@ -279,12 +338,132 @@ mod tests {
     fn the_switched_sentence_has_one_spelling() {
         let fixture = Fixture::new();
         let store = fixture.store();
-        let account = save_live_login(&fixture.claude, &store, None, Utc::now())
+        let (account, _) = save_live_login(&fixture.claude, &store, None, None, Utc::now())
             .expect("the live login is saved");
         assert_eq!(
             switch_message(&store, &account.id),
             Ok("Switched to AC — Acme".to_string())
         );
+    }
+
+    fn event_values(root: &std::path::Path) -> Vec<serde_json::Value> {
+        let folder = root.join("atlas");
+        let mut names: Vec<std::path::PathBuf> = fs::read_dir(&folder)
+            .expect("the history folder")
+            .map(|entry| entry.expect("a history entry").path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("events-") && name.ends_with(".jsonl"))
+            })
+            .collect();
+        names.sort();
+        names
+            .into_iter()
+            .flat_map(|path| {
+                fs::read_to_string(path)
+                    .expect("the events file")
+                    .lines()
+                    .map(|line| serde_json::from_str(line).expect("an event line"))
+                    .collect::<Vec<serde_json::Value>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn save_live_login_records_a_new_account_with_its_plan() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let history = tempfile::tempdir().expect("history folder");
+        let recorder = Recorder::new(HistoryDir::at(history.path(), "atlas"));
+
+        let (account, history_error) = save_live_login(
+            &fixture.claude,
+            &store,
+            Some(&recorder),
+            Some("Acme".to_string()),
+            Utc::now(),
+        )
+        .expect("the live login is saved");
+        assert_eq!(history_error, None);
+
+        let events = event_values(history.path());
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["type"], "accountAdded");
+        assert_eq!(events[0]["account"]["acc"], ACCOUNT_UUID);
+        assert_eq!(events[0]["account"]["org"], ORG_UUID);
+        assert_eq!(events[0]["plan"], "Team");
+
+        // Saving the same login again updates the stored copy, not a new account.
+        save_live_login(&fixture.claude, &store, Some(&recorder), None, Utc::now())
+            .expect("the stored copy is updated");
+        assert_eq!(event_values(history.path()).len(), 1);
+        assert_eq!(store.load().expect("accounts").accounts[0].id, account.id);
+    }
+
+    #[test]
+    fn remove_account_records_the_removed_account() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        save_live_login(
+            &fixture.claude,
+            &store,
+            None,
+            Some("Acme".to_string()),
+            Utc::now(),
+        )
+        .expect("the live login is saved");
+        let history = tempfile::tempdir().expect("history folder");
+        let recorder = Recorder::new(HistoryDir::at(history.path(), "atlas"));
+
+        let (removed, history_error) = remove_account(&store, "AC", Some(&recorder), Utc::now())
+            .expect("the account is removed");
+
+        assert_eq!(removed.label, "Acme");
+        assert_eq!(history_error, None);
+        let events = event_values(history.path());
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["type"], "accountRemoved");
+        assert_eq!(events[0]["account"]["acc"], ACCOUNT_UUID);
+        assert_eq!(events[0]["account"]["org"], ORG_UUID);
+        assert!(store.load().expect("accounts").accounts.is_empty());
+    }
+
+    #[test]
+    fn a_saved_new_account_is_written_before_its_switch() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let (account, _) = save_live_login(
+            &fixture.claude,
+            &store,
+            None,
+            Some("Acme".to_string()),
+            Utc::now(),
+        )
+        .expect("the live login is saved");
+        let history = tempfile::tempdir().expect("history folder");
+        let recorder = Recorder::new(HistoryDir::at(history.path(), "atlas"));
+        let at = Utc::now();
+
+        record_switch(
+            &recorder,
+            None,
+            AccountRef::of(&account),
+            Some(&account),
+            By::User,
+            None,
+            None,
+            None,
+            at,
+        )
+        .expect("the switch is written");
+
+        let events = event_values(history.path());
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0]["type"], "accountAdded");
+        assert_eq!(events[0]["account"]["acc"], ACCOUNT_UUID);
+        assert_eq!(events[0]["plan"], "Team");
+        assert_eq!(events[1]["type"], "switch");
     }
 
     #[test]
@@ -304,13 +483,14 @@ mod tests {
             &recorder,
             None,
             to,
+            None,
             By::User,
             None,
             None,
             Some(SessionCounts {
                 running: 2,
                 busy: 1,
-                tied: 0,
+                tied: None,
             }),
             at,
         )
