@@ -9,6 +9,9 @@
 pub(crate) use crate::format;
 
 pub(crate) mod ipc;
+// `parse_target` is used by the CLI and the socket listener; the window itself
+// is built only with the GUI.
+pub(crate) mod window;
 
 #[cfg(feature = "gui")]
 pub(crate) mod autostart;
@@ -180,12 +183,19 @@ pub(crate) fn run(
             panel::time_texts,
             panel::fit_panel,
             panel::hide_panel,
+            window::open_window,
         ])
         .build(tauri::generate_context!());
     match result {
         Ok(app) => {
-            app.run(|handle, event| {
-                if let tauri::RunEvent::Exit = event {
+            app.run(|handle, event| match event {
+                // The tray app has no window of its own: closing the large
+                // window (it is destroyed, not hidden) must leave the tray
+                // running. A quit calls `app.exit(0)`, which carries a code.
+                tauri::RunEvent::ExitRequested { code, api, .. } if keeps_running(code) => {
+                    api.prevent_exit();
+                }
+                tauri::RunEvent::Exit => {
                     if let Some(state) = handle.try_state::<GuiState>() {
                         state.exiting.store(true, Ordering::SeqCst);
                         // A quit drops the waiting notifications; the process
@@ -194,6 +204,7 @@ pub(crate) fn run(
                         let _ = state.engine.send(EngineCommand::Shutdown);
                     }
                 }
+                _ => {}
             });
             std::process::ExitCode::SUCCESS
         }
@@ -256,6 +267,12 @@ fn setup(
             let handle = listener_action.clone();
             let _ = listener_action.run_on_main_thread(move || {
                 let _ = panel::show(&handle, &view);
+            });
+        }
+        ipc::IpcCommand::OpenWindow(target) => {
+            let handle = listener_action.clone();
+            let _ = listener_action.run_on_main_thread(move || {
+                show_window(&handle, &target);
             });
         }
         ipc::IpcCommand::Feed => {
@@ -639,6 +656,21 @@ pub(crate) fn show_panel(app: &AppHandle, view: &str) {
 }
 
 #[cfg(feature = "gui")]
+pub(crate) fn show_window(app: &AppHandle, target: &str) {
+    if let Err(error) = window::show(app, target) {
+        eprintln!("seatswap: window: {error}");
+    }
+}
+
+/// Whether the app keeps running after a window asked to exit. Closing the
+/// large window sends `code: None`; `app.exit(0)` from the tray's quit carries
+/// a code and ends the app.
+#[cfg(feature = "gui")]
+fn keeps_running(code: Option<i32>) -> bool {
+    code.is_none()
+}
+
+#[cfg(feature = "gui")]
 pub(crate) fn set_pending(
     app: &AppHandle,
     state: &GuiState,
@@ -713,6 +745,15 @@ mod tests {
     use std::path::Path;
 
     use seatswap_core::paths::ClaudePaths;
+
+    #[test]
+    fn closing_a_window_keeps_the_app_running() {
+        assert!(
+            keeps_running(None),
+            "closing a window must not end the tray app"
+        );
+        assert!(!keeps_running(Some(0)), "Quit seatswap still ends the app");
+    }
 
     #[test]
     fn a_stopped_worker_reports_one_sentence_and_a_closed_channel_is_it() {

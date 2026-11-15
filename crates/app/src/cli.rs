@@ -203,6 +203,13 @@ pub(crate) enum Command {
         view: PanelView,
     },
 
+    /// Ask the running tray app to open the large window at an area.
+    Window {
+        /// Area, optionally "/<sub>" (default: sessions).
+        #[arg(value_name = "AREA")]
+        target: Option<String>,
+    },
+
     /// Print the live account and its binding limit.
     Status {
         /// Print JSON: `views` (every account), `active` (the id of the account in use) and
@@ -464,11 +471,13 @@ fn execute(cli: &mut Cli, caller: Caller, stdin: &mut dyn Read) -> Result<(), Cl
         return Ok(());
     }
     match caller {
-        // A person's call is never gated, and `panel` keeps needing only the
-        // data folder: it talks to the running tray app.
+        // A person's call is never gated, and `panel` and `window` keep needing
+        // only the data folder: they talk to the running tray app.
         Caller::Person => {
-            if let Command::Panel { view } = &command {
-                return panel(cli, *view);
+            match &command {
+                Command::Panel { view } => return panel(cli, *view),
+                Command::Window { target } => return window(cli, target.as_deref()),
+                _ => {}
             }
             let context = open_context(cli)?;
             run_command(context, command, By::Cli, None)
@@ -533,7 +542,7 @@ fn run_command(
         Command::Burn { action } => burn(context, action),
         Command::AgentSkill { action } => agent_skill(&context, action),
         // Handled before the store was opened; kept for exhaustiveness.
-        Command::Panel { .. } | Command::Statusline => Ok(()),
+        Command::Panel { .. } | Command::Window { .. } | Command::Statusline => Ok(()),
         Command::Status {
             json,
             waybar,
@@ -661,7 +670,8 @@ pub(crate) fn gate(command: &Command, caller: Caller, settings: &Settings) -> Ga
         | Command::Rm { .. }
         | Command::Edit { .. }
         | Command::AgentSkill { .. }
-        | Command::Panel { .. } => Gate::Refused(AGENTS_MAY_NOT_CHANGE),
+        | Command::Panel { .. }
+        | Command::Window { .. } => Gate::Refused(AGENTS_MAY_NOT_CHANGE),
     }
 }
 
@@ -719,6 +729,9 @@ fn command_text(command: &Command) -> String {
             }
         },
         Command::Panel { view } => format!("panel {}", view.as_str()),
+        Command::Window { target } => {
+            format!("window {}", target.as_deref().unwrap_or("sessions"))
+        }
         Command::Statusline => "statusline".to_string(),
         Command::Status {
             json,
@@ -847,10 +860,30 @@ fn open_context(cli: &Cli) -> Result<Context, CliError> {
     })
 }
 
+/// The line `seatswap panel settings` sends: `settings` has no view of its own
+/// in the pop-up any more, it opens the large window at Settings (spec §3.7).
+fn panel_settings_line() -> String {
+    ipc::window_line("settings")
+}
+
 /// `seatswap panel`: ask the running tray app to open a view.
 fn panel(cli: &Cli, view: PanelView) -> Result<(), CliError> {
     let app = AppPaths::resolve(cli.data_dir.as_deref())?;
-    ipc::send_open_panel(&app, view.as_str())?;
+    match view {
+        PanelView::Settings => ipc::send_line(&app, &panel_settings_line())?,
+        PanelView::Main | PanelView::Add => ipc::send_open_panel(&app, view.as_str())?,
+    }
+    Ok(())
+}
+
+/// `seatswap window`: ask the running tray app to open the large window at an
+/// area, `sessions` when none is given.
+fn window(cli: &Cli, target: Option<&str>) -> Result<(), CliError> {
+    let target = target.unwrap_or("sessions");
+    crate::gui::window::parse_target(target)
+        .map_err(|error| CliError::Usage(format!("window {target:?}: {error}")))?;
+    let app = AppPaths::resolve(cli.data_dir.as_deref())?;
+    ipc::send_window(&app, target)?;
     Ok(())
 }
 
@@ -2346,6 +2379,53 @@ pub(crate) mod tests {
                     Gate::Refused(AGENTS_MAY_NOT_CHANGE)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn panel_settings_opens_the_window() {
+        assert_eq!(panel_settings_line(), "window settings");
+    }
+
+    #[test]
+    fn an_agent_may_not_open_the_window() {
+        for allowed in [false, true] {
+            let settings = settings(allowed, allowed);
+            assert_eq!(
+                gate(
+                    &Command::Window {
+                        target: Some("settings".to_string()),
+                    },
+                    Caller::Agent,
+                    &settings
+                ),
+                Gate::Refused(AGENTS_MAY_NOT_CHANGE)
+            );
+        }
+    }
+
+    /// Proof (review C1-1): the target of `seatswap window` travels to the
+    /// running app as one line (`window <target>`). A target with a space or a
+    /// newline cannot travel over that line: the app reads the first word or
+    /// the first line, so the window the person asked for never opens and the
+    /// app answers "error unknown command". The command has to refuse such a
+    /// target itself, with a clear message.
+    #[test]
+    fn proof_a_target_that_cannot_travel_over_the_socket_line_is_refused() {
+        let fixture = Fixture::new();
+        for target in ["settings/a b", "settings/a\nb"] {
+            let error = fixture
+                .run(
+                    Command::Window {
+                        target: Some(target.to_string()),
+                    },
+                    Caller::Person,
+                )
+                .expect_err("a target that cannot be sent must be refused");
+            assert!(
+                matches!(&error, CliError::Usage(_)),
+                "the target {target:?} must be refused with a usage error, got: {error}"
+            );
         }
     }
 

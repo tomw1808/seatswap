@@ -65,10 +65,24 @@ pub(crate) enum IpcError {
     OlderTray,
 }
 
-/// Tell the running tray app to open `view` (`main`, `add`, `settings`).
+/// Tell the running tray app to open the pop-up on `view` (`main` or `add`).
 pub(crate) fn send_open_panel(app: &AppPaths, view: &str) -> Result<(), IpcError> {
     let socket = socket_for(app)?;
     send_open_panel_at(&socket, view)
+}
+
+/// Tell the running tray app to open the large window at `target`
+/// (`settings`, `settings/accounts`, `statistics`, …).
+pub(crate) fn send_window(app: &AppPaths, target: &str) -> Result<(), IpcError> {
+    let socket = socket_for(app)?;
+    send_window_at(&socket, target)
+}
+
+/// One already-built command line (see [`open_panel_line`] and
+/// [`window_line`]) to the tray app, then its one-line answer.
+pub(crate) fn send_line(app: &AppPaths, line: &str) -> Result<(), IpcError> {
+    let socket = socket_for(app)?;
+    send_at(&socket, &format!("{line}\n"))
 }
 
 /// Tell the running tray app that the status line has written a fresh feed.
@@ -107,9 +121,24 @@ fn socket_for(app: &AppPaths) -> Result<PathBuf, IpcError> {
     }
 }
 
+/// The one line that opens the pop-up on `view`, without its newline.
+pub(crate) fn open_panel_line(view: &str) -> String {
+    format!("open-panel {view}")
+}
+
+/// The one line that opens the large window at `target`, without its newline.
+pub(crate) fn window_line(target: &str) -> String {
+    format!("window {target}")
+}
+
 /// The socket half of [`send_open_panel`], split out so tests can name the path.
 pub(crate) fn send_open_panel_at(socket: &std::path::Path, view: &str) -> Result<(), IpcError> {
-    send_at(socket, &format!("open-panel {view}\n"))
+    send_at(socket, &format!("{}\n", open_panel_line(view)))
+}
+
+/// The socket half of [`send_window`], split out so tests can name the path.
+pub(crate) fn send_window_at(socket: &std::path::Path, target: &str) -> Result<(), IpcError> {
+    send_at(socket, &format!("{}\n", window_line(target)))
 }
 
 /// One command line to the tray app, then its one-line answer.
@@ -154,6 +183,7 @@ fn send_at(socket: &std::path::Path, line: &str) -> Result<(), IpcError> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum IpcCommand {
     OpenPanel(String),
+    OpenWindow(String),
     Feed,
 }
 
@@ -309,23 +339,32 @@ fn handle_connection(mut stream: UnixStream, on_command: &dyn Fn(IpcCommand)) {
     let _ = stream.write_all(reply.as_bytes());
 }
 
-/// `open-panel <view>`, with the three views the panel has, or `feed`.
-/// Anything else is an unknown command and never panics.
+/// `open-panel <view>` (the pop-up: `main` or `add`), `window <target>` (the
+/// large window, checked by `window::parse_target`) or `feed`. Anything else is
+/// an unknown command and never panics.
 #[cfg(feature = "gui")]
 fn parse_command(line: &str) -> Option<IpcCommand> {
-    if line == "feed" {
-        return Some(IpcCommand::Feed);
-    }
     let mut parts = line.split_whitespace();
-    if parts.next() != Some("open-panel") {
-        return None;
-    }
-    let view = parts.next()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    match view {
-        "main" | "add" | "settings" => Some(IpcCommand::OpenPanel(view.to_string())),
+    match parts.next()? {
+        "feed" if parts.next().is_none() => Some(IpcCommand::Feed),
+        "open-panel" => {
+            let view = parts.next()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            match view {
+                "main" | "add" => Some(IpcCommand::OpenPanel(view.to_string())),
+                _ => None,
+            }
+        }
+        "window" => {
+            let target = parts.next()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            super::window::parse_target(target).ok()?;
+            Some(IpcCommand::OpenWindow(target.to_string()))
+        }
         _ => None,
     }
 }
@@ -483,10 +522,10 @@ mod tests {
             let _ = opened.send(command);
         })
         .expect("listener despite the leftover socket");
-        send_open_panel_at(&socket, "settings").expect("the new listener answers");
+        send_open_panel_at(&socket, "main").expect("the new listener answers");
         assert_eq!(
             received.recv_timeout(Duration::from_secs(2)),
-            Ok(IpcCommand::OpenPanel("settings".to_string()))
+            Ok(IpcCommand::OpenPanel("main".to_string()))
         );
     }
 
@@ -508,6 +547,17 @@ mod tests {
             Ok(IpcCommand::Feed)
         );
         assert_eq!(parse_command("feed extra"), None);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn window_is_a_known_command() {
+        assert_eq!(
+            parse_command("window statistics"),
+            Some(IpcCommand::OpenWindow("statistics".to_string()))
+        );
+        assert_eq!(parse_command("window nonsense"), None);
+        assert_eq!(parse_command("open-panel settings"), None);
     }
 
     #[test]

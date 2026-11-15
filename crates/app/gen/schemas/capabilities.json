@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"Permissions of the seatswap panel window","local":true,"windows":["panel"],"permissions":["core:default"]}}
+{"default":{"identifier":"default","description":"Permissions of the seatswap panel and large window","local":true,"windows":["panel","main"],"permissions":["core:default"]}}

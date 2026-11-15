@@ -363,6 +363,7 @@ fn build_menu(app: &AppHandle, snapshot: &Snapshot) -> tauri::Result<Menu<tauri:
         ("open-panel", "Open panel…"),
         ("add-account", "Add account…"),
         ("settings", "Settings…"),
+        ("open-window", "Open seatswap…"),
     ] {
         let item = MenuItem::with_id(app, id, text, true, None::<&str>)?;
         menu.append(&item)?;
@@ -377,7 +378,8 @@ fn menu_event(app: &AppHandle, id: &str) {
     match id {
         "open-panel" => super::show_panel(app, "main"),
         "add-account" | "save-current" => super::show_panel(app, "add"),
-        "settings" => super::show_panel(app, "settings"),
+        "settings" => super::show_window(app, "settings"),
+        "open-window" => super::show_window(app, "sessions"),
         "quit" => app.exit(0),
         other => {
             if let Some(key) = other.strip_prefix("account:") {

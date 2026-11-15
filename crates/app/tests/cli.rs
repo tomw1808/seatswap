@@ -692,9 +692,11 @@ fn panel_sends_the_view_to_the_running_app() {
 
     let result = fixture.run(&["panel", "settings"]);
     assert_ok(&result);
+    // `panel settings` opens the large window now (spec §3.7); the pop-up has
+    // no settings view of its own.
     assert_eq!(
         received.join().expect("listener thread").trim(),
-        "open-panel settings"
+        "window settings"
     );
 }
 
