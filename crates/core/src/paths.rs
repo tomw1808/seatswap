@@ -28,6 +28,8 @@ pub enum PathsError {
         #[source]
         source: std::io::Error,
     },
+    #[error("{0}; set hostName in the settings")]
+    HostName(String),
 }
 
 /// Claude Code's files for one config folder.
@@ -118,6 +120,16 @@ impl ClaudePaths {
     pub fn identity_lock(&self) -> PathBuf {
         append_to_file_name(&self.identity_file, ".lock")
     }
+
+    /// Claude Code's running session files: `<config_dir>/sessions`.
+    pub fn sessions_dir(&self) -> PathBuf {
+        self.config_dir.join("sessions")
+    }
+
+    /// Claude Code's transcripts: `<config_dir>/projects`.
+    pub fn projects_dir(&self) -> PathBuf {
+        self.config_dir.join("projects")
+    }
 }
 
 /// seatswap's own files (spec §5).
@@ -166,6 +178,18 @@ impl AppPaths {
     pub fn gui_lock(&self) -> PathBuf {
         self.data_dir.join("gui.lock")
     }
+    /// The history folder when the setting names none: `<data_dir>/history`.
+    pub fn history_dir(&self) -> PathBuf {
+        self.data_dir.join("history")
+    }
+    /// The id that tells this machine apart from another host writing the same history.
+    pub fn machine_id_file(&self) -> PathBuf {
+        self.data_dir.join("machine-id")
+    }
+    /// One state file per Claude Code project folder: `<data_dir>/transcripts-state`.
+    pub fn transcripts_state_dir(&self) -> PathBuf {
+        self.data_dir.join("transcripts-state")
+    }
     /// The Unix socket of the running tray app. `Some(dir)` names one socket per
     /// data folder inside that runtime directory; `None` puts it in the data
     /// folder. The name comes from the folder's real path, so every spelling of
@@ -191,6 +215,55 @@ impl AppPaths {
         }
         Ok(path)
     }
+}
+
+/// The name this host writes its history under: `explicit` if set, else the
+/// machine's host name (Linux: /proc/sys/kernel/hostname; Windows: %COMPUTERNAME%).
+/// 1..=63 characters of [A-Za-z0-9._-]; anything else is
+/// [`PathsError::HostName`] with the text "set hostName in the settings". The
+/// result is always in lower case: Windows has the same name in upper case in
+/// %COMPUTERNAME% and in lower case in Claude Code's files (checked 15 November
+/// 2026).
+pub fn host_name(explicit: Option<&str>) -> Result<String, PathsError> {
+    let name = match explicit {
+        Some(name) => name.to_string(),
+        None => machine_host_name()?,
+    };
+    if !(1..=63).contains(&name.len())
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+    {
+        return Err(PathsError::HostName(format!(
+            "host name {name:?} must be 1 to 63 characters of A-Z, a-z, 0-9, '.', '_' or '-'"
+        )));
+    }
+    Ok(name.to_ascii_lowercase())
+}
+
+#[cfg(target_os = "linux")]
+fn machine_host_name() -> Result<String, PathsError> {
+    const FILE: &str = "/proc/sys/kernel/hostname";
+    let text = std::fs::read_to_string(FILE).map_err(|e| {
+        PathsError::HostName(format!(
+            "cannot read the machine's host name from {FILE}: {e}"
+        ))
+    })?;
+    Ok(text.strip_suffix('\n').unwrap_or(&text).to_string())
+}
+
+#[cfg(windows)]
+fn machine_host_name() -> Result<String, PathsError> {
+    std::env::var("COMPUTERNAME").map_err(|_| {
+        PathsError::HostName("COMPUTERNAME does not give the machine's host name".to_string())
+    })
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn machine_host_name() -> Result<String, PathsError> {
+    Err(PathsError::HostName(
+        "the machine's host name cannot be read on this system".to_string(),
+    ))
 }
 
 /// A folder named on the command line as an absolute path, resolved against the
@@ -236,6 +309,31 @@ fn append_to_file_name(path: &Path, suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_name_takes_the_explicit_one() {
+        assert_eq!(host_name(Some("vega")).unwrap(), "vega");
+    }
+
+    #[test]
+    fn host_name_is_lower_case() {
+        assert_eq!(host_name(Some("VEGA-PC")).unwrap(), "vega-pc");
+    }
+
+    #[test]
+    fn host_name_rejects_other_characters() {
+        assert!(matches!(
+            host_name(Some("a/b")),
+            Err(PathsError::HostName(_))
+        ));
+    }
+
+    #[test]
+    fn claude_folders() {
+        let p = ClaudePaths::for_config_dir(Path::new("/x/c"), Path::new("/x"));
+        assert_eq!(p.sessions_dir(), Path::new("/x/c/sessions"));
+        assert_eq!(p.projects_dir(), Path::new("/x/c/projects"));
+    }
 
     #[test]
     fn default_folder_keeps_identity_next_to_it() {

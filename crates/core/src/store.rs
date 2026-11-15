@@ -134,6 +134,14 @@ pub enum Theme {
     Dark,
 }
 
+/// Which hosts' waiting sessions notify (spec §4.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WaitingHosts {
+    ThisHost,
+    AllHosts,
+}
+
 const DEFAULT_POLL_ACTIVE_SECS: u64 = 120;
 const DEFAULT_POLL_INACTIVE_SECS: u64 = 900;
 const DEFAULT_SUGGEST_AT: u32 = 90;
@@ -188,6 +196,30 @@ fn default_theme() -> Theme {
     Theme::System
 }
 
+fn default_read_sessions() -> bool {
+    true
+}
+
+fn default_notify_usable_again() -> bool {
+    true
+}
+
+fn default_notify_waiting() -> bool {
+    true
+}
+
+fn default_notify_waiting_hosts() -> WaitingHosts {
+    WaitingHosts::ThisHost
+}
+
+fn default_agents_read() -> bool {
+    true
+}
+
+fn default_agents_switch() -> bool {
+    false
+}
+
 /// Settings (spec §10). Each field has a serde default, so a file written by an
 /// older build still loads with that setting's default; a present but invalid
 /// value is rejected by [`Settings::validate`], never silently replaced.
@@ -220,6 +252,27 @@ pub struct Settings {
     pub theme: Theme,
     #[serde(default)]
     pub claude_config_dir: Option<PathBuf>,
+    /// `None` (absent or `null` in the file) means `<data dir>/history`; a relative
+    /// path is refused by [`Settings::validate`].
+    #[serde(default)]
+    pub history_dir: Option<PathBuf>,
+    /// `None` (absent or `null` in the file) means the machine's host name; an empty
+    /// text or a name outside [`crate::paths::host_name`]'s rule is refused by
+    /// [`Settings::validate`].
+    #[serde(default)]
+    pub host_name: Option<String>,
+    #[serde(default = "default_read_sessions")]
+    pub read_sessions: bool,
+    #[serde(default = "default_notify_usable_again")]
+    pub notify_usable_again: bool,
+    #[serde(default = "default_notify_waiting")]
+    pub notify_waiting: bool,
+    #[serde(default = "default_notify_waiting_hosts")]
+    pub notify_waiting_hosts: WaitingHosts,
+    #[serde(default = "default_agents_read")]
+    pub agents_read: bool,
+    #[serde(default = "default_agents_switch")]
+    pub agents_switch: bool,
 }
 
 impl Default for Settings {
@@ -238,6 +291,14 @@ impl Default for Settings {
             start_at_login: default_start_at_login(),
             theme: default_theme(),
             claude_config_dir: None,
+            history_dir: None,
+            host_name: None,
+            read_sessions: default_read_sessions(),
+            notify_usable_again: default_notify_usable_again(),
+            notify_waiting: default_notify_waiting(),
+            notify_waiting_hosts: default_notify_waiting_hosts(),
+            agents_read: default_agents_read(),
+            agents_switch: default_agents_switch(),
         }
     }
 }
@@ -266,6 +327,18 @@ impl Settings {
                     dir.display()
                 )));
             }
+        }
+        if let Some(dir) = &self.history_dir {
+            if !dir.is_absolute() {
+                return Err(StoreError::InvalidSetting(format!(
+                    "historyDir must be an absolute path, got {}",
+                    dir.display()
+                )));
+            }
+        }
+        if let Some(name) = &self.host_name {
+            crate::paths::host_name(Some(name))
+                .map_err(|e| StoreError::InvalidSetting(e.to_string()))?;
         }
         Ok(())
     }
@@ -1172,6 +1245,78 @@ mod tests {
             ..Settings::default()
         };
         assert!(absolute.validate().is_ok());
+    }
+
+    #[test]
+    fn settings_from_an_older_file_get_the_new_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(&tmp.path().join("app"));
+        fs::create_dir_all(store.app_paths().data_dir.clone()).unwrap();
+        fs::write(
+            store.app_paths().accounts_file(),
+            br#"{"version":1,"accounts":[],"settings":{"trayText":"percent"}}"#,
+        )
+        .unwrap();
+        let file = store.load().unwrap();
+        assert!(file.settings.read_sessions);
+        assert!(!file.settings.agents_switch);
+        assert_eq!(file.settings.notify_waiting_hosts, WaitingHosts::ThisHost);
+        assert_eq!(file.settings.history_dir, None);
+    }
+
+    #[test]
+    fn validate_rejects_a_bad_host_name() {
+        let bad = Settings {
+            host_name: Some("my host".to_string()),
+            ..Settings::default()
+        };
+        match bad.validate() {
+            Err(StoreError::InvalidSetting(message)) => {
+                assert!(message.contains("hostName"), "got {message}");
+            }
+            other => panic!("expected InvalidSetting, got {other:?}"),
+        }
+
+        let good = Settings {
+            host_name: Some("vega".to_string()),
+            ..Settings::default()
+        };
+        assert!(good.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_an_empty_host_name() {
+        let empty = Settings {
+            host_name: Some(String::new()),
+            ..Settings::default()
+        };
+        match empty.validate() {
+            Err(StoreError::InvalidSetting(message)) => {
+                assert!(message.contains("hostName"), "got {message}");
+            }
+            other => panic!("expected InvalidSetting, got {other:?}"),
+        }
+
+        let absent = Settings {
+            host_name: None,
+            ..Settings::default()
+        };
+        assert!(absent.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_a_relative_history_dir() {
+        let settings = Settings {
+            history_dir: Some(PathBuf::from("history")),
+            ..Settings::default()
+        };
+        match settings.validate() {
+            Err(StoreError::InvalidSetting(message)) => {
+                assert!(message.contains("historyDir"), "got {message}");
+                assert!(message.contains("absolute path"), "got {message}");
+            }
+            other => panic!("expected InvalidSetting, got {other:?}"),
+        }
     }
 
     #[test]

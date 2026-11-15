@@ -28,6 +28,14 @@ const DEFAULT_SETTINGS = {
   startAtLogin: true,
   theme: "system",
   claudeConfigDir: null,
+  historyDir: null,
+  hostName: null,
+  readSessions: true,
+  notifyUsableAgain: true,
+  notifyWaiting: true,
+  notifyWaitingHosts: "thisHost",
+  agentsRead: true,
+  agentsSwitch: false,
 };
 
 const LEVEL_COLORS = {
@@ -1938,7 +1946,10 @@ async function saveSettings() {
   }
 
   const configDir = String(draft.claudeConfigDir || "").trim();
-  const payload = {
+  // Keep every field the pop-up does not edit (history, sessions, notifications,
+  // agents), so saving here never resets one of them to its default.
+  const payload = Object.assign({}, draft);
+  Object.assign(payload, {
     trayText: draft.trayText,
     iconLimit: draft.iconLimit,
     pollActiveSecs: draft.pollActiveSecs,
@@ -1952,7 +1963,7 @@ async function saveSettings() {
     startAtLogin: Boolean(draft.startAtLogin),
     theme: draft.theme,
     claudeConfigDir: configDir === "" ? null : configDir,
-  };
+  });
 
   try {
     await invoke("save_settings", { settings: payload });
@@ -2622,6 +2633,11 @@ function validateFixtureSettings(settings) {
   }
   if (!["system", "light", "dark"].includes(merged.theme)) {
     throw new Error(`invalid theme ${JSON.stringify(merged.theme)}`);
+  }
+  if (!["thisHost", "allHosts"].includes(merged.notifyWaitingHosts)) {
+    throw new Error(
+      `invalid notifyWaitingHosts ${JSON.stringify(merged.notifyWaitingHosts)}`
+    );
   }
   if (!Number.isInteger(merged.pollActiveSecs) || merged.pollActiveSecs < 30) {
     throw new Error(`pollActiveSecs must be at least 30 s, got ${merged.pollActiveSecs}`);
