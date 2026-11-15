@@ -33,6 +33,12 @@ pub struct Range {
 }
 
 impl Range {
+    /// Every instant: [`DateTime::<Utc>::MIN_UTC`] .. [`DateTime::<Utc>::MAX_UTC`].
+    pub const ALL: Range = Range {
+        from: DateTime::<Utc>::MIN_UTC,
+        to: DateTime::<Utc>::MAX_UTC,
+    };
+
     /// The range between two optional ends: an open start is
     /// [`DateTime::<Utc>::MIN_UTC`], an open end is [`DateTime::<Utc>::MAX_UTC`].
     /// A start that is not before the end is [`HistoryError::Range`], naming

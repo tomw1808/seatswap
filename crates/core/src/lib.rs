@@ -10,6 +10,7 @@
 //! - `history`  the history folder: record types, appending, reading a range, merging hosts
 //! - `project`  from a folder to the project's identity
 //! - `sessions` Claude Code's session files and which are alive
+//! - `stats`    everything the statistics pages show, computed from the history
 //! - `transcripts` Claude Code's transcripts: answers, user turns, token records
 //! - `locks`    Claude Code's six lock folders + seatswap's own switch.lock
 //! - `live`     read/write the live login (.credentials.json) and identity (.claude.json)
@@ -36,6 +37,7 @@ pub mod paths;
 pub mod project;
 pub mod projects;
 pub mod sessions;
+pub mod stats;
 pub mod store;
 pub mod switcher;
 pub mod transcripts;

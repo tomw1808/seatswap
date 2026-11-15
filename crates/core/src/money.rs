@@ -785,13 +785,7 @@ impl Valuer {
         };
         let windows = history.finished_windows(&widened, &Hosts::All)?;
         let samples = history.read::<Sample>(&widened, &Hosts::All)?;
-        let events = history.read::<Event>(
-            &Range {
-                from: DateTime::<Utc>::MIN_UTC,
-                to: DateTime::<Utc>::MAX_UTC,
-            },
-            &Hosts::All,
-        )?;
+        let events = history.read::<Event>(&Range::ALL, &Hosts::All)?;
         let tokens = history.read::<TokenRecord>(&widened, &Hosts::All)?;
 
         let mut valuer = Valuer {
@@ -1014,7 +1008,7 @@ impl Valuer {
     /// [`Missing::PriceInOtherCurrency`], one without a currency
     /// [`Missing::PriceWithoutCurrency`]. Only an account without any stored
     /// price is [`Missing::NoAccountPrice`].
-    fn price_at(&self, account: &AccountRef, at: DateTime<Utc>) -> Result<f64, Missing> {
+    pub fn price_at(&self, account: &AccountRef, at: DateTime<Utc>) -> Result<f64, Missing> {
         let (amount, currency) = match self.price_changes.get(account) {
             Some(changes) if !changes.is_empty() => {
                 let after = changes.partition_point(|(t, _, _)| *t <= at);

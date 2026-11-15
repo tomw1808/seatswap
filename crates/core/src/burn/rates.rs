@@ -234,6 +234,18 @@ impl Timeline {
         }
     }
 
+    /// The moments in `(from, to)` at which the account in use changes.
+    pub(crate) fn changes_between(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> impl Iterator<Item = DateTime<Utc>> + '_ {
+        self.changes
+            .iter()
+            .map(|change| change.0)
+            .filter(move |at| *at > from && *at < to)
+    }
+
     /// The seconds of `[from, to)` in which this timeline had `account` live.
     fn seconds(&self, account: &AccountRef, from: DateTime<Utc>, to: DateTime<Utc>) -> f64 {
         let mut total = 0.0;
