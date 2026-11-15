@@ -78,6 +78,11 @@ const state = {
   // before left them, so a quick second change never carries a stale copy.
   saving: Promise.resolve(),
   pendingSaves: 0,
+  // The resolved projects and organizations (spec §3.6), and the request token
+  // that keeps a slow reply from overwriting a newer one.
+  projects: null,
+  projectsError: null,
+  projectsToken: 0,
 };
 
 // A snapshot read before a save landed must not undo it: while saves are
@@ -132,6 +137,7 @@ export async function render(container, context) {
   state.group = group;
   listenMoney(context);
   await loadMoney(context);
+  if (group === "accounts" || group === "projects") await loadProjects();
 
   clear(container);
   const right = h("div", { class: "col settings-col" });
@@ -185,7 +191,7 @@ function renderGroup(right, id) {
     right.appendChild(panel("Settings", "", [message("Unknown setting group.")]));
     return;
   }
-  if (!["general", "accounts", "auto-burn", "notifications", "agents"].includes(id)) {
+  if (!["general", "accounts", "auto-burn", "notifications", "projects", "agents"].includes(id)) {
     right.appendChild(panel(labelOf(id), "", [message(NOT_YET)]));
     return;
   }
@@ -193,6 +199,7 @@ function renderGroup(right, id) {
   else if (id === "accounts") right.appendChild(accountsCard());
   else if (id === "auto-burn") right.appendChild(autoBurnCard());
   else if (id === "notifications") right.appendChild(notificationsCard());
+  else if (id === "projects") right.appendChild(projectsCard());
   else right.appendChild(agentsCard());
 }
 
@@ -1122,11 +1129,7 @@ function accountRow(row) {
       h("span", { class: "acc-text", title: accountPlan(row), text: accountPlan(row) }),
       priceCell,
       h("div", { class: "acc-switch" }, [auto]),
-      h("span", {
-        class: "acc-text",
-        text: "—",
-        title: "The organization list comes with the Projects group",
-      }),
+      accountOrgCell(row, field),
       h("span", { class: "acc-text", text: loginEndsText(row) }),
     ])
   );
@@ -1300,6 +1303,432 @@ async function removeAccount(row, field) {
   } catch (error) {
     fieldError(field, errorMessage(error));
   }
+}
+
+// ---------------------------------------------------------------------------
+// Projects and organizations (spec §3.6): names, joins, organizations — the
+// same on every host. A change appends one line to the shared project log.
+// ---------------------------------------------------------------------------
+
+// Every replacement of state.projects bumps the token, so a `loadProjects`
+// reply that started before it cannot overwrite the newer view.
+function setProjects(view, error) {
+  state.projectsToken += 1;
+  state.projects = view;
+  state.projectsError = error;
+}
+
+async function loadProjects() {
+  const token = ++state.projectsToken;
+  try {
+    const view = await state.context.invoke("projects_view", {});
+    if (token !== state.projectsToken) return;
+    if (!isObject(view)) throw new Error("projects_view returned an unexpected reply");
+    setProjects(view, null);
+  } catch (error) {
+    if (token !== state.projectsToken) return;
+    setProjects(null, errorMessage(error));
+  }
+}
+
+function projectKeyText(key) {
+  if (!isObject(key) || typeof key.id !== "string") return "?";
+  return key.id;
+}
+
+function sameRef(first, second) {
+  return Boolean(first && second && first.acc === second.acc && first.org === second.org);
+}
+
+function accountRefOf(projects, id) {
+  if (!projects || !Array.isArray(projects.accountRefs)) return null;
+  const entry = projects.accountRefs.find((item) => item.id === id);
+  return entry ? entry.account : null;
+}
+
+function orgOfAccount(projects, id) {
+  const ref = accountRefOf(projects, id);
+  if (!ref) return null;
+  const orgs = Array.isArray(projects.orgs) ? projects.orgs : [];
+  return orgs.find((org) => (org.accounts || []).some((account) => sameRef(account, ref))) || null;
+}
+
+function addRef(accounts, ref) {
+  const list = Array.isArray(accounts) ? accounts : [];
+  return list.some((account) => sameRef(account, ref)) ? list : [...list, ref];
+}
+
+function removeRef(accounts, ref) {
+  const list = Array.isArray(accounts) ? accounts : [];
+  return list.filter((account) => !sameRef(account, ref));
+}
+
+// One project edit through the window's command, queued with the settings
+// saves so two quick changes keep their order. The reply is the whole new view.
+function saveProject(edit, field) {
+  return queuedSave(async () => {
+    try {
+      const view = await state.context.invoke("projects_edit", { edit });
+      if (!isObject(view)) throw new Error("projects_edit returned an unexpected reply");
+      setProjects(view, null);
+      fieldError(field, null);
+      if (state.right && (state.group === "projects" || state.group === "accounts")) {
+        renderGroup(state.right, state.group);
+      }
+      return true;
+    } catch (error) {
+      fieldError(field, errorMessage(error));
+      return false;
+    }
+  });
+}
+
+// The Accounts group's organization column: the organizations plus "none". One
+// change is one edit: moving the account to an organization writes that
+// organization's list with the account; moving it to "none" writes the losing
+// organization's list without it.
+function accountOrgCell(row, field) {
+  const projects = isObject(state.projects) ? state.projects : null;
+  if (!projects) {
+    return h("span", {
+      class: "acc-text",
+      text: "not read",
+      title: state.projectsError || "The organizations are read from the history.",
+    });
+  }
+  const current = orgOfAccount(projects, row.id);
+  const options = [["", "none"], ...projects.orgs.map((org) => [org.id, org.name])];
+  const select = selectInput(options, current ? current.id : "", async (next) => {
+    select.disabled = true;
+    const ok = await saveAccountOrg(row, next, field);
+    if (ok) {
+      renderGroup(state.right, "accounts");
+      return;
+    }
+    select.disabled = false;
+    const back = orgOfAccount(state.projects, row.id);
+    select.value = back ? back.id : "";
+  });
+  select.setAttribute("aria-label", `Organization of ${row.abbr || "the account"}`);
+  return select;
+}
+
+function saveAccountOrg(row, orgId, field) {
+  return queuedSave(async () => {
+    const projects = isObject(state.projects) ? state.projects : null;
+    if (!projects) {
+      fieldError(field, "The organizations could not be read; nothing is saved.");
+      return false;
+    }
+    const ref = accountRefOf(projects, row.id);
+    if (!ref) {
+      fieldError(field, "The account is not in the stored list; nothing is saved.");
+      return false;
+    }
+    const from = orgOfAccount(projects, row.id);
+    const to = orgId === "" ? null : projects.orgs.find((org) => org.id === orgId) || null;
+    if (orgId !== "" && !to) {
+      fieldError(field, `unknown organization ${orgId}`);
+      return false;
+    }
+    if ((from ? from.id : "") === (to ? to.id : "")) {
+      fieldError(field, null);
+      return true;
+    }
+    if (!from && !to) {
+      fieldError(field, null);
+      return true;
+    }
+    // One edit: the gaining organization's whole list with the account added,
+    // or the losing organization's whole list with it removed. The core's
+    // per-account rule moves the account out of the other organization.
+    const edit = to
+      ? { edit: "orgAccounts", org: to.id, accounts: addRef(to.accounts, ref) }
+      : { edit: "orgAccounts", org: from.id, accounts: removeRef(from.accounts, ref) };
+    try {
+      const view = await state.context.invoke("projects_edit", { edit });
+      if (!isObject(view)) throw new Error("projects_edit returned an unexpected reply");
+      setProjects(view, null);
+      fieldError(field, null);
+      return true;
+    } catch (error) {
+      fieldError(field, errorMessage(error));
+      await loadProjects();
+      return false;
+    }
+  });
+}
+
+function foldersText(folders) {
+  if (!isObject(folders)) return "—";
+  const parts = [];
+  for (const host of Object.keys(folders).sort()) {
+    const list = Array.isArray(folders[host]) ? folders[host] : [];
+    parts.push(`${host}: ${list.join(", ")}`);
+  }
+  return parts.length > 0 ? parts.join(" · ") : "—";
+}
+
+function projectsCard() {
+  const card = panel(
+    "Projects",
+    "a project is a repository; an organization is several projects · the same on all your hosts",
+    [],
+    [
+      h("span", {
+        class: "mf",
+        text: "Changes apply to the past too: the history stores the repository, not the name.",
+      }),
+    ]
+  );
+  const body = card.querySelector(".settings-body");
+  const projects = isObject(state.projects) ? state.projects : null;
+  if (!projects) {
+    body.appendChild(message(state.projectsError || "The projects could not be read."));
+    return card;
+  }
+  body.appendChild(
+    h("div", { class: "lr hd proj-grid" }, [
+      h("span", { text: "Project" }),
+      h("span", { text: "Repository" }),
+      h("span", { text: "Folders, per host" }),
+      h("span", { text: "Organization" }),
+      h("span", { class: "n", text: "Sessions" }),
+    ])
+  );
+  if (projects.projects.length === 0) {
+    body.appendChild(
+      h("div", { class: "lr mf", text: "No sessions recorded yet, so no project is known." })
+    );
+  }
+  for (const project of projects.projects) body.appendChild(projectRow(project, projects));
+
+  body.appendChild(section("Join projects"));
+  body.appendChild(joinRow(projects));
+
+  body.appendChild(section("Organizations"));
+  if (projects.orgs.length === 0) {
+    body.appendChild(h("div", { class: "lr mf", text: "No organization yet." }));
+  }
+  for (const org of projects.orgs) body.appendChild(orgRow(org, projects));
+  body.appendChild(
+    note([
+      h("b", { text: "Found by the repository." }),
+      " The address of a repository (here its GitHub name) is the same on every host, so the same project needs no set-up anywhere. Its owner becomes the organization. What you rename, join or assign here is shared with your other hosts through the history folder.",
+    ])
+  );
+  return card;
+}
+
+function projectRow(project, projects) {
+  const field = `project:${projectKeyText(project.key)}`;
+  const wrap = h("div", { class: "proj-wrap", dataset: { field } });
+
+  const nameInput = textInput({
+    class: "inp tall proj-name",
+    value: project.name || "",
+    "aria-label": "Project name",
+  });
+  nameInput.addEventListener("change", async () => {
+    const next = nameInput.value.trim();
+    if (next === project.name) {
+      nameInput.value = project.name || "";
+      return;
+    }
+    const ok = await saveProject({ edit: "rename", key: project.key, name: next }, field);
+    if (!ok) nameInput.value = project.name || "";
+  });
+
+  const repo = project.repo
+    ? h("span", { class: "mono x11", title: project.repo, text: project.repo })
+    : h("span", { class: "mono x11 mf", text: "no repository" });
+  const folders = foldersText(project.folders);
+  wrap.appendChild(
+    h("div", { class: "lr tall proj-grid" }, [
+      nameInput,
+      repo,
+      h("span", { class: "mono x11 mf", title: folders, text: folders }),
+      projectOrgCell(project, projects, field),
+      h("span", { class: "n", text: String(project.sessions) }),
+    ])
+  );
+  if (Array.isArray(project.joined) && project.joined.length > 0) {
+    wrap.appendChild(joinedLine(project, field));
+  }
+  wrap.appendChild(
+    h("div", {
+      class: "row-error",
+      hidden: !state.errors[field],
+      text: state.errors[field] || "",
+    })
+  );
+  return wrap;
+}
+
+function projectOrgCell(project, projects, field) {
+  const NEW_ORG = "\u0000new-organization";
+  const select = selectInput(
+    [
+      ["", "none"],
+      ...projects.orgs.map((org) => [org.id, org.name]),
+      [NEW_ORG, "new…"],
+    ],
+    project.org || "",
+    async (next) => {
+      if (next === NEW_ORG) {
+        newWrap.hidden = false;
+        newInput.focus();
+        select.value = project.org || "";
+        return;
+      }
+      const ok = await saveProject(
+        { edit: "assign", key: project.key, org: next === "" ? null : next },
+        field
+      );
+      if (!ok) select.value = project.org || "";
+    }
+  );
+  select.setAttribute("aria-label", `Organization of ${project.name || "the project"}`);
+
+  const newInput = textInput({
+    class: "inp tall proj-new-input",
+    placeholder: "organization name",
+    "aria-label": "New organization name",
+  });
+  const use = h("button", { type: "button", class: "hbtn xs", text: "Use" });
+  const saveNew = async () => {
+    const next = newInput.value.trim();
+    if (next === "") {
+      fieldError(field, "An organization name must not be empty.");
+      newInput.focus();
+      return;
+    }
+    use.disabled = true;
+    const ok = await saveProject({ edit: "assign", key: project.key, org: next }, field);
+    use.disabled = false;
+    if (!ok) {
+      newInput.focus();
+      return;
+    }
+    newWrap.hidden = true;
+    newInput.value = "";
+  };
+  use.addEventListener("click", saveNew);
+  newInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      saveNew();
+    }
+  });
+  const newWrap = h("span", { class: "proj-new-org", hidden: true }, [newInput, use]);
+  return h("span", { class: "proj-org" }, [select, newWrap]);
+}
+
+// A joined project has no row of its own: the core sends its key and the
+// default name of that key, shown under the project it was joined into, with
+// an undo that writes `Unjoin`.
+function joinedLine(project, field) {
+  const line = h("div", { class: "proj-joined" }, [h("span", { class: "mf", text: "joined: " })]);
+  project.joined.forEach((joined, index) => {
+    if (index > 0) line.appendChild(document.createTextNode(" · "));
+    line.appendChild(h("span", { class: "mono x11", text: joined.name }));
+    const undo = h("button", {
+      type: "button",
+      class: "hbtn xs ghost",
+      text: "undo",
+      "aria-label": `Unjoin ${joined.name}`,
+    });
+    undo.addEventListener("click", async () => {
+      undo.disabled = true;
+      const ok = await saveProject({ edit: "unjoin", key: joined.key }, field);
+      if (!ok) undo.disabled = false;
+    });
+    line.appendChild(document.createTextNode(" "));
+    line.appendChild(undo);
+  });
+  return line;
+}
+
+function joinRow(projects) {
+  const field = "project:join";
+  const rows = projects.projects;
+  const options = rows.map((project, index) => [String(index), project.name]);
+  const first = selectInput(options, "0", () => {});
+  const second = selectInput(options, rows.length > 1 ? "1" : "0", () => {});
+  first.setAttribute("aria-label", "Join this project");
+  second.setAttribute("aria-label", "Into this project");
+  const join = h("button", { type: "button", class: "hbtn", text: "Join projects" });
+  join.disabled = rows.length < 2;
+  join.addEventListener("click", async () => {
+    const from = rows[Number(first.value)];
+    const into = rows[Number(second.value)];
+    if (!from || !into) return;
+    join.disabled = true;
+    const ok = await saveProject({ edit: "join", key: from.key, into: into.key }, field);
+    if (!ok) join.disabled = false;
+  });
+  const control = h("span", { class: "proj-join" }, [
+    h("span", { class: "mf", text: "join" }),
+    first,
+    h("span", { class: "mf", text: "into" }),
+    second,
+    join,
+  ]);
+  return setting(
+    "Join projects",
+    control,
+    rows.length < 2
+      ? "there must be two projects"
+      : "the first project's sessions count for the second",
+    field
+  );
+}
+
+function accountChip(ref, projects) {
+  const entry = (projects.accountRefs || []).find((item) => sameRef(item.account, ref));
+  const row = entry ? accountRows().find((account) => account.id === entry.id) : null;
+  const abbr = row && row.abbr ? row.abbr : "?";
+  const color = row && isColor(row.color) ? row.color : "#555b66";
+  return h("span", {
+    class: "acc-chip org-chip",
+    style: { background: color, color: contrastText(color) },
+    title: row ? `${row.label || abbr}${row.email ? ` · ${row.email}` : ""}` : ref.acc,
+    text: abbr,
+  });
+}
+
+function orgRow(org, projects) {
+  const field = `org:${org.id}`;
+  const nameInput = textInput({
+    class: "inp tall org-name",
+    value: org.name || "",
+    "aria-label": "Organization name",
+  });
+  nameInput.addEventListener("change", async () => {
+    const next = nameInput.value.trim();
+    if (next === org.name) {
+      nameInput.value = org.name || "";
+      return;
+    }
+    const ok = await saveProject({ edit: "orgRename", org: org.id, name: next }, field);
+    if (!ok) nameInput.value = org.name || "";
+  });
+  const chips = (org.accounts || []).map((ref) => accountChip(ref, projects));
+  const accounts =
+    chips.length > 0
+      ? h("span", { class: "org-chips" }, chips)
+      : h("span", { class: "mf", text: "no account" });
+  const counts = `${countText(org.accounts.length, "account", "accounts")} · ${countText(
+    org.projects,
+    "project",
+    "projects"
+  )}`;
+  return setting(
+    nameInput,
+    accounts,
+    `from the owner of the repositories · ${counts}`,
+    field
+  );
 }
 
 function generalCard() {

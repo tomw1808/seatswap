@@ -736,6 +736,103 @@ code,
   color: var(--muted);
 }
 
+/* ---------- the Projects group (spec §3.6) ---------- */
+
+.proj-grid {
+  grid-template-columns: 150px minmax(120px, 204px) minmax(0, 1fr) 190px 66px;
+}
+
+.proj-wrap {
+  border-top: 1px solid var(--border);
+}
+
+.proj-wrap .lr {
+  border-top: 0;
+}
+
+.proj-wrap .row-error {
+  padding: 0 12px 6px;
+  color: var(--danger);
+  font-size: 12px;
+  line-height: 16px;
+  white-space: normal;
+}
+
+.proj-name {
+  width: 100%;
+  font-weight: 600;
+}
+
+.proj-org {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.proj-org > select {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.proj-new-org {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.proj-new-input {
+  width: 110px;
+  min-width: 0;
+}
+
+.proj-joined {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 12px;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.proj-join {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.proj-join select.inp {
+  max-width: 200px;
+}
+
+.org-chips {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.acc-chip.org-chip {
+  width: 30px;
+  min-width: 30px;
+  height: 22px;
+  border-radius: 7px;
+  font-size: 11px;
+}
+
+.org-name {
+  width: 100%;
+  max-width: 220px;
+}
+
+.acc-grid select.inp {
+  width: 100%;
+}
+
 /* ---------- the settings controls ---------- */
 
 .inp {

@@ -14,6 +14,7 @@
 //! - `locks`    Claude Code's six lock folders + seatswap's own switch.lock
 //! - `live`     read/write the live login (.credentials.json) and identity (.claude.json)
 //! - `money`    API prices with their dates, the dollar rate, the value of tokens
+//! - `projects` projects and organizations: names, joins, the shared log (spec §3.6)
 //! - `store`    accounts.json (no secrets) + secrets (OS keyring, or 0600 files)
 //! - `api`      the two HTTP endpoints: usage and token refresh
 //! - `switcher` the switch algorithm (spec §6.2) and saving the current login
@@ -31,6 +32,7 @@ pub mod locks;
 pub mod money;
 pub mod paths;
 pub mod project;
+pub mod projects;
 pub mod sessions;
 pub mod store;
 pub mod switcher;

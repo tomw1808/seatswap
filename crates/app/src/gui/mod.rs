@@ -201,6 +201,8 @@ pub(crate) fn run(
             panel::agent_calls,
             panel::skill_status,
             panel::skill_install,
+            panel::projects_view,
+            panel::projects_edit,
             window::open_window,
         ])
         .build(tauri::generate_context!());

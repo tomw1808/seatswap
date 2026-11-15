@@ -74,7 +74,7 @@ mod limit_kind {
     }
 }
 
-/// The six kinds of history line, each with its own file per month.
+/// The seven kinds of history line, each with its own file per month.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Kind {
     Samples,
@@ -83,6 +83,7 @@ pub enum Kind {
     Tokens,
     Sessions,
     Up,
+    Projects,
 }
 
 impl Kind {
@@ -94,6 +95,7 @@ impl Kind {
             Kind::Tokens => "tokens",
             Kind::Sessions => "sessions",
             Kind::Up => "up",
+            Kind::Projects => "projects",
         }
     }
 }

@@ -18,9 +18,10 @@ use tauri::{
 };
 
 use seatswap_core::engine::PollReason;
-use seatswap_core::history::{By, Event, EventKind, HistoryDir, Hosts, Range};
+use seatswap_core::history::{By, Event, EventKind, HistoryDir, Hosts, Range, SessionRecord};
 use seatswap_core::money::ModelPrice;
-use seatswap_core::store::{self, Settings};
+use seatswap_core::projects::{ProjectEdit, Projects, ProjectsLogRecord};
+use seatswap_core::store::{self, Account, Settings};
 use seatswap_core::switcher::UnsavedPolicy;
 
 use super::format;
@@ -849,6 +850,91 @@ pub(crate) async fn skill_install(
         .map_err(|error| error.to_string())
 }
 
+/// Every host's session records and project log lines (spec §3.6), over all
+/// time, with each folder written with `~` for `home` as the app shows paths
+/// everywhere: a torn line is skipped by the reader with its warning, as for
+/// the other kinds.
+fn projects_from(
+    history: &HistoryDir,
+    home: &Path,
+    accounts: &[Account],
+) -> Result<Projects, String> {
+    let range = Range {
+        from: DateTime::<Utc>::MIN_UTC,
+        to: DateTime::<Utc>::MAX_UTC,
+    };
+    let log = history
+        .read::<ProjectsLogRecord>(&range, &Hosts::All)
+        .map_err(|error| error.to_string())?;
+    let sessions = history
+        .read::<SessionRecord>(&range, &Hosts::All)
+        .map_err(|error| error.to_string())?;
+    for warning in log.warnings.iter().chain(sessions.warnings.iter()) {
+        eprintln!("seatswap: history: {warning}");
+    }
+    let mut projects = Projects::resolve(&log.records, &sessions.records, accounts);
+    for project in &mut projects.projects {
+        for cwds in project.folders.values_mut() {
+            for cwd in cwds.iter_mut() {
+                *cwd = with_tilde(cwd, home);
+            }
+        }
+    }
+    Ok(projects)
+}
+
+/// One project edit: validated first, so a refused edit appends nothing. The
+/// line goes to this host's own log through the history it already has, and
+/// the new resolution is returned.
+fn edit_projects(
+    history: &HistoryDir,
+    home: &Path,
+    accounts: &[Account],
+    at: DateTime<Utc>,
+    edit: ProjectEdit,
+) -> Result<Projects, String> {
+    edit.validate().map_err(|error| error.to_string())?;
+    history
+        .append(&ProjectsLogRecord { t: at, edit })
+        .map_err(|error| error.to_string())?;
+    projects_from(history, home, accounts)
+}
+
+/// The stored accounts, read from `accounts.json`; an unreadable file is the
+/// error text, never an empty list.
+fn stored_accounts(state: &GuiState) -> Result<Vec<Account>, String> {
+    store::load_accounts(&state.app)
+        .map(|file| file.accounts)
+        .map_err(|error| error.to_string())
+}
+
+/// The Projects group: every project of every host with its folders, its
+/// organization and its session count.
+#[tauri::command]
+pub(crate) async fn projects_view(state: State<'_, GuiState>) -> Result<Projects, String> {
+    projects_from(
+        &history_of(&state)?,
+        &state.claude.home,
+        &stored_accounts(&state)?,
+    )
+}
+
+/// Rename, join, unjoin or assign a project, or edit an organization. Returns
+/// the new resolution; a refused edit is the error text and appends nothing.
+#[tauri::command]
+pub(crate) async fn projects_edit(
+    state: State<'_, GuiState>,
+    edit: ProjectEdit,
+) -> Result<Projects, String> {
+    edit_projects(
+        &history_of(&state)?,
+        &state.claude.home,
+        &stored_accounts(&state)?,
+        Utc::now(),
+        edit,
+    )
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct IconPx {
@@ -984,6 +1070,7 @@ mod tests {
 
     use seatswap_core::history::Recorder;
     use seatswap_core::paths::ClaudePaths;
+    use seatswap_core::project::ProjectKey;
 
     fn monitor() -> Rect {
         Rect {
@@ -1117,6 +1204,68 @@ mod tests {
             )
         );
         assert!(row.installed && row.differs);
+    }
+
+    #[test]
+    fn a_name_over_40_characters_is_refused() {
+        let tmp = tempfile::tempdir().expect("a temp folder");
+        let history = HistoryDir::at(tmp.path(), "atlas");
+        let key = ProjectKey::Folder("atlas".to_string());
+        let at = DateTime::parse_from_rfc3339("2026-11-14T10:00:00Z")
+            .expect("a test time")
+            .with_timezone(&Utc);
+        let rename = |name: String| ProjectEdit::Rename {
+            key: key.clone(),
+            name,
+        };
+        let log = tmp.path().join("atlas/projects-2026-11.jsonl");
+
+        let refused = edit_projects(&history, tmp.path(), &[], at, rename("a".repeat(41)))
+            .expect_err("a name over 40 characters is refused");
+        assert!(refused.contains("40"), "{refused}");
+        assert!(
+            !log.exists(),
+            "a refused edit appends nothing, but {} exists",
+            log.display()
+        );
+
+        // Exactly 40 characters are accepted, and the line lands in this
+        // host's own project log.
+        edit_projects(&history, tmp.path(), &[], at, rename("a".repeat(40)))
+            .expect("a name of 40 characters is accepted");
+        let lines = fs::read_to_string(&log).expect("the project log");
+        assert_eq!(lines.lines().count(), 1, "{lines}");
+        assert!(lines.contains(&"a".repeat(40)), "{lines}");
+    }
+
+    #[test]
+    fn project_folders_are_written_with_tilde() {
+        let tmp = tempfile::tempdir().expect("a temp folder");
+        let history = HistoryDir::at(tmp.path(), "atlas");
+        let at = DateTime::parse_from_rfc3339("2026-11-14T10:00:00Z")
+            .expect("a test time")
+            .with_timezone(&Utc);
+        history
+            .append(&SessionRecord {
+                t: at,
+                session: "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34".to_string(),
+                cwd: "/home/sam/projects/atlas".to_string(),
+                project: ProjectKey::Repo("github.com/sam/atlas".to_string()),
+                entrypoint: Some("cli".to_string()),
+                first: at,
+                last: at,
+                agents_started: 0,
+                agents_finished: 0,
+                closed: false,
+            })
+            .expect("a session line");
+        let projects =
+            projects_from(&history, Path::new("/home/sam"), &[]).expect("the projects resolve");
+        assert_eq!(projects.projects.len(), 1);
+        assert_eq!(
+            projects.projects[0].folders.get("atlas"),
+            Some(&vec!["~/projects/atlas".to_string()])
+        );
     }
 
     #[test]
