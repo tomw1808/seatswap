@@ -6,7 +6,7 @@
 //! tests control time; the only exception is [`UsageCache::set_aside`], whose new
 //! name carries the current UTC time.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::PathBuf;
@@ -15,8 +15,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::api::{Api, ApiError, Usage};
+use crate::api::{Api, ApiError, Limit, LimitKind, Usage};
 use crate::atomic::{self, write_atomic, Access};
+use crate::history::{AccountRef, EventKind, HistoryError, Recorder, Source};
 use crate::live;
 use crate::locks::{self, LockError};
 use crate::paths::{AppPaths, ClaudePaths};
@@ -38,6 +39,19 @@ const MAX_BACKOFF_SECS: u64 = 30 * 60;
 const WAITING_MESSAGE: &str = "waiting for Claude Code to renew its login";
 const LOGGED_OUT_MESSAGE: &str = "logged out — log in again";
 const NO_STORED_LOGIN_MESSAGE: &str = "no stored login — log in again";
+/// The prefix of a history error about a reading (a sample) an entry's
+/// `last_error` may hold.
+const READING_HISTORY_ERROR_PREFIX: &str = "cannot write the history: ";
+/// The prefix of a history error about an AllBlocked/AnyUsable event.
+const EVENT_HISTORY_ERROR_PREFIX: &str = "cannot write an event to the history: ";
+
+/// What a history error was about; the two texts must stay distinct so a
+/// successful event write never clears a failing reading (and the reverse).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryErrorKind {
+    Reading,
+    Event,
+}
 
 /// Everything the engine can fail with. Only failures that affect every account
 /// (the store or the cache file) leave [`Engine::poll`] as an error; a failure of
@@ -195,6 +209,14 @@ pub enum PollReason {
     Wake,
 }
 
+/// Why a usage answer blocks an account (spec §2.7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Blocker {
+    Week,
+    Session,
+    Model(String),
+}
+
 /// One account as the CLI and the GUI show it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -211,6 +233,10 @@ pub struct AccountView {
     /// floor((ends - now) / 1 day); may be negative.
     pub login_days_left: Option<i64>,
     pub usage: Option<Usage>,
+    /// Login ok, usage known, and no limit blocks it.
+    pub usable: bool,
+    /// The reset time of the blocking limit, when one blocks.
+    pub blocked_until: Option<DateTime<Utc>>,
     pub fetched_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
 }
@@ -246,6 +272,9 @@ pub struct Engine<R: Remote> {
     store: Store,
     remote: R,
     cache: UsageCache,
+    recorder: Option<Recorder>,
+    models_in_use: Option<BTreeSet<String>>,
+    last_any_usable: Option<bool>,
 }
 
 impl<R: Remote> Engine<R> {
@@ -257,7 +286,26 @@ impl<R: Remote> Engine<R> {
             store,
             remote,
             cache,
+            recorder: None,
+            models_in_use: None,
+            last_any_usable: None,
         })
+    }
+
+    /// Record every usage answer into the history as well.
+    pub fn with_recorder(mut self, recorder: Recorder) -> Self {
+        self.recorder = Some(recorder);
+        self
+    }
+
+    pub fn recorder(&mut self) -> Option<&mut Recorder> {
+        self.recorder.as_mut()
+    }
+
+    /// The models of the running sessions (lower-case ids), or `None` when they
+    /// are not known (readSessions off, or the CLI).
+    pub fn set_models_in_use(&mut self, models: Option<BTreeSet<String>>) {
+        self.models_in_use = models;
     }
 
     pub fn store(&self) -> &Store {
@@ -296,14 +344,19 @@ impl<R: Remote> Engine<R> {
                 .or_default()
                 .attempted_at = Some(now);
             if is_active {
-                self.poll_active(&id, now);
+                self.poll_active(account, now);
             } else {
-                self.poll_inactive(&id, now, &settings)?;
+                self.poll_inactive(account, now, &settings)?;
             }
         }
 
         self.cache.save(self.store.app_paths())?;
-        self.views(now)
+        let views = self.views(now)?;
+        if self.note_usable_state(&views, now) {
+            self.cache.save(self.store.app_paths())?;
+            return self.views(now);
+        }
+        Ok(views)
     }
 
     /// Views from the cache without any network call. The active account first,
@@ -334,6 +387,12 @@ impl<R: Remote> Engine<R> {
 
     fn view_for(&self, account: &Account, active: Option<&str>, now: DateTime<Utc>) -> AccountView {
         let entry = self.cache.entries.get(&account.id);
+        let usage = entry.and_then(|entry| entry.usage.clone());
+        let blocking = usage
+            .as_ref()
+            .and_then(|usage| blocking_limit(usage, self.models_in_use.as_ref()));
+        let usable = account.login_state == LoginState::Ok && usage.is_some() && blocking.is_none();
+        let blocked_until = blocking.and_then(|(limit, _)| limit.resets_at);
         AccountView {
             id: account.id.clone(),
             label: account.label.clone(),
@@ -347,7 +406,9 @@ impl<R: Remote> Engine<R> {
             login_days_left: account
                 .login_ends_at_ms
                 .map(|ends_at_ms| (ends_at_ms - now.timestamp_millis()).div_euclid(DAY_MS)),
-            usage: entry.and_then(|entry| entry.usage.clone()),
+            usage,
+            usable,
+            blocked_until,
             fetched_at: entry.and_then(|entry| entry.fetched_at),
             last_error: entry.and_then(|entry| entry.last_error.clone()),
         }
@@ -369,14 +430,24 @@ impl<R: Remote> Engine<R> {
             // A transient failure is retried when its back-off ends, as before.
             return now >= backoff_until;
         }
-        let fetched_at = entry.and_then(|entry| entry.fetched_at);
-        let attempted_at = entry.and_then(|entry| entry.attempted_at);
-        let Some(last) = (match (fetched_at, attempted_at) {
-            (Some(fetched), Some(attempted)) => Some(fetched.max(attempted)),
-            (Some(fetched), None) => Some(fetched),
-            (None, Some(attempted)) => Some(attempted),
-            (None, None) => None,
-        }) else {
+        // A blocked account is polled 30 s after its reset, whatever the
+        // interval; only a reading or an attempt before that moment is old
+        // enough. An attempt at or after the reset used the rule up.
+        if let Some(entry) = entry {
+            if let Some(usage) = &entry.usage {
+                if let Some((limit, _)) = blocking_limit(usage, self.models_in_use.as_ref()) {
+                    if let Some(blocked_until) = limit.resets_at {
+                        let retry_at = blocked_until + chrono::Duration::seconds(30);
+                        if now >= retry_at
+                            && last_activity(entry).is_some_and(|last| last < retry_at)
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        let Some(last) = entry.and_then(last_activity) else {
             return true;
         };
         let interval_secs = match reason {
@@ -402,7 +473,8 @@ impl<R: Remote> Engine<R> {
 
     /// The active account's usage always uses the live file's token, freshly
     /// read, and is never refreshed (spec §6.2, §7.1).
-    fn poll_active(&mut self, id: &str, now: DateTime<Utc>) {
+    fn poll_active(&mut self, account: &Account, now: DateTime<Utc>) {
+        let id = account.id.as_str();
         let token = match live::read_login(&self.claude) {
             Ok(Some(login)) => login.access_token().map(str::to_string),
             Ok(None) => None,
@@ -417,7 +489,13 @@ impl<R: Remote> Engine<R> {
         };
 
         match self.remote.usage(&token) {
-            Ok(usage) => self.record_success(id, usage, now),
+            Ok(usage) => self.record_success(
+                id,
+                &account_ref(account),
+                account.plan.as_deref(),
+                usage,
+                now,
+            ),
             Err(ApiError::Unauthorized) => {
                 // Claude Code may have renewed the login between our read and
                 // the request: read the live file again and retry exactly once.
@@ -427,7 +505,13 @@ impl<R: Remote> Engine<R> {
                 };
                 match retry {
                     Some(token) => match self.remote.usage(&token) {
-                        Ok(usage) => self.record_success(id, usage, now),
+                        Ok(usage) => self.record_success(
+                            id,
+                            &account_ref(account),
+                            account.plan.as_deref(),
+                            usage,
+                            now,
+                        ),
                         Err(ApiError::Unauthorized) => {
                             self.set_last_error(id, WAITING_MESSAGE.to_string())
                         }
@@ -444,10 +528,11 @@ impl<R: Remote> Engine<R> {
     /// to be) expired it is refreshed first (spec §6.3).
     fn poll_inactive(
         &mut self,
-        id: &str,
+        account: &Account,
         now: DateTime<Utc>,
         settings: &Settings,
     ) -> Result<(), EngineError> {
+        let id = account.id.as_str();
         let stored = match self.store.secrets().get(id) {
             Ok(Some(login)) => login,
             Ok(None) => {
@@ -462,7 +547,7 @@ impl<R: Remote> Engine<R> {
 
         if needs_refresh(&stored, now) {
             if settings.refresh_inactive {
-                return self.refresh_account(id, &stored, now, false);
+                return self.refresh_account(account, &stored, now, false);
             }
             // Nothing to do: the view keeps showing the cached usage and its age.
             return Ok(());
@@ -474,13 +559,19 @@ impl<R: Remote> Engine<R> {
         };
         match self.remote.usage(&token) {
             Ok(usage) => {
-                self.record_success(id, usage, now);
+                self.record_success(
+                    id,
+                    &account_ref(account),
+                    account.plan.as_deref(),
+                    usage,
+                    now,
+                );
                 Ok(())
             }
             // Spec §7.1: a 401 for an inactive account means the stored token is
             // dead; refresh it (same path as an expired token).
             Err(ApiError::Unauthorized) if settings.refresh_inactive => {
-                self.refresh_account(id, &stored, now, true)
+                self.refresh_account(account, &stored, now, true)
             }
             Err(error) => {
                 self.record_api_error(id, error, now);
@@ -493,11 +584,12 @@ impl<R: Remote> Engine<R> {
     /// then fetch its usage with the new token (spec §6.3).
     fn refresh_account(
         &mut self,
-        id: &str,
+        account: &Account,
         initial: &Login,
         now: DateTime<Utc>,
         from_unauthorized: bool,
     ) -> Result<(), EngineError> {
+        let id = account.id.as_str();
         let app = self.store.app_paths().clone();
         let lock = match locks::acquire_app_lock(&app, APP_LOCK_TIMEOUT) {
             Ok(lock) => lock,
@@ -518,12 +610,17 @@ impl<R: Remote> Engine<R> {
                 return Ok(());
             }
         };
-        let Some(account) = file.find(id) else {
+        let Some(current) = file.find(id) else {
             // Removed meanwhile: nothing to refresh or save.
             return Ok(());
         };
-        let account_uuid = account.account_uuid.clone();
-        let organization_uuid = account.organization_uuid.clone();
+        let account_uuid = current.account_uuid.clone();
+        let organization_uuid = current.organization_uuid.clone();
+        let current_ref = AccountRef {
+            acc: account_uuid.clone(),
+            org: organization_uuid.clone(),
+        };
+        let plan = current.plan.clone();
 
         // Make sure the account did not become the live one. If the identity
         // cannot be read, we cannot prove it is inactive, so we leave the login
@@ -562,7 +659,7 @@ impl<R: Remote> Engine<R> {
             };
             drop(lock);
             match self.remote.usage(&token) {
-                Ok(usage) => self.record_success(id, usage, now),
+                Ok(usage) => self.record_success(id, &current_ref, plan.as_deref(), usage, now),
                 Err(error) => self.record_api_error(id, error, now),
             }
             return Ok(());
@@ -609,7 +706,7 @@ impl<R: Remote> Engine<R> {
             Some(token) => {
                 let token = token.to_string();
                 match self.remote.usage(&token) {
-                    Ok(usage) => self.record_success(id, usage, now),
+                    Ok(usage) => self.record_success(id, &current_ref, plan.as_deref(), usage, now),
                     Err(error) => self.record_api_error(id, error, now),
                 }
             }
@@ -644,13 +741,93 @@ impl<R: Remote> Engine<R> {
         Ok(())
     }
 
-    fn record_success(&mut self, id: &str, usage: Usage, now: DateTime<Utc>) {
+    fn record_success(
+        &mut self,
+        id: &str,
+        account: &AccountRef,
+        plan: Option<&str>,
+        usage: Usage,
+        now: DateTime<Utc>,
+    ) {
         let entry = self.cache.entries.entry(id.to_string()).or_default();
-        entry.usage = Some(usage);
+        entry.usage = Some(usage.clone());
         entry.fetched_at = Some(now);
         entry.last_error = None;
         entry.failures = 0;
         entry.backoff_until = None;
+        if let Some(recorder) = self.recorder.as_mut() {
+            if let Err(error) = recorder.reading(account, plan, &usage, now, Source::Poll) {
+                self.set_last_error(id, history_error_text(HistoryErrorKind::Reading, &error));
+            }
+        }
+    }
+
+    /// Write AllBlocked / AnyUsable when "some account is usable" changed.
+    /// A write error becomes the target entry's `last_error` only when that
+    /// entry has no other error; it never hides one. Returns whether the cache
+    /// changed (so the caller saves it again).
+    fn note_usable_state(&mut self, views: &[AccountView], now: DateTime<Utc>) -> bool {
+        if self.recorder.is_none() {
+            return false;
+        }
+        if !views
+            .iter()
+            .any(|view| view.login_state != LoginState::LoggedOut)
+        {
+            return false;
+        }
+        let any = views.iter().any(|view| view.usable);
+        let event = match (self.last_any_usable, any) {
+            (None, false) | (Some(true), false) => Some(EventKind::AllBlocked),
+            (Some(false), true) => Some(EventKind::AnyUsable),
+            _ => None,
+        };
+        let Some(event) = event else {
+            self.last_any_usable = Some(any);
+            return false;
+        };
+        let written = match self.recorder.as_ref() {
+            Some(recorder) => recorder.event(now, event),
+            None => return false,
+        };
+        match written {
+            Ok(()) => {
+                // The folder writes again: clear exactly the event texts a
+                // failed event write left behind, never a reading error and
+                // never any other error.
+                let mut cleared = false;
+                for entry in self.cache.entries.values_mut() {
+                    if entry
+                        .last_error
+                        .as_deref()
+                        .is_some_and(|text| text.starts_with(EVENT_HISTORY_ERROR_PREFIX))
+                    {
+                        entry.last_error = None;
+                        cleared = true;
+                    }
+                }
+                self.last_any_usable = Some(any);
+                cleared
+            }
+            Err(error) => {
+                let text = history_error_text(HistoryErrorKind::Event, &error);
+                // The active account, else the first account still logged in.
+                let target = views.iter().find(|view| view.is_active).or_else(|| {
+                    views
+                        .iter()
+                        .find(|view| view.login_state != LoginState::LoggedOut)
+                });
+                let Some(target) = target else {
+                    return false;
+                };
+                let entry = self.cache.entries.entry(target.id.clone()).or_default();
+                if entry.last_error.is_some() {
+                    return false;
+                }
+                entry.last_error = Some(text);
+                true
+            }
+        }
     }
 
     fn set_last_error(&mut self, id: &str, message: String) {
@@ -696,6 +873,106 @@ impl<R: Remote> Engine<R> {
         entry.backoff_until = now.checked_add_signed(backoff);
         entry.last_error = Some(error.to_string());
     }
+}
+
+/// Why this usage answer blocks the account, or `None` (spec §2.7). `Week` and
+/// `Session` block at 100 %; a `Model` limit blocks while a running session uses
+/// that model, or, when the models are unknown, while the server calls it active.
+pub fn blocker(usage: &Usage, models_in_use: Option<&BTreeSet<String>>) -> Option<Blocker> {
+    blocking_limit(usage, models_in_use).map(|(_, blocker)| blocker)
+}
+
+/// The blocking limit that wins and why. The latest reset wins, a limit with no
+/// reset wins over one with a time, and on a tie Week before Model before Session.
+fn blocking_limit<'a>(
+    usage: &'a Usage,
+    models_in_use: Option<&BTreeSet<String>>,
+) -> Option<(&'a Limit, Blocker)> {
+    let mut winner: Option<(&Limit, Blocker)> = None;
+    for limit in &usage.limits {
+        if limit.percent < 100.0 {
+            continue;
+        }
+        let blocker = match &limit.kind {
+            LimitKind::WeeklyAll => Blocker::Week,
+            LimitKind::Session => Blocker::Session,
+            LimitKind::WeeklyScoped => match limit
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+            {
+                Some(model) => {
+                    let model_lower = model.to_lowercase();
+                    let blocks = match models_in_use {
+                        Some(models) => models
+                            .iter()
+                            .any(|id| id.to_lowercase().contains(&model_lower)),
+                        None => limit.is_active,
+                    };
+                    if !blocks {
+                        continue;
+                    }
+                    Blocker::Model(model.to_string())
+                }
+                None => {
+                    // A full per-model limit without a model cannot be matched
+                    // to a session: it blocks exactly while it is active.
+                    if !limit.is_active {
+                        continue;
+                    }
+                    Blocker::Model("unknown model".to_string())
+                }
+            },
+            LimitKind::Other(_) => continue,
+        };
+        let wins = winner.as_ref().is_none_or(|(current, current_blocker)| {
+            beats(limit, &blocker, current, current_blocker)
+        });
+        if wins {
+            winner = Some((limit, blocker));
+        }
+    }
+    winner
+}
+
+fn beats(
+    candidate: &Limit,
+    candidate_blocker: &Blocker,
+    current: &Limit,
+    current_blocker: &Blocker,
+) -> bool {
+    match (candidate.resets_at, current.resets_at) {
+        (None, Some(_)) => true,
+        (Some(_), None) => false,
+        (Some(candidate_at), Some(current_at)) if candidate_at != current_at => {
+            candidate_at > current_at
+        }
+        _ => blocker_rank(candidate_blocker) < blocker_rank(current_blocker),
+    }
+}
+
+fn blocker_rank(blocker: &Blocker) -> u8 {
+    match blocker {
+        Blocker::Week => 0,
+        Blocker::Model(_) => 1,
+        Blocker::Session => 2,
+    }
+}
+
+fn account_ref(account: &Account) -> AccountRef {
+    AccountRef {
+        acc: account.account_uuid.clone(),
+        org: account.organization_uuid.clone(),
+    }
+}
+
+fn history_error_text(kind: HistoryErrorKind, error: &HistoryError) -> String {
+    let prefix = match kind {
+        HistoryErrorKind::Reading => READING_HISTORY_ERROR_PREFIX,
+        HistoryErrorKind::Event => EVENT_HISTORY_ERROR_PREFIX,
+    };
+    format!("{prefix}{error}")
 }
 
 /// §7.4: the active account's binding limit is at least `suggest_at` and another
@@ -765,6 +1042,17 @@ fn needs_refresh(login: &Login, now: DateTime<Utc>) -> bool {
         })
 }
 
+/// The later of an entry's last success and its last attempt. Due times run
+/// from this, so a failure that is not transient is not retried every tick.
+fn last_activity(entry: &CacheEntry) -> Option<DateTime<Utc>> {
+    match (entry.fetched_at, entry.attempted_at) {
+        (Some(fetched), Some(attempted)) => Some(fetched.max(attempted)),
+        (Some(fetched), None) => Some(fetched),
+        (None, Some(attempted)) => Some(attempted),
+        (None, None) => None,
+    }
+}
+
 fn age_at_least(now: DateTime<Utc>, fetched_at: DateTime<Utc>, secs: u64) -> bool {
     let elapsed_ms = now
         .timestamp_millis()
@@ -777,13 +1065,14 @@ fn age_at_least(now: DateTime<Utc>, fetched_at: DateTime<Utc>, secs: u64) -> boo
 mod tests {
     use super::*;
 
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::{BTreeSet, HashMap, VecDeque};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use serde_json::json;
 
     use crate::api::{Limit, LimitKind, Severity};
+    use crate::history::{HistoryDir, Recorder};
     use crate::paths::AppPaths;
     use crate::store::FileSecrets;
     use crate::types::OAuthAccount;
@@ -1253,6 +1542,8 @@ mod tests {
             login_ends_at_ms: days_left.map(|days| t0_ms() + days * DAY),
             login_days_left: days_left,
             usage: percent.map(|percent| usage_with(percent, None)),
+            usable: true,
+            blocked_until: None,
             fetched_at: Some(t0()),
             last_error: None,
         }
@@ -2236,5 +2527,496 @@ mod tests {
             Ok(_) => panic!("a corrupt cache must not be loaded"),
         }
         assert_eq!(fs::read(&path).unwrap(), b"{ not json");
+    }
+
+    fn limit_of(
+        kind: LimitKind,
+        percent: f64,
+        resets_at: Option<DateTime<Utc>>,
+        model: Option<&str>,
+        is_active: bool,
+    ) -> Limit {
+        Limit {
+            kind,
+            percent,
+            severity: Severity::Normal,
+            resets_at,
+            model: model.map(str::to_string),
+            is_active,
+        }
+    }
+
+    fn usage_of(limits: Vec<Limit>) -> Usage {
+        Usage {
+            limits,
+            extra_usage_enabled: false,
+        }
+    }
+
+    fn cache_usage(
+        engine: &mut Engine<FakeRemote>,
+        id: &str,
+        usage: Usage,
+        fetched_at: DateTime<Utc>,
+    ) {
+        engine.cache.entries.insert(
+            id.to_string(),
+            CacheEntry {
+                usage: Some(usage),
+                fetched_at: Some(fetched_at),
+                ..CacheEntry::default()
+            },
+        );
+    }
+
+    fn history_at(tmp: &tempfile::TempDir) -> (PathBuf, HistoryDir) {
+        let root = tmp.path().join("history");
+        (root.clone(), HistoryDir::at(&root, "vega"))
+    }
+
+    fn view_by_id(engine: &Engine<FakeRemote>, id: &str, now: DateTime<Utc>) -> AccountView {
+        engine
+            .views(now)
+            .unwrap()
+            .into_iter()
+            .find(|view| view.id == id)
+            .expect("the account's view")
+    }
+
+    fn read_json_lines(path: &std::path::Path) -> Vec<Value> {
+        fs::read_to_string(path)
+            .expect("the history file")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("a JSON line"))
+            .collect()
+    }
+
+    fn state_event_types(root: &std::path::Path) -> Vec<String> {
+        let path = root.join("vega/events-2026-11.jsonl");
+        if !path.exists() {
+            return Vec::new();
+        }
+        read_json_lines(&path)
+            .into_iter()
+            .filter_map(|value| {
+                value
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .filter(|kind| kind == "allBlocked" || kind == "anyUsable")
+            .collect()
+    }
+
+    #[test]
+    fn a_successful_poll_writes_a_sample() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fixture = Fixture::new(&tmp);
+        fixture.file.accounts[1].login_state = LoginState::LoggedOut;
+        fixture.save_file();
+        let fake = fixture.fake.clone();
+        fake.script_usage_ok(&live_access(), 42.0);
+        let (root, dir) = history_at(&tmp);
+        let (_app, _fake, engine) = fixture.into_engine();
+        let mut engine = engine.with_recorder(Recorder::new(dir));
+
+        engine.poll(PollReason::Timer, t0()).unwrap();
+
+        let lines = read_json_lines(&root.join("vega/samples-2026-11.jsonl"));
+        assert_eq!(lines.len(), 1, "one sample line");
+        assert_eq!(lines[0]["src"], json!("poll"));
+    }
+
+    #[test]
+    fn a_full_week_blocks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = Fixture::new(&tmp);
+        let (_app, _fake, mut engine) = fixture.into_engine();
+        let reset = at(3600);
+        let usage = usage_of(vec![limit_of(
+            LimitKind::WeeklyAll,
+            100.0,
+            Some(reset),
+            None,
+            true,
+        )]);
+        cache_usage(&mut engine, A_ID, usage, t0());
+
+        let view = view_by_id(&engine, A_ID, t0());
+        assert!(!view.usable);
+        assert_eq!(view.blocked_until, Some(reset));
+    }
+
+    #[test]
+    fn a_full_fable_limit_blocks_only_with_a_fable_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = Fixture::new(&tmp);
+        let (_app, _fake, mut engine) = fixture.into_engine();
+        let scoped_reset = at(3600);
+        let week_reset = at(7200);
+        let usage = usage_of(vec![
+            limit_of(LimitKind::WeeklyAll, 60.0, Some(week_reset), None, true),
+            limit_of(
+                LimitKind::WeeklyScoped,
+                100.0,
+                Some(scoped_reset),
+                Some("Fable"),
+                false,
+            ),
+        ]);
+
+        let opus: BTreeSet<String> = ["claude-opus-5-5".to_string()].into_iter().collect();
+        assert_eq!(blocker(&usage, Some(&opus)), None);
+        cache_usage(&mut engine, A_ID, usage.clone(), t0());
+        engine.set_models_in_use(Some(opus));
+        assert!(view_by_id(&engine, A_ID, t0()).usable);
+
+        let fable: BTreeSet<String> = ["claude-fable-5-2".to_string()].into_iter().collect();
+        assert_eq!(
+            blocker(&usage, Some(&fable)),
+            Some(Blocker::Model("Fable".to_string()))
+        );
+        engine.set_models_in_use(Some(fable));
+        let view = view_by_id(&engine, A_ID, t0());
+        assert!(!view.usable);
+        assert_eq!(view.blocked_until, Some(scoped_reset));
+
+        assert_eq!(blocker(&usage, None), None);
+        engine.set_models_in_use(None);
+        assert!(view_by_id(&engine, A_ID, t0()).usable);
+
+        let mut active_scoped = usage;
+        active_scoped.limits[1].is_active = true;
+        assert_eq!(
+            blocker(&active_scoped, None),
+            Some(Blocker::Model("Fable".to_string()))
+        );
+        cache_usage(&mut engine, A_ID, active_scoped, t0());
+        assert!(!view_by_id(&engine, A_ID, t0()).usable);
+    }
+
+    #[test]
+    fn a_failed_poll_after_the_reset_waits_for_the_interval() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fixture = Fixture::new(&tmp);
+        // A is not part of this check, and B needs a live token so that its poll
+        // after the reset fetches usage instead of refreshing the login.
+        fixture.file.accounts[0].login_state = LoginState::LoggedOut;
+        fixture.save_file();
+        let fresh_b = login(
+            &b_old_access(),
+            &b_refresh_token(),
+            t0_ms() + 8 * HOUR_MS,
+            t0_ms() + 20 * DAY,
+            B_ORG,
+        );
+        fixture.store.secrets().set(B_ID, &fresh_b).unwrap();
+
+        let fake = fixture.fake.clone();
+        fake.script_usage(
+            &b_old_access(),
+            Err(ApiError::Http {
+                status: 403,
+                body: "error code: 1010".to_string(),
+            }),
+        );
+        let (_app, fake, mut engine) = fixture.into_engine();
+        let reset = at(9600);
+        cache_usage(&mut engine, B_ID, usage_with(100.0, Some(reset)), at(9000));
+
+        engine.poll(PollReason::Timer, at(9630)).unwrap();
+        assert_eq!(fake.usage_tokens(), vec![b_old_access()]);
+
+        let settings = Settings::default();
+        assert!(
+            !engine.due(B_ID, false, PollReason::Timer, at(9660), &settings),
+            "the attempt at the reset moment used the reset rule up"
+        );
+    }
+
+    #[test]
+    fn a_full_per_model_limit_without_a_model_follows_is_active() {
+        let opus: BTreeSet<String> = ["claude-opus-5-5".to_string()].into_iter().collect();
+        let fable: BTreeSet<String> = ["claude-fable-5-2".to_string()].into_iter().collect();
+        for missing in [None, Some(""), Some("  ")] {
+            let usage = usage_of(vec![limit_of(
+                LimitKind::WeeklyScoped,
+                100.0,
+                Some(at(3600)),
+                missing,
+                false,
+            )]);
+            assert_eq!(
+                blocker(&usage, Some(&fable)),
+                None,
+                "model {missing:?} is inactive"
+            );
+
+            let mut active = usage;
+            active.limits[0].is_active = true;
+            assert_eq!(
+                blocker(&active, Some(&opus)),
+                Some(Blocker::Model("unknown model".to_string())),
+                "model {missing:?} is active"
+            );
+        }
+    }
+
+    #[test]
+    fn a_blocked_account_is_polled_30_s_after_its_reset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = Fixture::new(&tmp);
+        let (_app, _fake, mut engine) = fixture.into_engine();
+        let reset = at(9600); // 14:40:00, the session limit's reset
+        cache_usage(&mut engine, B_ID, usage_with(100.0, Some(reset)), at(9000));
+        let settings = Settings::default();
+
+        assert!(!engine.due(B_ID, false, PollReason::Timer, at(9620), &settings));
+        assert!(engine.due(B_ID, false, PollReason::Timer, at(9630), &settings));
+    }
+
+    #[test]
+    fn all_blocked_and_any_usable_are_written_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = Fixture::new(&tmp);
+        let fresh_b = login(
+            &b_old_access(),
+            &b_refresh_token(),
+            t0_ms() + 8 * HOUR_MS,
+            t0_ms() + 20 * DAY,
+            B_ORG,
+        );
+        fixture.store.secrets().set(B_ID, &fresh_b).unwrap();
+
+        let fake = fixture.fake.clone();
+        let full = || usage_with(100.0, Some(at(3600)));
+        fake.script_usage(&live_access(), Ok(full()));
+        fake.script_usage(&b_old_access(), Ok(full()));
+        fake.script_usage(&live_access(), Ok(usage_with(3.0, None)));
+        let (root, dir) = history_at(&tmp);
+        let (_app, _fake, engine) = fixture.into_engine();
+        let mut engine = engine.with_recorder(Recorder::new(dir));
+
+        engine.poll(PollReason::Timer, t0()).unwrap();
+        assert_eq!(state_event_types(&root), vec!["allBlocked"]);
+
+        engine.poll(PollReason::Timer, at(60)).unwrap();
+        assert_eq!(
+            state_event_types(&root),
+            vec!["allBlocked"],
+            "an unchanged poll writes no second event"
+        );
+
+        engine.poll(PollReason::Timer, at(130)).unwrap();
+        assert_eq!(state_event_types(&root), vec!["allBlocked", "anyUsable"]);
+    }
+
+    #[test]
+    fn a_successful_event_write_keeps_a_reading_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = Fixture::new(&tmp);
+        let (root, dir) = history_at(&tmp);
+        let (_app, _fake, engine) = fixture.into_engine();
+        let mut engine = engine.with_recorder(Recorder::new(dir));
+        let blocked = || usage_with(100.0, Some(at(3600)));
+        cache_usage(&mut engine, A_ID, blocked(), t0());
+        cache_usage(&mut engine, B_ID, blocked(), t0());
+        let reading_error =
+            "cannot write the history: No such file or directory (os error 2)".to_string();
+        engine.cache.entries.get_mut(B_ID).unwrap().last_error = Some(reading_error.clone());
+
+        let views = engine.poll(PollReason::Timer, t0()).unwrap();
+
+        assert_eq!(
+            state_event_types(&root),
+            vec!["allBlocked"],
+            "the event write succeeds, so the test exercises its success path"
+        );
+        let b = views.iter().find(|view| view.id == B_ID).unwrap();
+        assert_eq!(
+            b.last_error.as_deref(),
+            Some(reading_error.as_str()),
+            "a successful event write must not clear a reading error"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_event_write_error_without_an_active_account_goes_to_the_first_logged_in() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fixture = Fixture::new(&tmp);
+        // A is logged out and the live credentials no longer hold a login, so
+        // there is no active account either way.
+        fixture.file.accounts[0].login_state = LoginState::LoggedOut;
+        fixture.save_file();
+        let credentials = json!({
+            "mcpOAuth": {},
+            "organizationUuid": A_ORG,
+        });
+        fs::write(
+            &fixture.claude.credentials_file,
+            serde_json::to_vec(&credentials).unwrap(),
+        )
+        .unwrap();
+
+        let root = tmp.path().join("history");
+        let host_dir = root.join("vega");
+        fs::create_dir_all(&host_dir).unwrap();
+        fs::set_permissions(&host_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let (_app, _fake, engine) = fixture.into_engine();
+        let mut engine = engine.with_recorder(Recorder::new(HistoryDir::at(&root, "vega")));
+        let blocked = || usage_with(100.0, Some(at(3600)));
+        cache_usage(&mut engine, A_ID, blocked(), t0());
+        cache_usage(&mut engine, B_ID, blocked(), t0());
+
+        let views = engine.poll(PollReason::Timer, t0()).unwrap();
+
+        assert!(
+            views.iter().all(|view| !view.is_active),
+            "no live login means no active account"
+        );
+        let a = views.iter().find(|view| view.id == A_ID).unwrap();
+        assert_eq!(a.last_error, None, "a logged-out account gets no error");
+        let b = views.iter().find(|view| view.id == B_ID).unwrap();
+        let error = b.last_error.as_deref().expect("the event write error");
+        assert!(
+            error.starts_with("cannot write an event to the history: "),
+            "got {error}"
+        );
+        fs::set_permissions(&host_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn a_successful_event_write_keeps_an_api_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = Fixture::new(&tmp);
+        let (root, dir) = history_at(&tmp);
+        let (_app, _fake, engine) = fixture.into_engine();
+        let mut engine = engine.with_recorder(Recorder::new(dir));
+        let blocked = || usage_with(100.0, Some(at(3600)));
+        cache_usage(&mut engine, A_ID, blocked(), t0());
+        cache_usage(&mut engine, B_ID, blocked(), t0());
+        let api_error = ApiError::Server(503).to_string();
+        engine.cache.entries.get_mut(A_ID).unwrap().last_error = Some(api_error.clone());
+
+        let views = engine.poll(PollReason::Timer, t0()).unwrap();
+
+        let a = views.iter().find(|view| view.id == A_ID).unwrap();
+        assert!(a.is_active);
+        assert_eq!(
+            a.last_error.as_deref(),
+            Some(api_error.as_str()),
+            "a successful event write must not clear an API error"
+        );
+        assert_eq!(
+            state_event_types(&root),
+            vec!["allBlocked"],
+            "the event write succeeds, so the test exercises its success path"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_event_write_error_does_not_hide_an_api_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = Fixture::new(&tmp);
+        let root = tmp.path().join("history");
+        let host_dir = root.join("vega");
+        fs::create_dir_all(&host_dir).unwrap();
+        fs::set_permissions(&host_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let (_app, _fake, engine) = fixture.into_engine();
+        let mut engine = engine.with_recorder(Recorder::new(HistoryDir::at(&root, "vega")));
+        let blocked = || {
+            usage_of(vec![limit_of(
+                LimitKind::Session,
+                100.0,
+                Some(at(3600)),
+                None,
+                true,
+            )])
+        };
+        cache_usage(&mut engine, A_ID, blocked(), t0());
+        cache_usage(&mut engine, B_ID, blocked(), t0());
+        let api_error = ApiError::Server(503).to_string();
+        engine.cache.entries.get_mut(A_ID).unwrap().last_error = Some(api_error.clone());
+
+        let views = engine.poll(PollReason::Timer, t0()).unwrap();
+
+        let a = views.iter().find(|view| view.id == A_ID).unwrap();
+        assert!(a.is_active);
+        assert_eq!(
+            a.last_error.as_deref(),
+            Some(api_error.as_str()),
+            "the event write error must not overwrite an API error"
+        );
+        fs::set_permissions(&host_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_event_write_error_is_cleared_after_a_successful_write() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = Fixture::new(&tmp);
+        let root = tmp.path().join("history");
+        let host_dir = root.join("vega");
+        fs::create_dir_all(&host_dir).unwrap();
+        fs::set_permissions(&host_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let (_app, _fake, engine) = fixture.into_engine();
+        let mut engine = engine.with_recorder(Recorder::new(HistoryDir::at(&root, "vega")));
+        let blocked = usage_with(100.0, Some(at(3600)));
+        cache_usage(&mut engine, A_ID, blocked.clone(), t0());
+        cache_usage(&mut engine, B_ID, blocked, t0());
+
+        let views = engine.poll(PollReason::Timer, t0()).unwrap();
+        let a = views.iter().find(|view| view.id == A_ID).unwrap();
+        let error = a.last_error.as_deref().expect("the event write error");
+        assert!(
+            error.starts_with("cannot write an event to the history: "),
+            "got {error}"
+        );
+
+        fs::set_permissions(&host_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let views = engine.poll(PollReason::Timer, at(60)).unwrap();
+        let a = views.iter().find(|view| view.id == A_ID).unwrap();
+        assert_eq!(
+            a.last_error, None,
+            "a successful write clears its own history text"
+        );
+        assert_eq!(state_event_types(&root), vec!["allBlocked"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_history_error_does_not_fail_the_poll() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fixture = Fixture::new(&tmp);
+        fixture.file.accounts[1].login_state = LoginState::LoggedOut;
+        fixture.save_file();
+        let fake = fixture.fake.clone();
+        fake.script_usage_ok(&live_access(), 42.0);
+        let root = tmp.path().join("history");
+        let host_dir = root.join("vega");
+        fs::create_dir_all(&host_dir).unwrap();
+        fs::set_permissions(&host_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let (_app, _fake, engine) = fixture.into_engine();
+        let mut engine = engine.with_recorder(Recorder::new(HistoryDir::at(&root, "vega")));
+
+        let views = engine.poll(PollReason::Timer, t0()).unwrap();
+
+        let a = views.iter().find(|view| view.id == A_ID).unwrap();
+        let error = a.last_error.as_deref().expect("the history error");
+        assert!(
+            error.starts_with("cannot write the history: "),
+            "got {error}"
+        );
+        fs::set_permissions(&host_dir, fs::Permissions::from_mode(0o755)).unwrap();
     }
 }

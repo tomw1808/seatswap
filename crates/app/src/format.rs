@@ -299,6 +299,8 @@ mod tests {
             login_ends_at_ms: None,
             login_days_left: None,
             usage: None,
+            usable: true,
+            blocked_until: None,
             fetched_at: None,
             last_error: None,
         };
@@ -329,6 +331,8 @@ mod tests {
             login_ends_at_ms: None,
             login_days_left: None,
             usage: None,
+            usable: true,
+            blocked_until: None,
             fetched_at: None,
             last_error: None,
         };
