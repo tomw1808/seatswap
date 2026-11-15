@@ -89,6 +89,9 @@ pub(crate) struct GuiState {
     /// skill rows.
     pub(crate) app: AppPaths,
     pub(crate) claude: seatswap_core::paths::ClaudePaths,
+    /// The history folder the recorder opened at startup, or why it could not
+    /// be opened. A changed setting takes effect after a restart.
+    pub(crate) history: Result<seatswap_core::history::HistoryDir, String>,
     /// The latest sessions summary; every snapshot is emitted with it.
     sessions: Mutex<Option<SessionsSummary>>,
     pub(crate) engine: std::sync::mpsc::Sender<EngineCommand>,
@@ -122,6 +125,13 @@ impl GuiState {
             .lock()
             .map(|snapshot| snapshot.clone())
             .map_err(|_| "the snapshot lock is poisoned".to_string())
+    }
+
+    /// A save that the action thread has confirmed: the snapshot holds the
+    /// saved settings now, not when the engine's next `Publish` arrives. The
+    /// settings page reads the saved values before its restart note is drawn.
+    pub(crate) fn remember_settings(&self, settings: seatswap_core::store::Settings) {
+        lock(&self.snapshot).settings = Some(settings);
     }
 }
 
@@ -203,6 +213,9 @@ pub(crate) fn run(
             panel::skill_install,
             panel::projects_view,
             panel::projects_edit,
+            panel::history_view,
+            panel::history_import,
+            panel::history_export,
             window::open_window,
         ])
         .build(tauri::generate_context!());
@@ -366,11 +379,13 @@ fn setup(
         .take()
         .ok_or_else(|| "the look-up thread did not start".to_string())?;
     let lookup = lookup_handle.client();
+    let history = worker.history.clone();
 
     tauri_app.manage(GuiState {
         snapshot: Mutex::new(initial.clone()),
         app: app.clone(),
         claude: claude.clone(),
+        history,
         sessions: Mutex::new(None),
         engine: worker.engine.clone(),
         action: worker.action.clone(),

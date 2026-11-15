@@ -20,7 +20,7 @@ use crate::store::{Account, Settings};
 mod read;
 mod write;
 
-pub use read::{Hosted, Hosts, Range, Read};
+pub use read::{export_csv, export_json, HostInfo, Hosted, Hosts, Range, Read};
 pub use write::{closed_windows, sample_of, Recorder};
 
 #[derive(Debug, thiserror::Error)]
@@ -49,6 +49,12 @@ pub enum HistoryError {
     },
     #[error(transparent)]
     Paths(#[from] PathsError),
+    #[error("{} does not exist", path.display())]
+    NoFolder { path: PathBuf },
+    #[error(
+        "two machines use the host name {host}; give one of them another name under History and hosts"
+    )]
+    HostConflict { host: String },
     #[error("a {kind:?} record is too long: its line with the newline is more than 4096 bytes")]
     LineTooLong { kind: Kind },
     #[error("a {kind:?} record holds a number that is not finite")]
@@ -396,6 +402,7 @@ impl Record for UpRecord {
 
 /// One host's history folder: `<root>/<host>/`, shared with other hosts by
 /// pointing `historyDir` at one synced folder on every machine.
+#[derive(Clone)]
 pub struct HistoryDir {
     root: PathBuf,
     host: String,
@@ -1337,5 +1344,487 @@ mod tests {
         let session = sample.limit(&LimitKind::Session).expect("a session limit");
         assert!((session.p - 12.0).abs() < 1e-9);
         assert!(sample.limit(&LimitKind::WeeklyAll).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // The hosts of a history folder, the import and the export
+    // -----------------------------------------------------------------------
+
+    fn an_up(t: DateTime<Utc>) -> UpRecord {
+        UpRecord { t }
+    }
+
+    fn a_window(end: DateTime<Utc>, percent: f64) -> WindowRecord {
+        WindowRecord {
+            account: atlas_account(),
+            k: LimitKind::WeeklyAll,
+            m: None,
+            start: Some(end - chrono::Duration::hours(4)),
+            end,
+            final_percent: percent,
+            lost: None,
+            last_sample: end - chrono::Duration::minutes(2),
+            plan: None,
+            uncertain: false,
+        }
+    }
+
+    fn a_token(
+        t: DateTime<Utc>,
+        project: ProjectKey,
+        model: &str,
+        input: u64,
+        out: u64,
+    ) -> TokenRecord {
+        TokenRecord {
+            t,
+            session: "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34".to_string(),
+            cwd: "/home/sam/projects/atlas".to_string(),
+            project,
+            model: model.to_string(),
+            input,
+            out,
+            cw: 0,
+            cr: 0,
+            answers: 1,
+            agent_answers: 0,
+        }
+    }
+
+    /// A host folder a reader recognizes: a `host.json` marker and no records.
+    fn mark_host(root: &std::path::Path, host: &str) {
+        mark_host_with(root, host, "0b4e7c22-6a1d-4e3f-8c59-2d7a9e1b4f60");
+    }
+
+    fn mark_host_with(root: &std::path::Path, host: &str, machine_id: &str) {
+        fs::create_dir_all(root.join(host)).unwrap();
+        fs::write(
+            root.join(host).join("host.json"),
+            format!("{{\"machineId\":\"{machine_id}\"}}"),
+        )
+        .unwrap();
+    }
+
+    fn atlas_project() -> ProjectKey {
+        ProjectKey::Repo("github.com/sam/atlas".to_string())
+    }
+
+    /// Every file of one folder with its bytes, by name: two runs are identical
+    /// only when nothing in the folder changed.
+    fn folder_files(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+        let mut files: Vec<(String, Vec<u8>)> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| entry.metadata().unwrap().is_file())
+            .map(|entry| {
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn host_infos_list_every_host_with_its_last_record() {
+        let dir = tempdir().unwrap();
+        let atlas = HistoryDir::at(dir.path(), "atlas");
+        atlas.append(&an_up(utc("2026-11-14T09:58:00Z"))).unwrap();
+        let vega = HistoryDir::at(dir.path(), "vega");
+        vega.append(&an_up(utc("2026-11-14T07:00:00Z"))).unwrap();
+        mark_host(dir.path(), "vega");
+
+        let infos = atlas.host_infos().unwrap();
+        let hosts: Vec<&str> = infos.iter().map(|info| info.host.as_str()).collect();
+        assert_eq!(hosts, vec!["atlas", "vega"]);
+        assert!(infos[0].this_host, "atlas is this host");
+        assert!(!infos[1].this_host, "vega is another host");
+
+        // The plan's fixture: each host's only `up` line is its newest record,
+        // and also the first record of its oldest file.
+        assert_eq!(infos[0].last_record, Some(utc("2026-11-14T09:58:00Z")));
+        assert_eq!(infos[1].last_record, Some(utc("2026-11-14T07:00:00Z")));
+        assert_eq!(infos[0].first_record, Some(utc("2026-11-14T09:58:00Z")));
+        assert_eq!(infos[1].first_record, Some(utc("2026-11-14T07:00:00Z")));
+
+        // Every file of the folder counts, the marker too.
+        for info in &infos {
+            assert!(info.bytes > 0, "{info:?}");
+        }
+        let sizes: u64 = ["up-2026-11.jsonl", "samples-2026-11.jsonl", "host.json"]
+            .iter()
+            .map(|name| {
+                fs::metadata(dir.path().join("atlas").join(name))
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0)
+            })
+            .sum();
+        assert_eq!(infos[0].bytes, sizes);
+    }
+
+    #[test]
+    fn host_infos_carry_this_host_before_it_has_a_folder() {
+        let dir = tempdir().unwrap();
+        let history = HistoryDir::at(dir.path(), "atlas");
+
+        let infos = history.host_infos().unwrap();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].host, "atlas");
+        assert!(infos[0].this_host);
+        assert_eq!(infos[0].first_record, None);
+        assert_eq!(infos[0].last_record, None);
+        assert_eq!(infos[0].bytes, 0);
+    }
+
+    /// The hosts table shows the first and the last record of a host and the
+    /// size of its folder. It must not read every record of every kind of every
+    /// host to do that: a file it does not need must not decide whether the
+    /// table is there at all. Two broken lines among a hundred are more than
+    /// 1 % of the file, so the reader calls that file an error; the table does
+    /// not read the file.
+    #[test]
+    fn host_infos_does_not_read_the_records_it_does_not_need() {
+        let dir = tempdir().unwrap();
+        let atlas = HistoryDir::at(dir.path(), "atlas");
+        atlas.append(&an_up(utc("2026-11-14T09:58:00Z"))).unwrap();
+        let mut lines = String::new();
+        for index in 0..100 {
+            if index == 40 || index == 41 {
+                lines.push_str("this is not a record\n");
+            } else {
+                lines.push_str("{\"t\":\"2026-11-14T09:00:00Z\"}\n");
+            }
+        }
+        fs::write(
+            dir.path().join("atlas").join("tokens-2026-11.jsonl"),
+            &lines,
+        )
+        .unwrap();
+
+        let infos = atlas
+            .host_infos()
+            .expect("the hosts table is there even when a file it does not need is broken");
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].host, "atlas");
+        assert_eq!(infos[0].last_record, Some(utc("2026-11-14T09:58:00Z")));
+    }
+
+    #[test]
+    fn import_copies_another_host_and_never_the_own() {
+        let here = tempdir().unwrap();
+        let there = tempdir().unwrap();
+        let own = HistoryDir::at(here.path(), "atlas");
+        own.append(&an_up(utc("2026-11-14T09:58:00Z"))).unwrap();
+        mark_host(here.path(), "atlas");
+        let before = folder_files(&here.path().join("atlas"));
+
+        // The other folder holds this host's name too, with another line.
+        let other = HistoryDir::at(there.path(), "atlas");
+        other.append(&an_up(utc("2026-11-14T02:00:00Z"))).unwrap();
+        mark_host(there.path(), "atlas");
+        let vega = HistoryDir::at(there.path(), "vega");
+        vega.append(&an_up(utc("2026-11-14T07:00:00Z"))).unwrap();
+        mark_host(there.path(), "vega");
+
+        let copied = own.import(there.path()).unwrap();
+        assert_eq!(copied, vec!["vega"]);
+        assert_eq!(
+            folder_files(&here.path().join("atlas")),
+            before,
+            "this host's own folder is never touched"
+        );
+        assert!(here.path().join("vega/up-2026-11.jsonl").is_file());
+        assert!(here.path().join("vega/host.json").is_file());
+        assert_eq!(
+            own.host_infos()
+                .unwrap()
+                .iter()
+                .map(|info| info.host.clone())
+                .collect::<Vec<_>>(),
+            vec!["atlas", "vega"]
+        );
+
+        // A second run copies nothing more.
+        assert!(own.import(there.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn import_takes_the_longer_file() {
+        let here = tempdir().unwrap();
+        let there = tempdir().unwrap();
+        let own = HistoryDir::at(here.path(), "atlas");
+        mark_host(there.path(), "vega");
+
+        let two = "{\"t\":\"2026-11-14T07:00:00Z\"}\n{\"t\":\"2026-11-14T08:00:00Z\"}\n";
+        let five = "{\"t\":\"2026-11-14T07:00:00Z\"}\n{\"t\":\"2026-11-14T08:00:00Z\"}\n\
+                    {\"t\":\"2026-11-14T09:00:00Z\"}\n{\"t\":\"2026-11-14T10:00:00Z\"}\n\
+                    {\"t\":\"2026-11-14T11:00:00Z\"}\n";
+        fs::create_dir_all(here.path().join("vega")).unwrap();
+        fs::create_dir_all(there.path().join("vega")).unwrap();
+        fs::write(here.path().join("vega/up-2026-11.jsonl"), two).unwrap();
+        fs::write(there.path().join("vega/up-2026-11.jsonl"), five).unwrap();
+
+        assert_eq!(own.import(there.path()).unwrap(), vec!["vega"]);
+        assert_eq!(
+            fs::read_to_string(here.path().join("vega/up-2026-11.jsonl")).unwrap(),
+            five
+        );
+
+        // The other way round: the longer file here stays.
+        fs::write(there.path().join("vega/up-2026-11.jsonl"), two).unwrap();
+        assert!(own.import(there.path()).unwrap().is_empty());
+        assert_eq!(
+            fs::read_to_string(here.path().join("vega/up-2026-11.jsonl")).unwrap(),
+            five
+        );
+    }
+
+    #[test]
+    fn import_refuses_this_folder() {
+        let dir = tempdir().unwrap();
+        let history = HistoryDir::at(dir.path(), "atlas");
+        history.append(&an_up(utc("2026-11-14T09:58:00Z"))).unwrap();
+        mark_host(dir.path(), "atlas");
+
+        let error = history
+            .import(dir.path())
+            .expect_err("the same folder cannot be imported");
+        assert!(
+            error.to_string().contains("that is this history folder"),
+            "{error}"
+        );
+
+        // A folder with no host folder in it says so.
+        let empty = tempdir().unwrap();
+        fs::create_dir_all(empty.path().join("not a host")).unwrap();
+        let error = history.import(empty.path()).expect_err("nothing to import");
+        assert!(
+            error.to_string().contains(&format!(
+                "no host folder found in {}",
+                empty.path().display()
+            )),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn import_refuses_a_host_of_another_machine() {
+        let here = tempdir().unwrap();
+        let there = tempdir().unwrap();
+        let own = HistoryDir::at(here.path(), "atlas");
+
+        // The `vega` folder here belongs to this machine; the source's `vega`
+        // belongs to another one.
+        mark_host_with(here.path(), "vega", "0b4e7c22-6a1d-4e3f-8c59-2d7a9e1b4f60");
+        let before = folder_files(&here.path().join("vega"));
+        let vega = HistoryDir::at(there.path(), "vega");
+        vega.append(&an_up(utc("2026-11-14T07:00:00Z"))).unwrap();
+        mark_host_with(there.path(), "vega", "5d8a1f30-2c7b-4e91-b6a4-9f0c3d7e2a15");
+        // Another host is copied before the conflict is reached.
+        let ledger = HistoryDir::at(there.path(), "ledger");
+        ledger.append(&an_up(utc("2026-11-14T06:00:00Z"))).unwrap();
+        mark_host(there.path(), "ledger");
+
+        let error = own.import(there.path()).expect_err("two machines use vega");
+        assert_eq!(
+            error.to_string(),
+            "two machines use the host name vega; give one of them another name under History and hosts"
+        );
+        assert_eq!(
+            folder_files(&here.path().join("vega")),
+            before,
+            "nothing of the other machine's vega is copied"
+        );
+        assert!(
+            here.path().join("ledger/up-2026-11.jsonl").is_file(),
+            "the other hosts are still copied"
+        );
+    }
+
+    #[test]
+    fn import_says_when_the_source_folder_is_not_there() {
+        let dir = tempdir().unwrap();
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let missing = dir.path().join("no-such-folder");
+
+        let error = history
+            .import(&missing)
+            .expect_err("the folder is not there");
+        assert_eq!(
+            error.to_string(),
+            format!("{} does not exist", missing.display())
+        );
+    }
+
+    #[test]
+    fn export_csv_has_a_header_and_one_line_per_window() {
+        let dir = tempdir().unwrap();
+        let atlas = HistoryDir::at(dir.path(), "atlas");
+        atlas
+            .append(&a_window(utc("2026-11-14T19:30:00Z"), 87.0))
+            .unwrap();
+        let vega = HistoryDir::at(dir.path(), "vega");
+        vega.append(&a_window(utc("2026-11-15T02:00:00Z"), 64.5))
+            .unwrap();
+        mark_host(dir.path(), "vega");
+
+        let mut out = Vec::new();
+        export_csv(&atlas, &wide_range(), &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[0],
+            "kind,account,org,limit,model,start,end,percent,day_utc,project,input,output,cache_write,cache_read"
+        );
+        let windows: Vec<&&str> = lines[1..]
+            .iter()
+            .filter(|line| line.starts_with("window,"))
+            .collect();
+        assert_eq!(windows.len(), 2, "{text}");
+        let first: Vec<&str> = windows[0].split(',').collect();
+        assert_eq!(first.len(), 14);
+        assert_eq!(first[1], atlas_account().acc);
+        assert_eq!(first[2], atlas_account().org);
+        assert_eq!(first[3], "weekly_all");
+        assert_eq!(first[4], "", "a window without a model");
+        assert_eq!(first[5], "2026-11-14T15:30:00Z");
+        assert_eq!(first[6], "2026-11-14T19:30:00Z");
+        assert_eq!(first[7], "87");
+        assert_eq!(&first[8..], ["", "", "", "", "", ""]);
+        assert!(windows[1].contains(",64.5,"), "{text}");
+    }
+
+    #[test]
+    fn export_json_has_the_same_rows() {
+        let dir = tempdir().unwrap();
+        let atlas = HistoryDir::at(dir.path(), "atlas");
+        atlas
+            .append(&a_window(utc("2026-11-14T19:30:00Z"), 87.0))
+            .unwrap();
+        atlas
+            .append(&a_token(
+                utc("2026-11-14T09:00:00Z"),
+                atlas_project(),
+                "claude-opus-5-5",
+                1_284_000,
+                96_500,
+            ))
+            .unwrap();
+        atlas
+            .append(&a_token(
+                utc("2026-11-14T18:20:00Z"),
+                atlas_project(),
+                "claude-opus-5-5",
+                731_000,
+                41_200,
+            ))
+            .unwrap();
+        let vega = HistoryDir::at(dir.path(), "vega");
+        vega.append(&a_window(utc("2026-11-15T02:00:00Z"), 64.5))
+            .unwrap();
+        // A window whose record holds neither a model nor a start: both are
+        // still in the JSON, as `null`.
+        let mut bare = a_window(utc("2026-11-16T03:00:00Z"), 12.0);
+        bare.start = None;
+        atlas.append(&bare).unwrap();
+        vega.append(&a_token(
+            utc("2026-11-14T20:10:00Z"),
+            atlas_project(),
+            "claude-opus-5-5",
+            405_000,
+            12_400,
+        ))
+        .unwrap();
+        vega.append(&a_token(
+            utc("2026-11-15T08:00:00Z"),
+            ProjectKey::Folder("ledger".to_string()),
+            "claude-opus-5-5",
+            88_000,
+            3_100,
+        ))
+        .unwrap();
+        mark_host(dir.path(), "vega");
+
+        let mut csv = Vec::new();
+        export_csv(&atlas, &wide_range(), &mut csv).unwrap();
+        let csv = String::from_utf8(csv).unwrap();
+        let mut json = Vec::new();
+        export_json(&atlas, &wide_range(), &mut json).unwrap();
+        let json: Value = serde_json::from_slice(&json).unwrap();
+
+        // The same number of rows in both formats.
+        let window_lines = csv
+            .lines()
+            .filter(|line| line.starts_with("window,"))
+            .count();
+        let token_lines = csv
+            .lines()
+            .filter(|line| line.starts_with("tokens,"))
+            .count();
+        assert_eq!(json["windows"].as_array().unwrap().len(), window_lines);
+        assert_eq!(json["dailyTokens"].as_array().unwrap().len(), token_lines);
+
+        // Two lines of one day and project on different hosts are one row; a
+        // third day and folder is a second one.
+        assert_eq!(token_lines, 2, "{csv}");
+        let days = json["dailyTokens"].as_array().unwrap();
+        assert_eq!(days[0]["dayUtc"], "2026-11-14");
+        assert_eq!(days[0]["project"], "repo:github.com/sam/atlas");
+        assert_eq!(days[0]["input"], 1_284_000 + 731_000 + 405_000);
+        assert_eq!(days[0]["output"], 96_500 + 41_200 + 12_400);
+        assert_eq!(days[0]["cacheWrite"], 0);
+        assert_eq!(days[0]["cacheRead"], 0);
+        assert_eq!(days[1]["dayUtc"], "2026-11-15");
+        assert_eq!(days[1]["project"], "folder:ledger");
+        assert_eq!(days[1]["input"], 88_000);
+
+        // The window rows carry the same window ends and percentages, and the
+        // JSON holds every column: an empty model or start is `null`, not left
+        // out.
+        let windows = json["windows"].as_array().unwrap();
+        assert_eq!(windows[0].as_object().unwrap().len(), 8);
+        assert_eq!(windows[0]["account"], atlas_account().acc);
+        assert_eq!(windows[0]["limit"], "weekly_all");
+        assert_eq!(windows[0]["percent"], 87.0);
+        assert!(windows[0].get("model").is_some());
+        assert!(windows[0]["model"].is_null());
+        assert!(windows[0].get("start").is_some());
+        let first: Vec<&str> = csv
+            .lines()
+            .find(|line| line.starts_with("window,"))
+            .unwrap()
+            .split(',')
+            .collect();
+        assert_eq!(windows[0]["end"], first[6]);
+        assert_eq!(windows[0]["start"], first[5]);
+        assert_eq!(windows[1]["percent"], 64.5);
+        assert!(windows[2].get("model").is_some());
+        assert!(windows[2]["model"].is_null());
+        assert!(windows[2].get("start").is_some());
+        assert!(windows[2]["start"].is_null());
+    }
+
+    #[test]
+    fn export_csv_quotes_a_field_with_a_comma_or_a_quote() {
+        let dir = tempdir().unwrap();
+        let atlas = HistoryDir::at(dir.path(), "atlas");
+        atlas
+            .append(&a_token(
+                utc("2026-11-14T09:00:00Z"),
+                ProjectKey::Folder("atlas, \"old\"".to_string()),
+                "claude-opus-5-5",
+                10,
+                2,
+            ))
+            .unwrap();
+        let mut out = Vec::new();
+        export_csv(&atlas, &wide_range(), &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains(",\"folder:atlas, \"\"old\"\"\","),
+            "a folder name with a comma and quotes is quoted:\n{text}"
+        );
     }
 }

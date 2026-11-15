@@ -54,6 +54,21 @@ pub(crate) fn with_tilde(path: &str, home: &std::path::Path) -> String {
     }
 }
 
+/// The path a person typed, with a leading `~` for the home folder expanded
+/// (`~/seatswap-history.csv` → `/home/sam/seatswap-history.csv`). Only a `~`
+/// that starts the path names the home folder; a `~` later in the path is a
+/// normal character.
+pub(crate) fn expand_tilde(path: &str, home: &std::path::Path) -> std::path::PathBuf {
+    if path == "~" {
+        return home.to_path_buf();
+    }
+    let prefix = format!("~{}", std::path::MAIN_SEPARATOR);
+    match path.strip_prefix(&prefix) {
+        Some(rest) => home.join(rest),
+        None => std::path::PathBuf::from(path),
+    }
+}
+
 /// `path` without the whole `home` prefix, compared component by component.
 /// No `cfg`: on Unix there is no `Prefix` component to meet, so the one rule
 /// costs nothing there.
@@ -435,6 +450,32 @@ mod tests {
                 std::path::Path::new(r"C:\Users\sam")
             ),
             r"~\projects"
+        );
+    }
+
+    #[test]
+    fn a_tilde_at_the_start_of_a_path_becomes_the_home_folder() {
+        let home = std::path::Path::new("/home/sam");
+        assert_eq!(
+            expand_tilde("~/seatswap-history.csv", home),
+            std::path::PathBuf::from("/home/sam/seatswap-history.csv")
+        );
+        assert_eq!(
+            expand_tilde("~", home),
+            std::path::PathBuf::from("/home/sam")
+        );
+        assert_eq!(
+            expand_tilde("/home/sam/x", home),
+            std::path::PathBuf::from("/home/sam/x")
+        );
+        // Only a `~` that starts the path names the home folder.
+        assert_eq!(
+            expand_tilde("/tmp/~/x", home),
+            std::path::PathBuf::from("/tmp/~/x")
+        );
+        assert_eq!(
+            expand_tilde("~/Projects/atlas", home),
+            std::path::PathBuf::from("/home/sam/Projects/atlas")
         );
     }
 

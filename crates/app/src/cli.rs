@@ -19,7 +19,9 @@ use seatswap_core::burn::plan::{follow, slack, Policy};
 use seatswap_core::burn::replay::replay;
 use seatswap_core::burn::wu_hours;
 use seatswap_core::engine::{AccountView, Engine, PollReason, UsageCache};
-use seatswap_core::history::{AccountRef, By, EventKind, HistoryDir, Range, Recorder};
+use seatswap_core::history::{
+    export_csv, export_json, AccountRef, By, EventKind, HistoryDir, Range, Recorder,
+};
 use seatswap_core::money::{self, Prices};
 use seatswap_core::paths::{self, AppPaths, ClaudePaths, PathsError};
 use seatswap_core::store::{self, Account, AccountsFile, LoginState, Settings, Store, StoreError};
@@ -234,8 +236,54 @@ pub(crate) enum Command {
         refresh: bool,
     },
 
+    /// Write the history as CSV or JSON, or copy another host's folder in.
+    History {
+        #[command(subcommand)]
+        action: HistoryAction,
+    },
+
     /// Print Claude Code's status line; reads its JSON from standard input.
     Statusline,
+}
+
+/// What `seatswap history` does (spec §1.5, §3.7).
+#[derive(Debug, Subcommand)]
+pub(crate) enum HistoryAction {
+    /// Write the history to standard output.
+    Export {
+        /// `csv` or `json`.
+        #[arg(long, value_enum)]
+        format: ExportFormat,
+
+        /// First UTC day, `YYYY-MM-DD` (default: the oldest record).
+        #[arg(long, value_name = "YYYY-MM-DD")]
+        from: Option<String>,
+
+        /// Last UTC day, `YYYY-MM-DD`, inclusive (default: every later day).
+        #[arg(long, value_name = "YYYY-MM-DD")]
+        to: Option<String>,
+    },
+    /// Copy another history folder's host folders in by hand.
+    Import {
+        /// The other history folder, an absolute path.
+        folder: String,
+    },
+}
+
+/// The two formats of `seatswap history export`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum ExportFormat {
+    Csv,
+    Json,
+}
+
+impl ExportFormat {
+    fn as_str(self) -> &'static str {
+        match self {
+            ExportFormat::Csv => "csv",
+            ExportFormat::Json => "json",
+        }
+    }
 }
 
 /// What `seatswap burn` does (spec §2.4, §2.8).
@@ -544,6 +592,12 @@ fn run_command(
             color,
         } => edit(context, &key, label, abbr, color),
         Command::Burn { action } => burn(context, action),
+        Command::History { action } => match action {
+            HistoryAction::Export { format, from, to } => {
+                history_export(&context, format, from.as_deref(), to.as_deref())
+            }
+            HistoryAction::Import { folder } => history_import(&context, &folder),
+        },
         Command::AgentSkill { action } => agent_skill(&context, action),
         Command::Prices { refresh } => prices(context, refresh),
         // Handled before the store was opened; kept for exhaustiveness.
@@ -656,6 +710,17 @@ pub(crate) fn gate(command: &Command, caller: Caller, settings: &Settings) -> Ga
                 Gate::Refused(AGENTS_MAY_NOT_READ)
             }
         }
+        // `history export` reads like `status`; `history import` writes files.
+        Command::History { action } => match action {
+            HistoryAction::Export { .. } => {
+                if settings.agents_read {
+                    Gate::Allowed
+                } else {
+                    Gate::Refused(AGENTS_MAY_NOT_READ)
+                }
+            }
+            HistoryAction::Import { .. } => Gate::Refused(AGENTS_MAY_NOT_CHANGE),
+        },
         Command::List { .. } | Command::Status { .. } | Command::Burn { .. } => {
             if settings.agents_read {
                 Gate::Allowed
@@ -747,6 +812,14 @@ fn command_text(command: &Command) -> String {
         Command::Window { target } => {
             format!("window {}", target.as_deref().unwrap_or("sessions"))
         }
+        Command::History { action } => match action {
+            HistoryAction::Export { format, from, to } => flags(
+                &format!("history export --format {}", format.as_str()),
+                &[("--from", from.is_some()), ("--to", to.is_some())],
+            ),
+            // The folder is free text; a path stays out of the recorded line.
+            HistoryAction::Import { .. } => "history import".to_string(),
+        },
         Command::Statusline => "statusline".to_string(),
         Command::Prices { refresh } => flags("prices", &[("--refresh", *refresh)]),
         Command::Status {
@@ -1282,6 +1355,105 @@ fn price_number(value: f64) -> String {
     } else {
         format!("{value}")
     }
+}
+
+/// `seatswap history export --format csv|json [--from …] [--to …]`: the UTC days
+/// of the range, written to standard output.
+fn history_export(
+    context: &Context,
+    format: ExportFormat,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Result<(), CliError> {
+    let range = export_day_range(from, to)?;
+    let history = history_dir(context.store.app_paths(), &context.settings)?;
+    let mut out = io::stdout().lock();
+    write_export(&history, format, &range, &mut out)?;
+    out.flush()?;
+    Ok(())
+}
+
+/// The export's rows, written to `out`.
+fn write_export(
+    history: &HistoryDir,
+    format: ExportFormat,
+    range: &Range,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    match format {
+        ExportFormat::Csv => export_csv(history, range, out),
+        ExportFormat::Json => export_json(history, range, out),
+    }
+    .map_err(|error| CliError::Message(format!("cannot read the history: {error}")))
+}
+
+/// The range of two UTC days; `--to` is inclusive, so the range ends at the
+/// midnight after it. A day that is not given leaves that end open; `--from`
+/// after `--to` is an error.
+fn export_day_range(from: Option<&str>, to: Option<&str>) -> Result<Range, CliError> {
+    let first = match from {
+        Some(text) => Some(parse_date("--from", text)?),
+        None => None,
+    };
+    let last = match to {
+        Some(text) => Some(parse_date("--to", text)?),
+        None => None,
+    };
+    if let (Some(first), Some(last)) = (first, last) {
+        if first > last {
+            return Err(CliError::Usage(format!(
+                "--from {first} is after --to {last}"
+            )));
+        }
+    }
+    let from = match first {
+        Some(day) => utc_midnight(day)?,
+        None => DateTime::<Utc>::MIN_UTC,
+    };
+    let to = match last {
+        Some(day) => {
+            let next = day
+                .succ_opt()
+                .ok_or_else(|| CliError::Usage(format!("--to {day}: there is no day after it")))?;
+            utc_midnight(next)?
+        }
+        None => DateTime::<Utc>::MAX_UTC,
+    };
+    Ok(Range { from, to })
+}
+
+/// Midnight UTC of a day: the export's days are UTC days, not local ones.
+fn utc_midnight(date: NaiveDate) -> Result<DateTime<Utc>, CliError> {
+    date.and_hms_opt(0, 0, 0)
+        .map(|naive| Utc.from_utc_datetime(&naive))
+        .ok_or_else(|| CliError::Usage(format!("{date}: the day has no midnight")))
+}
+
+/// `seatswap history import <folder>`: one line per host at least one file was
+/// copied for, or "nothing new".
+fn history_import(context: &Context, folder: &str) -> Result<(), CliError> {
+    let copied = import_history(context, folder)?;
+    if copied.is_empty() {
+        println!("nothing new");
+    } else {
+        for host in copied {
+            println!("copied {host}");
+        }
+    }
+    Ok(())
+}
+
+/// Copy another history folder's host folders in; returns the hosts a file was
+/// copied for, sorted.
+fn import_history(context: &Context, folder: &str) -> Result<Vec<String>, CliError> {
+    let path = crate::format::expand_tilde(folder, &context.claude.home);
+    if !path.is_absolute() {
+        return Err(CliError::Usage(format!("{folder} is not an absolute path")));
+    }
+    let history = history_dir(context.store.app_paths(), &context.settings)?;
+    history
+        .import(&path)
+        .map_err(|error| CliError::Message(error.to_string()))
 }
 
 /// The history folder `status` and `burn` read, without creating it.
@@ -2249,6 +2421,18 @@ pub(crate) mod tests {
             },
             Command::Prices { refresh: false },
             Command::Prices { refresh: true },
+            Command::History {
+                action: HistoryAction::Export {
+                    format: ExportFormat::Csv,
+                    from: None,
+                    to: None,
+                },
+            },
+            Command::History {
+                action: HistoryAction::Import {
+                    folder: "/home/sam/seatswap-history".to_string(),
+                },
+            },
             Command::Statusline,
         ]
     }
@@ -2689,6 +2873,30 @@ pub(crate) mod tests {
         );
     }
 
+    /// The recorded line of an agent's call keeps the folder out of it: a path
+    /// is the person's, not the history's.
+    #[test]
+    fn the_history_command_text_leaves_out_the_path() {
+        assert_eq!(
+            command_text(&Command::History {
+                action: HistoryAction::Import {
+                    folder: "/home/sam/Sync/seatswap-history".to_string(),
+                },
+            }),
+            "history import"
+        );
+        assert_eq!(
+            command_text(&Command::History {
+                action: HistoryAction::Export {
+                    format: ExportFormat::Csv,
+                    from: Some("2026-11-14".to_string()),
+                    to: None,
+                },
+            }),
+            "history export --format csv --from"
+        );
+    }
+
     #[test]
     fn a_refused_call_exits_3_and_is_recorded() {
         let fixture = Fixture::new();
@@ -2751,6 +2959,151 @@ pub(crate) mod tests {
         assert_eq!(call["command"], "(no subcommand)");
         assert!(call["cwd"].is_string(), "{call}");
         assert_eq!(fixture.live_bytes(), before);
+    }
+
+    fn utc_text(text: &str) -> DateTime<Utc> {
+        text.parse::<DateTime<Utc>>().expect("a test time")
+    }
+
+    fn a_token(t: DateTime<Utc>, input: u64) -> TokenRecord {
+        TokenRecord {
+            t,
+            session: "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34".to_string(),
+            cwd: "/home/sam/projects/atlas".to_string(),
+            project: ProjectKey::Repo("github.com/sam/atlas".to_string()),
+            model: "claude-opus-5-5".to_string(),
+            input,
+            out: 96_500,
+            cw: 0,
+            cr: 0,
+            answers: 1,
+            agent_answers: 0,
+        }
+    }
+
+    #[test]
+    fn history_export_follows_agents_read_and_import_is_refused() {
+        let export = Command::History {
+            action: HistoryAction::Export {
+                format: ExportFormat::Csv,
+                from: None,
+                to: None,
+            },
+        };
+        for read in [false, true] {
+            let expected = if read {
+                Gate::Allowed
+            } else {
+                Gate::Refused(AGENTS_MAY_NOT_READ)
+            };
+            assert_eq!(
+                gate(&export, Caller::Agent, &settings(read, true)),
+                expected
+            );
+        }
+
+        let import = Command::History {
+            action: HistoryAction::Import {
+                folder: "/home/sam/seatswap-history".to_string(),
+            },
+        };
+        for read in [false, true] {
+            for switch in [false, true] {
+                assert_eq!(
+                    gate(&import, Caller::Agent, &settings(read, switch)),
+                    Gate::Refused(AGENTS_MAY_NOT_CHANGE)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn history_export_writes_the_utc_days_to_the_writer() {
+        let fixture = Fixture::new();
+        let history = fixture.history();
+        history
+            .append(&a_token(utc_text("2026-11-14T09:00:00Z"), 1_284_000))
+            .expect("the token line");
+        history
+            .append(&a_token(utc_text("2026-11-18T09:00:00Z"), 405_000))
+            .expect("the token line");
+
+        let range = export_day_range(Some("2026-11-09"), Some("2026-11-16")).expect("two UTC days");
+        assert_eq!(range.from, utc_text("2026-11-09T00:00:00Z"));
+        assert_eq!(
+            range.to,
+            utc_text("2026-11-17T00:00:00Z"),
+            "--to is inclusive"
+        );
+
+        let mut out = Vec::new();
+        write_export(&history, ExportFormat::Csv, &range, &mut out).expect("the export");
+        let text = String::from_utf8(out).expect("CSV is text");
+        assert!(
+            text.starts_with(
+                "kind,account,org,limit,model,start,end,percent,day_utc,project,input,output,cache_write,cache_read\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(",2026-11-14,repo:github.com/sam/atlas,1284000,96500,0,0\n"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("2026-11-18"),
+            "a day outside the range stays out:\n{text}"
+        );
+
+        // Both ends are optional, and a range that ends before it starts is an error.
+        let open = export_day_range(None, None).expect("the whole history");
+        assert_eq!(open.from, DateTime::<Utc>::MIN_UTC);
+        assert_eq!(open.to, DateTime::<Utc>::MAX_UTC);
+        assert!(export_day_range(Some("2026-11-17"), Some("2026-11-16")).is_err());
+        assert!(export_day_range(Some("2026-11-32"), None).is_err());
+    }
+
+    #[test]
+    fn history_import_copies_a_host_folder() {
+        let fixture = Fixture::new();
+        let command = Command::History {
+            action: HistoryAction::Import {
+                folder: String::new(),
+            },
+        };
+        let context = open_context(&fixture.cli(command)).expect("the context opens");
+        let there = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(there.path().join("vega")).expect("the host folder");
+        fs::write(
+            there.path().join("vega/host.json"),
+            "{\"machineId\":\"0b4e7c22-6a1d-4e3f-8c59-2d7a9e1b4f60\"}",
+        )
+        .expect("the marker");
+        let line = "{\"t\":\"2026-11-14T07:00:00Z\"}\n";
+        fs::write(there.path().join("vega/up-2026-11.jsonl"), line).expect("an up line");
+
+        let copied = import_history(&context, &there.path().display().to_string())
+            .expect("the folder is imported");
+        assert_eq!(copied, vec!["vega"]);
+        assert_eq!(
+            fs::read_to_string(fixture.data_dir.join("history/vega/up-2026-11.jsonl"))
+                .expect("the copied line"),
+            line
+        );
+        assert!(
+            import_history(&context, &there.path().display().to_string())
+                .expect("a second import")
+                .is_empty()
+        );
+
+        // This history folder itself, and a folder that is not absolute.
+        let own = fixture.data_dir.join("history");
+        let error = import_history(&context, &own.display().to_string())
+            .expect_err("the same folder is refused");
+        assert!(
+            error.to_string().contains("that is this history folder"),
+            "{error}"
+        );
+        assert!(import_history(&context, "seatswap-history").is_err());
     }
 
     #[test]

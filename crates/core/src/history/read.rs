@@ -2,15 +2,28 @@
 //! files that overlap the range, and a bad line skipped with a warning. A torn
 //! line is always only a warning; other broken lines are an error only when they
 //! are more than 1 % of the file's lines.
+//!
+//! The same reader answers what the hosts hold ([`HistoryDir::host_infos`]),
+//! copies another history folder's host folders in ([`HistoryDir::import`]) and
+//! writes the export ([`export_csv`], [`export_json`]). The export is raw data:
+//! accounts by the server's ids, projects by the key as stored.
 
+use std::collections::BTreeMap;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::Path;
 
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, SecondsFormat, TimeZone, Utc};
+use serde::Serialize;
 
-use super::{HistoryDir, HistoryError, Kind, Record};
+use super::{
+    Event, HistoryDir, HistoryError, HostMarker, Kind, Record, Sample, SessionRecord, TokenRecord,
+    UpRecord, WindowRecord,
+};
+use crate::atomic::{self, Access};
 use crate::paths;
+use crate::project::ProjectKey;
+use crate::projects::ProjectsLogRecord;
 
 /// A time range: `from` inclusive, `to` exclusive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,6 +161,17 @@ pub(super) fn months_of_kind(dir: &Path, kind: Kind) -> Result<Vec<Range>, Histo
     Ok(months)
 }
 
+/// The file of `kind` for one month, if it exists. The month range comes from
+/// [`months_of_kind`].
+fn file_of_month(
+    dir: &Path,
+    kind: Kind,
+    month: &Range,
+) -> Result<Option<std::path::PathBuf>, HistoryError> {
+    let mut files = month_files(dir, kind.stem(), month)?;
+    Ok(files.pop().map(|name| dir.join(name)))
+}
+
 /// `(year, month)` of a file named `<stem>-YYYY-MM.jsonl`, or `None` for any
 /// other shape (including a month outside 1..=12).
 fn month_of_name(name: &str, stem: &str) -> Option<(i32, u32)> {
@@ -199,6 +223,29 @@ pub(super) fn month_start(year: i32, month: u32) -> Option<DateTime<Utc>> {
         .map(|naive| Utc.from_utc_datetime(&naive))
 }
 
+/// A history file's bytes, or `None` when it is not there (another host may
+/// have removed it). Every history read gets its bytes here.
+fn read_bytes(path: &Path) -> Result<Option<Vec<u8>>, HistoryError> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(HistoryError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// The lines of a history file: split on `\n`, the empty piece after a final
+/// newline dropped. One torn line must not lose the complete ones around it.
+fn file_lines(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
+    if bytes.last() == Some(&b'\n') {
+        lines.pop();
+    }
+    lines
+}
+
 fn read_file<R: Record>(
     path: &Path,
     host: &str,
@@ -207,23 +254,11 @@ fn read_file<R: Record>(
     records: &mut Vec<Hosted<R>>,
     warnings: &mut Vec<String>,
 ) -> Result<(), HistoryError> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(source) => {
-            return Err(HistoryError::Io {
-                path: path.to_path_buf(),
-                source,
-            })
-        }
+    let Some(bytes) = read_bytes(path)? else {
+        return Ok(());
     };
 
-    // Split the bytes on '\n' and decode every line on its own: one torn line
-    // must not lose the complete ones around it.
-    let mut lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
-    if bytes.last() == Some(&b'\n') {
-        lines.pop();
-    }
+    let lines = file_lines(&bytes);
     let total = lines.len();
     let mut counted = 0usize;
     let mut first_counted: Option<(usize, serde_json::Error)> = None;
@@ -287,4 +322,647 @@ fn read_file<R: Record>(
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The hosts of a history folder (spec §1.5, §3.7)
+// ---------------------------------------------------------------------------
+
+/// One host folder under the history root, as the Settings page shows it.
+/// "Since" is the first record of the oldest file of each kind; `last_record`
+/// is the newest `up` or `samples` line, which is written while the app runs, so
+/// it says when the host was last heard of.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostInfo {
+    pub host: String,
+    pub this_host: bool,
+    pub first_record: Option<DateTime<Utc>>,
+    pub last_record: Option<DateTime<Utc>>,
+    pub bytes: u64,
+}
+
+impl HistoryDir {
+    /// One entry per host folder under the root, this host's own folder
+    /// included even when it is still empty, sorted by host name.
+    pub fn host_infos(&self) -> Result<Vec<HostInfo>, HistoryError> {
+        let mut hosts = self.hosts()?;
+        if !hosts.iter().any(|host| host == self.host()) {
+            hosts.push(self.host().to_string());
+        }
+        hosts.sort();
+        let mut infos = Vec::with_capacity(hosts.len());
+        for host in hosts {
+            infos.push(self.host_info(&host)?);
+        }
+        Ok(infos)
+    }
+
+    fn host_info(&self, host: &str) -> Result<HostInfo, HistoryError> {
+        let firsts = [
+            self.first_of_kind::<UpRecord>(host)?,
+            self.first_of_kind::<Sample>(host)?,
+            self.first_of_kind::<WindowRecord>(host)?,
+            self.first_of_kind::<Event>(host)?,
+            self.first_of_kind::<TokenRecord>(host)?,
+            self.first_of_kind::<SessionRecord>(host)?,
+            self.first_of_kind::<ProjectsLogRecord>(host)?,
+        ];
+        let lasts = [
+            self.newest_of_kind::<UpRecord>(host)?,
+            self.newest_of_kind::<Sample>(host)?,
+        ];
+        Ok(HostInfo {
+            host: host.to_string(),
+            this_host: host == self.host(),
+            first_record: firsts.into_iter().flatten().min(),
+            last_record: lasts.into_iter().flatten().max(),
+            bytes: folder_bytes(&self.root().join(host))?,
+        })
+    }
+
+    /// The first record that parses in the oldest month file of one kind. A
+    /// line that does not parse is skipped, as [`HistoryDir::read`] skips a torn
+    /// one: the table never fails on a record it does not need.
+    fn first_of_kind<R: Record>(&self, host: &str) -> Result<Option<DateTime<Utc>>, HistoryError> {
+        let dir = self.root().join(host);
+        let Some(month) = months_of_kind(&dir, R::KIND)?.last().copied() else {
+            return Ok(None);
+        };
+        let Some(path) = file_of_month(&dir, R::KIND, &month)? else {
+            return Ok(None);
+        };
+        let Some(bytes) = read_bytes(&path)? else {
+            return Ok(None);
+        };
+        for line in file_lines(&bytes) {
+            let Ok(text) = std::str::from_utf8(line) else {
+                continue;
+            };
+            if let Ok(record) = serde_json::from_str::<R>(text) {
+                return Ok(Some(record.at()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The newest record of one kind in its newest month file.
+    fn newest_of_kind<R: Record>(&self, host: &str) -> Result<Option<DateTime<Utc>>, HistoryError> {
+        let dir = self.root().join(host);
+        let Some(month) = months_of_kind(&dir, R::KIND)?.first().copied() else {
+            return Ok(None);
+        };
+        let Some(path) = file_of_month(&dir, R::KIND, &month)? else {
+            return Ok(None);
+        };
+        let Some(bytes) = read_bytes(&path)? else {
+            return Ok(None);
+        };
+        let mut newest = None;
+        for line in file_lines(&bytes) {
+            let Ok(text) = std::str::from_utf8(line) else {
+                continue;
+            };
+            if let Ok(record) = serde_json::from_str::<R>(text) {
+                let at = record.at();
+                if newest.is_none_or(|newest| at > newest) {
+                    newest = Some(at);
+                }
+            }
+        }
+        Ok(newest)
+    }
+
+    /// Copy every file of another history folder's host folders that is missing
+    /// here or longer there; a file that is longer here is kept. This host's own
+    /// folder is never read or written: a host only ever writes its own folder.
+    /// Returns the hosts at least one file was copied for, sorted.
+    pub fn import(&self, from: &Path) -> Result<Vec<String>, HistoryError> {
+        match fs::metadata(from) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(HistoryError::NoFolder {
+                    path: from.to_path_buf(),
+                })
+            }
+            Err(source) => {
+                return Err(HistoryError::Io {
+                    path: from.to_path_buf(),
+                    source,
+                })
+            }
+        }
+        if same_folder(from, self.root()) {
+            return Err(failed(
+                from,
+                io::ErrorKind::InvalidInput,
+                "that is this history folder",
+            ));
+        }
+        let source = HistoryDir::at(from, self.host());
+        let hosts = source.hosts()?;
+        if hosts.is_empty() {
+            return Err(failed(
+                from,
+                io::ErrorKind::NotFound,
+                format!("no host folder found in {}", from.display()),
+            ));
+        }
+        let mut copied = Vec::new();
+        let mut conflict = None;
+        for host in hosts {
+            if host == self.host() {
+                continue;
+            }
+            match self.copy_host(from, &host) {
+                Ok(true) => copied.push(host),
+                Ok(false) => {}
+                Err(HistoryError::HostConflict { host }) => {
+                    // The other hosts are still copied; this one is reported
+                    // after them, never merged with another machine's files.
+                    conflict.get_or_insert(HistoryError::HostConflict { host });
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if let Some(error) = conflict {
+            return Err(error);
+        }
+        copied.sort();
+        Ok(copied)
+    }
+
+    /// Copy the files of one other host's folder in; `true` when one was copied.
+    fn copy_host(&self, from: &Path, host: &str) -> Result<bool, HistoryError> {
+        let from_dir = from.join(host);
+        let to_dir = self.root().join(host);
+        // A folder here that belongs to another machine is never touched: two
+        // machines with the same host name would otherwise merge their files.
+        if let (Some(here), Some(there)) = (
+            host_machine_id(&to_dir.join("host.json"))?,
+            host_machine_id(&from_dir.join("host.json"))?,
+        ) {
+            if here != there {
+                return Err(HistoryError::HostConflict {
+                    host: host.to_string(),
+                });
+            }
+        }
+        let entries = fs::read_dir(&from_dir).map_err(|source| HistoryError::Io {
+            path: from_dir.clone(),
+            source,
+        })?;
+        let mut files = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| HistoryError::Io {
+                path: from_dir.clone(),
+                source,
+            })?;
+            match entry.metadata() {
+                Ok(metadata) if metadata.is_file() => files.push(entry.path()),
+                Ok(_) => continue,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(HistoryError::Io {
+                        path: entry.path(),
+                        source,
+                    })
+                }
+            }
+        }
+        // By name, so a copy is the same whatever order the file system lists in.
+        files.sort();
+        let mut copied = false;
+        for file in files {
+            let Some(name) = file.file_name() else {
+                continue;
+            };
+            let target = to_dir.join(name);
+            let there = fs::metadata(&file)
+                .map_err(|source| HistoryError::Io {
+                    path: file.clone(),
+                    source,
+                })?
+                .len();
+            let here = match fs::metadata(&target) {
+                Ok(metadata) if metadata.is_file() => Some(metadata.len()),
+                Ok(_) => {
+                    return Err(failed(
+                        &target,
+                        io::ErrorKind::AlreadyExists,
+                        "exists but is not a file",
+                    ))
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                Err(source) => {
+                    return Err(HistoryError::Io {
+                        path: target,
+                        source,
+                    })
+                }
+            };
+            if here.is_some_and(|length| length >= there) {
+                continue;
+            }
+            let bytes = fs::read(&file).map_err(|source| HistoryError::Io {
+                path: file.clone(),
+                source,
+            })?;
+            atomic::ensure_private_dir(&to_dir).map_err(|source| HistoryError::Io {
+                path: to_dir.clone(),
+                source,
+            })?;
+            atomic::write_atomic(&target, &bytes, Access::Private).map_err(|source| {
+                HistoryError::Io {
+                    path: target.clone(),
+                    source,
+                }
+            })?;
+            copied = true;
+        }
+        Ok(copied)
+    }
+}
+
+/// The sum of the sizes of the files directly in one host folder; a folder that
+/// is not there yet is 0 bytes.
+fn folder_bytes(dir: &Path) -> Result<u64, HistoryError> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(source) => {
+            return Err(HistoryError::Io {
+                path: dir.to_path_buf(),
+                source,
+            })
+        }
+    };
+    let mut bytes = 0u64;
+    for entry in entries {
+        let entry = entry.map_err(|source| HistoryError::Io {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(HistoryError::Io {
+                    path: entry.path(),
+                    source,
+                })
+            }
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        bytes = bytes.checked_add(metadata.len()).ok_or_else(|| {
+            failed(
+                dir,
+                io::ErrorKind::InvalidData,
+                "the files add up to more than 2^64 bytes",
+            )
+        })?;
+    }
+    Ok(bytes)
+}
+
+/// Whether two paths name the same folder. Both are canonicalized when they
+/// exist, so a trailing slash, `..` or a link does not hide the same folder.
+fn same_folder(first: &Path, second: &Path) -> bool {
+    match (fs::canonicalize(first), fs::canonicalize(second)) {
+        (Ok(first), Ok(second)) => first == second,
+        _ => first == second,
+    }
+}
+
+/// An error about one path with our own text, in the shape the history's other
+/// errors have.
+fn failed(path: &Path, kind: io::ErrorKind, text: impl Into<String>) -> HistoryError {
+    HistoryError::Io {
+        path: path.to_path_buf(),
+        source: io::Error::new(kind, text.into()),
+    }
+}
+
+/// The machine id in a host folder's `host.json`, or `None` when the file is
+/// not there.
+fn host_machine_id(path: &Path) -> Result<Option<String>, HistoryError> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(HistoryError::Io {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
+    };
+    let marker: HostMarker = serde_json::from_str(&text)
+        .map_err(|source| failed(path, io::ErrorKind::InvalidData, source.to_string()))?;
+    Ok(Some(marker.machine_id))
+}
+
+// ---------------------------------------------------------------------------
+// The export (spec §3.7; step C1 task 7, decision 3)
+// ---------------------------------------------------------------------------
+
+/// The export's columns, in this order: the CSV header, and the fields the JSON
+/// objects carry (camelCase there).
+const EXPORT_COLUMNS: [&str; 14] = [
+    "kind",
+    "account",
+    "org",
+    "limit",
+    "model",
+    "start",
+    "end",
+    "percent",
+    "day_utc",
+    "project",
+    "input",
+    "output",
+    "cache_write",
+    "cache_read",
+];
+
+/// One `window` line: a finished window as its record holds it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WindowRow {
+    kind: &'static str,
+    account: String,
+    org: String,
+    limit: String,
+    model: Option<String>,
+    start: Option<DateTime<Utc>>,
+    end: DateTime<Utc>,
+    percent: f64,
+}
+
+impl WindowRow {
+    fn of(record: WindowRecord) -> WindowRow {
+        WindowRow {
+            kind: "window",
+            account: record.account.acc,
+            org: record.account.org,
+            limit: record.k.as_api().to_string(),
+            model: record.m,
+            start: record.start,
+            end: record.end,
+            percent: record.final_percent,
+        }
+    }
+
+    /// This row's fields in [`EXPORT_COLUMNS`]' order.
+    fn fields(&self) -> [String; 14] {
+        [
+            self.kind.to_string(),
+            self.account.clone(),
+            self.org.clone(),
+            self.limit.clone(),
+            self.model.clone().unwrap_or_default(),
+            self.start.map(time_text).unwrap_or_default(),
+            time_text(self.end),
+            number_text(self.percent),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ]
+    }
+}
+
+/// One `tokens` line: every token record of one UTC day and one project key,
+/// every host, added up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TokenDayRow {
+    kind: &'static str,
+    day_utc: NaiveDate,
+    project: String,
+    input: u64,
+    output: u64,
+    cache_write: u64,
+    cache_read: u64,
+}
+
+impl TokenDayRow {
+    fn of(day_utc: NaiveDate, project: ProjectKey, counts: [u64; 4]) -> TokenDayRow {
+        let [input, output, cache_write, cache_read] = counts;
+        TokenDayRow {
+            kind: "tokens",
+            day_utc,
+            project: project_text(&project),
+            input,
+            output,
+            cache_write,
+            cache_read,
+        }
+    }
+
+    /// This row's fields in [`EXPORT_COLUMNS`]' order.
+    fn fields(&self) -> [String; 14] {
+        [
+            self.kind.to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            self.day_utc.to_string(),
+            self.project.clone(),
+            self.input.to_string(),
+            self.output.to_string(),
+            self.cache_write.to_string(),
+            self.cache_read.to_string(),
+        ]
+    }
+}
+
+/// The months of `kind` that hold records of `range`, every host, in time
+/// order and clipped to the range. The files that exist bound the list, so an
+/// open end never walks the calendar; each month is read through
+/// [`HistoryDir::read`], the one range reader.
+fn months_in(history: &HistoryDir, kind: Kind, range: &Range) -> Result<Vec<Range>, HistoryError> {
+    if range.from >= range.to {
+        return Ok(Vec::new());
+    }
+    let mut months = Vec::new();
+    for host in history.hosts_to_read(&Hosts::All)? {
+        let dir = history.root().join(host);
+        for month in months_of_kind(&dir, kind)? {
+            if month.from < range.to && month.to > range.from {
+                months.push(Range {
+                    from: month.from.max(range.from),
+                    to: month.to.min(range.to),
+                });
+            }
+        }
+    }
+    months.sort_by_key(|month| month.from);
+    months.dedup();
+    Ok(months)
+}
+
+/// A write error of an export, named with the history folder.
+fn export_io(history: &HistoryDir, source: io::Error) -> HistoryError {
+    HistoryError::Io {
+        path: history.root().to_path_buf(),
+        source,
+    }
+}
+
+/// One month's token rows: the token records of the month and the range, every
+/// host, summed per UTC day and project key and sorted by them.
+fn token_rows_of_month(
+    history: &HistoryDir,
+    month: &Range,
+) -> Result<Vec<TokenDayRow>, HistoryError> {
+    let mut sums: BTreeMap<(NaiveDate, ProjectKey), [u64; 4]> = BTreeMap::new();
+    for hosted in history.read::<TokenRecord>(month, &Hosts::All)?.records {
+        let record = hosted.record;
+        let day = record.t.date_naive();
+        let project = project_text(&record.project);
+        let total = sums.entry((day, record.project)).or_insert([0; 4]);
+        for (sum, value) in total
+            .iter_mut()
+            .zip([record.input, record.out, record.cw, record.cr])
+        {
+            *sum = sum.checked_add(value).ok_or_else(|| {
+                failed(
+                    history.root(),
+                    io::ErrorKind::InvalidData,
+                    format!("the token counts of {day} in {project} are too large to add up"),
+                )
+            })?;
+        }
+    }
+    Ok(sums
+        .into_iter()
+        .map(|((day, project), counts)| TokenDayRow::of(day, project, counts))
+        .collect())
+}
+
+/// The export as CSV: one header line, one `window` line per window record of
+/// the range, one `tokens` line per UTC day and project key, every host. Fields
+/// are quoted RFC 4180 style; a field that does not apply to a line is empty.
+/// Each month is read as it is written, so memory holds one month plus one row.
+pub fn export_csv(
+    history: &HistoryDir,
+    range: &Range,
+    out: &mut dyn Write,
+) -> Result<(), HistoryError> {
+    out.write_all(EXPORT_COLUMNS.join(",").as_bytes())
+        .map_err(|source| export_io(history, source))?;
+    out.write_all(b"\n")
+        .map_err(|source| export_io(history, source))?;
+    for month in months_in(history, Kind::Windows, range)? {
+        for hosted in history.read::<WindowRecord>(&month, &Hosts::All)?.records {
+            let row = WindowRow::of(hosted.record);
+            out.write_all(csv_line(&row.fields()).as_bytes())
+                .map_err(|source| export_io(history, source))?;
+        }
+    }
+    for month in months_in(history, Kind::Tokens, range)? {
+        for row in token_rows_of_month(history, &month)? {
+            out.write_all(csv_line(&row.fields()).as_bytes())
+                .map_err(|source| export_io(history, source))?;
+        }
+    }
+    Ok(())
+}
+
+/// The same rows as [`export_csv`], as one JSON object
+/// `{"windows":[…],"dailyTokens":[…]}`. The rows are written as they are made.
+pub fn export_json(
+    history: &HistoryDir,
+    range: &Range,
+    out: &mut dyn Write,
+) -> Result<(), HistoryError> {
+    let encode = |error: serde_json::Error| {
+        failed(
+            history.root(),
+            io::ErrorKind::InvalidData,
+            format!("cannot encode the export: {error}"),
+        )
+    };
+    out.write_all(b"{\"windows\":[")
+        .map_err(|source| export_io(history, source))?;
+    let mut first = true;
+    for month in months_in(history, Kind::Windows, range)? {
+        for hosted in history.read::<WindowRecord>(&month, &Hosts::All)?.records {
+            if !first {
+                out.write_all(b",")
+                    .map_err(|source| export_io(history, source))?;
+            }
+            first = false;
+            let row = WindowRow::of(hosted.record);
+            serde_json::to_writer(&mut *out, &row).map_err(encode)?;
+        }
+    }
+    out.write_all(b"],\"dailyTokens\":[")
+        .map_err(|source| export_io(history, source))?;
+    first = true;
+    for month in months_in(history, Kind::Tokens, range)? {
+        for row in token_rows_of_month(history, &month)? {
+            if !first {
+                out.write_all(b",")
+                    .map_err(|source| export_io(history, source))?;
+            }
+            first = false;
+            serde_json::to_writer(&mut *out, &row).map_err(encode)?;
+        }
+    }
+    out.write_all(b"]}\n")
+        .map_err(|source| export_io(history, source))
+}
+
+/// A project key as the export writes it: the key as stored, `repo:<id>` or
+/// `folder:<id>`. A name the projects log gives it is never used: an export is
+/// raw data, and a name changes.
+fn project_text(key: &ProjectKey) -> String {
+    match key {
+        ProjectKey::Repo(id) => format!("repo:{id}"),
+        ProjectKey::Folder(id) => format!("folder:{id}"),
+    }
+}
+
+/// One CSV line, its fields quoted RFC 4180 style when they hold a comma, a
+/// quote or a line break.
+fn csv_line(fields: &[String]) -> String {
+    let mut line = String::new();
+    for (index, field) in fields.iter().enumerate() {
+        if index > 0 {
+            line.push(',');
+        }
+        let needs_quotes = field.contains(',')
+            || field.contains('"')
+            || field.contains('\n')
+            || field.contains('\r');
+        if needs_quotes {
+            line.push('"');
+            line.push_str(&field.replace('"', "\"\""));
+            line.push('"');
+        } else {
+            line.push_str(field);
+        }
+    }
+    line.push('\n');
+    line
+}
+
+/// A moment in the export: UTC, RFC 3339, with the sub-second digits only when
+/// the record has them.
+fn time_text(time: DateTime<Utc>) -> String {
+    time.to_rfc3339_opts(SecondsFormat::AutoSi, true)
+}
+
+/// A number in the export, without a trailing `.0` for a whole percentage.
+fn number_text(value: f64) -> String {
+    format!("{value}")
 }

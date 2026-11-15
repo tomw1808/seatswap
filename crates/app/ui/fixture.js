@@ -457,11 +457,57 @@ function makeFixture() {
       },
     ],
     projectLog: [],
+    // The History and hosts group (spec §1.5, §3.7): the host folders of the
+    // history, and the files an export in this browser has "written".
+    history: {
+      host: "atlas",
+      dir: "~/Sync/seatswap-history",
+      hosts: [
+        {
+          host: "atlas",
+          thisHost: true,
+          firstRecord: isoIn(-100 * day),
+          lastRecord: isoIn(-2 * 60000),
+          bytes: 3040870,
+        },
+        {
+          host: "vega",
+          thisHost: false,
+          firstRecord: isoIn(-72 * day),
+          lastRecord: isoIn(-3 * hour),
+          bytes: 1258291,
+        },
+      ],
+      bytes: 4299161,
+    },
+    exports: [],
     settings: Object.assign({}, DEFAULT_SETTINGS, {
       autoBurn: true,
       suggestSwitches: true,
     }),
   };
+}
+
+// The history view as the app opened it, plus the saved settings' values when
+// they differ: a restart would use those, as the real command reports.
+function fixtureHistoryView(fixture) {
+  const view = clone(fixture.history);
+  const settings = fixture.settings || {};
+  const host =
+    typeof settings.hostName === "string" ? settings.hostName.trim() : "";
+  view.savedHost = host !== "" && host !== view.host ? host : null;
+  const dir =
+    typeof settings.historyDir === "string" ? settings.historyDir.trim() : "";
+  view.savedDir = dir !== "" && dir !== view.dir ? dir : null;
+  view.bytes = view.hosts.reduce((total, host) => total + (Number(host.bytes) || 0), 0);
+  return view;
+}
+
+// The command's `expand_tilde`: `~/…` is the fixture's home folder.
+function fixtureExpand(path) {
+  if (path === "~") return "/home/sam";
+  if (path.startsWith("~/")) return `/home/sam/${path.slice(2)}`;
+  return path;
 }
 
 // The money view with the fixture's current settings, as the Rust thread would
@@ -1328,6 +1374,64 @@ export async function fixtureInvoke(command, args) {
     case "projects_edit": {
       fixtureEditProject(fixture, args.edit);
       return clone(fixtureResolveProjects(fixture));
+    }
+
+    case "history_view":
+      return fixtureHistoryView(fixture);
+
+    case "history_import": {
+      const from = fixtureExpand(String(args.from || "").trim());
+      if (from === "") throw new Error("enter a folder path");
+      if (!from.startsWith("/")) {
+        throw new Error(`the folder must be an absolute path, got ${from}`);
+      }
+      const folders = from.replace(/\/+$/, "").split("/");
+      const name = String(folders[folders.length - 1] || "").toLowerCase();
+      // The history folder itself, as the group shows it ("~" is the home folder).
+      const own = fixtureHistoryView(fixture).dir.replace(/^~/, "/home/sam");
+      if (from.replace(/\/+$/, "") === own || name === fixture.history.host) {
+        throw new Error(`${from}: that is this history folder`);
+      }
+      if (!/^[a-z0-9][a-z0-9._-]*$/.test(name)) {
+        throw new Error(`no host folder found in ${from}`);
+      }
+      const known = fixture.history.hosts.find((host) => host.host === name);
+      const copied = [];
+      if (!known) {
+        fixture.history.hosts.push({
+          host: name,
+          thisHost: false,
+          firstRecord: isoIn(-30 * 86400000),
+          lastRecord: isoIn(-60000),
+          bytes: 734003,
+        });
+        copied.push(name);
+      } else {
+        // One more file arrived from that host.
+        known.bytes += 262144;
+        known.lastRecord = isoIn(-30000);
+        copied.push(name);
+      }
+      fixture.history.hosts.sort((one, other) => (one.host < other.host ? -1 : 1));
+      return { copied, view: fixtureHistoryView(fixture) };
+    }
+
+    case "history_export": {
+      const format = String(args.format || "");
+      if (format !== "csv" && format !== "json") {
+        throw new Error(`unknown export format ${JSON.stringify(format)}: use "csv" or "json"`);
+      }
+      const to = fixtureExpand(String(args.to || "").trim());
+      if (to === "") throw new Error("enter a file path");
+      if (!to.startsWith("/")) throw new Error(`the export path must be an absolute path, got ${to}`);
+      const from = args.from ? Date.parse(String(args.from)) : null;
+      const until = args.until ? Date.parse(String(args.until)) : null;
+      if (from !== null && until !== null && !(from < until)) {
+        throw new Error(`from ${args.from} is not before until ${args.until}`);
+      }
+      if (fixture.exports.includes(to)) throw new Error(`${to} exists; choose another name`);
+      fixture.exports.push(to);
+      return null;
     }
 
     case "fit_panel":

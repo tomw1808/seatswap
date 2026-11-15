@@ -17,8 +17,12 @@ use tauri::{
     WebviewWindowBuilder, WindowEvent,
 };
 
+use seatswap_core::atomic::{self, Access};
 use seatswap_core::engine::PollReason;
-use seatswap_core::history::{By, Event, EventKind, HistoryDir, Hosts, Range, SessionRecord};
+use seatswap_core::history::{
+    export_csv, export_json, By, Event, EventKind, HistoryDir, HostInfo, Hosts, Range,
+    SessionRecord,
+};
 use seatswap_core::money::ModelPrice;
 use seatswap_core::projects::{ProjectEdit, Projects, ProjectsLogRecord};
 use seatswap_core::store::{self, Account, Settings};
@@ -29,7 +33,7 @@ use super::lookup_rt::{price_rows, MoneyView, PriceRow};
 use super::worker::{ActionCommand, ActionReply, EngineCommand, Snapshot};
 use super::GuiState;
 use crate::agent_skill::{self, SkillStatus};
-use crate::format::with_tilde;
+use crate::format::{expand_tilde, with_tilde};
 use crate::icon::{self, IconSpec};
 
 /// Window label used by `tauri.conf.json`'s capability and by every command.
@@ -654,6 +658,7 @@ pub(crate) async fn save_settings(
     settings: Settings,
 ) -> Result<(), String> {
     let action = state.action.clone();
+    let saved = settings.clone();
     let reply = tauri::async_runtime::spawn_blocking(move || {
         request(&action, |reply| ActionCommand::SaveSettings {
             settings,
@@ -663,7 +668,10 @@ pub(crate) async fn save_settings(
     .await
     .map_err(|error| error.to_string())??;
     match reply {
-        ActionReply::Done => Ok(()),
+        ActionReply::Done => {
+            state.remember_settings(saved);
+            Ok(())
+        }
         ActionReply::Failed(message) => Err(message),
         _ => Err("the action thread gave an unexpected reply".to_string()),
     }
@@ -753,18 +761,10 @@ pub(crate) struct AgentCallRow {
     pub allowed: bool,
 }
 
-/// The history folder and host the app already uses; a settings file that is
-/// not loaded or a folder that cannot be named is the error text.
+/// The history folder the tray app opened at startup, the one its recorder
+/// keeps writing to; a folder that could not be opened is the error text.
 fn history_of(state: &GuiState) -> Result<HistoryDir, String> {
-    let snapshot = state.snapshot()?;
-    let settings = snapshot
-        .settings
-        .ok_or_else(|| "the settings are not loaded; cannot find the history folder".to_string())?;
-    let root = seatswap_core::paths::history_root(settings.history_dir.as_deref(), &state.app)
-        .map_err(|error| error.to_string())?;
-    let host = seatswap_core::paths::host_name(settings.host_name.as_deref())
-        .map_err(|error| error.to_string())?;
-    Ok(HistoryDir::at(&root, &host))
+    state.history.clone()
 }
 
 /// The `AgentCall` events of this host, newest first, at most `limit` of them,
@@ -933,6 +933,178 @@ pub(crate) async fn projects_edit(
         Utc::now(),
         edit,
     )
+}
+
+// ---------------------------------------------------------------------------
+// History and hosts (spec §1.5, §3.7; step C1 task 7)
+// ---------------------------------------------------------------------------
+
+/// What the Settings page's History and hosts group shows: this host's name,
+/// the folder the history is read from, and every host folder in it, this host
+/// included even before it holds a record. `saved_host` and `saved_dir` are the
+/// saved settings' values when they differ from the ones in effect: a restart
+/// makes those take effect.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct HistoryView {
+    host: String,
+    dir: String,
+    hosts: Vec<HostInfo>,
+    bytes: u64,
+    saved_host: Option<String>,
+    saved_dir: Option<String>,
+}
+
+/// What an import copied and the folder afterwards.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ImportResult {
+    copied: Vec<String>,
+    view: HistoryView,
+}
+
+/// The saved settings' host name and folder when they differ from the ones the
+/// recorder opened at startup; `None` when they agree or no settings are loaded.
+fn saved_history(
+    state: &GuiState,
+    history: &HistoryDir,
+) -> Result<(Option<String>, Option<String>), String> {
+    let snapshot = state.snapshot()?;
+    let Some(settings) = snapshot.settings else {
+        return Ok((None, None));
+    };
+    let host = seatswap_core::paths::host_name(settings.host_name.as_deref())
+        .map_err(|error| error.to_string())?;
+    let root = seatswap_core::paths::history_root(settings.history_dir.as_deref(), &state.app)
+        .map_err(|error| error.to_string())?;
+    Ok((
+        (host != history.host()).then_some(host),
+        (root != history.root()).then(|| with_tilde(&root.to_string_lossy(), &state.claude.home)),
+    ))
+}
+
+fn history_view_of(
+    history: &HistoryDir,
+    home: &Path,
+    saved_host: Option<String>,
+    saved_dir: Option<String>,
+) -> Result<HistoryView, String> {
+    let hosts = history.host_infos().map_err(|error| error.to_string())?;
+    let bytes = hosts
+        .iter()
+        .try_fold(0u64, |total, info| total.checked_add(info.bytes))
+        .ok_or_else(|| "the host folders add up to more than 2^64 bytes".to_string())?;
+    Ok(HistoryView {
+        host: history.host().to_string(),
+        dir: with_tilde(&history.root().to_string_lossy(), home),
+        hosts,
+        bytes,
+        saved_host,
+        saved_dir,
+    })
+}
+
+/// The history view of the folder in effect, with the saved values that a
+/// restart would use.
+fn history_view_for(state: &GuiState, history: &HistoryDir) -> Result<HistoryView, String> {
+    let (saved_host, saved_dir) = saved_history(state, history)?;
+    history_view_of(history, &state.claude.home, saved_host, saved_dir)
+}
+
+/// The Settings page's History and hosts group.
+#[tauri::command]
+pub(crate) async fn history_view(state: State<'_, GuiState>) -> Result<HistoryView, String> {
+    let history = history_of(&state)?;
+    history_view_for(&state, &history)
+}
+
+/// Copy another history folder's host folders in and show what the folder holds
+/// afterwards. A folder that is this history folder, or that holds no host
+/// folder, is an error.
+#[tauri::command]
+pub(crate) async fn history_import(
+    state: State<'_, GuiState>,
+    from: String,
+) -> Result<ImportResult, String> {
+    let history = history_of(&state)?;
+    let from = expand_tilde(&from, &state.claude.home);
+    if !from.is_absolute() {
+        return Err(format!(
+            "the folder must be an absolute path, got {}",
+            from.display()
+        ));
+    }
+    let copied = history.import(&from).map_err(|error| error.to_string())?;
+    let view = history_view_for(&state, &history)?;
+    Ok(ImportResult { copied, view })
+}
+
+/// The range an export covers: `from` inclusive, `until` exclusive, either end
+/// open when it is `None`.
+fn export_range(
+    from: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+) -> Result<Range, String> {
+    let range = Range {
+        from: from.unwrap_or(DateTime::<Utc>::MIN_UTC),
+        to: until.unwrap_or(DateTime::<Utc>::MAX_UTC),
+    };
+    if range.from >= range.to {
+        return Err(format!(
+            "from {} is not before until {}",
+            range.from.to_rfc3339(),
+            range.to.to_rfc3339()
+        ));
+    }
+    Ok(range)
+}
+
+/// Write the history of the range to `to` as CSV or JSON. An existing file is
+/// refused, never overwritten; the file is written through `atomic`, so a
+/// reader never sees half of it.
+fn export_history(
+    history: &HistoryDir,
+    format: &str,
+    to: &Path,
+    from: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+) -> Result<(), String> {
+    let range = export_range(from, until)?;
+    if !to.is_absolute() {
+        return Err(format!(
+            "the export path must be an absolute path, got {}",
+            to.display()
+        ));
+    }
+    if to.exists() {
+        return Err(format!("{} exists; choose another name", to.display()));
+    }
+    let mut bytes = Vec::new();
+    match format {
+        "csv" => export_csv(history, &range, &mut bytes),
+        "json" => export_json(history, &range, &mut bytes),
+        other => {
+            return Err(format!(
+                "unknown export format {other:?}: use \"csv\" or \"json\""
+            ))
+        }
+    }
+    .map_err(|error| error.to_string())?;
+    atomic::write_atomic(to, &bytes, Access::Private)
+        .map_err(|source| format!("{}: {source}", to.display()))
+}
+
+/// Write the history as CSV or JSON to a file the person names.
+#[tauri::command]
+pub(crate) async fn history_export(
+    state: State<'_, GuiState>,
+    format: String,
+    to: String,
+    from: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+) -> Result<(), String> {
+    let to = expand_tilde(&to, &state.claude.home);
+    export_history(&history_of(&state)?, &format, &to, from, until)
 }
 
 #[derive(Debug, Serialize)]
@@ -1508,6 +1680,38 @@ mod tests {
             serde_json::json!({ "at": "tomorrow", "style": "clock" }),
         );
         assert!(bad_time.is_err());
+    }
+
+    #[test]
+    fn history_export_refuses_an_existing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let out = dir.path().join("seatswap-history.csv");
+        fs::write(&out, "an older export").expect("an existing file");
+
+        let error = export_history(&history, "csv", &out, None, None)
+            .expect_err("an existing file is refused");
+        assert!(error.contains(&out.display().to_string()), "{error}");
+        assert!(error.contains("exists; choose another name"), "{error}");
+        assert_eq!(
+            fs::read_to_string(&out).expect("the file"),
+            "an older export",
+            "the file is never overwritten"
+        );
+
+        // A new name gets the header and this host's empty history.
+        let fresh = dir.path().join("seatswap-history-2.csv");
+        export_history(&history, "csv", &fresh, None, None).expect("the export is written");
+        assert_eq!(
+            fs::read_to_string(&fresh).expect("the export"),
+            "kind,account,org,limit,model,start,end,percent,day_utc,project,input,output,cache_write,cache_read\n"
+        );
+
+        // The format is checked before anything is written.
+        let error = export_history(&history, "xml", &dir.path().join("x.xml"), None, None)
+            .expect_err("an unknown format");
+        assert!(error.contains("unknown export format"), "{error}");
+        assert!(!dir.path().join("x.xml").exists());
     }
 
     #[test]

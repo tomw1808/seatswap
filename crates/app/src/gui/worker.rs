@@ -29,10 +29,9 @@ use seatswap_core::engine::{
     AccountView, Engine, EngineError, LoginWarning, PollReason, UsageCache,
 };
 use seatswap_core::feed;
-#[cfg(test)]
-use seatswap_core::history::HistoryDir;
 use seatswap_core::history::{
-    AccountRef, By, Event, EventKind, HistoryError, Hosts, Range, Recorder, SessionCounts,
+    AccountRef, By, Event, EventKind, HistoryDir, HistoryError, Hosts, Range, Recorder,
+    SessionCounts,
 };
 use seatswap_core::locks::{self, LockError};
 use seatswap_core::paths::{AppPaths, ClaudePaths};
@@ -339,6 +338,9 @@ pub(crate) struct Worker {
     pub sessions: Option<SessionsHandle>,
     /// The look-up thread runs whatever `lookUpPrices` says.
     pub lookup: Option<LookupHandle>,
+    /// The history folder the recorder opened at startup. Every reader uses
+    /// this one; a changed setting takes effect after a restart.
+    pub history: Result<seatswap_core::history::HistoryDir, String>,
 }
 
 pub(crate) fn spawn(
@@ -351,12 +353,21 @@ pub(crate) fn spawn(
     let (engine_tx, engine_rx) = mpsc::channel::<EngineCommand>();
     let (action_tx, action_rx) = mpsc::channel::<ActionCommand>();
 
+    // The one history folder this run uses: the recorder's and every read's.
+    // Opening it here means a changed `hostName` or `historyDir` is not read
+    // from a newer snapshot while the recorder still writes the old folder.
+    let history = match settings.as_ref() {
+        Some(settings) => ops::open_history(&app, settings).map(|recorder| recorder.dir().clone()),
+        None => Err(ops::history_unwritable(&"the settings are not loaded")),
+    };
+
     let action_engine = engine_tx.clone();
     let engine_action = action_tx.clone();
     let engine_commands = engine_tx.clone();
     let engine_app = app.clone();
     let engine_claude = claude.clone();
     let engine_ui = ui.clone();
+    let engine_history = history.clone();
     thread::Builder::new()
         .name("seatswap-engine".to_string())
         .spawn(move || {
@@ -366,6 +377,7 @@ pub(crate) fn spawn(
                 engine_ui,
                 engine_action,
                 engine_commands,
+                engine_history,
             )
             .run(engine_rx)
         })
@@ -389,12 +401,19 @@ pub(crate) fn spawn(
         .unwrap_or_else(|| Arc::new(Mutex::new(None)));
 
     let action_claude = claude;
+    let action_history = history.clone();
     thread::Builder::new()
         .name("seatswap-action".to_string())
         .spawn(move || {
-            ActionRuntime::new(app, action_claude, autostart_args, action_engine)
-                .with_sessions(latest)
-                .run(action_rx)
+            ActionRuntime::new(
+                app,
+                action_claude,
+                autostart_args,
+                action_engine,
+                action_history,
+            )
+            .with_sessions(latest)
+            .run(action_rx)
         })
         .map_err(|error| format!("cannot start the action thread: {error}"))?;
 
@@ -403,6 +422,7 @@ pub(crate) fn spawn(
         action: action_tx,
         sessions,
         lookup,
+        history,
     })
 }
 
@@ -507,12 +527,12 @@ struct OpenedEngine {
     history_error: Option<String>,
 }
 
-fn open_engine(app: &AppPaths, claude: &ClaudePaths) -> Result<OpenedEngine, String> {
+fn open_engine(
+    app: &AppPaths,
+    claude: &ClaudePaths,
+    history: &Result<HistoryDir, String>,
+) -> Result<OpenedEngine, String> {
     let (store, mut warning) = store::open_store(app.clone()).map_err(|error| error.to_string())?;
-    // The settings only choose where the history goes; a failed load here must
-    // not keep the engine from opening. It opens without a recorder, and
-    // `history_error` says why.
-    let settings = store.load().map(|file| file.settings);
     let (engine, notice) = match Engine::new(claude.clone(), store, Api::new()) {
         Ok(engine) => (engine, None),
         Err(EngineError::CacheCorrupt { .. }) => {
@@ -532,12 +552,9 @@ fn open_engine(app: &AppPaths, claude: &ClaudePaths) -> Result<OpenedEngine, Str
         }
         Err(error) => return Err(error.to_string()),
     };
-    let (engine, history_error) = match &settings {
-        Ok(settings) => match ops::open_history(app, settings) {
-            Ok(recorder) => (engine.with_recorder(recorder), None),
-            Err(error) => (engine, Some(error)),
-        },
-        Err(error) => (engine, Some(ops::history_unwritable(error))),
+    let (engine, history_error) = match history {
+        Ok(dir) => (engine.with_recorder(Recorder::new(dir.clone())), None),
+        Err(error) => (engine, Some(error.clone())),
     };
     Ok(OpenedEngine {
         engine,
@@ -552,6 +569,8 @@ struct EngineRuntime {
     claude: ClaudePaths,
     ui: Sender<UiEvent>,
     engine: Option<Engine<Api>>,
+    /// The history folder opened at startup, shared with every other reader.
+    history: Result<HistoryDir, String>,
     secrets_warning: Option<String>,
     /// The engine-wide error of the last open/poll attempt.
     open_error: Option<String>,
@@ -596,12 +615,14 @@ impl EngineRuntime {
         ui: Sender<UiEvent>,
         action: Sender<ActionCommand>,
         engine: Sender<EngineCommand>,
+        history: Result<HistoryDir, String>,
     ) -> EngineRuntime {
         let mut runtime = EngineRuntime {
             app,
             claude,
             ui,
             engine: None,
+            history,
             secrets_warning: None,
             open_error: None,
             history_error: None,
@@ -699,7 +720,7 @@ impl EngineRuntime {
     /// Open the store and the engine. False when this failed; the message is in
     /// `open_error` and reaches the next snapshot.
     fn open(&mut self) -> bool {
-        match open_engine(&self.app, &self.claude) {
+        match open_engine(&self.app, &self.claude, &self.history) {
             Ok(opened) => {
                 self.engine = Some(opened.engine);
                 self.history_error = opened.history_error;
@@ -1028,12 +1049,10 @@ impl ActionRuntime {
         claude: ClaudePaths,
         autostart_args: Vec<String>,
         engine: Sender<EngineCommand>,
+        history: Result<HistoryDir, String>,
     ) -> ActionRuntime {
         let loaded = store::load_accounts(&app);
-        let history = match &loaded {
-            Ok(file) => ops::open_history(&app, &file.settings),
-            Err(error) => Err(ops::history_unwritable(error)),
-        };
+        let history = history.map(Recorder::new);
         let live = loaded.ok().and_then(|file| {
             switcher::live_state(&claude, &file)
                 .ok()
@@ -1864,6 +1883,11 @@ mod tests {
             }
         }
 
+        fn history(&self) -> Result<seatswap_core::history::HistoryDir, String> {
+            let file = store::load_accounts(&self.app).map_err(|error| error.to_string())?;
+            ops::open_history(&self.app, &file.settings).map(|recorder| recorder.dir().clone())
+        }
+
         fn engine(&self) -> Engine<FakeRemote> {
             let store = Store::new(
                 self.app.clone(),
@@ -2097,7 +2121,9 @@ mod tests {
         let fixture = Fixture::new();
         fs::remove_file(&fixture.claude.credentials_file).expect("remove credentials");
         let (engine, _engine_rx) = mpsc::channel();
-        let mut action = ActionRuntime::new(fixture.app, fixture.claude, Vec::new(), engine);
+        let history = fixture.history();
+        let mut action =
+            ActionRuntime::new(fixture.app, fixture.claude, Vec::new(), engine, history);
         match action.save_current(None) {
             ActionReply::Failed(message) => {
                 assert!(message.contains("no live login"), "{message}");
@@ -2114,11 +2140,13 @@ mod tests {
     fn a_toggle_writes_auto_burn_set() {
         let fixture = Fixture::new();
         let (engine, _engine_rx) = mpsc::channel();
+        let history = fixture.history();
         let mut action = ActionRuntime::new(
             fixture.app.clone(),
             fixture.claude.clone(),
             Vec::new(),
             engine,
+            history,
         );
         let off = Settings {
             auto_burn: false,
@@ -2173,11 +2201,13 @@ mod tests {
     fn a_changed_price_is_written_to_the_history() {
         let fixture = Fixture::new();
         let (engine, _engine_rx) = mpsc::channel();
+        let history = fixture.history();
         let mut action = ActionRuntime::new(
             fixture.app.clone(),
             fixture.claude.clone(),
             Vec::new(),
             engine,
+            history,
         );
         let reply = action.edit(
             &fixture.account.id,
@@ -2232,11 +2262,13 @@ mod tests {
         store.save(&file).expect("the stale plan is stored");
 
         let (engine, _engine_rx) = mpsc::channel();
+        let history = fixture.history();
         let mut action = ActionRuntime::new(
             fixture.app.clone(),
             fixture.claude.clone(),
             Vec::new(),
             engine,
+            history,
         );
         action.sync_live();
 
@@ -2271,11 +2303,13 @@ mod tests {
     fn an_unchanged_price_is_not_written_to_the_history() {
         let fixture = Fixture::new();
         let (engine, _engine_rx) = mpsc::channel();
+        let history = fixture.history();
         let mut action = ActionRuntime::new(
             fixture.app.clone(),
             fixture.claude.clone(),
             Vec::new(),
             engine,
+            history,
         );
         let host = seatswap_core::paths::host_name(None).expect("the host name");
         let history = HistoryDir::at(&fixture.app.history_dir(), &host);
@@ -2373,8 +2407,15 @@ mod tests {
 
         let (sender, _receiver) = mpsc::channel();
         let (action, engine_commands) = burn_channels();
-        let runtime =
-            EngineRuntime::new(fixture.app, fixture.claude, sender, action, engine_commands);
+        let history = fixture.history();
+        let runtime = EngineRuntime::new(
+            fixture.app,
+            fixture.claude,
+            sender,
+            action,
+            engine_commands,
+            history,
+        );
         let error = runtime
             .snapshot
             .error
@@ -2390,7 +2431,8 @@ mod tests {
         let fixture = Fixture::new();
         fs::write(fixture.app.usage_cache_file(), b"{ not json").expect("corrupt cache");
 
-        let opened = open_engine(&fixture.app, &fixture.claude).expect("the engine reopens");
+        let opened = open_engine(&fixture.app, &fixture.claude, &fixture.history())
+            .expect("the engine reopens");
         let message = opened.notice.expect("a notice names the moved cache");
         assert!(message.contains("usage cache was unreadable"), "{message}");
         assert!(message.contains("usage is fetched again"), "{message}");
@@ -2418,8 +2460,15 @@ mod tests {
         fs::write(fixture.app.usage_cache_file(), b"{ not json").expect("corrupt cache");
         let (sender, _receiver) = mpsc::channel();
         let (action, engine_commands) = burn_channels();
-        let runtime =
-            EngineRuntime::new(fixture.app, fixture.claude, sender, action, engine_commands);
+        let history = fixture.history();
+        let runtime = EngineRuntime::new(
+            fixture.app,
+            fixture.claude,
+            sender,
+            action,
+            engine_commands,
+            history,
+        );
         assert!(runtime.engine.is_some(), "the engine reopened");
         let error = runtime
             .snapshot
@@ -2445,8 +2494,15 @@ mod tests {
 
         let (sender, _receiver) = mpsc::channel();
         let (action, engine_commands) = burn_channels();
-        let runtime =
-            EngineRuntime::new(fixture.app, fixture.claude, sender, action, engine_commands);
+        let history = fixture.history();
+        let runtime = EngineRuntime::new(
+            fixture.app,
+            fixture.claude,
+            sender,
+            action,
+            engine_commands,
+            history,
+        );
         assert!(runtime.engine.is_none(), "the engine could not open");
         assert_eq!(
             runtime
@@ -2469,8 +2525,15 @@ mod tests {
         fs::write(fixture.app.accounts_file(), b"{ not json").expect("corrupt accounts");
         let (sender, _receiver) = mpsc::channel();
         let (action, engine_commands) = burn_channels();
-        let runtime =
-            EngineRuntime::new(fixture.app, fixture.claude, sender, action, engine_commands);
+        let history = fixture.history();
+        let runtime = EngineRuntime::new(
+            fixture.app,
+            fixture.claude,
+            sender,
+            action,
+            engine_commands,
+            history,
+        );
         assert!(runtime.snapshot.settings.is_none());
         let error = runtime.snapshot.error.expect("an error is shown");
         assert!(error.contains("accounts.json"), "{error}");
@@ -2667,6 +2730,7 @@ mod tests {
             claude: fixture.claude.clone(),
             ui,
             engine: Some(engine),
+            history: fixture.history(),
             secrets_warning: None,
             open_error: None,
             history_error: None,
@@ -2722,6 +2786,7 @@ mod tests {
             claude: fixture.claude.clone(),
             ui,
             engine: Some(engine),
+            history: fixture.history(),
             secrets_warning: None,
             open_error: None,
             history_error: None,

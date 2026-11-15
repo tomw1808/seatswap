@@ -1005,3 +1005,36 @@ button.link:hover {
   padding-top: 6px;
 }
 
+/* ---------- the History and hosts group (spec §1.5, §3.7) ---------- */
+
+.hist-hosts {
+  padding-bottom: 2px;
+}
+
+.hist-grid {
+  grid-template-columns: 120px 150px minmax(0, 1fr) 90px;
+}
+
+.hist-size {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.hist-export,
+.hist-import {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.hist-buttons {
+  display: inline-flex;
+  gap: 6px;
+}
+
+.hist-export .inp,
+.hist-import .inp {
+  width: 250px;
+  min-width: 0;
+}

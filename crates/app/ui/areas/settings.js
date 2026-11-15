@@ -83,6 +83,15 @@ const state = {
   projects: null,
   projectsError: null,
   projectsToken: 0,
+  // The host folders of the history (spec §1.5), the view loaded when the
+  // group is opened, and what the export and import rows are holding.
+  history: null,
+  historyError: null,
+  historyToken: 0,
+  exportPath: "",
+  exportResult: "",
+  importFolder: "",
+  importResult: "",
 };
 
 // A snapshot read before a save landed must not undo it: while saves are
@@ -113,6 +122,7 @@ export async function render(container, context) {
   const snapshot = isObject(context.snapshot) ? context.snapshot : {};
   const parsed = groupFrom(context.sub);
   const group = parsed.group;
+  const groupChanged = group !== state.group;
   const sameTarget = state.sub === context.sub;
   state.sub = context.sub;
   if (parsed.item && !sameTarget) {
@@ -138,6 +148,9 @@ export async function render(container, context) {
   listenMoney(context);
   await loadMoney(context);
   if (group === "accounts" || group === "projects") await loadProjects();
+  // The hosts table is read once when the group opens; a snapshot in between
+  // redraws it from the stored view.
+  if (group === "history" && groupChanged) await loadHistory();
 
   clear(container);
   const right = h("div", { class: "col settings-col" });
@@ -191,7 +204,17 @@ function renderGroup(right, id) {
     right.appendChild(panel("Settings", "", [message("Unknown setting group.")]));
     return;
   }
-  if (!["general", "accounts", "auto-burn", "notifications", "projects", "agents"].includes(id)) {
+  if (
+    ![
+      "general",
+      "accounts",
+      "auto-burn",
+      "notifications",
+      "projects",
+      "agents",
+      "history",
+    ].includes(id)
+  ) {
     right.appendChild(panel(labelOf(id), "", [message(NOT_YET)]));
     return;
   }
@@ -200,6 +223,7 @@ function renderGroup(right, id) {
   else if (id === "auto-burn") right.appendChild(autoBurnCard());
   else if (id === "notifications") right.appendChild(notificationsCard());
   else if (id === "projects") right.appendChild(projectsCard());
+  else if (id === "history") right.appendChild(historyCard());
   else right.appendChild(agentsCard());
 }
 
@@ -2199,4 +2223,276 @@ async function renderCalls(container, rows) {
       )
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// History and hosts (spec §1.5, §3.7; step C1 task 7)
+// ---------------------------------------------------------------------------
+
+const RESTART_NOTE = "takes effect after the tray app restarts";
+// The mock-up's line: a host whose last record is older than this is amber.
+const HOST_STALE_MS = 15 * 60000;
+
+function historyCard() {
+  const view = isObject(state.history) ? state.history : null;
+  const card = panel("History and hosts", "what seatswap has recorded, and where", []);
+  const body = card.querySelector(".settings-body");
+
+  body.appendChild(section("This host"));
+  body.appendChild(
+    restartField(
+      "hostName",
+      "Name of this host",
+      view && typeof view.host === "string" ? view.host : "",
+      "must be different on every host",
+      Boolean(view && typeof view.savedHost === "string")
+    )
+  );
+  body.appendChild(
+    restartField(
+      "historyDir",
+      "History folder",
+      view && typeof view.dir === "string" ? view.dir : "",
+      "a synced folder shares it with your other hosts",
+      Boolean(view && typeof view.savedDir === "string")
+    )
+  );
+
+  body.appendChild(section("Hosts found in the folder"));
+  const hosts = h("div", { class: "col hist-hosts" });
+  body.appendChild(hosts);
+  renderHosts(hosts, view, state.historyError);
+
+  body.appendChild(
+    note([
+      h("b", { text: "Each host writes only its own subfolder," }),
+      " so two hosts can never overwrite each other. ",
+      h("b", { text: "Logins are never put here:" }),
+      " a login copied to another host would log this one out.",
+    ])
+  );
+
+  body.appendChild(section("Export and import"));
+  body.appendChild(exportRow());
+  body.appendChild(importRow());
+  return card;
+}
+
+// A field whose new value only reaches the tray app when it restarts. The
+// restart note shows exactly when the saved value differs from the one in
+// effect, as the view says.
+function restartField(field, label, placeholder, baseNote, differs) {
+  const value = savedValue(field);
+  const input = textInput({
+    value: value === null || value === undefined ? "" : String(value),
+    placeholder,
+    "aria-label": label,
+  });
+  input.className = "inp tall";
+  const noteNode = h("span", { class: "mf" });
+  const showNote = () => {
+    noteNode.textContent = differs ? RESTART_NOTE : baseNote;
+  };
+  input.addEventListener("change", async () => {
+    const raw = input.value.trim();
+    const next = raw === "" ? null : raw;
+    const ok = await saveField(field, next);
+    if (!ok) {
+      input.value = savedValue(field) || "";
+      showNote();
+      return;
+    }
+    input.value = next || "";
+    // The saved value now differs from the one in effect; read the view again
+    // so the note and the placeholders come from the command, not the page.
+    await loadHistory();
+    if (state.group === "history" && state.right) renderGroup(state.right, "history");
+  });
+  showNote();
+  return setting(label, input, noteNode, field);
+}
+
+// Read the host folders when the group opens, after an import and after a
+// saved host name or folder. A snapshot render in between uses the stored view.
+async function loadHistory() {
+  if (!state.context) return;
+  const token = ++state.historyToken;
+  try {
+    const view = await state.context.invoke("history_view", {});
+    if (token !== state.historyToken) return;
+    if (!isObject(view)) throw new Error("history_view returned an unexpected reply");
+    state.history = view;
+    state.historyError = null;
+  } catch (error) {
+    if (token !== state.historyToken) return;
+    state.historyError = errorMessage(error);
+  }
+}
+
+// The hosts table: Host · Last record · Since · Size, 28 px rows as the mock-up.
+function renderHosts(container, view, error) {
+  clear(container);
+  const rows = isObject(view) && Array.isArray(view.hosts) ? view.hosts : [];
+  if (error && rows.length === 0) {
+    container.appendChild(message(error));
+    return;
+  }
+  container.appendChild(
+    h("div", { class: "lr hd hist-grid" }, [
+      h("span", { text: "Host" }),
+      h("span", { text: "Last record" }),
+      h("span", { text: "Since" }),
+      h("span", { class: "hist-size", text: "Size" }),
+    ])
+  );
+  const times = [];
+  const now = Date.now();
+  for (const info of rows) {
+    let last = null;
+    if (typeof info.lastRecord === "string" && info.lastRecord !== "") {
+      const age = Date.parse(info.lastRecord);
+      const stale = !Number.isFinite(age) || now - age > HOST_STALE_MS;
+      const text = h("span");
+      last = h("span", { class: stale ? "sw warn" : "sw ok" }, [text]);
+      times.push({ node: text, style: "age", at: info.lastRecord, fallback: "" });
+    } else {
+      last = h("span", { class: "mf", text: "no record yet" });
+    }
+
+    let since;
+    if (typeof info.firstRecord === "string" && info.firstRecord !== "") {
+      const date = h("span");
+      times.push({
+        node: date,
+        style: "date",
+        at: info.firstRecord,
+        fallback: info.firstRecord.slice(0, 10),
+      });
+      since = h("span", {}, [date, document.createTextNode(` ${info.firstRecord.slice(0, 4)}`)]);
+      if (info.thisHost) since.appendChild(document.createTextNode(" · this host"));
+    } else {
+      since = h("span", { class: "mf", text: "—" });
+    }
+
+    container.appendChild(
+      h("div", { class: "lr hist-grid" }, [
+        h("b", { text: info.host }),
+        h("span", {}, [last]),
+        since,
+        h("span", { class: "n hist-size", text: bytesText(info.bytes) }),
+      ])
+    );
+  }
+  if (error) container.appendChild(message(error));
+  fillTimeNodes(times);
+}
+
+// A folder's size as the mock-up shows it: "2.9 MB".
+function bytesText(bytes) {
+  const count = Number(bytes);
+  if (!Number.isFinite(count) || count < 0) return "—";
+  if (count >= 1024 * 1024) return `${(count / (1024 * 1024)).toFixed(1)} MB`;
+  if (count >= 1024) return `${(count / 1024).toFixed(1)} kB`;
+  return `${Math.round(count)} B`;
+}
+
+function exportRow() {
+  const input = textInput({
+    value: state.exportPath,
+    placeholder: "~/seatswap-history.csv",
+    "aria-label": "save to",
+  });
+  input.className = "inp";
+  input.addEventListener("input", () => {
+    state.exportPath = input.value;
+  });
+  const result = h("span", { class: "mf" });
+  const written = (text) => {
+    state.exportResult = text;
+    result.textContent = text;
+  };
+  const run = (format) => async () => {
+    const to = String(state.exportPath || "").trim();
+    if (to === "") {
+      written("");
+      fieldError("historyExport", "enter a file path");
+      return;
+    }
+    fieldError("historyExport", null);
+    try {
+      await state.context.invoke("history_export", {
+        format,
+        to,
+        from: null,
+        until: null,
+      });
+      written(`written: ${to}`);
+    } catch (error) {
+      written("");
+      fieldError("historyExport", errorMessage(error));
+    }
+  };
+  const buttons = h("span", { class: "hist-buttons" }, [
+    h("button", { type: "button", class: "hbtn xs", onclick: run("csv") }, "CSV"),
+    h("button", { type: "button", class: "hbtn xs", onclick: run("json") }, "JSON"),
+  ]);
+  written(state.exportResult);
+  return setting(
+    "Export",
+    h("span", { class: "hist-export" }, [input, buttons]),
+    result,
+    "historyExport"
+  );
+}
+
+function importRow() {
+  const input = textInput({
+    value: state.importFolder,
+    placeholder: "~/Sync/seatswap-history",
+    "aria-label": "import from",
+  });
+  input.className = "inp";
+  input.addEventListener("input", () => {
+    state.importFolder = input.value;
+  });
+  const result = h("span", { class: "mf", text: state.importResult });
+  const run = async () => {
+    const from = String(state.importFolder || "").trim();
+    if (from === "") {
+      state.importResult = "";
+      result.textContent = "";
+      fieldError("historyImport", "enter a folder path");
+      return;
+    }
+    fieldError("historyImport", null);
+    try {
+      const reply = await state.context.invoke("history_import", { from });
+      if (
+        !isObject(reply) ||
+        !Array.isArray(reply.copied) ||
+        !isObject(reply.view)
+      ) {
+        throw new Error("history_import returned an unexpected reply");
+      }
+      state.history = reply.view;
+      state.importResult =
+        reply.copied.length === 0 ? "nothing new" : `copied: ${reply.copied.join(", ")}`;
+    } catch (error) {
+      state.importResult = "";
+      result.textContent = "";
+      fieldError("historyImport", errorMessage(error));
+      return;
+    }
+    // The table shows the folder as it is now; the field keeps what was typed.
+    if (state.group === "history" && state.right) renderGroup(state.right, "history");
+  };
+  return setting(
+    "Import another host's folder",
+    h("span", { class: "hist-import" }, [
+      input,
+      h("button", { type: "button", class: "hbtn xs", onclick: run }, "Import"),
+    ]),
+    result,
+    "historyImport"
+  );
 }
