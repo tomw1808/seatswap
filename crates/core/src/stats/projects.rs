@@ -17,8 +17,9 @@ use crate::store::Account;
 use crate::transcripts::Tokens;
 
 use super::{
-    account_abbr, account_chosen, account_id, account_position, account_weeks_valued, money_text,
-    output_by_account_week, percent_text, range_of, thousands, week_start, Ctx, Query, StatsError,
+    account_abbr, account_chosen, account_id, account_position, account_weeks_valued, join_names,
+    money_text, output_by_account_week, percent_text, range_of, thousands, week_start, Ctx, Query,
+    StatsError,
 };
 
 /// The level of a row of the tree.
@@ -812,16 +813,6 @@ fn api_order(a: Option<f64>, b: Option<f64>) -> Ordering {
         (Some(_), None) => Ordering::Less,
         (None, Some(_)) => Ordering::Greater,
         (None, None) => Ordering::Equal,
-    }
-}
-
-/// Names joined with ", " and a last " and ".
-fn join_names(names: &[String]) -> String {
-    match names {
-        [] => String::new(),
-        [one] => one.clone(),
-        [first, second] => format!("{first} and {second}"),
-        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
 }
 

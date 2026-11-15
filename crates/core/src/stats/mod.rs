@@ -16,6 +16,7 @@ use crate::money::{percent_value, Fx, Missing, MoneyError, Prices, Valuer};
 use crate::projects::{Projects, ProjectsLogRecord};
 use crate::store::{Account, Settings};
 
+pub mod forecast;
 pub mod overview;
 pub mod projects;
 pub mod subscriptions;
@@ -420,6 +421,16 @@ pub(crate) fn money_text(amount: f64, currency: &str) -> String {
         format!("{value:.2} {currency}")
     } else {
         format!("{} {currency}", thousands(value.round() as i64))
+    }
+}
+
+/// Names joined with ", " and a last " and ": `a`, `a and b`, `a, b and c`.
+pub(crate) fn join_names(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [first, second] => format!("{first} and {second}"),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
 }
 

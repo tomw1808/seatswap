@@ -804,8 +804,8 @@ fn eager_move(
 }
 
 /// The first weekly reset after `at`: the account's reset time repeated every
-/// 7 days.
-fn next_reset(reset: DateTime<Utc>, at: DateTime<Utc>) -> DateTime<Utc> {
+/// 7 days. This is the reset the plan plays the account to.
+pub(crate) fn next_reset(reset: DateTime<Utc>, at: DateTime<Utc>) -> DateTime<Utc> {
     let mut next = reset;
     while next <= at {
         next += Duration::weeks(1);
