@@ -222,6 +222,7 @@ pub(crate) enum ActionCommand {
         label: Option<String>,
         abbr: Option<String>,
         color: Option<String>,
+        auto_burn: Option<bool>,
         reply: Sender<ActionReply>,
     },
     Remove {
@@ -234,9 +235,7 @@ pub(crate) enum ActionCommand {
     },
     /// The watcher saw a change; mirror it when `mirrorLive` is on.
     SyncLive,
-    /// Pause auto-burn for `hours`, or resume with `None`. The pop-up sends it
-    /// (Task 9); the handler and its history event live here already.
-    #[allow(dead_code)]
+    /// Pause auto-burn for `hours`, or resume with `None` (spec §2.5).
     PauseBurn { hours: Option<i64> },
 }
 
@@ -286,9 +285,14 @@ pub(crate) fn spawn(
     thread::Builder::new()
         .name("seatswap-engine".to_string())
         .spawn(move || {
-            EngineRuntime::new(engine_app, engine_claude, engine_ui)
-                .with_burn_channels(engine_action, engine_commands)
-                .run(engine_rx)
+            EngineRuntime::new(
+                engine_app,
+                engine_claude,
+                engine_ui,
+                engine_action,
+                engine_commands,
+            )
+            .run(engine_rx)
         })
         .map_err(|error| format!("cannot start the engine thread: {error}"))?;
 
@@ -501,7 +505,13 @@ impl ClockBaseline {
 }
 
 impl EngineRuntime {
-    fn new(app: AppPaths, claude: ClaudePaths, ui: Sender<UiEvent>) -> EngineRuntime {
+    fn new(
+        app: AppPaths,
+        claude: ClaudePaths,
+        ui: Sender<UiEvent>,
+        action: Sender<ActionCommand>,
+        engine: Sender<EngineCommand>,
+    ) -> EngineRuntime {
         let mut runtime = EngineRuntime {
             app,
             claude,
@@ -514,7 +524,7 @@ impl EngineRuntime {
             notice: None,
             snapshot: Snapshot::empty(None, None, None),
             baseline: ClockBaseline::now(),
-            burn: BurnRuntime::new(),
+            burn: BurnRuntime::new(action, engine),
             tied_busy: 0,
         };
         runtime.open();
@@ -526,15 +536,6 @@ impl EngineRuntime {
             .unwrap_or_default();
         runtime.capture(views, None);
         runtime
-    }
-
-    fn with_burn_channels(
-        mut self,
-        action: Sender<ActionCommand>,
-        engine: Sender<EngineCommand>,
-    ) -> EngineRuntime {
-        self.burn = std::mem::take(&mut self.burn).with_channels(action, engine);
-        self
     }
 
     fn run(mut self, commands: Receiver<EngineCommand>) {
@@ -996,9 +997,10 @@ impl ActionRuntime {
                     label,
                     abbr,
                     color,
+                    auto_burn,
                     reply,
                 } => {
-                    let _ = reply.send(self.edit(&key, label, abbr, color));
+                    let _ = reply.send(self.edit(&key, label, abbr, color, auto_burn));
                 }
                 ActionCommand::Remove { key, reply } => {
                     let _ = reply.send(self.remove(&key));
@@ -1178,9 +1180,15 @@ impl ActionRuntime {
             .map_err(|error| error.to_string())?
             .settings
             .auto_burn;
+        self.record(EventKind::AutoBurn { on, paused_until })
+    }
+
+    /// Write one event to the history. A pause or resume and a settings save
+    /// that turns auto-burn on or off both come here, each with its own event.
+    fn record(&mut self, kind: EventKind) -> Result<(), String> {
         let recorder = self.recorder()?;
         recorder
-            .event(now, EventKind::AutoBurn { on, paused_until })
+            .event(Utc::now(), kind)
             .map_err(|error| ops::history_unwritable(&error))
     }
 
@@ -1212,6 +1220,7 @@ impl ActionRuntime {
         label: Option<String>,
         abbr: Option<String>,
         color: Option<String>,
+        auto_burn: Option<bool>,
     ) -> ActionReply {
         let result = match self.store() {
             Ok(store) => switcher::edit_account(
@@ -1220,6 +1229,7 @@ impl ActionRuntime {
                 label.as_deref(),
                 abbr.as_deref(),
                 color.as_deref(),
+                auto_burn,
             ),
             Err(error) => return ActionReply::Failed(error),
         };
@@ -1256,16 +1266,29 @@ impl ActionRuntime {
         if let Err(error) = settings.validate() {
             return ActionReply::Failed(error.to_string());
         }
-        let result = (|| -> Result<(), String> {
+        let result = (|| -> Result<Settings, String> {
             let store = self.store()?;
             let _lock = locks::acquire_app_lock(store.app_paths(), switcher::APP_LOCK_TIMEOUT)
                 .map_err(|error| error.to_string())?;
             let mut file = store.load().map_err(|error| error.to_string())?;
+            let previous = file.settings.clone();
             file.settings = settings.clone();
-            store.save(&file).map_err(|error| error.to_string())
+            store.save(&file).map_err(|error| error.to_string())?;
+            Ok(previous)
         })();
-        if let Err(error) = result {
-            return ActionReply::Failed(error);
+        let previous = match result {
+            Ok(previous) => previous,
+            Err(error) => return ActionReply::Failed(error),
+        };
+        // The setting is saved; its history event is one place, also used when
+        // the pop-up changes `autoBurn`.
+        if let Some(event) = settings_change_event(&previous, &settings) {
+            match self.record(event) {
+                Ok(()) => {
+                    let _ = self.engine.send(EngineCommand::HistoryChanged);
+                }
+                Err(error) => report_history_error(&error),
+            }
         }
         if let Err(error) =
             autostart::apply_autostart(settings.start_at_login, &self.autostart_args)
@@ -1364,6 +1387,16 @@ impl ActionRuntime {
 fn report_history_error(error: &str) {
     eprintln!("seatswap: {error}");
     notify::send_error(error);
+}
+
+/// The history event a settings save writes, or `None` when the save changes
+/// none of the settings the history records. Turning auto-burn on or off is
+/// `AutoBurnSet`, never a pause or resume (spec §2.5).
+fn settings_change_event(previous: &Settings, next: &Settings) -> Option<EventKind> {
+    if previous.auto_burn != next.auto_burn {
+        return Some(EventKind::AutoBurnSet { on: next.auto_burn });
+    }
+    None
 }
 
 /// The history read warnings this run of the app has already printed. A month
@@ -1708,6 +1741,14 @@ mod tests {
         }
     }
 
+    /// The two senders a runtime needs. The receivers are dropped: these tests
+    /// read the snapshot, not the commands.
+    fn burn_channels() -> (Sender<ActionCommand>, Sender<EngineCommand>) {
+        let (action, _action_rx) = mpsc::channel();
+        let (engine, _engine_rx) = mpsc::channel();
+        (action, engine)
+    }
+
     #[test]
     fn snapshot_names_the_active_account_and_the_live_login() {
         let fixture = Fixture::new();
@@ -1919,6 +1960,69 @@ mod tests {
         }
     }
 
+    /// Turning auto-burn on or off writes `AutoBurnSet`, not the pause/resume
+    /// event: a toggle must not end a manual switch's hold. The event a save
+    /// writes comes from `settings_change_event`, so this needs no
+    /// `save_settings` (which applies `startAtLogin`).
+    #[test]
+    fn a_toggle_writes_auto_burn_set() {
+        let fixture = Fixture::new();
+        let (engine, _engine_rx) = mpsc::channel();
+        let mut action = ActionRuntime::new(
+            fixture.app.clone(),
+            fixture.claude.clone(),
+            Vec::new(),
+            engine,
+        );
+        let off = Settings {
+            auto_burn: false,
+            ..Settings::default()
+        };
+        let on = Settings {
+            auto_burn: true,
+            ..off.clone()
+        };
+        let event = settings_change_event(&off, &on).expect("a toggle writes one event");
+        assert_eq!(event, EventKind::AutoBurnSet { on: true });
+        assert_eq!(
+            serde_json::to_value(&event).expect("the event as JSON"),
+            json!({"type": "autoBurnSet", "on": true})
+        );
+        assert_eq!(
+            settings_change_event(&on, &on),
+            None,
+            "a save that leaves auto-burn alone writes no event"
+        );
+        let other = Settings {
+            notify_on_switch: !on.notify_on_switch,
+            ..on.clone()
+        };
+        assert_eq!(
+            settings_change_event(&on, &other),
+            None,
+            "another setting is not auto-burn"
+        );
+
+        action.record(event).expect("the event is written");
+        let host = seatswap_core::paths::host_name(None).expect("the host name");
+        let history = HistoryDir::at(&fixture.app.history_dir(), &host);
+        let now = Utc::now();
+        let events = history
+            .read::<Event>(
+                &Range {
+                    from: now - chrono::Duration::hours(1),
+                    to: now + chrono::Duration::hours(1),
+                },
+                &Hosts::One(host),
+            )
+            .expect("the events are read");
+        assert_eq!(events.records.len(), 1, "one event for one toggle");
+        assert_eq!(
+            events.records[0].record.kind,
+            EventKind::AutoBurnSet { on: true }
+        );
+    }
+
     #[test]
     fn a_failed_autostart_says_the_settings_were_saved() {
         assert_eq!(
@@ -1957,7 +2061,9 @@ mod tests {
         store.save(&file).expect("save the invalid colour");
 
         let (sender, _receiver) = mpsc::channel();
-        let runtime = EngineRuntime::new(fixture.app, fixture.claude, sender);
+        let (action, engine_commands) = burn_channels();
+        let runtime =
+            EngineRuntime::new(fixture.app, fixture.claude, sender, action, engine_commands);
         let error = runtime
             .snapshot
             .error
@@ -2000,7 +2106,9 @@ mod tests {
         let fixture = Fixture::new();
         fs::write(fixture.app.usage_cache_file(), b"{ not json").expect("corrupt cache");
         let (sender, _receiver) = mpsc::channel();
-        let runtime = EngineRuntime::new(fixture.app, fixture.claude, sender);
+        let (action, engine_commands) = burn_channels();
+        let runtime =
+            EngineRuntime::new(fixture.app, fixture.claude, sender, action, engine_commands);
         assert!(runtime.engine.is_some(), "the engine reopened");
         let error = runtime
             .snapshot
@@ -2025,7 +2133,9 @@ mod tests {
         fs::create_dir(fixture.app.usage_cache_file()).expect("cache path is a folder");
 
         let (sender, _receiver) = mpsc::channel();
-        let runtime = EngineRuntime::new(fixture.app, fixture.claude, sender);
+        let (action, engine_commands) = burn_channels();
+        let runtime =
+            EngineRuntime::new(fixture.app, fixture.claude, sender, action, engine_commands);
         assert!(runtime.engine.is_none(), "the engine could not open");
         assert_eq!(
             runtime
@@ -2047,7 +2157,9 @@ mod tests {
         let fixture = Fixture::new();
         fs::write(fixture.app.accounts_file(), b"{ not json").expect("corrupt accounts");
         let (sender, _receiver) = mpsc::channel();
-        let runtime = EngineRuntime::new(fixture.app, fixture.claude, sender);
+        let (action, engine_commands) = burn_channels();
+        let runtime =
+            EngineRuntime::new(fixture.app, fixture.claude, sender, action, engine_commands);
         assert!(runtime.snapshot.settings.is_none());
         let error = runtime.snapshot.error.expect("an error is shown");
         assert!(error.contains("accounts.json"), "{error}");
@@ -2219,6 +2331,7 @@ mod tests {
             .expect("engine")
             .with_recorder(Recorder::new(HistoryDir::at(&history_root, "atlas")));
         let (ui, _rx) = mpsc::channel();
+        let (action, engine_commands) = burn_channels();
         let mut runtime = EngineRuntime {
             app: fixture.app.clone(),
             claude: fixture.claude.clone(),
@@ -2231,7 +2344,7 @@ mod tests {
             notice: None,
             snapshot: Snapshot::empty(None, None, None),
             baseline: ClockBaseline::now(),
-            burn: BurnRuntime::new(),
+            burn: BurnRuntime::new(action, engine_commands),
             tied_busy: 0,
         };
 
@@ -2273,6 +2386,7 @@ mod tests {
             .expect("engine")
             .with_recorder(Recorder::new(HistoryDir::at(&history_root, "atlas")));
         let (ui, _rx) = mpsc::channel();
+        let (action, engine_commands) = burn_channels();
         let mut runtime = EngineRuntime {
             app: fixture.app.clone(),
             claude: fixture.claude.clone(),
@@ -2285,7 +2399,7 @@ mod tests {
             notice: None,
             snapshot: Snapshot::empty(None, None, None),
             baseline: ClockBaseline::now(),
-            burn: BurnRuntime::new(),
+            burn: BurnRuntime::new(action, engine_commands),
             tied_busy: 0,
         };
 

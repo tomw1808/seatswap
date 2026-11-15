@@ -16,8 +16,8 @@ use crate::history::{
 use crate::store::{Account, LoginState};
 
 use super::cost::switch_cost;
-use super::decide::Situation;
-use super::plan::{blocked, AccountState, Inputs, PlanError, SessionState};
+use super::decide::{Decision, Situation};
+use super::plan::{blocked, AccountState, Inputs, Plan, PlanError, SessionState};
 use super::rates::{rates, rhythm};
 use super::{Rates, Rhythm, MANUAL_HOLD_H, RATES_DAYS, RHYTHM_WEEKS};
 
@@ -191,6 +191,26 @@ pub fn situation(
     Ok(Readiness::Ready(situation))
 }
 
+/// The account auto-burn would switch to at this reading: the target of a
+/// [`Decision::Switch`] or [`Decision::Wait`], otherwise the first account of
+/// the lazy plan other than the active one, otherwise `None`. It is the one
+/// rule `BurnView` and `status --json`'s `next` use.
+pub fn next_account(situation: &Situation, decision: &Decision, plan: &Plan) -> Option<String> {
+    match decision {
+        Decision::Switch { to, .. } | Decision::Wait { to, .. } => Some(to.clone()),
+        Decision::Stay | Decision::Stale | Decision::AllFull { .. } => {
+            plan.segments.iter().find_map(|segment| {
+                let id = segment.account.as_deref()?;
+                if Some(id) == situation.inputs.active.as_deref() {
+                    None
+                } else {
+                    Some(id.to_string())
+                }
+            })
+        }
+    }
+}
+
 /// The weekly limit and the session state of a view, plus when the reading was
 /// fetched. `None` when there is no usage, no weekly limit with a reset, or no
 /// fetch time: a value auto-burn cannot plan from.
@@ -230,7 +250,9 @@ fn last_switch_at(learned: &Learned, now: DateTime<Utc>) -> Option<DateTime<Utc>
 
 /// The latest of a manual switch's [`MANUAL_HOLD_H`] hold and an `AutoBurn`
 /// pause, less the manual hold that ended because its account is blocked now.
-/// A resume (`paused_until: None`) ends a manual hold that came before it.
+/// A resume (`paused_until: None`) ends a manual hold that came before it. An
+/// `AutoBurnSet` (a settings toggle) is not a pause or a resume and changes
+/// neither.
 fn manual_hold_until(
     learned: &Learned,
     accounts: &[Account],
@@ -290,6 +312,7 @@ mod tests {
     use chrono::FixedOffset;
 
     use crate::api::{Limit, LimitKind, Severity, Usage};
+    use crate::burn::decide::Reason;
     use crate::burn::plan::{follow, Policy};
     use crate::types::OAuthAccount;
 
@@ -364,6 +387,7 @@ mod tests {
             color: "#3b82f6".to_string(),
             email: None,
             plan: None,
+            auto_burn: true,
             is_active: false,
             login_state: LoginState::Ok,
             login_ends_at_ms: None,
@@ -610,5 +634,147 @@ mod tests {
         ];
         let situation = ready(&learned, &views, &[pr, ac], Some("ac"), now);
         assert_eq!(situation.manual_hold_until, None);
+    }
+
+    #[test]
+    fn a_toggle_does_not_end_a_manual_hold_or_a_pause() {
+        let now = utc("2026-11-10T12:00:00Z");
+        let pr = account("pr", "PR", PR_ACC, true);
+        let ac = account("ac", "AC", AC_ACC, true);
+        let views = vec![
+            view("pr", "PR", 10.0, None, now - Duration::minutes(1)),
+            view("ac", "AC", 10.0, None, now - Duration::minutes(1)),
+        ];
+        let switch = switch_event(
+            "atlas",
+            now - Duration::hours(1),
+            AccountRef::of(&ac),
+            By::User,
+        );
+        let toggle = Hosted {
+            host: "atlas".to_string(),
+            record: Event {
+                t: now - Duration::minutes(30),
+                kind: EventKind::AutoBurnSet { on: true },
+            },
+        };
+        let first_learned = learned("atlas", vec![switch, toggle]);
+        let situation = ready(
+            &first_learned,
+            &views,
+            &[pr.clone(), ac.clone()],
+            Some("ac"),
+            now,
+        );
+        assert_eq!(
+            situation.manual_hold_until,
+            Some(now + Duration::hours(3)),
+            "a settings toggle is not a resume of the manual switch's hold"
+        );
+
+        let pause = Hosted {
+            host: "atlas".to_string(),
+            record: Event {
+                t: now - Duration::minutes(45),
+                kind: EventKind::AutoBurn {
+                    on: true,
+                    paused_until: Some(now + Duration::hours(2)),
+                },
+            },
+        };
+        let toggle = Hosted {
+            host: "atlas".to_string(),
+            record: Event {
+                t: now - Duration::minutes(30),
+                kind: EventKind::AutoBurnSet { on: false },
+            },
+        };
+        let learned = learned("atlas", vec![pause, toggle]);
+        let situation = ready(&learned, &views, &[pr, ac], Some("ac"), now);
+        assert_eq!(
+            situation.manual_hold_until,
+            Some(now + Duration::hours(2)),
+            "a settings toggle is not a resume of the explicit pause"
+        );
+    }
+
+    #[test]
+    fn next_account_is_the_decisions_target_then_the_plans() {
+        let now = utc("2026-11-10T12:00:00Z");
+        let pr = account("pr", "PR", PR_ACC, true);
+        let ac = account("ac", "AC", AC_ACC, true);
+        let mut learned = learned("atlas", Vec::new());
+        // Every hour has work, so PR at 99.5 % fills in the plan's first step
+        // and the lazy plan moves to AC.
+        learned.rhythm = Rhythm { wu: [1.0; 168] };
+        learned.rates = BTreeMap::from([
+            (AccountRef::of(&pr), Rates { c: 2.0, s: None }),
+            (
+                AccountRef::of(&ac),
+                Rates {
+                    c: 4.0,
+                    s: Some(100.0),
+                },
+            ),
+        ]);
+        let views = vec![
+            view("pr", "PR", 99.5, None, now - Duration::minutes(1)),
+            view("ac", "AC", 10.0, Some(10.0), now - Duration::minutes(1)),
+        ];
+        let situation = ready(&learned, &views, &[pr, ac], Some("pr"), now);
+        let plan = follow(&situation.inputs, Policy::Lazy);
+        assert_eq!(plan.segments[1].account.as_deref(), Some("ac"));
+
+        let switch = Decision::Switch {
+            to: "lb".to_string(),
+            reason: Reason::WindowOpen,
+        };
+        assert_eq!(
+            next_account(&situation, &switch, &plan).as_deref(),
+            Some("lb")
+        );
+        let wait = Decision::Wait {
+            to: "lb".to_string(),
+            latest: now + Duration::hours(1),
+            tied_busy: 1,
+            reason: Reason::WindowOpen,
+        };
+        assert_eq!(
+            next_account(&situation, &wait, &plan).as_deref(),
+            Some("lb")
+        );
+        assert_eq!(
+            next_account(&situation, &Decision::Stay, &plan).as_deref(),
+            Some("ac"),
+            "without a target, the first other account of the lazy plan is next"
+        );
+        assert_eq!(
+            next_account(&situation, &Decision::AllFull { next: None }, &plan).as_deref(),
+            Some("ac")
+        );
+    }
+
+    #[test]
+    fn paused_until_is_the_situations_hold() {
+        let now = utc("2026-11-10T12:00:00Z");
+        let pr = account("pr", "PR", PR_ACC, true);
+        let ac = account("ac", "AC", AC_ACC, true);
+        let switch = switch_event(
+            "atlas",
+            now - Duration::hours(1),
+            AccountRef::of(&ac),
+            By::Cli,
+        );
+        let learned = learned("atlas", vec![switch]);
+        let views = vec![
+            view("pr", "PR", 10.0, None, now - Duration::minutes(1)),
+            view("ac", "AC", 10.0, Some(10.0), now - Duration::minutes(1)),
+        ];
+        let situation = ready(&learned, &views, &[pr, ac], Some("ac"), now);
+        assert_eq!(
+            situation.manual_hold_until,
+            Some(now + Duration::hours(3)),
+            "a CLI switch one hour ago holds for four hours"
+        );
     }
 }

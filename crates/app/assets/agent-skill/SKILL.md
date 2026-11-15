@@ -20,7 +20,10 @@ The answer is one JSON object:
 |---|---|
 | `active` | id of the account Claude Code is using now |
 | `views[]` | one entry per account: `id`, `abbr`, `label`, `plan`, `isActive`, `loginState`, `usable` |
+| `views[].slackHours` | working hours this account can be left alone and still be emptied before its reset; absent while unknown |
 | `views[].usage.limits[]` | one entry per limit: `kind` (`session` = the 5 h window, `weekly_all` = the week, `weekly_scoped` = one model's week, named in `model`), `percent` used, `resetsAt` (UTC; null when no window is running), `isActive` (true on the limit that binds now) |
+| `autoBurn` | `{on, pausedUntil}`: whether auto-burn switches by itself, and until when it is paused |
+| `next` | id of the account auto-burn would switch to, or null |
 
 An account without a `session` entry has no 5 h limit. A limit at 100 % or more is blocked until `resetsAt`.
 
@@ -34,10 +37,11 @@ seatswap use PR      # to a named account, by abbreviation or id
 
 Rules:
 
-1. A switch moves every Claude Code session on the machine, not only yours. They continue on the new account with their following request. Sessions on Fable 5.2, Sonnet 5.5 or Haiku 5.5 then work without their earlier reasoning until someone switches back.
-2. Switch only when the active account is blocked or will be before your task ends, and another account is `usable`.
-3. After a switch, say in your answer which account is in use now and why you switched.
-4. Never run `seatswap add`, `rm` or `edit`, never change seatswap's settings, and never read or write seatswap's data folder or Claude Code's login files yourself.
+1. If `autoBurn.on` is true, do not switch: auto-burn decides.
+2. A switch moves every Claude Code session on the machine, not only yours. They continue on the new account with their following request. Sessions on Fable 5.2, Sonnet 5.5 or Haiku 5.5 then work without their earlier reasoning until someone switches back.
+3. Switch only when the active account is blocked or will be before your task ends, and another account is `usable`.
+4. After a switch, say in your answer which account is in use now and why you switched.
+5. Never run `seatswap add`, `rm` or `edit`, never change seatswap's settings, and never read or write seatswap's data folder or Claude Code's login files yourself.
 
 ## When everything is blocked
 

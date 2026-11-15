@@ -438,6 +438,7 @@ mod tests {
             color: "#1e3a8a".to_string(),
             email: Some("someone@example.com".to_string()),
             plan: None,
+            auto_burn: true,
             is_active,
             login_state,
             login_ends_at_ms: None,

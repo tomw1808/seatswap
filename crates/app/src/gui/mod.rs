@@ -174,6 +174,8 @@ pub(crate) fn run(
             panel::edit_account,
             panel::remove_account,
             panel::save_settings,
+            panel::set_auto_burn,
+            panel::pause_burn,
             panel::icon_preview,
             panel::time_texts,
             panel::fit_panel,

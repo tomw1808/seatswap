@@ -737,6 +737,7 @@ mod tests {
             color: "#3b82f6".to_string(),
             email: None,
             plan: None,
+            auto_burn: true,
             is_active,
             login_state: LoginState::Ok,
             login_ends_at_ms: None,

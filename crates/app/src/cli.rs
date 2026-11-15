@@ -5,11 +5,12 @@
 //! decision about an account, a usage percentage or which login is live is made
 //! in `seatswap_core`.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, FixedOffset, Local, LocalResult, NaiveDate, NaiveTime, TimeZone, Utc};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
@@ -17,9 +18,10 @@ use seatswap_core::api::{Api, Usage};
 use seatswap_core::atomic::{self, Access};
 use seatswap_core::burn::decide::{decide, regime};
 use seatswap_core::burn::live::{self, Readiness};
-use seatswap_core::burn::plan::{follow, Policy};
+use seatswap_core::burn::plan::{follow, slack, Policy};
+use seatswap_core::burn::replay::replay;
 use seatswap_core::engine::{AccountView, Engine, PollReason, UsageCache};
-use seatswap_core::history::{AccountRef, By, EventKind, HistoryDir, Recorder};
+use seatswap_core::history::{AccountRef, By, EventKind, HistoryDir, Range, Recorder};
 use seatswap_core::paths::{self, AppPaths, ClaudePaths, PathsError};
 use seatswap_core::store::{self, Account, AccountsFile, LoginState, Settings, Store, StoreError};
 use seatswap_core::switcher::{self, LiveState, SwitchError, UnsavedPolicy};
@@ -40,6 +42,9 @@ const AGENT_SKILL: &str = include_str!("../assets/agent-skill/SKILL.md");
 const AGENTS_MAY_NOT_READ: &str = "agents may not read usage (seatswap settings → Agents)";
 const AGENTS_MAY_NOT_SWITCH: &str = "agents may not switch accounts (seatswap settings → Agents)";
 const AGENTS_MAY_NOT_CHANGE: &str = "agents may not change seatswap's accounts or settings";
+
+/// What an agent's `next` prints while auto-burn decides (spec §6.2).
+const AUTO_BURN_DECIDES: &str = "seatswap: auto-burn is on and decides";
 
 /// Who started this call (spec §6.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,6 +184,12 @@ pub(crate) enum Command {
         color: Option<String>,
     },
 
+    /// Print the auto-burn plan or replay recorded work.
+    Burn {
+        #[command(subcommand)]
+        action: BurnAction,
+    },
+
     /// Install or remove seatswap's agent skill in Claude Code's config folder.
     AgentSkill {
         #[command(subcommand)]
@@ -214,6 +225,31 @@ pub(crate) enum Command {
 
     /// Print Claude Code's status line; reads its JSON from standard input.
     Statusline,
+}
+
+/// What `seatswap burn` does (spec §2.4, §2.8).
+#[derive(Debug, Subcommand)]
+pub(crate) enum BurnAction {
+    /// Print the early-switching regime and the lazy plan's segments.
+    Plan {
+        /// Print one JSON object instead of the lines.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Replay recorded work against both policies.
+    Simulate {
+        /// First local day of the replay, `YYYY-MM-DD`.
+        #[arg(long, value_name = "YYYY-MM-DD")]
+        from: String,
+
+        /// Last local day of the replay, `YYYY-MM-DD`, inclusive.
+        #[arg(long, value_name = "YYYY-MM-DD")]
+        to: String,
+
+        /// Leave an account out, by abbreviation or id.
+        #[arg(long = "without", value_name = "ABBR")]
+        without: Vec<String>,
+    },
 }
 
 /// Install or remove the bundled skill (spec §6.4).
@@ -270,6 +306,15 @@ pub enum CliError {
     #[error("{0}")]
     UnsavedCurrent(String),
 
+    /// The command cannot run with the given values or the data on hand (bad
+    /// dates, an unknown abbreviation, no reading): exits 2, as a usage error.
+    #[error("{0}")]
+    Usage(String),
+
+    /// An auto-burn text the values do not allow (a missing view or reset).
+    #[error(transparent)]
+    Text(#[from] burn_text::TextError),
+
     /// The agent gate refused this call; exits 3 and is recorded first.
     #[error("{0}")]
     AgentRefused(&'static str),
@@ -299,7 +344,7 @@ pub enum CliError {
 impl CliError {
     fn exit_code(&self) -> u8 {
         match self {
-            CliError::UnsavedCurrent(_) => 2,
+            CliError::UnsavedCurrent(_) | CliError::Usage(_) => 2,
             CliError::AgentRefused(_) => 3,
             _ => 1,
         }
@@ -472,7 +517,11 @@ fn run_command(
         Command::Next {
             save_current,
             discard_current,
-        } => next_account(context, save_current, discard_current, by, cwd),
+        } => {
+            let line = next_account(context, save_current, discard_current, by, cwd)?;
+            println!("{line}");
+            Ok(())
+        }
         Command::Add { label } => add(context, label),
         Command::Rm { key, yes } => remove(context, &key, yes),
         Command::Edit {
@@ -481,6 +530,7 @@ fn run_command(
             abbr,
             color,
         } => edit(context, &key, label, abbr, color),
+        Command::Burn { action } => burn(context, action),
         Command::AgentSkill { action } => agent_skill(&context, action),
         // Handled before the store was opened; kept for exhaustiveness.
         Command::Panel { .. } | Command::Statusline => Ok(()),
@@ -581,7 +631,7 @@ pub(crate) fn gate(command: &Command, caller: Caller, settings: &Settings) -> Ga
         // Claude Code calls it every two seconds as an agent, for a line and
         // nothing else: no setting and no caller can refuse it.
         Command::Statusline => Gate::Allowed,
-        Command::List { .. } | Command::Status { .. } => {
+        Command::List { .. } | Command::Status { .. } | Command::Burn { .. } => {
             if settings.agents_read {
                 Gate::Allowed
             } else {
@@ -659,6 +709,12 @@ fn command_text(command: &Command) -> String {
             SkillAction::Install { force } => flags("agent-skill install", &[("--force", *force)]),
             SkillAction::Uninstall { force } => {
                 flags("agent-skill uninstall", &[("--force", *force)])
+            }
+        },
+        Command::Burn { action } => match action {
+            BurnAction::Plan { json } => flags("burn plan", &[("--json", *json)]),
+            BurnAction::Simulate { without, .. } => {
+                flags("burn simulate", &[("--without", !without.is_empty())])
             }
         },
         Command::Panel { view } => format!("panel {}", view.as_str()),
@@ -822,7 +878,7 @@ fn use_account(
     let now = Utc::now();
     let outcome = switcher::switch_to(&context.claude, &context.store, key, policy, now)
         .map_err(switch_error)?;
-    print_switch(&context.store, &outcome.to);
+    println!("{}", switch_line(&context.store, &outcome.to));
     record_cli_switch(&context, &outcome, by, cwd, now);
     Ok(())
 }
@@ -859,10 +915,10 @@ fn record_cli_switch(
 
 /// The switch already happened, so an account list that cannot name it is a
 /// sentence, not a failed command.
-fn print_switch(store: &Store, account_id: &str) {
+fn switch_line(store: &Store, account_id: &str) -> String {
     match ops::switch_message(store, account_id) {
-        Ok(message) => println!("{message}"),
-        Err(error) => println!("{}", ops::switched_without_list(&error)),
+        Ok(message) => message,
+        Err(error) => ops::switched_without_list(&error),
     }
 }
 
@@ -872,7 +928,12 @@ fn next_account(
     discard_current: bool,
     by: By,
     cwd: Option<String>,
-) -> Result<(), CliError> {
+) -> Result<String, CliError> {
+    // Auto-burn decides on its own: an agent's `next` must not switch behind
+    // it (spec §6.2). Nothing is loaded or written for this answer.
+    if by == By::Agent && context.settings.auto_burn {
+        return Ok(AUTO_BURN_DECIDES.to_string());
+    }
     let policy = unsaved_policy(save_current, discard_current);
     let now = Utc::now();
 
@@ -911,9 +972,9 @@ fn next_account(
     let target = next_target(&file, &live)?;
     let outcome = switcher::switch_to(&context.claude, &context.store, &target, policy, now)
         .map_err(switch_error)?;
-    print_switch(&context.store, &outcome.to);
+    let line = switch_line(&context.store, &outcome.to);
     record_cli_switch(&context, &outcome, by, cwd, now);
-    Ok(())
+    Ok(line)
 }
 
 /// The CLI's history recorder, or `None` with the reason printed once. The
@@ -1000,6 +1061,7 @@ fn edit(
         label.as_deref(),
         abbr.as_deref(),
         color.as_deref(),
+        None,
     )?;
     println!("Updated {} — {}", account.abbr, account.label);
     Ok(())
@@ -1107,88 +1169,327 @@ fn status(
     refresh: bool,
 ) -> Result<(), CliError> {
     let now = Utc::now();
+    let offset = *Local::now().offset();
     let mut engine = Engine::new(context.claude, context.store, Api::new())?;
     let views = account_views(&mut engine, refresh, PollReason::Timer, now)?;
 
     if json {
+        // Only the JSON form shows auto-burn, and the history read costs four
+        // weeks of files: the printed forms must not read it (waybar runs this
+        // every few seconds).
+        let accounts = engine.store().load()?.accounts;
         let active = views
             .iter()
             .find(|view| view.is_active)
             .map(|view| view.id.clone());
-        let suggestion = if context.settings.auto_burn || !context.settings.suggest_switches {
-            None
-        } else {
-            let accounts = engine.store().load()?.accounts;
-            // Read-only: a status call must not create the history folder.
-            let root = paths::history_root(
-                context.settings.history_dir.as_deref(),
-                engine.store().app_paths(),
-            )?;
-            let host = paths::host_name(context.settings.host_name.as_deref())?;
-            let history = HistoryDir::at(&root, &host);
-            status_suggestion(
-                &history,
-                &views,
-                &accounts,
-                &context.settings,
-                active.as_deref(),
-                now,
-                *Local::now().offset(),
-            )?
-        };
-        let output = StatusJson {
-            views: &views,
-            active,
-            suggestion,
-        };
+        let burn = burn_status(
+            engine.store().app_paths(),
+            &context.settings,
+            &views,
+            &accounts,
+            active.as_deref(),
+            now,
+            offset,
+        );
+        let output = StatusJson::new(&views, active, &burn);
         println!("{}", serde_json::to_string(&output)?);
-    } else if waybar {
-        println!("{}", serde_json::to_string(&waybar_line(&views, now))?);
-    } else if i3blocks {
-        let (full, short, color) = i3blocks_lines(&views, now);
-        println!("{full}");
-        println!("{short}");
-        println!("{color}");
-    } else if let Some(view) = active_view(&views) {
-        println!("{}", status_line(view, now));
     } else {
-        println!("no live account");
+        if waybar {
+            println!("{}", serde_json::to_string(&waybar_line(&views, now))?);
+        } else if i3blocks {
+            let (full, short, color) = i3blocks_lines(&views, now);
+            println!("{full}");
+            println!("{short}");
+            println!("{color}");
+        } else if let Some(view) = active_view(&views) {
+            println!("{}", status_line(view, now));
+        } else {
+            println!("no live account");
+        }
     }
     Ok(())
 }
 
-/// The suggestion `status --json` prints: the planner's own decision, never a
-/// second rule beside it (spec §2.5).
+/// The history folder `status` and `burn` read, without creating it.
+fn history_dir(app: &AppPaths, settings: &Settings) -> Result<HistoryDir, PathsError> {
+    let root = paths::history_root(settings.history_dir.as_deref(), app)?;
+    let host = paths::host_name(settings.host_name.as_deref())?;
+    Ok(HistoryDir::at(&root, &host))
+}
+
+/// What `status` shows of auto-burn, derived from one history read. A history
+/// read or planner error is kept in `error` so `status` can answer anyway;
+/// `next` and `slack_hours` are then absent.
+#[derive(Debug, Default)]
+struct BurnStatus {
+    on: bool,
+    paused_until: Option<DateTime<Utc>>,
+    next: Option<String>,
+    suggestion: Option<SuggestionJson>,
+    slack_hours: BTreeMap<String, f64>,
+    error: Option<String>,
+}
+
+/// Read the history once and give the auto-burn facts `status` prints. It never
+/// fails: a history or planner error goes into [`BurnStatus::error`] and leaves
+/// `next` and `slack_hours` empty (spec §6.2).
 #[allow(clippy::too_many_arguments)]
-fn status_suggestion(
-    history: &HistoryDir,
+fn burn_status(
+    app: &AppPaths,
+    settings: &Settings,
     views: &[AccountView],
     accounts: &[Account],
-    settings: &Settings,
     active: Option<&str>,
     now: DateTime<Utc>,
-    offset: chrono::FixedOffset,
-) -> Result<Option<SuggestionJson>, CliError> {
-    if settings.auto_burn || !settings.suggest_switches {
-        return Ok(None);
-    }
-    let active = active.filter(|id| accounts.iter().any(|account| account.id == *id));
-    let learned = live::learn(history, now, offset, accounts)
-        .map_err(|error| CliError::Message(format!("cannot read the history: {error}")))?;
-    let readiness = live::situation(&learned, views, accounts, active, now, offset, 0)
-        .map_err(|error| CliError::Message(error.to_string()))?;
-    let Readiness::Ready(situation) = readiness else {
-        return Ok(None);
+    offset: FixedOffset,
+) -> BurnStatus {
+    let mut status = BurnStatus {
+        on: settings.auto_burn,
+        ..BurnStatus::default()
     };
+    let history = match history_dir(app, settings) {
+        Ok(history) => history,
+        Err(error) => {
+            status.error = Some(error.to_string());
+            return status;
+        }
+    };
+    let learned = match live::learn(&history, now, offset, accounts) {
+        Ok(learned) => learned,
+        Err(error) => {
+            status.error = Some(format!("cannot read the history: {error}"));
+            return status;
+        }
+    };
+    let active = active.filter(|id| accounts.iter().any(|account| account.id == *id));
+    let readiness = match live::situation(&learned, views, accounts, active, now, offset, 0) {
+        Ok(readiness) => readiness,
+        Err(error) => {
+            status.error = Some(error.to_string());
+            return status;
+        }
+    };
+    let Readiness::Ready(situation) = readiness else {
+        return status;
+    };
+    status.paused_until = situation.manual_hold_until.filter(|until| *until > now);
     let regime = regime(&situation);
     let decision = decide(&situation, &regime);
     let plan = follow(&situation.inputs, Policy::Lazy);
-    let suggestion = burn_text::suggestion(&decision, &plan, active, views, now, offset)
+    status.next = live::next_account(&situation, &decision, &plan);
+
+    let typical = situation.inputs.rhythm.typical_hour();
+    if typical > 0.0 {
+        for account in &situation.inputs.accounts {
+            if let Some(slack_wu) = slack(account, &situation.inputs) {
+                status
+                    .slack_hours
+                    .insert(account.id.clone(), slack_wu / typical);
+            }
+        }
+    }
+
+    if !settings.auto_burn && settings.suggest_switches {
+        match burn_text::suggestion(&decision, &plan, active, views, now, offset) {
+            Ok(suggestion) => {
+                status.suggestion = suggestion.map(|suggestion| SuggestionJson {
+                    to_id: suggestion.to,
+                    text: suggestion.text,
+                });
+            }
+            Err(error) => status.error = Some(error.to_string()),
+        }
+    }
+    status
+}
+
+/// `seatswap burn`: print the plan or the replay.
+fn burn(context: Context, action: BurnAction) -> Result<(), CliError> {
+    match action {
+        BurnAction::Plan { json } => println!("{}", burn_plan(context, json)?),
+        BurnAction::Simulate { from, to, without } => {
+            println!("{}", burn_simulate(context, &from, &to, &without)?)
+        }
+    }
+    Ok(())
+}
+
+/// One JSON object of `seatswap burn plan --json`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BurnPlanJson {
+    regime: BurnRegimeJson,
+    segments: Vec<BurnSegmentJson>,
+    left_at_reset: BTreeMap<String, f64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BurnRegimeJson {
+    early: bool,
+    why: String,
+    blocked_lazy_h: Option<f64>,
+    blocked_eager_h: Option<f64>,
+    extra_switches: u32,
+    cost_h: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BurnSegmentJson {
+    account: Option<String>,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+}
+
+/// `seatswap burn plan [--json]`: the early-switching regime and the lazy plan,
+/// read exactly as the tray app reads them (`tied_busy` is 0: the CLI has no
+/// session count).
+fn burn_plan(context: Context, json: bool) -> Result<String, CliError> {
+    let now = Utc::now();
+    let offset = *Local::now().offset();
+    let history = history_dir(context.store.app_paths(), &context.settings)?;
+    let engine = Engine::new(context.claude, context.store, Api::new())?;
+    let views = engine.views(now)?;
+    let accounts = engine.store().load()?.accounts;
+    let active = views
+        .iter()
+        .find(|view| view.is_active)
+        .map(|view| view.id.as_str());
+    let learned = live::learn(&history, now, offset, &accounts)
+        .map_err(|error| CliError::Message(format!("cannot read the history: {error}")))?;
+    let readiness = live::situation(&learned, &views, &accounts, active, now, offset, 0)
         .map_err(|error| CliError::Message(error.to_string()))?;
-    Ok(suggestion.map(|suggestion| SuggestionJson {
-        to_id: suggestion.to,
-        text: suggestion.text,
-    }))
+    let situation = match readiness {
+        Readiness::Ready(situation) => situation,
+        Readiness::Unread { accounts } => {
+            let names = accounts
+                .iter()
+                .map(|id| burn_text::abbr(&views, id))
+                .collect::<Result<Vec<_>, _>>()?
+                .join(", ");
+            return Err(CliError::Usage(format!("no reading for {names}")));
+        }
+        Readiness::NoAccounts => {
+            return Err(CliError::Usage(
+                "no account has a login with a reading".to_string(),
+            ))
+        }
+    };
+    let regime = regime(&situation);
+    let plan = follow(&situation.inputs, Policy::Lazy);
+    if json {
+        let typical = situation.inputs.rhythm.typical_hour();
+        let hours = |value: f64| if typical > 0.0 { Some(value) } else { None };
+        let output = BurnPlanJson {
+            regime: BurnRegimeJson {
+                early: regime.early,
+                why: burn_text::why(regime.why).to_string(),
+                blocked_lazy_h: hours(regime.lazy_blocked_h),
+                blocked_eager_h: hours(regime.eager_blocked_h),
+                extra_switches: regime.extra_switches,
+                cost_h: regime.cost_h,
+            },
+            segments: plan
+                .segments
+                .iter()
+                .map(|segment| BurnSegmentJson {
+                    account: segment.account.clone(),
+                    from: segment.from,
+                    to: segment.to,
+                })
+                .collect(),
+            left_at_reset: plan.left_at_reset,
+        };
+        return Ok(serde_json::to_string(&output)?);
+    }
+
+    let mut lines = vec![burn_text::why(regime.why).to_string()];
+    for segment in &plan.segments {
+        lines.push(burn_text::segment_line(
+            segment.account.as_deref(),
+            &views,
+            segment.from,
+            segment.to,
+            now,
+            offset,
+        )?);
+    }
+    Ok(lines.join("\n"))
+}
+
+/// `seatswap burn simulate --from … --to … [--without ABBR]…`: replay the
+/// recorded work of the local days `from` … `to` (inclusive) for both policies.
+fn burn_simulate(
+    context: Context,
+    from: &str,
+    to: &str,
+    without: &[String],
+) -> Result<String, CliError> {
+    let from_date = parse_date("--from", from)?;
+    let to_date = parse_date("--to", to)?;
+    if from_date > to_date {
+        return Err(CliError::Usage(format!("--from {from} is after --to {to}")));
+    }
+    // `--to` is inclusive: the range ends at the local midnight of the day
+    // after it. A fixed 24 h would drop the last hour of a day with a clock
+    // change.
+    let day_after = to_date
+        .succ_opt()
+        .ok_or_else(|| CliError::Usage(format!("--to {to} has no day after it")))?;
+    let range = Range {
+        from: local_midnight(from_date)?,
+        to: local_midnight(day_after)?,
+    };
+    let now = Utc::now();
+    let offset = *Local::now().offset();
+    let history = history_dir(context.store.app_paths(), &context.settings)?;
+    let file = context.store.load()?;
+    let mut excluded = Vec::new();
+    for key in without {
+        let account = file
+            .find_by_key(key)
+            .ok_or_else(|| CliError::Usage(format!("unknown account {key}")))?;
+        excluded.push(AccountRef::of(account));
+    }
+    let accounts = file.accounts;
+    let learned = live::learn(&history, now, offset, &accounts)
+        .map_err(|error| CliError::Message(format!("cannot read the history: {error}")))?;
+    let mut lines = Vec::new();
+    let mut printed = BTreeSet::new();
+    for policy in [Policy::Lazy, Policy::Eager] {
+        let result = replay(&history, &range, &learned.rates, &excluded, policy)
+            .map_err(|error| CliError::Message(error.to_string()))?;
+        // Both replays read the same files; a torn line is one warning.
+        for warning in &result.warnings {
+            if printed.insert(warning.clone()) {
+                eprintln!("seatswap: warning: {warning}");
+            }
+        }
+        lines.push(burn_text::replay_report(&result, &accounts)?);
+    }
+    Ok(lines.join("\n"))
+}
+
+fn parse_date(flag: &str, text: &str) -> Result<NaiveDate, CliError> {
+    NaiveDate::parse_from_str(text, "%Y-%m-%d").map_err(|error| {
+        CliError::Usage(format!("{flag} {text:?} is not a YYYY-MM-DD date: {error}"))
+    })
+}
+
+/// The UTC instant of a local midnight. An ambiguous or missing local midnight
+/// is an error, never one of the two chosen silently.
+fn local_midnight(date: NaiveDate) -> Result<DateTime<Utc>, CliError> {
+    let midnight = date.and_time(NaiveTime::MIN);
+    match Local.from_local_datetime(&midnight) {
+        LocalResult::Single(at) => Ok(at.with_timezone(&Utc)),
+        LocalResult::Ambiguous(first, second) => Err(CliError::Usage(format!(
+            "the local midnight of {date} is ambiguous ({first} or {second})"
+        ))),
+        LocalResult::None => Err(CliError::Usage(format!(
+            "there is no local midnight on {date}"
+        ))),
+    }
 }
 
 fn account_views(
@@ -1330,12 +1631,58 @@ fn login_ends_text(days: Option<i64>) -> Option<String> {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StatusJson<'a> {
-    views: &'a [AccountView],
+    views: Vec<StatusView<'a>>,
     active: Option<String>,
     suggestion: Option<SuggestionJson>,
+    auto_burn: AutoBurnJson,
+    next: Option<String>,
+    burn_error: Option<String>,
 }
 
+impl<'a> StatusJson<'a> {
+    fn new(views: &'a [AccountView], active: Option<String>, burn: &BurnStatus) -> StatusJson<'a> {
+        StatusJson {
+            views: views
+                .iter()
+                .map(|view| StatusView {
+                    view,
+                    slack_hours: burn.slack_hours.get(&view.id).copied(),
+                })
+                .collect(),
+            active,
+            suggestion: burn.suggestion.clone(),
+            auto_burn: AutoBurnJson {
+                on: burn.on,
+                paused_until: burn.paused_until,
+            },
+            next: burn.next.clone(),
+            burn_error: burn.error.clone(),
+        }
+    }
+}
+
+/// One account view plus the auto-burn number `status --json` adds to it. The
+/// view's own fields are serialized flat, exactly as `seatswap list --json`
+/// writes them.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StatusView<'a> {
+    #[serde(flatten)]
+    view: &'a AccountView,
+    /// Working hours the account can be left alone and still be emptied before
+    /// its reset; absent while unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slack_hours: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AutoBurnJson {
+    on: bool,
+    paused_until: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SuggestionJson {
     to_id: String,
@@ -1405,13 +1752,16 @@ fn i3blocks_lines(views: &[AccountView], now: DateTime<Utc>) -> (String, String,
 pub(crate) mod tests {
     use super::*;
 
+    use chrono::Duration;
     use chrono::Utc;
     use serde_json::{json, Value};
 
     use chrono::FixedOffset;
     use seatswap_core::api::{Limit, LimitKind, Severity, Usage};
-    use seatswap_core::engine::AccountView;
+    use seatswap_core::engine::{AccountView, CacheEntry};
+    use seatswap_core::history::{LimitSample, Sample, Source, TokenRecord};
     use seatswap_core::paths::ClaudePaths;
+    use seatswap_core::project::ProjectKey;
     use seatswap_core::store::{FileSecrets, LoginState, Settings, Store};
     use seatswap_core::types::OAuthAccount;
 
@@ -1624,6 +1974,105 @@ pub(crate) mod tests {
                 fs::read(self.config_dir.join(".claude.json")).expect("identity"),
             )
         }
+
+        fn history(&self) -> HistoryDir {
+            HistoryDir::at(&self.data_dir.join("history"), "atlas")
+        }
+
+        fn set_auto_burn(&self, on: bool) {
+            let store = self.store();
+            let mut file = store.load().expect("accounts");
+            file.settings.auto_burn = on;
+            store.save(&file).expect("settings saved");
+        }
+
+        fn account(&self, index: usize) -> Account {
+            let (account_uuid, org_uuid, ..) = live(index);
+            let store = self.store();
+            let file = store.load().expect("accounts");
+            file.accounts
+                .iter()
+                .find(|account| {
+                    account.account_uuid == account_uuid && account.organization_uuid == org_uuid
+                })
+                .cloned()
+                .expect("the saved account")
+        }
+
+        /// Put one usage reading in the cache, so the engine's views have it.
+        fn set_reading(&self, account: &Account, week: f64, session: bool) {
+            let now = Utc::now();
+            let reset = now + Duration::days(3);
+            let mut limits = vec![Limit {
+                kind: LimitKind::WeeklyAll,
+                percent: week,
+                severity: Severity::Normal,
+                resets_at: Some(reset),
+                model: None,
+                is_active: false,
+            }];
+            if session {
+                limits.push(Limit {
+                    kind: LimitKind::Session,
+                    percent: 10.0,
+                    severity: Severity::Normal,
+                    resets_at: Some(reset),
+                    model: None,
+                    is_active: false,
+                });
+            }
+            let app = AppPaths::at(&self.data_dir);
+            let mut cache = UsageCache::load(&app).expect("the usage cache");
+            cache.entries.insert(
+                account.id.clone(),
+                CacheEntry {
+                    usage: Some(Usage {
+                        limits,
+                        extra_usage_enabled: false,
+                    }),
+                    fetched_at: Some(now),
+                    ..CacheEntry::default()
+                },
+            );
+            cache.save(&app).expect("the usage cache is saved");
+        }
+
+        /// One weekly reading in the history, for the rates a plan or replay learns.
+        fn write_sample(&self, account: &Account, at: DateTime<Utc>, week: f64) {
+            self.history()
+                .append(&Sample {
+                    t: at,
+                    account: AccountRef::of(account),
+                    src: Source::Poll,
+                    l: vec![LimitSample {
+                        k: LimitKind::WeeklyAll,
+                        m: None,
+                        p: week,
+                        r: Some(at + Duration::days(3)),
+                        b: false,
+                    }],
+                })
+                .expect("the sample is written");
+        }
+
+        /// One hour of work in the history.
+        fn write_work(&self, at: DateTime<Utc>, work_wu: f64) {
+            self.history()
+                .append(&TokenRecord {
+                    t: at,
+                    session: "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34".to_string(),
+                    cwd: "/home/sam/projects/atlas".to_string(),
+                    project: ProjectKey::Repo("github.com/sam/atlas".to_string()),
+                    model: "claude-fable-5-2".to_string(),
+                    input: (work_wu * 1_000_000.0).round() as u64,
+                    out: 0,
+                    cw: 0,
+                    cr: 0,
+                    answers: 1,
+                    agent_answers: 0,
+                })
+                .expect("the token record is written");
+        }
     }
 
     fn settings(read: bool, switch: bool) -> Settings {
@@ -1675,6 +2124,16 @@ pub(crate) mod tests {
                 label: None,
                 abbr: None,
                 color: None,
+            },
+            Command::Burn {
+                action: BurnAction::Plan { json: false },
+            },
+            Command::Burn {
+                action: BurnAction::Simulate {
+                    from: "2026-11-09".to_string(),
+                    to: "2026-11-16".to_string(),
+                    without: vec!["LB".to_string()],
+                },
             },
             Command::AgentSkill {
                 action: SkillAction::Install { force: false },
@@ -1778,6 +2237,16 @@ pub(crate) mod tests {
                         waybar: true,
                         i3blocks: false,
                         refresh: true,
+                    },
+                    Command::Burn {
+                        action: BurnAction::Plan { json: true },
+                    },
+                    Command::Burn {
+                        action: BurnAction::Simulate {
+                            from: "2026-11-09".to_string(),
+                            to: "2026-11-16".to_string(),
+                            without: Vec::new(),
+                        },
                     },
                 ] {
                     assert_eq!(
@@ -2404,6 +2873,15 @@ pub(crate) mod tests {
         assert_eq!(events[switched]["to"]["acc"], json!(FIRST_ACCOUNT_UUID));
     }
 
+    /// Settings whose history is `<root>/history`, under the test host `atlas`.
+    fn history_settings(root: &Path) -> Settings {
+        Settings {
+            history_dir: Some(root.join("history")),
+            host_name: Some("atlas".to_string()),
+            ..Settings::default()
+        }
+    }
+
     fn burn_account(id: &str, abbr: &str, acc: &str) -> Account {
         Account {
             id: id.to_string(),
@@ -2457,6 +2935,7 @@ pub(crate) mod tests {
             color: "#3b82f6".to_string(),
             email: None,
             plan: None,
+            auto_burn: true,
             is_active: false,
             login_state: LoginState::Ok,
             login_ends_at_ms: None,
@@ -2473,10 +2952,63 @@ pub(crate) mod tests {
         }
     }
 
+    /// The printed forms of `status` show nothing of auto-burn, so they must
+    /// not read the four weeks of history: `--waybar` runs every few seconds.
+    /// A history folder that cannot be read is the proof: the JSON form calls
+    /// it an error, the waybar line still prints without a warning.
+    #[test]
+    fn status_waybar_does_not_read_the_history() {
+        if std::env::var_os("SEATSWAP_WAYBAR_CHILD").is_some() {
+            waybar_with_a_broken_history();
+            return;
+        }
+        let exe = std::env::current_exe().expect("the test binary");
+        let output = std::process::Command::new(exe)
+            .args([
+                "status_waybar_does_not_read_the_history",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("SEATSWAP_WAYBAR_CHILD", "1")
+            .output()
+            .expect("the child runs");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stdout.contains("SEATSWAP-WAYBAR-CHILD-RAN"),
+            "the child did not run:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            output.status.success(),
+            "the child failed:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("warning"),
+            "the waybar line must not read the history:\n{stderr}"
+        );
+    }
+
+    fn waybar_with_a_broken_history() {
+        let fixture = Fixture::new();
+        fixture.add_account(0);
+        // A regular file where the history root belongs: reading it fails.
+        fs::write(fixture.data_dir.join("history"), b"not a folder")
+            .expect("a file where the history root belongs");
+        let store = fixture.store();
+        let settings = store.load().expect("accounts").settings;
+        let context = Context {
+            store,
+            claude: fixture.claude(),
+            settings,
+        };
+        let result = status(context, false, true, false, false);
+        assert!(result.is_ok(), "the waybar line is printed: {result:?}");
+        println!("SEATSWAP-WAYBAR-CHILD-RAN");
+    }
+
     #[test]
     fn status_json_suggestion_is_the_planners() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let history = HistoryDir::at(tmp.path(), "atlas");
         let now = Utc::now();
         let reset = DateTime::parse_from_rfc3339("2026-11-16T02:00:00Z")
             .expect("a test time")
@@ -2490,17 +3022,17 @@ pub(crate) mod tests {
             burn_view("ac", "AC", 10.0, true, reset, now),
         ];
         let offset = FixedOffset::east_opt(0).expect("UTC");
-        let suggestion = status_suggestion(
-            &history,
+        let burn = burn_status(
+            &AppPaths::at(tmp.path()),
+            &history_settings(tmp.path()),
             &views,
             &accounts,
-            &Settings::default(),
             Some("pr"),
             now,
             offset,
-        )
-        .expect("the history reads")
-        .expect("the planner suggests a switch");
+        );
+        assert_eq!(burn.error, None);
+        let suggestion = burn.suggestion.expect("the planner suggests a switch");
         assert_eq!(suggestion.to_id, "ac");
         assert!(suggestion.text.starts_with("Switch to AC now:"));
     }
@@ -2508,11 +3040,7 @@ pub(crate) mod tests {
     #[test]
     fn status_json_has_usable() {
         let views = vec![account_view(true), account_view(false)];
-        let output = StatusJson {
-            views: &views,
-            active: None,
-            suggestion: None,
-        };
+        let output = StatusJson::new(&views, None, &BurnStatus::default());
         let value = serde_json::to_value(&output).expect("status JSON");
         let views = value["views"].as_array().expect("views");
         assert_eq!(views.len(), 2);
@@ -2526,6 +3054,309 @@ pub(crate) mod tests {
         assert_eq!(views[1]["usable"], false);
     }
 
+    #[test]
+    fn burn_plan_json_has_regime_and_segments() {
+        let fixture = Fixture::new();
+        fixture.add_account(0);
+        let account = fixture.account(0);
+        fixture.set_reading(&account, 10.0, false);
+        let context = open_context(&fixture.cli(Command::Burn {
+            action: BurnAction::Plan { json: true },
+        }))
+        .expect("the context opens");
+
+        let text = burn_plan(context, true).expect("the plan is written");
+        let value: Value = serde_json::from_str(&text).expect("one JSON object");
+        assert_eq!(value["regime"]["early"], false);
+        assert_eq!(
+            value["regime"]["why"], "learning",
+            "no rates and no rhythm: the plan says why"
+        );
+        assert!(value["regime"]["blockedLazyH"].is_null());
+        assert!(value["regime"]["blockedEagerH"].is_null());
+        assert_eq!(value["regime"]["extraSwitches"], 0);
+        assert!(value["regime"]["costH"].is_null());
+        let segments = value["segments"].as_array().expect("segments");
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0]["account"], json!(account.id));
+        assert!(segments[0]["from"].is_string());
+        assert!(segments[0]["to"].is_string());
+        assert!(value["leftAtReset"].is_object());
+    }
+
+    #[test]
+    fn burn_plan_without_a_reading_is_an_error() {
+        let fixture = Fixture::new();
+        fixture.add_account(0);
+        let context = open_context(&fixture.cli(Command::Burn {
+            action: BurnAction::Plan { json: false },
+        }))
+        .expect("the context opens");
+
+        let error = burn_plan(context, false).expect_err("a missing reading is an error");
+        assert_eq!(error.exit_code(), 2, "a usage error");
+        match error {
+            CliError::Usage(text) => {
+                assert!(text.contains("AC"), "{text}");
+                assert!(text.contains("no reading"), "{text}");
+            }
+            other => panic!("expected a usage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_json_has_auto_burn_and_next() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let history = HistoryDir::at(&tmp.path().join("history"), "atlas");
+        let mut settings = history_settings(tmp.path());
+        settings.auto_burn = true;
+        let now = Utc::now();
+        let pause = now + Duration::hours(2);
+        history
+            .append(&seatswap_core::history::Event {
+                t: now - Duration::minutes(1),
+                kind: EventKind::AutoBurn {
+                    on: true,
+                    paused_until: Some(pause),
+                },
+            })
+            .expect("the pause is written");
+        let reset = now + Duration::days(3);
+        let accounts = vec![
+            burn_account("pr", "PR", FIRST_ACCOUNT_UUID),
+            burn_account("ac", "AC", SECOND_ACCOUNT_UUID),
+        ];
+        let views = vec![
+            burn_view("pr", "PR", 100.0, false, reset, now),
+            burn_view("ac", "AC", 10.0, true, reset, now),
+        ];
+        let burn = burn_status(
+            &AppPaths::at(tmp.path()),
+            &settings,
+            &views,
+            &accounts,
+            Some("pr"),
+            now,
+            FixedOffset::east_opt(0).expect("UTC"),
+        );
+        let output = StatusJson::new(&views, Some("pr".to_string()), &burn);
+        let value = serde_json::to_value(&output).expect("status JSON");
+        assert_eq!(value["autoBurn"]["on"], true);
+        assert_eq!(value["autoBurn"]["pausedUntil"], json!(pause));
+        assert_eq!(value["next"], "ac");
+        assert!(value["burnError"].is_null());
+        for view in value["views"].as_array().expect("views") {
+            assert!(
+                view.get("slackHours").is_none(),
+                "a missing slack is absent, not null: {view}"
+            );
+        }
+    }
+
+    #[test]
+    fn next_by_an_agent_does_nothing_while_auto_burn_is_on() {
+        let fixture = Fixture::new();
+        fixture.add_account(0);
+        fixture.write_live(1);
+        fixture.add_account(1);
+        fixture.write_live(0);
+        fixture.set_agents(true, true);
+        fixture.set_auto_burn(true);
+        let before = fixture.live_bytes();
+
+        let context = open_context(&fixture.cli(plain_next())).expect("the context opens");
+        let line = next_account(context, None, false, By::Agent, None)
+            .expect("auto-burn answers instead of switching");
+        assert_eq!(line, "seatswap: auto-burn is on and decides");
+        assert_eq!(fixture.live_bytes(), before);
+
+        let mut cli = fixture.cli(plain_next());
+        let mut stdin: &[u8] = b"";
+        execute(&mut cli, Caller::Agent, &mut stdin).expect("exit 0");
+        assert_eq!(
+            fixture.live_bytes(),
+            before,
+            "the agent's next touched no login"
+        );
+    }
+
+    #[test]
+    fn simulate_prints_both_policies() {
+        let fixture = Fixture::new();
+        fixture.add_account(0);
+        let account = fixture.account(0);
+        let day = DateTime::parse_from_rfc3339("2026-11-10T12:00:00Z")
+            .expect("a test time")
+            .with_timezone(&Utc);
+        fixture.write_sample(&account, day, 0.0);
+        fixture.write_work(day, 1.0);
+        fixture.write_work(day + Duration::hours(1), 2.0);
+        let context = open_context(&fixture.cli(Command::Burn {
+            action: BurnAction::Simulate {
+                from: "2026-11-09".to_string(),
+                to: "2026-11-16".to_string(),
+                without: Vec::new(),
+            },
+        }))
+        .expect("the context opens");
+
+        let text =
+            burn_simulate(context, "2026-11-09", "2026-11-16", &[]).expect("the replay runs");
+        assert!(text.contains("Lazy: worked"), "{text}");
+        assert!(text.contains("Eager: worked"), "{text}");
+        assert!(text.contains("switches"), "{text}");
+        assert!(text.contains("AC: 100 % expired"), "{text}");
+    }
+
+    #[test]
+    fn simulate_rejects_an_unknown_without() {
+        let fixture = Fixture::new();
+        fixture.add_account(0);
+        let context = open_context(&fixture.cli(Command::Burn {
+            action: BurnAction::Simulate {
+                from: "2026-11-09".to_string(),
+                to: "2026-11-16".to_string(),
+                without: Vec::new(),
+            },
+        }))
+        .expect("the context opens");
+
+        let error = burn_simulate(context, "2026-11-09", "2026-11-16", &["ZZ".to_string()])
+            .expect_err("an unknown abbreviation is an error");
+        assert_eq!(error.exit_code(), 2, "a usage error");
+        match error {
+            CliError::Usage(text) => assert!(text.contains("ZZ"), "{text}"),
+            other => panic!("expected a usage error, got {other:?}"),
+        }
+    }
+
+    /// A range of one local day is a range: `--to` is the *last* local day of
+    /// the replay and it is inclusive, so `--from X --to X` replays the day X.
+    #[test]
+    fn a_one_day_replay_is_a_range() {
+        let fixture = Fixture::new();
+        fixture.add_account(0);
+        let account = fixture.account(0);
+        let day = DateTime::parse_from_rfc3339("2026-11-10T12:00:00Z")
+            .expect("a test time")
+            .with_timezone(&Utc);
+        fixture.write_sample(&account, day, 0.0);
+        fixture.write_work(day, 1.0);
+        let context = open_context(&fixture.cli(Command::Burn {
+            action: BurnAction::Simulate {
+                from: "2026-11-10".to_string(),
+                to: "2026-11-10".to_string(),
+                without: Vec::new(),
+            },
+        }))
+        .expect("the context opens");
+
+        let text = burn_simulate(context, "2026-11-10", "2026-11-10", &[])
+            .expect("--from and --to on the same day replay that one day");
+        assert!(text.contains("Lazy: worked"), "{text}");
+        assert!(text.contains("Eager: worked"), "{text}");
+    }
+
+    /// The last hour of a local day belongs to that day, also when the clock
+    /// changes inside it: the replay ends at the local midnight of the next
+    /// day, not 24 hours after the local midnight of the last day. The work
+    /// runs in a child process in Europe/Berlin, where the local day
+    /// 2026-10-25 has 25 hours. Only Unix reads the child's `TZ`.
+    #[cfg(unix)]
+    #[test]
+    fn a_day_with_a_clock_change_keeps_its_last_hour() {
+        if std::env::var_os("SEATSWAP_TZ").is_some() {
+            replay_in_berlin();
+            return;
+        }
+        let exe = std::env::current_exe().expect("the test binary");
+        let output = std::process::Command::new(exe)
+            .args([
+                "a_day_with_a_clock_change_keeps_its_last_hour",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("SEATSWAP_TZ", "Europe/Berlin")
+            .env("TZ", "Europe/Berlin")
+            .output()
+            .expect("the child runs");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stdout.contains("SEATSWAP-TZ-CHILD-RAN"),
+            "the child did not run:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            output.status.success(),
+            "the child failed:\n{stdout}\n{stderr}"
+        );
+    }
+
+    /// The replay of the local days 2026-10-24 and 2026-10-25 in Berlin: the
+    /// hour of work in the last hour of the 25th (23:00-24:00 local time)
+    /// belongs to the 25th.
+    #[cfg(unix)]
+    fn replay_in_berlin() {
+        let fixture = Fixture::new();
+        fixture.add_account(0);
+        let account = fixture.account(0);
+        let at = |text: &str| {
+            DateTime::parse_from_rfc3339(text)
+                .expect("a test time")
+                .with_timezone(&Utc)
+        };
+        // A reading inside the range, so the account can be used.
+        fixture.write_sample(&account, at("2026-10-24T12:00:00Z"), 0.0);
+        // One hour of work in the last hour of the local day 2026-10-25
+        // (23:00-24:00 in Berlin, 22:00-23:00 UTC).
+        fixture.write_work(at("2026-10-25T22:30:00Z"), 1.0);
+        let context = open_context(&fixture.cli(Command::Burn {
+            action: BurnAction::Simulate {
+                from: "2026-10-24".to_string(),
+                to: "2026-10-25".to_string(),
+                without: Vec::new(),
+            },
+        }))
+        .expect("the context opens");
+
+        let text =
+            burn_simulate(context, "2026-10-24", "2026-10-25", &[]).expect("the replay runs");
+        println!("SEATSWAP-TZ-CHILD-RAN");
+        assert!(
+            text.contains("Lazy: worked 1.0 h"),
+            "the last hour of the local day belongs to the day: {text}"
+        );
+    }
+
+    #[test]
+    fn burn_commands_follow_agents_read() {
+        let plan = Command::Burn {
+            action: BurnAction::Plan { json: true },
+        };
+        let simulate = Command::Burn {
+            action: BurnAction::Simulate {
+                from: "2026-11-09".to_string(),
+                to: "2026-11-16".to_string(),
+                without: Vec::new(),
+            },
+        };
+        for read in [false, true] {
+            let settings = settings(read, true);
+            let expected = if read {
+                Gate::Allowed
+            } else {
+                Gate::Refused(AGENTS_MAY_NOT_READ)
+            };
+            for command in [&plan, &simulate] {
+                assert_eq!(
+                    gate(command, Caller::Agent, &settings),
+                    expected,
+                    "agentsRead {read}: {command:?}"
+                );
+            }
+        }
+    }
+
     fn account_view(usable: bool) -> AccountView {
         AccountView {
             id: "id".to_string(),
@@ -2534,6 +3365,7 @@ pub(crate) mod tests {
             color: "#3b82f6".to_string(),
             email: Some("one@example.com".to_string()),
             plan: None,
+            auto_burn: true,
             is_active: false,
             login_state: LoginState::Ok,
             login_ends_at_ms: None,

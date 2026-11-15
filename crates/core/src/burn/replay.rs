@@ -27,6 +27,9 @@ pub struct ReplayResult {
     /// The week-% unused at every weekly reset the replay passed, summed per
     /// account.
     pub expired: BTreeMap<AccountRef, f64>,
+    /// The mean work of the recorded hours that had work: the "typical working
+    /// hour" the play's eager rule used. 0.0 when no hour had work.
+    pub typical_wu: f64,
     /// The warnings of the sample and token reads, for the caller that shows
     /// them (Task 9's CLI).
     pub warnings: Vec<String>,
@@ -115,12 +118,8 @@ pub fn replay(
         rhythm: Rhythm { wu: [0.0; 168] },
     };
     inputs.check()?;
-    let played = play(
-        &inputs,
-        policy,
-        &walk,
-        mean_over_hours(hours.values().copied()),
-    );
+    let typical_wu = mean_over_hours(hours.values().copied());
+    let played = play(&inputs, policy, &walk, typical_wu);
     let expired = played
         .expired
         .into_iter()
@@ -132,6 +131,7 @@ pub fn replay(
         blocked_wu: played.plan.blocked_wu,
         switches: played.plan.switches,
         expired,
+        typical_wu,
         warnings,
     })
 }

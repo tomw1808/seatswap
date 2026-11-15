@@ -589,14 +589,16 @@ pub fn remove_account(store: &Store, key: &str) -> Result<Account, SwitchError> 
     Ok(removed)
 }
 
-/// Change label, abbreviation or colour. Every value goes through the store's
-/// validator first, so an invalid value leaves the account list untouched.
+/// Change label, abbreviation, colour or whether auto-burn may use the
+/// account. Every value goes through the store's validator first, so an
+/// invalid value leaves the account list untouched.
 pub fn edit_account(
     store: &Store,
     key: &str,
     label: Option<&str>,
     abbr: Option<&str>,
     color: Option<&str>,
+    auto_burn: Option<bool>,
 ) -> Result<Account, SwitchError> {
     let _app_lock = locks::acquire_app_lock(store.app_paths(), APP_LOCK_TIMEOUT)?;
     let mut file = store.load()?;
@@ -639,6 +641,12 @@ pub fn edit_account(
     if let Some(color) = color {
         if account.color != color {
             account.color = color;
+            changed = true;
+        }
+    }
+    if let Some(auto_burn) = auto_burn {
+        if account.auto_burn != auto_burn {
+            account.auto_burn = auto_burn;
             changed = true;
         }
     }
@@ -1646,21 +1654,21 @@ mod tests {
         let w = World::new();
         let before_accounts = w.accounts_bytes();
 
-        let clash = edit_account(&w.store, &w.a_id, None, Some("pr"), None);
+        let clash = edit_account(&w.store, &w.a_id, None, Some("pr"), None, None);
         match clash {
             Err(SwitchError::Store(StoreError::DuplicateAbbr(_))) => {}
             other => panic!("expected DuplicateAbbr, got {other:?}"),
         }
         assert_eq!(w.accounts_bytes(), before_accounts);
 
-        let bad_color = edit_account(&w.store, &w.a_id, None, None, Some("3b82f6"));
+        let bad_color = edit_account(&w.store, &w.a_id, None, None, Some("3b82f6"), None);
         match bad_color {
             Err(SwitchError::Store(StoreError::InvalidColor(_))) => {}
             other => panic!("expected InvalidColor, got {other:?}"),
         }
         assert_eq!(w.accounts_bytes(), before_accounts);
 
-        let bad_label = edit_account(&w.store, &w.a_id, Some("   "), None, None);
+        let bad_label = edit_account(&w.store, &w.a_id, Some("   "), None, None, None);
         match bad_label {
             Err(SwitchError::Store(StoreError::InvalidLabel(_))) => {}
             other => panic!("expected InvalidLabel, got {other:?}"),
@@ -1673,6 +1681,7 @@ mod tests {
             Some("  Team A  "),
             Some("z9"),
             Some("#ABCDEF"),
+            None,
         )
         .unwrap();
         assert_eq!(edited.label, "Team A");
@@ -1683,6 +1692,25 @@ mod tests {
         assert_eq!(stored.label, "Team A");
         assert_eq!(stored.abbr, "Z9");
         assert_eq!(stored.color, "#abcdef");
+    }
+
+    #[test]
+    fn edit_account_sets_auto_burn() {
+        let w = World::new();
+        assert!(w.account_file().find(&w.a_id).unwrap().auto_burn);
+
+        let edited = edit_account(&w.store, &w.a_id, None, None, None, Some(false)).unwrap();
+        assert!(!edited.auto_burn);
+        let stored = w.account_file();
+        assert!(!stored.find(&w.a_id).unwrap().auto_burn);
+        assert!(
+            stored.find(&w.b_id).unwrap().auto_burn,
+            "the other account keeps its own switch"
+        );
+
+        let edited = edit_account(&w.store, &w.a_id, None, None, None, Some(true)).unwrap();
+        assert!(edited.auto_burn);
+        assert!(w.account_file().find(&w.a_id).unwrap().auto_burn);
     }
 
     #[test]

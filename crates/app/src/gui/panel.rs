@@ -593,6 +593,7 @@ pub(crate) async fn edit_account(
     label: Option<String>,
     abbr: Option<String>,
     color: Option<String>,
+    auto_burn: Option<bool>,
 ) -> Result<(), String> {
     let action = state.action.clone();
     let reply = tauri::async_runtime::spawn_blocking(move || {
@@ -601,6 +602,7 @@ pub(crate) async fn edit_account(
             label,
             abbr,
             color,
+            auto_burn,
             reply,
         })
     })
@@ -647,6 +649,39 @@ pub(crate) async fn save_settings(
         ActionReply::Failed(message) => Err(message),
         _ => Err("the action thread gave an unexpected reply".to_string()),
     }
+}
+
+/// Turn auto-burn on or off from the pop-up. It saves through the same settings
+/// path as the settings page, so the change is written to the history in one
+/// place (`worker::save_settings`).
+#[tauri::command]
+pub(crate) async fn set_auto_burn(state: State<'_, GuiState>, on: bool) -> Result<(), String> {
+    let snapshot = state.snapshot()?;
+    let mut settings = snapshot
+        .settings
+        .ok_or_else(|| "the settings are not loaded".to_string())?;
+    settings.auto_burn = on;
+    let action = state.action.clone();
+    let reply = tauri::async_runtime::spawn_blocking(move || {
+        request(&action, |reply| ActionCommand::SaveSettings {
+            settings,
+            reply,
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    match reply {
+        ActionReply::Done => Ok(()),
+        ActionReply::Failed(message) => Err(message),
+        _ => Err("the action thread gave an unexpected reply".to_string()),
+    }
+}
+
+/// Pause auto-burn for `hours`, or resume with `None`. The action thread writes
+/// the history event and wakes the engine.
+#[tauri::command]
+pub(crate) fn pause_burn(state: State<'_, GuiState>, hours: Option<i64>) -> Result<(), String> {
+    super::send_to_worker(state.action.send(ActionCommand::PauseBurn { hours }))
 }
 
 #[derive(Debug, Serialize)]

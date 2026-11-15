@@ -291,12 +291,18 @@ pub enum EventKind {
         project: ProjectKey,
         secs: u64,
     },
-    /// Auto-burn was turned on or off, or paused. A pause ends at
-    /// `paused_until`; `None` clears a pause (spec §2.5).
+    /// Auto-burn was paused or resumed. A pause ends at `paused_until`; `None`
+    /// clears a pause (spec §2.5).
     AutoBurn {
         on: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         paused_until: Option<DateTime<Utc>>,
+    },
+    /// A settings save changed whether auto-burn is on. It is not a pause or a
+    /// resume: a toggle leaves a manual switch's hold and an explicit pause
+    /// alone (spec §2.5).
+    AutoBurnSet {
+        on: bool,
     },
 }
 

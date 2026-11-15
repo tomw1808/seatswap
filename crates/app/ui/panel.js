@@ -19,8 +19,8 @@ const DEFAULT_SETTINGS = {
   iconLimit: "binding",
   pollActiveSecs: 120,
   pollInactiveSecs: 900,
-  suggestAt: 90,
-  suggestTargetBelow: 50,
+  autoBurn: false,
+  suggestSwitches: true,
   notifyOnSwitch: true,
   mirrorLive: true,
   refreshInactive: true,
@@ -97,6 +97,9 @@ const state = {
   // The account the keyboard cursor (↑/↓, Enter) is on; null = no cursor shown.
   // Cleared every time the pop-up opens, so it never outlives one use.
   cursorId: null,
+  // The account a switch waits for the person to confirm; only a switch with
+  // sessions on a model that loses its thinking asks (spec §2.12).
+  confirmSwitchId: null,
   editingId: null,
   editor: null,
   pendingKey: null,
@@ -111,6 +114,7 @@ const state = {
   lastCardOrder: [],
   errors: {
     banner: null,
+    burn: null,
     accounts: {},
     editor: null,
     editorColor: null,
@@ -492,9 +496,21 @@ function renderMain() {
     state.errors.editor = null;
     state.errors.editorColor = null;
   }
+  if (state.confirmSwitchId && !views.some((view) => view.id === state.confirmSwitchId)) {
+    state.confirmSwitchId = null;
+  }
 
   clear(banners);
   renderBanners(banners);
+
+  const oldStrip = document.getElementById("burn-strip");
+  if (oldStrip) oldStrip.remove();
+  if (state.snapshot && isObject(state.snapshot.burn)) {
+    const strip = renderBurnStrip();
+    if (strip && cards.parentNode) cards.parentNode.insertBefore(strip, cards);
+  } else {
+    state.errors.burn = null;
+  }
 
   const previousPositions = captureCardPositions();
   clear(cards);
@@ -530,6 +546,25 @@ function renderMain() {
   }
 }
 
+// The running sessions and the number that wait for you (spec §4.1). The strip
+// carries the same line while auto-burn has a view; the footer keeps it
+// otherwise.
+function sessionsLineNode(sessions, className) {
+  if (sessions.unavailable != null) {
+    return h("span", { class: className, text: String(sessions.unavailable) });
+  }
+  const waiting = Array.isArray(sessions.waiting) ? sessions.waiting.length : 0;
+  const line = h("span", { class: className }, [
+    `${sessions.running} sessions · ${sessions.busy} busy`,
+  ]);
+  if (waiting > 0) {
+    line.appendChild(
+      h("span", { class: "footer-waiting", text: ` · ${waiting} waiting for you` })
+    );
+  }
+  return line;
+}
+
 // The footer line beside "+ Add account": the running sessions, and a warning
 // mark whose tooltip is the sessions thread's warning (spec §1.6).
 function renderFooter() {
@@ -541,24 +576,9 @@ function renderFooter() {
   const snapshot = state.snapshot;
   if (!snapshot || snapshot.sessions == null) return;
   const sessions = snapshot.sessions;
-  if (sessions.unavailable != null) {
-    footer.appendChild(
-      h("span", {
-        class: "footer-sessions",
-        text: String(sessions.unavailable),
-      })
-    );
-  } else {
-    const waiting = Array.isArray(sessions.waiting) ? sessions.waiting.length : 0;
-    const line = h("span", { class: "footer-sessions" }, [
-      `${sessions.running} sessions · ${sessions.busy} busy`,
-    ]);
-    if (waiting > 0) {
-      line.appendChild(
-        h("span", { class: "footer-waiting", text: ` · ${waiting} waiting for you` })
-      );
-    }
-    footer.appendChild(line);
+  // The strip above the cards shows this line whenever auto-burn has a view.
+  if (!isObject(snapshot.burn)) {
+    footer.appendChild(sessionsLineNode(sessions, "footer-sessions"));
   }
   if (sessions.warning != null) {
     footer.appendChild(
@@ -568,6 +588,118 @@ function renderFooter() {
         text: "⚠",
       })
     );
+  }
+}
+
+// The strip above the cards: the auto-burn switch, Pause/Resume, the plan's
+// line, a waiting switch and the running sessions (spec §2.4, §2.12).
+function renderBurnStrip() {
+  const burn = state.snapshot.burn;
+  const strip = h("div", {
+    class: "burn-strip",
+    id: "burn-strip",
+    role: "group",
+    "aria-label": "Auto-burn",
+  });
+  const errors = [];
+
+  if (typeof burn.on !== "boolean") {
+    errors.push("The auto-burn state is missing.");
+  }
+  const on = burn.on === true;
+  const row = h("div", { class: "burn-row" }, [
+    h("b", { class: "burn-title", text: "Auto-burn" }),
+    typeof burn.on === "boolean"
+      ? switchButton(on, "Auto-burn", setAutoBurn)
+      : null,
+    h("span", { class: "burn-state", text: on ? "On" : "Off" }),
+    h("span", { class: "burn-spacer" }),
+  ]);
+
+  let pausedAt = NaN;
+  if (burn.pausedUntil != null) {
+    if (typeof burn.pausedUntil === "string") {
+      pausedAt = Date.parse(burn.pausedUntil);
+    }
+    if (!Number.isFinite(pausedAt)) {
+      errors.push("The auto-burn pause time is not a time.");
+      pausedAt = NaN;
+    }
+  }
+  if (pausedAt > Date.now()) {
+    const paused = h("span", { class: "burn-paused" }, [
+      "Auto-burn paused until ",
+      timeNode(burn.pausedUntil, "clock"),
+      " · ",
+    ]);
+    paused.appendChild(button("Resume", "ghost small", () => pauseBurn(null)));
+    row.appendChild(paused);
+  } else {
+    row.appendChild(button("Pause 4 h", "ghost small", () => pauseBurn(4)));
+  }
+  strip.appendChild(row);
+
+  if (burn.line != null) {
+    strip.appendChild(h("p", { class: "burn-line", text: String(burn.line) }));
+  }
+
+  if (burn.waiting != null) {
+    const waiting = isObject(burn.waiting) ? burn.waiting : null;
+    const target = waiting ? findView(waiting.to) : null;
+    const tiedBusy = waiting ? Number(waiting.tiedBusy) : NaN;
+    if (!waiting) {
+      errors.push("The waiting switch is incomplete.");
+    } else if (!target) {
+      errors.push("The waiting switch names an account that is not in the list.");
+    } else if (!Number.isInteger(tiedBusy) || tiedBusy < 0) {
+      errors.push("The waiting switch has no valid number of busy sessions.");
+    } else if (typeof waiting.latest !== "string") {
+      errors.push("The waiting switch has no latest time.");
+    } else {
+      strip.appendChild(
+        h("p", { class: "burn-waiting" }, [
+          `A switch to ${accountLabel(target)} is waiting: ${tiedBusy} ${
+            tiedBusy === 1 ? "session" : "sessions"
+          } on a model that would lose its thinking ${
+            tiedBusy === 1 ? "is" : "are"
+          } busy. At the latest `,
+          timeNode(waiting.latest, "clock"),
+          ".",
+        ])
+      );
+    }
+  }
+
+  if (state.snapshot.sessions != null) {
+    strip.appendChild(sessionsLineNode(state.snapshot.sessions, "burn-sessions"));
+  }
+
+  if (state.errors.burn) errors.unshift(state.errors.burn);
+  for (const text of errors) {
+    strip.appendChild(h("div", { class: "inline-error burn-error", text }));
+  }
+  return strip;
+}
+
+async function setAutoBurn(on) {
+  state.errors.burn = null;
+  try {
+    await invoke("set_auto_burn", { on });
+    afterCommand();
+  } catch (error) {
+    state.errors.burn = errorMessage(error);
+    renderMain();
+  }
+}
+
+async function pauseBurn(hours) {
+  state.errors.burn = null;
+  try {
+    await invoke("pause_burn", { hours });
+    afterCommand();
+  } catch (error) {
+    state.errors.burn = errorMessage(error);
+    renderMain();
   }
 }
 
@@ -638,9 +770,11 @@ function renderBanners(container) {
     }
   }
 
-  if (snapshot.suggestion) {
-    container.appendChild(renderSuggestionBanner(snapshot.suggestion));
+  if (isObject(snapshot.burn) && isObject(snapshot.burn.suggestion)) {
+    container.appendChild(renderBurnSuggestion(snapshot.burn.suggestion));
   }
+  const confirmation = renderSwitchConfirmation();
+  if (confirmation) container.appendChild(confirmation);
 
   if (Array.isArray(snapshot.warnings)) {
     for (const warning of snapshot.warnings) {
@@ -771,20 +905,42 @@ function renderUnknownLoginBanner(live) {
   );
 }
 
-function renderSuggestionBanner(suggestion) {
-  const from = findView(suggestion.fromId);
-  const to = findView(suggestion.toId);
-  const fromName = accountLabel(from);
-  const toName = to ? accountLabel(to) : "another account";
-  const text = [`${fromName} is at ${fmtPercent(suggestion.fromPercent)}`];
-  if (suggestion.fromResetsAt) {
-    text.push(" (resets ", timeNode(suggestion.fromResetsAt, "clock"), ")");
+// The suggestion auto-burn would carry out while it is off (spec §2.5).
+function renderBurnSuggestion(suggestion) {
+  const to = typeof suggestion.to === "string" ? suggestion.to : "";
+  const text = typeof suggestion.text === "string" ? suggestion.text : "";
+  if (!to || !text) {
+    return banner("error", "⚠", "The switch suggestion is incomplete.");
   }
-  text.push(` — switch to ${toName} (${fmtPercent(suggestion.toPercent)})?`);
-
   return banner("info", "⚠", text, [
     h("div", { class: "banner-actions" }, [
-      button("Switch", "primary small", () => switchTo(suggestion.toId)),
+      button("Switch", "primary small", () => switchTo(to)),
+    ]),
+  ]);
+}
+
+// A manual switch while sessions hold thinking the new account cannot keep
+// (spec §2.12): the person decides, so this asks once.
+function renderSwitchConfirmation() {
+  const key = state.confirmSwitchId;
+  if (!key) return null;
+  const sessions = state.snapshot ? state.snapshot.sessions : null;
+  if (!sessions || !(Number(sessions.tied) > 0)) {
+    state.confirmSwitchId = null;
+    return null;
+  }
+  if (!findView(key)) {
+    state.confirmSwitchId = null;
+    return null;
+  }
+  const text = `${sessions.running} sessions · ${sessions.busy} busy · ${sessions.tied} on a model that will work without its earlier thinking until you switch back.`;
+  return banner("warn", "⚠", text, [
+    h("div", { class: "banner-actions" }, [
+      button("Switch", "primary small", confirmSwitch),
+      button("Cancel", "ghost small", () => {
+        state.confirmSwitchId = null;
+        renderMain();
+      }),
     ]),
   ]);
 }
@@ -793,6 +949,32 @@ function loginDaysLeftOf(view) {
   if (view && typeof view.loginDaysLeft === "number") return view.loginDaysLeft;
   if (view && typeof view.loginEndsAtMs === "number") {
     return Math.floor((view.loginEndsAtMs - Date.now()) / 86400000);
+  }
+  return null;
+}
+
+// "next · about 12:00" or, when a switch waits for a quiet moment,
+// "waiting · latest 12:40" (spec §3.7.1). Only while auto-burn is on.
+function renderCardTag(view) {
+  const burn = state.snapshot && isObject(state.snapshot.burn) ? state.snapshot.burn : null;
+  if (!burn || burn.on !== true || viewIsActive(view) || view.loginState === "loggedOut") {
+    return null;
+  }
+  if (isObject(burn.waiting) && burn.waiting.to === view.id) {
+    if (typeof burn.waiting.latest === "string") {
+      return h("span", { class: "card-tag waiting" }, [
+        "waiting · latest ",
+        timeNode(burn.waiting.latest, "clock"),
+      ]);
+    }
+    return h("span", { class: "card-tag error", text: "waiting · latest time missing" });
+  }
+  const planned = isObject(burn.planned) ? burn.planned[view.id] : null;
+  if (typeof planned === "string") {
+    return h("span", { class: "card-tag next" }, [
+      "next · about ",
+      timeNode(planned, "clock"),
+    ]);
   }
   return null;
 }
@@ -886,9 +1068,12 @@ function renderCard(view, index) {
   if (view.plan) metaParts.push(view.plan);
   const metaText = metaParts.length ? metaParts.join(" · ") : "no login details";
   const age = usageAge(view);
-  main.appendChild(
-    h("div", { class: "card-meta", title: metaText }, age ? [metaText, " · ", age] : metaText)
-  );
+  const metaRow = h("div", { class: "card-meta-row" }, [
+    h("div", { class: "card-meta", title: metaText }, age ? [metaText, " · ", age] : metaText),
+  ]);
+  const tag = renderCardTag(view);
+  if (tag) metaRow.appendChild(tag);
+  main.appendChild(metaRow);
 
   if (view.loginState === "loggedOut") {
     main.appendChild(renderLoggedOut());
@@ -1119,6 +1304,9 @@ function openEditor(id) {
     // An invalid saved colour leaves the field empty; it is never replaced by
     // a palette colour that would silently be saved over the real value.
     color: validColor ? account.color.toLowerCase() : "",
+    // Missing is not "off": Save refuses until the view carries the real value.
+    autoBurn:
+      typeof account.autoBurn === "boolean" ? account.autoBurn : null,
     confirmRemove: false,
   };
   state.errors.editor = null;
@@ -1126,6 +1314,9 @@ function openEditor(id) {
     ? null
     : `The saved colour ${JSON.stringify(account.color)} is not #rrggbb. Choose a colour.`;
   state.errors.preview = null;
+  if (typeof state.editor.autoBurn !== "boolean") {
+    state.errors.editor = "Auto-burn may use this account: the account's value is missing.";
+  }
   renderMain();
 }
 
@@ -1350,6 +1541,29 @@ function renderEditor(account) {
   wrapper.appendChild(previews);
   wrapper.appendChild(previewError);
 
+  wrapper.appendChild(
+    h("div", { class: "setting editor-setting" }, [
+      h("div", { class: "setting-label" }, [
+        h("span", { text: "Auto-burn may use this account" }),
+        h("span", {
+          class: "sub",
+          text:
+            "off: auto-burn never switches to it; it still leaves it when it is full",
+        }),
+      ]),
+      h("div", { class: "setting-control" }, [
+        switchButton(
+          editor.autoBurn === true,
+          "Auto-burn may use this account",
+          (value) => {
+            editor.autoBurn = value;
+            if (state.errors.editor) editorError(null);
+          }
+        ),
+      ]),
+    ])
+  );
+
   if (editor.confirmRemove) {
     const name = `${account.abbr || "?"} — ${account.label || "this account"}`;
     wrapper.appendChild(
@@ -1535,6 +1749,10 @@ async function saveEditor() {
     return;
   }
   editorColorError(null);
+  if (typeof editor.autoBurn !== "boolean") {
+    editorError("Auto-burn may use this account: the account's value is missing; re-open the panel.");
+    return;
+  }
 
   try {
     await invoke("edit_account", {
@@ -1542,6 +1760,7 @@ async function saveEditor() {
       label,
       abbr,
       color,
+      autoBurn: editor.autoBurn,
     });
     state.errors.editor = null;
     closeEditor();
@@ -1807,22 +2026,6 @@ function renderSettings() {
     )
   );
 
-  settings.appendChild(
-    settingRow(
-      "Suggest a switch at",
-      numberControl(draft, "suggestAt", { min: "1", max: "100", step: "1" }, "%"),
-      "Show the switch suggestion when the live account reaches this percentage."
-    )
-  );
-
-  settings.appendChild(
-    settingRow(
-      "Suggest a target below",
-      numberControl(draft, "suggestTargetBelow", { min: "1", max: "100", step: "1" }, "%"),
-      "Only suggest an account whose binding limit is below this percentage."
-    )
-  );
-
   settings.appendChild(settingRow("Notify on switch", checkboxControl(draft, "notifyOnSwitch")));
   settings.appendChild(
     settingRow(
@@ -1901,6 +2104,18 @@ function renderSettings() {
       class: "setting-note",
       text: "Takes effect after restarting seatswap.",
     })
+  );
+
+  settings.appendChild(settingGroup("Auto-burn"));
+  settings.appendChild(
+    settingRow("Auto-burn", switchControl(draft, "autoBurn", "Auto-burn"))
+  );
+  settings.appendChild(
+    settingRow(
+      "Suggest switches",
+      switchControl(draft, "suggestSwitches", "Suggest switches"),
+      "while auto-burn is off"
+    )
   );
 
   settings.appendChild(settingGroup("History"));
@@ -2076,6 +2291,29 @@ function checkboxControl(draft, key) {
   return input;
 }
 
+// The switch used for auto-burn and for the two per-account switches.
+function switchButton(checked, label, onchange) {
+  const control = h("button", {
+    type: "button",
+    class: "switch",
+    role: "switch",
+    "aria-checked": checked ? "true" : "false",
+    "aria-label": label,
+  });
+  control.addEventListener("click", () => {
+    const next = control.getAttribute("aria-checked") !== "true";
+    control.setAttribute("aria-checked", next ? "true" : "false");
+    onchange(next);
+  });
+  return control;
+}
+
+function switchControl(draft, key, label) {
+  return switchButton(Boolean(draft[key]), label || key, (value) => {
+    draft[key] = value;
+  });
+}
+
 function settingsError(text) {
   state.errors.settings = text || null;
   const node = document.getElementById("settings-error");
@@ -2149,18 +2387,6 @@ async function saveSettings() {
     settingsError("Poll other accounts must be a whole number of at least 30 seconds.");
     return;
   }
-  if (!Number.isInteger(draft.suggestAt) || draft.suggestAt < 1 || draft.suggestAt > 100) {
-    settingsError("Suggest a switch at must be a whole number between 1 and 100 %.");
-    return;
-  }
-  if (
-    !Number.isInteger(draft.suggestTargetBelow) ||
-    draft.suggestTargetBelow < 1 ||
-    draft.suggestTargetBelow > 100
-  ) {
-    settingsError("Suggest a target below must be between 1 and 100 %.");
-    return;
-  }
 
   const configDir = String(draft.claudeConfigDir || "").trim();
   const hostName = String(draft.hostName || "").trim();
@@ -2173,8 +2399,8 @@ async function saveSettings() {
     iconLimit: draft.iconLimit,
     pollActiveSecs: draft.pollActiveSecs,
     pollInactiveSecs: draft.pollInactiveSecs,
-    suggestAt: draft.suggestAt,
-    suggestTargetBelow: draft.suggestTargetBelow,
+    autoBurn: Boolean(draft.autoBurn),
+    suggestSwitches: Boolean(draft.suggestSwitches),
     notifyOnSwitch: Boolean(draft.notifyOnSwitch),
     mirrorLive: Boolean(draft.mirrorLive),
     refreshInactive: Boolean(draft.refreshInactive),
@@ -2235,10 +2461,29 @@ function afterCommand() {
 }
 
 async function switchTo(key) {
+  const sessions = state.snapshot ? state.snapshot.sessions : null;
+  if (sessions && Number(sessions.tied) > 0) {
+    state.confirmSwitchId = key;
+    state.errors.banner = null;
+    renderMain();
+    return;
+  }
+  state.confirmSwitchId = null;
+  return switchWithPolicy(key, "refuse", null);
+}
+
+function confirmSwitch() {
+  const key = state.confirmSwitchId;
+  state.confirmSwitchId = null;
+  if (!key) {
+    renderMain();
+    return;
+  }
   return switchWithPolicy(key, "refuse", null);
 }
 
 async function switchWithPolicy(key, unsaved, label) {
+  state.confirmSwitchId = null;
   const cleanLabel = label === undefined || label === null ? null : String(label).trim();
   if (unsaved === "save" && !cleanLabel) {
     state.errors.banner = "Enter a label of 1 to 40 characters for the new account.";
@@ -2594,17 +2839,99 @@ function makeFixture() {
   const day = 86400000;
   const hour = 3600000;
   const acmeId = "5d1c2a9b-e0d3-4c11-9e21-7c8f1a2b3c4d";
-  const privateId = "8b4e7f20-6a1d-4d33-b8c5-2f9a0e6d7c81";
-  const dailyId = "c0a1b2d3-e4f5-4a6b-8c7d-9e0f1a2b3c4d";
+  const labId = "8b4e7f20-6a1d-4d33-b8c5-2f9a0e6d7c81";
+  const privateId = "c0a1b2d3-e4f5-4a6b-8c7d-9e0f1a2b3c4d";
   return {
     views: [
+      {
+        id: privateId,
+        label: "Private",
+        abbr: "PR",
+        color: "#8b5cf6",
+        email: "sam.private@mail.example",
+        plan: "Ultra",
+        autoBurn: true,
+        isActive: false,
+        loginState: "ok",
+        loginEndsAtMs: Date.now() + 4 * day,
+        loginDaysLeft: 4,
+        usage: {
+          limits: [
+            {
+              kind: "weekly_all",
+              percent: 70,
+              severity: "normal",
+              resetsAt: isoIn(3 * day + 5 * hour),
+              model: null,
+              isActive: true,
+            },
+            {
+              kind: "weekly_scoped",
+              percent: 22,
+              severity: "normal",
+              resetsAt: isoIn(3 * day),
+              model: "Opus",
+              isActive: false,
+            },
+            // An Other limit keeps the card's generic row in the fixture too.
+            {
+              kind: { other: "daily_tokens" },
+              percent: 42,
+              severity: "normal",
+              resetsAt: isoIn(6 * hour),
+              model: null,
+              isActive: false,
+            },
+          ],
+          extraUsageEnabled: false,
+        },
+        fetchedAt: isoIn(-8 * 60000),
+        lastError: null,
+      },
+      {
+        id: labId,
+        label: "Lab",
+        abbr: "LB",
+        color: "#10b981",
+        email: "sam@lab.example",
+        plan: "Max",
+        autoBurn: true,
+        isActive: false,
+        loginState: "ok",
+        loginEndsAtMs: Date.now() + 12 * day,
+        loginDaysLeft: 12,
+        usage: {
+          limits: [
+            {
+              kind: "weekly_all",
+              percent: 40,
+              severity: "normal",
+              resetsAt: isoIn(5 * day + 3 * hour),
+              model: null,
+              isActive: true,
+            },
+            {
+              kind: "weekly_scoped",
+              percent: 21,
+              severity: "normal",
+              resetsAt: isoIn(5 * day),
+              model: "Fable",
+              isActive: false,
+            },
+          ],
+          extraUsageEnabled: false,
+        },
+        fetchedAt: isoIn(-60000),
+        lastError: null,
+      },
       {
         id: acmeId,
         label: "Acme",
         abbr: "AC",
         color: "#3b82f6",
-        email: "someone@acme.example",
-        plan: "Team",
+        email: "sam@acme.example",
+        plan: "Team 5x",
+        autoBurn: true,
         isActive: true,
         loginState: "ok",
         loginEndsAtMs: Date.now() + 41 * day,
@@ -2641,80 +2968,21 @@ function makeFixture() {
         fetchedAt: isoIn(-12000),
         lastError: null,
       },
-      {
-        id: privateId,
-        label: "Private",
-        abbr: "P",
-        color: "#8b5cf6",
-        email: "private@example.com",
-        plan: "Ultra",
-        isActive: false,
-        loginState: "ok",
-        loginEndsAtMs: Date.now() + 4 * day,
-        loginDaysLeft: 4,
-        usage: {
-          limits: [
-            {
-              kind: "weekly_all",
-              percent: 31,
-              severity: "normal",
-              resetsAt: isoIn(3 * day + 5 * hour),
-              model: null,
-              isActive: true,
-            },
-            {
-              kind: "weekly_scoped",
-              percent: 12,
-              severity: "normal",
-              resetsAt: isoIn(3 * day),
-              model: "Opus",
-              isActive: false,
-            },
-          ],
-          extraUsageEnabled: false,
-        },
-        fetchedAt: isoIn(-8 * 60000),
-        lastError: null,
-      },
-      {
-        id: dailyId,
-        label: "Daily tokens",
-        abbr: "DT",
-        color: "#f59e0b",
-        email: "daily@example.com",
-        plan: "Pro",
-        isActive: false,
-        loginState: "ok",
-        loginEndsAtMs: Date.now() + 12 * day,
-        loginDaysLeft: 12,
-        // Only an Other limit: the card must still show a row, not "No usage limits".
-        usage: {
-          limits: [
-            {
-              kind: { other: "daily_tokens" },
-              percent: 42,
-              severity: "normal",
-              resetsAt: isoIn(6 * hour),
-              model: null,
-              isActive: true,
-            },
-          ],
-          extraUsageEnabled: false,
-        },
-        fetchedAt: isoIn(-60000),
-        lastError: null,
-      },
     ],
     activeId: acmeId,
     live: { kind: "known", accountId: acmeId },
-    suggestion: {
-      fromId: acmeId,
-      toId: privateId,
-      fromPercent: 97,
-      toPercent: 12,
-      fromResetsAt: isoIn(72 * 60000),
+    burn: {
+      on: true,
+      pausedUntil: null,
+      early: false,
+      why: "switching before 100 % does not pay",
+      learning: [],
+      line: "On AC until its 5 h window is full, about 2h. Then LB.",
+      planned: { [labId]: isoIn(2 * hour) },
+      waiting: { to: privateId, latest: isoIn(40 * 60000), tiedBusy: 1 },
+      suggestion: null,
     },
-    warnings: [{ kind: "soon", id: privateId, daysLeft: 4 }],
+    warnings: [{ kind: "soon", id: labId, daysLeft: 4 }],
     pending: null,
     secretsWarning: null,
     lastPollAt: isoIn(-12000),
@@ -2722,6 +2990,8 @@ function makeFixture() {
     sessions: {
       running: 9,
       busy: 2,
+      tied: 1,
+      tiedBusy: 1,
       waiting: [
         {
           session: "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34",
@@ -2733,7 +3003,10 @@ function makeFixture() {
       unavailable: null,
       warning: null,
     },
-    settings: Object.assign({}, DEFAULT_SETTINGS),
+    settings: Object.assign({}, DEFAULT_SETTINGS, {
+      autoBurn: true,
+      suggestSwitches: true,
+    }),
   };
 }
 
@@ -2764,6 +3037,7 @@ function fixtureCreateFromLive(fixture, labelValue) {
     color: color || PALETTE[0],
     email: fixture.live.email || null,
     plan: "Ultra",
+    autoBurn: true,
     isActive: false,
     loginState: "ok",
     loginEndsAtMs: Date.now() + 30 * 86400000,
@@ -2776,7 +3050,7 @@ function fixtureCreateFromLive(fixture, labelValue) {
   for (const view of fixture.views) view.isActive = view.id === account.id;
   fixture.activeId = account.id;
   fixture.live = { kind: "known", accountId: account.id };
-  fixture.suggestion = null;
+  if (fixture.burn) fixture.burn.suggestion = null;
   fixture.lastPollAt = new Date().toISOString();
   return account;
 }
@@ -2881,18 +3155,6 @@ function validateFixtureSettings(settings) {
   if (!Number.isInteger(merged.pollInactiveSecs) || merged.pollInactiveSecs < 30) {
     throw new Error(`pollInactiveSecs must be at least 30 s, got ${merged.pollInactiveSecs}`);
   }
-  if (!Number.isInteger(merged.suggestAt) || merged.suggestAt < 1 || merged.suggestAt > 100) {
-    throw new Error(`suggestAt must be between 1 and 100, got ${merged.suggestAt}`);
-  }
-  if (
-    !Number.isInteger(merged.suggestTargetBelow) ||
-    merged.suggestTargetBelow < 1 ||
-    merged.suggestTargetBelow > 100
-  ) {
-    throw new Error(
-      `suggestTargetBelow must be between 1 and 100, got ${merged.suggestTargetBelow}`
-    );
-  }
   if (
     merged.claudeConfigDir !== null &&
     merged.claudeConfigDir !== undefined &&
@@ -2965,7 +3227,7 @@ async function fixtureInvoke(command, args) {
       for (const view of fixture.views) view.isActive = view.id === target.id;
       fixture.activeId = target.id;
       fixture.live = { kind: "known", accountId: target.id };
-      fixture.suggestion = null;
+      if (fixture.burn) fixture.burn.suggestion = null;
       fixture.lastPollAt = new Date().toISOString();
       return `Switched to ${target.abbr} — ${target.label}`;
     }
@@ -3025,9 +3287,17 @@ async function fixtureInvoke(command, args) {
       if (!/^#[0-9a-f]{6}$/.test(color)) {
         throw new Error(`invalid colour ${JSON.stringify(color)}: use #rrggbb`);
       }
+      const autoBurn =
+        args.autoBurn === undefined || args.autoBurn === null
+          ? account.autoBurn
+          : args.autoBurn;
+      if (typeof autoBurn !== "boolean") {
+        throw new Error("autoBurn must be true or false");
+      }
       account.label = label;
       account.abbr = abbr;
       account.color = color;
+      account.autoBurn = autoBurn;
       return clone(account);
     }
 
@@ -3048,15 +3318,44 @@ async function fixtureInvoke(command, args) {
       }
       if (fixture.activeId === removed.id) fixture.activeId = null;
       for (const view of fixture.views) view.isActive = view.id === fixture.activeId;
-      fixture.suggestion = null;
+      if (fixture.burn) fixture.burn.suggestion = null;
       if (Array.isArray(fixture.warnings)) {
         fixture.warnings = fixture.warnings.filter((warning) => warning.id !== removed.id);
       }
       return clone(removed);
     }
 
+    case "set_auto_burn": {
+      if (typeof args.on !== "boolean") {
+        throw new Error("set_auto_burn needs a boolean on");
+      }
+      if (!fixture.burn) throw new Error("auto-burn is not loaded");
+      fixture.settings = Object.assign({}, fixture.settings, { autoBurn: args.on });
+      fixture.burn.on = args.on;
+      if (args.on) fixture.burn.suggestion = null;
+      fixture.lastPollAt = new Date().toISOString();
+      return null;
+    }
+
+    case "pause_burn": {
+      if (!fixture.burn) throw new Error("auto-burn is not loaded");
+      const hours = args.hours;
+      if (hours === null || hours === undefined) {
+        fixture.burn.pausedUntil = null;
+      } else {
+        if (!Number.isInteger(hours) || hours <= 0) {
+          throw new Error(`pause_burn needs a positive whole number of hours, got ${hours}`);
+        }
+        fixture.burn.pausedUntil = isoIn(hours * 3600000);
+      }
+      fixture.lastPollAt = new Date().toISOString();
+      return null;
+    }
+
     case "save_settings":
       fixture.settings = validateFixtureSettings(args.settings || {});
+      if (fixture.burn) fixture.burn.on = fixture.settings.autoBurn;
+      if (fixture.burn && fixture.settings.autoBurn) fixture.burn.suggestion = null;
       fixture.lastPollAt = fixture.lastPollAt || new Date().toISOString();
       return null;
 

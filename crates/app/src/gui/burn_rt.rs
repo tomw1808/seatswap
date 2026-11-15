@@ -106,18 +106,14 @@ pub(crate) struct BurnRuntime {
     view: Option<BurnView>,
     warned: BTreeSet<String>,
     force_learn: bool,
-    action: Option<Sender<ActionCommand>>,
-    engine: Option<Sender<EngineCommand>>,
-}
-
-impl Default for BurnRuntime {
-    fn default() -> Self {
-        Self::new()
-    }
+    action: Sender<ActionCommand>,
+    engine: Sender<EngineCommand>,
 }
 
 impl BurnRuntime {
-    pub(crate) fn new() -> BurnRuntime {
+    /// The runtime needs both senders from the start: the first snapshot the
+    /// engine builds already decides and may switch (spec §2.5).
+    pub(crate) fn new(action: Sender<ActionCommand>, engine: Sender<EngineCommand>) -> BurnRuntime {
         BurnRuntime {
             learned: None,
             learn_attempted_at: None,
@@ -130,19 +126,9 @@ impl BurnRuntime {
             view: None,
             warned: BTreeSet::new(),
             force_learn: false,
-            action: None,
-            engine: None,
+            action,
+            engine,
         }
-    }
-
-    pub(crate) fn with_channels(
-        mut self,
-        action: Sender<ActionCommand>,
-        engine: Sender<EngineCommand>,
-    ) -> BurnRuntime {
-        self.action = Some(action);
-        self.engine = Some(engine);
-        self
     }
 
     /// Re-learn at the next snapshot, after a switch or a pause was written.
@@ -313,10 +299,11 @@ impl BurnRuntime {
         {
             return;
         }
-        let Some(engine) = &self.engine else {
-            return;
-        };
-        if engine.send(EngineCommand::Poll(PollReason::Stale)).is_ok() {
+        if self
+            .engine
+            .send(EngineCommand::Poll(PollReason::Stale))
+            .is_ok()
+        {
             self.last_stale_ask = Some(now);
         }
     }
@@ -394,18 +381,17 @@ impl BurnRuntime {
                         ) {
                             (Ok(reason_text), Ok(notification)) => {
                                 let (reply, reply_rx) = mpsc::channel();
-                                let sent = self.action.as_ref().is_some_and(|action| {
-                                    action
-                                        .send(ActionCommand::Switch {
-                                            key: to.clone(),
-                                            unsaved: UnsavedPolicy::Refuse,
-                                            label: None,
-                                            by: By::Auto,
-                                            reason: Some(reason_text),
-                                            reply,
-                                        })
-                                        .is_ok()
-                                });
+                                let sent = self
+                                    .action
+                                    .send(ActionCommand::Switch {
+                                        key: to.clone(),
+                                        unsaved: UnsavedPolicy::Refuse,
+                                        label: None,
+                                        by: By::Auto,
+                                        reason: Some(reason_text),
+                                        reply,
+                                    })
+                                    .is_ok();
                                 if sent {
                                     self.last_sent = Some(SentSwitch {
                                         to: to.clone(),
@@ -579,6 +565,7 @@ mod tests {
             color: "#3b82f6".to_string(),
             email: None,
             plan: None,
+            auto_burn: true,
             is_active: false,
             login_state: LoginState::Ok,
             login_ends_at_ms: None,
@@ -696,11 +683,53 @@ mod tests {
     ) {
         let (action_tx, action_rx) = mpsc::channel();
         let (engine_tx, engine_rx) = mpsc::channel();
-        (
-            BurnRuntime::new().with_channels(action_tx, engine_tx),
-            action_rx,
-            engine_rx,
-        )
+        (BurnRuntime::new(action_tx, engine_tx), action_rx, engine_rx)
+    }
+
+    /// The engine builds its first snapshot before it starts `run`, so the
+    /// runtime must own both senders from `new`: that first tick already
+    /// decides and may switch (the tray bench showed "auto-burn: the switch
+    /// action is not connected" before).
+    #[test]
+    fn the_first_snapshot_can_switch() {
+        let now = utc("2026-11-10T12:00:00Z");
+        let tmp = tempfile::tempdir().expect("a temp folder");
+        let history = HistoryDir::at(tmp.path(), "atlas");
+        let (action_tx, action_rx) = mpsc::channel();
+        let (engine_tx, _engine_rx) = mpsc::channel();
+        let mut runtime = BurnRuntime::new(action_tx, engine_tx);
+        let accounts = vec![
+            account("pr", "PR", PR_ACC, true),
+            account("ac", "AC", AC_ACC, true),
+        ];
+        let views = vec![
+            view("pr", "PR", 100.0, false, now - Duration::minutes(1)),
+            view("ac", "AC", 10.0, true, now - Duration::minutes(1)),
+        ];
+        let settings = Settings {
+            auto_burn: true,
+            ..Settings::default()
+        };
+        let tick = BurnTick {
+            history: Some(&history),
+            views: &views,
+            accounts: &accounts,
+            settings: &settings,
+            active: Some("pr"),
+            now,
+            offset: offset(),
+            tied_busy: 0,
+        };
+        let report = runtime.after_snapshot(&tick);
+        assert!(report.view.is_some(), "the first snapshot has a view");
+        match action_rx.try_recv().expect("the first tick sends a switch") {
+            ActionCommand::Switch { key, by, .. } => {
+                assert_eq!(key, "ac");
+                assert_eq!(by, By::Auto);
+            }
+            _ => panic!("not a switch"),
+        }
+        assert!(action_rx.try_recv().is_err(), "only one command");
     }
 
     #[test]

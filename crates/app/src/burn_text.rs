@@ -8,13 +8,15 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, FixedOffset, Utc};
 use serde::Serialize;
 
-#[cfg(feature = "gui")]
 use seatswap_core::burn::decide::RegimeWhy;
 use seatswap_core::burn::decide::{Decision, Reason};
 #[cfg(feature = "gui")]
 use seatswap_core::burn::plan::Fill;
-use seatswap_core::burn::plan::Plan;
+use seatswap_core::burn::plan::{Plan, Policy};
+use seatswap_core::burn::replay::ReplayResult;
 use seatswap_core::engine::AccountView;
+use seatswap_core::history::AccountRef;
+use seatswap_core::store::Account;
 
 use crate::format;
 
@@ -109,7 +111,6 @@ fn duration(seconds: i64) -> String {
     format!("{days}d{hours}h")
 }
 
-#[cfg(feature = "gui")]
 /// Why early switching is on or off (spec §2.5).
 pub fn why(why: RegimeWhy) -> &'static str {
     match why {
@@ -118,6 +119,75 @@ pub fn why(why: RegimeWhy) -> &'static str {
         RegimeWhy::NotWorthIt => "switching before 100 % does not pay",
         RegimeWhy::Pays => "switching before 100 % pays",
     }
+}
+
+/// One line of `seatswap burn plan`: `HH:MM–HH:MM  AC`, or
+/// `HH:MM–HH:MM  nothing usable` for a stretch without an account. The times
+/// are local; a time that is not today carries its weekday. An account without
+/// a view is an error, never an empty name.
+pub fn segment_line(
+    account: Option<&str>,
+    views: &[AccountView],
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    now: DateTime<Utc>,
+    offset: FixedOffset,
+) -> Result<String, TextError> {
+    let name = match account {
+        Some(id) => abbr(views, id)?,
+        None => "nothing usable".to_string(),
+    };
+    Ok(format!(
+        "{}–{}  {name}",
+        clock(from, now, offset),
+        clock(to, now, offset)
+    ))
+}
+
+/// The name of a replay's policy: the words `seatswap burn simulate` prints.
+pub fn policy_name(policy: Policy) -> &'static str {
+    match policy {
+        Policy::Lazy => "Lazy",
+        Policy::Eager => "Eager",
+    }
+}
+
+/// A work-unit figure as the hours it takes at `typical_wu` work units per
+/// typical working hour. A typical hour of 0 means the hours are not known:
+/// they are said so, never divided by zero.
+fn hours(wu: f64, typical_wu: f64) -> String {
+    if typical_wu > 0.0 {
+        format!("{:.1} h", wu / typical_wu)
+    } else {
+        "not known".to_string()
+    }
+}
+
+/// The report of one replay: its policy, the hours worked and blocked, its
+/// switches, and the expired week-percent of every account whose reset the
+/// replay passed. A replay account without a stored account is an error.
+pub fn replay_report(result: &ReplayResult, accounts: &[Account]) -> Result<String, TextError> {
+    let mut lines = vec![format!(
+        "{}: worked {}, blocked {}, {} switches",
+        policy_name(result.policy),
+        hours(result.worked_wu, result.typical_wu),
+        hours(result.blocked_wu, result.typical_wu),
+        result.switches
+    )];
+    for (account, expired) in &result.expired {
+        let stored = accounts
+            .iter()
+            .find(|stored| AccountRef::of(stored) == *account)
+            .ok_or_else(|| TextError::ViewMissing {
+                account: format!("{}/{}", account.acc, account.org),
+            })?;
+        lines.push(format!(
+            "  {}: {} % expired",
+            stored.abbr,
+            format::integer_percent(*expired)
+        ));
+    }
+    Ok(lines.join("\n"))
 }
 
 /// The reason of a switch, in the words the notification and the suggestion use.
@@ -350,6 +420,7 @@ mod tests {
             color: "#3b82f6".to_string(),
             email: None,
             plan: None,
+            auto_burn: true,
             is_active: false,
             login_state: LoginState::Ok,
             login_ends_at_ms: None,
