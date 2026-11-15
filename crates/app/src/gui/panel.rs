@@ -19,11 +19,10 @@ use tauri::{
 use seatswap_core::atomic::{self, Access};
 use seatswap_core::engine::PollReason;
 use seatswap_core::history::{
-    export_csv, export_json, By, Event, EventKind, HistoryDir, HostConflict, HostInfo, Hosts,
-    Range, SessionRecord,
+    export_csv, export_json, By, Event, EventKind, HistoryDir, HostConflict, HostInfo, Hosts, Range,
 };
 use seatswap_core::money::ModelPrice;
-use seatswap_core::projects::{ProjectEdit, Projects, ProjectsLogRecord};
+use seatswap_core::projects::{self, ProjectEdit, Projects, ProjectsLogRecord};
 use seatswap_core::store::{self, Account, Settings};
 use seatswap_core::switcher::UnsavedPolicy;
 
@@ -860,20 +859,11 @@ fn projects_from(
     home: &Path,
     accounts: &[Account],
 ) -> Result<Projects, String> {
-    let range = Range {
-        from: DateTime::<Utc>::MIN_UTC,
-        to: DateTime::<Utc>::MAX_UTC,
-    };
-    let log = history
-        .read::<ProjectsLogRecord>(&range, &Hosts::All)
-        .map_err(|error| error.to_string())?;
-    let sessions = history
-        .read::<SessionRecord>(&range, &Hosts::All)
-        .map_err(|error| error.to_string())?;
-    for warning in log.warnings.iter().chain(sessions.warnings.iter()) {
+    let (mut projects, warnings) =
+        projects::load(history, accounts).map_err(|error| error.to_string())?;
+    for warning in &warnings {
         eprintln!("seatswap: history: {warning}");
     }
-    let mut projects = Projects::resolve(&log.records, &sessions.records, accounts);
     for project in &mut projects.projects {
         for cwds in project.folders.values_mut() {
             for cwd in cwds.iter_mut() {
@@ -1435,7 +1425,7 @@ mod tests {
             .expect("a test time")
             .with_timezone(&Utc);
         history
-            .append(&SessionRecord {
+            .append(&seatswap_core::history::SessionRecord {
                 t: at,
                 session: "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34".to_string(),
                 cwd: "/home/sam/projects/atlas".to_string(),

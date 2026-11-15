@@ -20,7 +20,7 @@ use notify_rust::NotificationResponse;
 use notify_rust::Timeout;
 
 use seatswap_core::engine::{all_blocked, Blocker, LoginWarning};
-use seatswap_core::store::LoginState;
+use seatswap_core::store::{LoginState, Settings, WaitingHosts};
 use seatswap_core::switcher::UnsavedPolicy;
 
 #[cfg(windows)]
@@ -105,6 +105,15 @@ pub(crate) struct Deduper {
     waiting_notified: HashMap<String, DateTime<Utc>>,
 }
 
+/// Whether a waiting session's notification is wanted (spec §4.1): this host
+/// always, another host only when `notifyWaitingHosts` is all hosts.
+fn notifies(waiting: &Waiting, settings: &Settings) -> bool {
+    match waiting.host {
+        None => true,
+        Some(_) => settings.notify_waiting_hosts == WaitingHosts::AllHosts,
+    }
+}
+
 impl Deduper {
     pub(crate) fn new() -> Deduper {
         Deduper::default()
@@ -186,8 +195,12 @@ impl Deduper {
         now: DateTime<Utc>,
     ) -> Option<DateTime<Utc>> {
         let sessions = snapshot.sessions.as_ref()?;
+        let settings = snapshot.settings.as_ref()?;
         let mut earliest: Option<DateTime<Utc>> = None;
         for waiting in &sessions.waiting {
+            if !notifies(waiting, settings) {
+                continue;
+            }
             if self.waiting_notified.get(&waiting.session) == Some(&waiting.since) {
                 continue;
             }
@@ -289,7 +302,12 @@ impl Deduper {
         let Some(sessions) = &snapshot.sessions else {
             return;
         };
-        for waiting in &sessions.waiting {
+        let current: Vec<&Waiting> = sessions
+            .waiting
+            .iter()
+            .filter(|waiting| notifies(waiting, settings))
+            .collect();
+        for waiting in &current {
             if now.signed_duration_since(waiting.since) < chrono::Duration::seconds(15) {
                 continue;
             }
@@ -298,10 +316,9 @@ impl Deduper {
             }
             self.waiting_notified
                 .insert(waiting.session.clone(), waiting.since);
-            due.push(Notification::Waiting(waiting.clone()));
+            due.push(Notification::Waiting((*waiting).clone()));
         }
-        let current: HashSet<&str> = sessions
-            .waiting
+        let current: HashSet<&str> = current
             .iter()
             .map(|waiting| waiting.session.as_str())
             .collect();
@@ -505,10 +522,11 @@ fn all_full_text(next: Option<(&str, &str)>) -> String {
     }
 }
 
-/// `acme-kb-dd is waiting for you (acme-kb, on atlas).` — the host part is
-/// left out when the machine has no acceptable host name (spec §4.1).
-fn waiting_text(waiting: &Waiting, host: Option<&str>) -> String {
-    match host {
+/// `acme-kb-dd is waiting for you (acme-kb, on atlas).` — the waiting
+/// session's own host when it is another one, this host's name otherwise; the
+/// host part is left out when there is no acceptable host name (spec §4.1).
+fn waiting_text(waiting: &Waiting, this_host: Option<&str>) -> String {
+    match waiting.host.as_deref().or(this_host) {
         Some(host) => format!(
             "{} is waiting for you ({}, on {host}).",
             waiting.label, waiting.project
@@ -558,8 +576,8 @@ pub(crate) fn send_all_full(next: Option<(&str, &str)>) {
 /// A waiting session's notification that stays until it is clicked or
 /// withdrawn (spec §4.1).
 ///
-/// `host` is the name the text shows (or `None` for the version without a
-/// host): [`Waiting`] carries no host, and this host's name is a setting.
+/// `host` is this host's name, used for a session with no host of its own
+/// (`None` in [`Waiting`]); another host's name is in the waiting session.
 #[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) fn send_waiting(
     waiting: &Waiting,
@@ -687,7 +705,7 @@ mod tests {
 
     use chrono::DateTime;
     use seatswap_core::engine::AccountView;
-    use seatswap_core::store::{LoginState, Settings};
+    use seatswap_core::store::{LoginState, Settings, WaitingHosts};
 
     use crate::format;
     use crate::gui::burn_rt::BurnView;
@@ -802,6 +820,7 @@ mod tests {
             label: "acme-kb-dd".to_string(),
             project: "acme-kb".to_string(),
             since,
+            host: None,
         }
     }
 
@@ -1298,6 +1317,58 @@ mod tests {
             vec![Notification::WaitingOver {
                 session: "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34".to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn another_hosts_waiting_session_notifies_only_with_all_hosts() {
+        let mut deduper = Deduper::new();
+        let mut on_vega = waiting(utc("2026-11-10T09:56:00Z"));
+        on_vega.host = Some("vega".to_string());
+
+        let this_host_only = with_views(
+            Vec::new(),
+            Some(sessions(vec![on_vega.clone()], 0)),
+            Some(Settings::default()),
+        );
+        assert!(
+            deduper
+                .due(&this_host_only, utc("2026-11-10T09:56:20Z"))
+                .is_empty(),
+            "this host's setting does not notify another host's wait"
+        );
+
+        let all_hosts = Settings {
+            notify_waiting_hosts: WaitingHosts::AllHosts,
+            ..Settings::default()
+        };
+        let everywhere = with_views(
+            Vec::new(),
+            Some(sessions(vec![on_vega.clone()], 0)),
+            Some(all_hosts),
+        );
+        let due = deduper.due(&everywhere, utc("2026-11-10T09:56:21Z"));
+        assert_eq!(due, vec![Notification::Waiting(on_vega.clone())]);
+        match &due[0] {
+            Notification::Waiting(waiting) => assert_eq!(
+                waiting_text(waiting, Some("atlas")),
+                "acme-kb-dd is waiting for you (acme-kb, on vega)."
+            ),
+            other => panic!("a waiting notification, not {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_waiting_text_names_the_waiting_sessions_host() {
+        let mut on_vega = waiting(utc("2026-11-10T09:56:00Z"));
+        on_vega.host = Some("vega".to_string());
+        assert_eq!(
+            waiting_text(&on_vega, Some("atlas")),
+            "acme-kb-dd is waiting for you (acme-kb, on vega)."
+        );
+        assert_eq!(
+            waiting_text(&waiting(utc("2026-11-10T09:56:00Z")), Some("atlas")),
+            "acme-kb-dd is waiting for you (acme-kb, on atlas)."
         );
     }
 

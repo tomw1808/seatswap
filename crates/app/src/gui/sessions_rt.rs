@@ -6,6 +6,7 @@
 //! session records to the history, then hands a [`SessionsSummary`] to the main
 //! thread and the models in use to the engine thread.
 
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,13 +15,16 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 
-use seatswap_core::history::{EventKind, HistoryDir, Recorder, SessionRecord};
+use seatswap_core::history::{EventKind, HistoryDir, Range, Recorder, SessionRecord};
+use seatswap_core::live_sessions::{self, LiveSession, LiveStatus};
+use seatswap_core::money::{Fx, Prices, Valuer};
 use seatswap_core::paths::{AppPaths, ClaudePaths};
 use seatswap_core::project::{self, ProjectKey};
 use seatswap_core::projects;
 use seatswap_core::sessions::{self, Liveness, SessionFile, SessionStatus, SystemProbe};
+use seatswap_core::store::{self, Settings};
 use seatswap_core::transcripts::{self, RecordedSession, ScanState, SessionSeen};
 use seatswap_core::watcher::{watch_folder, FolderWatch, WatchError};
 
@@ -35,6 +39,15 @@ const AFTER_INCOMPLETE: Duration = Duration::from_secs(1);
 const SCAN_BUDGET: u64 = 64 * 1024 * 1024;
 /// A session record is rewritten at most this often while its summary changes.
 const RECORD_EVERY_SECS: i64 = 10 * 60;
+/// The projects, values and settings the rows are built with are at most this
+/// old.
+const ROWS_CONTEXT_MAX_AGE_SECS: i64 = 300;
+/// A part of the rows context that could not be built is tried again after
+/// this many seconds, not on every pass.
+const ROWS_CONTEXT_RETRY_SECS: i64 = 60;
+/// This host reports even when nothing changed after this many seconds, so
+/// another host does not take a quiet host for a stale one.
+const REPORT_HEARTBEAT_SECS: i64 = 300;
 
 /// What one pass found, for the thread and the tests.
 #[derive(Debug, Clone)]
@@ -43,6 +56,37 @@ pub(crate) struct PassOutcome {
     pub models: Option<BTreeSet<String>>,
     pub tied_busy: u32,
     pub wake_soon: bool,
+}
+
+/// The projects and the pricing the rows are built with. They are built and
+/// rebuilt apart from each other: a failing one does not keep the other from
+/// being built, and the rows are built with what is there.
+#[derive(Default)]
+struct RowsContext {
+    projects: Option<ProjectsBuilt>,
+    /// Why the projects could not be built, and when that was tried.
+    projects_failure: Option<ContextFailure>,
+    pricing: Option<PricingBuilt>,
+    /// Why the pricing could not be built, and when that was tried.
+    pricing_failure: Option<ContextFailure>,
+}
+
+struct ProjectsBuilt {
+    projects: projects::Projects,
+    /// Warnings from the project and session reads.
+    warnings: Vec<String>,
+    built: DateTime<Utc>,
+}
+
+struct PricingBuilt {
+    valuer: Valuer,
+    settings: Settings,
+    built: DateTime<Utc>,
+}
+
+struct ContextFailure {
+    text: String,
+    tried: DateTime<Utc>,
 }
 
 /// What the thread remembers between two passes.
@@ -56,6 +100,22 @@ pub(crate) struct SessionMemory {
     /// already pruned from the [`ScanState`], so `SessionSeen.recorded` cannot
     /// remember them. A session still in the state uses `recorded`, never this.
     closed: HashSet<String>,
+    rows_context: Option<RowsContext>,
+    /// The rows of the last report written successfully.
+    last_rows: Option<Vec<LiveSession>>,
+    /// When this host's report was last written successfully.
+    last_report_at: Option<DateTime<Utc>>,
+    /// The running sessions of the last pass that could read every file, so a
+    /// session that left the list is reported at once.
+    running_ids: BTreeSet<String>,
+    /// The other hosts' reports of the last read, used on every pass until the
+    /// next read so no wait or warning flickers.
+    other_hosts: Option<live_sessions::OtherHosts>,
+    /// When the other hosts' reports were last read.
+    last_other_hosts_at: Option<DateTime<Utc>>,
+    /// Why there is no history, when the thread started without one: the rows
+    /// then say why their values are missing.
+    history_error: Option<String>,
 }
 
 impl SessionMemory {
@@ -66,6 +126,13 @@ impl SessionMemory {
             waiting: HashMap::new(),
             records: HashMap::new(),
             closed: HashSet::new(),
+            rows_context: None,
+            last_rows: None,
+            last_report_at: None,
+            running_ids: BTreeSet::new(),
+            other_hosts: None,
+            last_other_hosts_at: None,
+            history_error: None,
         }
     }
 
@@ -77,6 +144,165 @@ impl SessionMemory {
         self.projects.insert(cwd.to_string(), project.clone());
         project
     }
+}
+
+/// Whether a time is due for the next round: `now` is at least `secs` after
+/// `at`, or `at` is in the future (a clock that moved back must not silence
+/// the thread). `None` is due at once. Every "is it time again" rule of the
+/// thread goes through this one helper.
+fn is_due(at: Option<DateTime<Utc>>, now: DateTime<Utc>, secs: i64) -> bool {
+    match at {
+        None => true,
+        Some(at) => at > now || now.signed_duration_since(at).num_seconds() >= secs,
+    }
+}
+
+/// Whether one part of the rows context has to be built now: never built,
+/// older than [`ROWS_CONTEXT_MAX_AGE_SECS`], or a failed build whose
+/// [`ROWS_CONTEXT_RETRY_SECS`] have passed.
+fn part_needs_build(
+    built: Option<DateTime<Utc>>,
+    failure: Option<&ContextFailure>,
+    now: DateTime<Utc>,
+) -> bool {
+    if !is_due(built, now, ROWS_CONTEXT_MAX_AGE_SECS) {
+        return false;
+    }
+    failure.is_none_or(|failure| is_due(Some(failure.tried), now, ROWS_CONTEXT_RETRY_SECS))
+}
+
+/// Build the two parts of the rows context that are due, show every failure
+/// that is still current once, and hand out the projects and the pricing the
+/// rows are built with.
+fn prepare_rows_context<'a>(
+    context: &'a mut RowsContext,
+    app: &AppPaths,
+    history: &HistoryDir,
+    now: DateTime<Utc>,
+    summary: &mut SessionsSummary,
+) -> (Option<&'a projects::Projects>, live_sessions::Pricing<'a>) {
+    let projects_due = part_needs_build(
+        context.projects.as_ref().map(|built| built.built),
+        context.projects_failure.as_ref(),
+        now,
+    );
+    let pricing_due = part_needs_build(
+        context.pricing.as_ref().map(|built| built.built),
+        context.pricing_failure.as_ref(),
+        now,
+    );
+    if projects_due || pricing_due {
+        let accounts = store::load_accounts(app)
+            .map_err(|error| format!("the accounts cannot be read: {error}"));
+        if projects_due {
+            match &accounts {
+                Ok(file) => match projects::load(history, &file.accounts) {
+                    Ok((projects, warnings)) => {
+                        context.projects = Some(ProjectsBuilt {
+                            projects,
+                            warnings,
+                            built: now,
+                        });
+                        context.projects_failure = None;
+                    }
+                    Err(error) => {
+                        context.projects_failure = Some(ContextFailure {
+                            text: format!("the projects cannot be read: {error}"),
+                            tried: now,
+                        })
+                    }
+                },
+                Err(error) => {
+                    context.projects_failure = Some(ContextFailure {
+                        text: error.clone(),
+                        tried: now,
+                    })
+                }
+            }
+        }
+        if pricing_due {
+            match &accounts {
+                Ok(file) => match build_pricing(app, history, now, file) {
+                    Ok((valuer, settings)) => {
+                        context.pricing = Some(PricingBuilt {
+                            valuer,
+                            settings,
+                            built: now,
+                        });
+                        context.pricing_failure = None;
+                    }
+                    Err(text) => {
+                        context.pricing_failure = Some(ContextFailure { text, tried: now })
+                    }
+                },
+                Err(error) => {
+                    context.pricing_failure = Some(ContextFailure {
+                        text: error.clone(),
+                        tried: now,
+                    })
+                }
+            }
+        }
+    }
+
+    let projects_failure = context
+        .projects_failure
+        .as_ref()
+        .map(|failure| failure.text.clone());
+    let pricing_failure = context
+        .pricing_failure
+        .as_ref()
+        .map(|failure| failure.text.clone());
+    if let Some(text) = &projects_failure {
+        add_unavailable(summary, text.clone());
+    }
+    if let Some(text) = &pricing_failure {
+        // The accounts are one failure for both parts: show it once.
+        if projects_failure.as_ref() != Some(text) {
+            add_unavailable(summary, text.clone());
+        }
+    }
+    if let Some(built) = &context.projects {
+        for warning in &built.warnings {
+            add_warning(summary, warning.clone());
+        }
+    }
+    let projects = context.projects.as_ref().map(|built| &built.projects);
+    let pricing = match &context.pricing {
+        Some(built) => live_sessions::Pricing::Known {
+            valuer: &built.valuer,
+            settings: &built.settings,
+        },
+        None => live_sessions::Pricing::Unknown {
+            reason: pricing_failure.unwrap_or_else(|| "the values cannot be read".to_string()),
+        },
+    };
+    (projects, pricing)
+}
+
+/// Read the prices, the dollar rate and the accounts and build the valuer for
+/// the day up to `now`. Any failure is the error text the sessions area shows.
+fn build_pricing(
+    app: &AppPaths,
+    history: &HistoryDir,
+    now: DateTime<Utc>,
+    file: &store::AccountsFile,
+) -> Result<(Valuer, Settings), String> {
+    let prices =
+        Prices::load(app).map_err(|error| format!("the prices cannot be read: {error}"))?;
+    let fx = Fx::load(app).map_err(|error| format!("the dollar rate cannot be read: {error}"))?;
+    let range = Range::between(Some(now - ChronoDuration::days(1)), Some(now))
+        .map_err(|error| error.to_string())?;
+    let valuer = Valuer::build(
+        history,
+        &range,
+        &prices,
+        &fx,
+        &file.settings,
+        &file.accounts,
+    )
+    .map_err(|error| format!("the values cannot be read: {error}"))?;
+    Ok((valuer, file.settings.clone()))
 }
 
 struct WaitingMemory {
@@ -173,6 +399,7 @@ fn run(
     };
     let (mut state, state_error) = load_state(&app);
     let mut memory = SessionMemory::new(claude.home().to_path_buf());
+    memory.history_error = history_error.clone();
     let mut watch: Option<FolderWatch> = None;
     let mut last_watch_error: Option<String> = None;
 
@@ -445,29 +672,18 @@ pub(crate) fn run_pass(
         );
     }
 
-    // Waiting sessions, and the waits that just ended.
+    // Waiting sessions, and the waits that just ended. The rows are the one
+    // source of a waiting session's text; a file with an invalid time is their
+    // warning, not a second one here.
     let mut still_waiting: HashSet<String> = HashSet::new();
     for session in &running.sessions {
         if session.status != SessionStatus::Waiting {
             continue;
         }
         let Some(since) = DateTime::<Utc>::from_timestamp_millis(session.status_updated_at) else {
-            add_warning(
-                &mut summary,
-                format!(
-                    "session {} has an invalid statusUpdatedAt {}",
-                    session.session_id, session.status_updated_at
-                ),
-            );
             continue;
         };
         let project = memory.project_for(&session.cwd);
-        summary.waiting.push(Waiting {
-            session: session.session_id.clone(),
-            label: label_of(session, &project),
-            project: projects::default_name(&project),
-            since,
-        });
         memory
             .waiting
             .insert(session.session_id.clone(), WaitingMemory { project, since });
@@ -731,6 +947,133 @@ pub(crate) fn run_pass(
         state.forget_closed(&running_ids, now);
     }
 
+    // The rows of this host, and the report the other hosts read. The session
+    // files alone are enough to build them: a history that cannot be read gives
+    // the projects' default names and says why the values are missing, so a
+    // waiting session still notifies.
+    let rows = match recorder {
+        Some(recorder) => {
+            let mut context = memory.rows_context.take().unwrap_or_default();
+            let rows = {
+                let (projects, pricing) =
+                    prepare_rows_context(&mut context, app, recorder.dir(), now, &mut summary);
+                live_rows(
+                    &running.sessions,
+                    state,
+                    claude,
+                    memory,
+                    projects,
+                    &pricing,
+                    recorder.dir().host(),
+                    now,
+                )
+            };
+            memory.rows_context = Some(context);
+            Some(rows)
+        }
+        None => {
+            let pricing = live_sessions::Pricing::Unknown {
+                reason: memory.history_error.clone().unwrap_or_else(|| {
+                    "the history is not open, so the values are not known".to_string()
+                }),
+            };
+            Some(live_rows(
+                &running.sessions,
+                state,
+                claude,
+                memory,
+                None,
+                &pricing,
+                "",
+                now,
+            ))
+        }
+    };
+    if let Some(rows) = &rows {
+        for warning in &rows.warnings {
+            add_warning(&mut summary, warning.clone());
+        }
+        for session in rows
+            .sessions
+            .iter()
+            .filter(|session| session.status == LiveStatus::Waiting)
+        {
+            summary.waiting.push(Waiting {
+                session: session.session.clone(),
+                label: session.label.clone(),
+                project: session.project.clone(),
+                since: session.since,
+                host: None,
+            });
+        }
+    }
+
+    // A session that left the list is reported at once; otherwise the report
+    // follows the rows at most every [`live_sessions::REPORT_EVERY_SECS`], with
+    // a heartbeat so another host does not see a quiet host as stale.
+    let closed_now = running.skipped.is_empty()
+        && memory
+            .running_ids
+            .iter()
+            .any(|session| !running_ids.contains(session));
+    if running.skipped.is_empty() {
+        if let (Some(recorder), Some(rows)) = (recorder, rows.as_ref()) {
+            write_report_if_due(
+                recorder,
+                &rows.sessions,
+                now,
+                closed_now,
+                memory,
+                &mut summary,
+            );
+            memory.running_ids = running_ids.clone();
+        }
+    }
+
+    // The other hosts' waiting sessions. Their reports are read at most every
+    // [`live_sessions::REPORT_EVERY_SECS`], like this host writes its own; the
+    // last read is used on every pass in between, so a wait and a warning stay
+    // put until the next read. A read that fails replaces it with an empty one
+    // and its error.
+    if let Some(recorder) = recorder {
+        if is_due(
+            memory.last_other_hosts_at,
+            now,
+            live_sessions::REPORT_EVERY_SECS,
+        ) {
+            memory.last_other_hosts_at = Some(now);
+            memory.other_hosts = Some(match live_sessions::other_hosts(recorder.dir(), now) {
+                Ok(other) => other,
+                Err(error) => live_sessions::OtherHosts {
+                    hosts: Vec::new(),
+                    warnings: vec![format!("the other hosts' reports cannot be read: {error}")],
+                },
+            });
+        }
+        if let Some(other) = &memory.other_hosts {
+            for warning in &other.warnings {
+                add_warning(&mut summary, warning.clone());
+            }
+            for host in &other.hosts {
+                if host.stale {
+                    continue;
+                }
+                for session in &host.sessions {
+                    if session.status != LiveStatus::Waiting {
+                        continue;
+                    }
+                    summary.waiting.push(Waiting {
+                        session: session.session.clone(),
+                        label: session.label.clone(),
+                        project: session.project.clone(),
+                        since: session.since,
+                        host: Some(host.host.clone()),
+                    });
+                }
+            }
+        }
+    }
+
     let models = models_in_use(&running.sessions, state);
     let (_, tied_busy) = tied_sessions(&running.sessions, state);
     PassOutcome {
@@ -739,6 +1082,42 @@ pub(crate) fn run_pass(
         tied_busy,
         wake_soon: !scan_complete,
     }
+}
+
+/// The rows of this host from the session files, with the project look-up the
+/// thread caches and the pricing that is known.
+#[allow(clippy::too_many_arguments)]
+fn live_rows(
+    files: &[SessionFile],
+    state: &ScanState,
+    claude: &ClaudePaths,
+    memory: &mut SessionMemory,
+    projects: Option<&projects::Projects>,
+    pricing: &live_sessions::Pricing,
+    host: &str,
+    now: DateTime<Utc>,
+) -> live_sessions::Rows {
+    let metas = |session: &str| {
+        state
+            .sessions
+            .get(session)
+            .map(|seen| transcripts::agents_of(claude, session, &seen.spawns))
+            .unwrap_or_default()
+    };
+    let project_of = {
+        let memory = RefCell::new(memory);
+        move |cwd: &str| memory.borrow_mut().project_for(cwd)
+    };
+    live_sessions::running(
+        files,
+        state,
+        &metas,
+        projects,
+        pricing,
+        host,
+        now,
+        &project_of,
+    )
 }
 
 fn session_record(
@@ -846,12 +1225,32 @@ fn tied_sessions(running: &[SessionFile], state: &ScanState) -> (u32, u32) {
     (tied, busy)
 }
 
-fn label_of(session: &SessionFile, project: &ProjectKey) -> String {
-    if let Some(name) = &session.name {
-        return name.clone();
+/// Write this host's report when the rows changed and the last one is at least
+/// [`live_sessions::REPORT_EVERY_SECS`] old, when a session just closed, or when
+/// the last report is older than [`REPORT_HEARTBEAT_SECS`] even though nothing
+/// changed. The time is passed in, so tests drive it without sleeping.
+fn write_report_if_due(
+    recorder: &Recorder,
+    sessions: &[LiveSession],
+    now: DateTime<Utc>,
+    closed_now: bool,
+    memory: &mut SessionMemory,
+    summary: &mut SessionsSummary,
+) {
+    let changed = memory.last_rows.as_deref() != Some(sessions);
+    let due = closed_now
+        || is_due(memory.last_report_at, now, REPORT_HEARTBEAT_SECS)
+        || (changed && is_due(memory.last_report_at, now, live_sessions::REPORT_EVERY_SECS));
+    if !due {
+        return;
     }
-    let prefix: String = session.session_id.chars().take(2).collect();
-    format!("{}-{prefix}", projects::default_name(project))
+    match live_sessions::write_report(recorder.dir(), sessions, now) {
+        Ok(_) => {
+            memory.last_report_at = Some(now);
+            memory.last_rows = Some(sessions.to_vec());
+        }
+        Err(error) => add_history_error(summary, error),
+    }
 }
 
 fn add_unavailable(summary: &mut SessionsSummary, text: String) {
@@ -1012,7 +1411,9 @@ mod tests {
 
     #[test]
     fn summary_counts_running_busy_and_waiting() {
-        let (tmp, claude, _app) = fixture();
+        let (tmp, claude, app) = fixture();
+        let history = history(&tmp.path().join("history"));
+        let recorder = Recorder::new(history);
         let waiting_since = time("2026-11-14T09:56:00Z");
         write_session(
             &claude,
@@ -1053,10 +1454,10 @@ mod tests {
         let mut state = ScanState::default();
         let mut memory = SessionMemory::new(tmp.path().to_path_buf());
         let outcome = run_pass(
-            &_app,
+            &app,
             &claude,
             &probe(&[100, 101, 102]),
-            None,
+            Some(&recorder),
             &mut state,
             &mut memory,
             time("2026-11-14T10:00:00Z"),
@@ -1070,7 +1471,9 @@ mod tests {
 
     #[test]
     fn a_session_without_a_name_gets_project_and_two_hex() {
-        let (tmp, claude, _app) = fixture();
+        let (tmp, claude, app) = fixture();
+        let history = history(&tmp.path().join("history"));
+        let recorder = Recorder::new(history);
         let cwd = repo(tmp.path(), "atlas");
         let status_at = time("2026-11-14T09:56:00Z");
         write_session(
@@ -1088,10 +1491,10 @@ mod tests {
         let mut state = ScanState::default();
         let mut memory = SessionMemory::new(tmp.path().to_path_buf());
         let outcome = run_pass(
-            &_app,
+            &app,
             &claude,
             &probe(&[200]),
-            None,
+            Some(&recorder),
             &mut state,
             &mut memory,
             time("2026-11-14T10:00:00Z"),
@@ -1561,7 +1964,11 @@ mod tests {
                     let path = entry.unwrap().path();
                     if path.is_dir() {
                         folders.push(path);
-                    } else {
+                    } else if path.file_name().and_then(|name| name.to_str())
+                        != Some("sessions-now.json")
+                    {
+                        // The live report is not a history line: it is rewritten
+                        // each time this host's rows are reported.
                         files.insert(path.clone(), fs::read(&path).unwrap());
                     }
                 }
@@ -2365,6 +2772,399 @@ mod tests {
         assert!(
             state.sessions.contains_key(SESSION),
             "a session file that cannot be read must not make the thread forget a session"
+        );
+    }
+
+    // ---- this host's report and the other hosts' reports (spec §3.8) ----
+
+    fn report_of(root: &Path, host: &str) -> live_sessions::HostReport {
+        let path = history(root).sessions_now_file(host);
+        let text =
+            fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        serde_json::from_str(&text).expect("a report as write_report writes it")
+    }
+
+    #[test]
+    fn the_report_is_written_at_most_every_thirty_seconds() {
+        let (tmp, claude, app) = fixture();
+        let root = tmp.path().join("history");
+        let recorder = Recorder::new(history(&root));
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        let first = time("2026-11-14T10:00:00Z");
+        write_session(
+            &claude,
+            400,
+            &session_json(
+                400,
+                SESSION,
+                "/home/sam/projects/atlas",
+                Some("atlas-a6"),
+                "busy",
+                first.timestamp_millis(),
+            ),
+        );
+
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[400]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            first,
+            None,
+        );
+        let report = report_of(&root, "atlas");
+        assert_eq!(report.at, first);
+        assert_eq!(report.sessions.len(), 1);
+
+        // The rows changed 10 s later: the report waits for the 30 s.
+        let changed = first + chrono::Duration::seconds(10);
+        write_session(
+            &claude,
+            400,
+            &session_json(
+                400,
+                SESSION,
+                "/home/sam/projects/atlas",
+                Some("atlas-a6"),
+                "idle",
+                changed.timestamp_millis(),
+            ),
+        );
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[400]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            changed,
+            None,
+        );
+        assert_eq!(report_of(&root, "atlas").at, first);
+
+        // At 30 s the change is reported.
+        let due = first + chrono::Duration::seconds(30);
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[400]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            due,
+            None,
+        );
+        let report = report_of(&root, "atlas");
+        assert_eq!(report.at, due);
+        assert_eq!(report.sessions[0].status, live_sessions::LiveStatus::Idle);
+    }
+
+    #[test]
+    fn a_quiet_host_still_reports_every_five_minutes() {
+        let (tmp, claude, app) = fixture();
+        let root = tmp.path().join("history");
+        let recorder = Recorder::new(history(&root));
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        let first = time("2026-11-14T10:00:00Z");
+
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            first,
+            None,
+        );
+        assert!(report_of(&root, "atlas").sessions.is_empty());
+        assert_eq!(report_of(&root, "atlas").at, first);
+
+        // Nothing changed and four minutes have not passed: no new report.
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            first + chrono::Duration::seconds(299),
+            None,
+        );
+        assert_eq!(report_of(&root, "atlas").at, first);
+
+        // The heartbeat writes the same empty rows again after five minutes.
+        let heartbeat = first + chrono::Duration::seconds(301);
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            heartbeat,
+            None,
+        );
+        let report = report_of(&root, "atlas");
+        assert_eq!(report.at, heartbeat);
+        assert!(report.sessions.is_empty(), "an empty list is a report too");
+    }
+
+    #[test]
+    fn a_closed_session_is_reported_at_once() {
+        let (tmp, claude, app) = fixture();
+        let root = tmp.path().join("history");
+        let recorder = Recorder::new(history(&root));
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        let first = time("2026-11-14T10:00:00Z");
+        write_session(
+            &claude,
+            500,
+            &session_json(
+                500,
+                SESSION,
+                "/home/sam/projects/atlas",
+                Some("atlas-a6"),
+                "busy",
+                first.timestamp_millis(),
+            ),
+        );
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[500]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            first,
+            None,
+        );
+        assert_eq!(report_of(&root, "atlas").sessions.len(), 1);
+
+        fs::remove_file(claude.sessions_dir().join("500.json")).unwrap();
+        let closed = first + chrono::Duration::seconds(10);
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            closed,
+            None,
+        );
+        let report = report_of(&root, "atlas");
+        assert_eq!(report.at, closed, "a close is reported at once");
+        assert!(report.sessions.is_empty());
+    }
+
+    // ---- proof tests of the C2-3 review ----
+
+    fn vega_waiting_row(since: DateTime<Utc>) -> LiveSession {
+        LiveSession {
+            session: "dd5e0c1a-3b7f-4c2d-9e8a-6f1b2c3d4e5f".to_string(),
+            host: "vega".to_string(),
+            label: "acme-kb-dd".to_string(),
+            project: "acme-kb".to_string(),
+            org: None,
+            cwd: "/home/sam/projects/acme-kb".to_string(),
+            provider: "Claude Code".to_string(),
+            model: Some("claude-opus-5-5".to_string()),
+            tied: false,
+            status: LiveStatus::Waiting,
+            since,
+            started: since,
+            agents_running: 0,
+            agents_done: 0,
+            agents: Vec::new(),
+            tokens: Default::default(),
+            last_hour: Default::default(),
+            values: live_sessions::Values {
+                api: None,
+                api_currency: None,
+                api_missing: None,
+                subscription: None,
+                currency: None,
+                subscription_missing: None,
+            },
+        }
+    }
+
+    #[test]
+    fn review_other_hosts_waiting_session_stays_on_the_passes_between_two_reads() {
+        let (tmp, claude, app) = fixture();
+        let root = tmp.path().join("history");
+        let recorder = Recorder::new(history(&root));
+        let first = time("2026-11-14T10:00:00Z");
+        let vega = seatswap_core::history::HistoryDir::at(&root, "vega");
+        fs::create_dir_all(root.join("vega")).unwrap();
+        fs::write(
+            root.join("vega").join("host.json"),
+            "{\"machineId\":\"made-up\"}",
+        )
+        .unwrap();
+        let since = first - chrono::Duration::minutes(2);
+        live_sessions::write_report(&vega, &[vega_waiting_row(since)], first).unwrap();
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+
+        let one = run_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            first,
+            None,
+        );
+        assert_eq!(
+            one.summary.waiting.len(),
+            1,
+            "the read pass lists vega's wait"
+        );
+        let two = run_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            first + chrono::Duration::seconds(5),
+            None,
+        );
+        assert_eq!(
+            two.summary.waiting.len(),
+            1,
+            "a pass between two reads drops vega's wait, so notify.rs withdraws the notification and sends it again at the next read"
+        );
+    }
+
+    #[test]
+    fn review_this_hosts_waiting_session_does_not_need_the_history() {
+        let (tmp, claude, app) = fixture();
+        let status_at = time("2026-11-14T09:56:00Z");
+        write_session(
+            &claude,
+            600,
+            &session_json(
+                600,
+                SESSION,
+                "/home/sam/projects/acme-kb",
+                Some("acme-kb-dd"),
+                "waiting",
+                status_at.timestamp_millis(),
+            ),
+        );
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        let outcome = run_pass(
+            &app,
+            &claude,
+            &probe(&[600]),
+            None,
+            &mut state,
+            &mut memory,
+            time("2026-11-14T10:00:00Z"),
+            None,
+        );
+        assert_eq!(
+            outcome.summary.waiting.len(),
+            1,
+            "before C2-3 a waiting session notified without a history folder"
+        );
+    }
+
+    #[test]
+    fn review_this_hosts_waiting_session_survives_a_broken_prices_file() {
+        let (tmp, claude, app) = fixture();
+        let root = tmp.path().join("history");
+        let recorder = Recorder::new(history(&root));
+        fs::write(app.prices_file(), "{not json").unwrap();
+        let status_at = time("2026-11-14T09:56:00Z");
+        write_session(
+            &claude,
+            601,
+            &session_json(
+                601,
+                SESSION,
+                "/home/sam/projects/acme-kb",
+                Some("acme-kb-dd"),
+                "waiting",
+                status_at.timestamp_millis(),
+            ),
+        );
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        let outcome = run_pass(
+            &app,
+            &claude,
+            &probe(&[601]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            time("2026-11-14T10:00:00Z"),
+            None,
+        );
+        assert!(outcome.summary.unavailable.is_some(), "the context fails");
+        assert_eq!(
+            outcome.summary.waiting.len(),
+            1,
+            "a broken prices file must not switch off this host's waiting notifications"
+        );
+    }
+
+    #[test]
+    fn review_a_clock_that_moved_back_does_not_silence_the_report() {
+        let (tmp, claude, app) = fixture();
+        let root = tmp.path().join("history");
+        let recorder = Recorder::new(history(&root));
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        let first = time("2026-11-14T10:00:00Z");
+        let file = |status: &str, at: DateTime<Utc>| {
+            session_json(
+                700,
+                SESSION,
+                "/home/sam/projects/atlas",
+                Some("atlas-a6"),
+                status,
+                at.timestamp_millis(),
+            )
+        };
+        write_session(&claude, 700, &file("busy", first));
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[700]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            first,
+            None,
+        );
+
+        let back = first - chrono::Duration::hours(1);
+        write_session(&claude, 700, &file("idle", back));
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[700]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            back,
+            None,
+        );
+        assert_eq!(
+            report_of(&root, "atlas").at,
+            back,
+            "the rows changed and the last report is far away from now: it is due"
         );
     }
 }

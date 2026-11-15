@@ -356,6 +356,7 @@ function makeFixture() {
           label: "acme-kb-dd",
           project: "acme-kb",
           since: isoIn(-4 * 60000),
+          host: null,
         },
       ],
       unavailable: null,

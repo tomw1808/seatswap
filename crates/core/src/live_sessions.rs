@@ -3,10 +3,13 @@
 //! values of those tokens.
 
 use std::collections::BTreeMap;
+use std::fs;
+use std::io;
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
+use crate::atomic::{self, Access};
 use crate::burn::tied::thinking_tied;
 use crate::history::{HistoryDir, HistoryError, Hosted, Hosts, Range, SessionRecord, TokenRecord};
 use crate::money::{Valued, Valuer};
@@ -18,6 +21,12 @@ use crate::transcripts::{self, AgentMeta, AgentSeen, ScanState, Tokens};
 
 /// A session idle longer than this pays nothing extra for a switch (spec V11).
 pub const CACHE_LIFE_MIN: i64 = 60;
+
+/// The report is rewritten after this many seconds when the rows changed.
+pub const REPORT_EVERY_SECS: i64 = 30;
+
+/// A report older than this many minutes is stale (spec §3.8).
+pub const REPORT_STALE_MIN: i64 = 15;
 
 /// What the provider of every row is today (spec §3.8).
 const PROVIDER: &str = "Claude Code";
@@ -33,7 +42,7 @@ const TWO_CURRENCIES: &str =
     "the dollar rate is missing for some of these days, so the values are in two currencies";
 
 /// What a session is doing, as the Sessions area shows it (spec §3.8).
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum LiveStatus {
     Busy,
@@ -50,7 +59,7 @@ pub enum LiveStatus {
 /// yet. `subscription` is always in `currency`, the settings' currency. A
 /// missing half names its reason with the text of [`crate::money::Missing`];
 /// the two halves are never mixed and a sum is all or nothing.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Values {
     pub api: Option<f64>,
@@ -142,10 +151,56 @@ impl Values {
             subscription_missing: Some(reason.to_string()),
         }
     }
+
+    /// Both halves missing with the same reason and no currency: the pricing
+    /// itself is not known, so there is no settings' currency either.
+    fn unknown(reason: &str) -> Values {
+        Values {
+            api: None,
+            api_currency: None,
+            api_missing: Some(reason.to_string()),
+            subscription: None,
+            currency: None,
+            subscription_missing: Some(reason.to_string()),
+        }
+    }
+}
+
+/// How the rows' values are built (spec §3.8): with a valuer and the settings'
+/// currency, or not at all because the history, the prices or the dollar rate
+/// cannot be read. `Unknown` gives every row's and agent's [`Values`] both
+/// halves missing with `reason` and no currency: the two facts the session
+/// files alone cannot provide do not keep the rows from being built.
+pub enum Pricing<'a> {
+    Known {
+        valuer: &'a Valuer,
+        settings: &'a Settings,
+    },
+    Unknown {
+        reason: String,
+    },
+}
+
+impl Pricing<'_> {
+    /// The values of a list of records for one row or agent.
+    fn of(&self, valued: &[Valued]) -> Values {
+        match self {
+            Pricing::Known { settings, .. } => Values::of(valued, settings),
+            Pricing::Unknown { reason } => Values::unknown(reason),
+        }
+    }
+
+    /// The settings' currency, for the one `Values` built without a valuer.
+    fn missing(&self, reason: &str) -> Values {
+        match self {
+            Pricing::Known { settings, .. } => Values::missing(reason, settings),
+            Pricing::Unknown { reason } => Values::unknown(reason),
+        }
+    }
 }
 
 /// One agent of a running session (spec §3.8).
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveAgent {
     pub agent: String,
@@ -164,7 +219,7 @@ pub struct LiveAgent {
 }
 
 /// One row of the Sessions area (spec §3.8).
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveSession {
     pub session: String,
@@ -254,14 +309,18 @@ pub fn switch_kind(
 ///
 /// A session file whose `startedAt` or `statusUpdatedAt` is not a valid time is
 /// not a row: the reason goes into [`Rows::warnings`], never a default time.
-#[allow(clippy::too_many_arguments)] // the plan's signature plus `settings` for Values::of and project_of
+///
+/// `projects` is `None` when the history cannot be read: a row's project then
+/// has its key's default name and no organization, so the session files alone
+/// still give every waiting session its label. `pricing` says how the values
+/// are built, or why they are missing; it never keeps a row from being built.
+#[allow(clippy::too_many_arguments)] // the plan's signature plus `project_of`
 pub fn running(
     files: &[SessionFile],
     state: &ScanState,
     metas: &dyn Fn(&str) -> Vec<AgentMeta>,
-    projects: &Projects,
-    valuer: &Valuer,
-    settings: &Settings,
+    projects: Option<&Projects>,
+    pricing: &Pricing,
     host: &str,
     now: DateTime<Utc>,
     project_of: &dyn Fn(&str) -> ProjectKey,
@@ -286,7 +345,7 @@ pub fn running(
         let seen = state.sessions.get(&file.session_id);
         let key = project_of(&file.cwd);
         let id = ProjectId::of(&key, host);
-        let project = projects.of(&id);
+        let (project_name, org) = named_project(projects, &id);
 
         let mut live_agents = Vec::new();
         let mut agents_running = 0u32;
@@ -312,13 +371,16 @@ pub fn running(
             } else {
                 agents_done += 1;
             }
-            let values = match (model.as_deref(), last) {
-                (Some(model), Some(last)) => {
-                    let record =
-                        token_record(&file.session_id, &file.cwd, &key, model, last, tokens);
-                    Values::of(&[valuer.value(host, &record)], settings)
-                }
-                _ => Values::missing(NO_AGENT_MODEL, settings),
+            let values = match pricing {
+                Pricing::Known { valuer, .. } => match (model.as_deref(), last) {
+                    (Some(model), Some(last)) => {
+                        let record =
+                            token_record(&file.session_id, &file.cwd, &key, model, last, tokens);
+                        pricing.of(&[valuer.value(host, &record)])
+                    }
+                    _ => pricing.missing(NO_AGENT_MODEL),
+                },
+                Pricing::Unknown { reason } => Values::unknown(reason),
             };
             live_agents.push(LiveAgent {
                 agent,
@@ -339,37 +401,40 @@ pub fn running(
         let last_hour = seen
             .map(|seen| transcripts::last_hour(seen, now))
             .unwrap_or_default();
-        let values = match seen {
-            None => Values::of(&[], settings),
-            Some(seen) => {
-                let valued: Vec<Valued> = seen
-                    .by_model
-                    .iter()
-                    .map(|(model, tokens)| {
-                        let record = token_record(
-                            &file.session_id,
-                            &file.cwd,
-                            &key,
-                            model,
-                            seen.last,
-                            *tokens,
-                        );
-                        valuer.value(host, &record)
-                    })
-                    .collect();
-                Values::of(&valued, settings)
-            }
+        let values = match pricing {
+            Pricing::Known { valuer, .. } => match seen {
+                None => pricing.of(&[]),
+                Some(seen) => {
+                    let valued: Vec<Valued> = seen
+                        .by_model
+                        .iter()
+                        .map(|(model, tokens)| {
+                            let record = token_record(
+                                &file.session_id,
+                                &file.cwd,
+                                &key,
+                                model,
+                                seen.last,
+                                *tokens,
+                            );
+                            valuer.value(host, &record)
+                        })
+                        .collect();
+                    pricing.of(&valued)
+                }
+            },
+            Pricing::Unknown { reason } => Values::unknown(reason),
         };
         let label = file
             .name
             .clone()
-            .unwrap_or_else(|| format!("{}-{}", project.name, short_id(&file.session_id)));
+            .unwrap_or_else(|| format!("{}-{}", project_name, short_id(&file.session_id)));
         sessions.push(LiveSession {
             session: file.session_id.clone(),
             host: host.to_string(),
             label,
-            project: project.name,
-            org: project.org,
+            project: project_name,
+            org,
             cwd: file.cwd.clone(),
             provider: PROVIDER.to_string(),
             tied: model.as_deref().map(thinking_tied).unwrap_or(false),
@@ -396,14 +461,14 @@ pub fn running(
 /// before `now`. Its agents list is empty; the counts come from the
 /// record. `label` is `<project>-<first 2 characters of the session id>`.
 ///
-/// The history read's warnings are passed on in [`Rows::warnings`].
+/// The history read's warnings are passed on in [`Rows::warnings`]. `projects`
+/// and `pricing` mean what they do in [`running`].
 pub fn closed(
     history: &HistoryDir,
     since: DateTime<Utc>,
     now: DateTime<Utc>,
-    projects: &Projects,
-    valuer: &Valuer,
-    settings: &Settings,
+    projects: Option<&Projects>,
+    pricing: &Pricing,
 ) -> Result<Rows, HistoryError> {
     let range = Range::between(Some(since), Some(now))?;
     let read = history.read::<SessionRecord>(&range, &Hosts::All)?;
@@ -461,18 +526,20 @@ pub fn closed(
                 last_hour += of_record;
             }
             *out_by_model.entry(token.model.clone()).or_insert(0) += token.out;
-            valued.push(valuer.value(&hosted.host, token));
+            if let Pricing::Known { valuer, .. } = pricing {
+                valued.push(valuer.value(&hosted.host, token));
+            }
         }
         let model = most_output(&out_by_model);
         let id = ProjectId::of(&record.project, &hosted.host);
-        let project = projects.of(&id);
-        let label = format!("{}-{}", project.name, short_id(&record.session));
+        let (project_name, org) = named_project(projects, &id);
+        let label = format!("{}-{}", project_name, short_id(&record.session));
         sessions.push(LiveSession {
             session: record.session.clone(),
             host: hosted.host.clone(),
             label,
-            project: project.name,
-            org: project.org,
+            project: project_name,
+            org,
             cwd: record.cwd.clone(),
             provider: PROVIDER.to_string(),
             tied: model.as_deref().map(thinking_tied).unwrap_or(false),
@@ -485,10 +552,134 @@ pub fn closed(
             agents: Vec::new(),
             tokens,
             last_hour,
-            values: Values::of(&valued, settings),
+            values: pricing.of(&valued),
         });
     }
     Ok(Rows { sessions, warnings })
+}
+
+/// A project's name and organization after the joins. Without a project
+/// look-up (the history cannot be read) the key's default name and no
+/// organization are used, so a row can always name its project.
+fn named_project(projects: Option<&Projects>, id: &ProjectId) -> (String, Option<String>) {
+    match projects {
+        Some(projects) => {
+            let project = projects.of(id);
+            (project.name, project.org)
+        }
+        None => (crate::projects::default_name(&id.key), None),
+    }
+}
+
+/// What this host writes for the other hosts (spec §3.8): the rows of the
+/// Sessions area at one moment. No agent's `task` is ever in it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostReport {
+    pub at: DateTime<Utc>,
+    pub sessions: Vec<LiveSession>,
+}
+
+/// One other host's report, as this host reads it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OtherHost {
+    pub host: String,
+    pub at: DateTime<Utc>,
+    /// Older than [`REPORT_STALE_MIN`]: its sessions say `Other("no report")`.
+    pub stale: bool,
+    pub sessions: Vec<LiveSession>,
+}
+
+/// Every other host's report, and the reports that could not be read.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OtherHosts {
+    pub hosts: Vec<OtherHost>,
+    pub warnings: Vec<String>,
+}
+
+/// This host's rows as the report other hosts read (spec §3.8). Every agent's
+/// `task` is set to `None` first, so no task text can reach the file. The file
+/// lives in this host's own folder, written with [`atomic::write_atomic`] and
+/// [`Access::Private`].
+pub fn write_report(
+    history: &HistoryDir,
+    sessions: &[LiveSession],
+    at: DateTime<Utc>,
+) -> Result<HostReport, HistoryError> {
+    let mut sessions = sessions.to_vec();
+    for session in &mut sessions {
+        for agent in &mut session.agents {
+            agent.task = None;
+        }
+    }
+    let report = HostReport { at, sessions };
+    let path = history.sessions_now_file(history.host());
+    let bytes = serde_json::to_vec_pretty(&report).map_err(|source| HistoryError::Io {
+        path: path.clone(),
+        source: io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("cannot encode the sessions report: {source}"),
+        ),
+    })?;
+    let folder = history.root().join(history.host());
+    atomic::ensure_private_dir(&folder).map_err(|source| HistoryError::Io {
+        path: folder.clone(),
+        source,
+    })?;
+    atomic::write_atomic(&path, &bytes, Access::Private)
+        .map_err(|source| HistoryError::Io { path, source })?;
+    Ok(report)
+}
+
+/// The reports of every other host folder (spec §3.8). A folder without
+/// `sessions-now.json` is left out: that host has no report. A file that cannot
+/// be read or parsed is a warning naming the file and the reason, and its host
+/// is left out. Only an error listing the host folders themselves is an error.
+///
+/// A report whose `at` is more than [`REPORT_STALE_MIN`] before `now` is stale:
+/// every session's status becomes `Other("no report")`. A report from the
+/// future (another machine's clock is ahead) is fresh.
+pub fn other_hosts(history: &HistoryDir, now: DateTime<Utc>) -> Result<OtherHosts, HistoryError> {
+    let mut hosts = Vec::new();
+    let mut warnings = Vec::new();
+    for host in history.hosts()? {
+        if host == history.host() {
+            continue;
+        }
+        let path = history.sessions_now_file(&host);
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                warnings.push(format!("{}: {source}", path.display()));
+                continue;
+            }
+        };
+        let report: HostReport = match serde_json::from_str(&text) {
+            Ok(report) => report,
+            Err(source) => {
+                warnings.push(format!("{}: {source}", path.display()));
+                continue;
+            }
+        };
+        let stale = now.signed_duration_since(report.at) > Duration::minutes(REPORT_STALE_MIN);
+        let mut sessions = report.sessions;
+        if stale {
+            for session in &mut sessions {
+                session.status = LiveStatus::Other("no report".to_string());
+            }
+        }
+        hosts.push(OtherHost {
+            host,
+            at: report.at,
+            stale,
+            sessions,
+        });
+    }
+    hosts.sort_by(|a, b| a.host.cmp(&b.host));
+    Ok(OtherHosts { hosts, warnings })
 }
 
 /// The model with the most output tokens; on a tie, the first in name order.
@@ -745,6 +936,10 @@ mod tests {
         Projects::resolve(&[], &[hosted], &[])
     }
 
+    fn known_pricing<'a>(valuer: &'a Valuer, settings: &'a Settings) -> Pricing<'a> {
+        Pricing::Known { valuer, settings }
+    }
+
     fn weekly_window() -> WindowRecord {
         let end = utc("2026-11-14T00:00:00Z");
         WindowRecord {
@@ -812,9 +1007,8 @@ mod tests {
             &[session_file()],
             &state,
             &|_: &str| Vec::new(),
-            &projects(),
-            &valuer,
-            &settings,
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
             "atlas",
             utc("2026-11-14T19:00:00Z"),
             &|_: &str| project_key(),
@@ -858,9 +1052,8 @@ mod tests {
             &[session_file()],
             &state,
             &metas_of,
-            &projects(),
-            &valuer,
-            &settings,
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
             "atlas",
             utc("2026-11-14T19:00:00Z"),
             &|_: &str| project_key(),
@@ -883,9 +1076,8 @@ mod tests {
             &[session_file()],
             &state,
             &|_: &str| Vec::new(),
-            &projects(),
-            &valuer,
-            &settings,
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
             "atlas",
             utc("2026-11-14T19:00:00Z"),
             &|_: &str| project_key(),
@@ -1020,9 +1212,8 @@ mod tests {
             &history,
             utc("2026-11-14T09:00:00Z"),
             utc("2026-11-14T10:00:00Z"),
-            &projects(),
-            &valuer,
-            &settings,
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
         )
         .expect("rows");
 
@@ -1059,9 +1250,8 @@ mod tests {
             &history,
             utc("2026-11-14T09:00:00Z"),
             utc("2026-11-14T10:00:00Z"),
-            &projects(),
-            &valuer,
-            &settings,
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
         )
         .expect("rows");
 
@@ -1090,9 +1280,8 @@ mod tests {
             &[session_file()],
             &state,
             &metas_of,
-            &projects(),
-            &valuer,
-            &settings,
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
             "atlas",
             utc("2026-11-14T19:00:00Z"),
             &|_: &str| project_key(),
@@ -1187,9 +1376,8 @@ mod tests {
             &history,
             utc("2026-11-14T09:00:00Z"),
             utc("2026-11-14T10:00:00Z"),
-            &projects(),
-            &valuer,
-            &settings,
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
         )
         .expect("rows");
 
@@ -1210,9 +1398,8 @@ mod tests {
             &[file],
             &ScanState::default(),
             &|_: &str| Vec::new(),
-            &projects(),
-            &valuer,
-            &settings,
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
             "atlas",
             utc("2026-11-14T19:00:00Z"),
             &|_: &str| project_key(),
@@ -1270,9 +1457,8 @@ mod tests {
             &atlas,
             utc("2026-11-14T09:00:00Z"),
             utc("2026-11-14T10:00:00Z"),
-            &projects(),
-            &valuer,
-            &settings,
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
         )
         .expect("rows");
 
@@ -1312,9 +1498,8 @@ mod tests {
             &history,
             utc("2026-11-14T09:00:00Z"),
             utc("2026-11-14T10:00:00Z"),
-            &projects(),
-            &valuer,
-            &settings,
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
         )
         .expect("rows");
 
@@ -1352,9 +1537,8 @@ mod tests {
             &history,
             utc("2026-11-14T09:00:00Z"),
             utc("2026-11-14T10:00:00Z"),
-            &projects(),
-            &valuer,
-            &settings,
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
         )
         .expect("rows");
 
@@ -1422,9 +1606,8 @@ mod tests {
             &[session_file()],
             &state_with(seen),
             &|_: &str| Vec::new(),
-            &projects(),
-            &valuer,
-            &settings,
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
             "atlas",
             utc("2026-11-14T19:00:00Z"),
             &|_: &str| project_key(),
@@ -1463,9 +1646,8 @@ mod tests {
             &[session_file()],
             &state_with(seen("claude-opus-5-5", 1_000_000)),
             &metas_of,
-            &projects(),
-            &valuer,
-            &settings,
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
             "atlas",
             utc("2026-11-14T19:00:00Z"),
             &|_: &str| project_key(),
@@ -1488,9 +1670,8 @@ mod tests {
             &[session_file()],
             &ScanState::default(),
             &|_: &str| Vec::new(),
-            &projects(),
-            &valuer,
-            &settings,
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
             "atlas",
             utc("2026-11-14T19:00:00Z"),
             &|_: &str| project_key(),
@@ -1541,9 +1722,8 @@ mod tests {
             &[file],
             &state_with(seen("claude-opus-5-5", 1_000_000)),
             &|_: &str| Vec::new(),
-            &projects,
-            &valuer,
-            &settings,
+            Some(&projects),
+            &known_pricing(&valuer, &settings),
             "atlas",
             utc("2026-11-14T19:00:00Z"),
             &|_: &str| ProjectKey::Folder("atlas-old".to_string()),
@@ -1578,9 +1758,8 @@ mod tests {
             &atlas,
             utc("2026-11-14T09:00:00Z"),
             utc("2026-11-14T10:00:00Z"),
-            &projects(),
-            &valuer,
-            &settings,
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
         )
         .expect("rows");
 
@@ -1610,9 +1789,8 @@ mod tests {
             &history,
             utc("2026-11-14T09:00:00Z"),
             utc("2026-11-14T10:00:00Z"),
-            &projects(),
-            &valuer,
-            &settings,
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
         )
         .expect("rows");
 
@@ -1654,9 +1832,8 @@ mod tests {
             &history,
             utc("2026-11-14T09:00:00Z"),
             utc("2026-11-14T09:20:00Z"),
-            &projects(),
-            &valuer,
-            &settings,
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
         )
         .expect("rows");
 
@@ -1693,9 +1870,8 @@ mod tests {
             &[session_file()],
             &state,
             &metas_of,
-            &projects(),
-            &valuer,
-            &settings,
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
             "atlas",
             utc("2026-11-14T19:00:00Z"),
             &|_: &str| project_key(),
@@ -1763,9 +1939,8 @@ mod tests {
             &[session_file(), second],
             &state_with(seen("claude-opus-5-5", 1_000_000)),
             &metas_of,
-            &projects(),
-            &valuer,
-            &settings,
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
             "atlas",
             utc("2026-11-14T19:00:00Z"),
             &|_: &str| project_key(),
@@ -1773,5 +1948,128 @@ mod tests {
 
         assert_eq!(rows.sessions.len(), 2);
         assert_eq!(*calls.borrow(), 2, "one call per session file");
+    }
+
+    // ---- the report other hosts read (spec §3.8) ----
+
+    fn report_session(host: &str, status: LiveStatus, at: DateTime<Utc>) -> LiveSession {
+        let mut session = row(status, Some("claude-opus-5-5"), at);
+        session.host = host.to_string();
+        session
+    }
+
+    #[test]
+    fn the_report_has_no_task_text() {
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let at = utc("2026-11-14T19:00:00Z");
+        let mut session = report_session("atlas", LiveStatus::Busy, at);
+        session.agents.push(LiveAgent {
+            agent: "a8751b20660a1de6b".to_string(),
+            parent: None,
+            kind: Some("general-purpose".to_string()),
+            task: Some("fix the failing tests".to_string()),
+            model: Some("claude-opus-5-5".to_string()),
+            running: false,
+            first: Some(at),
+            last: Some(at),
+            tokens: Tokens::default(),
+            values: Values::missing(NO_TOKENS, &Settings::default()),
+        });
+
+        let report = write_report(&history, &[session], at).expect("the report");
+        assert!(
+            report.sessions[0].agents[0].task.is_none(),
+            "the returned report has no task either"
+        );
+        let text =
+            std::fs::read_to_string(history.sessions_now_file("atlas")).expect("the report file");
+        assert!(
+            !text.contains("fix the failing tests"),
+            "an agent's task is never written: {text}"
+        );
+        assert!(text.contains("general-purpose"));
+        assert!(text.contains("claude-opus-5-5"));
+    }
+
+    #[test]
+    fn other_hosts_reads_every_other_report() {
+        let dir = tempdir().expect("tempdir");
+        let now = utc("2026-11-14T19:00:00Z");
+        let atlas = HistoryDir::at(dir.path(), "atlas");
+        let vega = HistoryDir::at(dir.path(), "vega");
+        host_marker(dir.path(), "atlas");
+        host_marker(dir.path(), "vega");
+        let at = now - Duration::minutes(2);
+        write_report(&atlas, &[report_session("atlas", LiveStatus::Busy, at)], at)
+            .expect("this host's report");
+        write_report(
+            &vega,
+            &[report_session("vega", LiveStatus::Waiting, at)],
+            at,
+        )
+        .expect("vega's report");
+
+        let other = other_hosts(&atlas, now).expect("the other hosts");
+        assert!(other.warnings.is_empty(), "{:?}", other.warnings);
+        assert_eq!(other.hosts.len(), 1);
+        assert_eq!(other.hosts[0].host, "vega");
+        assert_eq!(other.hosts[0].at, at);
+        assert!(!other.hosts[0].stale, "two minutes old is fresh");
+        assert_eq!(other.hosts[0].sessions[0].status, LiveStatus::Waiting);
+    }
+
+    #[test]
+    fn an_old_report_is_stale() {
+        let dir = tempdir().expect("tempdir");
+        let now = utc("2026-11-14T19:00:00Z");
+        let atlas = HistoryDir::at(dir.path(), "atlas");
+        let vega = HistoryDir::at(dir.path(), "vega");
+        host_marker(dir.path(), "vega");
+        let at = now - Duration::minutes(REPORT_STALE_MIN + 1);
+        write_report(
+            &vega,
+            &[report_session("vega", LiveStatus::Waiting, at)],
+            at,
+        )
+        .expect("vega's report");
+
+        let other = other_hosts(&atlas, now).expect("the other hosts");
+        assert_eq!(other.hosts.len(), 1);
+        assert!(other.hosts[0].stale);
+        assert_eq!(
+            other.hosts[0].sessions[0].status,
+            LiveStatus::Other("no report".to_string())
+        );
+    }
+
+    #[test]
+    fn a_broken_report_is_a_warning_and_hides_nothing_else() {
+        let dir = tempdir().expect("tempdir");
+        let now = utc("2026-11-14T19:00:00Z");
+        let atlas = HistoryDir::at(dir.path(), "atlas");
+        let vega = HistoryDir::at(dir.path(), "vega");
+        let ledger = HistoryDir::at(dir.path(), "ledger");
+        host_marker(dir.path(), "vega");
+        host_marker(dir.path(), "ledger");
+        host_marker(dir.path(), "pr");
+        write_report(&vega, &[report_session("vega", LiveStatus::Busy, now)], now)
+            .expect("vega's report");
+        std::fs::write(ledger.sessions_now_file("ledger"), "{not json").expect("a broken report");
+
+        let other = other_hosts(&atlas, now).expect("the folder can be listed");
+        assert_eq!(other.hosts.len(), 1, "vega is still read");
+        assert_eq!(other.hosts[0].host, "vega");
+        assert_eq!(other.warnings.len(), 1, "{:?}", other.warnings);
+        assert!(
+            other.warnings[0].contains("ledger/sessions-now.json"),
+            "the warning names the file: {}",
+            other.warnings[0]
+        );
+        assert!(
+            other.warnings[0].contains("key must be a string"),
+            "the warning names the reason: {}",
+            other.warnings[0]
+        );
     }
 }

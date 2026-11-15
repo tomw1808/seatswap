@@ -23,11 +23,39 @@ const WINDOW_HEIGHT: f64 = 800.0;
 
 /// `"settings/accounts"` → `("settings", Some("accounts"))`;
 /// `"settings/accounts?<id>"` → `("settings", Some("accounts?<id>"))`;
-/// `"settings"` → `("settings", None)`. Anything else is an error with the
-/// reason: an unknown area, an empty sub-area, one that is not a plain name
-/// (`a-z`, `0-9`, `-`) optionally followed by `?<item>` (the item a plain name
-/// too), or more than one `/`.
+/// `"sessions?<session id>"` → `("sessions", Some("<session id>"))`;
+/// `"settings"` → `("settings", None)`. An item without a `/` is only for the
+/// sessions area: `"settings?accounts"` is an error. Anything else is an error
+/// with the reason: an unknown area, an empty sub-area, one that is not a plain
+/// name (`a-z`, `0-9`, `-`) optionally followed by `?<item>` (the item a plain
+/// name too), or more than one `/`.
 pub(crate) fn parse_target(target: &str) -> Result<(&str, Option<&str>), String> {
+    if !target.contains('/') {
+        let (area, item) = match target.split_once('?') {
+            Some((area, item)) => (area, Some(item)),
+            None => (target, None),
+        };
+        if !AREAS.contains(&area) {
+            return Err(format!(
+                "unknown area {area:?}: use one of {}",
+                AREAS.join(", ")
+            ));
+        }
+        let Some(item) = item else {
+            return Ok((area, None));
+        };
+        if area != "sessions" {
+            return Err(format!(
+                "{target:?}: only the sessions area takes an item after \"?\""
+            ));
+        }
+        if !is_slug(item) {
+            return Err(format!(
+                "the item {item:?} may hold only a-z, 0-9 and \"-\""
+            ));
+        }
+        return Ok((area, Some(item)));
+    }
     let mut parts = target.split('/');
     let area = parts.next().unwrap_or_default();
     if !AREAS.contains(&area) {
@@ -145,10 +173,25 @@ mod tests {
         assert!(parse_target("settings/accounts?a b").is_err());
         assert!(parse_target("nonsense").is_err());
         assert_eq!(parse_target("settings"), Ok(("settings", None)));
+        assert_eq!(
+            parse_target("sessions?7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34"),
+            Ok(("sessions", Some("7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34")))
+        );
+        assert!(parse_target("sessions?").is_err());
+        assert!(parse_target("sessions?7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34/x").is_err());
         assert!(parse_target("settings/").is_err());
         assert!(parse_target("settings/a/b").is_err());
         assert!(parse_target("settings/a b").is_err());
         assert!(parse_target("settings/a\nb").is_err());
         assert!(parse_target("settings/Übersicht").is_err());
+    }
+
+    #[test]
+    fn review_an_item_after_another_area_is_not_a_sub_area() {
+        assert!(
+            parse_target("settings?accounts").is_err(),
+            "\"settings?accounts\" is read as the sub-area accounts"
+        );
+        assert!(parse_target("statistics?x").is_err());
     }
 }

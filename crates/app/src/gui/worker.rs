@@ -177,6 +177,8 @@ pub(crate) struct Waiting {
     pub label: String,
     pub project: String,
     pub since: DateTime<Utc>,
+    /// The host the session runs on; `None` is this host.
+    pub host: Option<String>,
 }
 
 impl Snapshot {

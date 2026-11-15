@@ -51,7 +51,7 @@ use chrono::{DateTime, Local, Utc};
 #[cfg(feature = "gui")]
 use seatswap_core::history::By;
 #[cfg(feature = "gui")]
-use seatswap_core::paths::{self, AppPaths};
+use seatswap_core::paths::AppPaths;
 #[cfg(feature = "gui")]
 use seatswap_core::store;
 #[cfg(feature = "gui")]
@@ -566,16 +566,19 @@ fn apply_snapshot(app: &AppHandle, mut snapshot: Snapshot) {
                 None => notify::send_all_full(None),
             },
             Notification::Waiting(waiting) => {
-                let host = snapshot
-                    .settings
+                let this_host = state
+                    .history
                     .as_ref()
-                    .and_then(|settings| paths::host_name(settings.host_name.as_deref()).ok());
+                    .ok()
+                    .map(|history| history.host().to_string());
                 let open_app = app.clone();
+                let session = waiting.session.clone();
                 let on_open = move || {
                     let handle = open_app.clone();
-                    let _ = open_app.run_on_main_thread(move || show_panel(&handle, "main"));
+                    let target = format!("sessions?{session}");
+                    let _ = open_app.run_on_main_thread(move || show_window(&handle, &target));
                 };
-                let handle = notify::send_waiting(&waiting, host.as_deref(), on_open);
+                let handle = notify::send_waiting(&waiting, this_host.as_deref(), on_open);
                 let previous = lock(&state.waiting).insert(waiting.session.clone(), handle);
                 if let Some(previous) = previous {
                     previous.withdraw();

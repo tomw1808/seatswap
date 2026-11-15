@@ -411,6 +411,10 @@ pub struct HistoryDir {
     host: String,
 }
 
+/// The one file in a host folder that is not history: this host's live state,
+/// which the other hosts read (spec §3.8). The import never copies it.
+pub(crate) const SESSIONS_NOW_FILE: &str = "sessions-now.json";
+
 /// The one rule for "the history folder of these settings": the root and this
 /// machine's host folder inside it. `historyDir`/`hostName` are used when set;
 /// otherwise the app's history folder and this machine's host name are.
@@ -458,6 +462,12 @@ impl HistoryDir {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// `<root>/<host>/sessions-now.json`: one host's live state, not a history
+    /// record (spec §3.8).
+    pub fn sessions_now_file(&self, host: &str) -> PathBuf {
+        self.root.join(host).join(SESSIONS_NOW_FILE)
     }
 
     /// Every subfolder of the root whose name follows `paths::host_name`'s rule,
@@ -1543,6 +1553,33 @@ mod tests {
     }
 
     #[test]
+    fn a_hosts_size_leaves_out_its_report() {
+        let dir = tempdir().unwrap();
+        let atlas = HistoryDir::at(dir.path(), "atlas");
+        atlas.append(&an_up(utc("2026-11-14T09:58:00Z"))).unwrap();
+        let report = atlas.sessions_now_file("atlas");
+        fs::write(&report, "{\"at\":\"2026-11-14T09:58:00Z\",\"sessions\":[]}").unwrap();
+        assert!(
+            fs::metadata(&report).unwrap().len() > 0,
+            "the report is there and has bytes"
+        );
+
+        let infos = atlas.host_infos().unwrap();
+        let sizes: u64 = ["up-2026-11.jsonl", "samples-2026-11.jsonl", "host.json"]
+            .iter()
+            .map(|name| {
+                fs::metadata(dir.path().join("atlas").join(name))
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0)
+            })
+            .sum();
+        assert_eq!(
+            infos[0].bytes, sizes,
+            "the live report is not history and does not count"
+        );
+    }
+
+    #[test]
     fn host_infos_carry_this_host_before_it_has_a_folder() {
         let dir = tempdir().unwrap();
         let history = HistoryDir::at(dir.path(), "atlas");
@@ -1627,6 +1664,42 @@ mod tests {
 
         // A second run copies nothing more.
         assert!(own.import(there.path()).unwrap().copied.is_empty());
+    }
+
+    #[test]
+    fn sessions_now_file_is_in_the_hosts_folder() {
+        let dir = tempdir().unwrap();
+        let history = HistoryDir::at(dir.path(), "atlas");
+        assert_eq!(
+            history.sessions_now_file("vega"),
+            dir.path().join("vega").join("sessions-now.json")
+        );
+    }
+
+    #[test]
+    fn the_import_does_not_copy_a_hosts_report() {
+        let here = tempdir().unwrap();
+        let there = tempdir().unwrap();
+        let own = HistoryDir::at(here.path(), "atlas");
+        mark_host(here.path(), "atlas");
+
+        let vega = HistoryDir::at(there.path(), "vega");
+        vega.append(&an_up(utc("2026-11-14T07:00:00Z"))).unwrap();
+        mark_host(there.path(), "vega");
+        fs::write(
+            vega.sessions_now_file("vega"),
+            "{\"at\":\"2026-11-14T07:00:00Z\",\"sessions\":[]}",
+        )
+        .unwrap();
+
+        let imported = own.import(there.path()).unwrap();
+        assert_eq!(imported.copied, vec!["vega"]);
+        assert!(imported.conflicts.is_empty());
+        assert!(here.path().join("vega/up-2026-11.jsonl").is_file());
+        assert!(
+            !here.path().join("vega/sessions-now.json").exists(),
+            "one host's live state is not a history record and is never copied"
+        );
     }
 
     #[test]

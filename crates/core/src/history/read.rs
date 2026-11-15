@@ -18,7 +18,7 @@ use serde::Serialize;
 
 use super::{
     read_marker, same_reset, Event, HistoryDir, HistoryError, Kind, Record, Sample, SessionRecord,
-    TokenRecord, UpRecord, WindowRecord,
+    TokenRecord, UpRecord, WindowRecord, SESSIONS_NOW_FILE,
 };
 use crate::atomic::{self, Access};
 use crate::paths;
@@ -637,6 +637,11 @@ impl HistoryDir {
             let Some(name) = file.file_name() else {
                 continue;
             };
+            // `sessions-now.json` is one host's live state, not a history
+            // record: it is never copied (spec §3.8).
+            if name.to_str() == Some(SESSIONS_NOW_FILE) {
+                continue;
+            }
             let target = to_dir.join(name);
             let there = fs::metadata(&file)
                 .map_err(|source| HistoryError::Io {
@@ -723,8 +728,9 @@ fn cannot_tell(host: &str, from: &Path, folder: &Path) -> String {
     )
 }
 
-/// The sum of the sizes of the files directly in one host folder; a folder that
-/// is not there yet is 0 bytes.
+/// The sum of the sizes of the history files directly in one host folder; a
+/// folder that is not there yet is 0 bytes. `sessions-now.json` is this host's
+/// live state, not history, so it does not count.
 fn folder_bytes(dir: &Path) -> Result<u64, HistoryError> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -742,6 +748,10 @@ fn folder_bytes(dir: &Path) -> Result<u64, HistoryError> {
             path: dir.to_path_buf(),
             source,
         })?;
+        // The live report is not history: it is left out of the size.
+        if entry.file_name().to_str() == Some(SESSIONS_NOW_FILE) {
+            continue;
+        }
         let metadata = match entry.metadata() {
             Ok(metadata) => metadata,
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,

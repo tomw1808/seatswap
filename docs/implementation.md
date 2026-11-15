@@ -1084,7 +1084,7 @@ warnings of the month file `record_external_switch` reads.
 pub(crate) struct SessionsSummary { pub running: u32, pub busy: u32, pub tied: u32, pub tied_busy: u32,
     pub waiting: Vec<Waiting>, pub unavailable: Option<String>, pub warning: Option<String> }
 pub(crate) struct Waiting { pub session: String, pub label: String, pub project: String,
-    pub since: DateTime<Utc> }
+    pub since: DateTime<Utc>, pub host: Option<String> /* None = this host */ }
 pub(crate) struct Snapshot { … pub burn: Option<BurnView>, pub sessions: Option<SessionsSummary> /* None = readSessions off */ … }
 pub(crate) enum EngineCommand { Poll(PollReason), Publish,
     ModelsInUse { models: Option<BTreeSet<String>>, tied_busy: u32 }, Feed, HistoryChanged, Shutdown }
@@ -1142,9 +1142,11 @@ which withdraws its notification. The texts come from one place each: `usable_ag
 `{abbr} is usable again: {reason}.`, with reason `its 5 h window reset`, `its week reset` or
 `its {model} week reset`; `all_full_text` = `All accounts are full. Next: {abbr} at {time}.` or
 `All accounts are full.`; `waiting_text` = `{label} is waiting for you ({project}, on {host}).` or,
-without a host name, `{label} is waiting for you ({project}).`. On Linux a waiting notification
-never times out and can be withdrawn; on Windows it follows the system's rules and the pop-up keeps
-the count.
+without a host name, `{label} is waiting for you ({project}).` (the host is `waiting.host` when set,
+this host's history name otherwise; a click opens the large window at `sessions?<session id>`).
+`notifyWaitingHosts` decides which waits notify: `ThisHost` only `host: None`, `AllHosts` all. On
+Linux a waiting notification never times out and can be withdrawn; on Windows it follows the
+system's rules and the pop-up keeps the count.
 
 ---
 
@@ -2113,7 +2115,8 @@ pub struct HostConflict { pub host: String, pub reason: String }
 impl HistoryDir {
     /// One entry per host folder under the root, this host's own included when it is still
     /// empty, sorted by host. `first_record` is the first record of the oldest file of any kind;
-    /// `last_record` the newest `up` or `samples` line; `bytes` the folder's size.
+    /// `last_record` the newest `up` or `samples` line; `bytes` the size of the history files in
+    /// the folder (`sessions-now.json` is live state, not history, and does not count).
     pub fn host_infos(&self) -> Result<Vec<HostInfo>, HistoryError>;
     /// The window records of the range, one per (account, kind, end within `same_reset`): the
     /// record with the latest `lastSample` counts (spec §1.5), a tie goes to the host name that
@@ -2250,3 +2253,73 @@ settings` sends `window settings` instead of a pop-up view.
   "amount":180.0,"currency":"EUR"}` when an account's price changes (amount and currency omitted
   when null); `{"t":"…","type":"planChanged","account":{…},"from":"Team","to":"Team 5x"}` when a
   stored login changes the plan label.
+
+## Step C2: the Sessions area and the other hosts (spec §3.8, §4.1)
+
+`core::live_sessions` owns the rows and the small report another host reads.
+
+```rust
+// live_sessions.rs
+pub const REPORT_EVERY_SECS: i64 = 30;
+pub const REPORT_STALE_MIN: i64 = 15;
+pub enum Pricing<'a> { Known { valuer: &'a Valuer, settings: &'a Settings },
+    Unknown { reason: String } }
+pub fn running(files: &[SessionFile], state: &ScanState,
+    metas: &dyn Fn(&str) -> Vec<AgentMeta>, projects: Option<&Projects>,
+    pricing: &Pricing, host: &str, now: DateTime<Utc>,
+    project_of: &dyn Fn(&str) -> ProjectKey) -> Rows;
+pub fn closed(history: &HistoryDir, since: DateTime<Utc>, now: DateTime<Utc>,
+    projects: Option<&Projects>, pricing: &Pricing) -> Result<Rows, HistoryError>;
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)] #[serde(rename_all = "camelCase")]
+pub struct HostReport { pub at: DateTime<Utc>, pub sessions: Vec<LiveSession> }
+#[derive(Debug, Clone, PartialEq, Serialize)] #[serde(rename_all = "camelCase")]
+pub struct OtherHost { pub host: String, pub at: DateTime<Utc>, pub stale: bool,
+    pub sessions: Vec<LiveSession> }
+#[derive(Debug, Clone, PartialEq, Serialize)] #[serde(rename_all = "camelCase")]
+pub struct OtherHosts { pub hosts: Vec<OtherHost>, pub warnings: Vec<String> }
+pub fn write_report(history: &HistoryDir, sessions: &[LiveSession], at: DateTime<Utc>)
+    -> Result<HostReport, HistoryError>;
+pub fn other_hosts(history: &HistoryDir, now: DateTime<Utc>)
+    -> Result<OtherHosts, HistoryError>;
+
+// history/mod.rs
+const SESSIONS_NOW_FILE: &str = "sessions-now.json";      // one host's live state, not history
+impl HistoryDir { pub fn sessions_now_file(&self, host: &str) -> PathBuf; }
+
+// projects.rs: the one project read the pop-up and the sessions thread share
+pub fn load(history: &HistoryDir, accounts: &[Account])
+    -> Result<(Projects, Vec<String>), HistoryError>;
+```
+
+`write_report` sets every agent's `task` to `None` before it writes, so no task text ever leaves
+memory; the file is pretty JSON, written with `atomic::write_atomic` and `Access::Private` in this
+host's folder. `other_hosts` lists the host folders with `HistoryDir::hosts`, skips this host and a
+folder without the file, and turns every unreadable or unparseable file into a warning naming the
+file and the reason while the other reports are still returned; only failing to list the folders is
+an error. A report more than `REPORT_STALE_MIN` before `now` is stale: its sessions say
+`Other("no report")`; a future `at` is fresh. The import skips `SESSIONS_NOW_FILE`, and the month
+file listing and the export never see it.
+
+The sessions thread (`gui/sessions_rt.rs`) keeps a rows context of two parts built apart: the
+`Projects` and a `Valuer` for the day up to `now` with the settings from `load_accounts`. A part
+that was built is kept for `ROWS_CONTEXT_MAX_AGE_SECS = 300`; a part that could not be built keeps
+its error and is tried again after `ROWS_CONTEXT_RETRY_SECS = 60`, not on every pass. Each failure
+is `SessionsSummary.unavailable`, shown once, and the rows are built with what is there. Without a
+history (`recorder` is `None`) the projects are `None` (the keys' default names, no organization)
+and the pricing is `Pricing::Unknown` with the history's error, so this host's waiting sessions
+still notify; no report is written and no other host is read. The report is written also when the
+pricing is unknown, because its rows say why the values are missing. Every "is it time again" rule
+of the thread (the report's 30 s and heartbeat, the other hosts' read, the context's ages) counts a
+time in the future of `now` as due, so a clock that moved back silences nothing. The rows are the
+one source of a waiting session's `label` and `project`; their warnings are the one place an
+invalid session time is said. This host's report is written when the rows changed and the last
+write is at least `REPORT_EVERY_SECS` old, at once when a running session left the list, and as a
+heartbeat when the last write is older than `REPORT_HEARTBEAT_SECS = 300`; an empty list is a
+report too. The same thread reads `other_hosts` at most every `REPORT_EVERY_SECS` and keeps the
+last read for the passes in between, so its waiting sessions and warnings do not flicker; a read
+that fails stores an empty one with its error. Every waiting session of a fresh report goes into
+`SessionsSummary.waiting` with its host. `waiting: Vec<Waiting>` carries
+`Waiting.host: Option<String>` (`None` = this host); this host's name is `GuiState.history.host()`.
+`Deduper` shows another host's wait only with `notifyWaitingHosts: AllHosts`; a click opens the
+large window at `sessions?<session id>` (`window::parse_target` accepts the id and refuses an item
+after any other area).

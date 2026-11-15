@@ -9,7 +9,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::history::{AccountRef, Hosted, Kind, Record, SessionRecord};
+use crate::history::{
+    AccountRef, HistoryDir, HistoryError, Hosted, Hosts, Kind, Range, Record, SessionRecord,
+};
 use crate::project::ProjectKey;
 use crate::store::Account;
 
@@ -279,6 +281,27 @@ pub struct Projects {
     joins: BTreeMap<ProjectId, (ProjectId, usize)>,
     #[serde(skip)]
     org_join: BTreeMap<String, (String, usize)>,
+}
+
+/// The projects of a history folder, all of time and every host: the project
+/// log and the session records, resolved with the stored accounts. The read
+/// warnings are returned with them, in the order the reads make them.
+pub fn load(
+    history: &HistoryDir,
+    accounts: &[Account],
+) -> Result<(Projects, Vec<String>), HistoryError> {
+    let range = Range {
+        from: DateTime::<Utc>::MIN_UTC,
+        to: DateTime::<Utc>::MAX_UTC,
+    };
+    let log = history.read::<ProjectsLogRecord>(&range, &Hosts::All)?;
+    let sessions = history.read::<SessionRecord>(&range, &Hosts::All)?;
+    let mut warnings = log.warnings;
+    warnings.extend(sessions.warnings);
+    Ok((
+        Projects::resolve(&log.records, &sessions.records, accounts),
+        warnings,
+    ))
 }
 
 impl Projects {
