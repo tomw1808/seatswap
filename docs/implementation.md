@@ -2122,9 +2122,11 @@ impl HistoryDir {
         -> Result<Vec<Hosted<WindowRecord>>, HistoryError>;
     /// Copy every file of `from`'s host folders that is missing here or longer there; keep a
     /// longer file; never read or write this host's folder; refuse this folder and a folder
-    /// without a host folder. A host folder that is not here yet is copied as it is. One that
-    /// is here is copied only when both sides' `host.json` name this machine; another machine
-    /// id, or no `host.json` on either side, is a conflict ("cannot tell whether …"), and
+    /// without a host folder. A host folder that is not here yet is copied as it is when its
+    /// `host.json` names a machine; without one `hosts` would never list the copy, so it is a
+    /// conflict ("… has no host.json with a machine id …"). One that is here is copied only
+    /// when both sides' `host.json` name the same machine; another machine id, or no
+    /// `host.json` (or an empty id) on either side, is a conflict ("cannot tell whether …"), and
     /// nothing of that folder is copied. A read or write error stops the whole import; a
     /// conflict does not. Returns what was copied and the conflicts, both sorted by host.
     pub fn import(&self, from: &Path) -> Result<Imported, HistoryError>;

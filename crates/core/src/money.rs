@@ -1042,12 +1042,16 @@ impl Valuer {
     }
 }
 
-/// A price counts only in the currency it was entered in (spec §1.4).
+/// A price counts only in the currency it was entered in (spec §1.4). Without
+/// a currency in the settings there is none to count it in.
 fn counted_price(
     amount: f64,
     currency: Option<&str>,
     current: Option<&str>,
 ) -> Result<f64, Missing> {
+    if current.is_none() {
+        return Err(Missing::NoCurrency);
+    }
     match currency {
         Some(currency) if Some(currency) != current => Err(Missing::PriceInOtherCurrency {
             currency: currency.to_string(),
@@ -2342,6 +2346,46 @@ mod tests {
                 currency: "EUR".to_string()
             }),
             "a stored price keeps the currency it was entered in"
+        );
+    }
+
+    #[test]
+    fn proof_without_a_currency_the_value_says_the_currency_is_missing() {
+        let (history, _dir, opus, _haiku, prices) = two_records();
+        history
+            .append(&weekly_window(
+                utc("2026-11-07T00:00:00Z"),
+                utc("2026-11-14T00:00:00Z"),
+                80.0,
+            ))
+            .expect("a finished window");
+        let mut account = account_with_price(Some(140.0));
+        account.price_currency = Some("EUR".to_string());
+        let settings = Settings {
+            currency: None,
+            ..Settings::default()
+        };
+
+        let valuer = Valuer::build(
+            &history,
+            &range("2026-11-10T00:00:00Z", "2026-11-11T00:00:00Z"),
+            &prices,
+            &empty_fx(),
+            &settings,
+            &[account],
+        )
+        .expect("a valuer");
+
+        let value = valuer.value("atlas", &opus);
+        assert_eq!(
+            value.api_missing,
+            Some(Missing::NoCurrency),
+            "without a currency the API value says the currency is missing"
+        );
+        assert_eq!(
+            value.subscription_missing,
+            Some(Missing::NoCurrency),
+            "without a currency there is no current currency to enter the price in"
         );
     }
 

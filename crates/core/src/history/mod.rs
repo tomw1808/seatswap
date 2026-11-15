@@ -1784,6 +1784,65 @@ mod tests {
     }
 
     #[test]
+    fn proof_import_does_not_merge_two_host_folders_with_an_empty_machine_id() {
+        let here = tempdir().unwrap();
+        let there = tempdir().unwrap();
+        let own = HistoryDir::at(here.path(), "atlas");
+
+        // Both sides carry a marker, but neither names a machine: an empty id
+        // proves nothing about which machine wrote the folder.
+        fs::create_dir_all(here.path().join("vega")).unwrap();
+        fs::write(here.path().join("vega/host.json"), "{\"machineId\":\"\"}").unwrap();
+        // One byte shorter than the other side's line, so "the longer file
+        // wins" would replace it.
+        let mine = "{\"t\":\"2026-11-14T06:00:00Z\"}";
+        fs::write(here.path().join("vega/up-2026-11.jsonl"), mine).unwrap();
+
+        let vega = HistoryDir::at(there.path(), "vega");
+        vega.append(&an_up(utc("2026-11-14T07:00:00Z"))).unwrap();
+        fs::write(there.path().join("vega/host.json"), "{\"machineId\":\"\"}").unwrap();
+
+        let imported = own.import(there.path()).unwrap();
+        assert!(
+            imported.copied.is_empty(),
+            "an empty machine id proves nothing: {:?}",
+            imported.copied
+        );
+        assert_eq!(imported.conflicts.len(), 1, "the host is a conflict");
+        assert_eq!(imported.conflicts[0].host, "vega");
+        assert_eq!(
+            fs::read_to_string(here.path().join("vega/up-2026-11.jsonl")).unwrap(),
+            mine,
+            "the other machine's vega is never merged in"
+        );
+    }
+
+    #[test]
+    fn import_does_not_copy_a_host_without_a_machine_id() {
+        let here = tempdir().unwrap();
+        let there = tempdir().unwrap();
+        let own = HistoryDir::at(here.path(), "atlas");
+
+        // vega is not here yet, and the source's vega has no marker: a copy
+        // would never be listed by `hosts`, so its files would never be read.
+        let vega = HistoryDir::at(there.path(), "vega");
+        vega.append(&an_up(utc("2026-11-14T07:00:00Z"))).unwrap();
+
+        let imported = own.import(there.path()).unwrap();
+        assert!(imported.copied.is_empty(), "{:?}", imported.copied);
+        assert_eq!(imported.conflicts.len(), 1);
+        assert_eq!(imported.conflicts[0].host, "vega");
+        assert!(
+            imported.conflicts[0]
+                .reason
+                .contains("has no host.json with a machine id"),
+            "{}",
+            imported.conflicts[0].reason
+        );
+        assert!(!here.path().join("vega").exists(), "nothing is copied");
+    }
+
+    #[test]
     fn import_matches_a_marker_with_a_trailing_newline() {
         let here = tempdir().unwrap();
         let there = tempdir().unwrap();

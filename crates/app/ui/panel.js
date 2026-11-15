@@ -378,8 +378,13 @@ function renderBurnStrip() {
 async function setAutoBurn(on) {
   state.errors.burn = null;
   try {
-    await invoke("set_auto_burn", { on });
+    // A warning is not a refused save: the setting is saved, the warning shown.
+    const warning = await invoke("set_auto_burn", { on });
     afterCommand();
+    if (typeof warning === "string" && warning !== "") {
+      state.errors.burn = warning;
+      renderMain();
+    }
   } catch (error) {
     state.errors.burn = errorMessage(error);
     renderMain();

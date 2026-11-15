@@ -678,7 +678,12 @@ pub(crate) async fn save_setting(
 /// same settings path as the settings page, so the change is merged under the
 /// app lock and written to the history in one place (`worker::save_setting`).
 #[tauri::command]
-pub(crate) async fn set_auto_burn(state: State<'_, GuiState>, on: bool) -> Result<(), String> {
+/// The answer is the save's warning (the autostart entry could not be
+/// applied), which the pop-up shows; the setting is saved all the same.
+pub(crate) async fn set_auto_burn(
+    state: State<'_, GuiState>,
+    on: bool,
+) -> Result<Option<String>, String> {
     let action = state.action.clone();
     let reply = tauri::async_runtime::spawn_blocking(move || {
         request(&action, |reply| ActionCommand::SaveSetting {
@@ -692,10 +697,7 @@ pub(crate) async fn set_auto_burn(state: State<'_, GuiState>, on: bool) -> Resul
     match reply {
         ActionReply::Saved(saved) => {
             state.remember_settings(saved.settings);
-            match saved.warning {
-                Some(warning) => Err(warning),
-                None => Ok(()),
-            }
+            Ok(saved.warning)
         }
         ActionReply::Failed(message) => Err(message),
         _ => Err("the action thread gave an unexpected reply".to_string()),

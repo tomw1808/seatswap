@@ -564,13 +564,14 @@ impl HistoryDir {
     fn copy_host(&self, from: &Path, host: &str) -> Result<HostImport, HistoryError> {
         let from_dir = from.join(host);
         let to_dir = self.root().join(host);
+        // A marker without a machine id proves nothing, like no marker.
+        let there = read_marker(&from_dir.join("host.json"))?
+            .filter(|marker| !marker.machine_id.is_empty());
         // A folder here that belongs to another machine is never touched: two
         // machines with the same host name would otherwise merge their files.
-        // A folder that is not here yet is copied without asking (an old host
-        // may have no marker).
         if folder_exists(&to_dir)? {
-            let here = read_marker(&to_dir.join("host.json"))?;
-            let there = read_marker(&from_dir.join("host.json"))?;
+            let here = read_marker(&to_dir.join("host.json"))?
+                .filter(|marker| !marker.machine_id.is_empty());
             match (here, there) {
                 (Some(here), Some(there)) if here.machine_id == there.machine_id => {}
                 (Some(_), Some(_)) => {
@@ -595,6 +596,17 @@ impl HistoryDir {
                     }))
                 }
             }
+        } else if there.is_none() {
+            // A folder without a machine id is not copied either: `hosts` would
+            // not list it, so its files would never be read.
+            return Ok(HostImport::Conflict(HostConflict {
+                host: host.to_string(),
+                reason: format!(
+                    "{} has no host.json with a machine id, so seatswap would not read it; \
+                     start seatswap once on that host and import again",
+                    from_dir.display()
+                ),
+            }));
         }
         let entries = fs::read_dir(&from_dir).map_err(|source| HistoryError::Io {
             path: from_dir.clone(),
