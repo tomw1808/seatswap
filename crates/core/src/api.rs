@@ -1,10 +1,12 @@
-//! The two HTTP endpoints seatswap uses: an account's usage and the OAuth
-//! token refresh (spec §3, §6.3, §7.2, §7.3). Both endpoints are undocumented,
-//! so their URLs, headers and reply shapes live in this file and nowhere else.
+//! The HTTP endpoints seatswap uses: an account's usage, the OAuth token
+//! refresh (spec §3, §6.3, §7.2, §7.3), models.dev's prices and Frankfurter's
+//! dollar rate (spec §1.4.1). The first two are undocumented, so their URLs,
+//! headers and reply shapes live here and nowhere else.
 
+use std::io::Read;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -14,11 +16,22 @@ pub const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 pub const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 pub const OAUTH_BETA: &str = "oauth-2025-04-20";
+pub const MODELS_DEV_URL: &str = "https://models.dev/api.json";
+pub const FRANKFURTER_URL: &str = "https://api.frankfurter.dev/v1/latest";
 
 /// The server rejects a library default User-Agent with 403 "error code: 1010".
 const USER_AGENT: &str = concat!("seatswap/", env!("CARGO_PKG_VERSION"));
 const TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_ERROR_BODY_CHARS: usize = 300;
+/// The most of models.dev's list this build reads (the file is about 6.5 MB).
+const MAX_MODELS_DEV_BYTES: usize = 32 * 1024 * 1024;
+
+/// What a conditional look-up answered.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Fetched<T> {
+    NotModified,
+    New { etag: Option<String>, body: T },
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
@@ -58,6 +71,8 @@ pub struct Api {
     agent: ureq::Agent,
     usage_url: String,
     token_url: String,
+    models_dev_url: String,
+    frankfurter_url: String,
 }
 
 impl Api {
@@ -66,6 +81,8 @@ impl Api {
             agent: build_agent(),
             usage_url: USAGE_URL.to_string(),
             token_url: TOKEN_URL.to_string(),
+            models_dev_url: MODELS_DEV_URL.to_string(),
+            frankfurter_url: FRANKFURTER_URL.to_string(),
         }
     }
 
@@ -75,7 +92,16 @@ impl Api {
             agent: build_agent(),
             usage_url: usage_url.to_string(),
             token_url: token_url.to_string(),
+            models_dev_url: MODELS_DEV_URL.to_string(),
+            frankfurter_url: FRANKFURTER_URL.to_string(),
         }
+    }
+
+    /// The two look-up URLs pointed at a local fake server (tests).
+    pub fn with_lookup_urls(mut self, models_dev: &str, frankfurter: &str) -> Api {
+        self.models_dev_url = models_dev.to_string();
+        self.frankfurter_url = frankfurter.to_string();
+        self
     }
 
     /// GET the account's usage with its access token.
@@ -136,6 +162,90 @@ impl Api {
             serde_json::from_str(&body).map_err(|error| ApiError::Decode(error.to_string()))?;
         refreshed_login(login, &reply, expected, now_ms)
     }
+
+    /// GET models.dev's list, conditionally with `etag`. A 304 answer is
+    /// [`Fetched::NotModified`]; a body over [`MAX_MODELS_DEV_BYTES`] is an error.
+    pub fn models_dev(&self, etag: Option<&str>) -> Result<Fetched<Value>, ApiError> {
+        let mut request = self
+            .agent
+            .get(&self.models_dev_url)
+            .set("User-Agent", USER_AGENT);
+        if let Some(etag) = etag {
+            request = request.set("If-None-Match", etag);
+        }
+        let response = match request.call() {
+            Ok(response) if response.status() == 304 => return Ok(Fetched::NotModified),
+            Ok(response) => response,
+            Err(ureq::Error::Status(304, _)) => return Ok(Fetched::NotModified),
+            Err(ureq::Error::Status(status, response)) => {
+                return Err(status_error(status, response))
+            }
+            Err(ureq::Error::Transport(error)) => return Err(ApiError::Network(error.to_string())),
+        };
+
+        if let Some(length) = response.header("Content-Length") {
+            if let Ok(length) = length.trim().parse::<usize>() {
+                if length > MAX_MODELS_DEV_BYTES {
+                    return Err(too_large());
+                }
+            }
+        }
+        let etag = response.header("ETag").map(str::to_string);
+        let mut body = Vec::new();
+        response
+            .into_reader()
+            .take(MAX_MODELS_DEV_BYTES as u64 + 1)
+            .read_to_end(&mut body)
+            .map_err(|error| ApiError::Network(error.to_string()))?;
+        if body.len() > MAX_MODELS_DEV_BYTES {
+            return Err(too_large());
+        }
+        let body: Value =
+            serde_json::from_slice(&body).map_err(|error| ApiError::Decode(error.to_string()))?;
+        Ok(Fetched::New { etag, body })
+    }
+
+    /// GET Frankfurter's latest USD rate for `currency`.
+    pub fn usd_rate(&self, currency: &str) -> Result<(NaiveDate, f64), ApiError> {
+        if currency.len() != 3 || !currency.bytes().all(|byte| byte.is_ascii_uppercase()) {
+            return Err(ApiError::Decode(format!(
+                "currency {currency:?} must be three capital letters"
+            )));
+        }
+        let url = format!("{}?base=USD&symbols={}", self.frankfurter_url, currency);
+        let response = match self.agent.get(&url).set("User-Agent", USER_AGENT).call() {
+            Ok(response) => response,
+            Err(ureq::Error::Status(status, response)) => {
+                return Err(status_error(status, response))
+            }
+            Err(ureq::Error::Transport(error)) => return Err(ApiError::Network(error.to_string())),
+        };
+        let body = read_body(response)?;
+        let value: Value =
+            serde_json::from_str(&body).map_err(|error| ApiError::Decode(error.to_string()))?;
+        let date = value
+            .get("date")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ApiError::Decode("the rate reply has no date".to_string()))?;
+        let date = NaiveDate::parse_from_str(date, "%Y-%m-%d").map_err(|error| {
+            ApiError::Decode(format!("the rate reply's date is not a day: {error}"))
+        })?;
+        let rate = value
+            .get("rates")
+            .and_then(Value::as_object)
+            .and_then(|rates| rates.get(currency))
+            .and_then(Value::as_f64)
+            .ok_or_else(|| {
+                ApiError::Decode(format!("the rate reply has no rate for {currency}"))
+            })?;
+        Ok((date, rate))
+    }
+}
+
+fn too_large() -> ApiError {
+    ApiError::Decode(format!(
+        "the models.dev list is larger than {MAX_MODELS_DEV_BYTES} bytes"
+    ))
 }
 
 impl Default for Api {
@@ -787,6 +897,10 @@ mod tests {
         )
     }
 
+    fn lookup_api(base: &str) -> Api {
+        api_for(base).with_lookup_urls(&format!("{base}/api.json"), &format!("{base}/v1/latest"))
+    }
+
     fn captured(receiver: &Receiver<Captured>, handle: JoinHandle<()>) -> Captured {
         let request = receiver
             .recv_timeout(Duration::from_secs(10))
@@ -1287,5 +1401,176 @@ mod tests {
         let usage = api_for(&base).usage(&usage_token()).unwrap();
         let _ = captured(&receiver, handle);
         assert_eq!(usage.limits[0].resets_at, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // the two look-ups (spec §1.4.1)
+
+    const MODELS_DEV_BODY: &str = r#"{
+      "anthropic": {"id": "anthropic", "models": {
+        "claude-opus-5-5": {"id": "claude-opus-5-5", "cost": {"input": 4, "output": 20}}
+      }}
+    }"#;
+
+    fn start_length_server(length: usize) -> (String, Receiver<Captured>, JoinHandle<()>) {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let base = format!("http://{address}");
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut request = server.recv().unwrap();
+            let mut body = String::new();
+            request.as_reader().read_to_string(&mut body).unwrap();
+            let captured = Captured {
+                method: request.method().as_str().to_string(),
+                path: request.url().to_string(),
+                headers: request
+                    .headers()
+                    .iter()
+                    .map(|header| {
+                        (
+                            header.field.as_str().as_str().to_string(),
+                            header.value.as_str().to_string(),
+                        )
+                    })
+                    .collect(),
+                body,
+            };
+            let response = Response::new(
+                StatusCode(200),
+                Vec::new(),
+                std::io::empty(),
+                Some(length),
+                None,
+            )
+            .with_chunked_threshold(usize::MAX);
+            let _ = request.respond(response);
+            let _ = sender.send(captured);
+        });
+        (base, receiver, handle)
+    }
+
+    fn start_chunked_server(body: Vec<u8>) -> (String, Receiver<Captured>, JoinHandle<()>) {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let base = format!("http://{address}");
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut request = server.recv().unwrap();
+            let mut request_body = String::new();
+            request
+                .as_reader()
+                .read_to_string(&mut request_body)
+                .unwrap();
+            let captured = Captured {
+                method: request.method().as_str().to_string(),
+                path: request.url().to_string(),
+                headers: request
+                    .headers()
+                    .iter()
+                    .map(|header| {
+                        (
+                            header.field.as_str().as_str().to_string(),
+                            header.value.as_str().to_string(),
+                        )
+                    })
+                    .collect(),
+                body: request_body,
+            };
+            let response = Response::new(
+                StatusCode(200),
+                Vec::new(),
+                std::io::Cursor::new(body),
+                None,
+                None,
+            );
+            let _ = request.respond(response);
+            let _ = sender.send(captured);
+        });
+        (base, receiver, handle)
+    }
+
+    #[test]
+    fn models_dev_sends_the_etag_and_understands_304() {
+        let (base, receiver, handle) = start_server(Reply::status(304, ""));
+        let fetched = lookup_api(&base)
+            .models_dev(Some("W/\"abc\""))
+            .expect("a 304 answer");
+        let request = captured(&receiver, handle);
+
+        assert_eq!(fetched, Fetched::NotModified);
+        assert_eq!(request.path, "/api.json");
+        assert_eq!(request.header("If-None-Match"), Some("W/\"abc\""));
+        assert_eq!(request.header("User-Agent"), Some(USER_AGENT));
+    }
+
+    #[test]
+    fn models_dev_returns_the_body_and_the_new_etag() {
+        let (base, receiver, handle) =
+            start_server(Reply::ok(MODELS_DEV_BODY).header("ETag", "W/\"def\""));
+        let fetched = lookup_api(&base).models_dev(None).expect("a list");
+        let request = captured(&receiver, handle);
+
+        assert_eq!(request.header("If-None-Match"), None);
+        match fetched {
+            Fetched::New { etag, body } => {
+                assert_eq!(etag.as_deref(), Some("W/\"def\""));
+                assert_eq!(
+                    body["anthropic"]["models"]["claude-opus-5-5"]["cost"]["input"],
+                    4
+                );
+            }
+            Fetched::NotModified => panic!("a 200 answer is not a 304"),
+        }
+    }
+
+    #[test]
+    fn models_dev_refuses_a_huge_body() {
+        let (base, receiver, handle) = start_length_server(MAX_MODELS_DEV_BYTES + 1);
+        let error = lookup_api(&base)
+            .models_dev(None)
+            .expect_err("a body over the limit");
+        let _ = receiver.recv_timeout(std::time::Duration::from_secs(10));
+        let _ = handle.join();
+        assert!(matches!(error, ApiError::Decode(_)), "got {error:?}");
+        assert!(error.to_string().contains("larger than"), "got {error}");
+    }
+
+    #[test]
+    fn models_dev_refuses_a_huge_body_without_content_length() {
+        let body = vec![b'a'; MAX_MODELS_DEV_BYTES + 1];
+        let (base, receiver, handle) = start_chunked_server(body);
+        let error = lookup_api(&base)
+            .models_dev(None)
+            .expect_err("a body over the limit");
+        let _ = receiver.recv_timeout(std::time::Duration::from_secs(10));
+        let _ = handle.join();
+        assert!(matches!(error, ApiError::Decode(_)), "got {error:?}");
+        assert!(error.to_string().contains("larger than"), "got {error}");
+    }
+
+    #[test]
+    fn usd_rate_reads_date_and_rate() {
+        let body = r#"{"base":"USD","date":"2026-11-13","rates":{"EUR":0.90481}}"#;
+        let (base, receiver, handle) = start_server(Reply::ok(body));
+        let (date, rate) = lookup_api(&base).usd_rate("EUR").expect("the rate");
+        let request = captured(&receiver, handle);
+
+        assert_eq!(date, NaiveDate::from_ymd_opt(2026, 11, 13).unwrap());
+        assert_eq!(rate, 0.90481);
+        assert_eq!(request.path, "/v1/latest?base=USD&symbols=EUR");
+        assert_eq!(request.header("User-Agent"), Some(USER_AGENT));
+    }
+
+    #[test]
+    fn usd_rate_without_the_currency_is_an_error() {
+        let body = r#"{"base":"USD","date":"2026-11-13","rates":{}}"#;
+        let (base, receiver, handle) = start_server(Reply::ok(body));
+        let error = lookup_api(&base)
+            .usd_rate("EUR")
+            .expect_err("a reply without EUR");
+        let _ = captured(&receiver, handle);
+        assert!(matches!(error, ApiError::Decode(_)), "got {error:?}");
+        assert!(error.to_string().contains("EUR"), "got {error}");
     }
 }

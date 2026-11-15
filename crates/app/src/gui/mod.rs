@@ -18,6 +18,8 @@ pub(crate) mod autostart;
 #[cfg(feature = "gui")]
 pub(crate) mod burn_rt;
 #[cfg(feature = "gui")]
+pub(crate) mod lookup_rt;
+#[cfg(feature = "gui")]
 pub(crate) mod notify;
 #[cfg(feature = "gui")]
 pub(crate) mod panel;
@@ -62,6 +64,8 @@ use notify::Notification;
 use tauri::{AppHandle, Emitter, Manager};
 
 #[cfg(feature = "gui")]
+use lookup_rt::{LookupClient, LookupHandle};
+#[cfg(feature = "gui")]
 use sessions_rt::SessionsHandle;
 #[cfg(feature = "gui")]
 use worker::SessionsSummary;
@@ -89,6 +93,9 @@ pub(crate) struct GuiState {
     sessions: Mutex<Option<SessionsSummary>>,
     pub(crate) engine: std::sync::mpsc::Sender<EngineCommand>,
     pub(crate) action: std::sync::mpsc::Sender<ActionCommand>,
+    /// The look-up thread's view, and the handle that keeps the thread alive.
+    pub(crate) lookup: LookupClient,
+    _lookup: Mutex<Option<LookupHandle>>,
     deduper: Mutex<notify::Deduper>,
     /// The waiting notifications that can still be withdrawn, by session id.
     waiting: Mutex<HashMap<String, notify::WaitingHandle>>,
@@ -183,6 +190,10 @@ pub(crate) fn run(
             panel::save_settings,
             panel::set_auto_burn,
             panel::pause_burn,
+            panel::money_view,
+            panel::price_list,
+            panel::set_price_override,
+            panel::lookup_now,
             panel::icon_preview,
             panel::time_texts,
             panel::fit_panel,
@@ -348,6 +359,11 @@ fn setup(
     };
     let initial = Snapshot::empty(startup_error.clone(), None, settings);
     let sessions = worker.sessions.take();
+    let lookup_handle = worker
+        .lookup
+        .take()
+        .ok_or_else(|| "the look-up thread did not start".to_string())?;
+    let lookup = lookup_handle.client();
 
     tauri_app.manage(GuiState {
         snapshot: Mutex::new(initial.clone()),
@@ -356,6 +372,8 @@ fn setup(
         sessions: Mutex::new(None),
         engine: worker.engine.clone(),
         action: worker.action.clone(),
+        lookup,
+        _lookup: Mutex::new(Some(lookup_handle)),
         deduper: Mutex::new(notify::Deduper::new()),
         waiting: Mutex::new(HashMap::new()),
         recheck: Mutex::new(Recheck::default()),
@@ -450,6 +468,9 @@ fn handle_ui_event(app: &AppHandle, event: UiEvent) {
             *lock(&state.sessions) = Some(summary);
             let snapshot = lock(&state.snapshot).clone();
             apply_snapshot(app, snapshot);
+        }
+        UiEvent::Money(view) => {
+            let _ = app.emit("money", &view);
         }
     }
 }

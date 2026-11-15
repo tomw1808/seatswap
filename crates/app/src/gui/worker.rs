@@ -43,6 +43,7 @@ use seatswap_core::types::Login;
 
 use super::autostart;
 use super::burn_rt::{BurnRuntime, BurnTick};
+use super::lookup_rt::{self, LookupHandle, MoneyView};
 use super::notify;
 use super::sessions_rt::{self, SessionsHandle};
 use crate::format::with_tilde;
@@ -327,6 +328,7 @@ pub(crate) enum ActionReply {
 pub(crate) enum UiEvent {
     Snapshot(Snapshot),
     Sessions(SessionsSummary),
+    Money(MoneyView),
 }
 
 /// The handles the Tauri side keeps.
@@ -335,6 +337,8 @@ pub(crate) struct Worker {
     pub action: Sender<ActionCommand>,
     /// Present only while `readSessions` is on; the tray keeps it alive.
     pub sessions: Option<SessionsHandle>,
+    /// The look-up thread runs whatever `lookUpPrices` says.
+    pub lookup: Option<LookupHandle>,
 }
 
 pub(crate) fn spawn(
@@ -367,6 +371,8 @@ pub(crate) fn spawn(
         })
         .map_err(|error| format!("cannot start the engine thread: {error}"))?;
 
+    let lookup = Some(lookup_rt::spawn(app.clone(), Api::new(), ui.clone())?);
+
     let sessions = match settings.as_ref().filter(|settings| settings.read_sessions) {
         Some(settings) => Some(sessions_rt::spawn(
             app.clone(),
@@ -396,6 +402,7 @@ pub(crate) fn spawn(
         engine: engine_tx,
         action: action_tx,
         sessions,
+        lookup,
     })
 }
 

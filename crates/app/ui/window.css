@@ -827,3 +827,84 @@ button.link {
 button.link:hover {
   text-decoration: underline;
 }
+
+/* ---------- the General group's Money section (spec §1.4, §1.4.1) ---------- */
+
+.money-currency,
+.money-prices-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.money-other {
+  display: inline-flex;
+}
+
+.money-other-input {
+  width: 72px;
+  text-transform: uppercase;
+}
+
+.money-rate {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.money-api-note {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0;
+  white-space: normal;
+}
+
+.price-list {
+  display: flex;
+  flex-direction: column;
+  padding: 0 0 6px;
+}
+
+.price-grid {
+  grid-template-columns: minmax(170px, 1fr) 74px 74px 86px 86px minmax(110px, auto);
+}
+
+.price-value {
+  display: flex;
+  min-width: 0;
+}
+
+.price-field {
+  width: 100%;
+  min-width: 0;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.price-marks {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.price-own-line {
+  display: flex;
+  justify-content: flex-end;
+  padding: 0 12px 4px;
+}
+
+.price-wrap .row-error,
+.price-list-error {
+  padding: 2px 12px 6px;
+  color: var(--danger);
+  font-size: 12px;
+  line-height: 16px;
+  white-space: normal;
+}
+
+.price-list-note {
+  padding-top: 6px;
+}
+

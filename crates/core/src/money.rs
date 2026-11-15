@@ -11,14 +11,17 @@ use std::path::PathBuf;
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::api::{Api, ApiError, Fetched};
 use crate::atomic::{self, Access};
 use crate::burn::rates::{timelines, Timeline};
 use crate::history::{
     same_reset, AccountRef, Event, EventKind, HistoryDir, HistoryError, Hosted, Hosts, Range,
     Sample, TokenRecord, WindowRecord,
 };
+use crate::locks::{self, LockError};
 use crate::paths::AppPaths;
 use crate::store::{Account, Settings};
+use crate::switcher::APP_LOCK_TIMEOUT;
 
 /// The models.dev providers seatswap reads prices from (spec §1.4.1).
 const PRICE_PROVIDERS: [&str; 3] = ["anthropic", "openai", "ollama-cloud"];
@@ -46,6 +49,12 @@ pub enum MoneyError {
     UnsupportedVersion { path: PathBuf, version: u32 },
     #[error("models.dev's answer is not the expected model list: {0}")]
     ModelsDev(String),
+    #[error("the look-up failed: {0}")]
+    Api(#[from] ApiError),
+    #[error("cannot take the app lock: {0}")]
+    Lock(#[from] LockError),
+    #[error("{currency}'s dollar rate {rate} is not a number above 0")]
+    BadRate { currency: String, rate: f64 },
     #[error(transparent)]
     History(#[from] HistoryError),
 }
@@ -90,6 +99,16 @@ pub struct PriceChange {
     pub added: Vec<String>,
     pub changed: Vec<String>,
     pub removed: Vec<String>,
+}
+
+/// The price of one key in effect now: its own price, else its last looked-up
+/// point (spec §1.4). `since` is when that point started; an own price has none.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CurrentPrice {
+    pub key: String,
+    pub price: ModelPrice,
+    pub own: bool,
+    pub since: Option<DateTime<Utc>>,
 }
 
 /// `prices.json`: the looked-up prices with their dates, the last look-up's
@@ -175,6 +194,35 @@ impl Prices {
         }
     }
 
+    /// The current price of every key: its own price when it has one, else its
+    /// last looked-up point, sorted by key. The one place the CLI table, the
+    /// price list and the count get "the price of every model" from.
+    pub fn current(&self) -> Vec<CurrentPrice> {
+        let mut keys: BTreeSet<&String> = self.models.keys().collect();
+        keys.extend(self.overrides.keys());
+        keys.into_iter()
+            .filter_map(|key| {
+                if let Some(price) = self.overrides.get(key) {
+                    return Some(CurrentPrice {
+                        key: key.clone(),
+                        price: price.clone(),
+                        own: true,
+                        since: None,
+                    });
+                }
+                self.models
+                    .get(key)
+                    .and_then(|points| points.last())
+                    .map(|point| CurrentPrice {
+                        key: key.clone(),
+                        price: point.price.clone(),
+                        own: false,
+                        since: Some(point.from),
+                    })
+            })
+            .collect()
+    }
+
     /// Take a new list: add a point for every model that is new or whose price
     /// differs from its last point. A model missing from the list keeps its
     /// points and is reported as removed only the first time it is missing. A
@@ -196,10 +244,13 @@ impl Prices {
                         .map(|point| point.price != *price)
                         .unwrap_or(true);
                     if differs {
-                        points.push(PricePoint {
-                            from: at,
-                            price: price.clone(),
-                        });
+                        insert_point(
+                            points,
+                            PricePoint {
+                                from: at,
+                                price: price.clone(),
+                            },
+                        );
                         changed.push(key.clone());
                     }
                 }
@@ -232,6 +283,16 @@ impl Prices {
         };
         self.last_change = Some(change.clone());
         Some(change)
+    }
+}
+
+/// Insert a point keeping `points` sorted by `from`; a point at the same time
+/// replaces the one there. A look-up whose clock moved back then still leaves
+/// the list [`Prices::at`] searches in order.
+fn insert_point(points: &mut Vec<PricePoint>, point: PricePoint) {
+    match points.binary_search_by(|existing| existing.from.cmp(&point.from)) {
+        Ok(index) => points[index] = point,
+        Err(index) => points.insert(index, point),
     }
 }
 
@@ -422,7 +483,8 @@ pub fn price_key(provider: &str, model_id: &str) -> String {
 }
 
 /// The dollar rate used at a date (spec §1.4).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Rate {
     /// Units of the settings' currency per 1 USD.
     pub value: f64,
@@ -459,6 +521,73 @@ pub fn usd_rate(settings: &Settings, fx: &Fx, date: NaiveDate) -> Option<Rate> {
         date: Some(point.date),
         own: false,
     })
+}
+
+/// What one look-up did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Looked {
+    NotModified,
+    Taken(Option<PriceChange>),
+}
+
+/// One look-up of models.dev's list (spec §1.4.1): load `prices.json` for its
+/// ETag, ask models.dev, then take the app lock and load `prices.json` again so
+/// an own price written while the request ran is kept. Take the new list and
+/// store the new ETag and `checkedAt`. "Not modified" only moves `checkedAt`.
+/// On any error nothing is saved.
+pub fn look_up_prices(api: &Api, app: &AppPaths, now: DateTime<Utc>) -> Result<Looked, MoneyError> {
+    let etag = Prices::load(app)?.etag;
+    let fetched = api.models_dev(etag.as_deref())?;
+    let _lock = locks::acquire_app_lock(app, APP_LOCK_TIMEOUT)?;
+    let mut prices = Prices::load(app)?;
+    match fetched {
+        Fetched::NotModified => {
+            prices.checked_at = Some(now);
+            prices.save(app)?;
+            Ok(Looked::NotModified)
+        }
+        Fetched::New { etag, body } => {
+            let list = prices_from_models_dev(&body)?;
+            let change = prices.take(list, now);
+            prices.etag = etag;
+            prices.checked_at = Some(now);
+            prices.save(app)?;
+            Ok(Looked::Taken(change))
+        }
+    }
+}
+
+/// One look-up of the dollar rate for `currency`. "USD" has no rate to look up
+/// and sends no request. A rate of an earlier currency in `fx.json` is replaced
+/// by a new [`Fx`] for `currency`; a rate that is not finite or not above 0 is an
+/// error, and nothing is saved. The file is read and written under the app lock.
+pub fn look_up_rate(
+    api: &Api,
+    app: &AppPaths,
+    currency: &str,
+) -> Result<Option<FxPoint>, MoneyError> {
+    if currency == "USD" {
+        return Ok(None);
+    }
+    let (date, rate) = api.usd_rate(currency)?;
+    if !(rate.is_finite() && rate > 0.0) {
+        return Err(MoneyError::BadRate {
+            currency: currency.to_string(),
+            rate,
+        });
+    }
+    let _lock = locks::acquire_app_lock(app, APP_LOCK_TIMEOUT)?;
+    let mut fx = Fx::load(app)?;
+    if fx.currency != currency {
+        fx = Fx {
+            version: MONEY_VERSION,
+            currency: currency.to_string(),
+            points: Vec::new(),
+        };
+    }
+    fx.take(date, rate);
+    fx.save(app)?;
+    Ok(Some(FxPoint { date, rate }))
 }
 
 /// What one token record costs at API prices, in USD. `None` when the record's
@@ -1010,6 +1139,69 @@ mod tests {
             20.0,
             "before the first point, the first point"
         );
+    }
+
+    #[test]
+    fn a_point_taken_with_an_earlier_time_keeps_the_order() {
+        let later = utc("2026-11-03T00:00:00Z");
+        let earlier = utc("2026-11-02T00:00:00Z");
+        let key = "anthropic/claude-opus-5-5";
+        let mut prices = Prices::default();
+        let mut list = model_list();
+        prices.take(list.clone(), later);
+
+        list.get_mut(key).expect("opus").input = 10.0;
+        prices.take(list, earlier);
+
+        let points = &prices.models[key];
+        assert_eq!(
+            points.iter().map(|point| point.from).collect::<Vec<_>>(),
+            vec![earlier, later],
+            "a point taken with an earlier time is inserted in time order"
+        );
+        assert_eq!(prices.at(key, earlier).expect("opus").input, 10.0);
+        assert_eq!(
+            prices.at(key, later).expect("opus").input,
+            4.0,
+            "the later point still wins at its time"
+        );
+    }
+
+    #[test]
+    fn current_lists_own_prices_first_and_looked_up_ones() {
+        let at = utc("2026-11-02T00:00:00Z");
+        let mut prices = priced_prices(at);
+        let own = "anthropic/claude-haiku-5-5";
+        prices.overrides.insert(
+            own.to_string(),
+            ModelPrice {
+                input: 7.0,
+                output: 8.0,
+                cache_write: 9.0,
+                cache_read: 10.0,
+                tiered: false,
+            },
+        );
+
+        let current = prices.current();
+        let keys: Vec<&str> = current.iter().map(|row| row.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "anthropic/claude-haiku-5-5",
+                "anthropic/claude-opus-5-5",
+                "ollama-cloud/deepseek-v4.1-flash"
+            ],
+            "sorted by key"
+        );
+        let own_row = &current[0];
+        assert!(own_row.own);
+        assert_eq!(own_row.price.input, 7.0);
+        assert_eq!(own_row.since, None, "an own price has no looked-up time");
+        let looked_up = &current[1];
+        assert!(!looked_up.own);
+        assert_eq!(looked_up.price.input, 4.0);
+        assert_eq!(looked_up.since, Some(at));
     }
 
     #[test]
@@ -1581,5 +1773,307 @@ mod tests {
         let with_rate = value_of(&settings_eur());
         assert_eq!(with_rate.api, Some(4.0));
         assert!(!with_rate.missing_rate);
+    }
+
+    // -----------------------------------------------------------------------
+    // a local HTTP server for the two look-ups (never the internet)
+
+    #[derive(Debug)]
+    struct Captured {
+        path: String,
+        headers: Vec<(String, String)>,
+    }
+
+    impl Captured {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(field, _)| field.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str())
+        }
+    }
+
+    struct Reply {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: String,
+    }
+
+    impl Reply {
+        fn ok(body: impl Into<String>) -> Reply {
+            Reply {
+                status: 200,
+                headers: Vec::new(),
+                body: body.into(),
+            }
+        }
+
+        fn status(status: u16) -> Reply {
+            Reply {
+                status,
+                headers: Vec::new(),
+                body: String::new(),
+            }
+        }
+
+        fn header(mut self, name: &str, value: &str) -> Reply {
+            self.headers.push((name.to_string(), value.to_string()));
+            self
+        }
+    }
+
+    fn start_server(
+        reply: Reply,
+    ) -> (
+        String,
+        std::sync::mpsc::Receiver<Captured>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::sync::mpsc;
+        use std::thread;
+
+        use tiny_http::{Header, Response, Server, StatusCode};
+
+        let server = Server::http("127.0.0.1:0").expect("a local server");
+        let address = server.server_addr().to_ip().expect("a local address");
+        let base = format!("http://{address}");
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut request = server.recv().expect("one request");
+            let mut body = String::new();
+            request
+                .as_reader()
+                .read_to_string(&mut body)
+                .expect("a body");
+            let captured = Captured {
+                path: request.url().to_string(),
+                headers: request
+                    .headers()
+                    .iter()
+                    .map(|header| {
+                        (
+                            header.field.as_str().as_str().to_string(),
+                            header.value.as_str().to_string(),
+                        )
+                    })
+                    .collect(),
+            };
+            let mut response =
+                Response::from_string(reply.body).with_status_code(StatusCode(reply.status));
+            for (name, value) in reply.headers {
+                response = response
+                    .with_header(Header::from_bytes(name.as_bytes(), value.as_bytes()).unwrap());
+            }
+            request.respond(response).expect("a reply");
+            sender.send(captured).expect("the capture");
+        });
+        (base, receiver, handle)
+    }
+
+    fn lookup_api(base: &str) -> Api {
+        Api::with_urls(
+            &format!("{base}/api/oauth/usage"),
+            &format!("{base}/v1/oauth/token"),
+        )
+        .with_lookup_urls(&format!("{base}/api.json"), &format!("{base}/v1/latest"))
+    }
+
+    fn captured(
+        receiver: &std::sync::mpsc::Receiver<Captured>,
+        handle: std::thread::JoinHandle<()>,
+    ) -> Captured {
+        let request = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the fake server received no request");
+        handle.join().expect("the server thread");
+        request
+    }
+
+    #[test]
+    fn look_up_prices_stores_the_etag_and_the_points() {
+        let dir = tempdir().expect("tempdir");
+        let app = AppPaths::at(&dir.path().join("data"));
+        let now = utc("2026-11-14T09:00:00Z");
+        let (base, receiver, handle) =
+            start_server(Reply::ok(MODELS_DEV).header("ETag", "W/\"new\""));
+
+        let looked = look_up_prices(&lookup_api(&base), &app, now).expect("the look-up");
+        assert!(matches!(looked, Looked::Taken(Some(_))));
+        let request = captured(&receiver, handle);
+        assert_eq!(request.path, "/api.json");
+        assert_eq!(request.header("If-None-Match"), None);
+
+        let stored = Prices::load(&app).expect("prices.json");
+        assert_eq!(stored.etag.as_deref(), Some("W/\"new\""));
+        assert_eq!(stored.checked_at, Some(now));
+        assert_eq!(stored.models.len(), 3);
+        assert_eq!(stored.models["anthropic/claude-opus-5-5"].len(), 1);
+    }
+
+    #[test]
+    fn look_up_prices_saves_nothing_on_a_failure() {
+        let dir = tempdir().expect("tempdir");
+        let app = AppPaths::at(&dir.path().join("data"));
+        let stored_at = utc("2026-11-13T09:00:00Z");
+        let mut prices = priced_prices(stored_at);
+        prices.checked_at = Some(stored_at);
+        prices.etag = Some("W/\"old\"".to_string());
+        prices.save(&app).expect("the stored prices");
+
+        let (base, receiver, handle) = start_server(Reply::status(500));
+        let error = look_up_prices(&lookup_api(&base), &app, utc("2026-11-14T09:00:00Z"))
+            .expect_err("a failed look-up");
+        assert!(matches!(error, MoneyError::Api(_)), "got {error:?}");
+        let request = captured(&receiver, handle);
+        assert_eq!(request.header("If-None-Match"), Some("W/\"old\""));
+
+        let after = Prices::load(&app).expect("prices.json");
+        assert_eq!(after.checked_at, Some(stored_at), "checkedAt stays");
+        assert_eq!(after.etag.as_deref(), Some("W/\"old\""));
+        assert_eq!(after.models, prices.models, "the stored prices stay");
+    }
+
+    #[test]
+    fn look_up_rate_with_usd_sends_nothing() {
+        let dir = tempdir().expect("tempdir");
+        let app = AppPaths::at(&dir.path().join("data"));
+        // A port with nothing listening: a request would be a network error.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+        let address = listener.local_addr().expect("the address");
+        drop(listener);
+        let api = lookup_api(&format!("http://{address}"));
+
+        assert!(look_up_rate(&api, &app, "USD")
+            .expect("USD needs no request")
+            .is_none());
+        assert!(!app.fx_file().exists(), "USD writes no fx.json");
+    }
+
+    #[test]
+    fn look_up_rate_replaces_an_fx_of_another_currency() {
+        let dir = tempdir().expect("tempdir");
+        let app = AppPaths::at(&dir.path().join("data"));
+        let old_rate = 0.8;
+        let mut fx = Fx {
+            currency: "GBP".to_string(),
+            ..Fx::default()
+        };
+        fx.take(date("2026-11-10"), old_rate);
+        fx.save(&app).expect("the old fx.json");
+
+        let body = r#"{"base":"USD","date":"2026-11-13","rates":{"EUR":0.90481}}"#;
+        let (base, receiver, handle) = start_server(Reply::ok(body));
+        let point = look_up_rate(&lookup_api(&base), &app, "EUR")
+            .expect("the rate")
+            .expect("a point");
+        assert_eq!(point.date, date("2026-11-13"));
+        assert_eq!(point.rate, 0.90481);
+        let request = captured(&receiver, handle);
+        assert_eq!(request.path, "/v1/latest?base=USD&symbols=EUR");
+
+        let stored = Fx::load(&app).expect("fx.json");
+        assert_eq!(stored.currency, "EUR");
+        assert_eq!(
+            stored.points,
+            vec![FxPoint {
+                date: date("2026-11-13"),
+                rate: 0.90481,
+            }],
+            "the GBP point is gone"
+        );
+    }
+
+    #[test]
+    fn look_up_rate_refuses_a_rate_that_is_not_above_zero() {
+        let dir = tempdir().expect("tempdir");
+        let app = AppPaths::at(&dir.path().join("data"));
+        let body = r#"{"base":"USD","date":"2026-11-13","rates":{"EUR":0}}"#;
+        let (base, receiver, handle) = start_server(Reply::ok(body));
+        let error = look_up_rate(&lookup_api(&base), &app, "EUR").expect_err("a bad rate");
+        assert!(
+            error.to_string().contains("EUR") && error.to_string().contains('0'),
+            "the error names the rate, got {error}"
+        );
+        let _ = captured(&receiver, handle);
+        assert!(!app.fx_file().exists(), "a bad rate is not saved");
+    }
+
+    /// A look-up and the window's own price must not overwrite each other: the
+    /// look-up loads `prices.json`, waits for the server and saves the file it
+    /// loaded. An own price written in between is lost.
+    #[test]
+    fn proof_a_refresh_does_not_lose_an_own_price_written_while_it_runs() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        use tiny_http::{Response, Server, StatusCode};
+
+        let dir = tempdir().expect("tempdir");
+        let app = AppPaths::at(&dir.path().join("data"));
+        let prices = priced_prices(utc("2026-11-13T09:00:00Z"));
+        prices.save(&app).expect("the stored prices");
+
+        // A server that answers only when the test says so.
+        let server = Server::http("127.0.0.1:0").expect("a local server");
+        let address = server.server_addr().to_ip().expect("a local address");
+        let base = format!("http://{address}");
+        let (arrived_tx, arrived_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel();
+        let server_thread = thread::spawn(move || {
+            let mut request = server.recv().expect("one request");
+            let mut body = String::new();
+            let _ = request.as_reader().read_to_string(&mut body);
+            let _ = arrived_tx.send(());
+            let _ = go_rx.recv();
+            let _ = request
+                .respond(Response::from_string(MODELS_DEV).with_status_code(StatusCode(200)));
+        });
+
+        // The look-up runs in its own thread: it has read `prices.json` already.
+        let (done_tx, done_rx) = mpsc::channel();
+        let app_for_thread = app.clone();
+        let base_for_thread = base.clone();
+        let worker = thread::spawn(move || {
+            let result = look_up_prices(
+                &lookup_api(&base_for_thread),
+                &app_for_thread,
+                utc("2026-11-14T09:00:00Z"),
+            );
+            let _ = done_tx.send(result.is_ok());
+        });
+
+        arrived_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the fake server received no request");
+        // The window's thread writes an own price while the look-up waits.
+        let mut during = Prices::load(&app).expect("prices.json");
+        during.overrides.insert(
+            "anthropic/claude-opus-5-5".to_string(),
+            ModelPrice {
+                input: 99.0,
+                output: 99.0,
+                cache_write: 0.0,
+                cache_read: 0.0,
+                tiered: false,
+            },
+        );
+        during.save(&app).expect("the own price");
+        let _ = go_tx.send(());
+        assert!(
+            done_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the look-up did not finish"),
+            "the look-up failed"
+        );
+        let _ = worker.join();
+        let _ = server_thread.join();
+
+        let after = Prices::load(&app).expect("prices.json");
+        assert!(
+            after.overrides.contains_key("anthropic/claude-opus-5-5"),
+            "the look-up overwrote the own price: {:?}",
+            after.overrides
+        );
     }
 }

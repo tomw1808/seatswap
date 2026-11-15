@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Local, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Local, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use tauri::webview::PageLoadEvent;
 use tauri::{
@@ -19,10 +19,12 @@ use tauri::{
 
 use seatswap_core::engine::PollReason;
 use seatswap_core::history::{By, Event, EventKind, HistoryDir, Hosts, Range};
+use seatswap_core::money::ModelPrice;
 use seatswap_core::store::{self, Settings};
 use seatswap_core::switcher::UnsavedPolicy;
 
 use super::format;
+use super::lookup_rt::{price_rows, MoneyView, PriceRow};
 use super::worker::{ActionCommand, ActionReply, EngineCommand, Snapshot};
 use super::GuiState;
 use crate::agent_skill::{self, SkillStatus};
@@ -692,6 +694,47 @@ pub(crate) async fn set_auto_burn(state: State<'_, GuiState>, on: bool) -> Resul
     }
 }
 
+/// The money facts the General group reads. The look-up thread owns them; this
+/// only clones its view.
+#[tauri::command]
+pub(crate) async fn money_view(state: State<'_, GuiState>) -> Result<MoneyView, String> {
+    state.lookup.view()
+}
+
+/// Every model with an effective price, for the price list under API prices.
+#[tauri::command]
+pub(crate) async fn price_list(state: State<'_, GuiState>) -> Result<Vec<PriceRow>, String> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        price_rows(&app).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Set one model's own price, or remove it with `None` ("back to the
+/// looked-up price"). The look-up thread is the only writer of `prices.json`.
+#[tauri::command]
+pub(crate) async fn set_price_override(
+    state: State<'_, GuiState>,
+    key: String,
+    price: Option<ModelPrice>,
+) -> Result<(), String> {
+    let lookup = state.lookup.clone();
+    tauri::async_runtime::spawn_blocking(move || lookup.set_override(key, price))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+/// One look-up now, after a setting in the Money section changed.
+#[tauri::command]
+pub(crate) async fn lookup_now(state: State<'_, GuiState>) -> Result<MoneyView, String> {
+    let lookup = state.lookup.clone();
+    tauri::async_runtime::spawn_blocking(move || lookup.now())
+        .await
+        .map_err(|error| error.to_string())?
+}
+
 /// Pause auto-burn for `hours`, or resume with `None`. The action thread writes
 /// the history event and wakes the engine.
 #[tauri::command]
@@ -837,13 +880,17 @@ pub(crate) fn icon_preview(abbr: String, color: String) -> Result<Vec<IconPx>, S
 
 /// How the panel writes a time: `countdown` to a reset as in the cards
 /// (`format_reset_at`), `clock` as in the switch suggestion
-/// (`format_reset_clock`), `age` of a poll or a usage fetch (`format_age`).
+/// (`format_reset_clock`), `age` of a poll or a usage fetch (`format_age`),
+/// `day` for a looked-up value's time in local time, and `date` for a calendar
+/// date without a time zone conversion (`13 Nov`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum TimeStyle {
     Countdown,
     Clock,
     Age,
+    Day,
+    Date,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -869,6 +916,16 @@ where
             TimeStyle::Countdown => format::format_reset_at(time.at, now, tz),
             TimeStyle::Clock => format::format_reset_clock(time.at, now, tz),
             TimeStyle::Age => format::format_age(time.at, now),
+            TimeStyle::Day => {
+                let local = time.at.with_timezone(tz);
+                format!("{} {}", local.day(), local.format("%b"))
+            }
+            TimeStyle::Date => {
+                // A calendar date: the day as written, never moved by the
+                // time zone of the machine.
+                let date = time.at.date_naive();
+                format!("{} {}", date.day(), date.format("%b"))
+            }
         })
         .collect()
 }
@@ -1274,6 +1331,22 @@ mod tests {
                 "5 min ago"
             ]
         );
+    }
+
+    /// The rate's date is a calendar date: `13 Nov` also west of UTC, where a
+    /// local-time rendering of 00:00Z would say the 12th.
+    #[test]
+    fn a_calendar_date_is_not_moved_by_the_time_zone() {
+        let times: Vec<TimeRequest> = serde_json::from_value(serde_json::json!([
+            { "at": "2026-11-13T00:00:00Z", "style": "date" },
+            { "at": "2026-11-13T00:00:00Z", "style": "day" },
+        ]))
+        .expect("the panel's request");
+        let now = DateTime::parse_from_rfc3339("2026-11-13T12:00:00Z")
+            .expect("now")
+            .with_timezone(&Utc);
+        let west = chrono::FixedOffset::west_opt(5 * 3600).expect("a time zone");
+        assert_eq!(time_texts_at(&times, now, &west), vec!["13 Nov", "12 Nov"]);
     }
 
     #[test]

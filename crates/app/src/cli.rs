@@ -20,6 +20,7 @@ use seatswap_core::burn::replay::replay;
 use seatswap_core::burn::wu_hours;
 use seatswap_core::engine::{AccountView, Engine, PollReason, UsageCache};
 use seatswap_core::history::{AccountRef, By, EventKind, HistoryDir, Range, Recorder};
+use seatswap_core::money::{self, Prices};
 use seatswap_core::paths::{self, AppPaths, ClaudePaths, PathsError};
 use seatswap_core::store::{self, Account, AccountsFile, LoginState, Settings, Store, StoreError};
 use seatswap_core::switcher::{self, LiveState, SwitchError, UnsavedPolicy};
@@ -222,6 +223,13 @@ pub(crate) enum Command {
         i3blocks: bool,
 
         /// Poll the usage before printing.
+        #[arg(long)]
+        refresh: bool,
+    },
+
+    /// Print the stored API prices per model, in USD per million tokens.
+    Prices {
+        /// Look the list up at models.dev before printing.
         #[arg(long)]
         refresh: bool,
     },
@@ -537,6 +545,7 @@ fn run_command(
         } => edit(context, &key, label, abbr, color),
         Command::Burn { action } => burn(context, action),
         Command::AgentSkill { action } => agent_skill(&context, action),
+        Command::Prices { refresh } => prices(context, refresh),
         // Handled before the store was opened; kept for exhaustiveness.
         Command::Panel { .. } | Command::Window { .. } | Command::Statusline => Ok(()),
         Command::Status {
@@ -637,6 +646,16 @@ pub(crate) fn gate(command: &Command, caller: Caller, settings: &Settings) -> Ga
         // Claude Code calls it every two seconds as an agent, for a line and
         // nothing else: no setting and no caller can refuse it.
         Command::Statusline => Gate::Allowed,
+        // `prices` reads like `status`; refreshing writes prices.json.
+        Command::Prices { refresh } => {
+            if *refresh {
+                Gate::Refused(AGENTS_MAY_NOT_CHANGE)
+            } else if settings.agents_read {
+                Gate::Allowed
+            } else {
+                Gate::Refused(AGENTS_MAY_NOT_READ)
+            }
+        }
         Command::List { .. } | Command::Status { .. } | Command::Burn { .. } => {
             if settings.agents_read {
                 Gate::Allowed
@@ -729,6 +748,7 @@ fn command_text(command: &Command) -> String {
             format!("window {}", target.as_deref().unwrap_or("sessions"))
         }
         Command::Statusline => "statusline".to_string(),
+        Command::Prices { refresh } => flags("prices", &[("--refresh", *refresh)]),
         Command::Status {
             json,
             waybar,
@@ -1192,6 +1212,76 @@ fn status(
         }
     }
     Ok(())
+}
+
+/// `seatswap prices`: the stored list as a table, or a fresh look-up first.
+fn prices(context: Context, refresh: bool) -> Result<(), CliError> {
+    let app = context.store.app_paths().clone();
+    if refresh {
+        if !context.settings.look_up_prices {
+            return Err(CliError::Message(
+                "look-ups are off (lookUpPrices); turn them on in the settings to refresh"
+                    .to_string(),
+            ));
+        }
+        money::look_up_prices(&Api::new(), &app, Utc::now()).map_err(|error| {
+            CliError::Message(format!("cannot refresh the API prices: {error}"))
+        })?;
+    }
+    let stored = Prices::load(&app)
+        .map_err(|error| CliError::Message(format!("cannot read prices.json: {error}")))?;
+    let current = stored.current();
+    if current.is_empty() {
+        println!("no prices yet: run `seatswap prices --refresh` while online.");
+        return Ok(());
+    }
+
+    let labelled: Vec<(String, money::ModelPrice)> = current
+        .into_iter()
+        .map(|row| {
+            let label = if row.price.tiered {
+                format!("{} *", row.key)
+            } else {
+                row.key
+            };
+            (label, row.price)
+        })
+        .collect();
+    let key_width = labelled
+        .iter()
+        .map(|(key, _)| key.chars().count())
+        .max()
+        .unwrap_or(3)
+        .max("key".len());
+
+    println!("USD per million tokens");
+    println!(
+        "{:<key_width$}  {:>8}  {:>8}  {:>11}  {:>10}",
+        "key", "input", "output", "cache write", "cache read"
+    );
+    for (key, price) in &labelled {
+        println!(
+            "{:<key_width$}  {:>8}  {:>8}  {:>11}  {:>10}",
+            key,
+            price_number(price.input),
+            price_number(price.output),
+            price_number(price.cache_write),
+            price_number(price.cache_read)
+        );
+    }
+    if labelled.iter().any(|(_, price)| price.tiered) {
+        println!();
+        println!("* the price depends on the prompt size; the base price is shown");
+    }
+    Ok(())
+}
+
+fn price_number(value: f64) -> String {
+    if value.fract() == 0.0 {
+        format!("{value:.0}")
+    } else {
+        format!("{value}")
+    }
 }
 
 /// The history folder `status` and `burn` read, without creating it.
@@ -2157,6 +2247,8 @@ pub(crate) mod tests {
                 i3blocks: false,
                 refresh: false,
             },
+            Command::Prices { refresh: false },
+            Command::Prices { refresh: true },
             Command::Statusline,
         ]
     }
@@ -2334,6 +2426,67 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn prices_follow_agents_read_and_a_refresh_is_refused() {
+        for read in [false, true] {
+            let settings = settings(read, false);
+            let expected = if read {
+                Gate::Allowed
+            } else {
+                Gate::Refused(AGENTS_MAY_NOT_READ)
+            };
+            assert_eq!(
+                gate(
+                    &Command::Prices { refresh: false },
+                    Caller::Agent,
+                    &settings
+                ),
+                expected,
+                "agentsRead {read}"
+            );
+        }
+        for read in [false, true] {
+            for switch in [false, true] {
+                let settings = settings(read, switch);
+                assert_eq!(
+                    gate(&Command::Prices { refresh: true }, Caller::Agent, &settings),
+                    Gate::Refused(AGENTS_MAY_NOT_CHANGE),
+                    "agentsRead {read}, agentsSwitch {switch}"
+                );
+            }
+        }
+        assert_eq!(
+            gate(
+                &Command::Prices { refresh: true },
+                Caller::Person,
+                &settings(false, false)
+            ),
+            Gate::Allowed
+        );
+    }
+
+    #[test]
+    fn a_refresh_with_look_ups_off_is_refused() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let mut file = store.load().expect("accounts");
+        file.settings.look_up_prices = false;
+        store.save(&file).expect("settings saved");
+        let settings = store.load().expect("accounts").settings;
+        let context = Context {
+            store,
+            claude: fixture.claude(),
+            settings,
+        };
+
+        let error = prices(context, true).expect_err("a refresh with look-ups off");
+        assert_eq!(
+            error.to_string(),
+            "look-ups are off (lookUpPrices); turn them on in the settings to refresh"
+        );
+        assert_eq!(error.exit_code(), 1);
     }
 
     #[test]

@@ -78,6 +78,10 @@ let fixture = null;
 export function ensureFixture() {
   if (!fixture) {
     fixture = makeFixture();
+    fixture.priceLookedUp = Object.create(null);
+    for (const row of fixture.priceList) {
+      fixture.priceLookedUp[row.key] = clone(row.price);
+    }
     console.info("[fixture] no window.__TAURI__; using the built-in snapshot");
   }
   return fixture;
@@ -347,11 +351,77 @@ function makeFixture() {
       unavailable: null,
       warning: null,
     },
+    money: {
+      currency: "EUR",
+      rate: { value: 0.9048, date: "2026-11-13", own: false },
+      lookUp: true,
+      modelsWithPrice: 4,
+      pricesCheckedAt: isoIn(-2 * 3600000),
+      lastChange: {
+        at: isoIn(-6 * 86400000),
+        added: ["openai/gpt-6"],
+        changed: ["anthropic/claude-haiku-5-5"],
+        removed: [],
+      },
+      lastError: null,
+    },
+    priceList: [
+      {
+        key: "anthropic/claude-opus-5-5",
+        price: { input: 4, output: 20, cacheWrite: 5, cacheRead: 0.2, tiered: false },
+        own: false,
+        tiered: false,
+        since: isoIn(-30 * 86400000),
+      },
+      {
+        key: "anthropic/claude-haiku-5-5",
+        price: { input: 0.1, output: 0.5, cacheWrite: 0.125, cacheRead: 0.01, tiered: true },
+        own: false,
+        tiered: true,
+        since: isoIn(-30 * 86400000),
+      },
+      {
+        key: "openai/gpt-6",
+        price: { input: 2, output: 10, cacheWrite: 2.5, cacheRead: 0.2, tiered: false },
+        own: false,
+        tiered: false,
+        since: isoIn(-12 * 86400000),
+      },
+      {
+        key: "ollama-cloud/deepseek-v4.1-flash",
+        price: { input: 0.3, output: 1.2, cacheWrite: 0, cacheRead: 0, tiered: false },
+        own: false,
+        tiered: false,
+        since: isoIn(-5 * 86400000),
+      },
+    ],
     settings: Object.assign({}, DEFAULT_SETTINGS, {
       autoBurn: true,
       suggestSwitches: true,
     }),
   };
+}
+
+// The money view with the fixture's current settings, as the Rust thread would
+// compute it from the stored files.
+function fixtureMoneyView(fixture) {
+  const view = Object.assign({}, clone(fixture.money));
+  const currency =
+    typeof fixture.settings.currency === "string" ? fixture.settings.currency : null;
+  view.currency = currency;
+  view.lookUp = Boolean(fixture.settings.lookUpPrices);
+  view.modelsWithPrice = Array.isArray(fixture.priceList) ? fixture.priceList.length : 0;
+  if (!currency) {
+    view.rate = null;
+  } else if (currency === "USD") {
+    view.rate = { value: 1, date: null, own: false };
+  } else if (typeof fixture.settings.usdRate === "number") {
+    view.rate = { value: fixture.settings.usdRate, date: null, own: true };
+  } else if (currency !== "EUR") {
+    // The fixture's stored looked-up rate is in EUR.
+    view.rate = null;
+  }
+  return view;
 }
 
 function fixtureUniqueAbbr(fixture, label) {
@@ -757,6 +827,49 @@ export async function fixtureInvoke(command, args) {
       );
     }
 
+    case "money_view":
+      return fixtureMoneyView(fixture);
+
+    case "price_list":
+      return clone(fixture.priceList);
+
+    case "set_price_override": {
+      const key = String(args.key || "");
+      const row = fixture.priceList.find((entry) => entry.key === key);
+      if (!row) throw new Error(`unknown model ${key}`);
+      if (args.price === null || args.price === undefined) {
+        const original = fixture.priceLookedUp && fixture.priceLookedUp[key];
+        if (!original) throw new Error(`no looked-up price for ${key}`);
+        row.price = clone(original);
+        row.own = false;
+        row.tiered = Boolean(original.tiered);
+      } else {
+        const source = args.price;
+        const price = {
+          input: Number(source.input),
+          output: Number(source.output),
+          cacheWrite: Number(source.cacheWrite),
+          cacheRead: Number(source.cacheRead),
+          tiered: Boolean(source.tiered),
+        };
+        for (const [name, value] of Object.entries(price)) {
+          if (name === "tiered") continue;
+          if (!Number.isFinite(value) || value < 0) {
+            throw new Error(`the ${name} price must be a number of 0 or more`);
+          }
+        }
+        row.price = price;
+        row.own = true;
+        row.tiered = price.tiered;
+      }
+      fixture.money.modelsWithPrice = fixture.priceList.length;
+      return null;
+    }
+
+    case "lookup_now":
+      fixture.money.pricesCheckedAt = new Date().toISOString();
+      return fixtureMoneyView(fixture);
+
     case "skill_status":
       return clone(fixture.skill);
 
@@ -793,6 +906,28 @@ export async function fixtureInvoke(command, args) {
       return (args.times || []).map((time) => {
         if (time.style === "age") return "a moment ago";
         const date = new Date(time.at);
+        if (time.style === "day" || time.style === "date") {
+          const months = [
+            "Jan",
+            "Feb",
+            "Mar",
+            "Apr",
+            "May",
+            "Jun",
+            "Jul",
+            "Aug",
+            "Sep",
+            "Oct",
+            "Nov",
+            "Dec",
+          ];
+          // `date` is a calendar date: the day as written, without moving it
+          // into the browser's time zone. `day` is a moment in local time.
+          if (time.style === "date") {
+            return `${date.getUTCDate()} ${months[date.getUTCMonth()]}`;
+          }
+          return `${date.getDate()} ${months[date.getMonth()]}`;
+        }
         return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
       });
 
