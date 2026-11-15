@@ -39,6 +39,9 @@ pub(crate) struct MoneyView {
     /// The models of the last look-up's list that were left out, each
     /// `"<key>: <reason>"`; kept until a later list names others.
     pub left_out: Vec<String>,
+    /// The rate look-up's failure, for the rate row (spec §1.4). The price
+    /// look-up's errors and the file errors stay in `last_error`.
+    pub rate_error: Option<String>,
     pub last_error: Option<String>,
 }
 
@@ -246,6 +249,7 @@ impl LookupRuntime {
     /// what is stored.
     pub(crate) fn round(&mut self, settings: &Settings, now: DateTime<Utc>) -> MoneyView {
         let mut error: Option<String> = None;
+        let mut rate_error: Option<String> = None;
         let mut left_out: Option<Vec<String>> = None;
         let today = local_day(now);
         if settings.look_up_prices {
@@ -284,7 +288,8 @@ impl LookupRuntime {
                                     self.last_rate_day = Some((today, currency.clone()));
                                 }
                                 Err(failure) => {
-                                    error = combine(error, format!("the dollar rate: {failure}"));
+                                    rate_error =
+                                        combine(rate_error, format!("the dollar rate: {failure}"));
                                 }
                             }
                         }
@@ -293,7 +298,7 @@ impl LookupRuntime {
             }
         }
         self.settings = Some(settings.clone());
-        self.build_view(settings, error, today, left_out)
+        self.build_view(settings, error, rate_error, today, left_out)
     }
 
     /// accounts.json could not be read: remember that and send no request.
@@ -305,6 +310,7 @@ impl LookupRuntime {
     }
 
     fn set_override(&mut self, key: String, price: Option<ModelPrice>) -> Result<(), String> {
+        money::parse_price_key(&key)?;
         if let Some(price) = &price {
             price.validate()?;
         }
@@ -323,7 +329,7 @@ impl LookupRuntime {
         }
         prices.save(&self.app).map_err(|error| error.to_string())?;
         if let Some(settings) = self.settings.clone() {
-            self.build_view(&settings, None, local_day(Utc::now()), None);
+            self.build_view(&settings, None, None, local_day(Utc::now()), None);
         }
         Ok(())
     }
@@ -332,6 +338,7 @@ impl LookupRuntime {
         &mut self,
         settings: &Settings,
         error: Option<String>,
+        rate_error: Option<String>,
         today: NaiveDate,
         left_out: Option<Vec<String>>,
     ) -> MoneyView {
@@ -362,6 +369,7 @@ impl LookupRuntime {
             prices_checked_at: prices.checked_at,
             last_change: prices.last_change,
             left_out,
+            rate_error,
             last_error: error,
         };
         self.store(view)
@@ -406,6 +414,7 @@ fn stored_view(app: &AppPaths) -> MoneyView {
         prices_checked_at: prices.checked_at,
         last_change: prices.last_change,
         left_out: Vec::new(),
+        rate_error: None,
         last_error: error,
     }
 }
@@ -743,6 +752,41 @@ mod tests {
     }
 
     #[test]
+    fn an_own_price_needs_a_known_provider() {
+        let dir = tempdir().expect("tempdir");
+        let app = AppPaths::at(&dir.path().join("data"));
+        let mut runtime = runtime(app.clone(), lookup_api("http://127.0.0.1:1"));
+
+        for key in [
+            "claude-opus-5-5",
+            "acme/claude-opus-5-5",
+            "anthropic/",
+            "/claude-opus-5-5",
+        ] {
+            let error = runtime
+                .set_override(key.to_string(), Some(model_price(1.0)))
+                .expect_err("a key without a known provider and a model id is refused");
+            assert!(
+                error.contains("anthropic"),
+                "the refusal names the providers of models.dev, got {error}"
+            );
+        }
+
+        runtime
+            .set_override(
+                "anthropic/claude-opus-5-5".to_string(),
+                Some(model_price(1.0)),
+            )
+            .expect("a known provider and a model id are accepted");
+        let rows = price_rows(&app).expect("the rows");
+        assert!(
+            rows.iter()
+                .any(|row| row.key == "anthropic/claude-opus-5-5" && row.own),
+            "an own price for a model no look-up listed is a row"
+        );
+    }
+
+    #[test]
     fn the_view_serialises_the_fields_the_window_reads() {
         let view = MoneyView {
             currency: Some("EUR".to_string()),
@@ -761,6 +805,7 @@ mod tests {
                 removed: Vec::new(),
             }),
             left_out: vec!["anthropic/claude-x: the input cost is not a number".to_string()],
+            rate_error: Some("the dollar rate: the look-up failed".to_string()),
             last_error: None,
         };
         let json = serde_json::to_value(view).expect("the event's JSON");
@@ -771,6 +816,10 @@ mod tests {
         assert_eq!(
             json["leftOut"],
             json!(["anthropic/claude-x: the input cost is not a number"])
+        );
+        assert_eq!(
+            json["rateError"],
+            json!("the dollar rate: the look-up failed")
         );
     }
 
@@ -786,21 +835,22 @@ mod tests {
         let today = NaiveDate::from_ymd_opt(2026, 11, 14).expect("a test date");
         let names = vec!["anthropic/claude-x: the input price is negative".to_string()];
 
-        let taken = runtime.build_view(&settings, None, today, Some(names.clone()));
+        let taken = runtime.build_view(&settings, None, None, today, Some(names.clone()));
         assert_eq!(taken.left_out, names);
 
-        let not_modified = runtime.build_view(&settings, None, today, None);
+        let not_modified = runtime.build_view(&settings, None, None, today, None);
         assert_eq!(not_modified.left_out, names, "NotModified keeps the names");
 
         let error = runtime.build_view(
             &settings,
             Some("API prices: models.dev's answer failed".to_string()),
+            Some("the dollar rate: the look-up failed".to_string()),
             today,
             None,
         );
         assert_eq!(error.left_out, names, "an error keeps the names");
 
-        let cleared = runtime.build_view(&settings, None, today, Some(Vec::new()));
+        let cleared = runtime.build_view(&settings, None, None, today, Some(Vec::new()));
         assert!(
             cleared.left_out.is_empty(),
             "a later list without left-out models clears them"
@@ -888,7 +938,11 @@ mod tests {
         };
 
         let first = runtime.round(&settings, utc("2026-11-14T12:00:00Z"));
-        assert!(first.last_error.is_some(), "the failed rate is remembered");
+        assert!(
+            first.rate_error.is_some(),
+            "the failed rate is remembered at the rate"
+        );
+        assert_eq!(first.last_error, None, "the price look-up did not fail");
         // An hour later, the same local day.
         runtime.round(&settings, utc("2026-11-14T13:00:00Z"));
 

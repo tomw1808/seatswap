@@ -404,6 +404,7 @@ mod tests {
             login_ends_at_ms: None,
             auto_burn,
             price: None,
+            price_currency: None,
         }
     }
 

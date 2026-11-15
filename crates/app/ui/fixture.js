@@ -163,6 +163,7 @@ function makeFixture() {
         orgName: "sam",
         plan: "Ultra",
         price: 180.0,
+        priceCurrency: "USD",
         autoBurn: true,
         isActive: false,
         loginState: "ok",
@@ -210,6 +211,7 @@ function makeFixture() {
         orgName: "sam",
         plan: "Max",
         price: null,
+        priceCurrency: null,
         autoBurn: true,
         isActive: false,
         loginState: "ok",
@@ -248,6 +250,7 @@ function makeFixture() {
         orgName: "acme",
         plan: "Team 5x",
         price: 320.0,
+        priceCurrency: "EUR",
         autoBurn: true,
         isActive: true,
         loginState: "ok",
@@ -366,6 +369,8 @@ function makeFixture() {
         changed: ["anthropic/claude-haiku-5-5"],
         removed: [],
       },
+      leftOut: ["anthropic/claude-x-9: the input cost is not a number"],
+      rateError: null,
       lastError: null,
     },
     priceList: [
@@ -552,12 +557,13 @@ function fixtureMoneyView(fixture) {
   view.currency = currency;
   view.lookUp = Boolean(fixture.settings.lookUpPrices);
   view.modelsWithPrice = Array.isArray(fixture.priceList) ? fixture.priceList.length : 0;
+  const own = isObject(fixture.settings.usdRate) ? fixture.settings.usdRate : null;
   if (!currency) {
     view.rate = null;
   } else if (currency === "USD") {
     view.rate = { value: 1, date: null, own: false };
-  } else if (typeof fixture.settings.usdRate === "number") {
-    view.rate = { value: fixture.settings.usdRate, date: null, own: true };
+  } else if (own && own.currency === currency) {
+    view.rate = { value: own.value, date: null, own: true };
   } else if (currency !== "EUR") {
     // The fixture's stored looked-up rate is in EUR.
     view.rate = null;
@@ -593,6 +599,7 @@ function fixtureCreateFromLive(fixture, labelValue) {
     email: fixture.live.email || null,
     plan: "Ultra",
     price: null,
+    priceCurrency: null,
     autoBurn: true,
     isActive: false,
     loginState: "ok",
@@ -744,12 +751,17 @@ function validateFixtureSettings(settings) {
       `currency must be three capital letters, got ${JSON.stringify(merged.currency)}`
     );
   }
-  if (
-    merged.usdRate !== null &&
-    merged.usdRate !== undefined &&
-    !(Number.isFinite(merged.usdRate) && merged.usdRate > 0)
-  ) {
-    throw new Error(`usdRate must be above 0, got ${merged.usdRate}`);
+  if (merged.usdRate !== null && merged.usdRate !== undefined) {
+    const rate = merged.usdRate;
+    if (
+      !isObject(rate) ||
+      !/^[A-Z]{3}$/.test(String(rate.currency)) ||
+      !(Number.isFinite(rate.value) && rate.value > 0)
+    ) {
+      throw new Error(
+        `usdRate must be {currency: three capital letters, value: above 0}, got ${JSON.stringify(rate)}`
+      );
+    }
   }
   if (typeof merged.lookUpPrices !== "boolean") {
     throw new Error(`lookUpPrices must be true or false, got ${merged.lookUpPrices}`);
@@ -1064,10 +1076,19 @@ export async function fixtureInvoke(command, args) {
         throw new Error("autoBurn must be true or false");
       }
       let price = account.price === undefined ? null : account.price;
+      let priceCurrency = account.priceCurrency || null;
       if (Object.prototype.hasOwnProperty.call(args, "price")) {
         if (args.price === null || args.price === "") {
           price = null;
+          priceCurrency = null;
         } else {
+          const code =
+            typeof fixture.settings.currency === "string"
+              ? fixture.settings.currency
+              : null;
+          if (!code) {
+            throw new Error("set a currency in Settings → General before a price");
+          }
           const amount = Number(args.price);
           if (!Number.isFinite(amount) || amount <= 0) {
             throw new Error(
@@ -1075,6 +1096,7 @@ export async function fixtureInvoke(command, args) {
             );
           }
           price = amount;
+          priceCurrency = code;
         }
       }
       account.label = label;
@@ -1082,6 +1104,7 @@ export async function fixtureInvoke(command, args) {
       account.color = color;
       account.autoBurn = autoBurn;
       account.price = price;
+      account.priceCurrency = priceCurrency;
       return clone(account);
     }
 
@@ -1161,14 +1184,26 @@ export async function fixtureInvoke(command, args) {
 
     case "set_price_override": {
       const key = String(args.key || "");
-      const row = fixture.priceList.find((entry) => entry.key === key);
-      if (!row) throw new Error(`unknown model ${key}`);
+      const PROVIDERS = ["anthropic", "openai", "ollama-cloud"];
+      const mark = key.indexOf("/");
+      const provider = mark < 0 ? "" : key.slice(0, mark);
+      const modelId = mark < 0 ? "" : key.slice(mark + 1);
+      if (!PROVIDERS.includes(provider) || modelId === "") {
+        throw new Error(
+          "a model key is provider/model with a provider from anthropic, openai, ollama-cloud and a model id, e.g. anthropic/claude-opus-5-5"
+        );
+      }
+      let row = fixture.priceList.find((entry) => entry.key === key);
       if (args.price === null || args.price === undefined) {
+        if (!row) throw new Error(`no own price for ${key}`);
         const original = fixture.priceLookedUp && fixture.priceLookedUp[key];
-        if (!original) throw new Error(`no looked-up price for ${key}`);
-        row.price = clone(original);
-        row.own = false;
-        row.tiered = Boolean(original.tiered);
+        if (!original) {
+          fixture.priceList = fixture.priceList.filter((entry) => entry.key !== key);
+        } else {
+          row.price = clone(original);
+          row.own = false;
+          row.tiered = Boolean(original.tiered);
+        }
       } else {
         const source = args.price;
         const price = {
@@ -1184,9 +1219,20 @@ export async function fixtureInvoke(command, args) {
             throw new Error(`the ${name} price must be a number of 0 or more`);
           }
         }
-        row.price = price;
-        row.own = true;
-        row.tiered = price.tiered;
+        if (!row) {
+          row = {
+            key,
+            price,
+            own: true,
+            tiered: price.tiered,
+            since: null,
+          };
+          fixture.priceList.push(row);
+        } else {
+          row.price = price;
+          row.own = true;
+          row.tiered = price.tiered;
+        }
       }
       fixture.money.modelsWithPrice = fixture.priceList.length;
       return null;

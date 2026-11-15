@@ -24,7 +24,7 @@ use crate::store::{Account, Settings};
 use crate::switcher::APP_LOCK_TIMEOUT;
 
 /// The models.dev providers seatswap reads prices from (spec §1.4.1).
-const PRICE_PROVIDERS: [&str; 3] = ["anthropic", "openai", "ollama-cloud"];
+pub const PRICE_PROVIDERS: [&str; 3] = ["anthropic", "openai", "ollama-cloud"];
 
 /// The version of `prices.json` and `fx.json` this build reads and writes.
 const MONEY_VERSION: u32 = 1;
@@ -506,6 +506,28 @@ pub fn price_key(provider: &str, model_id: &str) -> String {
     format!("{provider}/{model_id}")
 }
 
+/// Split an own price's key into its provider and model id. A key is
+/// `"<provider>/<model id>"`, the provider one of [`PRICE_PROVIDERS`] and the
+/// model id not empty; anything else is an error with the text a page shows.
+pub fn parse_price_key(key: &str) -> Result<(&str, &str), String> {
+    let (provider, model_id) = key.split_once('/').ok_or_else(|| {
+        "a model key is provider/model, e.g. anthropic/claude-opus-5-5".to_string()
+    })?;
+    if !PRICE_PROVIDERS.contains(&provider) {
+        return Err(format!(
+            "a model key is provider/model with a provider from {}, e.g. anthropic/claude-opus-5-5",
+            PRICE_PROVIDERS.join(", ")
+        ));
+    }
+    if model_id.is_empty() {
+        return Err(
+            "a model key is provider/model with a model id after the provider, e.g. anthropic/claude-opus-5-5"
+                .to_string(),
+        );
+    }
+    Ok((provider, model_id))
+}
+
 /// The dollar rate used at a date (spec §1.4).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -733,8 +755,9 @@ pub struct Valuer {
     timelines: HashMap<String, Timeline>,
     windows: Vec<WeekWindow>,
     price_changes: PriceChanges,
-    /// The price as `accounts.json` has it now, for an account without changes.
-    stored_prices: BTreeMap<AccountRef, Option<f64>>,
+    /// The price as `accounts.json` has it now and the currency it was entered
+    /// in, for an account without changes.
+    stored_prices: BTreeMap<AccountRef, Option<(f64, Option<String>)>>,
     prices: Prices,
     fx: Fx,
     settings: Settings,
@@ -777,7 +800,14 @@ impl Valuer {
             price_changes: BTreeMap::new(),
             stored_prices: accounts
                 .iter()
-                .map(|account| (AccountRef::of(account), account.price))
+                .map(|account| {
+                    (
+                        AccountRef::of(account),
+                        account
+                            .price
+                            .map(|price| (price, account.price_currency.clone())),
+                    )
+                })
                 .collect(),
             prices: prices.clone(),
             fx: fx.clone(),
@@ -978,12 +1008,11 @@ impl Valuer {
 
     /// The account's monthly price at `at`: the last [`EventKind::PriceChanged`]
     /// at or before it, before the first one the first one; without any change
-    /// the price stored for the account now. A price is only counted in the
-    /// currency it was entered in (spec §1.4): a change in another currency is
-    /// [`Missing::PriceInOtherCurrency`], a change without a currency
-    /// [`Missing::PriceWithoutCurrency`]. A stored price has no change event
-    /// that names the currency it was entered in, so it is
-    /// [`Missing::PriceWithoutCurrency`] too; only an account without any stored
+    /// the price stored for the account now, in the currency `accounts.json`
+    /// records for it. A price is only counted in the currency it was entered in
+    /// (spec §1.4): a change in another currency is
+    /// [`Missing::PriceInOtherCurrency`], one without a currency
+    /// [`Missing::PriceWithoutCurrency`]. Only an account without any stored
     /// price is [`Missing::NoAccountPrice`].
     fn price_at(&self, account: &AccountRef, at: DateTime<Utc>) -> Result<f64, Missing> {
         let (amount, currency) = match self.price_changes.get(account) {
@@ -995,25 +1024,36 @@ impl Valuer {
                     changes.get(after - 1)
                 }
                 .ok_or(Missing::NoAccountPrice)?;
-                (*amount, currency)
+                (*amount, currency.as_deref())
             }
             _ => {
-                return match self.stored_prices.get(account).copied().flatten() {
-                    Some(_) => Err(Missing::PriceWithoutCurrency),
+                return match self.stored_prices.get(account).and_then(Option::as_ref) {
+                    Some((amount, currency)) => counted_price(
+                        *amount,
+                        currency.as_deref(),
+                        self.settings.currency.as_deref(),
+                    ),
                     None => Err(Missing::NoAccountPrice),
                 };
             }
         };
         let amount = amount.ok_or(Missing::NoAccountPrice)?;
-        match currency {
-            Some(currency) if Some(currency.as_str()) != self.settings.currency.as_deref() => {
-                Err(Missing::PriceInOtherCurrency {
-                    currency: currency.clone(),
-                })
-            }
-            Some(_) => Ok(amount),
-            None => Err(Missing::PriceWithoutCurrency),
-        }
+        counted_price(amount, currency, self.settings.currency.as_deref())
+    }
+}
+
+/// A price counts only in the currency it was entered in (spec §1.4).
+fn counted_price(
+    amount: f64,
+    currency: Option<&str>,
+    current: Option<&str>,
+) -> Result<f64, Missing> {
+    match currency {
+        Some(currency) if Some(currency) != current => Err(Missing::PriceInOtherCurrency {
+            currency: currency.to_string(),
+        }),
+        Some(_) => Ok(amount),
+        None => Err(Missing::PriceWithoutCurrency),
     }
 }
 
@@ -2250,6 +2290,58 @@ mod tests {
             stored.subscription_missing,
             Some(Missing::PriceWithoutCurrency),
             "a stored price names no currency"
+        );
+    }
+
+    #[test]
+    fn a_stored_price_counts_in_its_own_currency() {
+        let (history, _dir, opus, _haiku, prices) = two_records();
+        history
+            .append(&weekly_window(
+                utc("2026-11-07T00:00:00Z"),
+                utc("2026-11-14T00:00:00Z"),
+                80.0,
+            ))
+            .expect("a finished window");
+        let mut account = account_with_price(Some(140.0));
+        account.price_currency = Some("EUR".to_string());
+
+        let value_in = |currency: &str| {
+            let settings = Settings {
+                currency: Some(currency.to_string()),
+                usd_rate: Some(OwnRate {
+                    currency: currency.to_string(),
+                    value: 1.0,
+                }),
+                ..Settings::default()
+            };
+            Valuer::build(
+                &history,
+                &range("2026-11-10T00:00:00Z", "2026-11-11T00:00:00Z"),
+                &prices,
+                &empty_fx(),
+                &settings,
+                std::slice::from_ref(&account),
+            )
+            .expect("a valuer")
+            .value("atlas", &opus)
+        };
+
+        let eur = value_in("EUR");
+        assert!(
+            eur.subscription.is_some(),
+            "a stored price in the settings' currency counts: {:?}",
+            eur.subscription_missing
+        );
+
+        let chf = value_in("CHF");
+        assert_eq!(chf.subscription, None);
+        assert_eq!(
+            chf.subscription_missing,
+            Some(Missing::PriceInOtherCurrency {
+                currency: "EUR".to_string()
+            }),
+            "a stored price keeps the currency it was entered in"
         );
     }
 

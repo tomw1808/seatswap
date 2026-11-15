@@ -88,6 +88,11 @@ pub struct Account {
     /// `None`.
     #[serde(default)]
     pub price: Option<f64>,
+    /// The currency [`Self::price`] was entered in ([`Settings::currency`] at
+    /// that moment); `None` when no price is stored or it was entered before a
+    /// currency was set. An older file without the key loads with `None`.
+    #[serde(default)]
+    pub price_currency: Option<String>,
     /// A copy of `.claude.json`'s `oauthAccount`.
     pub oauth_account: OAuthAccount,
     pub added_at: DateTime<Utc>,
@@ -1242,6 +1247,7 @@ pub fn new_account(
         login_ends_at_ms: login.refresh_token_expires_at_ms(),
         auto_burn: true,
         price: None,
+        price_currency: None,
     })
 }
 

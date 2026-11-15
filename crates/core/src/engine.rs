@@ -1412,6 +1412,7 @@ mod tests {
             login_ends_at_ms,
             auto_burn: true,
             price: None,
+            price_currency: None,
         }
     }
 

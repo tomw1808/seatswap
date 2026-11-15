@@ -979,6 +979,13 @@ button.link:hover {
   font-variant-numeric: tabular-nums;
 }
 
+.price-add-key {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px 0;
+}
+
 .price-marks {
   display: flex;
   align-items: center;

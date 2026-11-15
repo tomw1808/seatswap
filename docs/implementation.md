@@ -1760,6 +1760,20 @@ token so a slow reply cannot overwrite a newer one (`moneyToken`, `priceToken`, 
 `historyToken`, `skillToken`, `callsToken`). A render or update keeps the old content until the new
 one replaces it, so the area is never blank while a view loads.
 
+**Money and the price cell.** In General → Money, `rateRow` shows the rate in effect with "looked up
+{date}", "your own rate" or, for USD, "USD itself"; without a rate it says "no rate yet: API values
+are shown in USD", and `state.money.rateError` is shown under that row. `ownRateRow` reads and saves
+`usdRate` as `{ currency, value }` (empty saves `null`) and is disabled while no currency is set or
+the currency is USD; a stored rate for another currency leaves the field empty and the row says
+"your rate 0.95 was for EUR and is not used for CHF". `apiPricesRow` adds "{n} models of models.dev's
+list were left out" with the entries in the line's `title` when `leftOut` is not empty.
+`drawPriceList` ends with `addModelRow`: a provider select (the three `PRICE_PROVIDERS`), a model id
+field and the four prices, saving through `set_price_override` with `<provider>/<model id>`, so an
+own price exists even with look-ups off and no list. In the Accounts group the price cell shows the
+amount with `row.priceCurrency`; when that differs from the settings' currency it shows a warning
+mark whose tooltip is "in EUR: enter it again for CHF", and entering the same amount again saves it
+in the new currency.
+
 The save queue is the page's one write path, in this order:
 
 ```js
@@ -1791,12 +1805,15 @@ pub struct Account {
     pub plan: Option<String>,   // plan_label(login, identity); serde default missing = None
     #[serde(default)]
     pub price: Option<f64>,     // per month, in Settings.currency; missing = None
+    #[serde(default)]
+    pub price_currency: Option<String>, // the currency `price` was entered in; missing = None
 }
+pub struct OwnRate { pub currency: String, pub value: f64 }
 pub struct Settings {
     // …
     #[serde(default = "default_notify_login_ends")] pub notify_login_ends: bool, // true
     #[serde(default)] pub currency: Option<String>,                             // None
-    #[serde(default)] pub usd_rate: Option<f64>,                                // None
+    #[serde(default)] pub usd_rate: Option<OwnRate>,                            // None
     #[serde(default = "default_look_up_prices")] pub look_up_prices: bool,      // true
 }
 
@@ -1811,17 +1828,24 @@ pub fn plan_label(login: &Login, identity: &OAuthAccount) -> Option<String>;
 pub fn validate_price(price: Option<f64>) -> Result<Option<f64>, StoreError>;
 ```
 
-`Settings::validate` refuses a currency that is not three capital letters and a `usdRate` that is
-not finite and above 0. An older `accounts.json` without `price`, `notifyLoginEnds`, `currency`,
-`usdRate` or `lookUpPrices` loads with `None`, `true`, `None`, `None`, `true`.
+`Settings::validate` refuses a currency that is not three capital letters, an `OwnRate.currency`
+that is not three capital letters, and an `OwnRate.value` that is not finite and above 0. An older
+`accounts.json` without `price`, `priceCurrency`, `notifyLoginEnds`, `currency`, `usdRate` or
+`lookUpPrices` loads with `None`, `None`, `true`, `None`, `None`, `true`.
 
 `switcher::edit_account` takes the price as `Option<Option<f64>>` (`None` keeps it, `Some(None)`
 clears it, `Some(Some(v))` sets it after `validate_price`) and returns
-`Edited { account, price_changed }`. The panel sends `price` as JSON: absent, `null`, or a number,
-because `Option<Option<f64>>` cannot tell absent from null over JSON. The worker writes
-`EventKind::PriceChanged { account, amount, currency }` only when `price_changed`, with the currency
-in effect at that moment. `ops::record_plan_change` writes `EventKind::PlanChanged` from a
-`switcher::PlanChange { account, from, to }` after a switch (CLI or app), a live sync or the mirror.
+`Edited { account, price_changed }`. Under the same app lock and from the same load of
+`accounts.json`, setting a price stores `account.price_currency = settings.currency`; clearing it
+clears the currency too. Setting a price while no currency is set is refused with
+`SwitchError::PriceWithoutCurrency` ("set a currency in Settings → General before a price"), and
+nothing is written. A save of the same amount counts as a change when `price_currency` differs from
+the settings' currency, so a `PriceChanged` with the new currency is recorded. The panel sends
+`price` as JSON: absent, `null`, or a number, because `Option<Option<f64>>` cannot tell absent from
+null over JSON. The worker writes `EventKind::PriceChanged { account, amount, currency }` only when
+`price_changed`, with `currency` taken from `edited.account.price_currency`. `ops::record_plan_change`
+writes `EventKind::PlanChanged` from a `switcher::PlanChange { account, from, to }` after a switch
+(CLI or app), a live sync or the mirror.
 
 ## api.rs additions (step C1)
 
@@ -1850,7 +1874,7 @@ look-ups never send a token or any user data. All HTTP still goes through `Api`.
 ## money (step C1)
 
 ```rust
-const PRICE_PROVIDERS: [&str; 3] = ["anthropic", "openai", "ollama-cloud"];
+pub const PRICE_PROVIDERS: [&str; 3] = ["anthropic", "openai", "ollama-cloud"];
 const MONEY_VERSION: u32 = 1;
 
 pub enum MoneyError { Io { path, source }, Json { path, source }, UnsupportedVersion { path, version },
@@ -1865,6 +1889,11 @@ pub struct PriceChange { pub at: DateTime<Utc>, pub added: Vec<String>,
     pub changed: Vec<String>, pub removed: Vec<String> }
 pub struct CurrentPrice { pub key: String, pub price: ModelPrice, pub own: bool,
     pub since: Option<DateTime<Utc>> }
+pub struct ModelsDevList { pub prices: BTreeMap<String, ModelPrice>, pub left_out: Vec<String> }
+/// Why a value is missing; Display is the text a page shows.
+pub enum Missing { NoCurrency, NoPrice { model: String }, NoAccount, NoAccountPrice,
+    PriceInOtherCurrency { currency: String }, PriceWithoutCurrency, NoReading,
+    UnpricedInWeek { model: String } }
 
 pub struct Prices { pub version: u32, pub checked_at: Option<DateTime<Utc>>,
     pub etag: Option<String>, pub last_change: Option<PriceChange>,
@@ -1886,30 +1915,41 @@ impl Fx { pub fn load(app) -> Result<Fx, MoneyError>; pub fn save(&self, app) ->
           pub fn at(&self, date: NaiveDate) -> Option<f64>; } // last point ≤ date, else first
 
 pub struct Rate { pub value: f64, pub date: Option<NaiveDate>, pub own: bool }
-/// settings.usd_rate wins; "USD" is 1.0 with no date; else Fx::at(date). None without a currency.
+/// settings.usdRate when its currency is the settings' currency; "USD" is 1.0 with no date;
+/// else Fx::at(date) for the same currency. None without a currency, and a rate of another
+/// currency is never used.
 pub fn usd_rate(settings: &Settings, fx: &Fx, date: NaiveDate) -> Option<Rate>;
 
-pub enum Looked { NotModified, Taken(Option<PriceChange>) }
+pub enum Looked {
+    NotModified,
+    Taken { change: Option<PriceChange>, left_out: Vec<String> },
+}
 /// Models.dev → prices.json. Load for the ETag, request, take the app lock, load again (an own
 /// price written meanwhile is kept), take the list, store the ETag and checkedAt. NotModified
-/// moves checkedAt only. Any error saves nothing.
+/// moves checkedAt only. Any error saves nothing. `left_out` names each model the list skipped
+/// and why; a later list replaces it.
 pub fn look_up_prices(api: &Api, app: &AppPaths, now: DateTime<Utc>) -> Result<Looked, MoneyError>;
 /// Frankfurter → fx.json under the app lock. "USD" sends nothing and returns None; a rate that is
 /// not finite and above 0 is BadRate; a file for another currency starts empty for this one.
 pub fn look_up_rate(api: &Api, app: &AppPaths, currency: &str) -> Result<Option<FxPoint>, MoneyError>;
 
-/// models.dev's body → the three providers' prices. No provider of the three = error; a model
-/// without id is skipped; input and output are required; cache_write/cache_read default to 0;
-/// a cost that is negative, non-finite or not a number is an error naming the key; tiers = tiered.
-pub fn prices_from_models_dev(body: &serde_json::Value) -> Result<BTreeMap<String, ModelPrice>, MoneyError>;
+/// models.dev's body → the three providers' prices and the models it left out. No provider of
+/// the three = error; a model without id is skipped; input and output are required;
+/// cache_write/cache_read default to 0; a cost that is negative, non-finite or not a number
+/// leaves that model out of the list, named in `left_out`; tiers = tiered.
+pub fn prices_from_models_dev(body: &serde_json::Value) -> Result<ModelsDevList, MoneyError>;
 pub fn price_key(provider: &str, model_id: &str) -> String; // "<provider>/<model id>"
+/// "<provider>/<model id>" → its two parts; the provider must be one of PRICE_PROVIDERS and the
+/// model id must not be empty, else the Err text a page shows.
+pub fn parse_price_key(key: &str) -> Result<(&str, &str), String>;
 
 /// One record at API prices, in USD; None when its model has no price. Anthropic/<model>.
 pub fn api_usd(record: &TokenRecord, prices: &Prices) -> Option<f64>;
 pub fn percent_value(monthly_price: f64) -> f64; // monthly × 12 / 52 / 100
 
 pub struct Valued { pub api: Option<f64>, pub subscription: Option<f64>,
-    pub account: Option<AccountRef>, pub missing_price_for: Option<String>, pub missing_rate: bool }
+    pub account: Option<AccountRef>, pub api_currency: Option<String>,
+    pub api_missing: Option<Missing>, pub subscription_missing: Option<Missing> }
 
 pub struct Valuer { … }
 impl Valuer {
@@ -1917,10 +1957,11 @@ impl Valuer {
     /// history (a record's account and price are the last Live/Switch/PriceChanged at or before it).
     pub fn build(history: &HistoryDir, range: &Range, prices: &Prices, fx: &Fx,
                  settings: &Settings, accounts: &[Account]) -> Result<Valuer, MoneyError>;
-    /// api = api_usd × rate of the record's day (None when either is missing);
-    /// subscription = usd / the week's api_sum × used × percent_value(price), None without a
-    /// window, a reading, a price or a positive api_sum; missing_price_for = the model when it has
-    /// no price; missing_rate = there is a price but no rate.
+    /// api = api_usd × rate of the record's day (USD, labelled, when there is no rate; None with
+    /// its reason when the model has no price or no currency is set);
+    /// subscription = usd / the week's api_sum × used × percent_value(price), None with its
+    /// reason when the account or its price is missing, the week has no reading, an unpriced model
+    /// is in the week, or the week has no API value to split.
     pub fn value(&self, host: &str, record: &TokenRecord) -> Valued;
 }
 ```
@@ -1928,8 +1969,10 @@ impl Valuer {
 `Prices::take` adds a point only for a new model or one whose price differs from its last point; a
 model missing from the list keeps its points and enters `missing` once; a model that comes back
 leaves it. `Prices::at` never looks into the future: before the first point it uses the first point,
-so the oldest price counts for the past. A price entered before a currency was set (`currency:
-None`) still counts for the subscription value; a price entered in another currency does not.
+so the oldest price counts for the past. The account's price is the last `PriceChanged` at or before
+the record, and a stored price without an event uses `Account.price_currency` like an event's
+currency: it counts only while that currency is the settings' currency, and a price whose currency
+is `None` does not count (`Missing::PriceWithoutCurrency`).
 
 ## lookup_rt (step C1)
 
@@ -1939,7 +1982,8 @@ const PRICE_EVERY: Duration = Duration::from_secs(60 * 60);
 #[derive(Serialize)] pub(crate) struct MoneyView {
     pub currency: Option<String>, pub rate: Option<Rate>, pub look_up: bool,
     pub models_with_price: u32, pub prices_checked_at: Option<DateTime<Utc>>,
-    pub last_change: Option<PriceChange>, pub last_error: Option<String> }
+    pub last_change: Option<PriceChange>, pub left_out: Vec<String>,
+    pub rate_error: Option<String>, pub last_error: Option<String> }
 
 #[derive(Serialize)] pub(crate) struct PriceRow {
     pub key: String, pub price: ModelPrice, pub own: bool, pub tiered: bool,
@@ -1969,8 +2013,12 @@ request, while a failure is tried again next round. With `lookUpPrices` off no r
 the view still shows what is stored. The runtime's constructor fills the view from the files before
 the first round, so the page never shows zero prices while `prices.json` holds some. Every changed
 view is sent as `UiEvent::Money(view)`; the main thread emits it to both windows. `set_override`
+first checks the key with `money::parse_price_key` (a known provider and a non-empty model id), then
 takes the app lock, changes `prices.json` through `Prices`, and rebuilds the view; a price that is
-negative, non-finite or not a number is refused.
+negative, non-finite or not a number is refused. A failed rate look-up goes into `rate_error`, so
+the rate row shows it; `last_error` keeps the price look-up's errors and the `prices.json` /
+`fx.json` read errors. `left_out` is the last list's skipped models and is kept until a later list
+names others.
 
 ## projects (step C1)
 

@@ -223,6 +223,7 @@ Config folder (Rust `dirs` crate):
     { "id": "6f1c…", "accountUuid": "…", "organizationUuid": "…",
       "label": "Acme", "abbr": "AC", "color": "#3b82f6",
       "email": "…", "orgName": "…", "plan": "Team 5x", "price": 180.0,
+      "priceCurrency": "EUR",
       "oauthAccount": { "...": "copy of ~/.claude.json oauthAccount" },
       "addedAt": "2026-11-10T12:00:00Z", "lastUsedAt": "…" },
     { "id": "a92d…", "label": "Private", "abbr": "P", "color": "#f59e0b", "...": "…" }
@@ -789,9 +790,10 @@ They give real click handling and exact placement on those desktops. They're not
 | `notifyWaitingHosts` | `thisHost` | `thisHost` · `allHosts`: whose waiting sessions notify; only this host's are known yet |
 | `notifyLoginEnds` | on | the login warnings at 5 days, 1 day and when a login ended (§7.5). `bool`; Settings → Notifications, "A login ends" |
 | `currency` | none | `null` or three capital letters (`"EUR"`); `Option<String>`; the currency every amount is shown in. Until it is set, amounts in money stay missing (§11.5). Settings → General, section Money, "Currency" |
-| `usdRate` | none | `null` or a number above 0: units of `currency` per 1 USD; `Option<f64>`; an entered rate wins over the looked-up one (§11.5). Settings → General, Money, "Use my own rate" |
+| `usdRate` | none | `null` or `{ "currency": "EUR", "value": 0.95 }`: units of that currency per 1 USD, value above 0; `Option<OwnRate>`. It is used only while its currency is `currency`; an entered rate wins over the looked-up one (§11.5). Settings → General, Money, "Use my own rate" |
 | `lookUpPrices` | on | `bool`; whether seatswap may ask models.dev for API prices and Frankfurter for the dollar rate (§11.5). Off, neither host is contacted and `prices --refresh` refuses; stored values stay. Settings → General, Money, "Look up prices and the dollar rate" |
-| `price` per account | none | `null` or a number above 0: what the subscription costs per month, in `currency`; `Option<f64>`. Without one the account is left out of every sum in money and the page says so (§11.5). Settings → Accounts, column "Price / month" |
+| `price` per account | none | `null` or a number above 0: what the subscription costs per month, in `priceCurrency`; `Option<f64>`. Without one the account is left out of every sum in money and the page says so (§11.5). Settings → Accounts, column "Price / month" |
+| `priceCurrency` per account | none | `null` or three capital letters: the `currency` in effect when `price` was entered. A price counts only in that currency; a price entered before a currency was set has `null` and does not count (§11.5). Settings → Accounts, the price cell |
 | `plan` per account | from the login | read-only `Option<String>`: the identity's `planDisplayName`, else the capitalised `subscriptionType` with its level from `rateLimitTier` ("Team 5x"; a tier seatswap cannot read as a multiplier in parentheses, "Team (team_premium)"). Shown in the pop-up, Settings → Accounts and `seatswap list` |
 | `agentsRead` | on | agents may run `list`, `status`, `burn plan`, `burn simulate`, `prices` and `history export` (§6.6, §7.7) |
 | `agentsSwitch` | off | agents may run `use` and `next` (§6.6); an agent's `next` does nothing while auto-burn is on (§7.8) |
@@ -904,20 +906,27 @@ settings the one before left, so a quick second change never carries a stale cop
 pending, an incoming snapshot does not overwrite the page's own copy.
 
 - **General.**
-  - *Money*: the currency; "Look up prices and the dollar rate"; the dollar rate with its date or
-    "my own rate"; "Use my own rate"; the API prices row with how many models have a price, when
-    they were checked, what the last look-up changed, and a price list. In the price list each
-    model's four prices are fields: changing one saves it as that model's own price, and a button
-    puts the looked-up price back; a model whose price depends on the prompt size is marked and
-    uses its base price (§11.5).
+  - *Money*: the currency; "Look up prices and the dollar rate"; "1 US dollar is" with the rate in
+    effect and whether it was looked up (with its date) or entered by hand, or "no rate yet: API
+    values are shown in USD", with a failed rate look-up's text under that row; "Use my own rate",
+    which saves the rate with the currency it is for and is disabled while no currency is set or it
+    is USD; the API prices row with how many models have a price, when they were checked, what the
+    last look-up changed, how many models models.dev's list left out and which, and a price list. In
+    the price list each model's four prices are fields: changing one saves it as that model's own
+    price, and a button puts the looked-up price back; a model whose price depends on the prompt size
+    is marked and uses its base price. The list ends with "add a model": a provider (one of the
+    three models.dev providers seatswap reads), a model id and the four prices, which saves an own
+    price for any model, also with look-ups off and no list (§11.5).
   - *Look*: theme, tray text, which limit the tray ring shows.
   - *Start and polling*: start at login; how often the active account and the inactive accounts are
     read.
   - *Claude Code*: the config folder; read the session files; copy the live login at once; refresh
     inactive logins.
 - **Accounts.** One row per account: the chip (abbreviation and colour), the label (editable), the
-  account's e-mail, its plan, its price per month in the currency, "Auto-burn may use it", its
-  organization, and when its login ends. A click on the chip opens the editor: one or two letters,
+  account's e-mail, its plan, its price per month with the currency it was entered in, "Auto-burn may
+  use it", its organization, and when its login ends. A price entered in another currency than the
+  current one is marked "in EUR: enter it again for CHF", and entering the same amount again saves it
+  in the current currency. A click on the chip opens the editor: one or two letters,
   ten colour swatches and a hex field, a live preview of the tray icon at 16, 22 and 32 px, and
   Remove with a confirmation that says the live login is not touched. Account and plan come from
   the login and are read-only. The organization is chosen from the organizations of §11.6 or
@@ -950,13 +959,17 @@ number: `1,234 EUR`, and below 10 with two decimals, `6.47 EUR`.
 
 - **One currency.** `currency` is the currency every amount is shown in. There is no default: until
   it is set, amounts in money stay missing and the page asks for it.
-- **A price per account.** An account's `price` is what its subscription costs per month, in that
-  currency. Without a price the account is left out of every sum in money, and the window says so;
-  it is never assumed.
+- **A price per account.** An account's `price` is what its subscription costs per month, in the
+  currency it was entered in, `priceCurrency`. Without a price the account is left out of every sum
+  in money, and the window says so; it is never assumed. A price whose `priceCurrency` is another
+  currency than the current one does not count, and the page marks it so it can be entered again; a
+  price entered before a currency was set has no `priceCurrency` and does not count either.
 - **The dollar rate.** API prices are in dollars; a rate turns them into the chosen currency. A rate
-  entered by hand (`usdRate`) wins over the looked-up one. `USD` itself is always 1, with no
-  looked-up rate. Without a rate an API value has no value in the currency, and the value says its
-  rate is missing; the code never assumes a rate.
+  entered by hand (`usdRate`) wins over the looked-up one, but only while its own `currency` is the
+  current one; a rate for another currency is not used. `USD` itself is always 1, with no looked-up
+  rate. Without a rate an API value has no value in the currency, and the value says its rate is
+  missing; the code never assumes a rate. The settings row shows the rate in effect and where it came
+  from, or that API values are shown in USD, and a failed rate look-up is shown there.
 - **The value of one percent** of an account's week is `monthly price × 12 / 52 / 100`: 180 EUR a
   month is 41.54 EUR a week and 0.415 EUR per percent.
 
@@ -964,10 +977,13 @@ number: `1,234 EUR`, and below 10 with two decimals, `6.47 EUR`.
 `ollama-cloud`. A model's key is `<provider>/<model id>`; its price has four parts, in USD per
 million tokens: `input`, `output`, `cacheWrite` and `cacheRead`. A model whose `cost.tiers` makes
 the price depend on the prompt size is marked `tiered` and counted at its base price. A model that
-lacks an input or an output price is left out; a missing cache price counts as 0. A negative or
-non-finite price, a provider without a model list, an answer that is not the expected model list,
-and an answer with none of the three providers are errors naming the model or the answer, and
-nothing is stored.
+lacks an input or an output price is left out; a missing cache price counts as 0. A cost that is
+not a number, negative or not finite leaves that model out of the list and names it in the settings
+("2 models of models.dev's list were left out"), while the rest of the list is stored; a provider
+without a model list, an answer that is not the expected model list, and an answer with none of the
+three providers are errors naming the answer, and nothing is stored. Any model, listed or not, can
+be given an own price in the settings; its key must be `<provider>/<model id>` with one of those
+three providers and a non-empty model id.
 
 **Prices are kept with their dates.** Each looked-up price that differs from the stored one starts a
 new point at the look-up's time; the tokens of a past day keep the price of that day. `prices.json`
@@ -1018,12 +1034,14 @@ the account has no price, or when the week's used part or its API value is unkno
   `its API USD / the week's API USD × used percent × percent_value(monthly price)`.
 - The price used is the account's price at the record's time: the last `priceChanged` at or before
   it, before the first one the first one, or, when the account has no such event, the price stored
-  in `accounts.json`. A price entered in another currency than the current `currency` is not used,
-  and the value is left out. So is a record whose week has no reading, or whose account's records
-  in that week have no API value to split.
+  in `accounts.json` with its `priceCurrency`. A price entered in another currency than the current
+  `currency` is not used, and the value is left out; a price without a currency does not count
+  either. So is a record whose week has no reading, or whose account's records in that week have no
+  API value to split.
 
 `priceChanged` is written to the history when an account's price changes; it carries the new
-`amount` and the `currency` in effect at that moment. A plan change is `planChanged`.
+`amount` and the `currency` in effect at that moment. The same amount saved again in a new currency
+is a change, so it is recorded with the new currency. A plan change is `planChanged`.
 
 **The files.**
 

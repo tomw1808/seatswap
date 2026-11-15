@@ -742,9 +742,9 @@ function lookUpRow() {
 
 function rateText(view, code) {
   if (!code) return "set a currency first";
-  if (!view || !isObject(view.rate)) return "not looked up yet";
+  if (!view || !isObject(view.rate)) return "no rate yet: API values are shown in USD";
   const value = Number(view.rate.value);
-  if (!Number.isFinite(value)) return "not looked up yet";
+  if (!Number.isFinite(value)) return "no rate yet: API values are shown in USD";
   return `${value.toFixed(4)} ${code}`;
 }
 
@@ -766,36 +766,66 @@ function rateRow(times) {
         prefix: "looked up ",
         fallback: view.rate.date,
       });
+    } else if (code === "USD") {
+      note.textContent = "USD itself";
     }
   }
-  return setting("1 US dollar is", control, note, "rate");
+  const row = setting("1 US dollar is", control, note, "rate");
+  const problem =
+    view && typeof view.rateError === "string" && view.rateError !== ""
+      ? view.rateError
+      : null;
+  if (problem) {
+    const error = row.querySelector(".row-error");
+    error.hidden = false;
+    error.textContent = problem;
+  }
+  return row;
 }
 
 function ownRateRow() {
   const code = currencyCode();
   const stored = savedValue("usdRate");
+  const own = isObject(stored) ? stored : null;
+  const ownValue =
+    own && typeof own.currency === "string" && own.currency === code
+      ? own.value
+      : null;
   const input = h("input", {
     type: "number",
     class: "inp num",
-    value: typeof stored === "number" ? String(stored) : "",
+    value: typeof ownValue === "number" ? String(ownValue) : "",
     min: "0",
     step: "0.0001",
     "aria-label": "Use my own rate",
+    disabled: !code || code === "USD",
   });
   const reset = () => {
     const value = savedValue("usdRate");
-    input.value = typeof value === "number" ? String(value) : "";
+    const current =
+      isObject(value) &&
+      typeof value.currency === "string" &&
+      value.currency === code &&
+      typeof value.value === "number"
+        ? value.value
+        : null;
+    input.value = current === null ? "" : String(current);
   };
   input.addEventListener("change", async () => {
+    if (!code || code === "USD") {
+      reset();
+      return;
+    }
     const raw = input.value.trim();
     let next = null;
     if (raw !== "") {
-      next = Number(raw);
-      if (!Number.isFinite(next) || next <= 0) {
+      const value = Number(raw);
+      if (!Number.isFinite(value) || value <= 0) {
         fieldError("usdRate", "The rate must be a number above 0.");
         reset();
         return;
       }
+      next = { currency: code, value };
     }
     const ok = await saveField("usdRate", next);
     if (!ok) {
@@ -808,12 +838,13 @@ function ownRateRow() {
     input,
     code ? h("span", { class: "mf", text: `${code} per USD` }) : null,
   ]);
-  return setting(
-    "Use my own rate",
-    control,
-    "empty: the looked-up rate is used",
-    "usdRate"
-  );
+  let note = "empty: the looked-up rate is used";
+  if (!code) note = "set a currency first";
+  else if (code === "USD") note = "USD needs no rate";
+  else if (own && own.currency !== code) {
+    note = `your rate ${own.value} was for ${own.currency} and is not used for ${code}`;
+  }
+  return setting("Use my own rate", control, note, "usdRate");
 }
 
 function countText(count, singular, plural) {
@@ -910,6 +941,18 @@ function apiPricesRow(times) {
       error.appendChild(document.createTextNode(" · nothing is stored yet"));
     }
   }
+  const leftOut =
+    view && Array.isArray(view.leftOut)
+      ? view.leftOut.filter((entry) => typeof entry === "string" && entry !== "")
+      : [];
+  if (leftOut.length > 0) {
+    const line = h("div", {
+      class: "lr mf price-left-out",
+      text: `${countText(leftOut.length, "model", "models")} of models.dev's list ${leftOut.length === 1 ? "was" : "were"} left out`,
+      title: leftOut.join("\n"),
+    });
+    row.appendChild(line);
+  }
   return row;
 }
 
@@ -938,41 +981,41 @@ function drawPriceList(container) {
     container.appendChild(
       h("div", { class: "row-error price-list-error", text: state.priceError })
     );
-    return;
-  }
-  if (!state.priceLoaded || state.priceRows === null) {
+  } else if (!state.priceLoaded || state.priceRows === null) {
     container.appendChild(h("div", { class: "lr mf", text: "loading the price list…" }));
     return;
+  } else {
+    const rows = state.priceRows;
+    if (rows.length === 0) {
+      container.appendChild(
+        h("div", {
+          class: "lr mf",
+          text: "no prices yet: run a look-up with the switch on, or add a model below",
+        })
+      );
+    } else {
+      container.appendChild(
+        h("div", { class: "lr hd price-grid" }, [
+          h("span", { text: "Model" }),
+          h("span", { text: "Input" }),
+          h("span", { text: "Output" }),
+          h("span", { text: "Cache write" }),
+          h("span", { text: "Cache read" }),
+          h("span", { text: "" }),
+        ])
+      );
+      const times = [];
+      for (const row of rows) container.appendChild(priceRow(row, times));
+      container.appendChild(
+        h("div", {
+          class: "note price-list-note",
+          text: "USD per million tokens. A field saves that model's own price; a tiered model uses its base price.",
+        })
+      );
+      fillTimeNodes(times);
+    }
   }
-  const rows = state.priceRows;
-  if (rows.length === 0) {
-    container.appendChild(
-      h("div", {
-        class: "lr mf",
-        text: "no prices yet: run a look-up with the switch on, or enter an own price below",
-      })
-    );
-    return;
-  }
-  container.appendChild(
-    h("div", { class: "lr hd price-grid" }, [
-      h("span", { text: "Model" }),
-      h("span", { text: "Input" }),
-      h("span", { text: "Output" }),
-      h("span", { text: "Cache write" }),
-      h("span", { text: "Cache read" }),
-      h("span", { text: "" }),
-    ])
-  );
-  const times = [];
-  for (const row of rows) container.appendChild(priceRow(row, times));
-  container.appendChild(
-    h("div", {
-      class: "note price-list-note",
-      text: "USD per million tokens. A field saves that model's own price; a tiered model uses its base price.",
-    })
-  );
-  fillTimeNodes(times);
+  container.appendChild(addModelRow());
 }
 
 function priceInputValue(row, property) {
@@ -1078,6 +1121,93 @@ function priceRow(row, times) {
   }
   wrap.appendChild(h("div", { class: "row-error", hidden: true }));
   return wrap;
+}
+
+// An own price for any model (spec §1.4.1), including one models.dev does not
+// list: the key is `<provider>/<model id>`, the provider one of the three the
+// look-up reads. The server checks the same rule and refuses another key.
+const PRICE_PROVIDERS = ["anthropic", "openai", "ollama-cloud"];
+
+function addModelRow() {
+  const field = "price:new";
+  const provider = selectInput(
+    PRICE_PROVIDERS.map((name) => [name, name]),
+    PRICE_PROVIDERS[0],
+    () => {}
+  );
+  provider.setAttribute("aria-label", "Model provider");
+  const model = textInput({
+    class: "inp tall price-add-model",
+    placeholder: "claude-opus-5-5",
+    "aria-label": "Model id",
+  });
+  const grid = h("div", { class: "lr price-grid price-add-grid" }, [
+    h("span", { class: "mf", text: "add a model" }),
+  ]);
+  const labels = {
+    input: "input",
+    output: "output",
+    cacheWrite: "cache write",
+    cacheRead: "cache read",
+  };
+  const inputs = {};
+  for (const [property, table] of Object.entries(labels)) {
+    const input = h("input", {
+      type: "number",
+      class: "inp num price-field",
+      value: "0",
+      min: "0",
+      step: "any",
+      "aria-label": `${table} price for the new model`,
+    });
+    inputs[property] = input;
+    grid.appendChild(h("span", { class: "price-value" }, [input]));
+  }
+  const add = h("button", { type: "button", class: "hbtn xs", text: "Add" });
+  grid.appendChild(h("span", { class: "price-marks" }, [add]));
+  add.addEventListener("click", async () => {
+    const modelId = model.value.trim();
+    if (modelId === "") {
+      fieldError(field, "A model id is needed after the provider.");
+      return;
+    }
+    const price = { tiered: false };
+    for (const [property, input] of Object.entries(inputs)) {
+      const raw = input.value.trim();
+      const value = Number(raw);
+      if (raw === "" || !Number.isFinite(value) || value < 0) {
+        fieldError(
+          field,
+          `The ${labels[property]} price must be a number of 0 or more.`
+        );
+        return;
+      }
+      price[property] = value;
+    }
+    const key = `${provider.value}/${modelId}`;
+    add.disabled = true;
+    try {
+      await state.context.invoke("set_price_override", { key, price });
+      fieldError(field, null);
+      model.value = "";
+      for (const input of Object.values(inputs)) input.value = "0";
+      await reloadMoney();
+    } catch (error) {
+      fieldError(field, errorMessage(error));
+    } finally {
+      add.disabled = false;
+    }
+  });
+  return h("div", { class: "price-add", dataset: { field } }, [
+    h("div", { class: "price-add-key" }, [
+      h("span", { class: "mf", text: "own price for" }),
+      provider,
+      h("span", { class: "mf", text: "/" }),
+      model,
+    ]),
+    grid,
+    h("div", { class: "row-error", hidden: true }),
+  ]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1210,6 +1340,49 @@ function accountRow(row) {
     else labelInput.value = row.label || "";
   });
 
+  const code = currencyCode();
+  const priceCurrency = () =>
+    typeof row.priceCurrency === "string" && row.priceCurrency !== ""
+      ? row.priceCurrency
+      : null;
+  const currencyLabel = h("span", { class: "x11 mf" });
+  const currencyMark = h("span", {
+    class: "sw warn price-currency-mark",
+    hidden: true,
+  });
+  const paintPriceCurrency = () => {
+    currencyMark.hidden = true;
+    currencyMark.title = "";
+    currencyMark.setAttribute("aria-label", "");
+    if (row.price === null || row.price === undefined) {
+      if (code) {
+        currencyLabel.textContent = code;
+        currencyLabel.className = "x11 mf";
+      } else {
+        currencyLabel.textContent = "currency: set it under General";
+        currencyLabel.className = "x11 mf currency-hint";
+      }
+      return;
+    }
+    const own = priceCurrency();
+    if (own === null) {
+      currencyLabel.textContent = "no currency";
+      currencyLabel.className = "x11 mf";
+      currencyMark.hidden = false;
+      currencyMark.title =
+        "the price was entered before a currency was set; enter it again";
+      currencyMark.setAttribute("aria-label", currencyMark.title);
+      return;
+    }
+    currencyLabel.textContent = own;
+    currencyLabel.className = "x11 mf";
+    if (code && own !== code) {
+      currencyMark.hidden = false;
+      currencyMark.title = `in ${own}: enter it again for ${code}`;
+      currencyMark.setAttribute("aria-label", currencyMark.title);
+    }
+  };
+
   const priceInput = textInput({
     class: "inp tall acc-price",
     value: row.price === null || row.price === undefined ? "" : String(row.price),
@@ -1229,28 +1402,28 @@ function accountRow(row) {
         return;
       }
     }
-    if (amount === row.price) {
+    const sameCurrency =
+      amount === null || (code !== null && priceCurrency() === code);
+    if (amount === row.price && sameCurrency) {
       priceInput.value = storedPrice();
       return;
     }
     const ok = await saveAccount(row, { price: amount }, field);
     if (ok) {
       row.price = amount;
+      row.priceCurrency = amount === null ? null : code;
       priceInput.value = storedPrice();
+      paintPriceCurrency();
     } else {
       priceInput.value = storedPrice();
     }
   });
 
-  const code = currencyCode();
+  paintPriceCurrency();
   const priceCell = h("div", { class: "price-cell" }, [
     priceInput,
-    code
-      ? h("span", { class: "x11 mf", text: code })
-      : h("span", {
-          class: "x11 mf currency-hint",
-          text: "currency: set it under General",
-        }),
+    currencyLabel,
+    currencyMark,
   ]);
 
   const auto = switchButton(

@@ -121,6 +121,9 @@ pub(crate) struct AccountRow {
     pub org_name: Option<String>,
     pub plan: Option<String>,
     pub price: Option<f64>,
+    /// The currency `price` was entered in; `None` when there is no price or it
+    /// was entered before a currency was set.
+    pub price_currency: Option<String>,
     pub auto_burn: bool,
     pub login_ends_at_ms: Option<i64>,
     pub login_days_left: Option<i64>,
@@ -139,6 +142,7 @@ impl AccountRow {
             org_name: account.org_name.clone(),
             plan: account.plan.clone(),
             price: account.price,
+            price_currency: account.price_currency.clone(),
             auto_burn: account.auto_burn,
             login_ends_at_ms: account.login_ends_at_ms,
             login_days_left: view.and_then(|view| view.login_days_left),
@@ -1362,19 +1366,6 @@ impl ActionRuntime {
         auto_burn: Option<bool>,
         price: Option<Option<f64>>,
     ) -> ActionReply {
-        // The currency the price is entered in, as the settings hold it at the
-        // time of the change: `PriceChanged` names it (spec §1.4). Only a price
-        // edit needs it, so a label change does not load accounts.json for it.
-        let currency = match price {
-            Some(_) => match self
-                .store()
-                .and_then(|store| store.load().map_err(|error| error.to_string()))
-            {
-                Ok(file) => file.settings.currency,
-                Err(error) => return ActionReply::Failed(error),
-            },
-            None => None,
-        };
         let result = match self.store() {
             Ok(store) => switcher::edit_account(
                 store,
@@ -1393,7 +1384,7 @@ impl ActionRuntime {
                     let event = EventKind::PriceChanged {
                         account: AccountRef::of(&edited.account),
                         amount: edited.account.price,
-                        currency,
+                        currency: edited.account.price_currency.clone(),
                     };
                     if let Err(error) = self.record(event) {
                         report_history_error(&error);

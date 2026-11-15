@@ -42,6 +42,8 @@ pub enum SwitchError {
     CurrentNotSaved {
         email: Option<String>,
     },
+    /// A price was entered while the settings have no currency (spec §1.4).
+    PriceWithoutCurrency,
     /// The login file was written but the identity was not.
     PartlyDone {
         state: String,
@@ -75,6 +77,9 @@ impl fmt::Display for SwitchError {
                 Some(email) => write!(f, "the current login ({email}) is not saved"),
                 None => write!(f, "the current login is not saved"),
             },
+            SwitchError::PriceWithoutCurrency => {
+                write!(f, "set a currency in Settings → General before a price")
+            }
             SwitchError::PartlyDone { state } => write!(f, "{state}"),
         }
     }
@@ -90,6 +95,7 @@ impl std::error::Error for SwitchError {
             | SwitchError::TargetLoggedOut { .. }
             | SwitchError::TargetHasNoLogin { .. }
             | SwitchError::CurrentNotSaved { .. }
+            | SwitchError::PriceWithoutCurrency
             | SwitchError::PartlyDone { .. } => None,
         }
     }
@@ -673,8 +679,15 @@ pub fn edit_account(
         None => None,
     };
     let color = color.map(store::validate_color).transpose()?;
+    let currency = file.settings.currency.clone();
     let price = match price {
-        Some(value) => Some(store::validate_price(value)?),
+        Some(value) => {
+            let value = store::validate_price(value)?;
+            if value.is_some() && currency.is_none() {
+                return Err(SwitchError::PriceWithoutCurrency);
+            }
+            Some(value)
+        }
         None => None,
     };
 
@@ -706,8 +719,10 @@ pub fn edit_account(
         }
     }
     if let Some(price) = price {
-        if account.price != price {
+        let price_currency = price.map(|_| currency.clone()).unwrap_or(None);
+        if account.price != price || account.price_currency != price_currency {
             account.price = price;
+            account.price_currency = price_currency;
             changed = true;
             price_changed = true;
         }
@@ -917,6 +932,12 @@ mod tests {
 
         fn account_file(&self) -> AccountsFile {
             self.store.load().unwrap()
+        }
+
+        fn set_currency(&self, code: &str) {
+            let mut file = self.account_file();
+            file.settings.currency = Some(code.to_string());
+            self.store.save(&file).unwrap();
         }
 
         fn secrets_snapshot(&self) -> BTreeMap<PathBuf, Vec<u8>> {
@@ -1782,12 +1803,22 @@ mod tests {
     #[test]
     fn edit_account_sets_and_clears_the_price() {
         let w = World::new();
+        w.set_currency("EUR");
         assert_eq!(w.account_file().find(&w.a_id).unwrap().price, None);
 
         let edited =
             edit_account(&w.store, &w.a_id, None, None, None, None, Some(Some(180.0))).unwrap();
         assert_eq!(edited.account.price, Some(180.0));
+        assert_eq!(edited.account.price_currency.as_deref(), Some("EUR"));
         assert_eq!(w.account_file().find(&w.a_id).unwrap().price, Some(180.0));
+        assert_eq!(
+            w.account_file()
+                .find(&w.a_id)
+                .unwrap()
+                .price_currency
+                .as_deref(),
+            Some("EUR")
+        );
         assert_eq!(
             w.account_file().find(&w.b_id).unwrap().price,
             None,
@@ -1796,7 +1827,9 @@ mod tests {
 
         let cleared = edit_account(&w.store, &w.a_id, None, None, None, None, Some(None)).unwrap();
         assert_eq!(cleared.account.price, None);
+        assert_eq!(cleared.account.price_currency, None);
         assert_eq!(w.account_file().find(&w.a_id).unwrap().price, None);
+        assert_eq!(w.account_file().find(&w.a_id).unwrap().price_currency, None);
 
         edit_account(&w.store, &w.a_id, None, None, None, None, Some(Some(180.0))).unwrap();
         let unchanged = edit_account(&w.store, &w.a_id, None, None, None, None, None).unwrap();
@@ -1808,8 +1841,82 @@ mod tests {
     }
 
     #[test]
+    fn a_price_is_stored_with_its_currency() {
+        let w = World::new();
+        w.set_currency("EUR");
+
+        let edited =
+            edit_account(&w.store, &w.a_id, None, None, None, None, Some(Some(180.0))).unwrap();
+        assert_eq!(edited.account.price, Some(180.0));
+        assert_eq!(edited.account.price_currency.as_deref(), Some("EUR"));
+        let stored = w.account_file();
+        assert_eq!(
+            stored.find(&w.a_id).unwrap().price_currency.as_deref(),
+            Some("EUR"),
+            "accounts.json holds the currency the price was entered in"
+        );
+
+        let cleared = edit_account(&w.store, &w.a_id, None, None, None, None, Some(None)).unwrap();
+        assert_eq!(cleared.account.price, None);
+        assert_eq!(cleared.account.price_currency, None);
+        assert_eq!(
+            w.account_file().find(&w.a_id).unwrap().price_currency,
+            None,
+            "clearing the price clears its currency too"
+        );
+    }
+
+    #[test]
+    fn a_price_without_a_currency_set_is_refused() {
+        let w = World::new();
+        let before = w.accounts_bytes();
+
+        let refused = edit_account(&w.store, &w.a_id, None, None, None, None, Some(Some(180.0)));
+
+        assert_eq!(
+            refused.as_ref().unwrap_err().to_string(),
+            "set a currency in Settings → General before a price"
+        );
+        assert!(matches!(refused, Err(SwitchError::PriceWithoutCurrency)));
+        assert_eq!(
+            w.accounts_bytes(),
+            before,
+            "a refused price leaves accounts.json untouched"
+        );
+    }
+
+    #[test]
+    fn the_same_price_in_a_new_currency_is_a_change() {
+        let w = World::new();
+        w.set_currency("EUR");
+
+        let first =
+            edit_account(&w.store, &w.a_id, None, None, None, None, Some(Some(180.0))).unwrap();
+        assert!(first.price_changed, "None to 180 is a change");
+        assert_eq!(first.account.price_currency.as_deref(), Some("EUR"));
+
+        w.set_currency("CHF");
+        let same =
+            edit_account(&w.store, &w.a_id, None, None, None, None, Some(Some(180.0))).unwrap();
+        assert!(
+            same.price_changed,
+            "the same amount in a new currency is a change: 180 EUR and 180 CHF differ"
+        );
+        assert_eq!(same.account.price, Some(180.0));
+        assert_eq!(same.account.price_currency.as_deref(), Some("CHF"));
+
+        let again =
+            edit_account(&w.store, &w.a_id, None, None, None, None, Some(Some(180.0))).unwrap();
+        assert!(
+            !again.price_changed,
+            "the same amount in the same currency is not a change"
+        );
+    }
+
+    #[test]
     fn edit_account_says_whether_the_price_changed() {
         let w = World::new();
+        w.set_currency("EUR");
 
         let first =
             edit_account(&w.store, &w.a_id, None, None, None, None, Some(Some(180.0))).unwrap();
