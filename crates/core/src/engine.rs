@@ -237,6 +237,11 @@ pub struct AccountView {
     pub usable: bool,
     /// The reset time of the blocking limit, when one blocks.
     pub blocked_until: Option<DateTime<Utc>>,
+    /// Why the blocking limit blocks, when one does. Not part of the JSON the
+    /// panel and `status --json` print; the engine's tie rule is the only
+    /// definition of it.
+    #[serde(skip)]
+    pub blocker: Option<Blocker>,
     pub fetched_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
 }
@@ -392,7 +397,8 @@ impl<R: Remote> Engine<R> {
             .as_ref()
             .and_then(|usage| blocking_limit(usage, self.models_in_use.as_ref()));
         let usable = account.login_state == LoginState::Ok && usage.is_some() && blocking.is_none();
-        let blocked_until = blocking.and_then(|(limit, _)| limit.resets_at);
+        let blocked_until = blocking.as_ref().and_then(|(limit, _)| limit.resets_at);
+        let blocker = blocking.map(|(_, blocker)| blocker);
         AccountView {
             id: account.id.clone(),
             label: account.label.clone(),
@@ -409,6 +415,7 @@ impl<R: Remote> Engine<R> {
             usage,
             usable,
             blocked_until,
+            blocker,
             fetched_at: entry.and_then(|entry| entry.fetched_at),
             last_error: entry.and_then(|entry| entry.last_error.clone()),
         }
@@ -1534,6 +1541,7 @@ mod tests {
             usage: percent.map(|percent| usage_with(percent, None)),
             usable: true,
             blocked_until: None,
+            blocker: None,
             fetched_at: Some(t0()),
             last_error: None,
         }

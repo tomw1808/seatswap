@@ -445,6 +445,7 @@ mod tests {
             usage,
             usable: true,
             blocked_until: None,
+            blocker: None,
             fetched_at: None,
             last_error: None,
         }

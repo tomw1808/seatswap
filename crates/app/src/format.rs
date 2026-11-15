@@ -301,6 +301,7 @@ mod tests {
             usage: None,
             usable: true,
             blocked_until: None,
+            blocker: None,
             fetched_at: None,
             last_error: None,
         };
@@ -333,6 +334,7 @@ mod tests {
             usage: None,
             usable: true,
             blocked_until: None,
+            blocker: None,
             fetched_at: None,
             last_error: None,
         };

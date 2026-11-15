@@ -5,20 +5,28 @@
 //! without notify-rust. Sending happens in small helpers; a suggestion with its
 //! "Switch" action waits on its own thread so no worker is blocked.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::thread;
 
-use chrono::{Local, Utc};
+#[cfg(all(unix, not(target_os = "macos")))]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(all(unix, not(target_os = "macos")))]
+use std::sync::{Arc, Mutex};
+
+use chrono::{DateTime, Local, Utc};
 use notify_rust::Notification as DesktopNotification;
 use notify_rust::NotificationResponse;
+#[cfg(all(unix, not(target_os = "macos")))]
+use notify_rust::Timeout;
 
-use seatswap_core::engine::{LoginWarning, Suggestion};
+use seatswap_core::engine::{Blocker, LoginWarning, Suggestion};
+use seatswap_core::store::LoginState;
 use seatswap_core::switcher::UnsavedPolicy;
 
 use super::format;
 #[cfg(windows)]
 use super::registry;
-use super::worker::{LiveView, Snapshot};
+use super::worker::{LiveView, Snapshot, Waiting};
 
 /// What the de-duplicator decided to show.
 #[derive(Debug, Clone, PartialEq)]
@@ -28,6 +36,17 @@ pub(crate) enum Notification {
     UnknownLogin {
         email: Option<String>,
         org_name: Option<String>,
+    },
+    UsableAgain {
+        id: String,
+        reason: String,
+    },
+    AllFull {
+        next: Option<(String, DateTime<Utc>)>,
+    },
+    Waiting(Waiting),
+    WaitingOver {
+        session: String,
     },
 }
 
@@ -48,10 +67,23 @@ impl WarningLevel {
     }
 }
 
-/// The rules of docs/implementation.md:
+/// What one account looked like in the previous snapshot (spec §4).
+#[derive(Debug, Clone)]
+struct PreviousView {
+    usable: bool,
+    blocked_until: Option<DateTime<Utc>>,
+    /// The engine's reason a limit blocked the account; `None` when no limit
+    /// blocked it (no usage yet, a login problem, or usable).
+    blocker: Option<Blocker>,
+}
+
+/// The rules of docs/implementation.md and spec §4:
 /// - a suggestion once per account and reset window;
 /// - a login warning once per account and level per run;
-/// - an unknown live login once per identity per run.
+/// - an unknown live login once per identity per run;
+/// - "usable again" once per account and reset;
+/// - "all accounts full" when the last usable account fills up;
+/// - each wait once per session and start, and its end when it is over.
 #[derive(Debug, Default)]
 pub(crate) struct Deduper {
     /// One entry per from-account and reset minute (docs/implementation.md).
@@ -59,6 +91,18 @@ pub(crate) struct Deduper {
     warnings: HashSet<(String, WarningLevel)>,
     /// Every unknown identity seen this run, so A -> B -> A announces A once.
     unknown: HashSet<(Option<String>, Option<String>)>,
+    /// The accounts as the previous snapshot showed them.
+    previous: HashMap<String, PreviousView>,
+    /// Whether any view was usable in the previous snapshot.
+    previous_any_usable: bool,
+    /// The first snapshot only fills [`Self::previous`] and
+    /// [`Self::previous_any_usable`]; it announces neither "usable again" nor
+    /// "all accounts full".
+    initialized: bool,
+    /// One entry per account id and its previous reset minute.
+    usable_again: HashSet<(String, Option<i64>)>,
+    /// The `since` already announced for each waiting session.
+    waiting_notified: HashMap<String, DateTime<Utc>>,
 }
 
 impl Deduper {
@@ -67,7 +111,7 @@ impl Deduper {
     }
 
     /// The notifications this snapshot adds, in the order they are sent.
-    pub(crate) fn due(&mut self, snapshot: &Snapshot) -> Vec<Notification> {
+    pub(crate) fn due(&mut self, snapshot: &Snapshot, now: DateTime<Utc>) -> Vec<Notification> {
         let mut due = Vec::new();
 
         if let Some(suggestion) = &snapshot.suggestion {
@@ -102,7 +146,179 @@ impl Deduper {
             }
         }
 
+        let any_usable = snapshot.views.iter().any(|view| view.usable);
+        if self.initialized {
+            self.usable_again(snapshot, &mut due);
+            self.all_full(snapshot, &mut due);
+        }
+        self.waiting(snapshot, now, &mut due);
+
+        self.previous = snapshot
+            .views
+            .iter()
+            .map(|view| {
+                (
+                    view.id.clone(),
+                    PreviousView {
+                        usable: view.usable,
+                        blocked_until: view.blocked_until,
+                        blocker: view.blocker.clone(),
+                    },
+                )
+            })
+            .collect();
+        self.previous_any_usable = any_usable;
+        self.initialized = true;
+
         due
+    }
+
+    /// When the earliest waiting session that is not yet old enough reaches
+    /// 15 s, so the caller does not wait for the next sessions pass.
+    pub(crate) fn recheck_at(
+        &self,
+        snapshot: &Snapshot,
+        now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        let sessions = snapshot.sessions.as_ref()?;
+        let mut earliest: Option<DateTime<Utc>> = None;
+        for waiting in &sessions.waiting {
+            if self.waiting_notified.get(&waiting.session) == Some(&waiting.since) {
+                continue;
+            }
+            let at = waiting.since + chrono::Duration::seconds(15);
+            if at <= now {
+                continue;
+            }
+            if earliest.is_none_or(|current| at < current) {
+                earliest = Some(at);
+            }
+        }
+        earliest
+    }
+
+    fn usable_again(&mut self, snapshot: &Snapshot, due: &mut Vec<Notification>) {
+        if !snapshot
+            .settings
+            .as_ref()
+            .is_some_and(|settings| settings.notify_usable_again)
+        {
+            return;
+        }
+        for view in &snapshot.views {
+            if !view.usable || view.is_active {
+                continue;
+            }
+            let Some(previous) = self.previous.get(&view.id) else {
+                continue;
+            };
+            let Some(blocker) = &previous.blocker else {
+                continue;
+            };
+            if previous.usable {
+                continue;
+            }
+            let key = (
+                view.id.clone(),
+                previous.blocked_until.map(|reset| reset.timestamp() / 60),
+            );
+            if self.usable_again.insert(key) {
+                due.push(Notification::UsableAgain {
+                    id: view.id.clone(),
+                    reason: blocker_reason(blocker),
+                });
+            }
+        }
+    }
+
+    /// "All accounts are full" only when the previous snapshot had a usable
+    /// view and every account whose login still works is blocked by a limit.
+    /// An account without a working login counts neither way (spec §4).
+    fn all_full(&self, snapshot: &Snapshot, due: &mut Vec<Notification>) {
+        if !self.previous_any_usable {
+            return;
+        }
+        let mut working = snapshot
+            .views
+            .iter()
+            .filter(|view| view.login_state == LoginState::Ok);
+        let Some(first) = working.next() else {
+            return;
+        };
+        if first.blocker.is_none() || working.any(|view| view.blocker.is_none()) {
+            return;
+        }
+        let mut next: Option<(String, DateTime<Utc>)> = None;
+        for view in snapshot
+            .views
+            .iter()
+            .filter(|view| view.login_state == LoginState::Ok)
+        {
+            let Some(blocked_until) = view.blocked_until else {
+                continue;
+            };
+            if next
+                .as_ref()
+                .is_none_or(|(_, earliest)| blocked_until < *earliest)
+            {
+                next = Some((view.id.clone(), blocked_until));
+            }
+        }
+        due.push(Notification::AllFull { next });
+    }
+
+    fn waiting(&mut self, snapshot: &Snapshot, now: DateTime<Utc>, due: &mut Vec<Notification>) {
+        let Some(settings) = snapshot.settings.as_ref() else {
+            return;
+        };
+        if !settings.notify_waiting {
+            // A shown notification is withdrawn even when the setting is off;
+            // nothing new is sent while it is off (spec §4.1).
+            let shown: Vec<String> = self.waiting_notified.keys().cloned().collect();
+            for session in shown {
+                self.waiting_notified.remove(&session);
+                due.push(Notification::WaitingOver { session });
+            }
+            return;
+        }
+        let Some(sessions) = &snapshot.sessions else {
+            return;
+        };
+        for waiting in &sessions.waiting {
+            if now.signed_duration_since(waiting.since) < chrono::Duration::seconds(15) {
+                continue;
+            }
+            if self.waiting_notified.get(&waiting.session) == Some(&waiting.since) {
+                continue;
+            }
+            self.waiting_notified
+                .insert(waiting.session.clone(), waiting.since);
+            due.push(Notification::Waiting(waiting.clone()));
+        }
+        let current: HashSet<&str> = sessions
+            .waiting
+            .iter()
+            .map(|waiting| waiting.session.as_str())
+            .collect();
+        let over: Vec<String> = self
+            .waiting_notified
+            .keys()
+            .filter(|session| !current.contains(session.as_str()))
+            .cloned()
+            .collect();
+        for session in over {
+            self.waiting_notified.remove(&session);
+            due.push(Notification::WaitingOver { session });
+        }
+    }
+}
+
+/// What the engine's [`Blocker`] says in "usable again" (spec §4).
+fn blocker_reason(blocker: &Blocker) -> String {
+    match blocker {
+        Blocker::Week => "its week reset".to_string(),
+        Blocker::Session => "its 5 h window reset".to_string(),
+        Blocker::Model(model) => format!("its {model} week reset"),
     }
 }
 
@@ -287,12 +503,204 @@ pub(crate) fn send_unknown_login(
     });
 }
 
+/// `PR is usable again: its week reset.`
+fn usable_again_text(account: &str, reason: &str) -> String {
+    format!("{account} is usable again: {reason}.")
+}
+
+/// `All accounts are full. Next: PR at 14:40.` — or without a next account.
+fn all_full_text(next: Option<(&str, &str)>) -> String {
+    match next {
+        Some((abbr, time)) => format!("All accounts are full. Next: {abbr} at {time}."),
+        None => "All accounts are full.".to_string(),
+    }
+}
+
+/// `acme-kb-dd is waiting for you (acme-kb, on atlas).` — the host part is
+/// left out when the machine has no acceptable host name (spec §4.1).
+fn waiting_text(waiting: &Waiting, host: Option<&str>) -> String {
+    match host {
+        Some(host) => format!(
+            "{} is waiting for you ({}, on {host}).",
+            waiting.label, waiting.project
+        ),
+        None => format!(
+            "{} is waiting for you ({}).",
+            waiting.label, waiting.project
+        ),
+    }
+}
+
+/// "PR is usable again: its week reset." with a "Switch" action; a click on
+/// the text opens the pop-up (spec §4).
+pub(crate) fn send_usable_again(
+    account: &str,
+    reason: &str,
+    on_switch: impl FnOnce() + Send + 'static,
+    on_open: impl FnOnce() + Send + 'static,
+) {
+    let body = usable_again_text(account, reason);
+    notify_in_background(move || {
+        let shown = clickable().body(&body).action("switch", "Switch").show();
+        let answered = shown.and_then(|handle| {
+            handle.wait_for_response(move |response: &NotificationResponse| {
+                match click(response, "switch") {
+                    Some(Click::Button) => on_switch(),
+                    Some(Click::Body) => on_open(),
+                    None => {}
+                }
+            })
+        });
+        if let Err(error) = answered {
+            eprintln!("seatswap: notification: {error}");
+        }
+    });
+}
+
+/// "All accounts are full." plus the next reset when there is one. Not
+/// clickable (spec §4).
+pub(crate) fn send_all_full(next: Option<(&str, &str)>) {
+    let body = all_full_text(next);
+    notify_in_background(move || {
+        let _ = base().body(&body).show();
+    });
+}
+
+/// A waiting session's notification that stays until it is clicked or
+/// withdrawn (spec §4.1).
+///
+/// `host` is the name the text shows (or `None` for the version without a
+/// host): [`Waiting`] carries no host, and this host's name is a setting.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn send_waiting(
+    waiting: &Waiting,
+    host: Option<&str>,
+    on_open: impl FnOnce() + Send + 'static,
+) -> WaitingHandle {
+    let body = waiting_text(waiting, host);
+    let state = Arc::new(WaitingState::default());
+    let thread_state = Arc::clone(&state);
+    notify_in_background(
+        move || match clickable().body(&body).timeout(Timeout::Never).show() {
+            Ok(handle) => {
+                let id = handle.id();
+                let withdrawn = {
+                    let mut slot = thread_state
+                        .id
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *slot = Some(id);
+                    thread_state.withdrawn.load(Ordering::SeqCst)
+                };
+                if withdrawn {
+                    close_by_id(id);
+                    return;
+                }
+                let answered = handle.wait_for_response(move |response: &NotificationResponse| {
+                    if click(response, "default").is_some() {
+                        on_open();
+                    }
+                });
+                if let Err(error) = answered {
+                    eprintln!("seatswap: notification: {error}");
+                }
+            }
+            Err(error) => eprintln!("seatswap: notification: {error}"),
+        },
+    );
+    WaitingHandle { state }
+}
+
+/// On Windows a toast follows the system's rules: it is shown once, may time
+/// out, and the pop-up keeps the count (spec §4.1).
+#[cfg(windows)]
+pub(crate) fn send_waiting(
+    waiting: &Waiting,
+    host: Option<&str>,
+    on_open: impl FnOnce() + Send + 'static,
+) -> WaitingHandle {
+    let body = waiting_text(waiting, host);
+    notify_in_background(move || match clickable().body(&body).show() {
+        Ok(handle) => {
+            let answered = handle.wait_for_response(move |response: &NotificationResponse| {
+                if click(response, "default").is_some() {
+                    on_open();
+                }
+            });
+            if let Err(error) = answered {
+                eprintln!("seatswap: notification: {error}");
+            }
+        }
+        Err(error) => eprintln!("seatswap: notification: {error}"),
+    });
+    WaitingHandle
+}
+
+/// The handle that can withdraw a waiting notification before the person
+/// clicks it.
+pub(crate) struct WaitingHandle {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    state: Arc<WaitingState>,
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[derive(Default)]
+struct WaitingState {
+    /// The notification's id, set by the showing thread before it waits.
+    id: Mutex<Option<u32>>,
+    /// Set by a withdraw that ran before the notification was shown, so the
+    /// showing thread closes it itself.
+    withdrawn: AtomicBool,
+}
+
+impl WaitingHandle {
+    /// Take the notification back (spec §4.1). A click after this does
+    /// nothing.
+    pub(crate) fn withdraw(self) {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let id = {
+                let slot = self
+                    .state
+                    .id
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                self.state.withdrawn.store(true, Ordering::SeqCst);
+                *slot
+            };
+            if let Some(id) = id {
+                close_by_id(id);
+            }
+        }
+        // Windows removes toasts by its own rules; notify-rust 4.19 gives no
+        // id on its Windows handle, so there is nothing to close there.
+        #[cfg(windows)]
+        let _ = self;
+    }
+}
+
+/// Close the notification with `id`: notify-rust 4.19 has no other way to
+/// close a notification whose handle waits for a click. Showing a notification
+/// built from [`base`] with the same id replaces that one, and the immediate
+/// `close` takes it away.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn close_by_id(id: u32) {
+    notify_in_background(move || {
+        if let Ok(handle) = base().id(id).show() {
+            handle.close();
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use chrono::DateTime;
-    use seatswap_core::store::Settings;
+    use seatswap_core::engine::AccountView;
+    use seatswap_core::store::{LoginState, Settings};
+
+    use crate::gui::worker::SessionsSummary;
 
     fn snapshot(
         suggestion: Option<Suggestion>,
@@ -321,6 +729,93 @@ mod tests {
             from_percent: 97.0,
             to_percent: 12.0,
             from_resets_at: resets_at,
+        }
+    }
+
+    fn utc(text: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(text)
+            .expect("a valid test time")
+            .with_timezone(&Utc)
+    }
+
+    fn view(
+        id: &str,
+        abbr: &str,
+        usable: bool,
+        blocked_until: Option<DateTime<Utc>>,
+        is_active: bool,
+    ) -> AccountView {
+        AccountView {
+            id: id.to_string(),
+            label: id.to_string(),
+            abbr: abbr.to_string(),
+            color: "#3b82f6".to_string(),
+            email: None,
+            plan: None,
+            is_active,
+            login_state: LoginState::Ok,
+            login_ends_at_ms: None,
+            login_days_left: None,
+            usage: None,
+            usable,
+            blocked_until,
+            blocker: None,
+            fetched_at: None,
+            last_error: None,
+        }
+    }
+
+    fn blocked_view(
+        id: &str,
+        abbr: &str,
+        blocked_until: Option<DateTime<Utc>>,
+        is_active: bool,
+        blocker: Blocker,
+    ) -> AccountView {
+        let mut view = view(id, abbr, false, blocked_until, is_active);
+        view.blocker = Some(blocker);
+        view
+    }
+
+    fn with_views(
+        views: Vec<AccountView>,
+        sessions: Option<SessionsSummary>,
+        settings: Option<Settings>,
+    ) -> Snapshot {
+        Snapshot {
+            active_id: views
+                .iter()
+                .find(|view| view.is_active)
+                .map(|view| view.id.clone()),
+            views,
+            live: LiveView::NoLogin,
+            suggestion: None,
+            warnings: Vec::new(),
+            pending: None,
+            secrets_warning: None,
+            last_poll_at: None,
+            error: None,
+            sessions,
+            settings,
+        }
+    }
+
+    fn waiting(since: DateTime<Utc>) -> Waiting {
+        Waiting {
+            session: "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34".to_string(),
+            label: "acme-kb-dd".to_string(),
+            project: "acme-kb".to_string(),
+            since,
+        }
+    }
+
+    fn sessions(waiting: Vec<Waiting>, busy: u32) -> SessionsSummary {
+        SessionsSummary {
+            running: waiting.len() as u32 + busy,
+            busy,
+            waiting,
+            unavailable: None,
+            warning: None,
         }
     }
 
@@ -382,10 +877,11 @@ mod tests {
                 org_name: None,
             },
         );
-        assert_eq!(deduper.due(&a).len(), 1);
-        assert_eq!(deduper.due(&b).len(), 1);
+        let now = Utc::now();
+        assert_eq!(deduper.due(&a, now).len(), 1);
+        assert_eq!(deduper.due(&b, now).len(), 1);
         assert!(
-            deduper.due(&a).is_empty(),
+            deduper.due(&a, now).is_empty(),
             "a login already announced this run must stay quiet"
         );
     }
@@ -404,10 +900,11 @@ mod tests {
         let a_to_p = snapshot(Some(make("a", "p")), Vec::new(), LiveView::NoLogin);
         let b_to_p = snapshot(Some(make("b", "p")), Vec::new(), LiveView::NoLogin);
         let a_to_p_again = snapshot(Some(make("a", "p")), Vec::new(), LiveView::NoLogin);
-        assert_eq!(deduper.due(&a_to_p).len(), 1);
-        assert_eq!(deduper.due(&b_to_p).len(), 1);
+        let now = Utc::now();
+        assert_eq!(deduper.due(&a_to_p, now).len(), 1);
+        assert_eq!(deduper.due(&b_to_p, now).len(), 1);
         assert!(
-            deduper.due(&a_to_p_again).is_empty(),
+            deduper.due(&a_to_p_again, now).is_empty(),
             "a suggestion already announced this run must stay quiet"
         );
     }
@@ -416,7 +913,8 @@ mod tests {
     fn a_suggestion_is_keyed_by_the_reset_minute() {
         let mut deduper = Deduper::new();
         // Start at a minute boundary so 20 s later is still the same minute.
-        let minute = Utc::now().timestamp() / 60 * 60;
+        let now = utc("2026-11-10T12:00:00Z");
+        let minute = now.timestamp();
         let reset = DateTime::<Utc>::from_timestamp(minute + 3600, 0).expect("valid timestamp");
         let first = snapshot(Some(suggestion(Some(reset))), Vec::new(), LiveView::NoLogin);
         let same_minute = snapshot(
@@ -424,15 +922,15 @@ mod tests {
             Vec::new(),
             LiveView::NoLogin,
         );
-        assert_eq!(deduper.due(&first).len(), 1);
-        assert!(deduper.due(&same_minute).is_empty());
+        assert_eq!(deduper.due(&first, now).len(), 1);
+        assert!(deduper.due(&same_minute, now).is_empty());
 
         let next_minute = snapshot(
             Some(suggestion(Some(reset + chrono::Duration::seconds(60)))),
             Vec::new(),
             LiveView::NoLogin,
         );
-        assert_eq!(deduper.due(&next_minute).len(), 1);
+        assert_eq!(deduper.due(&next_minute, now).len(), 1);
     }
 
     #[test]
@@ -442,16 +940,16 @@ mod tests {
         let reset = Some(now + chrono::Duration::hours(1));
 
         let first = snapshot(Some(suggestion(reset)), Vec::new(), LiveView::NoLogin);
-        assert_eq!(deduper.due(&first).len(), 1);
+        assert_eq!(deduper.due(&first, now).len(), 1);
         assert!(
-            deduper.due(&first).is_empty(),
+            deduper.due(&first, now).is_empty(),
             "the same window must not repeat"
         );
 
         // A new reset window may be announced again.
         let next_reset = Some(now + chrono::Duration::hours(6));
         let second = snapshot(Some(suggestion(next_reset)), Vec::new(), LiveView::NoLogin);
-        assert_eq!(deduper.due(&second).len(), 1);
+        assert_eq!(deduper.due(&second, now).len(), 1);
     }
 
     #[test]
@@ -461,8 +959,9 @@ mod tests {
             id: "as".to_string(),
             days_left: 4,
         };
+        let now = Utc::now();
         let first = snapshot(None, vec![soon.clone()], LiveView::NoLogin);
-        assert_eq!(deduper.due(&first).len(), 1);
+        assert_eq!(deduper.due(&first, now).len(), 1);
 
         // Same level, changed day count: still the same warning.
         let soon_again = LoginWarning::Soon {
@@ -470,21 +969,21 @@ mod tests {
             days_left: 3,
         };
         let again = snapshot(None, vec![soon_again], LiveView::NoLogin);
-        assert!(deduper.due(&again).is_empty());
+        assert!(deduper.due(&again, now).is_empty());
 
         // A different level for the same account is a new warning.
         let tomorrow = LoginWarning::Tomorrow {
             id: "as".to_string(),
         };
         let next = snapshot(None, vec![tomorrow], LiveView::NoLogin);
-        assert_eq!(deduper.due(&next).len(), 1);
+        assert_eq!(deduper.due(&next, now).len(), 1);
 
         // A different account is new too.
         let other = LoginWarning::Ended {
             id: "p".to_string(),
         };
         let other = snapshot(None, vec![other], LiveView::NoLogin);
-        assert_eq!(deduper.due(&other).len(), 1);
+        assert_eq!(deduper.due(&other, now).len(), 1);
     }
 
     #[test]
@@ -494,9 +993,10 @@ mod tests {
             email: Some("new@example.com".to_string()),
             org_name: Some("Acme".to_string()),
         };
+        let now = Utc::now();
         let first = snapshot(None, Vec::new(), live.clone());
-        assert_eq!(deduper.due(&first).len(), 1);
-        assert!(deduper.due(&first).is_empty());
+        assert_eq!(deduper.due(&first, now).len(), 1);
+        assert!(deduper.due(&first, now).is_empty());
 
         let other = snapshot(
             None,
@@ -506,6 +1006,437 @@ mod tests {
                 org_name: Some("Acme".to_string()),
             },
         );
-        assert_eq!(deduper.due(&other).len(), 1);
+        assert_eq!(deduper.due(&other, now).len(), 1);
+    }
+
+    #[test]
+    fn usable_again_fires_once_when_a_blocked_account_returns() {
+        let mut deduper = Deduper::new();
+        let now = utc("2026-11-10T14:35:00Z");
+        let blocked_until = Some(utc("2026-11-10T14:40:00Z"));
+
+        let blocked = with_views(
+            vec![blocked_view(
+                "AC",
+                "AC",
+                blocked_until,
+                false,
+                Blocker::Week,
+            )],
+            None,
+            Some(Settings::default()),
+        );
+        assert!(deduper.due(&blocked, now).is_empty());
+
+        let usable = with_views(
+            vec![view("AC", "AC", true, None, false)],
+            None,
+            Some(Settings::default()),
+        );
+        assert_eq!(
+            deduper.due(&usable, now + chrono::Duration::minutes(5)),
+            vec![Notification::UsableAgain {
+                id: "AC".to_string(),
+                reason: "its week reset".to_string(),
+            }]
+        );
+        assert!(deduper
+            .due(&usable, now + chrono::Duration::minutes(6))
+            .is_empty());
+    }
+
+    #[test]
+    fn usable_again_is_not_sent_for_the_active_account() {
+        let mut deduper = Deduper::new();
+        let now = utc("2026-11-10T14:35:00Z");
+        let blocked_until = Some(utc("2026-11-10T14:40:00Z"));
+
+        let blocked = with_views(
+            vec![blocked_view(
+                "AC",
+                "AC",
+                blocked_until,
+                false,
+                Blocker::Week,
+            )],
+            None,
+            Some(Settings::default()),
+        );
+        assert!(deduper.due(&blocked, now).is_empty());
+
+        let usable = with_views(
+            vec![view("AC", "AC", true, None, true)],
+            None,
+            Some(Settings::default()),
+        );
+        assert!(deduper
+            .due(&usable, now + chrono::Duration::minutes(5))
+            .is_empty());
+    }
+
+    #[test]
+    fn usable_again_respects_the_setting() {
+        let mut deduper = Deduper::new();
+        let now = utc("2026-11-10T14:35:00Z");
+        let blocked_until = Some(utc("2026-11-10T14:40:00Z"));
+        let settings = Settings {
+            notify_usable_again: false,
+            ..Settings::default()
+        };
+
+        let blocked = with_views(
+            vec![blocked_view(
+                "AC",
+                "AC",
+                blocked_until,
+                false,
+                Blocker::Week,
+            )],
+            None,
+            Some(settings.clone()),
+        );
+        assert!(deduper.due(&blocked, now).is_empty());
+
+        let usable = with_views(
+            vec![view("AC", "AC", true, None, false)],
+            None,
+            Some(settings),
+        );
+        assert!(deduper
+            .due(&usable, now + chrono::Duration::minutes(5))
+            .is_empty());
+    }
+
+    #[test]
+    fn usable_again_names_the_limit_that_blocked() {
+        let now = utc("2026-11-10T14:35:00Z");
+        let blocked_until = Some(utc("2026-11-10T14:40:00Z"));
+        for (blocker, reason) in [
+            (Blocker::Week, "its week reset"),
+            (Blocker::Session, "its 5 h window reset"),
+            (Blocker::Model("opus".to_string()), "its opus week reset"),
+        ] {
+            let mut deduper = Deduper::new();
+            let blocked = with_views(
+                vec![blocked_view("AC", "AC", blocked_until, false, blocker)],
+                None,
+                Some(Settings::default()),
+            );
+            assert!(deduper.due(&blocked, now).is_empty());
+
+            let usable = with_views(
+                vec![view("AC", "AC", true, None, false)],
+                None,
+                Some(Settings::default()),
+            );
+            assert_eq!(
+                deduper.due(&usable, now + chrono::Duration::minutes(5)),
+                vec![Notification::UsableAgain {
+                    id: "AC".to_string(),
+                    reason: reason.to_string(),
+                }],
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn all_full_names_the_next_account() {
+        let mut deduper = Deduper::new();
+        let now = utc("2026-11-10T14:00:00Z");
+
+        let some_usable = with_views(
+            vec![
+                view("AC", "AC", true, None, true),
+                blocked_view(
+                    "LB",
+                    "LB",
+                    Some(utc("2026-11-10T16:00:00Z")),
+                    false,
+                    Blocker::Week,
+                ),
+            ],
+            None,
+            Some(Settings::default()),
+        );
+        assert!(deduper.due(&some_usable, now).is_empty());
+
+        let all_full = with_views(
+            vec![
+                blocked_view(
+                    "AC",
+                    "AC",
+                    Some(utc("2026-11-10T14:40:00Z")),
+                    false,
+                    Blocker::Week,
+                ),
+                blocked_view(
+                    "LB",
+                    "LB",
+                    Some(utc("2026-11-10T16:00:00Z")),
+                    false,
+                    Blocker::Week,
+                ),
+            ],
+            None,
+            Some(Settings::default()),
+        );
+        assert_eq!(
+            deduper.due(&all_full, now + chrono::Duration::minutes(1)),
+            vec![Notification::AllFull {
+                next: Some(("AC".to_string(), utc("2026-11-10T14:40:00Z"))),
+            }]
+        );
+        assert!(deduper
+            .due(&all_full, now + chrono::Duration::minutes(2))
+            .is_empty());
+    }
+
+    #[test]
+    fn the_first_snapshot_sends_nothing() {
+        let now = utc("2026-11-10T14:00:00Z");
+        let blocked_until = Some(utc("2026-11-10T14:40:00Z"));
+
+        let mut deduper = Deduper::new();
+        let pair = with_views(
+            vec![
+                blocked_view("AC", "AC", blocked_until, false, Blocker::Week),
+                view("LB", "LB", true, None, true),
+            ],
+            None,
+            Some(Settings::default()),
+        );
+        assert!(
+            deduper.due(&pair, now).is_empty(),
+            "the first snapshot only fills the memory: no UsableAgain and no AllFull"
+        );
+
+        let mut deduper = Deduper::new();
+        let full = with_views(
+            vec![
+                blocked_view("AC", "AC", blocked_until, false, Blocker::Week),
+                blocked_view(
+                    "LB",
+                    "LB",
+                    Some(utc("2026-11-10T16:00:00Z")),
+                    false,
+                    Blocker::Week,
+                ),
+            ],
+            None,
+            Some(Settings::default()),
+        );
+        assert!(
+            deduper.due(&full, now).is_empty(),
+            "a first snapshot that is already full is not a change to full"
+        );
+    }
+
+    #[test]
+    fn waiting_needs_fifteen_seconds() {
+        let mut deduper = Deduper::new();
+        let wait = waiting(utc("2026-11-10T09:56:00Z"));
+
+        let early = with_views(
+            Vec::new(),
+            Some(sessions(vec![wait.clone()], 0)),
+            Some(Settings::default()),
+        );
+        assert!(deduper.due(&early, utc("2026-11-10T09:56:10Z")).is_empty());
+
+        assert_eq!(
+            deduper.due(&early, utc("2026-11-10T09:56:15Z")),
+            vec![Notification::Waiting(wait)]
+        );
+        assert!(deduper.due(&early, utc("2026-11-10T09:57:00Z")).is_empty());
+    }
+
+    #[test]
+    fn waiting_over_withdraws() {
+        let mut deduper = Deduper::new();
+        let wait = waiting(utc("2026-11-10T09:56:00Z"));
+
+        let waiting_now = with_views(
+            Vec::new(),
+            Some(sessions(vec![wait.clone()], 0)),
+            Some(Settings::default()),
+        );
+        assert_eq!(
+            deduper.due(&waiting_now, utc("2026-11-10T09:56:20Z")),
+            vec![Notification::Waiting(wait)]
+        );
+
+        let busy_again = with_views(
+            Vec::new(),
+            Some(sessions(Vec::new(), 1)),
+            Some(Settings::default()),
+        );
+        assert_eq!(
+            deduper.due(&busy_again, utc("2026-11-10T09:56:30Z")),
+            vec![Notification::WaitingOver {
+                session: "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn recheck_at_is_15_s_after_a_new_wait() {
+        let now = utc("2026-11-10T10:00:00Z");
+        let wait = waiting(utc("2026-11-10T09:59:55Z"));
+        let snapshot = with_views(
+            Vec::new(),
+            Some(sessions(vec![wait.clone()], 0)),
+            Some(Settings::default()),
+        );
+
+        let mut deduper = Deduper::new();
+        assert_eq!(
+            deduper.recheck_at(&snapshot, now),
+            Some(utc("2026-11-10T10:00:10Z")),
+            "a wait 5 s old is due 10 s later"
+        );
+
+        assert_eq!(
+            deduper.due(&snapshot, utc("2026-11-10T10:00:10Z")),
+            vec![Notification::Waiting(wait.clone())]
+        );
+        assert_eq!(
+            deduper.recheck_at(&snapshot, now),
+            None,
+            "a wait already announced needs no re-check"
+        );
+
+        let mut later = waiting(utc("2026-11-10T09:59:58Z"));
+        later.session = "2b7e4c1a-8d3f-4e6a-b8c5-2f0a1d7e9b34".to_string();
+        let two = with_views(
+            Vec::new(),
+            Some(sessions(vec![later, wait], 0)),
+            Some(Settings::default()),
+        );
+        let deduper = Deduper::new();
+        assert_eq!(
+            deduper.recheck_at(&two, now),
+            Some(utc("2026-11-10T10:00:10Z")),
+            "the earlier of two waits is the re-check"
+        );
+    }
+
+    #[test]
+    fn the_texts_are_exact() {
+        let wait = waiting(utc("2026-11-10T09:56:00Z"));
+
+        assert_eq!(
+            usable_again_text("PR", "its week reset"),
+            "PR is usable again: its week reset."
+        );
+        assert_eq!(
+            all_full_text(Some(("PR", "14:40"))),
+            "All accounts are full. Next: PR at 14:40."
+        );
+        assert_eq!(all_full_text(None), "All accounts are full.");
+        assert_eq!(
+            waiting_text(&wait, Some("atlas")),
+            "acme-kb-dd is waiting for you (acme-kb, on atlas)."
+        );
+        assert_eq!(
+            waiting_text(&wait, None),
+            "acme-kb-dd is waiting for you (acme-kb)."
+        );
+    }
+
+    #[test]
+    fn all_full_shows_the_weekday_of_a_far_reset() {
+        let now = utc("2026-11-13T01:00:00Z");
+        // Three days away: the shared helper shows the weekday.
+        let reset = utc("2026-11-16T01:00:00Z");
+        let time = format::format_reset_clock(reset, now, &Utc);
+        assert_eq!(
+            all_full_text(Some(("PR", &time))),
+            "All accounts are full. Next: PR at Mon 01:00."
+        );
+    }
+
+    // ---- Proof tests for the review of Task 10 (they fail today) ----
+
+    /// An account whose login ended is not a full account, so the "all
+    /// accounts are full" notification must not go out (spec §4: it is sent
+    /// "when the last usable account fills up").
+    #[test]
+    fn proof_all_full_is_not_sent_when_the_last_usable_account_logged_out() {
+        let mut deduper = Deduper::new();
+        let now = utc("2026-11-10T14:00:00Z");
+
+        let before = with_views(
+            vec![view("AC", "AC", true, None, true)],
+            None,
+            Some(Settings::default()),
+        );
+        assert!(deduper.due(&before, now).is_empty());
+
+        let mut logged_out = view("AC", "AC", false, None, true);
+        logged_out.login_state = LoginState::LoggedOut;
+        let after = with_views(vec![logged_out], None, Some(Settings::default()));
+        assert!(
+            deduper
+                .due(&after, now + chrono::Duration::minutes(1))
+                .is_empty(),
+            "an account whose login ended is not full: no \"All accounts are full.\""
+        );
+    }
+
+    /// The same rule with no account left: an empty list is not a full list.
+    #[test]
+    fn proof_all_full_is_not_sent_when_no_account_is_left() {
+        let mut deduper = Deduper::new();
+        let now = utc("2026-11-10T14:00:00Z");
+
+        let before = with_views(
+            vec![view("AC", "AC", true, None, true)],
+            None,
+            Some(Settings::default()),
+        );
+        assert!(deduper.due(&before, now).is_empty());
+
+        let after = with_views(Vec::new(), None, Some(Settings::default()));
+        assert!(
+            deduper
+                .due(&after, now + chrono::Duration::minutes(1))
+                .is_empty(),
+            "no account is not a full account: no \"All accounts are full.\""
+        );
+    }
+
+    /// The notification was shown and the setting is switched off: the wait is
+    /// over, so the notification must be withdrawn (spec §4.1).
+    #[test]
+    fn proof_a_shown_waiting_notification_is_withdrawn_when_the_setting_is_off() {
+        let mut deduper = Deduper::new();
+        let wait = waiting(utc("2026-11-10T09:56:00Z"));
+
+        let on = with_views(
+            Vec::new(),
+            Some(sessions(vec![wait.clone()], 0)),
+            Some(Settings::default()),
+        );
+        assert_eq!(
+            deduper.due(&on, utc("2026-11-10T09:56:20Z")),
+            vec![Notification::Waiting(wait.clone())]
+        );
+
+        let off = with_views(
+            Vec::new(),
+            Some(sessions(Vec::new(), 1)),
+            Some(Settings {
+                notify_waiting: false,
+                ..Settings::default()
+            }),
+        );
+        assert_eq!(
+            deduper.due(&off, utc("2026-11-10T09:56:30Z")),
+            vec![Notification::WaitingOver {
+                session: wait.session.clone()
+            }],
+            "a shown notification must be withdrawn when the wait is over"
+        );
     }
 }

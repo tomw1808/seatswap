@@ -26,7 +26,7 @@ pub(crate) mod tray;
 pub(crate) mod worker;
 
 #[cfg(feature = "gui")]
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 #[cfg(feature = "gui")]
 use std::path::PathBuf;
 #[cfg(feature = "gui")]
@@ -39,9 +39,14 @@ use std::sync::{Mutex, MutexGuard};
 use std::thread;
 
 #[cfg(feature = "gui")]
-use seatswap_core::paths::AppPaths;
+use chrono::{DateTime, Local, Utc};
+
+#[cfg(feature = "gui")]
+use seatswap_core::paths::{self, AppPaths};
 #[cfg(feature = "gui")]
 use seatswap_core::store;
+#[cfg(feature = "gui")]
+use seatswap_core::switcher::UnsavedPolicy;
 
 #[cfg(feature = "gui")]
 use notify::Notification;
@@ -56,6 +61,14 @@ use worker::SessionsSummary;
 #[cfg(feature = "gui")]
 use worker::{ActionCommand, ActionReply, EngineCommand, PendingSwitch, Snapshot, UiEvent};
 
+/// The one pending 15 s re-check: when it wakes and whether its thread runs.
+#[cfg(feature = "gui")]
+#[derive(Default)]
+struct Recheck {
+    at: Option<DateTime<Utc>>,
+    running: bool,
+}
+
 /// Everything the Tauri commands and the tray share. The snapshot is updated
 /// only on the main thread (from `UiEvent`s) or by a command that then emits it.
 #[cfg(feature = "gui")]
@@ -66,6 +79,11 @@ pub(crate) struct GuiState {
     pub(crate) engine: std::sync::mpsc::Sender<EngineCommand>,
     pub(crate) action: std::sync::mpsc::Sender<ActionCommand>,
     deduper: Mutex<notify::Deduper>,
+    /// The waiting notifications that can still be withdrawn, by session id.
+    waiting: Mutex<HashMap<String, notify::WaitingHandle>>,
+    /// The one pending 15 s re-check for a session that has just started to
+    /// wait (`notify::Deduper::recheck_at`).
+    recheck: Mutex<Recheck>,
     notified_errors: Mutex<HashSet<String>>,
     /// Where the panel was opened, its last height and when focus loss last
     /// hid it (`panel::PanelState`).
@@ -164,6 +182,9 @@ pub(crate) fn run(
                 if let tauri::RunEvent::Exit = event {
                     if let Some(state) = handle.try_state::<GuiState>() {
                         state.exiting.store(true, Ordering::SeqCst);
+                        // A quit drops the waiting notifications; the process
+                        // is ending, so nothing has to close them one by one.
+                        lock(&state.waiting).clear();
                         let _ = state.engine.send(EngineCommand::Shutdown);
                     }
                 }
@@ -292,6 +313,8 @@ fn setup(
         engine: worker.engine.clone(),
         action: worker.action.clone(),
         deduper: Mutex::new(notify::Deduper::new()),
+        waiting: Mutex::new(HashMap::new()),
+        recheck: Mutex::new(Recheck::default()),
         notified_errors: Mutex::new(HashSet::new()),
         panel: Mutex::new(panel::PanelState::new()),
         tray: Mutex::new(None),
@@ -397,12 +420,16 @@ fn apply_snapshot(app: &AppHandle, mut snapshot: Snapshot) {
             None => startup.clone(),
         });
     }
-    let due = {
+    let now = Utc::now();
+    let (due, recheck) = {
         let mut current = lock(&state.snapshot);
         snapshot.retain_pending(current.pending.as_ref());
-        let due = lock(&state.deduper).due(&snapshot);
+        let mut deduper = lock(&state.deduper);
+        let due = deduper.due(&snapshot, now);
+        let recheck = deduper.recheck_at(&snapshot, now);
+        drop(deduper);
         *current = snapshot.clone();
-        due
+        (due, recheck)
     };
 
     let _ = app.emit("snapshot", &snapshot);
@@ -436,8 +463,136 @@ fn apply_snapshot(app: &AppHandle, mut snapshot: Snapshot) {
             Notification::UnknownLogin { email, org_name } => {
                 notify::send_unknown_login(app.clone(), email.as_deref(), org_name.as_deref());
             }
+            Notification::UsableAgain { id, reason } => {
+                let abbr = view_abbr(&snapshot, &id);
+                let switch_app = app.clone();
+                let switch_id = id.clone();
+                let on_switch = move || {
+                    request_switch(&switch_app, switch_id, UnsavedPolicy::Refuse, None);
+                };
+                let open_app = app.clone();
+                let on_open = move || {
+                    let handle = open_app.clone();
+                    let _ = open_app.run_on_main_thread(move || show_panel(&handle, "main"));
+                };
+                notify::send_usable_again(&abbr, &reason, on_switch, on_open);
+            }
+            Notification::AllFull { next } => match next {
+                Some((id, at)) => {
+                    let abbr = view_abbr(&snapshot, &id);
+                    let time = format::format_reset_clock(at, Utc::now(), &Local);
+                    notify::send_all_full(Some((&abbr, &time)));
+                }
+                None => notify::send_all_full(None),
+            },
+            Notification::Waiting(waiting) => {
+                let host = snapshot
+                    .settings
+                    .as_ref()
+                    .and_then(|settings| paths::host_name(settings.host_name.as_deref()).ok());
+                let open_app = app.clone();
+                let on_open = move || {
+                    let handle = open_app.clone();
+                    let _ = open_app.run_on_main_thread(move || show_panel(&handle, "main"));
+                };
+                let handle = notify::send_waiting(&waiting, host.as_deref(), on_open);
+                let previous = lock(&state.waiting).insert(waiting.session.clone(), handle);
+                if let Some(previous) = previous {
+                    previous.withdraw();
+                }
+            }
+            Notification::WaitingOver { session } => {
+                let handle = lock(&state.waiting).remove(&session);
+                if let Some(handle) = handle {
+                    handle.withdraw();
+                }
+            }
         }
     }
+    schedule_recheck(app, recheck);
+}
+
+/// Keep at most one thread for the next 15 s re-check. A newer moment replaces
+/// the pending one's purpose: the thread that wakes for nothing finds nothing
+/// due and stops.
+#[cfg(feature = "gui")]
+fn schedule_recheck(app: &AppHandle, at: Option<DateTime<Utc>>) {
+    let Some(at) = at else {
+        return;
+    };
+    let state = app.state::<GuiState>();
+    let start = {
+        let mut recheck = lock(&state.recheck);
+        recheck.at = Some(at);
+        if recheck.running {
+            false
+        } else {
+            recheck.running = true;
+            true
+        }
+    };
+    if !start {
+        return;
+    }
+    let handle = app.clone();
+    let spawned = thread::Builder::new()
+        .name("seatswap-recheck".to_string())
+        .spawn(move || loop {
+            let Some(state) = handle.try_state::<GuiState>() else {
+                return;
+            };
+            let target = {
+                let recheck = lock(&state.recheck);
+                match recheck.at {
+                    Some(target) => target,
+                    None => {
+                        drop(recheck);
+                        let mut recheck = lock(&state.recheck);
+                        recheck.running = false;
+                        return;
+                    }
+                }
+            };
+            let now = Utc::now();
+            if target <= now {
+                apply_recheck_now(&handle);
+                return;
+            }
+            let wait = match (target - now).to_std() {
+                Ok(wait) => wait,
+                Err(_) => {
+                    // The target is not in the future (the clock moved past it
+                    // after the read above): apply the snapshot at once, as
+                    // the branch above does.
+                    apply_recheck_now(&handle);
+                    return;
+                }
+            };
+            thread::sleep(wait);
+        });
+    if let Err(error) = spawned {
+        eprintln!("seatswap: re-check thread: {error}");
+        let state = app.state::<GuiState>();
+        let mut recheck = lock(&state.recheck);
+        recheck.at = None;
+        recheck.running = false;
+    }
+}
+
+/// Apply the stored snapshot again because a pending 15 s re-check is due.
+#[cfg(feature = "gui")]
+fn apply_recheck_now(handle: &AppHandle) {
+    let Some(state) = handle.try_state::<GuiState>() else {
+        return;
+    };
+    {
+        let mut recheck = lock(&state.recheck);
+        recheck.at = None;
+        recheck.running = false;
+    }
+    let snapshot = lock(&state.snapshot).clone();
+    let wake = handle.clone();
+    let _ = handle.run_on_main_thread(move || apply_snapshot(&wake, snapshot));
 }
 
 #[cfg(feature = "gui")]
