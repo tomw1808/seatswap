@@ -6,7 +6,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use serde::Serialize;
 
 use crate::history::{AccountRef, Hosts, Range, TokenRecord};
@@ -115,15 +115,18 @@ pub struct ProjectDetail {
 type WeeklyByModel = Vec<(DateTime<Utc>, Vec<(String, u64)>)>;
 
 /// The Projects page of the range the query names.
-pub fn projects_page(ctx: &Ctx, q: &Query) -> Result<ProjectsPage, StatsError> {
+pub fn projects_page<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
+    q: &Query,
+) -> Result<ProjectsPage, StatsError> {
     let range = range_of(q.range, ctx)?;
     projects_page_in(ctx, &range, q)
 }
 
 /// The Projects page of `range`; the page's [`projects_page`] takes the range
 /// from its [`Query`], the tests name one.
-pub(crate) fn projects_page_in(
-    ctx: &Ctx,
+pub(crate) fn projects_page_in<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
     range: &Range,
     q: &Query,
 ) -> Result<ProjectsPage, StatsError> {
@@ -414,15 +417,19 @@ pub(crate) fn projects_page_in(
 
 /// The detail of the project `key`, over all hosts: a folder key is per host,
 /// so every host's folder of that name counts.
-pub fn project_detail(ctx: &Ctx, q: &Query, key: &ProjectKey) -> Result<ProjectDetail, StatsError> {
+pub fn project_detail<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
+    q: &Query,
+    key: &ProjectKey,
+) -> Result<ProjectDetail, StatsError> {
     let range = range_of(q.range, ctx)?;
     project_detail_in(ctx, &range, q, key)
 }
 
 /// The detail of `key` in `range`; the page's [`project_detail`] takes the
 /// range from its [`Query`], the tests name one.
-pub(crate) fn project_detail_in(
-    ctx: &Ctx,
+pub(crate) fn project_detail_in<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
     range: &Range,
     q: &Query,
     key: &ProjectKey,
@@ -499,7 +506,7 @@ pub(crate) fn project_detail_in(
         agent_answers += u64::from(hosted.record.agent_answers);
         add_value(&mut hosts, hosted.host.clone(), &entry.values);
         *weekly
-            .entry(week_start(hosted.record.t, ctx.offset))
+            .entry(week_start(hosted.record.t, &ctx.zone))
             .or_default()
             .entry(hosted.record.model.clone())
             .or_insert(0) += hosted.record.out;
@@ -622,7 +629,12 @@ struct NodeLabel {
     org_accounts: Vec<String>,
 }
 
-fn node_from(ctx: &Ctx, label: NodeLabel, sums: &Sums, page_api: Option<f64>) -> Node {
+fn node_from<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
+    label: NodeLabel,
+    sums: &Sums,
+    page_api: Option<f64>,
+) -> Node {
     let level = match label.kind {
         NodeKind::Org => 0,
         NodeKind::Project => 1,
@@ -645,7 +657,7 @@ fn node_from(ctx: &Ctx, label: NodeLabel, sums: &Sums, page_api: Option<f64>) ->
 
 /// Each account's share of the node's API value, largest first; an account no
 /// longer stored sorts after the stored ones.
-fn by_account(ctx: &Ctx, sums: &Sums) -> Vec<(Option<String>, f64)> {
+fn by_account<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, sums: &Sums) -> Vec<(Option<String>, f64)> {
     let Some(api) = sums.api().filter(|api| *api > 0.0) else {
         return Vec::new();
     };
@@ -696,7 +708,12 @@ fn org_cells(org: &OrgRow, accounts: &[&Account]) -> Vec<Option<f64>> {
 }
 
 /// The sentences of one organization that has accounts of its own.
-fn org_sentences(ctx: &Ctx, org: &OrgRow, orgs: &[OrgRow], currency: Option<&str>) -> Vec<String> {
+fn org_sentences<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
+    org: &OrgRow,
+    orgs: &[OrgRow],
+    currency: Option<&str>,
+) -> Vec<String> {
     let Some(identity) = &org.identity else {
         return Vec::new();
     };
@@ -825,7 +842,7 @@ fn org_sentences(ctx: &Ctx, org: &OrgRow, orgs: &[OrgRow], currency: Option<&str
 
 /// The shown name of an organization identity; a project without one is under
 /// `Unassigned`.
-fn org_name(ctx: &Ctx, identity: &Option<String>) -> String {
+fn org_name<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, identity: &Option<String>) -> String {
     match identity {
         Some(identity) => ctx
             .projects

@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde::Serialize;
 
 use crate::api::LimitKind;
@@ -18,9 +18,10 @@ use crate::transcripts::Tokens;
 
 use super::{
     account_abbr, account_chosen, account_id, account_position, account_weeks_valued,
-    blocked_by_week, blocked_spans, hours_text, lost_percent, money_of, money_text, percent_text,
-    range_of, switch_counts, top_three, week_columns, working_hours, working_rhythm, AccountWeek,
-    Ctx, Query, RangeKey, StatsError, SwitchCounts,
+    blocked_by_week, blocked_spans, hours_text, lost_percent, money_of, money_text,
+    next_week_start, percent_text, previous_week_start, range_of, switch_counts, top_three,
+    week_columns, week_start, working_hours, working_rhythm, AccountWeek, Ctx, Query, RangeKey,
+    StatsError, SwitchCounts,
 };
 
 /// The Weeks page: the grid of account weeks and the curves of the last 14
@@ -31,6 +32,9 @@ pub struct WeeksPage {
     /// The calendar weeks of the range, Monday 00:00 local, the same columns
     /// the Overview shows.
     pub week_starts: Vec<DateTime<Utc>>,
+    /// One per `week_starts`: whether that column is the calendar week
+    /// `Ctx::now` falls in. The page draws its "now" cell there.
+    pub running: Vec<bool>,
     pub rows: Vec<WeeksRow>,
     /// The working hours blocked in each column's week; a week without a span
     /// is a measured 0.0.
@@ -149,14 +153,18 @@ pub struct WindowDetail {
 }
 
 /// The Weeks page of the range the query names.
-pub fn weeks(ctx: &Ctx, q: &Query) -> Result<WeeksPage, StatsError> {
+pub fn weeks<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, q: &Query) -> Result<WeeksPage, StatsError> {
     let range = range_of(q.range, ctx)?;
     weeks_in(ctx, &range, q)
 }
 
 /// The Weeks page of `range`; the page's [`weeks`] takes the range from its
 /// [`Query`], the tests name one.
-pub(crate) fn weeks_in(ctx: &Ctx, range: &Range, q: &Query) -> Result<WeeksPage, StatsError> {
+pub(crate) fn weeks_in<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
+    range: &Range,
+    q: &Query,
+) -> Result<WeeksPage, StatsError> {
     let valuer = Valuer::build(
         ctx.history,
         range,
@@ -168,8 +176,8 @@ pub(crate) fn weeks_in(ctx: &Ctx, range: &Range, q: &Query) -> Result<WeeksPage,
     let finished = account_weeks_valued(ctx, range, q, &valuer)?;
     let spans = blocked_spans(ctx, range, q)?;
     let rhythm = working_rhythm(ctx, range)?;
-    let blocked_weeks = blocked_by_week(&spans, &rhythm, ctx.offset);
-    let week_starts = week_columns(range, ctx.offset);
+    let blocked_weeks = blocked_by_week(&spans, &rhythm, &ctx.zone);
+    let week_starts = week_columns(range, &ctx.zone);
     // The samples of the last 14 days and the newest one before now: one read
     // serves both the running percents and the curves.
     let samples = ctx.history.read::<Sample>(&Range::ALL, &Hosts::All)?;
@@ -245,9 +253,12 @@ pub(crate) fn weeks_in(ctx: &Ctx, range: &Range, q: &Query) -> Result<WeeksPage,
         .iter()
         .map(|week| blocked_weeks.get(week).copied().unwrap_or(0.0))
         .collect();
+    let this_week = week_start(ctx.now, &ctx.zone);
+    let running = week_starts.iter().map(|week| *week == this_week).collect();
 
     Ok(WeeksPage {
         week_starts,
+        running,
         rows,
         blocked,
         recent,
@@ -357,13 +368,17 @@ fn curve(
 }
 
 /// The summary of one calendar week, `[week, week + 7 d)`.
-pub fn week_summary(ctx: &Ctx, q: &Query, week: DateTime<Utc>) -> Result<WeekSummary, StatsError> {
+pub fn week_summary<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
+    q: &Query,
+    week: DateTime<Utc>,
+) -> Result<WeekSummary, StatsError> {
     let range = range_of(q.range, ctx)?;
     let week_range = Range {
         from: week,
-        to: week + Duration::days(7),
+        to: next_week_start(week, &ctx.zone),
     };
-    let previous = week - Duration::days(7);
+    let previous = previous_week_start(week, &ctx.zone);
     // The summary needs the week before too, also when the page's range starts
     // later: the change against it is part of the summary.
     let reading = Range {
@@ -436,7 +451,7 @@ pub fn week_summary(ctx: &Ctx, q: &Query, week: DateTime<Utc>) -> Result<WeekSum
     };
     let spans = blocked_spans(ctx, &blocked_range, q)?;
     let rhythm = working_rhythm(ctx, &range)?;
-    let blocked_hours = blocked_by_week(&spans, &rhythm, ctx.offset)
+    let blocked_hours = blocked_by_week(&spans, &rhythm, &ctx.zone)
         .get(&week)
         .copied()
         .unwrap_or(0.0);
@@ -608,8 +623,8 @@ fn waited_switches(events: &[Hosted<Event>], range: &Range, host: Option<&str>) 
 
 /// The detail of the finished weekly window of the stored account that ends at
 /// `end`.
-pub fn window_detail(
-    ctx: &Ctx,
+pub fn window_detail<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
     account_id: &str,
     end: DateTime<Utc>,
 ) -> Result<WindowDetail, StatsError> {
@@ -764,8 +779,8 @@ fn unknown_window(account_id: &str, end: DateTime<Utc>, unknown_account: bool) -
 /// The working hours blocked from `from` to the window's end. The hours are
 /// counted in the rhythm of the four weeks before [`Ctx::now`]: a single
 /// window has no range of its own to take them from.
-fn blocked_hours_after(
-    ctx: &Ctx,
+fn blocked_hours_after<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
     reference: &AccountRef,
     from: DateTime<Utc>,
     window: &WindowRecord,
@@ -788,7 +803,7 @@ fn blocked_hours_after(
             let start = span.from.max(from);
             let end = span.to.min(window.end);
             if start < end {
-                working_hours(start, end, &rhythm, ctx.offset)
+                working_hours(start, end, &rhythm, &ctx.zone)
             } else {
                 0.0
             }
@@ -849,6 +864,24 @@ mod tests {
         assert_eq!(lb.now_percent, Some(30.0));
         assert_eq!(ac.now_percent, Some(40.0));
         assert_eq!(page.blocked, vec![2.0, 0.0]);
+    }
+
+    /// The page says which column is the running week, so the browser needs no
+    /// clock of its own.
+    #[test]
+    fn the_running_week_is_marked_by_the_page() {
+        let tiny = tiny();
+        let ctx = tiny.ctx();
+        let range = Range {
+            from: utc("2026-11-09T00:00:00Z"),
+            to: tiny.now,
+        };
+        let page = weeks_in(&ctx, &range, &all()).unwrap();
+        assert_eq!(
+            page.week_starts,
+            vec![utc("2026-11-09T00:00:00Z"), utc("2026-11-16T00:00:00Z")]
+        );
+        assert_eq!(page.running, vec![false, true]);
     }
 
     /// A week before the account existed is empty, not zero: AC is added on

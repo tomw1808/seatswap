@@ -1333,13 +1333,15 @@ heartbeat: it rewrites the same account and time at least this often so a runnin
 ## burn/rates.rs — rhythm, live account, rates (step B)
 
 ```rust
-pub fn rhythm(tokens: &[Hosted<TokenRecord>], now: DateTime<Utc>, offset: FixedOffset) -> Rhythm;
+pub fn rhythm<Tz: TimeZone + Copy>(tokens: &[Hosted<TokenRecord>], now: DateTime<Utc>,
+                                   zone: &Tz) -> Rhythm;
 pub fn account_at(events: &[Hosted<Event>], host: &str, t: DateTime<Utc>) -> Option<AccountRef>;
 pub fn rates(account: &AccountRef, samples: &[Hosted<Sample>], tokens: &[Hosted<TokenRecord>],
              events: &[Hosted<Event>], now: DateTime<Utc>) -> Option<Rates>;
 ```
 
-`rhythm` spreads a record's hour over the local clock hours it covers. `rates` pairs consecutive
+`rhythm` spreads a record's hour over the local clock hours it covers with the zone's offset at
+each instant. `rates` pairs consecutive
 samples of the same weekly window at most 6 h apart in the last 14 days, counts the work of token
 records whose host had the account live, and returns `None` until the week's work reaches
 `LEARN_MIN_WU`; `s` is `None` for an uncapped account or too little session work. A pair whose
@@ -1473,7 +1475,7 @@ recorded hours with work (0.0 when none); the reads' warnings are kept for the c
     pub warnings: Vec<String>, pub events: Vec<Hosted<Event>>, pub host: String,
     pub sessions_off: bool }
 pub enum Readiness { Ready(Situation), Unread { accounts: Vec<String> }, NoAccounts }
-pub fn learn(history: &HistoryDir, now: DateTime<Utc>, offset: FixedOffset,
+pub fn learn<Tz: TimeZone + Copy>(history: &HistoryDir, now: DateTime<Utc>, zone: Tz,
              accounts: &[Account], read_sessions: bool) -> Result<Learned, HistoryError>;
 pub fn situation(learned: &Learned, views: &[AccountView], accounts: &[Account],
                  active: Option<&str>, now: DateTime<Utc>, offset: FixedOffset,
@@ -2682,32 +2684,44 @@ for tests or the core feature `fixtures`.
 pub enum StatsError { History(HistoryError), Money(MoneyError), Message(String) }
 pub enum RangeKey { ThisWeek, LastWeek, Days30, Days90, Months12, All }
 pub struct Query { pub range: RangeKey, pub accounts: Vec<String>, pub host: Option<String> }
-pub struct Ctx<'a> { pub history: &'a HistoryDir, pub accounts: &'a [Account],
-    pub settings: &'a Settings, pub prices: &'a Prices, pub fx: &'a Fx,
-    pub projects: &'a Projects, pub now: DateTime<Utc>, pub offset: FixedOffset }
+// Every function below that takes a `Ctx` declares `Tz: TimeZone + Copy`; the listings
+// write the short `ctx: &Ctx<Tz>` for space. `Ctx`'s zone defaults to `FixedOffset` for
+// the fixture; the app passes `chrono::Local`.
+pub struct Ctx<'a, Tz: TimeZone + Copy = FixedOffset> { pub history: &'a HistoryDir,
+    pub accounts: &'a [Account], pub settings: &'a Settings, pub prices: &'a Prices,
+    pub fx: &'a Fx, pub projects: &'a Projects, pub now: DateTime<Utc>, pub zone: Tz }
 
 /// ThisWeek: this week's Monday .. now. LastWeek: the Monday before .. this Monday.
 /// Days30/Days90/Months12: the Monday of the week holding now − 30/90/365 days .. now.
 /// All: the Monday of the week holding the first record .. now; this week's Monday when
 /// the history is empty.
-pub fn range_of(key: RangeKey, ctx: &Ctx) -> Result<Range, StatsError>;
-pub fn week_start(t: DateTime<Utc>, offset: FixedOffset) -> DateTime<Utc>;
-pub(crate) fn local_hour_start(t: DateTime<Utc>, offset: FixedOffset) -> DateTime<Utc>;
-pub(crate) fn local_day_start(t: DateTime<Utc>, offset: FixedOffset) -> DateTime<Utc>;
+pub fn range_of<Tz: TimeZone + Copy>(key: RangeKey, ctx: &Ctx<Tz>)
+    -> Result<Range, StatsError>;
+pub fn week_start<Tz: TimeZone + Copy>(t: DateTime<Utc>, zone: &Tz) -> DateTime<Utc>;
+pub(crate) fn local_hour_start<Tz: TimeZone + Copy>(t: DateTime<Utc>, zone: &Tz)
+    -> DateTime<Utc>;
+pub(crate) fn local_day_start<Tz: TimeZone + Copy>(t: DateTime<Utc>, zone: &Tz)
+    -> DateTime<Utc>;
+pub(crate) fn next_local_day_start<Tz: TimeZone + Copy>(t: DateTime<Utc>, zone: &Tz)
+    -> DateTime<Utc>;
+pub(crate) fn next_week_start<Tz: TimeZone + Copy>(week: DateTime<Utc>, zone: &Tz)
+    -> DateTime<Utc>;
+pub(crate) fn previous_week_start<Tz: TimeZone + Copy>(week: DateTime<Utc>, zone: &Tz)
+    -> DateTime<Utc>;
 
 pub struct AccountWeek { pub week: DateTime<Utc>, pub account: AccountRef,
     pub window: WindowRecord, pub price: Option<f64>, pub price_missing: Option<Missing> }
-pub fn account_weeks(ctx: &Ctx, range: &Range, q: &Query)
+pub fn account_weeks(ctx: &Ctx<Tz>, range: &Range, q: &Query)
     -> Result<Vec<AccountWeek>, StatsError>;
-pub(crate) fn account_weeks_valued(ctx: &Ctx, range: &Range, q: &Query, valuer: &Valuer)
+pub(crate) fn account_weeks_valued(ctx: &Ctx<Tz>, range: &Range, q: &Query, valuer: &Valuer)
     -> Result<Vec<AccountWeek>, StatsError>;
 
 pub struct BlockedSpan { pub host: String, pub account: AccountRef,
     pub from: DateTime<Utc>, pub to: DateTime<Utc>, pub hours: f64, pub avoidable_hours: f64 }
-pub fn blocked_spans(ctx: &Ctx, range: &Range, q: &Query)
+pub fn blocked_spans(ctx: &Ctx<Tz>, range: &Range, q: &Query)
     -> Result<Vec<BlockedSpan>, StatsError>;
 pub struct Empty { pub recording_since: Option<DateTime<Utc>> }
-pub fn empty(ctx: &Ctx, range: &Range) -> Result<Option<Empty>, StatsError>;
+pub fn empty(ctx: &Ctx<Tz>, range: &Range) -> Result<Option<Empty>, StatsError>;
 ```
 
 - `range_of` starts every range at a local Monday (spec §3.1's ranges); `All` uses the week of the
@@ -2740,7 +2754,7 @@ The shared helpers, used by more than one page:
 | `money_of` | the week's `money::window_money(price, final percent)`: `paid = 100 × pv`, `expired = max(0, 100 − final) × pv`, `used = paid − expired`; `None` without a price |
 | `lost_percent` | the window's `lost`; an error when the history lacks it, because seatswap always writes it |
 | `SwitchCounts`, `switch_counts` | `Switch` events of a range and host by `By::{User, Cli, Auto, Agent, External}` |
-| `week_columns` | Monday 00:00 local of the week holding `range.from`, then every seven days while the start is before `range.to` |
+| `week_columns` | Monday 00:00 local of the week holding `range.from`, then each following Monday 00:00 local while the start is before `range.to` |
 | `blocked_by_week`, `blocked_by_weekday` | spans split at every week start or local midnight; each part counts its working hours |
 | `week_of_record`, `output_by_account_week` | the account week whose window holds an instant; output tokens per `(account, calendar week)` for the records inside those windows |
 | `account_chosen` | empty `q.accounts` = every account; otherwise only a named account; a record without a known account is never chosen by a filter |
@@ -2765,11 +2779,11 @@ pub struct OverviewWeek { pub week: DateTime<Utc>, pub accounts: Vec<WeekAccount
 pub struct WeekAccount { pub id: String, pub used_percent: f64, pub used: Option<f64>,
     pub expired_percent: f64, pub expired: Option<f64>, pub uncertain: bool }
 pub struct Mark { pub at: DateTime<Utc>, pub label: String }
-pub fn overview(ctx: &Ctx, q: &Query) -> Result<Overview, StatsError>;
+pub fn overview(ctx: &Ctx<Tz>, q: &Query) -> Result<Overview, StatsError>;
 
 // weeks.rs
-pub struct WeeksPage { pub week_starts: Vec<DateTime<Utc>>, pub rows: Vec<WeeksRow>,
-    pub blocked: Vec<f64>, pub recent: Vec<Curve> }
+pub struct WeeksPage { pub week_starts: Vec<DateTime<Utc>>, pub running: Vec<bool>,
+    pub rows: Vec<WeeksRow>, pub blocked: Vec<f64>, pub recent: Vec<Curve> }
 pub struct WeeksRow { pub id: String, pub plan: Option<String>, pub cells: Vec<Option<WeekCell>>,
     pub now_percent: Option<f64> }
 pub struct WeekCell { pub end: DateTime<Utc>, pub used: f64, pub expired: f64,
@@ -2786,10 +2800,10 @@ pub struct WindowDetail { pub id: String, pub end: DateTime<Utc>, pub used: f64,
     pub session_windows_used: Option<u32>, pub switches_in_out: u32, pub switches_auto: u32,
     pub last_sample_before_end_secs: i64, pub uncertain: bool,
     pub curve: Vec<(DateTime<Utc>, f64)> }
-pub fn weeks(ctx: &Ctx, q: &Query) -> Result<WeeksPage, StatsError>;
-pub fn week_summary(ctx: &Ctx, q: &Query, week: DateTime<Utc>)
+pub fn weeks(ctx: &Ctx<Tz>, q: &Query) -> Result<WeeksPage, StatsError>;
+pub fn week_summary(ctx: &Ctx<Tz>, q: &Query, week: DateTime<Utc>)
     -> Result<WeekSummary, StatsError>;
-pub fn window_detail(ctx: &Ctx, account_id: &str, end: DateTime<Utc>)
+pub fn window_detail(ctx: &Ctx<Tz>, account_id: &str, end: DateTime<Utc>)
     -> Result<WindowDetail, StatsError>;
 
 // projects.rs
@@ -2806,8 +2820,8 @@ pub struct Matrix { pub orgs: Vec<String>, pub accounts: Vec<String>,
 pub struct ProjectDetail { pub name: String, pub tokens: Tokens, pub agent_share: f64,
     pub hosts: Vec<(String, f64)>, pub subscription: Option<f64>, pub api: Option<f64>,
     pub weekly_by_model: Vec<(DateTime<Utc>, Vec<(String, u64)>)>, pub sessions: u32 }
-pub fn projects_page(ctx: &Ctx, q: &Query) -> Result<ProjectsPage, StatsError>;
-pub fn project_detail(ctx: &Ctx, q: &Query, key: &ProjectKey)
+pub fn projects_page(ctx: &Ctx<Tz>, q: &Query) -> Result<ProjectsPage, StatsError>;
+pub fn project_detail(ctx: &Ctx<Tz>, q: &Query, key: &ProjectKey)
     -> Result<ProjectDetail, StatsError>;
 
 // subscriptions.rs
@@ -2825,8 +2839,8 @@ pub struct WhatIf { pub without: String, pub blocked_hours: Option<f64>,
     pub blocked_hours_was: f64, pub expired: Option<f64>, pub expired_was: Option<f64>,
     pub saved_price: Option<f64>, pub sentence: String,
     pub weekly: Vec<(DateTime<Utc>, f64, f64)> }
-pub fn subscriptions(ctx: &Ctx, q: &Query) -> Result<SubscriptionsPage, StatsError>;
-pub fn what_if(ctx: &Ctx, q: &Query, without: &str) -> Result<WhatIf, StatsError>;
+pub fn subscriptions(ctx: &Ctx<Tz>, q: &Query) -> Result<SubscriptionsPage, StatsError>;
+pub fn what_if(ctx: &Ctx<Tz>, q: &Query, without: &str) -> Result<WhatIf, StatsError>;
 
 // forecast.rs
 pub struct Forecast { pub basis_weeks: u32, pub learning: Vec<String>,
@@ -2841,7 +2855,7 @@ pub struct ForecastAccount { pub id: String, pub now: f64, pub expected: Option<
     pub only_when_full_expected: Option<f64>, pub only_when_full_expires: Option<f64> }
 pub struct Lane { pub id: String, pub blocks: Vec<(DateTime<Utc>, DateTime<Utc>)>,
     pub resets: Vec<DateTime<Utc>> }
-pub fn forecast(ctx: &Ctx, inputs: &Inputs, regime: &Regime) -> Result<Forecast, StatsError>;
+pub fn forecast(ctx: &Ctx<Tz>, inputs: &Inputs, regime: &Regime) -> Result<Forecast, StatsError>;
 
 // activity.rs
 pub struct RhythmPage { pub heat: Vec<f64>, pub per_day: Vec<DayRow> }
@@ -2863,8 +2877,8 @@ pub struct BigSession { pub label: String, pub project: String, pub host: String
 pub struct ActivityPage { pub lanes: Vec<HostLane>, pub days: Vec<DayTokens>,
     pub weeks: Vec<ActivityWeek>, pub largest: Vec<BigSession>,
     pub waited: Vec<(NaiveDate, f64)>, pub peak_hour: Tokens }
-pub fn rhythm(ctx: &Ctx, q: &Query) -> Result<RhythmPage, StatsError>;
-pub fn activity(ctx: &Ctx, q: &Query) -> Result<ActivityPage, StatsError>;
+pub fn rhythm(ctx: &Ctx<Tz>, q: &Query) -> Result<RhythmPage, StatsError>;
+pub fn activity(ctx: &Ctx<Tz>, q: &Query) -> Result<ActivityPage, StatsError>;
 ```
 
 Page details that are easy to miss:
@@ -2873,6 +2887,8 @@ Page details that are easy to miss:
   findings are the only sentences and are built in the fixed order above, each `None` when its data
   is missing.
 - `WeeksRow.cells` is one entry per `week_starts`; `None` means no finished window that week.
+  `WeeksPage.running` has one flag per column: `true` for the calendar week `Ctx::now` falls in;
+  the page draws the "now" cell there and needs no browser clock.
   `now_percent` is the newest weekly sample of an account whose window is still running.
   `recent` covers the last 14 days. `session_windows_used` counts finished `session` windows with
   `final > 0` that ended inside the weekly window. `blocked_hours_after` uses the rhythm of the four
@@ -2911,15 +2927,16 @@ pub(crate) enum Page<T> { Empty(Empty), Data(T) }        // serde: {"empty":{…
 pub(crate) struct StatsParts { accounts: Vec<Account>, settings: Settings, prices: Prices,
     fx: Fx, projects: projects::Projects }
 impl StatsParts {
-    pub(crate) fn ctx<'a>(&'a self, history: &'a HistoryDir, now: DateTime<Utc>,
-        offset: FixedOffset) -> Ctx<'a>;
+    pub(crate) fn ctx<'a, Tz: TimeZone + Copy>(&'a self, history: &'a HistoryDir,
+        now: DateTime<Utc>, zone: Tz) -> Ctx<'a, Tz>;
 }
 pub(crate) fn load_prices_and_fx(app: &AppPaths) -> Result<(Prices, Fx), String>;
 pub(crate) fn stats_ctx_parts(app: &AppPaths, history: &HistoryDir)
     -> Result<StatsParts, String>;
-fn stats_page<T>(parts: &StatsParts, history: &HistoryDir, now: DateTime<Utc>,
-    offset: FixedOffset, query: &Query,
-    compute: impl FnOnce(&Ctx<'_>) -> Result<T, stats::StatsError>) -> Result<Page<T>, String>;
+fn stats_page<T, Tz: TimeZone + Copy>(parts: &StatsParts, history: &HistoryDir,
+    now: DateTime<Utc>, zone: Tz, query: &Query,
+    compute: impl FnOnce(&Ctx<'_, Tz>) -> Result<T, stats::StatsError>)
+    -> Result<Page<T>, String>;
 ```
 
 `stats_ctx_parts` loads `accounts.json`, the prices and the dollar rate through the one
@@ -2935,27 +2952,27 @@ Each page has a plain testable function and one async command. Every page comman
 `stats_hosts` is the separate host list:
 
 ```rust
-pub(crate) fn stats_overview_at(parts, history, now, offset, query)
+pub(crate) fn stats_overview_at<Tz: TimeZone + Copy>(parts, history, now, zone, query)
     -> Result<Page<overview::Overview>, String>;
-pub(crate) fn stats_weeks_at(parts, history, now, offset, query)
+pub(crate) fn stats_weeks_at<Tz: TimeZone + Copy>(parts, history, now, zone, query)
     -> Result<Page<weeks::WeeksPage>, String>;
-pub(crate) fn stats_week_summary_at(parts, history, now, offset, query, week: DateTime<Utc>)
+pub(crate) fn stats_week_summary_at<Tz: TimeZone + Copy>(parts, history, now, zone, query, week: DateTime<Utc>)
     -> Result<Page<weeks::WeekSummary>, String>;
-pub(crate) fn stats_window_detail_at(parts, history, now, offset, query,
+pub(crate) fn stats_window_detail_at<Tz: TimeZone + Copy>(parts, history, now, zone, query,
     account_id: &str, end: DateTime<Utc>) -> Result<Page<weeks::WindowDetail>, String>;
-pub(crate) fn stats_projects_at(parts, history, now, offset, query)
+pub(crate) fn stats_projects_at<Tz: TimeZone + Copy>(parts, history, now, zone, query)
     -> Result<Page<stats_projects::ProjectsPage>, String>;
-pub(crate) fn stats_project_detail_at(parts, history, now, offset, query,
+pub(crate) fn stats_project_detail_at<Tz: TimeZone + Copy>(parts, history, now, zone, query,
     key: &ProjectKey) -> Result<Page<stats_projects::ProjectDetail>, String>;
-pub(crate) fn stats_subscriptions_at(parts, history, now, offset, query)
+pub(crate) fn stats_subscriptions_at<Tz: TimeZone + Copy>(parts, history, now, zone, query)
     -> Result<Page<subscriptions::SubscriptionsPage>, String>;
-pub(crate) fn stats_what_if_at(parts, history, now, offset, query, without: &str)
+pub(crate) fn stats_what_if_at<Tz: TimeZone + Copy>(parts, history, now, zone, query, without: &str)
     -> Result<Page<subscriptions::WhatIf>, String>;
-pub(crate) fn stats_forecast_at(parts, history, now, offset,
-    inputs: Option<(Inputs, Regime)>) -> Result<Page<forecast::Forecast>, String>;
-pub(crate) fn stats_rhythm_at(parts, history, now, offset, query)
+pub(crate) fn stats_forecast_at<Tz: TimeZone + Copy>(parts, history, now, zone,
+    kept: Option<KeptForecast>) -> Result<Page<forecast::Forecast>, String>;
+pub(crate) fn stats_rhythm_at<Tz: TimeZone + Copy>(parts, history, now, zone, query)
     -> Result<Page<activity::RhythmPage>, String>;
-pub(crate) fn stats_activity_at(parts, history, now, offset, query)
+pub(crate) fn stats_activity_at<Tz: TimeZone + Copy>(parts, history, now, zone, query)
     -> Result<Page<activity::ActivityPage>, String>;
 pub(crate) fn stats_hosts_at(history: &HistoryDir) -> Result<Vec<String>, String>;
 ```
@@ -2963,21 +2980,21 @@ pub(crate) fn stats_hosts_at(history: &HistoryDir) -> Result<Vec<String>, String
 `stats_forecast_at` takes no `Query`: the forecast is the latest plan kept from the auto-burn
 runtime, for every account and host (spec §3.4), and `stats_forecast` asks only the state. It
 returns the one error `the forecast needs a reading of every account first` both when the kept
-inputs are `None` and when their `now` is more than `burn::FRESH_MIN` (20 min) before the command's
-`now`. `stats_hosts_at` is `HistoryDir::hosts()`, so a broken prices file cannot hide the host
-list.
+inputs are `None` and when the oldest reading they were built from is more than `burn::FRESH_MIN`
+(20 min) before the command's `now`. `stats_hosts_at` is `HistoryDir::hosts()`, so a broken prices
+file cannot hide the host list.
 
 One private helper is the body of every page command (`stats_hosts` reads only the host list):
 
 ```rust
 async fn stats_command<T, F>(state: State<'_, super::GuiState>, run: F) -> Result<T, String>
 where T: Send + 'static,
-      F: FnOnce(&StatsParts, &HistoryDir, DateTime<Utc>, FixedOffset) -> Result<T, String>
+      F: FnOnce(&StatsParts, &HistoryDir, DateTime<Utc>, Local) -> Result<T, String>
           + Send + 'static;
 ```
 
 It clones the app paths and the history handle, and inside `spawn_blocking` loads `StatsParts`,
-takes `Utc::now()` and `*Local::now().offset()`, and runs the page's function. The files are thus
+takes `Utc::now()` and `Local`, the computer's time zone, and runs the page's function. The files are thus
 read on the blocking thread, not on the async one. The async commands `stats_overview`,
 `stats_weeks`, `stats_week_summary`, `stats_window_detail`, `stats_projects`,
 `stats_project_detail`, `stats_subscriptions`, `stats_what_if`, `stats_forecast`, `stats_rhythm`,
@@ -2988,22 +3005,24 @@ reads the kept `(Inputs, Regime)` from `GuiState` before it enters the helper.
 
 ```rust
 // gui/burn_rt.rs
-pub(crate) struct BurnReport { …, pub forecast: Option<(Inputs, Regime)> }
+pub(crate) type KeptForecast = (Inputs, Regime, DateTime<Utc>);
+pub(crate) struct BurnReport { …, pub forecast: Option<KeptForecast> }
 
 // gui/worker.rs and gui/mod.rs
-pub(crate) forecast: Arc<Mutex<Option<(Inputs, Regime)>>>
+pub(crate) forecast: Arc<Mutex<Option<KeptForecast>>>
 ```
 
 `BurnRuntime::tick`, after `live::assess` produced the situation, the regime and the plan, does
-`report.forecast = Some((situation.inputs.clone(), regime.clone()))`. A tick that has no situation
+`report.forecast = Some((situation.inputs.clone(), regime.clone(), situation.oldest_reading))`. A tick that has no situation
 (sessions off, no account, an unread account, or no learned rates) leaves it `None`; the worker
 stores `report.forecast` on every report, `None` included, through `gui::lock`, so a tick without a
 situation clears the kept forecast. `stats_forecast` reads that one field and hands it to
 `stats_forecast_at`; it never recomputes a situation. The values are the plan's own `Inputs`
 (each account's id, weekly percent and reset, session state and rates, `may_use` from the account's
 `auto_burn`) and `Regime` (the early-switching verdict and the lazy/eager blocked hours), so the
-Forecast page and auto-burn are computed from the same values; an `Inputs` older than `FRESH_MIN`
-is refused like none.
+Forecast page and auto-burn are computed from the same values; the page refuses the kept plan when
+the oldest reading it was built from (`situation.oldest_reading`) is older than `FRESH_MIN`, with the
+same text as no plan.
 
 ## The statistics fixture and `export_tiny` (step C3)
 

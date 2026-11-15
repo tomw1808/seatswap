@@ -2,7 +2,7 @@
 //! rhythm of work, and each account's rates. The plans, the decision, the cost
 //! of a switch and the replay join these types in the tasks after this one.
 
-use chrono::{DateTime, Datelike, FixedOffset, Timelike, Utc};
+use chrono::{DateTime, FixedOffset, Utc};
 
 pub mod burn_next;
 pub mod cost;
@@ -97,7 +97,7 @@ pub struct Rhythm {
 impl Rhythm {
     /// The work units of the hour that holds `t`.
     pub fn at(&self, t: DateTime<Utc>, offset: FixedOffset) -> f64 {
-        self.wu[hour_of_week(t, offset)]
+        self.wu[crate::stats::local_hour_of_week(t, &offset)]
     }
 
     /// The mean over the hours that have work, 0.0 when there is none: the
@@ -124,12 +124,6 @@ pub(crate) fn mean_over_hours(hours: impl IntoIterator<Item = f64>) -> f64 {
     } else {
         sum / count as f64
     }
-}
-
-/// The index of the hour of the week that holds `t`: Monday 00:00 local is 0.
-pub(crate) fn hour_of_week(t: DateTime<Utc>, offset: FixedOffset) -> usize {
-    let local = t.with_timezone(&offset);
-    local.weekday().num_days_from_monday() as usize * 24 + local.hour() as usize
 }
 
 /// One account's rates (spec §2.3): `c` is the percent of its week one work

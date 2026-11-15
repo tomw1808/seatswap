@@ -78,7 +78,7 @@ impl Tiny {
             fx: &self.fx,
             projects: &self.projects,
             now: self.now,
-            offset: self.offset,
+            zone: self.offset,
         }
     }
 

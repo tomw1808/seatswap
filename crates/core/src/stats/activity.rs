@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, Datelike, Days, Duration, NaiveDate, Timelike, Utc};
+use chrono::{DateTime, Datelike, Days, Duration, NaiveDate, TimeZone, Timelike, Utc};
 use serde::Serialize;
 
 use crate::history::{
@@ -17,8 +17,9 @@ use crate::transcripts::Tokens;
 
 use super::projects::folder_name;
 use super::{
-    account_chosen, blocked_by_weekday, blocked_spans, local_day_start, local_hour_start, range_of,
-    week_columns, week_start, working_rhythm, Ctx, Query, StatsError,
+    account_chosen, blocked_by_weekday, blocked_spans, local_date_start, local_day_start,
+    local_hour_start, next_local_day_start, range_of, week_columns, week_start, working_rhythm,
+    Ctx, Query, StatsError,
 };
 
 /// The Rhythm page: the heat map of the week and the averages per weekday.
@@ -161,19 +162,23 @@ pub struct ActivityPage {
 }
 
 /// The Rhythm page of the range the query names.
-pub fn rhythm(ctx: &Ctx, q: &Query) -> Result<RhythmPage, StatsError> {
+pub fn rhythm<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, q: &Query) -> Result<RhythmPage, StatsError> {
     let range = range_of(q.range, ctx)?;
     rhythm_in(ctx, &range, q)
 }
 
 /// The Rhythm page of `range`; the page's [`rhythm`] takes the range from its
 /// [`Query`], the tests name one.
-pub(crate) fn rhythm_in(ctx: &Ctx, range: &Range, q: &Query) -> Result<RhythmPage, StatsError> {
+pub(crate) fn rhythm_in<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
+    range: &Range,
+    q: &Query,
+) -> Result<RhythmPage, StatsError> {
     let valuer = valuer(ctx, range)?;
     let tokens = ctx.history.read::<TokenRecord>(range, &Hosts::All)?;
     let entries = chosen_entries(ctx, q, range, &valuer, &tokens.records);
 
-    let columns = week_columns(range, ctx.offset);
+    let columns = week_columns(range, &ctx.zone);
     let weeks = columns.len();
     if weeks == 0 {
         return Err(StatsError::Message(format!(
@@ -185,8 +190,8 @@ pub(crate) fn rhythm_in(ctx: &Ctx, range: &Range, q: &Query) -> Result<RhythmPag
     let mut hours_by_weekday: Vec<BTreeSet<DateTime<Utc>>> =
         (0..7).map(|_| BTreeSet::new()).collect();
     for entry in &entries {
-        let hour = local_hour_start(entry.record.t, ctx.offset);
-        let local = hour.with_timezone(&ctx.offset);
+        let hour = local_hour_start(entry.record.t, &ctx.zone);
+        let local = hour.with_timezone(&ctx.zone);
         let index = local.weekday().num_days_from_monday() as usize * 24 + local.hour() as usize;
         heat[index] += entry.record.out as f64;
         hours_by_weekday[local.weekday().num_days_from_monday() as usize].insert(hour);
@@ -197,7 +202,7 @@ pub(crate) fn rhythm_in(ctx: &Ctx, range: &Range, q: &Query) -> Result<RhythmPag
 
     let spans = blocked_spans(ctx, range, q)?;
     let rhythm = working_rhythm(ctx, range)?;
-    let blocked = blocked_by_weekday(&spans, &rhythm, ctx.offset);
+    let blocked = blocked_by_weekday(&spans, &rhythm, &ctx.zone);
 
     let mut per_day = Vec::with_capacity(7);
     for (weekday, hours) in hours_by_weekday.iter().enumerate() {
@@ -212,26 +217,33 @@ pub(crate) fn rhythm_in(ctx: &Ctx, range: &Range, q: &Query) -> Result<RhythmPag
 }
 
 /// The Activity page of the range the query names.
-pub fn activity(ctx: &Ctx, q: &Query) -> Result<ActivityPage, StatsError> {
+pub fn activity<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, q: &Query) -> Result<ActivityPage, StatsError> {
     let range = range_of(q.range, ctx)?;
     activity_in(ctx, &range, q)
 }
 
 /// The Activity page of `range`; the page's [`activity`] takes the range from
 /// its [`Query`], the tests name one.
-pub(crate) fn activity_in(ctx: &Ctx, range: &Range, q: &Query) -> Result<ActivityPage, StatsError> {
+pub(crate) fn activity_in<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
+    range: &Range,
+    q: &Query,
+) -> Result<ActivityPage, StatsError> {
     let valuer = valuer(ctx, range)?;
     // The lanes and the days end with the hour and the date that hold the
     // range's last instant (`range.to` itself is outside the range).
     let last = range.to - Duration::nanoseconds(1);
-    let lane_end = local_hour_start(last, ctx.offset) + Duration::hours(1);
+    let lane_end = local_hour_start(last, &ctx.zone) + Duration::hours(1);
     let lane = Range {
         from: lane_end - Duration::hours(168),
         to: lane_end,
     };
-    let day_end = local_day_start(last, ctx.offset) + Duration::days(1);
+    let last_date = local_day_start(last, &ctx.zone)
+        .with_timezone(&ctx.zone)
+        .date_naive();
+    let day_end = next_local_day_start(last, &ctx.zone);
     let day_window = Range {
-        from: day_end - Duration::days(14),
+        from: local_date_start(last_date - Duration::days(13), &ctx.zone),
         to: day_end,
     };
     let read = Range {
@@ -262,7 +274,7 @@ pub(crate) fn activity_in(ctx: &Ctx, range: &Range, q: &Query) -> Result<Activit
     })
 }
 
-fn valuer(ctx: &Ctx, range: &Range) -> Result<Valuer, StatsError> {
+fn valuer<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, range: &Range) -> Result<Valuer, StatsError> {
     Ok(Valuer::build(
         ctx.history,
         range,
@@ -282,8 +294,8 @@ struct Entry {
 
 /// The token records of `range` on the chosen hosts and accounts, each valued
 /// once.
-fn chosen_entries(
-    ctx: &Ctx,
+fn chosen_entries<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
     q: &Query,
     range: &Range,
     valuer: &Valuer,
@@ -338,8 +350,8 @@ fn hosts(
 /// the hour holding the range's last instant. `entries` are the range's chosen
 /// records, for the lane's `tokens` and `values`; `lane_entries` are the
 /// chosen records of the lane's own window.
-fn host_lanes(
-    ctx: &Ctx,
+fn host_lanes<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
     lane: &Range,
     entries: &[Entry],
     lane_entries: &[Entry],
@@ -363,7 +375,7 @@ fn host_lanes(
         if hosted.record.t >= first && hosted.record.t < end {
             up_hours.insert((
                 hosted.host.clone(),
-                local_hour_start(hosted.record.t, ctx.offset),
+                local_hour_start(hosted.record.t, &ctx.zone),
             ));
         }
     }
@@ -373,7 +385,7 @@ fn host_lanes(
         by_hour
             .entry((
                 entry.host.clone(),
-                local_hour_start(entry.record.t, ctx.offset),
+                local_hour_start(entry.record.t, &ctx.zone),
             ))
             .or_default()
             .push(entry);
@@ -392,7 +404,7 @@ fn host_lanes(
         let (mut working, mut idle, mut off, mut unknown) = (0, 0, 0, 0);
         let mut lane_out = 0;
         for step in 0..168 {
-            let t = first + Duration::hours(step);
+            let t = local_hour_start(first + Duration::hours(step), &ctx.zone);
             let key = (host.clone(), t);
             let mut by_model: BTreeMap<&str, u64> = BTreeMap::new();
             let mut sessions: BTreeSet<&str> = BTreeSet::new();
@@ -466,21 +478,21 @@ fn host_lanes(
 
 /// The output tokens per local date of `window`, the 14 days that end with the
 /// date holding the range's last instant, oldest first.
-fn days(
-    ctx: &Ctx,
+fn days<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
     window: &Range,
     entries: &[Entry],
     hosts: &[String],
 ) -> Result<Vec<DayTokens>, StatsError> {
-    let end = (window.to - Duration::days(1))
-        .with_timezone(&ctx.offset)
+    let end = (window.to - Duration::nanoseconds(1))
+        .with_timezone(&ctx.zone)
         .date_naive();
     let mut by_day: BTreeMap<(String, NaiveDate), u64> = BTreeMap::new();
     for entry in entries {
         *by_day
             .entry((
                 entry.host.clone(),
-                entry.record.t.with_timezone(&ctx.offset).date_naive(),
+                entry.record.t.with_timezone(&ctx.zone).date_naive(),
             ))
             .or_insert(0) += entry.record.out;
     }
@@ -504,18 +516,18 @@ fn days(
 }
 
 /// One row per calendar week of the range.
-fn activity_weeks(
-    ctx: &Ctx,
+fn activity_weeks<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
     range: &Range,
     entries: &[Entry],
     hosts: &[String],
 ) -> Vec<ActivityWeek> {
-    let columns = week_columns(range, ctx.offset);
+    let columns = week_columns(range, &ctx.zone);
     let mut by_week: BTreeMap<DateTime<Utc>, Vec<&Entry>> =
         columns.iter().map(|week| (*week, Vec::new())).collect();
     for entry in entries {
         by_week
-            .entry(week_start(entry.record.t, ctx.offset))
+            .entry(week_start(entry.record.t, &ctx.zone))
             .or_default()
             .push(entry);
     }
@@ -535,7 +547,7 @@ fn activity_weeks(
             hours
                 .entry(entry.host.as_str())
                 .or_default()
-                .insert(local_hour_start(entry.record.t, ctx.offset));
+                .insert(local_hour_start(entry.record.t, &ctx.zone));
             tokens += Tokens::from(&entry.record);
             valued.push(entry.valued.clone());
             sessions.insert((entry.host.clone(), entry.record.session.clone()));
@@ -572,7 +584,10 @@ fn activity_weeks(
 
 /// The sessions with records in the range, by output tokens, largest first, at
 /// most 20.
-fn largest_sessions(ctx: &Ctx, entries: &[Entry]) -> Result<Vec<BigSession>, StatsError> {
+fn largest_sessions<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
+    entries: &[Entry],
+) -> Result<Vec<BigSession>, StatsError> {
     #[derive(Default)]
     struct Sum {
         host: String,
@@ -598,7 +613,7 @@ fn largest_sessions(ctx: &Ctx, entries: &[Entry]) -> Result<Vec<BigSession>, Sta
         });
         sum.tokens += Tokens::from(&entry.record);
         sum.hours
-            .insert(local_hour_start(entry.record.t, ctx.offset));
+            .insert(local_hour_start(entry.record.t, &ctx.zone));
         *sum.by_model.entry(entry.record.model.clone()).or_insert(0) += entry.record.out;
         sum.valued.push(entry.valued.clone());
     }
@@ -648,8 +663,8 @@ fn largest_sessions(ctx: &Ctx, entries: &[Entry]) -> Result<Vec<BigSession>, Sta
 }
 
 /// The minutes sessions waited for the user, per local date.
-fn waited_minutes(
-    ctx: &Ctx,
+fn waited_minutes<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
     range: &Range,
     q: &Query,
 ) -> Result<Vec<(NaiveDate, f64)>, StatsError> {
@@ -664,7 +679,7 @@ fn waited_minutes(
         }
         if let EventKind::Waited { secs, .. } = &hosted.record.kind {
             *by_day
-                .entry(hosted.record.t.with_timezone(&ctx.offset).date_naive())
+                .entry(hosted.record.t.with_timezone(&ctx.zone).date_naive())
                 .or_insert(0) += secs;
         }
     }
@@ -676,11 +691,11 @@ fn waited_minutes(
 
 /// The tokens of the hour with the most output tokens, all chosen records
 /// together; `Tokens::default()` without a record.
-fn peak_hour(ctx: &Ctx, entries: &[Entry]) -> Tokens {
+fn peak_hour<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, entries: &[Entry]) -> Tokens {
     let mut by_hour: BTreeMap<DateTime<Utc>, Tokens> = BTreeMap::new();
     for entry in entries {
         *by_hour
-            .entry(local_hour_start(entry.record.t, ctx.offset))
+            .entry(local_hour_start(entry.record.t, &ctx.zone))
             .or_default() += Tokens::from(&entry.record);
     }
     let mut best: Option<Tokens> = None;
@@ -903,7 +918,7 @@ mod tests {
         .expect("the vega marker");
 
         let ctx = Ctx {
-            offset: FixedOffset::east_opt(3600).expect("+01:00"),
+            zone: FixedOffset::east_opt(3600).expect("+01:00"),
             ..tiny.ctx()
         };
         let page = rhythm_in(&ctx, &two_weeks(), &all()).unwrap();
@@ -1079,7 +1094,7 @@ mod tests {
             ])
             .expect("the two records");
         let ctx = Ctx {
-            offset: FixedOffset::east_opt(5 * 3600 + 1800).expect("+05:30"),
+            zone: FixedOffset::east_opt(5 * 3600 + 1800).expect("+05:30"),
             ..tiny.ctx()
         };
         let page = rhythm_in(&ctx, &two_weeks(), &all()).unwrap();
@@ -1139,7 +1154,7 @@ mod tests {
             to: utc("2026-11-04T00:00:00Z"),
         };
         let ctx = Ctx {
-            offset: FixedOffset::east_opt(5 * 3600 + 1800).expect("+05:30"),
+            zone: FixedOffset::east_opt(5 * 3600 + 1800).expect("+05:30"),
             ..tiny.ctx()
         };
         let page = activity_in(&ctx, &range, &all()).unwrap();

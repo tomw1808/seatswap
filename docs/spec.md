@@ -1089,8 +1089,10 @@ first` instead.
 **Definitions every page uses.**
 
 - **Local time.** Every clock hour, day, week, weekday and curve point is in this computer's local
-  time zone, also for records from another host. The Activity lanes and the Rhythm heat map take
-  the hours of the week in this host's local time for every host.
+  time zone: the zone's offset at that instant, not one offset for the whole range, so a record on
+  the other side of a daylight-saving change keeps its own hour and week. This holds for records
+  from another host too. The Activity lanes and the Rhythm heat map take the hours of the week in
+  this host's local time for every host.
 - **A calendar week** is Monday 00:00 local to the next Monday 00:00 local. A page shows every
   calendar week its range touches; a partial week counts as one.
 - **One window per account and calendar week.** A finished `weekly_all` window belongs to the
@@ -1231,13 +1233,14 @@ one per account, stored accounts first and accounts no longer stored after them:
 
 **Forecast.** The latest plan of every account and every host, so it follows neither the range, the
 account chips nor the host choice. Each time the page loads it uses the plan reading kept from the
-auto-burn runtime, which is at most 20 minutes old; it says how many weeks of history that plan
-reads. Below it:
+auto-burn runtime; when the oldest reading that plan was built from is older than 20 minutes the
+page refuses it and says `the forecast needs a reading of every account first`. It says how many
+weeks of history that plan reads. Below it:
 
 - **Four numbers**: the money expected to expire this week with auto-burn's plan as it is set now
   (eager when early switching pays, else lazy), the same when switching only when an account is full
-  (the lazy plan), the working hours the plan has no usable account, and the switches planned with
-  each of the two rules.
+  (the lazy plan), the hours of this plan with no usable account, and the switches planned with each
+  of the two rules.
 - **Per account**: the weekly percent now; the percent the plan expects at its reset (`100 − the
   plan's unused percent`); the low of its last 8 finished windows; when the plan first has it full;
   its next reset; and what switching only when full would leave unused, in percent and money.
@@ -1259,8 +1262,8 @@ reads. Below it:
 averaged over the range's calendar weeks (a partial week counts as one), all chosen hosts together.
 Below it, per weekday: the distinct local hours with tokens divided by the number of calendar weeks
 ("working hours per week"), and the blocked working hours of that weekday divided by the same
-number. Auto-burn and the Forecast plan with this picture; an hour that usually has work counts as
-a working hour.
+number. Auto-burn and the Forecast plan with the rhythm of the last 4 weeks before now, not with
+the range's picture; an hour that usually has work counts as a working hour.
 
 **Activity.** Every chosen host gets a lane over the last 168 local hours, ending with the hour that
 holds the range's end. Each hour is one of four states, decided in this order:

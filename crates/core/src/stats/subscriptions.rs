@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use serde::Serialize;
 
 use crate::burn::live;
@@ -17,7 +17,7 @@ use crate::money::{window_money, Valuer};
 
 use super::{
     account_abbr, account_chosen, account_id, account_weeks_valued, accounts_without_price,
-    add_value, blocked_by_week, blocked_spans, hours_text, lost_percent, money_of,
+    add_value, blocked_by_week, blocked_spans, hours_text, lost_percent, money_of, next_week_start,
     output_by_account_week, range_of, stored_account, week_columns, week_of_record, windows_span,
     working_rhythm, AccountWeek, Ctx, Query, StatsError,
 };
@@ -128,15 +128,18 @@ pub struct WhatIf {
 const NOT_ENOUGH: &str = "Not enough history yet to replay this.";
 
 /// The Subscriptions page of the range the query names.
-pub fn subscriptions(ctx: &Ctx, q: &Query) -> Result<SubscriptionsPage, StatsError> {
+pub fn subscriptions<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
+    q: &Query,
+) -> Result<SubscriptionsPage, StatsError> {
     let range = range_of(q.range, ctx)?;
     subscriptions_in(ctx, &range, q)
 }
 
 /// The Subscriptions page of `range`; the page's [`subscriptions`] takes the
 /// range from its [`Query`], the tests name one.
-pub(crate) fn subscriptions_in(
-    ctx: &Ctx,
+pub(crate) fn subscriptions_in<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
     range: &Range,
     q: &Query,
 ) -> Result<SubscriptionsPage, StatsError> {
@@ -308,15 +311,19 @@ pub(crate) fn subscriptions_in(
 
 /// The "what if" of the range the query names: the range replayed without the
 /// account whose id is `without`.
-pub fn what_if(ctx: &Ctx, q: &Query, without: &str) -> Result<WhatIf, StatsError> {
+pub fn what_if<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
+    q: &Query,
+    without: &str,
+) -> Result<WhatIf, StatsError> {
     let range = range_of(q.range, ctx)?;
     what_if_in(ctx, &range, q, without)
 }
 
 /// The "what if" of `range`; the page's [`what_if`] takes the range from its
 /// [`Query`], the tests name one.
-pub(crate) fn what_if_in(
-    ctx: &Ctx,
+pub(crate) fn what_if_in<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
     range: &Range,
     q: &Query,
     without: &str,
@@ -335,10 +342,10 @@ pub(crate) fn what_if_in(
     let weeks = account_weeks_valued(ctx, range, q, &valuer)?;
     let spans = blocked_spans(ctx, range, q)?;
     let rhythm = working_rhythm(ctx, range)?;
-    let recorded_weeks = blocked_by_week(&spans, &rhythm, ctx.offset);
+    let recorded_weeks = blocked_by_week(&spans, &rhythm, &ctx.zone);
     // The recorded hours of every calendar week, computed once: the same values
     // serve the replay and the "not enough history" path.
-    let was_by_week: Vec<(DateTime<Utc>, f64)> = week_columns(range, ctx.offset)
+    let was_by_week: Vec<(DateTime<Utc>, f64)> = week_columns(range, &ctx.zone)
         .into_iter()
         .map(|week| (week, recorded_weeks.get(&week).copied().unwrap_or(0.0)))
         .collect();
@@ -363,7 +370,7 @@ pub(crate) fn what_if_in(
     let learned = live::learn(
         ctx.history,
         range.to,
-        ctx.offset,
+        ctx.zone,
         ctx.accounts,
         ctx.settings.read_sessions,
     )?;
@@ -412,7 +419,7 @@ pub(crate) fn what_if_in(
     let mut expired_without = 0.0;
     for (week, was) in &was_by_week {
         let from = (*week).max(range.from);
-        let to = (*week + Duration::weeks(1)).min(range.to);
+        let to = next_week_start(*week, &ctx.zone).min(range.to);
         if from >= to {
             continue;
         }
@@ -461,7 +468,7 @@ pub(crate) fn what_if_in(
     })
 }
 
-fn build_valuer(ctx: &Ctx, range: &Range) -> Result<Valuer, StatsError> {
+fn build_valuer<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, range: &Range) -> Result<Valuer, StatsError> {
     Ok(Valuer::build(
         ctx.history,
         range,
@@ -720,7 +727,9 @@ impl AccountHistory {
 
 /// The events, samples and windows of the whole history, per account, for the
 /// periods and their plans.
-fn account_histories(ctx: &Ctx) -> Result<BTreeMap<AccountRef, AccountHistory>, StatsError> {
+fn account_histories<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
+) -> Result<BTreeMap<AccountRef, AccountHistory>, StatsError> {
     let events = ctx.history.read::<Event>(&Range::ALL, &Hosts::All)?;
     let samples = ctx.history.read::<Sample>(&Range::ALL, &Hosts::All)?;
     let windows = ctx.history.finished_windows(&Range::ALL, &Hosts::All)?;
@@ -792,8 +801,8 @@ fn event_accounts(kind: &EventKind) -> Vec<&AccountRef> {
 
 /// Every period of one account, over the whole history: the page lists the
 /// ones that overlap the range, while a row's `since` comes from the first.
-fn periods_of(
-    ctx: &Ctx,
+fn periods_of<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
     reference: &AccountRef,
     history: &AccountHistory,
     valuer: &Valuer,
@@ -888,8 +897,8 @@ fn split_at_changes(
 /// The plan at `at`: the last `PlanChanged.to` at or before it; before the first
 /// change that change's `from`; without any change the stored account's plan,
 /// and for an account no longer stored the plan of its latest window record.
-fn plan_at(
-    ctx: &Ctx,
+fn plan_at<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
     reference: &AccountRef,
     at: DateTime<Utc>,
     history: &AccountHistory,
@@ -914,6 +923,7 @@ fn plan_at(
 mod tests {
     use super::*;
 
+    use chrono::Duration;
     use tempfile::tempdir;
 
     use crate::api::LimitKind;

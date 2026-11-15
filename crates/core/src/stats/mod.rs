@@ -3,7 +3,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, Datelike, Duration, FixedOffset, Timelike, Utc};
+use chrono::{
+    DateTime, Datelike, Duration, FixedOffset, MappedLocalTime, NaiveDate, NaiveDateTime, TimeZone,
+    Timelike, Utc,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::api::LimitKind;
@@ -94,9 +97,9 @@ pub struct Query {
 }
 
 /// Everything a page reads: the history, the store's accounts and settings, the
-/// prices, the projects and the local time the pages are shown in.
+/// prices, the projects and the local zone the pages are shown in.
 #[derive(Clone, Copy)]
-pub struct Ctx<'a> {
+pub struct Ctx<'a, Tz: TimeZone + Copy = FixedOffset> {
     pub history: &'a HistoryDir,
     pub accounts: &'a [Account],
     pub settings: &'a Settings,
@@ -104,33 +107,30 @@ pub struct Ctx<'a> {
     pub fx: &'a Fx,
     pub projects: &'a Projects,
     pub now: DateTime<Utc>,
-    pub offset: FixedOffset,
+    /// The time zone of this computer; every local time is the zone's offset at
+    /// that instant. The app passes `chrono::Local`, tests a [`FixedOffset`] or
+    /// a zone with a daylight-saving change.
+    pub zone: Tz,
 }
 
 /// ThisWeek: Monday 00:00 local of this week .. now. LastWeek: the week before. Days30 / Days90 / Months12: from the
 /// Monday 00:00 of the week that holds now - 30 d / 90 d / 365 d .. now. All: from the Monday 00:00 local of the
 /// week that holds the first record .. now, so every page's first calendar week holds all its windows; when the
 /// history holds no record, from this week's Monday 00:00.
-pub fn range_of(key: RangeKey, ctx: &Ctx) -> Result<Range, StatsError> {
-    let this_week = week_start(ctx.now, ctx.offset);
+pub fn range_of<Tz: TimeZone + Copy>(key: RangeKey, ctx: &Ctx<Tz>) -> Result<Range, StatsError> {
+    let this_week = week_start(ctx.now, &ctx.zone);
     let (from, to) = match key {
         RangeKey::ThisWeek => (this_week, ctx.now),
-        RangeKey::LastWeek => (this_week - Duration::days(7), this_week),
-        RangeKey::Days30 => (
-            week_start(ctx.now - Duration::days(30), ctx.offset),
-            ctx.now,
-        ),
-        RangeKey::Days90 => (
-            week_start(ctx.now - Duration::days(90), ctx.offset),
-            ctx.now,
-        ),
+        RangeKey::LastWeek => (previous_week_start(this_week, &ctx.zone), this_week),
+        RangeKey::Days30 => (week_start(ctx.now - Duration::days(30), &ctx.zone), ctx.now),
+        RangeKey::Days90 => (week_start(ctx.now - Duration::days(90), &ctx.zone), ctx.now),
         RangeKey::Months12 => (
-            week_start(ctx.now - Duration::days(365), ctx.offset),
+            week_start(ctx.now - Duration::days(365), &ctx.zone),
             ctx.now,
         ),
         RangeKey::All => (
             first_record(ctx)?
-                .map(|first| week_start(first, ctx.offset))
+                .map(|first| week_start(first, &ctx.zone))
                 .unwrap_or(this_week),
             ctx.now,
         ),
@@ -138,29 +138,103 @@ pub fn range_of(key: RangeKey, ctx: &Ctx) -> Result<Range, StatsError> {
     Range::between(Some(from), Some(to)).map_err(StatsError::from)
 }
 
-/// The start of the local hour `t` falls in, as an instant.
-pub(crate) fn local_hour_start(t: DateTime<Utc>, offset: FixedOffset) -> DateTime<Utc> {
-    let local = t.with_timezone(&offset);
-    t - Duration::minutes(i64::from(local.minute()))
-        - Duration::seconds(i64::from(local.second()))
-        - Duration::nanoseconds(i64::from(local.nanosecond()))
+/// The instant a local wall-clock time starts at: one that does not exist (a
+/// change at that time) starts at the first instant after the gap, and one that
+/// exists twice starts at the earlier instant. The one rule for every local
+/// day and week start; [`local_hour_start`] adds the occurrence an instant
+/// falls in for an hour that exists twice.
+fn local_start<Tz: TimeZone>(zone: &Tz, local: NaiveDateTime) -> DateTime<Utc> {
+    match zone.from_local_datetime(&local) {
+        MappedLocalTime::Single(at) => at.with_timezone(&Utc),
+        MappedLocalTime::Ambiguous(earlier, _) => earlier.with_timezone(&Utc),
+        MappedLocalTime::None => {
+            // The gap holds no instant. The first local clock second that
+            // exists again is the gap's end, which is the first instant after
+            // it. A gap is finite, so this loop ends.
+            let mut after = local;
+            loop {
+                after += Duration::seconds(1);
+                match zone.from_local_datetime(&after) {
+                    MappedLocalTime::Single(at) => return at.with_timezone(&Utc),
+                    MappedLocalTime::Ambiguous(earlier, _) => {
+                        return earlier.with_timezone(&Utc);
+                    }
+                    MappedLocalTime::None => {}
+                }
+            }
+        }
+    }
+}
+
+/// The start of the local hour `t` falls in, as an instant. Every date has an
+/// hour that holds `t`; when the wall-clock hour exists twice, this is the
+/// occurrence that holds `t`, so consecutive hours never go backwards.
+pub(crate) fn local_hour_start<Tz: TimeZone + Copy>(t: DateTime<Utc>, zone: &Tz) -> DateTime<Utc> {
+    let local = t.with_timezone(zone);
+    let into_hour = Duration::minutes(i64::from(local.minute()))
+        + Duration::seconds(i64::from(local.second()))
+        + Duration::nanoseconds(i64::from(local.nanosecond()));
+    let wall = local.naive_local() - into_hour;
+    match zone.from_local_datetime(&wall) {
+        MappedLocalTime::Single(start) => start.with_timezone(&Utc),
+        MappedLocalTime::Ambiguous(earlier, later) => {
+            let later = later.with_timezone(&Utc);
+            if t >= later {
+                later
+            } else {
+                earlier.with_timezone(&Utc)
+            }
+        }
+        MappedLocalTime::None => local_start(zone, wall),
+    }
+}
+
+/// The instant local midnight of `date` starts at.
+pub(crate) fn local_date_start<Tz: TimeZone>(date: NaiveDate, zone: &Tz) -> DateTime<Utc> {
+    local_start(zone, date.and_time(chrono::NaiveTime::MIN))
 }
 
 /// The start of the local day `t` falls in, as an instant.
-pub(crate) fn local_day_start(t: DateTime<Utc>, offset: FixedOffset) -> DateTime<Utc> {
-    let local = t.with_timezone(&offset);
-    let into_day = Duration::hours(i64::from(local.hour()))
-        + Duration::minutes(i64::from(local.minute()))
-        + Duration::seconds(i64::from(local.second()))
-        + Duration::nanoseconds(i64::from(local.nanosecond()));
-    t - into_day
+pub(crate) fn local_day_start<Tz: TimeZone + Copy>(t: DateTime<Utc>, zone: &Tz) -> DateTime<Utc> {
+    let local = t.with_timezone(zone);
+    local_date_start(local.date_naive(), zone)
+}
+
+/// The next local midnight after `t`: a local day lasts 23, 24 or 25 hours, so
+/// this is not `t + 24 h`.
+pub(crate) fn next_local_day_start<Tz: TimeZone + Copy>(
+    t: DateTime<Utc>,
+    zone: &Tz,
+) -> DateTime<Utc> {
+    let date = t.with_timezone(zone).date_naive() + Duration::days(1);
+    local_date_start(date, zone)
 }
 
 /// Monday 00:00 local time of the week that holds `t`, as an instant.
-pub fn week_start(t: DateTime<Utc>, offset: FixedOffset) -> DateTime<Utc> {
-    let local = t.with_timezone(&offset);
-    let days = i64::from(local.weekday().num_days_from_monday());
-    local_day_start(t, offset) - Duration::days(days)
+pub fn week_start<Tz: TimeZone + Copy>(t: DateTime<Utc>, zone: &Tz) -> DateTime<Utc> {
+    let local = t.with_timezone(zone);
+    let monday =
+        local.date_naive() - Duration::days(i64::from(local.weekday().num_days_from_monday()));
+    local_date_start(monday, zone)
+}
+
+/// Monday 00:00 of the week after the one holding `week`; a local week lasts
+/// 167, 168 or 169 hours, so this is not `week + 7 d`.
+pub(crate) fn next_week_start<Tz: TimeZone + Copy>(
+    week: DateTime<Utc>,
+    zone: &Tz,
+) -> DateTime<Utc> {
+    let monday = week.with_timezone(zone).date_naive() + Duration::days(7);
+    local_date_start(monday, zone)
+}
+
+/// Monday 00:00 of the week before the one holding `week`.
+pub(crate) fn previous_week_start<Tz: TimeZone + Copy>(
+    week: DateTime<Utc>,
+    zone: &Tz,
+) -> DateTime<Utc> {
+    let monday = week.with_timezone(zone).date_naive() - Duration::days(7);
+    local_date_start(monday, zone)
 }
 
 /// One finished weekly window, put into the calendar week its midpoint falls in.
@@ -182,7 +256,11 @@ pub struct AccountWeek {
 /// hosts recorded the same window (same account and end), the one with the latest lastSample. One window per account
 /// and calendar week: when an account has two windows whose midpoints fall in one week (its reset moved), only the
 /// one with the later end is kept.
-pub fn account_weeks(ctx: &Ctx, range: &Range, q: &Query) -> Result<Vec<AccountWeek>, StatsError> {
+pub fn account_weeks<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
+    range: &Range,
+    q: &Query,
+) -> Result<Vec<AccountWeek>, StatsError> {
     let valuer = Valuer::build(
         ctx.history,
         range,
@@ -199,8 +277,8 @@ pub fn account_weeks(ctx: &Ctx, range: &Range, q: &Query) -> Result<Vec<AccountW
 /// per account and calendar week: when an account has two windows whose
 /// midpoints fall in one week (its reset moved), only the one with the later
 /// end is kept.
-pub(crate) fn account_weeks_valued(
-    ctx: &Ctx,
+pub(crate) fn account_weeks_valued<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
     range: &Range,
     q: &Query,
     valuer: &Valuer,
@@ -225,7 +303,7 @@ pub(crate) fn account_weeks_valued(
             Err(missing) => (None, Some(missing)),
         };
         let account_week = AccountWeek {
-            week: week_start(midpoint, ctx.offset),
+            week: week_start(midpoint, &ctx.zone),
             account: window.account.clone(),
             price,
             price_missing,
@@ -250,7 +328,10 @@ pub(crate) fn account_weeks_valued(
 /// stored accounts in [`Ctx::accounts`] order, then accounts no longer stored
 /// by id. These are the accounts left out of a money sum; a priced week of the
 /// same account still counts.
-pub(crate) fn accounts_without_price(ctx: &Ctx, weeks: &[AccountWeek]) -> Vec<String> {
+pub(crate) fn accounts_without_price<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
+    weeks: &[AccountWeek],
+) -> Vec<String> {
     let mut ids: Vec<String> = ctx
         .accounts
         .iter()
@@ -314,32 +395,42 @@ pub(crate) fn switch_counts(
     counts
 }
 
+/// The index of the local hour of the week that holds `t`: Monday 00:00 local
+/// is 0. The one index for the heat map and for burn's rhythm.
+pub(crate) fn local_hour_of_week<Tz: TimeZone + Copy>(t: DateTime<Utc>, zone: &Tz) -> usize {
+    let local = t.with_timezone(zone);
+    local.weekday().num_days_from_monday() as usize * 24 + local.hour() as usize
+}
+
 /// The calendar weeks of `range`: Monday 00:00 local of the week that holds
-/// `range.from`, then every seven days while the start is before `range.to`.
-pub(crate) fn week_columns(range: &Range, offset: FixedOffset) -> Vec<DateTime<Utc>> {
+/// `range.from`, then the following Monday 00:00 local of each day that is
+/// still before `range.to`.
+pub(crate) fn week_columns<Tz: TimeZone + Copy>(range: &Range, zone: &Tz) -> Vec<DateTime<Utc>> {
     let mut columns = Vec::new();
-    let mut week = week_start(range.from, offset);
+    let mut week = week_start(range.from, zone);
     while week < range.to {
         columns.push(week);
-        week += Duration::weeks(1);
+        // The next Monday 00:00 local, not 168 h later: a week may hold 167 or
+        // 169 real hours.
+        week = next_week_start(week, zone);
     }
     columns
 }
 
 /// The blocked hours of `spans` per calendar week: a span is split at every
 /// week start it crosses and each part counts the working hours it has.
-pub(crate) fn blocked_by_week(
+pub(crate) fn blocked_by_week<Tz: TimeZone + Copy>(
     spans: &[BlockedSpan],
     rhythm: &Rhythm,
-    offset: FixedOffset,
+    zone: &Tz,
 ) -> BTreeMap<DateTime<Utc>, f64> {
     let mut by_week = BTreeMap::new();
     for span in spans {
         let mut cursor = span.from;
         while cursor < span.to {
-            let week = week_start(cursor, offset);
-            let end = (week + Duration::weeks(1)).min(span.to);
-            *by_week.entry(week).or_insert(0.0) += working_hours(cursor, end, rhythm, offset);
+            let week = week_start(cursor, zone);
+            let end = next_week_start(week, zone).min(span.to);
+            *by_week.entry(week).or_insert(0.0) += working_hours(cursor, end, rhythm, zone);
             cursor = end;
         }
     }
@@ -349,19 +440,19 @@ pub(crate) fn blocked_by_week(
 /// The blocked hours of `spans` per local weekday, Monday first: a span is
 /// split at every local midnight it crosses and each part counts the working
 /// hours it has.
-pub(crate) fn blocked_by_weekday(
+pub(crate) fn blocked_by_weekday<Tz: TimeZone + Copy>(
     spans: &[BlockedSpan],
     rhythm: &Rhythm,
-    offset: FixedOffset,
+    zone: &Tz,
 ) -> [f64; 7] {
     let mut by_day = [0.0; 7];
     for span in spans {
         let mut cursor = span.from;
         while cursor < span.to {
-            let local = cursor.with_timezone(&offset);
+            let local = cursor.with_timezone(zone);
             let day = local.weekday().num_days_from_monday() as usize;
-            let next = (local_day_start(cursor, offset) + Duration::days(1)).min(span.to);
-            by_day[day] += working_hours(cursor, next, rhythm, offset);
+            let next = next_local_day_start(cursor, zone).min(span.to);
+            by_day[day] += working_hours(cursor, next, rhythm, zone);
             cursor = next;
         }
     }
@@ -416,7 +507,7 @@ pub(crate) fn output_by_account_week<'a>(
 
 /// The id a page writes for `reference`: the stored account's id, or the
 /// reference's account id when it is no longer stored.
-pub(crate) fn account_id(ctx: &Ctx, reference: &AccountRef) -> String {
+pub(crate) fn account_id<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, reference: &AccountRef) -> String {
     stored_account(ctx, reference)
         .map(|account| account.id.clone())
         .unwrap_or_else(|| reference.acc.clone())
@@ -425,7 +516,11 @@ pub(crate) fn account_id(ctx: &Ctx, reference: &AccountRef) -> String {
 /// Whether the query chooses `account`: every account when `q.accounts` is
 /// empty, else only the one whose [`account_id`] is named. A record without a
 /// known account is never chosen by a filter.
-pub(crate) fn account_chosen(ctx: &Ctx, q: &Query, account: Option<&AccountRef>) -> bool {
+pub(crate) fn account_chosen<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
+    q: &Query,
+    account: Option<&AccountRef>,
+) -> bool {
     if q.accounts.is_empty() {
         return true;
     }
@@ -439,7 +534,7 @@ pub(crate) fn account_chosen(ctx: &Ctx, q: &Query, account: Option<&AccountRef>)
 /// The abbreviation a page writes for `reference`: the stored account's, or the
 /// first 8 characters of the id `account_id` gives it when it is no longer
 /// stored (the rule `crates/app/ui/common.js` uses for an unknown account).
-pub(crate) fn account_abbr(ctx: &Ctx, reference: &AccountRef) -> String {
+pub(crate) fn account_abbr<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, reference: &AccountRef) -> String {
     match stored_account(ctx, reference) {
         Some(account) => account.abbr.clone(),
         None => reference.acc.chars().take(8).collect(),
@@ -448,7 +543,7 @@ pub(crate) fn account_abbr(ctx: &Ctx, reference: &AccountRef) -> String {
 
 /// Where an account id stands in the stored accounts' order; an id that is no
 /// longer stored sorts after all of them.
-pub(crate) fn account_position(ctx: &Ctx, id: &str) -> usize {
+pub(crate) fn account_position<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, id: &str) -> usize {
     ctx.accounts
         .iter()
         .position(|account| account.id == id)
@@ -522,8 +617,8 @@ pub(crate) fn percent_text(percent: f64) -> String {
 }
 
 /// A date in local time: `12 Nov`.
-pub(crate) fn date_text(t: DateTime<Utc>, offset: FixedOffset) -> String {
-    let local = t.with_timezone(&offset);
+pub(crate) fn date_text<Tz: TimeZone + Copy>(t: DateTime<Utc>, zone: &Tz) -> String {
+    let local = t.with_timezone(zone).naive_local();
     format!("{} {}", local.day(), local.format("%b"))
 }
 
@@ -555,7 +650,11 @@ pub struct Empty {
 /// rhythm of the four weeks before the range's end. A host's spans come only from
 /// the blocks that host recorded and the account that host had in use, so two
 /// hosts blocked at the same time each have their span.
-pub fn blocked_spans(ctx: &Ctx, range: &Range, q: &Query) -> Result<Vec<BlockedSpan>, StatsError> {
+pub fn blocked_spans<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
+    range: &Range,
+    q: &Query,
+) -> Result<Vec<BlockedSpan>, StatsError> {
     let events = ctx.history.read::<Event>(&Range::ALL, &Hosts::All)?;
     let intervals = block_intervals(&events.records, range.to);
     let mut weekly = Vec::new();
@@ -599,7 +698,7 @@ pub fn blocked_spans(ctx: &Ctx, range: &Range, q: &Query) -> Result<Vec<BlockedS
                     account: account.clone(),
                     from,
                     to,
-                    hours: working_hours(from, to, &rhythm, ctx.offset),
+                    hours: working_hours(from, to, &rhythm, &ctx.zone),
                     avoidable_hours: avoidable_hours(
                         ctx,
                         &host,
@@ -624,7 +723,10 @@ pub fn blocked_spans(ctx: &Ctx, range: &Range, q: &Query) -> Result<Vec<BlockedS
 
 /// Whether the history holds no record in the range; then the page says since
 /// when seatswap has been recording.
-pub fn empty(ctx: &Ctx, range: &Range) -> Result<Option<Empty>, StatsError> {
+pub fn empty<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
+    range: &Range,
+) -> Result<Option<Empty>, StatsError> {
     if has_record(ctx, range)? {
         return Ok(None);
     }
@@ -641,7 +743,7 @@ fn earliest<R: Record>(
     Ok(read.records.first().map(|hosted| hosted.record.at()))
 }
 
-fn first_record(ctx: &Ctx) -> Result<Option<DateTime<Utc>>, StatsError> {
+fn first_record<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>) -> Result<Option<DateTime<Utc>>, StatsError> {
     let range = Range::ALL;
     let found = [
         earliest::<Sample>(ctx.history, &range)?,
@@ -659,7 +761,7 @@ fn any_record<R: Record>(history: &HistoryDir, range: &Range) -> Result<bool, Hi
     Ok(!history.read::<R>(range, &Hosts::All)?.records.is_empty())
 }
 
-fn has_record(ctx: &Ctx, range: &Range) -> Result<bool, StatsError> {
+fn has_record<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, range: &Range) -> Result<bool, StatsError> {
     Ok(any_record::<Sample>(ctx.history, range)?
         || any_record::<WindowRecord>(ctx.history, range)?
         || any_record::<Event>(ctx.history, range)?
@@ -669,7 +771,10 @@ fn has_record(ctx: &Ctx, range: &Range) -> Result<bool, StatsError> {
         || any_record::<ProjectsLogRecord>(ctx.history, range)?)
 }
 
-pub(crate) fn stored_account<'a>(ctx: &Ctx<'a>, reference: &AccountRef) -> Option<&'a Account> {
+pub(crate) fn stored_account<'a, Tz: TimeZone + Copy>(
+    ctx: &Ctx<'a, Tz>,
+    reference: &AccountRef,
+) -> Option<&'a Account> {
     ctx.accounts.iter().find(|account| {
         account.account_uuid == reference.acc && account.organization_uuid == reference.org
     })
@@ -689,26 +794,26 @@ fn hosts_of(q: &Query, events: &[Hosted<Event>]) -> Vec<String> {
 
 /// The working hours of the range: the hours of the week whose value in the
 /// rhythm of the four weeks before `range.to` is above 0.
-fn working_rhythm(ctx: &Ctx, range: &Range) -> Result<Rhythm, StatsError> {
+fn working_rhythm<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, range: &Range) -> Result<Rhythm, StatsError> {
     let from = range.to - Duration::weeks(RHYTHM_WEEKS);
     let read = ctx
         .history
         .read::<TokenRecord>(&Range { from, to: range.to }, &Hosts::All)?;
-    Ok(rates::rhythm(&read.records, range.to, ctx.offset))
+    Ok(rates::rhythm(&read.records, range.to, &ctx.zone))
 }
 
 /// The hours of `[from, to)` that fall in a working hour.
-fn working_hours(
+fn working_hours<Tz: TimeZone + Copy>(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     rhythm: &Rhythm,
-    offset: FixedOffset,
+    zone: &Tz,
 ) -> f64 {
     let mut hours = 0.0;
     let mut cursor = from;
     while cursor < to {
-        let next = (local_hour_start(cursor, offset) + Duration::hours(1)).min(to);
-        if rhythm.at(cursor, offset) > 0.0 {
+        let next = (local_hour_start(cursor, zone) + Duration::hours(1)).min(to);
+        if rhythm.wu[local_hour_of_week(cursor, zone)] > 0.0 {
             hours += seconds_between(cursor, next) / 3600.0;
         }
         cursor = next;
@@ -795,8 +900,8 @@ fn blocked_at(
 /// The working hours of `[from, to)` in which another account auto-burn may use
 /// was not blocked on `host` and had a finished weekly window running that ended
 /// with something expired.
-fn avoidable_hours(
-    ctx: &Ctx,
+fn avoidable_hours<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
     host: &str,
     blocked: &AccountRef,
     span: Range,
@@ -846,14 +951,14 @@ fn avoidable_hours(
             continue;
         }
         if avoidable_at(ctx, host, blocked, start, intervals, weekly) {
-            hours += working_hours(start, end, rhythm, ctx.offset);
+            hours += working_hours(start, end, rhythm, &ctx.zone);
         }
     }
     hours
 }
 
-fn avoidable_at(
-    ctx: &Ctx,
+fn avoidable_at<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
     host: &str,
     blocked: &AccountRef,
     t: DateTime<Utc>,
@@ -884,12 +989,129 @@ pub(crate) mod tests {
 
     use std::fs;
 
+    use chrono::{NaiveDate, NaiveTime};
     use tempfile::tempdir;
 
     pub(crate) use crate::stats::fixture::Tiny;
 
     pub(crate) fn utc(text: &str) -> DateTime<Utc> {
         text.parse::<DateTime<Utc>>().expect("test date")
+    }
+
+    fn winter() -> FixedOffset {
+        FixedOffset::east_opt(3600).expect("+01:00")
+    }
+
+    fn summer() -> FixedOffset {
+        FixedOffset::east_opt(2 * 3600).expect("+02:00")
+    }
+
+    /// The offset either side of one change, and the local times that the
+    /// change makes nonexistent or ambiguous.
+    fn changing_offset(
+        local: &NaiveDateTime,
+        change: NaiveDateTime,
+        before: FixedOffset,
+        after: FixedOffset,
+    ) -> MappedLocalTime<FixedOffset> {
+        let offset_at = |utc: &NaiveDateTime| if *utc < change { before } else { after };
+        let mut found: Vec<(NaiveDateTime, FixedOffset)> = [before, after]
+            .into_iter()
+            .filter_map(|offset| {
+                let utc = *local - Duration::seconds(i64::from(offset.local_minus_utc()));
+                (offset_at(&utc) == offset).then_some((utc, offset))
+            })
+            .collect();
+        found.sort_by_key(|(utc, _)| *utc);
+        match found.as_slice() {
+            [] => MappedLocalTime::None,
+            [(_, offset)] => MappedLocalTime::Single(*offset),
+            [(_, earlier), (_, later)] => MappedLocalTime::Ambiguous(*earlier, *later),
+            _ => MappedLocalTime::None,
+        }
+    }
+
+    /// Central Europe's change on the last Sunday of March: +01:00 before
+    /// 2026-03-29T01:00:00Z and +02:00 from then on. A local time in the gap
+    /// has no offset and one in the fold has two, through
+    /// [`TimeZone::offset_from_local_datetime`].
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct SummerZone;
+
+    fn summer_change() -> NaiveDateTime {
+        utc("2026-03-29T01:00:00Z").naive_utc()
+    }
+
+    impl TimeZone for SummerZone {
+        type Offset = FixedOffset;
+
+        fn from_offset(_offset: &FixedOffset) -> Self {
+            SummerZone
+        }
+
+        fn offset_from_local_date(&self, local: &NaiveDate) -> MappedLocalTime<FixedOffset> {
+            self.offset_from_local_datetime(&local.and_time(NaiveTime::MIN))
+        }
+
+        fn offset_from_local_datetime(
+            &self,
+            local: &NaiveDateTime,
+        ) -> MappedLocalTime<FixedOffset> {
+            changing_offset(local, summer_change(), winter(), summer())
+        }
+
+        fn offset_from_utc_date(&self, utc: &NaiveDate) -> FixedOffset {
+            self.offset_from_utc_datetime(&utc.and_time(NaiveTime::MIN))
+        }
+
+        fn offset_from_utc_datetime(&self, utc: &NaiveDateTime) -> FixedOffset {
+            if *utc < summer_change() {
+                winter()
+            } else {
+                summer()
+            }
+        }
+    }
+
+    /// Central Europe's change on the last Sunday of October: +02:00 before
+    /// 2026-10-25T01:00:00Z and +01:00 from then on. The week and the day that
+    /// hold it are 169 and 25 hours long.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct FallZone;
+
+    fn fall_change() -> NaiveDateTime {
+        utc("2026-10-25T01:00:00Z").naive_utc()
+    }
+
+    impl TimeZone for FallZone {
+        type Offset = FixedOffset;
+
+        fn from_offset(_offset: &FixedOffset) -> Self {
+            FallZone
+        }
+
+        fn offset_from_local_date(&self, local: &NaiveDate) -> MappedLocalTime<FixedOffset> {
+            self.offset_from_local_datetime(&local.and_time(NaiveTime::MIN))
+        }
+
+        fn offset_from_local_datetime(
+            &self,
+            local: &NaiveDateTime,
+        ) -> MappedLocalTime<FixedOffset> {
+            changing_offset(local, fall_change(), summer(), winter())
+        }
+
+        fn offset_from_utc_date(&self, utc: &NaiveDate) -> FixedOffset {
+            self.offset_from_utc_datetime(&utc.and_time(NaiveTime::MIN))
+        }
+
+        fn offset_from_utc_datetime(&self, utc: &NaiveDateTime) -> FixedOffset {
+            if *utc < fall_change() {
+                summer()
+            } else {
+                winter()
+            }
+        }
     }
 
     pub(crate) fn all() -> Query {
@@ -919,6 +1141,21 @@ pub(crate) mod tests {
         let mut tiny = crate::stats::fixture::write(dir.path()).expect("the tiny fixture");
         tiny.dir.keep(Box::new(dir));
         tiny
+    }
+
+    /// The fixture's context with another zone; the tests use it to put a
+    /// daylight-saving change under a page.
+    pub(crate) fn ctx_with<Tz: TimeZone + Copy>(tiny: &Tiny, zone: Tz) -> Ctx<'_, Tz> {
+        Ctx {
+            history: &tiny.history,
+            accounts: &tiny.accounts,
+            settings: &tiny.settings,
+            prices: &tiny.prices,
+            fx: &tiny.fx,
+            projects: &tiny.projects,
+            now: tiny.now,
+            zone,
+        }
     }
 
     #[test]
@@ -1302,7 +1539,7 @@ pub(crate) mod tests {
     fn the_range_starts_at_the_local_monday() {
         let tiny = tiny();
         let ctx = Ctx {
-            offset: FixedOffset::east_opt(3600).expect("+01:00"),
+            zone: FixedOffset::east_opt(3600).expect("+01:00"),
             ..tiny.ctx()
         };
         let this_week = range_of(RangeKey::ThisWeek, &ctx).unwrap();
@@ -1337,5 +1574,106 @@ pub(crate) mod tests {
         assert_eq!(lb[0].from, utc("2026-11-07T11:30:00Z"));
         assert_eq!(lb[0].to, utc("2026-11-07T12:00:00Z"));
         assert!(close(lb[0].hours, 0.5), "hours {}", lb[0].hours);
+    }
+    /// A record at 09:00 in +02:00 stays in the heat map's hour 9 even when the
+    /// range starts in +01:00: every local hour uses its own instant's offset.
+    #[test]
+    fn a_summer_record_is_in_its_own_local_hour() {
+        let tiny = tiny();
+        tiny.history
+            .append(&TokenRecord {
+                t: utc("2026-03-30T07:00:00Z"),
+                session: "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34".to_string(),
+                cwd: "/home/sam/projects/atlas/engine".to_string(),
+                project: crate::project::ProjectKey::Repo("github.com/sam/atlas".to_string()),
+                model: "claude-opus-5-5".to_string(),
+                input: 0,
+                out: 1_000_000,
+                cw: 0,
+                cr: 0,
+                answers: 1,
+                agent_answers: 0,
+            })
+            .expect("the summer record");
+        // The range starts in +01:00 and ends after the change; it touches two
+        // calendar weeks.
+        let range = Range {
+            from: utc("2026-03-23T00:00:00Z"),
+            to: utc("2026-03-30T12:00:00Z"),
+        };
+        let ctx = ctx_with(&tiny, SummerZone);
+        let page = activity::rhythm_in(&ctx, &range, &all()).expect("the Rhythm page");
+
+        assert!(close(page.heat[9], 500_000.0), "heat 9: {}", page.heat[9]);
+        assert!(close(page.heat[8], 0.0), "heat 8: {}", page.heat[8]);
+        assert!(
+            close(page.per_day[0].working_hours, 0.5),
+            "Monday: {}",
+            page.per_day[0].working_hours
+        );
+    }
+
+    /// Every column of a range across the change starts at Monday 00:00 local:
+    /// 23:00 UTC in +01:00 and 22:00 UTC in +02:00.
+    #[test]
+    fn a_week_starts_on_monday_in_both_offsets() {
+        let range = Range {
+            from: utc("2026-03-01T00:00:00Z"),
+            to: utc("2026-04-10T00:00:00Z"),
+        };
+        let columns = week_columns(&range, &SummerZone);
+        assert!(columns.len() >= 5, "columns: {columns:?}");
+        let mut saw_winter = false;
+        let mut saw_summer = false;
+        for column in &columns {
+            let local = column.with_timezone(&SummerZone);
+            assert_eq!(local.weekday().num_days_from_monday(), 0, "{column}");
+            assert_eq!(local.hour(), 0, "{column}");
+            assert_eq!(local.minute(), 0, "{column}");
+            match local.offset().local_minus_utc() {
+                3600 => saw_winter = true,
+                7200 => saw_summer = true,
+                other => panic!("unexpected offset {other} at {column}"),
+            }
+        }
+        assert!(saw_winter, "no week started in +01:00");
+        assert!(saw_summer, "no week started in +02:00");
+    }
+
+    /// A fall-back week lasts 169 hours: adding 168 h to its Monday would land
+    /// on Sunday 23:00 local and find the same week again. The columns must
+    /// advance a local Monday at a time.
+    #[test]
+    fn a_fall_back_week_still_starts_on_monday() {
+        let range = Range {
+            from: utc("2026-10-19T00:00:00Z"),
+            to: utc("2026-11-08T23:00:00Z"),
+        };
+        let columns = week_columns(&range, &FallZone);
+        assert_eq!(
+            columns,
+            vec![
+                utc("2026-10-18T22:00:00Z"),
+                utc("2026-10-25T23:00:00Z"),
+                utc("2026-11-01T23:00:00Z"),
+            ]
+        );
+        for column in &columns {
+            let local = column.with_timezone(&FallZone);
+            assert_eq!(local.weekday().num_days_from_monday(), 0, "{column}");
+            assert_eq!(local.time(), NaiveTime::MIN, "{column}");
+        }
+        assert_eq!(previous_week_start(columns[1], &FallZone), columns[0]);
+        assert_eq!(next_week_start(columns[0], &FallZone), columns[1]);
+    }
+
+    /// The fall-back day lasts 25 hours; its end is the next local midnight,
+    /// not the instant 24 h later.
+    #[test]
+    fn a_fall_back_day_ends_at_the_next_local_midnight() {
+        let start = utc("2026-10-24T22:00:00Z"); // Sunday 00:00 +02:00
+        let end = next_local_day_start(start, &FallZone);
+        assert_eq!(end, utc("2026-10-25T23:00:00Z")); // Monday 00:00 +01:00
+        assert_eq!(end - start, Duration::hours(25));
     }
 }

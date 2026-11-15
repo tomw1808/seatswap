@@ -3,22 +3,27 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Duration, FixedOffset, Timelike, Utc};
+use chrono::{DateTime, Duration, TimeZone, Utc};
 
 use crate::api::LimitKind;
 use crate::history::{same_reset, AccountRef, Event, EventKind, Hosted, Sample, TokenRecord};
 
-use super::{
-    hour_of_week, week_weight, work_units, Rates, Rhythm, LEARN_MIN_WU, RATES_DAYS, RHYTHM_WEEKS,
-};
+use crate::stats::{local_hour_of_week, local_hour_start};
+
+use super::{week_weight, work_units, Rates, Rhythm, LEARN_MIN_WU, RATES_DAYS, RHYTHM_WEEKS};
 
 /// Average work units per hour of the week from the token records of all hosts
-/// in `[now - 4 weeks, now)`, in the local time of `offset`. A clock hour of the
+/// in `[now - 4 weeks, now)`, in the local time of `zone`. A clock hour of the
 /// week is the weighted mean over the four weeks: the two newer weeks weigh 2,
 /// the two older 1. A week without a record in that hour counts as 0 for it. A
 /// record's hour is spread over the local clock hours it covers, by the minutes
-/// each one holds, so an offset that is not a whole hour splits it between two.
-pub fn rhythm(tokens: &[Hosted<TokenRecord>], now: DateTime<Utc>, offset: FixedOffset) -> Rhythm {
+/// each one holds, so an offset that is not a whole hour splits it between two
+/// and a daylight-saving change is followed.
+pub fn rhythm<Tz: TimeZone + Copy>(
+    tokens: &[Hosted<TokenRecord>],
+    now: DateTime<Utc>,
+    zone: &Tz,
+) -> Rhythm {
     let mut weighted = [0.0f64; super::HOURS];
     let weight_sum: f64 = (0..RHYTHM_WEEKS).map(week_weight).sum();
     for hosted in tokens {
@@ -32,7 +37,7 @@ pub fn rhythm(tokens: &[Hosted<TokenRecord>], now: DateTime<Utc>, offset: FixedO
         let week = age.num_days() / 7;
         let record = &hosted.record;
         let units = work_units(record.input, record.out, record.cw, record.cr);
-        spread(&mut weighted, record.t, offset, week_weight(week) * units);
+        spread(&mut weighted, record.t, zone, week_weight(week) * units);
     }
     let mut wu = [0.0f64; super::HOURS];
     for (hour, sum) in wu.iter_mut().zip(weighted) {
@@ -42,17 +47,19 @@ pub fn rhythm(tokens: &[Hosted<TokenRecord>], now: DateTime<Utc>, offset: FixedO
 }
 
 /// Add the work of one record's hour to the clock hours it covers, by the share
-/// of the hour each one holds. A whole-hour offset leaves it in one hour.
-fn spread(weighted: &mut [f64; super::HOURS], t: DateTime<Utc>, offset: FixedOffset, units: f64) {
+/// of the hour each one holds. A whole-hour offset leaves it in one hour. The
+/// hour boundaries and the hour-of-week index are the statistics' one rule.
+fn spread<Tz: TimeZone + Copy>(
+    weighted: &mut [f64; super::HOURS],
+    t: DateTime<Utc>,
+    zone: &Tz,
+    units: f64,
+) {
     let end = t + Duration::hours(1);
     let mut cursor = t;
     while cursor < end {
-        let local = cursor.with_timezone(&offset);
-        let into_hour = Duration::minutes(local.minute() as i64)
-            + Duration::seconds(local.second() as i64)
-            + Duration::nanoseconds(local.nanosecond() as i64);
-        let to = (cursor - into_hour + Duration::hours(1)).min(end);
-        weighted[hour_of_week(cursor, offset)] += units * seconds_between(cursor, to) / 3600.0;
+        let to = (local_hour_start(cursor, zone) + Duration::hours(1)).min(end);
+        weighted[local_hour_of_week(cursor, zone)] += units * seconds_between(cursor, to) / 3600.0;
         cursor = to;
     }
 }
@@ -316,6 +323,8 @@ pub(super) fn work_in(
 mod tests {
     use super::*;
 
+    use chrono::FixedOffset;
+
     use crate::history::{By, LimitSample, Source};
     use crate::project::ProjectKey;
 
@@ -448,7 +457,7 @@ mod tests {
             token("vega", "2026-11-02T08:00:00Z", 2_000_000),
         ];
         let now = utc("2026-11-23T12:00:00Z");
-        let rhythm = rhythm(&tokens, now, east_one());
+        let rhythm = rhythm(&tokens, now, &east_one());
 
         assert!((rhythm.wu[9] - 2.0).abs() < EPS, "{:?}", rhythm.wu[9]);
         for (hour, wu) in rhythm.wu.iter().enumerate() {
@@ -470,7 +479,7 @@ mod tests {
             token("atlas", "2026-11-09T08:00:00Z", 1_000_000),
             token("atlas", "2026-11-02T08:00:00Z", 1_000_000),
         ];
-        let rhythm = rhythm(&tokens, utc("2026-11-23T12:00:00Z"), east_one());
+        let rhythm = rhythm(&tokens, utc("2026-11-23T12:00:00Z"), &east_one());
         assert!((rhythm.wu[9] - 3.0).abs() < EPS, "{:?}", rhythm.wu[9]);
     }
 
@@ -778,7 +787,7 @@ mod tests {
             token("atlas", "2026-11-09T10:00:00Z", 2_000_000),
             token("atlas", "2026-11-02T10:00:00Z", 2_000_000),
         ];
-        let rhythm = rhythm(&tokens, utc("2026-11-23T12:00:00Z"), half_hour());
+        let rhythm = rhythm(&tokens, utc("2026-11-23T12:00:00Z"), &half_hour());
 
         assert!(
             (rhythm.wu[15] - 1.0).abs() < EPS,
@@ -799,7 +808,7 @@ mod tests {
         // The window is [now - 4 weeks, now): the hour of a record that starts
         // at now lies in the future and is not work of the past four weeks.
         let tokens = vec![token("atlas", "2026-11-23T08:00:00Z", 2_000_000)];
-        let rhythm = rhythm(&tokens, utc("2026-11-23T08:00:00Z"), east_one());
+        let rhythm = rhythm(&tokens, utc("2026-11-23T08:00:00Z"), &east_one());
 
         assert!((rhythm.wu[9] - 0.0).abs() < EPS, "hour 9: {}", rhythm.wu[9]);
     }
@@ -873,5 +882,24 @@ mod tests {
         assert!((rates.c - 0.32).abs() < EPS, "c = {}", rates.c);
         let s = rates.s.expect("a session limit");
         assert!((s - 2.0).abs() < EPS, "s = {s}");
+    }
+
+    /// A record at 09:00 in +02:00 stays in hour 9 of the week even when the
+    /// four weeks start in +01:00: the rhythm uses the offset of each instant.
+    #[test]
+    fn a_summer_record_is_in_its_own_rhythm_hour() {
+        let tokens = vec![token("atlas", "2026-03-30T07:00:00Z", 2_000_000)];
+        let rhythm = rhythm(
+            &tokens,
+            utc("2026-03-30T12:00:00Z"),
+            &crate::stats::tests::SummerZone,
+        );
+
+        assert!(
+            (rhythm.wu[9] - 2.0 / 3.0).abs() < EPS,
+            "hour 9: {}",
+            rhythm.wu[9]
+        );
+        assert!((rhythm.wu[8] - 0.0).abs() < EPS, "hour 8: {}", rhythm.wu[8]);
     }
 }

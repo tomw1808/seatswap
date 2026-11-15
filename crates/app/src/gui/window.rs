@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(feature = "gui")]
-use chrono::{DateTime, Duration, FixedOffset, Local, Utc};
+use chrono::{DateTime, Duration, Local, TimeZone, Utc};
 #[cfg(feature = "gui")]
 use serde::{Deserialize, Serialize};
 
@@ -567,12 +567,12 @@ pub(crate) struct StatsParts {
 
 #[cfg(feature = "gui")]
 impl StatsParts {
-    pub(crate) fn ctx<'a>(
+    pub(crate) fn ctx<'a, Tz: TimeZone + Copy>(
         &'a self,
         history: &'a HistoryDir,
         now: DateTime<Utc>,
-        offset: FixedOffset,
-    ) -> Ctx<'a> {
+        zone: Tz,
+    ) -> Ctx<'a, Tz> {
         Ctx {
             history,
             accounts: &self.accounts,
@@ -581,7 +581,7 @@ impl StatsParts {
             fx: &self.fx,
             projects: &self.projects,
             now,
-            offset,
+            zone,
         }
     }
 }
@@ -620,15 +620,15 @@ pub(crate) fn stats_ctx_parts(app: &AppPaths, history: &HistoryDir) -> Result<St
 /// The one way a page becomes [`Page`]: "nothing recorded" first, else the
 /// page's own numbers.
 #[cfg(feature = "gui")]
-fn stats_page<T>(
+fn stats_page<T, Tz: TimeZone + Copy>(
     parts: &StatsParts,
     history: &HistoryDir,
     now: DateTime<Utc>,
-    offset: FixedOffset,
+    zone: Tz,
     query: &Query,
-    compute: impl FnOnce(&Ctx<'_>) -> Result<T, stats::StatsError>,
+    compute: impl FnOnce(&Ctx<'_, Tz>) -> Result<T, stats::StatsError>,
 ) -> Result<Page<T>, String> {
-    let ctx = parts.ctx(history, now, offset);
+    let ctx = parts.ctx(history, now, zone);
     let range = stats::range_of(query.range, &ctx).map_err(|error| error.to_string())?;
     match stats::empty(&ctx, &range).map_err(|error| error.to_string())? {
         Some(empty) => Ok(Page::Empty(empty)),
@@ -639,110 +639,110 @@ fn stats_page<T>(
 }
 
 #[cfg(feature = "gui")]
-pub(crate) fn stats_overview_at(
+pub(crate) fn stats_overview_at<Tz: TimeZone + Copy>(
     parts: &StatsParts,
     history: &HistoryDir,
     now: DateTime<Utc>,
-    offset: FixedOffset,
+    zone: Tz,
     query: &Query,
 ) -> Result<Page<overview::Overview>, String> {
-    stats_page(parts, history, now, offset, query, |ctx| {
+    stats_page(parts, history, now, zone, query, |ctx| {
         overview::overview(ctx, query)
     })
 }
 
 #[cfg(feature = "gui")]
-pub(crate) fn stats_weeks_at(
+pub(crate) fn stats_weeks_at<Tz: TimeZone + Copy>(
     parts: &StatsParts,
     history: &HistoryDir,
     now: DateTime<Utc>,
-    offset: FixedOffset,
+    zone: Tz,
     query: &Query,
 ) -> Result<Page<weeks::WeeksPage>, String> {
-    stats_page(parts, history, now, offset, query, |ctx| {
+    stats_page(parts, history, now, zone, query, |ctx| {
         weeks::weeks(ctx, query)
     })
 }
 
 #[cfg(feature = "gui")]
-pub(crate) fn stats_week_summary_at(
+pub(crate) fn stats_week_summary_at<Tz: TimeZone + Copy>(
     parts: &StatsParts,
     history: &HistoryDir,
     now: DateTime<Utc>,
-    offset: FixedOffset,
+    zone: Tz,
     query: &Query,
     week: DateTime<Utc>,
 ) -> Result<Page<weeks::WeekSummary>, String> {
-    stats_page(parts, history, now, offset, query, |ctx| {
+    stats_page(parts, history, now, zone, query, |ctx| {
         weeks::week_summary(ctx, query, week)
     })
 }
 
 #[cfg(feature = "gui")]
-pub(crate) fn stats_window_detail_at(
+pub(crate) fn stats_window_detail_at<Tz: TimeZone + Copy>(
     parts: &StatsParts,
     history: &HistoryDir,
     now: DateTime<Utc>,
-    offset: FixedOffset,
+    zone: Tz,
     query: &Query,
     account_id: &str,
     end: DateTime<Utc>,
 ) -> Result<Page<weeks::WindowDetail>, String> {
-    stats_page(parts, history, now, offset, query, |ctx| {
+    stats_page(parts, history, now, zone, query, |ctx| {
         weeks::window_detail(ctx, account_id, end)
     })
 }
 
 #[cfg(feature = "gui")]
-pub(crate) fn stats_projects_at(
+pub(crate) fn stats_projects_at<Tz: TimeZone + Copy>(
     parts: &StatsParts,
     history: &HistoryDir,
     now: DateTime<Utc>,
-    offset: FixedOffset,
+    zone: Tz,
     query: &Query,
 ) -> Result<Page<stats_projects::ProjectsPage>, String> {
-    stats_page(parts, history, now, offset, query, |ctx| {
+    stats_page(parts, history, now, zone, query, |ctx| {
         stats_projects::projects_page(ctx, query)
     })
 }
 
 #[cfg(feature = "gui")]
-pub(crate) fn stats_project_detail_at(
+pub(crate) fn stats_project_detail_at<Tz: TimeZone + Copy>(
     parts: &StatsParts,
     history: &HistoryDir,
     now: DateTime<Utc>,
-    offset: FixedOffset,
+    zone: Tz,
     query: &Query,
     key: &ProjectKey,
 ) -> Result<Page<stats_projects::ProjectDetail>, String> {
-    stats_page(parts, history, now, offset, query, |ctx| {
+    stats_page(parts, history, now, zone, query, |ctx| {
         stats_projects::project_detail(ctx, query, key)
     })
 }
 
 #[cfg(feature = "gui")]
-pub(crate) fn stats_subscriptions_at(
+pub(crate) fn stats_subscriptions_at<Tz: TimeZone + Copy>(
     parts: &StatsParts,
     history: &HistoryDir,
     now: DateTime<Utc>,
-    offset: FixedOffset,
+    zone: Tz,
     query: &Query,
 ) -> Result<Page<subscriptions::SubscriptionsPage>, String> {
-    stats_page(parts, history, now, offset, query, |ctx| {
+    stats_page(parts, history, now, zone, query, |ctx| {
         subscriptions::subscriptions(ctx, query)
     })
 }
 
 #[cfg(feature = "gui")]
-pub(crate) fn stats_what_if_at(
+pub(crate) fn stats_what_if_at<Tz: TimeZone + Copy>(
     parts: &StatsParts,
     history: &HistoryDir,
     now: DateTime<Utc>,
-    offset: FixedOffset,
+    zone: Tz,
     query: &Query,
     without: &str,
 ) -> Result<Page<subscriptions::WhatIf>, String> {
-    stats_page(parts, history, now, offset, query, |ctx| {
+    stats_page(parts, history, now, zone, query, |ctx| {
         subscriptions::what_if(ctx, query, without)
     })
 }
@@ -752,11 +752,11 @@ pub(crate) fn stats_what_if_at(
 /// freshness is the same as no reading; the age is the oldest reading the
 /// situation kept, not the tick time its plan was built for.
 #[cfg(feature = "gui")]
-pub(crate) fn stats_forecast_at(
+pub(crate) fn stats_forecast_at<Tz: TimeZone + Copy>(
     parts: &StatsParts,
     history: &HistoryDir,
     now: DateTime<Utc>,
-    offset: FixedOffset,
+    zone: Tz,
     kept: Option<KeptForecast>,
 ) -> Result<Page<forecast::Forecast>, String> {
     let Some((inputs, regime, oldest_reading)) = kept else {
@@ -766,34 +766,34 @@ pub(crate) fn stats_forecast_at(
     {
         return Err("the forecast needs a reading of every account first".to_string());
     }
-    let ctx = parts.ctx(history, now, offset);
+    let ctx = parts.ctx(history, now, zone);
     forecast::forecast(&ctx, &inputs, &regime)
         .map(Page::Data)
         .map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "gui")]
-pub(crate) fn stats_rhythm_at(
+pub(crate) fn stats_rhythm_at<Tz: TimeZone + Copy>(
     parts: &StatsParts,
     history: &HistoryDir,
     now: DateTime<Utc>,
-    offset: FixedOffset,
+    zone: Tz,
     query: &Query,
 ) -> Result<Page<activity::RhythmPage>, String> {
-    stats_page(parts, history, now, offset, query, |ctx| {
+    stats_page(parts, history, now, zone, query, |ctx| {
         activity::rhythm(ctx, query)
     })
 }
 
 #[cfg(feature = "gui")]
-pub(crate) fn stats_activity_at(
+pub(crate) fn stats_activity_at<Tz: TimeZone + Copy>(
     parts: &StatsParts,
     history: &HistoryDir,
     now: DateTime<Utc>,
-    offset: FixedOffset,
+    zone: Tz,
     query: &Query,
 ) -> Result<Page<activity::ActivityPage>, String> {
-    stats_page(parts, history, now, offset, query, |ctx| {
+    stats_page(parts, history, now, zone, query, |ctx| {
         activity::activity(ctx, query)
     })
 }
@@ -805,14 +805,12 @@ pub(crate) fn stats_hosts_at(history: &HistoryDir) -> Result<Vec<String>, String
 
 /// The one body of a statistics command: on the blocking thread it reads the
 /// files the page needs, then runs the page's own function with the moment and
-/// the local offset it read there.
+/// the local zone it uses there.
 #[cfg(feature = "gui")]
 async fn stats_command<T, F>(state: State<'_, super::GuiState>, run: F) -> Result<T, String>
 where
     T: Send + 'static,
-    F: FnOnce(&StatsParts, &HistoryDir, DateTime<Utc>, FixedOffset) -> Result<T, String>
-        + Send
-        + 'static,
+    F: FnOnce(&StatsParts, &HistoryDir, DateTime<Utc>, Local) -> Result<T, String> + Send + 'static,
 {
     let app = state.app.clone();
     let history = state
@@ -822,7 +820,7 @@ where
         .clone();
     tauri::async_runtime::spawn_blocking(move || {
         let parts = stats_ctx_parts(&app, &history)?;
-        run(&parts, &history, Utc::now(), *Local::now().offset())
+        run(&parts, &history, Utc::now(), Local)
     })
     .await
     .map_err(|error| error.to_string())?

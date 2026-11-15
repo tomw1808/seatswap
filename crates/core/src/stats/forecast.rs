@@ -3,7 +3,7 @@
 //! when switching only when full, the lanes of the plan, and the one sentence
 //! that says whether the week is enough. Everything here only reads.
 
-use chrono::{DateTime, Duration, FixedOffset, Utc};
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde::Serialize;
 
 use crate::api::LimitKind;
@@ -109,7 +109,11 @@ pub struct Lane {
 /// `planned` plan is the one auto-burn follows now: eager when the regime says
 /// early switching pays, else lazy; the other is the lazy plan, "only when
 /// full" (spec §3.4).
-pub fn forecast(ctx: &Ctx, inputs: &Inputs, regime: &Regime) -> Result<Forecast, StatsError> {
+pub fn forecast<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
+    inputs: &Inputs,
+    regime: &Regime,
+) -> Result<Forecast, StatsError> {
     let policy = if regime.early {
         Policy::Eager
     } else {
@@ -319,8 +323,8 @@ pub fn forecast(ctx: &Ctx, inputs: &Inputs, regime: &Regime) -> Result<Forecast,
         .filter(|(state, _)| learning.iter().any(|id| id == &state.id))
         .map(|(_, account)| account_abbr(ctx, &AccountRef::of(account)))
         .collect();
-    let sentence = sentence(ctx, &learning_abbrs, &planned, &accounts, to, inputs.offset)?;
-    let basis_weeks = basis_weeks(ctx, inputs.now, inputs.offset)?;
+    let sentence = sentence(ctx, &learning_abbrs, &planned, &accounts, to)?;
+    let basis_weeks = basis_weeks(ctx, inputs.now)?;
 
     Ok(Forecast {
         basis_weeks,
@@ -429,11 +433,11 @@ fn lane_resets(reset: DateTime<Utc>, from: DateTime<Utc>, to: DateTime<Utc>) -> 
 
 /// Whole weeks from the week start of the history's first record to the week
 /// start of `now`; 0 for an empty history.
-fn basis_weeks(ctx: &Ctx, now: DateTime<Utc>, offset: FixedOffset) -> Result<u32, StatsError> {
+fn basis_weeks<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, now: DateTime<Utc>) -> Result<u32, StatsError> {
     let Some(first) = first_record(ctx)? else {
         return Ok(0);
     };
-    let weeks = (week_start(now, offset) - week_start(first, offset)).num_weeks();
+    let weeks = (week_start(now, &ctx.zone) - week_start(first, &ctx.zone)).num_weeks();
     u32::try_from(weeks).map_err(|_| {
         StatsError::Message(format!(
             "the first record {first} lies after the forecast's now {now}"
@@ -445,13 +449,12 @@ fn basis_weeks(ctx: &Ctx, now: DateTime<Utc>, offset: FixedOffset) -> Result<u32
 /// auto-burn may use has no rates, then "Enough for the week." or the first
 /// blocked stretch and what ends it: the next account's weekly reset when the
 /// stretch ends there, else that account becoming usable again.
-fn sentence(
-    ctx: &Ctx,
+fn sentence<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
     learning_abbrs: &[String],
     planned: &Plan,
     accounts: &[ForecastAccount],
     to: DateTime<Utc>,
-    offset: FixedOffset,
 ) -> Result<String, StatsError> {
     let mut sentence = String::new();
     if !learning_abbrs.is_empty() {
@@ -470,7 +473,7 @@ fn sentence(
         return Ok(sentence);
     };
     let blocked = &planned.segments[index];
-    let start = clock_text(blocked.from, offset);
+    let start = clock_text(blocked.from, &ctx.zone);
     if blocked.to >= to {
         sentence.push_str(&format!(
             "All accounts full from {start} to the end of the forecast."
@@ -495,7 +498,7 @@ fn sentence(
         .iter()
         .find(|row| row.id == id)
         .ok_or_else(|| unknown_account(id))?;
-    let end = clock_text(blocked.to, offset);
+    let end = clock_text(blocked.to, &ctx.zone);
     let abbr = account_abbr(ctx, &AccountRef::of(account));
     if same_reset(blocked.to, row.resets_at) {
         sentence.push_str(&format!(
@@ -510,8 +513,11 @@ fn sentence(
 }
 
 /// A local time of the page as `%a %H:%M`: `Sat 16:00`.
-fn clock_text(t: DateTime<Utc>, offset: FixedOffset) -> String {
-    t.with_timezone(&offset).format("%a %H:%M").to_string()
+fn clock_text<Tz: TimeZone + Copy>(t: DateTime<Utc>, zone: &Tz) -> String {
+    t.with_timezone(zone)
+        .naive_local()
+        .format("%a %H:%M")
+        .to_string()
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Duration, FixedOffset, Utc};
+use chrono::{DateTime, Duration, FixedOffset, TimeZone, Utc};
 
 use crate::api::Limit;
 use crate::engine::{AccountView, Blocker};
@@ -58,10 +58,10 @@ pub enum Readiness {
 /// of [`RATES_DAYS`] days. The rates are computed for `accounts` only; an
 /// account with too little work has no entry. With `read_sessions` false no
 /// rates are learned: every account plays as one without rates (spec §2.3).
-pub fn learn(
+pub fn learn<Tz: TimeZone + Copy>(
     history: &HistoryDir,
     now: DateTime<Utc>,
-    offset: FixedOffset,
+    zone: Tz,
     accounts: &[Account],
     read_sessions: bool,
 ) -> Result<Learned, HistoryError> {
@@ -82,7 +82,7 @@ pub fn learn(
     warnings.extend(tokens.warnings);
     warnings.extend(events.warnings);
 
-    let rhythm = rhythm(&tokens.records, now, offset);
+    let rhythm = rhythm(&tokens.records, now, &zone);
     let mut learned_rates = BTreeMap::new();
     if read_sessions {
         for account in accounts {

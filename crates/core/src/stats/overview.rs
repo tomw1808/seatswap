@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde::Serialize;
 
 use crate::burn::cost::switch_cost;
@@ -101,14 +101,18 @@ pub struct Mark {
     pub label: String,
 }
 
-pub fn overview(ctx: &Ctx, q: &Query) -> Result<Overview, StatsError> {
+pub fn overview<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, q: &Query) -> Result<Overview, StatsError> {
     let range = range_of(q.range, ctx)?;
     overview_in(ctx, &range, q)
 }
 
 /// The Overview of `range`; the page's [`overview`] takes the range from its
 /// [`Query`], the tests name one.
-pub(crate) fn overview_in(ctx: &Ctx, range: &Range, q: &Query) -> Result<Overview, StatsError> {
+pub(crate) fn overview_in<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
+    range: &Range,
+    q: &Query,
+) -> Result<Overview, StatsError> {
     let valuer = Valuer::build(
         ctx.history,
         range,
@@ -131,7 +135,7 @@ pub(crate) fn overview_in(ctx: &Ctx, range: &Range, q: &Query) -> Result<Overvie
 
     // The page shows every calendar week of the range, with or without an
     // account week; the blocked hours of all of them add up to the KPI.
-    let mut weeks_by_start: BTreeMap<DateTime<Utc>, OverviewWeek> = week_columns(range, ctx.offset)
+    let mut weeks_by_start: BTreeMap<DateTime<Utc>, OverviewWeek> = week_columns(range, &ctx.zone)
         .into_iter()
         .map(|week| (week, empty_week(week)))
         .collect();
@@ -205,7 +209,7 @@ pub(crate) fn overview_in(ctx: &Ctx, range: &Range, q: &Query) -> Result<Overvie
         });
     }
 
-    for (week, hours) in blocked_by_week(&spans, &rhythm, ctx.offset) {
+    for (week, hours) in blocked_by_week(&spans, &rhythm, &ctx.zone) {
         weeks_by_start
             .entry(week)
             .or_insert_with(|| empty_week(week))
@@ -327,8 +331,8 @@ fn empty_week(week: DateTime<Utc>) -> OverviewWeek {
 /// The measured cost of one switch at the range's end (spec §2.13): the mean
 /// over the switches of the range, times `s` of the account in use at the end
 /// on this host. The rule is the Settings page's (`cost.wu × s`).
-fn switch_cost_percent(
-    ctx: &Ctx,
+fn switch_cost_percent<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
     range: &Range,
     events: &Read<Event>,
     samples: &Read<Sample>,
@@ -362,8 +366,8 @@ fn switch_cost_percent(
 
 /// The first finding: the account with the most expired money, if above zero;
 /// no money text without a currency.
-fn finding_expired(
-    ctx: &Ctx,
+fn finding_expired<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
     kpis: &Kpis,
     priced_weeks: &BTreeMap<AccountRef, u32>,
     currency: Option<&str>,
@@ -403,8 +407,8 @@ fn finding_blocked(kpis: &Kpis, weeks: &[OverviewWeek]) -> Option<String> {
 /// The third finding: since auto-burn was switched on and stayed on, with a
 /// full week on each side. Its expired share needs priced weeks, not a
 /// currency of its own.
-fn finding_auto_burn(
-    ctx: &Ctx,
+fn finding_auto_burn<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
     range: &Range,
     events: &[Hosted<Event>],
     weeks: &[OverviewWeek],
@@ -424,7 +428,7 @@ fn finding_auto_burn(
     let (blocked_after, expired_after) = week_averages(&after, money)?;
     Some(format!(
         "Since auto-burn ({}): {} blocked a week, {} expired. Before: {}, {}.",
-        date_text(at, ctx.offset),
+        date_text(at, &ctx.zone),
         hours_text(blocked_after),
         percent_text(expired_after),
         hours_text(blocked_before),
@@ -484,7 +488,7 @@ fn week_averages(
 }
 
 /// 4. The account with the most full weeks.
-fn finding_full(ctx: &Ctx, finished: &[AccountWeek]) -> Option<String> {
+fn finding_full<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, finished: &[AccountWeek]) -> Option<String> {
     let mut fullest: Option<(&crate::store::Account, u32, u32)> = None;
     for account in ctx.accounts {
         let reference = AccountRef::of(account);

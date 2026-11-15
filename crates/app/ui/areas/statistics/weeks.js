@@ -23,11 +23,8 @@ import {
   shortPercent,
   tokens,
   valueTip,
-  weekdayIndex,
 } from "../../common.js";
 import { grid, lines } from "../../charts.js";
-
-const WEEK_MS = 7 * 86400000;
 
 function accountLabel(row, env) {
   const label = h("span", { class: "stats-row-label" }, [
@@ -35,24 +32,6 @@ function accountLabel(row, env) {
   ]);
   if (row.plan) label.appendChild(h("span", { class: "stats-plan", text: row.plan }));
   return label;
-}
-
-function thisWeekStart() {
-  const now = new Date();
-  const monday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  monday.setDate(monday.getDate() - weekdayIndex(now));
-  return monday.getTime();
-}
-
-function newestFinished(weekStarts) {
-  const now = Date.now();
-  let best = null;
-  for (const week of weekStarts) {
-    const time = Date.parse(week);
-    if (Number.isNaN(time)) continue;
-    if (time + WEEK_MS <= now) best = week;
-  }
-  return best;
 }
 
 function switchLine(switches) {
@@ -78,9 +57,9 @@ export async function show(container, env) {
   root.appendChild(right);
   container.appendChild(root);
 
+  const runningIndex = data.running.findIndex((running) => running === true);
   const lastIsCurrent =
-    data.weekStarts.length > 0 &&
-    Math.abs(Date.parse(data.weekStarts[data.weekStarts.length - 1]) - thisWeekStart()) < 86400000;
+    runningIndex !== -1 && runningIndex === data.weekStarts.length - 1;
 
   function renderDetailError() {
     if (state.detailError === null) return null;
@@ -480,6 +459,8 @@ export async function show(container, env) {
   }
 
   paint();
-  const week = newestFinished(data.weekStarts);
+  const finished =
+    runningIndex === -1 ? data.weekStarts : data.weekStarts.slice(0, runningIndex);
+  const week = finished.length > 0 ? finished[finished.length - 1] : null;
   if (week !== null) await selectSummary(week);
 }

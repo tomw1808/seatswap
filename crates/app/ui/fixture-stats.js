@@ -499,6 +499,10 @@ function weeks(query) {
   const { indexes, chosen } = chosenAccounts(query);
   return {
     weekStarts: indexes.map(weekIso),
+    // The column that holds the fixture's now; its week has no finished window.
+    running: indexes.map(
+      (index) => weekTime(index) <= NOW_MS && NOW_MS < weekTime(index + 1)
+    ),
     rows: chosen.map((account) => ({
       id: account.id,
       plan: account.plan,
