@@ -14,7 +14,13 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "gui")]
-use seatswap_core::live_sessions::{switch_kind, LiveSession, LiveStatus, OtherHost, SwitchKind};
+use seatswap_core::live_sessions::{
+    switch_kind, LiveSession, LiveStatus, OtherHost, SwitchKind, Values,
+};
+#[cfg(feature = "gui")]
+use seatswap_core::projects::ProjectId;
+#[cfg(feature = "gui")]
+use seatswap_core::transcripts::Tokens;
 
 #[cfg(feature = "gui")]
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
@@ -278,8 +284,64 @@ pub(crate) struct SwitchEffect {
     pub free: u32,
 }
 
-/// What the Sessions area shows (spec §3.8). The totals and groups are computed
-/// by the page from `sessions`, so they always agree with the list.
+/// Which group a [`Sum`] belongs to (spec §3.8). The page looks a row's or a
+/// card's numbers up by this key; it never adds values itself. The page shows
+/// the provider group too, so a provider key is here beside the brief's four
+/// (`All`, `Project`, `ProjectModel`, `Model`).
+#[cfg(feature = "gui")]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum SumOf {
+    All,
+    Provider(String),
+    Project(ProjectId),
+    ProjectModel(ProjectId, Option<String>),
+    Model(Option<String>),
+}
+
+#[cfg(feature = "gui")]
+impl Serialize for SumOf {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        match self {
+            SumOf::All => map.serialize_entry("kind", "all")?,
+            SumOf::Provider(provider) => {
+                map.serialize_entry("kind", "provider")?;
+                map.serialize_entry("provider", provider)?;
+            }
+            SumOf::Project(project) => {
+                map.serialize_entry("kind", "project")?;
+                map.serialize_entry("project", project)?;
+            }
+            SumOf::ProjectModel(project, model) => {
+                map.serialize_entry("kind", "projectModel")?;
+                map.serialize_entry("project", project)?;
+                map.serialize_entry("model", model)?;
+            }
+            SumOf::Model(model) => {
+                map.serialize_entry("kind", "model")?;
+                map.serialize_entry("model", model)?;
+            }
+        }
+        map.end()
+    }
+}
+
+/// One group's numbers, built over the listed sessions only (spec §3.8): every
+/// total counts exactly what the page lists, and the page adds nothing.
+#[cfg(feature = "gui")]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Sum {
+    pub of: SumOf,
+    pub sessions: u32,
+    pub tokens: Tokens,
+    pub last_hour: Tokens,
+    pub values: Values,
+}
+
+/// What the Sessions area shows (spec §3.8). The groups' numbers come from
+/// `sums`, so they always agree with the list.
 #[cfg(feature = "gui")]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -293,6 +355,8 @@ pub(crate) struct SessionsView {
     /// This host's running rows in their order, then the other hosts' by host,
     /// then the closed ones newest first.
     pub sessions: Vec<LiveSession>,
+    /// Every group the page shows, over the listed sessions only.
+    pub sums: Vec<Sum>,
     /// This host's running sessions only, whatever the host filter says.
     pub switch_effect: SwitchEffect,
     /// The id of the account in use; filled in by `gui::fill_in_use`.
@@ -376,16 +440,60 @@ pub(crate) fn view_of(
         }
     }
 
+    let sums = sums_of(&sessions);
     SessionsView {
         at,
         this_host,
         hosts,
         sessions,
+        sums,
         switch_effect,
         in_use: None,
         currency: currency.map(str::to_string),
         unavailable: unavailable.map(str::to_string),
     }
+}
+
+/// Every group's numbers over exactly `sessions`: all listed, each provider,
+/// each project, each project's model, each model. A key exists when it has a
+/// session; `All` exists even for an empty list, so the page always has the
+/// total to look up.
+#[cfg(feature = "gui")]
+fn sums_of(sessions: &[LiveSession]) -> Vec<Sum> {
+    type Group<'a> = (u32, Tokens, Tokens, Vec<&'a Values>);
+    let mut groups: BTreeMap<SumOf, Group<'_>> = BTreeMap::new();
+    groups.insert(
+        SumOf::All,
+        (0, Tokens::default(), Tokens::default(), Vec::new()),
+    );
+    for row in sessions {
+        let keys = [
+            SumOf::All,
+            SumOf::Provider(row.provider.clone()),
+            SumOf::Project(row.project_id.clone()),
+            SumOf::ProjectModel(row.project_id.clone(), row.model.clone()),
+            SumOf::Model(row.model.clone()),
+        ];
+        for key in keys {
+            let group = groups
+                .entry(key)
+                .or_insert_with(|| (0, Tokens::default(), Tokens::default(), Vec::new()));
+            group.0 += 1;
+            group.1 += row.tokens;
+            group.2 += row.last_hour;
+            group.3.push(&row.values);
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(of, (sessions, tokens, last_hour, values))| Sum {
+            of,
+            sessions,
+            tokens,
+            last_hour,
+            values: Values::sum(&values),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -469,6 +577,10 @@ mod tests {
             session: session.to_string(),
             host: host.to_string(),
             label: format!("acme-kb-{}", session.chars().take(2).collect::<String>()),
+            project_id: ProjectId::of(
+                &seatswap_core::project::ProjectKey::Repo("github.com/acme/acme-kb".to_string()),
+                host,
+            ),
             project: "acme-kb".to_string(),
             org: None,
             cwd: "/home/sam/projects/acme-kb".to_string(),
@@ -853,6 +965,277 @@ mod tests {
             view.unavailable.as_deref(),
             Some("the history cannot be read")
         );
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn the_sums_cover_every_group() {
+        fn find<'a>(view: &'a SessionsView, of: &SumOf) -> &'a Sum {
+            view.sums
+                .iter()
+                .find(|sum| &sum.of == of)
+                .unwrap_or_else(|| panic!("no sum for {of:?}"))
+        }
+        use seatswap_core::project::ProjectKey;
+
+        let now = time("2026-11-14T10:00:00Z");
+        let first = ProjectId::of(
+            &ProjectKey::Repo("github.com/acme/acme-kb".to_string()),
+            "atlas",
+        );
+        let second = ProjectId::of(
+            &ProjectKey::Repo("github.com/sam/acme-kb".to_string()),
+            "atlas",
+        );
+        let mut a = row(
+            ATLAS,
+            "atlas",
+            LiveStatus::Busy,
+            Some("claude-opus-5-5"),
+            now,
+        );
+        a.project_id = first.clone();
+        a.tokens.out = 1_000_000;
+        let mut b = row(
+            "aaaa1111-1111-4111-8111-111111111111",
+            "atlas",
+            LiveStatus::Idle,
+            Some("claude-opus-5-5"),
+            now,
+        );
+        b.project_id = second.clone();
+        b.tokens.out = 2_000_000;
+        let mut c = row(
+            "bbbb1111-1111-4111-8111-111111111111",
+            "atlas",
+            LiveStatus::Idle,
+            Some("claude-fable-5-2"),
+            now,
+        );
+        c.project_id = first.clone();
+        c.tokens.out = 4_000_000;
+        let mut d = row(
+            "cccc1111-1111-4111-8111-111111111111",
+            "atlas",
+            LiveStatus::Idle,
+            None,
+            now,
+        );
+        d.project_id = first.clone();
+        d.provider = "Codex".to_string();
+        d.tokens.out = 8_000_000;
+        let view = view_of(
+            now,
+            Some("atlas".to_string()),
+            &[a, b, c, d],
+            &[],
+            &[],
+            &BTreeMap::new(),
+            None,
+            Some("EUR"),
+            &SessionsOptions::default(),
+        );
+
+        assert_eq!(view.sums.len(), 12, "{:?}", view.sums);
+        assert_eq!(find(&view, &SumOf::All).sessions, 4);
+        assert_eq!(find(&view, &SumOf::All).tokens.out, 15_000_000);
+        assert_eq!(
+            find(&view, &SumOf::Provider("Claude Code".to_string())).sessions,
+            3
+        );
+        assert_eq!(
+            find(&view, &SumOf::Provider("Claude Code".to_string()))
+                .tokens
+                .out,
+            7_000_000
+        );
+        assert_eq!(
+            find(&view, &SumOf::Provider("Codex".to_string())).sessions,
+            1
+        );
+        assert_eq!(find(&view, &SumOf::Project(first.clone())).sessions, 3);
+        assert_eq!(
+            find(&view, &SumOf::Project(first.clone())).tokens.out,
+            13_000_000
+        );
+        assert_eq!(
+            find(&view, &SumOf::Project(second.clone())).sessions,
+            1,
+            "two projects with the same name are two groups"
+        );
+        assert_eq!(
+            find(
+                &view,
+                &SumOf::ProjectModel(first.clone(), Some("claude-opus-5-5".to_string()))
+            )
+            .tokens
+            .out,
+            1_000_000
+        );
+        assert_eq!(
+            find(
+                &view,
+                &SumOf::ProjectModel(first.clone(), Some("claude-fable-5-2".to_string()))
+            )
+            .tokens
+            .out,
+            4_000_000
+        );
+        assert_eq!(
+            find(&view, &SumOf::ProjectModel(first.clone(), None))
+                .tokens
+                .out,
+            8_000_000
+        );
+        assert_eq!(
+            find(
+                &view,
+                &SumOf::ProjectModel(second.clone(), Some("claude-opus-5-5".to_string()))
+            )
+            .tokens
+            .out,
+            2_000_000
+        );
+        assert_eq!(
+            find(&view, &SumOf::Model(Some("claude-opus-5-5".to_string())))
+                .tokens
+                .out,
+            3_000_000
+        );
+        assert_eq!(
+            find(&view, &SumOf::Model(Some("claude-fable-5-2".to_string())))
+                .tokens
+                .out,
+            4_000_000
+        );
+        assert_eq!(find(&view, &SumOf::Model(None)).tokens.out, 8_000_000);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    /// A group's sum carries the values and the last hour of exactly the rows
+    /// it covers: the closed row is in the sum of the day, and another host's
+    /// row in another currency is not added.
+    fn the_sums_carry_the_values_of_their_rows() {
+        use seatswap_core::project::ProjectKey;
+
+        fn find<'a>(view: &'a SessionsView, of: &SumOf) -> &'a Sum {
+            view.sums
+                .iter()
+                .find(|sum| &sum.of == of)
+                .unwrap_or_else(|| panic!("no sum for {of:?}"))
+        }
+
+        fn valued(subscription: f64, api: f64, currency: &str) -> Values {
+            Values {
+                api: Some(api),
+                api_currency: Some(currency.to_string()),
+                api_missing: None,
+                subscription: Some(subscription),
+                currency: Some(currency.to_string()),
+                subscription_missing: None,
+            }
+        }
+
+        let now = time("2026-11-14T10:00:00Z");
+        let acme = ProjectId::of(
+            &ProjectKey::Repo("github.com/acme/acme-kb".to_string()),
+            "atlas",
+        );
+        let ledger = ProjectId::of(
+            &ProjectKey::Repo("github.com/sam/ledger".to_string()),
+            "atlas",
+        );
+        let mut a = row(
+            ATLAS,
+            "atlas",
+            LiveStatus::Busy,
+            Some("claude-opus-5-5"),
+            now,
+        );
+        a.project_id = acme.clone();
+        a.tokens.out = 1_000_000;
+        a.last_hour.out = 100_000;
+        a.values = valued(2.0, 20.0, "EUR");
+        let mut b = row(
+            "aaaa1111-1111-4111-8111-111111111111",
+            "vega",
+            LiveStatus::Busy,
+            Some("claude-opus-5-5"),
+            now,
+        );
+        b.project_id = acme.clone();
+        b.tokens.out = 2_000_000;
+        b.last_hour.out = 200_000;
+        b.values = valued(4.0, 40.0, "USD");
+        let mut c = row(
+            "bbbb1111-1111-4111-8111-111111111111",
+            "atlas",
+            LiveStatus::Idle,
+            Some("claude-fable-5-2"),
+            now,
+        );
+        c.project_id = ledger.clone();
+        c.tokens.out = 3_000_000;
+        c.last_hour.out = 300_000;
+        c.values = valued(6.0, 60.0, "EUR");
+        let mut done = row(
+            CLOSED_RECENT,
+            "atlas",
+            LiveStatus::Closed,
+            Some("claude-fable-5-2"),
+            now - Duration::hours(3),
+        );
+        done.project_id = ledger.clone();
+        done.tokens.out = 500_000;
+        done.last_hour.out = 50_000;
+        done.values = valued(1.0, 10.0, "EUR");
+
+        let view = view_of(
+            now,
+            Some("atlas".to_string()),
+            &[a, b, c],
+            &[done],
+            &[],
+            &BTreeMap::new(),
+            None,
+            Some("EUR"),
+            &options(ClosedSince::Day, None),
+        );
+
+        // The ledger group holds this host's row and the closed one.
+        let ledger_sum = find(&view, &SumOf::Project(ledger.clone()));
+        assert_eq!(ledger_sum.sessions, 2, "the closed row is in the day");
+        assert_eq!(ledger_sum.tokens.out, 3_500_000);
+        assert_eq!(ledger_sum.last_hour.out, 350_000);
+        assert_eq!(ledger_sum.values.subscription, Some(7.0));
+        assert_eq!(ledger_sum.values.api, Some(70.0));
+        assert_eq!(ledger_sum.values.currency.as_deref(), Some("EUR"));
+
+        // The group of the other host's row holds two currencies: nothing is added.
+        let acme_sum = find(&view, &SumOf::Project(acme.clone()));
+        assert_eq!(acme_sum.sessions, 2);
+        assert_eq!(acme_sum.tokens.out, 3_000_000);
+        assert_eq!(acme_sum.last_hour.out, 300_000);
+        assert_eq!(acme_sum.values.subscription, None);
+        assert_eq!(acme_sum.values.currency, None);
+        assert_eq!(
+            acme_sum.values.subscription_missing.as_deref(),
+            Some("these sessions are valued in two currencies")
+        );
+        assert_eq!(acme_sum.values.api, None);
+        assert_eq!(
+            acme_sum.values.api_missing.as_deref(),
+            Some(
+                "the dollar rate is missing for some of these days, so the values are in two currencies"
+            )
+        );
+
+        // The total of the day counts every listed row.
+        let all = find(&view, &SumOf::All);
+        assert_eq!(all.sessions, 4);
+        assert_eq!(all.tokens.out, 6_500_000);
+        assert_eq!(all.last_hour.out, 650_000);
     }
 
     #[cfg(feature = "gui")]

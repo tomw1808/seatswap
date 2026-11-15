@@ -41,6 +41,10 @@ const NO_AGENT_MODEL: &str = "the agent's model is not known yet";
 const TWO_CURRENCIES: &str =
     "the dollar rate is missing for some of these days, so the values are in two currencies";
 
+/// Why a sum has no subscription value when its parts are valued in two
+/// currencies (each host can set its own settings' currency).
+const TWO_SUBSCRIPTION_CURRENCIES: &str = "these sessions are valued in two currencies";
+
 /// What a session is doing, as the Sessions area shows it (spec §3.8).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -71,28 +75,57 @@ pub struct Values {
 }
 
 impl Values {
-    /// The one way a list of [`Valued`] becomes what a page shows. Each half is
-    /// added only when every part has it: an unpriced part makes the sum
-    /// unknown with the first part's reason, never quietly left out (the rule
-    /// step C1 chose for a week's value). API parts whose `api_currency`
-    /// differs are not added; they are in two currencies. An empty list has
-    /// both reasons "no tokens yet".
+    /// The one way a list of [`Valued`] becomes what a page shows: one
+    /// [`Values`] per record, then [`Values::sum`]. An empty list has both
+    /// reasons "no tokens yet" and the settings' currency.
     pub fn of(valued: &[Valued], settings: &Settings) -> Values {
-        if valued.is_empty() {
-            return Values::missing(NO_TOKENS, settings);
-        }
+        let parts: Vec<Values> = valued
+            .iter()
+            .map(|part| Values {
+                api: part.api,
+                api_currency: part.api_currency.clone(),
+                api_missing: part.api_missing.as_ref().map(ToString::to_string),
+                subscription: part.subscription,
+                currency: settings.currency.clone(),
+                subscription_missing: part.subscription_missing.as_ref().map(ToString::to_string),
+            })
+            .collect();
+        let parts: Vec<&Values> = parts.iter().collect();
+        let mut sum = Values::sum(&parts);
+        // Every part was built with the settings' currency; an empty list has
+        // no part to take it from.
+        sum.currency = settings.currency.clone();
+        sum
+    }
+
+    /// The sum of built values, with the same rule as [`Values::of`]: each
+    /// half is added only when every part has it; a missing part makes the sum
+    /// unknown with the first part's reason; parts whose `api_currency` or
+    /// `currency` differ are not added. The currency is the first part's; the
+    /// view is built with one settings' currency, so all parts agree. An empty
+    /// list has both reasons "no tokens yet".
+    pub fn sum(parts: &[&Values]) -> Values {
         let mut api = Some(0.0);
         let mut api_currency: Option<String> = None;
         let mut api_missing: Option<String> = None;
         let mut two_currencies = false;
         let mut subscription = Some(0.0);
         let mut subscription_missing: Option<String> = None;
-        for part in valued {
+        let mut currency: Option<String> = None;
+        let mut two_subscription_currencies = false;
+        for part in parts {
+            if let Some(part_currency) = &part.currency {
+                match &currency {
+                    None => currency = Some(part_currency.clone()),
+                    Some(first) if first != part_currency => two_subscription_currencies = true,
+                    Some(_) => {}
+                }
+            }
             match part.api {
                 None => {
                     api = None;
                     if api_missing.is_none() {
-                        api_missing = part.api_missing.as_ref().map(ToString::to_string);
+                        api_missing = part.api_missing.clone();
                     }
                 }
                 Some(value) => {
@@ -112,8 +145,7 @@ impl Values {
                 None => {
                     subscription = None;
                     if subscription_missing.is_none() {
-                        subscription_missing =
-                            part.subscription_missing.as_ref().map(ToString::to_string);
+                        subscription_missing = part.subscription_missing.clone();
                     }
                 }
                 Some(value) => {
@@ -130,12 +162,25 @@ impl Values {
         if api.is_none() {
             api_currency = None;
         }
+        if two_subscription_currencies {
+            if subscription.is_some() {
+                subscription = None;
+                subscription_missing = Some(TWO_SUBSCRIPTION_CURRENCIES.to_string());
+            }
+            currency = None;
+        }
+        if parts.is_empty() {
+            api = None;
+            subscription = None;
+            api_missing = Some(NO_TOKENS.to_string());
+            subscription_missing = Some(NO_TOKENS.to_string());
+        }
         Values {
             api,
             api_currency,
             api_missing,
             subscription,
-            currency: settings.currency.clone(),
+            currency,
             subscription_missing,
         }
     }
@@ -225,6 +270,9 @@ pub struct LiveSession {
     pub session: String,
     pub host: String,
     pub label: String,
+    /// The project the row is counted under after joins (spec §3.6). Its name
+    /// is `project`; two projects with the same name have different ids.
+    pub project_id: ProjectId,
     /// The project's name after joins (spec §3.6).
     pub project: String,
     pub org: Option<String>,
@@ -345,7 +393,7 @@ pub fn running(
         let seen = state.sessions.get(&file.session_id);
         let key = project_of(&file.cwd);
         let id = ProjectId::of(&key, host);
-        let (project_name, org) = named_project(projects, &id);
+        let (project_id, project_name, org) = named_project(projects, &id);
 
         let mut live_agents = Vec::new();
         let mut agents_running = 0u32;
@@ -433,6 +481,7 @@ pub fn running(
             session: file.session_id.clone(),
             host: host.to_string(),
             label,
+            project_id,
             project: project_name,
             org,
             cwd: file.cwd.clone(),
@@ -532,12 +581,13 @@ pub fn closed(
         }
         let model = most_output(&out_by_model);
         let id = ProjectId::of(&record.project, &hosted.host);
-        let (project_name, org) = named_project(projects, &id);
+        let (project_id, project_name, org) = named_project(projects, &id);
         let label = format!("{}-{}", project_name, short_id(&record.session));
         sessions.push(LiveSession {
             session: record.session.clone(),
             host: hosted.host.clone(),
             label,
+            project_id,
             project: project_name,
             org,
             cwd: record.cwd.clone(),
@@ -558,16 +608,19 @@ pub fn closed(
     Ok(Rows { sessions, warnings })
 }
 
-/// A project's name and organization after the joins. Without a project
-/// look-up (the history cannot be read) the key's default name and no
-/// organization are used, so a row can always name its project.
-fn named_project(projects: Option<&Projects>, id: &ProjectId) -> (String, Option<String>) {
+/// A project's key, name and organization after the joins. Without a project
+/// look-up (the history cannot be read) the row's own key, the key's default
+/// name and no organization are used, so a row can always name its project.
+fn named_project(
+    projects: Option<&Projects>,
+    id: &ProjectId,
+) -> (ProjectId, String, Option<String>) {
     match projects {
         Some(projects) => {
             let project = projects.of(id);
-            (project.name, project.org)
+            (project.key, project.name, project.org)
         }
-        None => (crate::projects::default_name(&id.key), None),
+        None => (id.clone(), crate::projects::default_name(&id.key), None),
     }
 }
 
@@ -978,6 +1031,7 @@ mod tests {
             session: SESSION.to_string(),
             host: "atlas".to_string(),
             label: "atlas-7c".to_string(),
+            project_id: ProjectId::of(&project_key(), "atlas"),
             project: "atlas".to_string(),
             org: Some("acme".to_string()),
             cwd: ATLAS_CWD.to_string(),
@@ -1918,6 +1972,138 @@ mod tests {
             values.subscription_missing.as_deref(),
             Some("no price for claude-x")
         );
+    }
+
+    #[test]
+    /// A sum is all or nothing per half, never adds two API currencies, and
+    /// keeps the first missing part's reason. An empty sum says "no tokens yet".
+    fn a_sum_of_values_is_all_or_nothing() {
+        let eur = Values {
+            api: Some(1.0),
+            api_currency: Some("EUR".to_string()),
+            api_missing: None,
+            subscription: Some(0.5),
+            currency: Some("EUR".to_string()),
+            subscription_missing: None,
+        };
+        let usd = Values {
+            api: Some(2.0),
+            api_currency: Some("USD".to_string()),
+            api_missing: None,
+            subscription: Some(0.75),
+            currency: Some("EUR".to_string()),
+            subscription_missing: None,
+        };
+        let sum = Values::sum(&[&eur, &usd]);
+        assert_eq!(sum.api, None);
+        assert_eq!(sum.api_currency, None);
+        assert_eq!(sum.api_missing.as_deref(), Some(TWO_CURRENCIES));
+        assert_eq!(sum.subscription, Some(1.25));
+        assert_eq!(sum.subscription_missing, None);
+        assert_eq!(sum.currency.as_deref(), Some("EUR"));
+
+        let unpriced = Values {
+            api: None,
+            api_currency: None,
+            api_missing: Some("no price for claude-x".to_string()),
+            subscription: None,
+            currency: Some("EUR".to_string()),
+            subscription_missing: Some("no price for claude-x".to_string()),
+        };
+        let sum = Values::sum(&[&eur, &unpriced]);
+        assert_eq!(sum.api, None);
+        assert_eq!(sum.api_missing.as_deref(), Some("no price for claude-x"));
+        assert_eq!(sum.subscription, None);
+        assert_eq!(
+            sum.subscription_missing.as_deref(),
+            Some("no price for claude-x")
+        );
+        assert_eq!(sum.currency.as_deref(), Some("EUR"));
+
+        let empty = Values::sum(&[]);
+        assert_eq!(empty.api, None);
+        assert_eq!(empty.subscription, None);
+        assert_eq!(empty.api_missing.as_deref(), Some(NO_TOKENS));
+        assert_eq!(empty.subscription_missing.as_deref(), Some(NO_TOKENS));
+        assert_eq!(empty.currency, None);
+    }
+
+    #[test]
+    /// Two hosts can set different currencies; their subscriptions are then not
+    /// added, and neither is their API value.
+    fn a_sum_of_two_hosts_in_two_currencies_is_not_added() {
+        let atlas = Values {
+            api: Some(1.0),
+            api_currency: Some("EUR".to_string()),
+            api_missing: None,
+            subscription: Some(2.0),
+            currency: Some("EUR".to_string()),
+            subscription_missing: None,
+        };
+        let vega = Values {
+            api: Some(3.0),
+            api_currency: Some("USD".to_string()),
+            api_missing: None,
+            subscription: Some(4.0),
+            currency: Some("USD".to_string()),
+            subscription_missing: None,
+        };
+        let sum = Values::sum(&[&atlas, &vega]);
+        assert_eq!(sum.subscription, None);
+        assert_eq!(sum.currency, None);
+        assert_eq!(
+            sum.subscription_missing.as_deref(),
+            Some(TWO_SUBSCRIPTION_CURRENCIES)
+        );
+        assert_eq!(sum.api, None);
+        assert_eq!(sum.api_currency, None);
+        assert_eq!(sum.api_missing.as_deref(), Some(TWO_CURRENCIES));
+    }
+
+    #[test]
+    /// `Values::of` is exactly the sum of the one-record values it builds.
+    fn values_of_is_the_sum_of_its_records() {
+        let records = [
+            Valued {
+                api: Some(2.0),
+                subscription: Some(0.5),
+                account: None,
+                api_currency: Some("EUR".to_string()),
+                api_missing: None,
+                subscription_missing: None,
+            },
+            Valued {
+                api: Some(3.0),
+                subscription: Some(0.25),
+                account: None,
+                api_currency: Some("EUR".to_string()),
+                api_missing: None,
+                subscription_missing: None,
+            },
+            Valued {
+                api: None,
+                subscription: None,
+                account: None,
+                api_currency: None,
+                api_missing: Some(crate::money::Missing::NoPrice {
+                    model: "claude-x".to_string(),
+                }),
+                subscription_missing: Some(crate::money::Missing::NoPrice {
+                    model: "claude-x".to_string(),
+                }),
+            },
+        ];
+        let settings = settings_eur();
+        let of = Values::of(&records, &settings);
+        let parts: Vec<Values> = records
+            .iter()
+            .map(|record| Values::of(std::slice::from_ref(record), &settings))
+            .collect();
+        let parts: Vec<&Values> = parts.iter().collect();
+        assert_eq!(of, Values::sum(&parts));
+        assert_eq!(of.api, None);
+        assert_eq!(of.api_missing.as_deref(), Some("no price for claude-x"));
+        assert_eq!(of.subscription, None);
     }
 
     #[test]

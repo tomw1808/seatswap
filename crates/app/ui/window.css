@@ -63,6 +63,22 @@ code,
   flex-shrink: 0;
 }
 
+/* The Sessions page has no second title row in mock-up 2: its choices sit on
+   the area tabs' row at the right, and its live line follows under the tabs. */
+.win-head.sess-mode {
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.win-head.sess-mode .win-titles {
+  display: none;
+}
+
+.win-head.sess-mode .sess-controls {
+  margin-left: auto;
+}
+
 .tabs {
   display: inline-flex;
   align-items: center;
@@ -400,12 +416,46 @@ code,
   background: #22c55e;
 }
 
+.sw.ok {
+  color: var(--pill-text);
+}
+
+.sw.pri::before {
+  background: var(--focus);
+}
+
+.sw.pri {
+  color: var(--focus);
+}
+
 .sw.warn::before {
   background: var(--warn);
 }
 
+.sw.warn {
+  color: var(--warn);
+}
+
 .sw.bad::before {
   background: var(--danger);
+}
+
+/* In the Sessions tree a status is grey, except busy/running (blue), waiting
+   (warn) and a finished agent (ok). */
+.sess-row .sw {
+  color: var(--muted);
+}
+
+.sess-row .sw.pri {
+  color: var(--focus);
+}
+
+.sess-row .sw.warn {
+  color: var(--warn);
+}
+
+.sess-row .sw.ok {
+  color: var(--pill-text);
 }
 
 /* ---------- the Settings area (spec §3.7) ---------- */
@@ -1066,4 +1116,596 @@ button.link:hover {
 .hist-import .inp {
   width: 250px;
   min-width: 0;
+}
+
+/* ---------- the Sessions area (spec §3.8) ---------- */
+
+.sessions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  height: 100%;
+  min-height: 0;
+  padding: 0 12px 12px;
+}
+
+.sess-head {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.sess-live {
+  /* Text nodes and spans in one line: a flex row would drop the spaces at
+     their edges ("as of" + the age). */
+  display: block;
+  min-height: 18px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.sess-live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #22c55e;
+  flex-shrink: 0;
+}
+
+.sess-unavailable,
+.sess-error,
+.sess-link-message {
+  margin: 0;
+  padding: 5px 8px;
+  border-radius: 8px;
+  font-size: 12px;
+}
+
+.sess-unavailable {
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-border);
+  color: var(--text);
+}
+
+.sess-error {
+  background: var(--error-bg);
+  border: 1px solid var(--error-border);
+  color: var(--danger);
+}
+
+.sess-link-message {
+  background: var(--info-bg);
+  border: 1px solid var(--info-border);
+  color: var(--text);
+}
+
+.sess-controls {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.sess-choice-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sess-seg {
+  display: inline-flex;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--input);
+}
+
+.sess-segbtn {
+  height: 24px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.sess-segbtn:hover {
+  background: var(--hover);
+}
+
+.sess-segbtn.ison {
+  background: var(--card-raised);
+  color: var(--text);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
+}
+
+.sess-host {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.sess-control-label {
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.sess-host-select {
+  height: 28px;
+  min-width: 110px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--input);
+  color: var(--text);
+}
+
+.sess-kpis {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  padding: 7px 4px;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: var(--card);
+  flex-shrink: 0;
+}
+
+.sess-kpi {
+  display: flex;
+  flex: 0 1 auto;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  padding: 1px 12px;
+  border-left: 1px solid var(--border);
+}
+
+.sess-kpi:first-child {
+  border-left: 0;
+}
+
+.sess-kpi:last-child {
+  flex: 1 1 auto;
+}
+
+.sess-kpi-label {
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.sess-kpi-value {
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 20px;
+}
+
+.sess-kpi-value.pri {
+  color: var(--focus);
+}
+
+.sess-kpi-value.warn {
+  color: var(--warn);
+}
+
+.sess-kpi-sub {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sess-kpi-sub.warn {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+.sess-acc {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  font-size: 10px;
+  font-weight: 700;
+  vertical-align: -5px;
+}
+
+.sess-inuse {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sess-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: 10px;
+  flex: 1;
+  min-height: 0;
+}
+
+.sess-tree {
+  min-height: 0;
+}
+
+.sess-cols {
+  display: grid;
+  grid-template-columns:
+    minmax(180px, 1.65fr) minmax(90px, 0.9fr) 132px 48px 62px 54px 64px 72px 82px;
+  column-gap: 7px;
+  align-items: center;
+  padding: 0 10px;
+}
+
+.sess-cols-head {
+  height: 22px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 9.5px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.sess-cols-head > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sess-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding-bottom: 4px;
+}
+
+.sess-row {
+  display: grid;
+  grid-template-columns:
+    minmax(180px, 1.65fr) minmax(90px, 0.9fr) 132px 48px 62px 54px 64px 72px 82px;
+  column-gap: 7px;
+  align-items: center;
+  min-height: 26px;
+  padding: 0 10px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+}
+
+.sess-row > * {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sess-group {
+  min-height: 28px;
+  border-top: 0;
+  font-size: 12.5px;
+}
+
+.sess-subrow {
+  display: block;
+  min-height: 22px;
+  border-top: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 20px;
+}
+
+.sess-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.sess-name > b,
+.sess-session-name,
+.sess-agent-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* A group's name never shrinks; the summary after it is what gets cut. */
+.sess-name > .sess-group-name {
+  flex-shrink: 0;
+  overflow: visible;
+  text-overflow: clip;
+}
+
+.sess-group-sub {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sess-session-name {
+  font-weight: 500;
+}
+
+.sess-model {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.sess-car,
+.sess-car0 {
+  display: inline-block;
+  flex-shrink: 0;
+  width: 8px;
+  height: 8px;
+}
+
+.sess-car {
+  width: 0;
+  height: 0;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  border-left: 5px solid currentColor;
+  opacity: 0.55;
+  transition: transform 120ms var(--ease-out);
+}
+
+details[open] > summary .sess-car {
+  transform: rotate(90deg);
+}
+
+.sess-agents {
+  /* Inline, so the spaces of " · " stay. */
+  display: block;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.sess-tag {
+  display: inline-flex;
+  align-items: center;
+  height: 15px;
+  padding: 0 4px;
+  border: 1px solid var(--warn-border);
+  border-radius: 5px;
+  background: var(--warn-bg);
+  color: var(--warn);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.sess-tied-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 5px;
+  border-radius: 50%;
+  background: var(--warn);
+  vertical-align: 1px;
+}
+
+.sess-details {
+  min-width: 0;
+}
+
+.sess-details > summary,
+.sess-summary-wrap {
+  list-style: none;
+  cursor: pointer;
+}
+
+.sess-details > summary::-webkit-details-marker,
+.sess-summary-wrap::-webkit-details-marker {
+  display: none;
+}
+
+.sess-summary-wrap {
+  display: block;
+}
+
+.sess-agent,
+.sess-completed {
+  border-top: 0;
+  min-height: 24px;
+  font-size: 11.5px;
+}
+
+.sess-completed {
+  color: var(--muted);
+}
+
+.sess-children {
+  min-width: 0;
+}
+
+.sess-dim {
+  opacity: 0.55;
+}
+
+.sess-marked {
+  background: var(--info-bg);
+  box-shadow: inset 2px 0 0 var(--focus);
+}
+
+.sess-empty {
+  margin: 0;
+  padding: 12px;
+  font-size: 12px;
+}
+
+.sess-side {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  overflow: auto;
+}
+
+.sess-card {
+  flex-shrink: 0;
+}
+
+.sess-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0 10px 9px;
+}
+
+.sess-mini-cols,
+.sess-mini-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 34px 36px 54px;
+  column-gap: 6px;
+  align-items: center;
+}
+
+.sess-mini-cols {
+  height: 18px;
+  color: var(--muted);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.sess-mini-row {
+  min-height: 21px;
+  border-top: 1px solid var(--border);
+  font-size: 11.5px;
+}
+
+.sess-mini-row > * {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sess-mini-name {
+  font-weight: 500;
+}
+
+.sess-card-note {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin: 4px 0 0;
+  font-size: 10.5px;
+}
+
+.sess-fnd {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 16px;
+}
+
+.sess-fnd li {
+  margin: 0 0 6px;
+  padding-left: 10px;
+  border-left: 2px solid var(--focus);
+}
+
+.sess-fnd b {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.sess-switch-row {
+  padding-top: 7px;
+}
+
+.sess-bar-row {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr) 54px;
+  column-gap: 7px;
+  align-items: center;
+  min-height: 22px;
+  font-size: 11.5px;
+}
+
+.sess-bar-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sess-bar {
+  display: block;
+  height: 6px;
+  border-radius: 4px;
+  background: var(--track);
+  overflow: hidden;
+}
+
+.sess-bar > i {
+  display: block;
+  height: 100%;
+  border-radius: 4px;
+  background: var(--muted);
+}
+
+.sess-bar > i.is-on {
+  background: var(--focus);
+}
+
+.sess-bar-value {
+  font-size: 10.5px;
+}
+
+.b6 {
+  font-weight: 600;
+}
+
+.pri {
+  color: var(--focus);
+}
+
+@media (max-width: 1050px) {
+  .sess-kpis {
+    flex-wrap: wrap;
+  }
+
+  .sess-kpi {
+    flex: 1 1 140px;
+  }
+
+  .sess-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .sess-side {
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+
+  .sess-card {
+    flex: 1;
+    min-width: 260px;
+  }
 }

@@ -1230,6 +1230,12 @@ pub(crate) fn hide_panel(app: AppHandle) -> Result<(), String> {
     hide(&app)
 }
 
+/// Open the pop-up from a page, the way the tray and the notifications do.
+#[tauri::command]
+pub(crate) fn open_panel(app: AppHandle) {
+    super::show_panel(&app, "main");
+}
+
 /// Send one request and wait for its own reply. Runs on the blocking pool.
 fn request(
     action: &mpsc::Sender<ActionCommand>,

@@ -231,6 +231,7 @@ pub(crate) fn run(
             panel::time_texts,
             panel::fit_panel,
             panel::hide_panel,
+            panel::open_panel,
             panel::agent_calls,
             panel::skill_status,
             panel::skill_install,

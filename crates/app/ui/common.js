@@ -573,14 +573,14 @@ function money(amount, currency) {
   return `${number} ${currency}`;
 }
 
-// "12.4 M" from a million, "845 k" from a thousand, "0" and the count below that.
+// "12.4 M" and "0.4 M" for every count of tokens, and "0 M" for none: the
+// Sessions page writes every token cell and total in millions, one decimal.
 function tokens(n) {
   if (typeof n !== "number" || !Number.isFinite(n) || n < 0) {
     throw new Error(`invalid token count ${String(n)}: use a finite number of 0 or more`);
   }
-  if (n >= 1000000) return `${(n / 1000000).toFixed(1)} M`;
-  if (n >= 1000) return `${Math.round(n / 1000)} k`;
-  return String(Math.round(n));
+  if (n === 0) return "0 M";
+  return `${(n / 1000000).toFixed(1)} M`;
 }
 
 export {

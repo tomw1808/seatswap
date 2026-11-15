@@ -3592,6 +3592,10 @@ mod tests {
             session: "dd5e0c1a-3b7f-4c2d-9e8a-6f1b2c3d4e5f".to_string(),
             host: "vega".to_string(),
             label: "acme-kb-dd".to_string(),
+            project_id: seatswap_core::projects::ProjectId::of(
+                &seatswap_core::project::ProjectKey::Repo("github.com/acme/acme-kb".to_string()),
+                "vega",
+            ),
             project: "acme-kb".to_string(),
             org: None,
             cwd: "/home/sam/projects/acme-kb".to_string(),

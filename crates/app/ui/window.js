@@ -41,6 +41,9 @@ const state = {
 };
 
 const modules = new Map();
+// The loaded module by area, kept apart from its import Promise: a leave while
+// the first render is still in flight must be able to call its `unmount`.
+const loaded = new Map();
 // A later hash or `open-area` wins over a dynamic import still in flight.
 let renderToken = 0;
 // The module that last rendered, so a snapshot can update it in place.
@@ -52,16 +55,38 @@ function findArea(id) {
   return AREAS.find((area) => area.id === id) || null;
 }
 
-// "settings/accounts" -> { area: "settings", sub: "accounts" }; "" -> sessions.
-// The same shape as gui/window.rs's `parse_target`: one optional sub, no empty.
+// "settings/accounts" -> { area: "settings", sub: "accounts" };
+// "sessions?<id>" -> { area: "sessions", sub: "<id>" }; "" -> sessions.
+// The same shape as gui/window.rs's `parse_target`: one optional sub-area, one
+// `?` item only for sessions, no empty, and names of `a-z`, `0-9` and `-`.
+function isSlug(value) {
+  return typeof value === "string" && /^[a-z0-9-]+$/.test(value);
+}
+
+function isSubArea(sub) {
+  const mark = sub.indexOf("?");
+  if (mark < 0) return isSlug(sub);
+  return isSlug(sub.slice(0, mark)) && isSlug(sub.slice(mark + 1));
+}
+
 function parseTarget(target) {
   if (typeof target !== "string") return null;
-  const slash = target.indexOf("/");
-  const area = slash < 0 ? target : target.slice(0, slash);
+  if (!target.includes("/")) {
+    const mark = target.indexOf("?");
+    const area = mark < 0 ? target : target.slice(0, mark);
+    const item = mark < 0 ? null : target.slice(mark + 1);
+    if (!findArea(area)) return null;
+    if (item === null) return { area, sub: null };
+    if (area !== "sessions" || !isSlug(item)) return null;
+    return { area, sub: item };
+  }
+  const parts = target.split("/");
+  const area = parts[0];
   if (!findArea(area)) return null;
-  if (slash < 0) return { area, sub: null };
-  const sub = target.slice(slash + 1);
-  if (!sub || sub.includes("/")) return null;
+  if (parts.length === 1) return { area, sub: null };
+  if (parts.length > 2) return null;
+  const sub = parts[1];
+  if (!sub || !isSubArea(sub)) return null;
   return { area, sub };
 }
 
@@ -121,13 +146,18 @@ async function loadArea(id) {
   if (!modules.has(id)) {
     modules.set(
       id,
-      import(`./areas/${id}.js`).catch((error) => {
-        // A module that does not exist yet is the normal case until its task
-        // builds it. The real reason goes to the console, where a broken
-        // module is not swallowed.
-        console.warn(`[window] cannot load areas/${id}.js`, error);
-        return null;
-      })
+      import(`./areas/${id}.js`)
+        .then((module) => {
+          loaded.set(id, module);
+          return module;
+        })
+        .catch((error) => {
+          // A module that does not exist yet is the normal case until its task
+          // builds it. The real reason goes to the console, where a broken
+          // module is not swallowed.
+          console.warn(`[window] cannot load areas/${id}.js`, error);
+          return null;
+        })
     );
   }
   return modules.get(id);
@@ -266,10 +296,27 @@ function open(target) {
   location.hash = target;
 }
 
+// An area module may hold a subscription or a listener; leaving it asks the
+// module to let go. `rendered.module` is empty while the module's first render
+// is in flight, so the loaded module is asked from `loaded` as well.
+function unloadArea() {
+  const area = rendered.area || state.area;
+  if (!area) return;
+  const module = rendered.module || loaded.get(area) || null;
+  if (!module || typeof module.unmount !== "function") return;
+  try {
+    module.unmount();
+  } catch (error) {
+    console.warn(`[window] cannot leave areas/${area}.js`, error);
+  }
+}
+
 function show(target, fromOpen = false) {
   state.target = typeof target === "string" ? target : "";
   const parsed = parseTarget(state.target);
-  state.area = parsed ? parsed.area : null;
+  const nextArea = parsed ? parsed.area : null;
+  if (state.area && nextArea !== state.area) unloadArea();
+  state.area = nextArea;
   state.sub = parsed ? parsed.sub : null;
   renderHead();
   renderArea({ fromOpen });

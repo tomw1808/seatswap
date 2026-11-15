@@ -1690,7 +1690,7 @@ The new modules, each with one job:
 | `core::money` | API prices with dates, the dollar rate, the look-ups, the value of token records |
 | `core::projects` | projects, joins and organizations from the session records and the shared project log |
 | `app::ui::common.js` | the page helpers both windows use |
-| `app::ui::window.js`, `areas/settings.js` | the window's tabs and areas, the Settings page |
+| `app::ui::window.js`, `areas/settings.js`, `areas/sessions.js` | the window's tabs and areas, the Settings and Sessions pages |
 
 ## gui/window.rs and the page helpers (step C1)
 
@@ -1712,11 +1712,21 @@ pub(crate) fn show(app: &AppHandle, target: &str) -> Result<(), String>;
 #[cfg(feature = "gui")]
 #[tauri::command]
 pub(crate) fn open_window(app: AppHandle, target: String) -> Result<(), String>;
+// every target goes to `show`; the pop-up has its own command:
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub(crate) fn open_panel(app: AppHandle);
+// calls `gui::show_panel(&app, "main")`, the one function the tray uses.
 ```
 
-`parse_target` accepts `settings`, `settings/accounts`, `settings/accounts?<id>`; it refuses an
-unknown area, an empty sub (`settings/`), a second `/`, a character outside `a-z 0-9 -` (also in the
-item after `?`), and an empty item. `show` refuses the same targets before it touches a window.
+`parse_target` accepts `settings`, `settings/accounts`, `sessions?<session-id>` (and a sub-area with
+`?<item>`); it refuses an unknown area, an item directly after an area other than `sessions`,
+an empty sub
+(`settings/`), a second `/`, a character outside `a-z 0-9 -` (also in the item after `?`), and an
+empty item. `show` refuses the same targets before it touches a window. `gui::panel::open_panel` is
+the page's way to open the pop-up: it calls `gui::show_panel(&app, "main")` (the function the tray
+and the notifications use), and the Sessions page's "Switch…" calls it; `open_window` has no
+special target.
 The pop-up keeps the event name `navigate`; the large window has `open-area`, because `emit`
 reaches every window.
 
@@ -1743,8 +1753,21 @@ shows "Comes with a later version."; a module that throws shows its error in the
 calls the current area's `update(snapshot)` when it has one and has rendered, and `render` only for
 an area without `update`. The old content stays until the area replaces it. `fromOpen` is true when
 an `open-area` request caused the render, so an item it names is applied even when the address
-already names the same item. `crates/app/capabilities/default.json` names both windows:
+already names the same item. An area module may also export `unmount()`; the window calls it before
+switching to another area, and `areas/sessions.js` uses it to remove its `sessions-view` listener and
+send `sessions_unsubscribe`. `crates/app/capabilities/default.json` names both windows:
 `"windows": ["panel", "main"]`.
+
+`areas/sessions.js` exports `render(container, context)`, `update(snapshot)` and `unmount()`. Its
+three kept choices are `seatswap.sessions.closed`, `seatswap.sessions.host` and
+`seatswap.sessions.grouping`; an unknown stored value is removed and the page opens at `None`, all
+hosts and By project. It calls `sessions_view` then `sessions_subscribe` on entry and
+`sessions_subscribe` then `sessions_view` on a choice change; `sessions-view` events update the
+page in place, keeping open details and the scroll. `sessions?<session-id>` opens and marks that
+session, and an id that is not listed says "that session is no longer listed". A running row that
+leaves the live list is held grey for 60 s, then removed; closed rows are not held. Numbers come
+from `SessionsView.sums` by key, values follow `values`' missing reasons and currency, and times and
+ages come from `time_texts`; the page never adds values.
 
 ## The Settings page and its save queue (step C1)
 
@@ -2292,6 +2315,17 @@ pub fn load(history: &HistoryDir, accounts: &[Account])
     -> Result<(Projects, Vec<String>), HistoryError>;
 ```
 
+`live_sessions::Values::sum(parts: &[&Values]) -> Values` is the one sum rule: each half is added
+only when every part has it, a missing part makes the sum unknown with the first part's reason, parts
+in two currencies are not added, and an empty list has both reasons "no tokens yet". API parts in two
+`api_currency` values say `TWO_CURRENCIES`; subscription parts in two `currency` values say "these
+sessions are valued in two currencies", and both `subscription` and `currency` are then `None` (each
+host can set its own settings' currency).
+`Values::of` builds one `Values` per record with the settings' currency and calls `Values::sum`; a
+group in the Sessions view uses the same function, never a second addition. `LiveSession` carries
+`project_id: ProjectId` after the project joins, so the shown `project` name and the grouping key
+stay apart.
+
 `write_report` sets every agent's `task` to `None` before it writes, so no task text ever leaves
 memory; the file is pretty JSON, written with `atomic::write_atomic` and `Access::Private` in this
 host's folder. `other_hosts` lists the host folders with `HistoryDir::hosts`, skips this host and a
@@ -2366,8 +2400,12 @@ pub(crate) struct SessionsOptions { pub closed: ClosedSince, pub host: Option<St
 pub(crate) struct HostState { pub host: String, pub at: DateTime<Utc>, pub stale: bool, pub this: bool }
 pub(crate) struct SwitchEffect { pub loses_thinking: u32, pub loses_thinking_busy: u32,
                                  pub resend: u32, pub free: u32 }
+pub(crate) enum SumOf { All, Provider(String), Project(ProjectId),
+    ProjectModel(ProjectId, Option<String>), Model(Option<String>) }
+pub(crate) struct Sum { pub of: SumOf, pub sessions: u32, pub tokens: Tokens,
+    pub last_hour: Tokens, pub values: Values }
 pub(crate) struct SessionsView { pub at: DateTime<Utc>, pub this_host: Option<String>,
-    pub hosts: Vec<HostState>, pub sessions: Vec<LiveSession>,
+    pub hosts: Vec<HostState>, pub sessions: Vec<LiveSession>, pub sums: Vec<Sum>,
     pub switch_effect: SwitchEffect, pub in_use: Option<String>,
     pub currency: Option<String>, pub unavailable: Option<String> }
 pub(crate) fn view_of(at: DateTime<Utc>, this_host: Option<String>, running: &[LiveSession],
@@ -2382,6 +2420,16 @@ stale) when there is a history, then the other hosts by name. `switch_effect` co
 running rows only, whatever `options.host` and `closed` say; `loses_thinking_busy` is the busy part
 of `loses_thinking`. `in_use` is set by the one function `gui::fill_in_use(&mut view, &snapshot)`,
 for the command's answer and every pushed view.
+
+`sums` is built over exactly the sessions the view lists, by `sums_of`, so a group's total and the
+rows agree and the page never adds values. It has `All` (even for an empty list) and one key for
+each provider, project, project's model and model that has a session. `Provider` is beyond the
+brief's four keys because the page shows the provider's total next to the provider group; the
+other four are the brief's `All`, `Project`, `ProjectModel` and `Model`. `Sum.tokens` and
+`Sum.last_hour` add the token counts; `Sum.values` is `Values::sum` over the group's row values, so
+each half is all or nothing and two API currencies are not added. `LiveSession` carries
+`project_id: ProjectId` beside `project`: the post-join key groups two projects with the same name
+apart, while `project` is only the shown name.
 
 The closed rows are valued with a `Valuer` built for exactly `[since, now]` (`build_pricing` now
 takes the range), with the rows context's projects; a part that is missing is `None` /
