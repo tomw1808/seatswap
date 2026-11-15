@@ -12,7 +12,7 @@ use crate::history::{
     AccountRef, By, Event, EventKind, HistoryDir, HistoryError, Hosted, Hosts, Range, Record,
     Sample, SessionRecord, TokenRecord, UpRecord, WindowRecord,
 };
-use crate::money::{percent_value, Fx, Missing, MoneyError, Prices, Valuer};
+use crate::money::{window_money, Fx, Missing, MoneyError, Prices, Valuer, WindowMoney};
 use crate::projects::{Projects, ProjectsLogRecord};
 use crate::store::{Account, Settings};
 
@@ -186,7 +186,7 @@ pub(crate) fn account_weeks_valued(
         if !account_chosen(ctx, q, Some(&window.account)) {
             continue;
         }
-        let (price, price_missing) = match valuer.price_at(&window.account, midpoint) {
+        let (price, price_missing) = match valuer.window_price(&window.account, window.end) {
             Ok(price) => (Some(price), None),
             Err(missing) => (None, Some(missing)),
         };
@@ -334,31 +334,12 @@ pub(crate) fn blocked_by_weekday(
     by_day
 }
 
-/// The money of one account week: a full window is `paid`, the share that
-/// expired is `expired` and the rest is `used`. `None` without a price; a
-/// weekly window without `lost` is an error (the history always writes it).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct WindowMoney {
-    pub(crate) used: f64,
-    pub(crate) paid: f64,
-    pub(crate) expired: f64,
-}
-
-/// The money of a weekly window, from its `lost` percent and its price:
-/// `expired = lost × pv`, `paid = 100 × pv`, `used = paid − expired`.
-pub(crate) fn money_of(week: &AccountWeek) -> Result<Option<WindowMoney>, StatsError> {
-    let lost = lost_percent(&week.window)?;
-    let Some(price) = week.price else {
-        return Ok(None);
-    };
-    let pv = percent_value(price);
-    let paid = 100.0 * pv;
-    let expired = lost * pv;
-    Ok(Some(WindowMoney {
-        used: paid - expired,
-        paid,
-        expired,
-    }))
+/// The money of one account week from its price and its window's final percent:
+/// `paid = 100 × pv`, `expired = max(0, 100 − final) × pv`,
+/// `used = paid − expired`. `None` without a price.
+pub(crate) fn money_of(week: &AccountWeek) -> Option<WindowMoney> {
+    week.price
+        .map(|price| window_money(price, week.window.final_percent))
 }
 
 /// The `lost` percent of a weekly window; a window without it is an error,
@@ -956,6 +937,80 @@ pub(crate) mod tests {
         };
         assert_eq!(price_of("2026-11-09T17:00:00Z"), Some(180.0));
         assert_eq!(price_of("2026-11-16T17:00:00Z"), Some(200.0));
+    }
+
+    /// A price change inside a week does not change the price of that week's
+    /// money: the window is priced at its midpoint, and its records share its
+    /// used money. LB's 80 % week of 200 EUR is worth 80 × pv(200) both on the
+    /// Overview and in the sum of its records' subscription values.
+    #[test]
+    fn a_price_change_inside_a_week_values_the_projects_as_the_week() {
+        let tiny = tiny();
+        tiny.history
+            .append(&Event {
+                t: utc("2026-11-12T00:00:00Z"),
+                kind: EventKind::PriceChanged {
+                    account: tiny.lb_ref(),
+                    amount: Some(200.0),
+                    currency: Some("EUR".to_string()),
+                },
+            })
+            .expect("LB's price change");
+
+        let page = overview::overview_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        let week = page
+            .weeks
+            .iter()
+            .find(|week| week.week == utc("2026-11-09T00:00:00Z"))
+            .expect("the week of 9 Nov");
+        let used = week
+            .accounts
+            .iter()
+            .find(|account| account.id == tiny.lb().id)
+            .expect("LB's week")
+            .used
+            .expect("LB's week has a price");
+
+        let window = tiny
+            .windows
+            .iter()
+            .find(|window| {
+                window.account == tiny.lb_ref() && window.end == utc("2026-11-16T17:00:00Z")
+            })
+            .expect("LB's window ending 16 Nov");
+        let valuer = Valuer::build(
+            &tiny.history,
+            &two_weeks(),
+            &tiny.prices,
+            &tiny.fx,
+            &tiny.settings,
+            &tiny.accounts,
+        )
+        .expect("a valuer");
+        let tokens = tiny
+            .history
+            .read::<TokenRecord>(&two_weeks(), &Hosts::All)
+            .unwrap();
+        let mut sum = 0.0;
+        let mut count = 0;
+        for hosted in &tokens.records {
+            if hosted.record.t < window.weekly_start() || hosted.record.t >= window.end {
+                continue;
+            }
+            let value = valuer.value(&hosted.host, &hosted.record);
+            if value.account.as_ref() != Some(&tiny.lb_ref()) {
+                continue;
+            }
+            sum += value
+                .subscription
+                .expect("LB's priced records of the week have a value");
+            count += 1;
+        }
+        assert_eq!(count, 1, "the fixture has one LB record in this window");
+        assert!(
+            (sum - used).abs() < 1e-9,
+            "LB's records are worth {sum}, its week's used money is {used}"
+        );
     }
 
     #[test]

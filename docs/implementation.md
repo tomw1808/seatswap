@@ -2088,6 +2088,13 @@ pub fn parse_price_key(key: &str) -> Result<(&str, &str), String>;
 pub fn api_usd(record: &TokenRecord, prices: &Prices) -> Option<f64>;
 pub fn percent_value(monthly_price: f64) -> f64; // monthly × 12 / 52 / 100
 
+/// One weekly window's money in the display currency.
+pub(crate) struct WindowMoney { pub(crate) used: f64, pub(crate) paid: f64, pub(crate) expired: f64 }
+/// The money of a weekly window from its price and the percent it used (a finished window's final
+/// percent, or a running window's latest sample): paid = 100 × pv, expired = max(0, 100 −
+/// percent) × pv, used = paid − expired.
+pub(crate) fn window_money(price: f64, percent: f64) -> WindowMoney;
+
 pub struct Valued { pub api: Option<f64>, pub subscription: Option<f64>,
     pub account: Option<AccountRef>, pub api_currency: Option<String>,
     pub api_missing: Option<Missing>, pub subscription_missing: Option<Missing> }
@@ -2095,14 +2102,19 @@ pub struct Valued { pub api: Option<f64>, pub subscription: Option<f64>,
 pub struct Valuer { … }
 impl Valuer {
     /// Reads samples, windows and tokens of the range widened by 7 days, and every event over all
-    /// history (a record's account and price are the last Live/Switch/PriceChanged at or before it).
+    /// history (a record's account is the last Live/Switch at or before it; a window's price is
+    /// the last PriceChanged at or before its midpoint).
     pub fn build(history: &HistoryDir, range: &Range, prices: &Prices, fx: &Fx,
                  settings: &Settings, accounts: &[Account]) -> Result<Valuer, MoneyError>;
+    /// The price of a window ending at `end`: the account's price at its midpoint (end − 84 h),
+    /// through price_at.
+    pub(crate) fn window_price(&self, account: &AccountRef, end: DateTime<Utc>)
+        -> Result<f64, Missing>;
     /// api = api_usd × rate of the record's day (USD, labelled, when there is no rate; None with
     /// its reason when the model has no price or no currency is set);
-    /// subscription = usd / the week's api_sum × used × percent_value(price), None with its
-    /// reason when the account or its price is missing, the week has no reading, an unpriced model
-    /// is in the week, or the week has no API value to split.
+    /// subscription = usd / the week's api_sum × the window's used money (at most what was paid)
+    /// at the window's price, None with its reason when the account or its price is missing, the
+    /// week has no reading, an unpriced model is in the week, or the week has no API value to split.
     pub fn value(&self, host: &str, record: &TokenRecord) -> Valued;
 }
 ```
@@ -2110,10 +2122,10 @@ impl Valuer {
 `Prices::take` adds a point only for a new model or one whose price differs from its last point; a
 model missing from the list keeps its points and enters `missing` once; a model that comes back
 leaves it. `Prices::at` never looks into the future: before the first point it uses the first point,
-so the oldest price counts for the past. The account's price is the last `PriceChanged` at or before
-the record, and a stored price without an event uses `Account.price_currency` like an event's
-currency: it counts only while that currency is the settings' currency, and a price whose currency
-is `None` does not count (`Missing::PriceWithoutCurrency`).
+so the oldest price counts for the past. A window's price is the last `PriceChanged` at or before
+the window's midpoint (`end − 84 h`); a stored price without an event uses `Account.price_currency`
+like an event's currency: it counts only while that currency is the settings' currency, and a price
+whose currency is `None` does not count (`Missing::PriceWithoutCurrency`).
 
 ## lookup_rt (step C1)
 
@@ -2703,9 +2715,9 @@ pub fn empty(ctx: &Ctx, range: &Range) -> Result<Option<Empty>, StatsError>;
   error, not an empty page.
 - `account_weeks` reads every finished `weekly_all` window, puts it in the calendar week of its
   midpoint (`end − 84 h`), keeps the window whose midpoint lies in `range`, filters with
-  `account_chosen`, and prices it at that midpoint with `Valuer::price_at`. One window survives per
-  account and calendar week: the one with the later end. The cross-host rule (same account and end:
-  the latest `lastSample`) is `HistoryDir::finished_windows`'s.
+  `account_chosen`, and prices it with `Valuer::window_price`, the price at its midpoint. One window
+  survives per account and calendar week: the one with the later end. The cross-host rule (same
+  account and end: the latest `lastSample`) is `HistoryDir::finished_windows`'s.
 - `blocked_spans` reads all events, builds each host's blocked intervals for every limit kind and
   each host's account timeline (the last `Live` or `Switch`), and cuts every interval at the range,
   at every change of the account in use and at an `Unblocked`. Only a piece with
@@ -2725,7 +2737,8 @@ The shared helpers, used by more than one page:
 | Helper | Job |
 |---|---|
 | `accounts_without_price` | the account ids with at least one account week that has no price: stored accounts in `Ctx::accounts` order, then removed accounts by id |
-| `WindowMoney`, `money_of`, `lost_percent` | `paid = 100 × pv(price)`, `expired = lost × pv`, `used = paid − expired`; a window without `lost` is an error because the history always writes it |
+| `money_of` | the week's `money::window_money(price, final percent)`: `paid = 100 × pv`, `expired = max(0, 100 − final) × pv`, `used = paid − expired`; `None` without a price |
+| `lost_percent` | the window's `lost`; an error when the history lacks it, because seatswap always writes it |
 | `SwitchCounts`, `switch_counts` | `Switch` events of a range and host by `By::{User, Cli, Auto, Agent, External}` |
 | `week_columns` | Monday 00:00 local of the week holding `range.from`, then every seven days while the start is before `range.to` |
 | `blocked_by_week`, `blocked_by_weekday` | spans split at every week start or local midnight; each part counts its working hours |

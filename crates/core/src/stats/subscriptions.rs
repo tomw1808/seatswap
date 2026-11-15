@@ -12,7 +12,7 @@ use crate::burn::plan::Policy;
 use crate::burn::replay::{replay, ReplayResult};
 use crate::burn::wu_hours;
 use crate::history::{AccountRef, Event, EventKind, Hosts, Range, Sample, TokenRecord};
-use crate::money::{percent_value, Valuer};
+use crate::money::{window_money, Valuer};
 
 use super::{
     account_abbr, account_chosen, account_id, account_weeks_valued, accounts_without_price,
@@ -338,7 +338,7 @@ pub(crate) fn what_if_in(
 
     let mut expired_was = None;
     for week in &weeks {
-        if let Some(money) = money_of(week)? {
+        if let Some(money) = money_of(week) {
             *expired_was.get_or_insert(0.0) += money.expired;
         }
     }
@@ -506,7 +506,7 @@ fn row_for(facts: RowFacts<'_>) -> Result<SubRow, StatsError> {
         if week.window.final_percent >= 100.0 {
             full_weeks += 1;
         }
-        match money_of(week)? {
+        match money_of(week) {
             Some(money) => {
                 *expired.get_or_insert(0.0) += money.expired;
                 if let Some(paid) = &mut paid {
@@ -611,7 +611,7 @@ fn blocked_hours_on(spans: &[super::BlockedSpan], reference: &AccountRef) -> f64
 fn saved_price(weeks: &[AccountWeek], reference: &AccountRef) -> Result<Option<f64>, StatsError> {
     let mut paid = Some(0.0);
     for week in weeks.iter().filter(|week| &week.account == reference) {
-        match money_of(week)? {
+        match money_of(week) {
             Some(money) => {
                 if let Some(paid) = &mut paid {
                     *paid += money.paid;
@@ -624,7 +624,7 @@ fn saved_price(weeks: &[AccountWeek], reference: &AccountRef) -> Result<Option<f
 }
 
 /// The expired money of one replay at the range's end: each account's expired
-/// week-percent times the value of one percent of its price there; an account
+/// week-percent as the expired part of a window at its price there; an account
 /// without a price is left out.
 fn replay_expired_money(valuer: &Valuer, result: &ReplayResult, at: DateTime<Utc>) -> f64 {
     result
@@ -634,7 +634,7 @@ fn replay_expired_money(valuer: &Valuer, result: &ReplayResult, at: DateTime<Utc
             valuer
                 .price_at(account, at)
                 .ok()
-                .map(|price| expired * percent_value(price))
+                .map(|price| window_money(price, 100.0 - *expired).expired)
         })
         .sum()
 }

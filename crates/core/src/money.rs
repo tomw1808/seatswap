@@ -670,6 +670,30 @@ pub fn percent_value(monthly_price: f64) -> f64 {
     monthly_price * 12.0 / 52.0 / 100.0
 }
 
+/// The money of one weekly window, in the display currency: a full window is
+/// `paid`, the share that expired is `expired` and the rest is `used`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct WindowMoney {
+    pub(crate) used: f64,
+    pub(crate) paid: f64,
+    pub(crate) expired: f64,
+}
+
+/// The money of a weekly window from its price and the percent it used (a
+/// finished window's final percent, or a running window's latest sample):
+/// `paid = 100 × pv`, `expired = max(0, 100 − percent) × pv`,
+/// `used = paid − expired`.
+pub(crate) fn window_money(price: f64, percent: f64) -> WindowMoney {
+    let pv = percent_value(price);
+    let paid = 100.0 * pv;
+    let expired = (100.0 - percent).max(0.0) * pv;
+    WindowMoney {
+        used: paid - expired,
+        paid,
+        expired,
+    }
+}
+
 /// Why a value is missing (spec §1.4: the window says so). `Display` is the text a page shows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -750,7 +774,7 @@ struct WeekWindow {
 type PriceChanges = BTreeMap<AccountRef, Vec<(DateTime<Utc>, Option<f64>, Option<String>)>>;
 
 /// The value of token records, built once for a range (spec §3.6): the account
-/// of every record, its weekly window, and the account's price at its time.
+/// of every record, its weekly window, and the window's price at its midpoint.
 pub struct Valuer {
     timelines: HashMap<String, Timeline>,
     windows: Vec<WeekWindow>,
@@ -767,10 +791,11 @@ impl Valuer {
     /// Reads samples, windows and tokens of `range` widened to whole weekly
     /// windows: a week that holds a point of the range begins at most seven
     /// days before it and ends at most seven days after it. Every event over
-    /// all of history is read too, because a record's account and its account's
-    /// price are the last `Live`/`Switch`/`PriceChanged` at or before it, which
-    /// can be older than the range; a price change after the range still names
-    /// the first price, which counts for the past.
+    /// all of history is read too, because a record's account is the last
+    /// `Live`/`Switch` at or before it, and its window's price is the last
+    /// `PriceChanged` at or before the window's midpoint, which can be older
+    /// than the range; a price change after the range still names the first
+    /// price, which counts for the past.
     pub fn build(
         history: &HistoryDir,
         range: &Range,
@@ -986,7 +1011,7 @@ impl Valuer {
             .find(|window| &window.account == account && window.start <= at && at < window.end)
             .ok_or(Missing::NoReading)?;
         let used = window.used.ok_or(Missing::NoReading)?;
-        let price = self.price_at(account, at)?;
+        let price = self.window_price(&window.account, window.end)?;
         if let Some(model) = &window.unpriced {
             return Err(Missing::UnpricedInWeek {
                 model: model.clone(),
@@ -997,7 +1022,17 @@ impl Valuer {
         if window.api_sum <= 0.0 {
             return Ok(0.0);
         }
-        Ok(usd / window.api_sum * used * percent_value(price))
+        Ok(usd / window.api_sum * window_money(price, used).used)
+    }
+
+    /// The price of a window ending at `end`: the account's price at the
+    /// window's midpoint (`end − 84 h`), through [`Valuer::price_at`].
+    pub(crate) fn window_price(
+        &self,
+        account: &AccountRef,
+        end: DateTime<Utc>,
+    ) -> Result<f64, Missing> {
+        self.price_at(account, end - Duration::hours(84))
     }
 
     /// The account's monthly price at `at`: the last [`EventKind::PriceChanged`]
@@ -1629,6 +1664,42 @@ mod tests {
         assert!(
             (one.subscription.expect("a value") + two.subscription.expect("a value") - week).abs()
                 < 1e-9
+        );
+    }
+
+    #[test]
+    fn a_window_above_100_percent_hands_out_what_was_paid() {
+        let (history, _dir, opus, haiku, prices) = two_records();
+        history
+            .append(&price_changed(
+                utc("2026-11-06T00:00:00Z"),
+                Some(140.0),
+                Some("EUR"),
+            ))
+            .expect("the account's price");
+        history
+            .append(&weekly_window(
+                utc("2026-11-07T00:00:00Z"),
+                utc("2026-11-14T00:00:00Z"),
+                105.0,
+            ))
+            .expect("a finished window above 100 %");
+        let valuer = Valuer::build(
+            &history,
+            &range("2026-11-10T00:00:00Z", "2026-11-11T00:00:00Z"),
+            &prices,
+            &empty_fx(),
+            &settings_eur(),
+            &[account_with_price(Some(140.0))],
+        )
+        .expect("a valuer");
+
+        let sum = valuer.value("atlas", &opus).subscription.expect("a value")
+            + valuer.value("atlas", &haiku).subscription.expect("a value");
+        let paid = 100.0 * percent_value(140.0);
+        assert!(
+            (sum - paid).abs() < 1e-9,
+            "the records share {sum}, but only {paid} was paid"
         );
     }
 

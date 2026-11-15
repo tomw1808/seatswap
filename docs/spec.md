@@ -1367,17 +1367,21 @@ the account has no price, or when the week's used part or its API value is unkno
   The value in the currency is that USD amount times the rate of the record's day.
 - A token record belongs to the account that the history's live and switch events say was in use on
   its host at its time.
-- The value of a subscription for a week: the account's used percent of that weekly window (a
-  finished window's final percent, or the latest sample's percent for a running week) times
-  `percent_value(price)`, split among the account's token records of that week in proportion to
-  their API value. So a record's subscription value is
-  `its API USD / the week's API USD × used percent × percent_value(monthly price)`.
-- The price used is the account's price at the record's time: the last `priceChanged` at or before
-  it, before the first one the first one, or, when the account has no such event, the price stored
-  in `accounts.json` with its `priceCurrency`. A price entered in another currency than the current
-  `currency` is not used, and the value is left out; a price without a currency does not count
-  either. So is a record whose week has no reading, or whose account's records in that week have no
-  API value to split.
+- The value of a subscription for a week: the window's used money, `paid − expired` and at most
+  what was paid, split among the account's token records of that week in proportion to their API
+  value. A record's subscription value is `its API USD / the week's API USD × used money`. The used
+  percent is a finished window's final percent, or the latest sample's percent for a running week;
+  a window above 100 % expired nothing, so its used money is what was paid. The paid and expired
+  money are the Statistics area's "Used, paid and expired money": `paid = 100 ×
+  percent_value(price)`, `expired = max(0, 100 − used percent) × percent_value(price)`,
+  `used = paid − expired`.
+- The price used is the Statistics area's "The price of a window": the account's monthly price at
+  the window's midpoint, its end minus 3.5 days; the last `priceChanged` at or before the midpoint,
+  the first change when the midpoint lies before all of them, or, when the account has no such
+  event, the price stored in `accounts.json` with its `priceCurrency`. A price entered in another
+  currency than the current `currency` is not used, and the value is left out; a price without a
+  currency does not count either. So is a record whose week has no reading, or whose account's
+  records in that week have no API value to split.
 
 `priceChanged` is written to the history when an account's price changes; it carries the new
 `amount` and the `currency` in effect at that moment. The same amount saved again in a new currency

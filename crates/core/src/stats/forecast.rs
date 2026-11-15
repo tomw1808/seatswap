@@ -11,7 +11,7 @@ use crate::burn::decide::Regime;
 use crate::burn::plan::{follow, next_reset, rates_known, AccountState, Inputs, Plan, Policy};
 use crate::burn::HORIZON_H;
 use crate::history::{same_reset, AccountRef, Hosts, Range, Sample, WindowRecord};
-use crate::money::{percent_value, Valuer};
+use crate::money::{window_money, Valuer};
 
 use super::{
     account_abbr, account_weeks_valued, first_record, join_names, week_start, Ctx, Query, RangeKey,
@@ -84,9 +84,10 @@ pub struct ForecastAccount {
     pub resets_at: DateTime<Utc>,
     /// What switching only when full expects to have used at the reset.
     pub only_when_full_expected: Option<f64>,
-    /// The money of the percent the lazy plan leaves unused at the reset:
-    /// `left_at_reset × percent_value(price)`. `None` without a price or without
-    /// known rates.
+    /// The money of the percent the lazy plan leaves unused at the reset, from
+    /// the expired money of a window ending at 100 % minus that percent:
+    /// `window_money(price, 100 − left_at_reset).expired`. `None` without a
+    /// price or without known rates.
     pub only_when_full_expires: Option<f64>,
 }
 
@@ -247,7 +248,7 @@ pub fn forecast(ctx: &Ctx, inputs: &Inputs, regime: &Regime) -> Result<Forecast,
             };
             let only_when_full_expires = if known {
                 match (prices[index], lazy.left_at_reset.get(&state.id)) {
-                    (Some(price), Some(left)) => Some(left * percent_value(price)),
+                    (Some(price), Some(left)) => Some(window_money(price, 100.0 - *left).expired),
                     _ => None,
                 }
             } else {
@@ -335,7 +336,8 @@ fn unknown_account(id: &str) -> StatsError {
     StatsError::Message(format!("the account {id} of the plan is not stored"))
 }
 
-/// The money of the percent `left_at_reset` leaves unused per account, at the
+/// The money of the percent `left_at_reset` leaves unused per account, as the
+/// expired money of a window ending at 100 % minus that percent, at the
 /// account's price at `now`. An account without known rates, an entry or a
 /// price is left out; `None` when that leaves no account.
 fn expire_money(
@@ -352,7 +354,7 @@ fn expire_money(
         let (Some(left), Some(price)) = (left_at_reset.get(&state.id), price) else {
             continue;
         };
-        sum += left * percent_value(*price);
+        sum += window_money(*price, 100.0 - *left).expired;
         any = true;
     }
     any.then_some(sum)
@@ -698,7 +700,7 @@ mod tests {
         assert!(close(left, 20.0), "left {left}");
         assert!(close(
             account.only_when_full_expires.expect("AC's money"),
-            left * percent_value(140.0)
+            window_money(140.0, 100.0 - left).expired
         ));
     }
 

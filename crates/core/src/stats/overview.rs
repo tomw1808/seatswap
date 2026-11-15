@@ -14,14 +14,14 @@ use crate::burn::{Rates, RATES_DAYS};
 use crate::history::{
     AccountRef, Event, EventKind, Hosted, Hosts, Range, Read, Sample, TokenRecord,
 };
-use crate::money::Valuer;
+use crate::money::{Valuer, WindowMoney};
 use crate::projects::ProjectId;
 
 use super::{
     account_abbr, account_id, account_position, account_weeks_valued, accounts_without_price,
     blocked_by_week, blocked_spans, date_text, hours_text, lost_percent, money_of, money_text,
     percent_text, range_of, switch_counts, top_three, week_columns, week_of_record, working_rhythm,
-    AccountWeek, Ctx, Query, StatsError, SwitchCounts, WindowMoney,
+    AccountWeek, Ctx, Query, StatsError, SwitchCounts,
 };
 
 /// The Overview page's numbers for one range (spec §3.1).
@@ -145,7 +145,7 @@ pub(crate) fn overview_in(ctx: &Ctx, range: &Range, q: &Query) -> Result<Overvie
     let mut expired_by_account: BTreeMap<AccountRef, f64> = BTreeMap::new();
     let mut money: BTreeMap<DateTime<Utc>, WindowMoney> = BTreeMap::new();
     for week in &finished {
-        let week_money = money_of(week)?;
+        let week_money = money_of(week);
         if let Some(week_money) = week_money {
             used += week_money.used;
             paid += week_money.paid;

@@ -279,7 +279,7 @@ fn row_for(
 
 /// One account week as the grid shows it.
 fn week_cell(week: &AccountWeek) -> Result<WeekCell, StatsError> {
-    let money = money_of(week)?;
+    let money = money_of(week);
     Ok(WeekCell {
         end: week.window.end,
         used: week.window.final_percent,
@@ -383,7 +383,7 @@ pub fn week_summary(ctx: &Ctx, q: &Query, week: DateTime<Utc>) -> Result<WeekSum
         .iter()
         .filter(|account_week| account_week.week == week)
     {
-        if let Some(money) = money_of(account_week)? {
+        if let Some(money) = money_of(account_week) {
             used += money.used;
             paid += money.paid;
             expired += money.expired;
@@ -400,7 +400,7 @@ pub fn week_summary(ctx: &Ctx, q: &Query, week: DateTime<Utc>) -> Result<WeekSum
         .iter()
         .filter(|account_week| account_week.week == previous)
     {
-        if let Some(money) = money_of(account_week)? {
+        if let Some(money) = money_of(account_week) {
             before += money.used;
             before_priced = true;
         }
@@ -494,7 +494,7 @@ pub fn week_summary(ctx: &Ctx, q: &Query, week: DateTime<Utc>) -> Result<WeekSum
                 percent_text(share)
             ));
         } else if let Some(currency) = ctx.settings.currency.as_deref() {
-            if let Some(money) = money_of(account_week)? {
+            if let Some(money) = money_of(account_week) {
                 conclusion.push(format!(
                     "{} of {abbr}'s week expired, {}.",
                     percent_text(share),
@@ -623,7 +623,7 @@ pub fn window_detail(
         .iter()
         .find(|week| week.account == reference && same_reset(week.window.end, window.end))
         .ok_or_else(|| unknown_window(account_id, end, false))?;
-    let money = money_of(week)?;
+    let money = money_of(week);
 
     let events = ctx.history.read::<Event>(&Range::ALL, &Hosts::All)?;
     let reached_100_at = events
