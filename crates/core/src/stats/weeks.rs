@@ -438,12 +438,7 @@ pub fn week_summary(ctx: &Ctx, q: &Query, week: DateTime<Utc>) -> Result<WeekSum
             continue;
         }
         records_seen = true;
-        tokens += Tokens {
-            input: record.input,
-            out: record.out,
-            cw: record.cw,
-            cr: record.cr,
-        };
+        tokens += Tokens::from(record);
         match value.api {
             Some(api) => {
                 api_total += api;

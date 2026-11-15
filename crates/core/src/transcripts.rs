@@ -102,6 +102,18 @@ impl std::ops::AddAssign for Tokens {
     }
 }
 
+/// The four counts a history [`TokenRecord`] holds.
+impl From<&TokenRecord> for Tokens {
+    fn from(record: &TokenRecord) -> Tokens {
+        Tokens {
+            input: record.input,
+            out: record.out,
+            cw: record.cw,
+            cr: record.cr,
+        }
+    }
+}
+
 /// One `agent-<id>.meta.json` file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentMeta {

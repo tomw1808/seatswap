@@ -16,6 +16,7 @@ use crate::money::{percent_value, Fx, Missing, MoneyError, Prices, Valuer};
 use crate::projects::{Projects, ProjectsLogRecord};
 use crate::store::{Account, Settings};
 
+pub mod activity;
 pub mod forecast;
 pub mod overview;
 pub mod projects;
@@ -101,15 +102,29 @@ pub fn range_of(key: RangeKey, ctx: &Ctx) -> Result<Range, StatsError> {
     Range::between(Some(from), Some(to)).map_err(StatsError::from)
 }
 
-/// Monday 00:00 local time of the week that holds `t`, as an instant.
-pub fn week_start(t: DateTime<Utc>, offset: FixedOffset) -> DateTime<Utc> {
+/// The start of the local hour `t` falls in, as an instant.
+pub(crate) fn local_hour_start(t: DateTime<Utc>, offset: FixedOffset) -> DateTime<Utc> {
     let local = t.with_timezone(&offset);
-    let days = i64::from(local.weekday().num_days_from_monday());
+    t - Duration::minutes(i64::from(local.minute()))
+        - Duration::seconds(i64::from(local.second()))
+        - Duration::nanoseconds(i64::from(local.nanosecond()))
+}
+
+/// The start of the local day `t` falls in, as an instant.
+pub(crate) fn local_day_start(t: DateTime<Utc>, offset: FixedOffset) -> DateTime<Utc> {
+    let local = t.with_timezone(&offset);
     let into_day = Duration::hours(i64::from(local.hour()))
         + Duration::minutes(i64::from(local.minute()))
         + Duration::seconds(i64::from(local.second()))
         + Duration::nanoseconds(i64::from(local.nanosecond()));
-    t - Duration::days(days) - into_day
+    t - into_day
+}
+
+/// Monday 00:00 local time of the week that holds `t`, as an instant.
+pub fn week_start(t: DateTime<Utc>, offset: FixedOffset) -> DateTime<Utc> {
+    let local = t.with_timezone(&offset);
+    let days = i64::from(local.weekday().num_days_from_monday());
+    local_day_start(t, offset) - Duration::days(days)
 }
 
 /// One finished weekly window, put into the calendar week its midpoint falls in.
@@ -293,6 +308,28 @@ pub(crate) fn blocked_by_week(
         }
     }
     by_week
+}
+
+/// The blocked hours of `spans` per local weekday, Monday first: a span is
+/// split at every local midnight it crosses and each part counts the working
+/// hours it has.
+pub(crate) fn blocked_by_weekday(
+    spans: &[BlockedSpan],
+    rhythm: &Rhythm,
+    offset: FixedOffset,
+) -> [f64; 7] {
+    let mut by_day = [0.0; 7];
+    for span in spans {
+        let mut cursor = span.from;
+        while cursor < span.to {
+            let local = cursor.with_timezone(&offset);
+            let day = local.weekday().num_days_from_monday() as usize;
+            let next = (local_day_start(cursor, offset) + Duration::days(1)).min(span.to);
+            by_day[day] += working_hours(cursor, next, rhythm, offset);
+            cursor = next;
+        }
+    }
+    by_day
 }
 
 /// The money of one account week: a full window is `paid`, the share that
@@ -651,11 +688,7 @@ fn working_hours(
     let mut hours = 0.0;
     let mut cursor = from;
     while cursor < to {
-        let local = cursor.with_timezone(&offset);
-        let into_hour = Duration::minutes(i64::from(local.minute()))
-            + Duration::seconds(i64::from(local.second()))
-            + Duration::nanoseconds(i64::from(local.nanosecond()));
-        let next = (cursor - into_hour + Duration::hours(1)).min(to);
+        let next = (local_hour_start(cursor, offset) + Duration::hours(1)).min(to);
         if rhythm.at(cursor, offset) > 0.0 {
             hours += seconds_between(cursor, next) / 3600.0;
         }

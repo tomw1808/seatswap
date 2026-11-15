@@ -476,7 +476,7 @@ pub fn running(
         let label = file
             .name
             .clone()
-            .unwrap_or_else(|| format!("{}-{}", project_name, short_id(&file.session_id)));
+            .unwrap_or_else(|| session_label(&project_name, &file.session_id));
         sessions.push(LiveSession {
             session: file.session_id.clone(),
             host: host.to_string(),
@@ -566,12 +566,7 @@ pub fn closed(
         let mut out_by_model: BTreeMap<String, u64> = BTreeMap::new();
         let mut valued = Vec::with_capacity(of_session.len());
         for token in of_session {
-            let of_record = Tokens {
-                input: token.input,
-                out: token.out,
-                cw: token.cw,
-                cr: token.cr,
-            };
+            let of_record = Tokens::from(*token);
             tokens += of_record;
             // The history is hourly: a record whose hour overlaps the window
             // counts, even when its start is before the window.
@@ -586,7 +581,7 @@ pub fn closed(
         let model = most_output(&out_by_model);
         let id = ProjectId::of(&record.project, &hosted.host);
         let (project_id, project_name, org) = named_project(projects, &id);
-        let label = format!("{}-{}", project_name, short_id(&record.session));
+        let label = session_label(&project_name, &record.session);
         sessions.push(LiveSession {
             session: record.session.clone(),
             host: hosted.host.clone(),
@@ -739,15 +734,15 @@ pub fn other_hosts(history: &HistoryDir, now: DateTime<Utc>) -> Result<OtherHost
     Ok(OtherHosts { hosts, warnings })
 }
 
-/// The model with the most output tokens; on a tie, the first in name order.
-fn most_output(out_by_model: &BTreeMap<String, u64>) -> Option<String> {
-    let mut best: Option<(&String, u64)> = None;
-    for (model, out) in out_by_model {
+/// The key with the most output tokens; on a tie, the first in key order.
+pub(crate) fn most_output<K: Ord + Clone>(by: &BTreeMap<K, u64>) -> Option<K> {
+    let mut best: Option<(&K, u64)> = None;
+    for (key, out) in by {
         if best.is_none_or(|(_, best_out)| *out > best_out) {
-            best = Some((model, *out));
+            best = Some((key, *out));
         }
     }
-    best.map(|(model, _)| model.clone())
+    best.map(|(key, _)| key.clone())
 }
 
 /// One token record for the live view: a model's or an agent's sum dated at its
@@ -788,6 +783,12 @@ fn live_status(status: &SessionStatus) -> LiveStatus {
 /// Milliseconds since the epoch as a time; `None` when it is not a valid time.
 fn time_ms(ms: i64) -> Option<DateTime<Utc>> {
     Utc.timestamp_millis_opt(ms).single()
+}
+
+/// A session's label: the project's name, a dash, and the first two characters
+/// of the session id.
+pub(crate) fn session_label(project: &str, session: &str) -> String {
+    format!("{}-{}", project, short_id(session))
 }
 
 /// The first two characters of a session id, the part a label adds to a

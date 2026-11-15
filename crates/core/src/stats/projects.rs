@@ -334,12 +334,7 @@ pub(crate) fn projects_page_in(
     let mut unknown_account_tokens = Tokens::default();
     for entry in &entries {
         if entry.value.account.is_none() {
-            unknown_account_tokens += Tokens {
-                input: entry.record.input,
-                out: entry.record.out,
-                cw: entry.record.cw,
-                cr: entry.record.cr,
-            };
+            unknown_account_tokens += Tokens::from(entry.record);
         }
     }
 
@@ -369,12 +364,7 @@ pub(crate) fn projects_page_in(
     for entry in &entries {
         if entry.value.account.is_some() && entry.value.subscription.is_none() {
             has_unvalued = true;
-            without_subscription += Tokens {
-                input: entry.record.input,
-                out: entry.record.out,
-                cw: entry.record.cw,
-                cr: entry.record.cr,
-            };
+            without_subscription += Tokens::from(entry.record);
             if let Some(missing) = &entry.value.subscription_missing {
                 reasons.insert(missing.to_string());
             }
@@ -565,12 +555,7 @@ struct Sums {
 impl Sums {
     fn add(&mut self, entry: &Entry) {
         let record = entry.record;
-        self.tokens += Tokens {
-            input: record.input,
-            out: record.out,
-            cw: record.cw,
-            cr: record.cr,
-        };
+        self.tokens += Tokens::from(record);
         self.sessions.insert(record.session.clone());
         if let Some(api) = entry.value.api {
             *self.api.get_or_insert(0.0) += api;
@@ -821,7 +806,7 @@ const TOP_FOLDER: &str = "(top folder)";
 
 /// The folder of `cwd` below the project's root on `host`: the first path part,
 /// or [`TOP_FOLDER`].
-fn folder_name(project: &Project, host: &str, cwd: &str) -> String {
+pub(crate) fn folder_name(project: &Project, host: &str, cwd: &str) -> String {
     let folders = project.folders.get(host).map(Vec::as_slice).unwrap_or(&[]);
     let root = common_parent(folders);
     let parts = path_parts(cwd);
