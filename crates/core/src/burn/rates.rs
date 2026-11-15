@@ -121,8 +121,9 @@ pub fn rates(
     Some(Rates { c, s })
 }
 
-/// The timeline of every host that has an event.
-pub(super) fn timelines(events: &[Hosted<Event>]) -> HashMap<String, Timeline> {
+/// The timeline of every host that has an event. `pub(crate)` so `money` reads
+/// a record's account through the same timelines, without a second copy.
+pub(crate) fn timelines(events: &[Hosted<Event>]) -> HashMap<String, Timeline> {
     let mut timelines: HashMap<String, Timeline> = HashMap::new();
     for hosted in events {
         if !timelines.contains_key(&hosted.host) {
@@ -205,7 +206,7 @@ fn session_gain(before: &Sample, after: &Sample) -> Option<f64> {
 
 /// When an account was live on one host. Every `live` and `switch` event changes
 /// it, so the account between two changes is the one of the earlier change.
-pub(super) struct Timeline {
+pub(crate) struct Timeline {
     changes: Vec<(DateTime<Utc>, Option<AccountRef>)>,
 }
 
@@ -224,7 +225,7 @@ impl Timeline {
         Timeline { changes }
     }
 
-    fn at(&self, t: DateTime<Utc>) -> Option<&AccountRef> {
+    pub(crate) fn at(&self, t: DateTime<Utc>) -> Option<&AccountRef> {
         let after = self.changes.partition_point(|change| change.0 <= t);
         if after == 0 {
             None

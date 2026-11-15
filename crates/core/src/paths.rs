@@ -193,6 +193,14 @@ impl AppPaths {
     pub fn burn_next_file(&self) -> PathBuf {
         self.data_dir.join("burn-next.json")
     }
+    /// The models.dev prices with their dates (spec §1.4.1).
+    pub fn prices_file(&self) -> PathBuf {
+        self.data_dir.join("prices.json")
+    }
+    /// The dollar rate with its dates (spec §1.4.1).
+    pub fn fx_file(&self) -> PathBuf {
+        self.data_dir.join("fx.json")
+    }
     /// seatswap's own lock, keeps two seatswap processes apart.
     pub fn switch_lock(&self) -> PathBuf {
         self.data_dir.join("switch.lock")

@@ -1,0 +1,1585 @@
+//! Money (spec §1.4, §1.4.1, §3.6): the API prices of models with their dates,
+//! the dollar rate with its dates, and the value of token records. Everything is
+//! kept in two files seatswap owns (`prices.json`, `fx.json`); a missing value is
+//! `None`, never a number.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs;
+use std::io;
+use std::path::PathBuf;
+
+use chrono::{DateTime, Duration, NaiveDate, Utc};
+use serde::{Deserialize, Serialize};
+
+use crate::atomic::{self, Access};
+use crate::burn::rates::{timelines, Timeline};
+use crate::history::{
+    same_reset, AccountRef, Event, EventKind, HistoryDir, HistoryError, Hosted, Hosts, Range,
+    Sample, TokenRecord, WindowRecord,
+};
+use crate::paths::AppPaths;
+use crate::store::{Account, Settings};
+
+/// The models.dev providers seatswap reads prices from (spec §1.4.1).
+const PRICE_PROVIDERS: [&str; 3] = ["anthropic", "openai", "ollama-cloud"];
+
+/// The version of `prices.json` and `fx.json` this build reads and writes.
+const MONEY_VERSION: u32 = 1;
+
+const MICRO: f64 = 1_000_000.0;
+
+#[derive(Debug, thiserror::Error)]
+pub enum MoneyError {
+    #[error("{path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("{path}: {source}")]
+    Json {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("{path} has version {version}, but this build reads version 1")]
+    UnsupportedVersion { path: PathBuf, version: u32 },
+    #[error("models.dev's answer is not the expected model list: {0}")]
+    ModelsDev(String),
+    #[error(transparent)]
+    History(#[from] HistoryError),
+}
+
+/// What one model costs at API prices, in USD per million tokens (spec §1.4.1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelPrice {
+    pub input: f64,
+    pub output: f64,
+    pub cache_write: f64,
+    pub cache_read: f64,
+    /// The model has `cost.tiers` (a price that depends on the prompt size);
+    /// this step counts its base price.
+    pub tiered: bool,
+}
+
+impl ModelPrice {
+    /// The USD cost of these four token counts at this price.
+    fn usd(&self, input: u64, output: u64, cache_write: u64, cache_read: u64) -> f64 {
+        (input as f64 * self.input
+            + output as f64 * self.output
+            + cache_write as f64 * self.cache_write
+            + cache_read as f64 * self.cache_read)
+            / MICRO
+    }
+}
+
+/// One model's price from one moment on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PricePoint {
+    pub from: DateTime<Utc>,
+    pub price: ModelPrice,
+}
+
+/// What a look-up changed, for the settings to show (spec §1.4.1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PriceChange {
+    pub at: DateTime<Utc>,
+    pub added: Vec<String>,
+    pub changed: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+/// `prices.json`: the looked-up prices with their dates, the last look-up's
+/// state, and the prices entered by hand.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Prices {
+    pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_change: Option<PriceChange>,
+    /// Key [`price_key`], points in time order.
+    #[serde(default)]
+    pub models: BTreeMap<String, Vec<PricePoint>>,
+    /// Key [`price_key`], a price entered by hand that wins over the points.
+    #[serde(default)]
+    pub overrides: BTreeMap<String, ModelPrice>,
+    /// The keys whose last looked-up list did not have them. A key is reported
+    /// as removed once, not on every later list that still lacks it; an older
+    /// `prices.json` loads with this empty.
+    #[serde(default)]
+    pub missing: BTreeSet<String>,
+}
+
+impl Default for Prices {
+    fn default() -> Self {
+        Prices {
+            version: MONEY_VERSION,
+            checked_at: None,
+            etag: None,
+            last_change: None,
+            models: BTreeMap::new(),
+            overrides: BTreeMap::new(),
+            missing: BTreeSet::new(),
+        }
+    }
+}
+
+impl Prices {
+    /// `prices.json`; a missing file is empty. A file that does not parse or
+    /// names another version is an error naming the path, never replaced.
+    pub fn load(app: &AppPaths) -> Result<Prices, MoneyError> {
+        let path = app.prices_file();
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Prices::default()),
+            Err(source) => return Err(MoneyError::Io { path, source }),
+        };
+        let prices: Prices = serde_json::from_str(&text).map_err(|source| MoneyError::Json {
+            path: path.clone(),
+            source,
+        })?;
+        if prices.version != MONEY_VERSION {
+            return Err(MoneyError::UnsupportedVersion {
+                path,
+                version: prices.version,
+            });
+        }
+        Ok(prices)
+    }
+
+    /// Pretty JSON, mode 0600, through [`atomic::write_atomic`].
+    pub fn save(&self, app: &AppPaths) -> Result<(), MoneyError> {
+        let path = app.prices_file();
+        save_json(app, &path, self.version, self)
+    }
+
+    /// The price of `key` at `at`: its override, else the last point at or
+    /// before `at`, else the first point. `None` when there is no price at all.
+    pub fn at(&self, key: &str, at: DateTime<Utc>) -> Option<&ModelPrice> {
+        if let Some(price) = self.overrides.get(key) {
+            return Some(price);
+        }
+        let points = self.models.get(key)?;
+        let after = points.partition_point(|point| point.from <= at);
+        if after == 0 {
+            points.first().map(|point| &point.price)
+        } else {
+            points.get(after - 1).map(|point| &point.price)
+        }
+    }
+
+    /// Take a new list: add a point for every model that is new or whose price
+    /// differs from its last point. A model missing from the list keeps its
+    /// points and is reported as removed only the first time it is missing. A
+    /// model that comes back leaves [`Prices::missing`]. Returns what changed,
+    /// or `None` when nothing did; `last_change` keeps its value then.
+    pub fn take(
+        &mut self,
+        list: BTreeMap<String, ModelPrice>,
+        at: DateTime<Utc>,
+    ) -> Option<PriceChange> {
+        let mut added = Vec::new();
+        let mut changed = Vec::new();
+        for (key, price) in &list {
+            self.missing.remove(key);
+            match self.models.get_mut(key) {
+                Some(points) => {
+                    let differs = points
+                        .last()
+                        .map(|point| point.price != *price)
+                        .unwrap_or(true);
+                    if differs {
+                        points.push(PricePoint {
+                            from: at,
+                            price: price.clone(),
+                        });
+                        changed.push(key.clone());
+                    }
+                }
+                None => {
+                    self.models.insert(
+                        key.clone(),
+                        vec![PricePoint {
+                            from: at,
+                            price: price.clone(),
+                        }],
+                    );
+                    added.push(key.clone());
+                }
+            }
+        }
+        let mut removed = Vec::new();
+        for key in self.models.keys() {
+            if !list.contains_key(key) && self.missing.insert(key.clone()) {
+                removed.push(key.clone());
+            }
+        }
+        if added.is_empty() && changed.is_empty() && removed.is_empty() {
+            return None;
+        }
+        let change = PriceChange {
+            at,
+            added,
+            changed,
+            removed,
+        };
+        self.last_change = Some(change.clone());
+        Some(change)
+    }
+}
+
+/// One day's dollar rate: units of the file's currency per 1 USD.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FxPoint {
+    pub date: NaiveDate,
+    pub rate: f64,
+}
+
+/// `fx.json`: one currency and its rates with their dates.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Fx {
+    pub version: u32,
+    /// The currency these rates are for; empty when nothing was looked up yet.
+    pub currency: String,
+    /// In date order.
+    #[serde(default)]
+    pub points: Vec<FxPoint>,
+}
+
+impl Default for Fx {
+    fn default() -> Self {
+        Fx {
+            version: MONEY_VERSION,
+            currency: String::new(),
+            points: Vec::new(),
+        }
+    }
+}
+
+impl Fx {
+    /// `fx.json`; a missing file is empty. A file that does not parse or names
+    /// another version is an error naming the path.
+    pub fn load(app: &AppPaths) -> Result<Fx, MoneyError> {
+        let path = app.fx_file();
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Fx::default()),
+            Err(source) => return Err(MoneyError::Io { path, source }),
+        };
+        let fx: Fx = serde_json::from_str(&text).map_err(|source| MoneyError::Json {
+            path: path.clone(),
+            source,
+        })?;
+        if fx.version != MONEY_VERSION {
+            return Err(MoneyError::UnsupportedVersion {
+                path,
+                version: fx.version,
+            });
+        }
+        Ok(fx)
+    }
+
+    /// Pretty JSON, mode 0600, through [`atomic::write_atomic`].
+    pub fn save(&self, app: &AppPaths) -> Result<(), MoneyError> {
+        let path = app.fx_file();
+        save_json(app, &path, self.version, self)
+    }
+
+    /// Replace the point of `date`, or add one, keeping the points in date order.
+    pub fn take(&mut self, date: NaiveDate, rate: f64) {
+        match self.points.binary_search_by_key(&date, |point| point.date) {
+            Ok(index) => self.points[index].rate = rate,
+            Err(index) => self.points.insert(index, FxPoint { date, rate }),
+        }
+    }
+
+    /// The rate at `date`: the point at or before it, else the first point.
+    pub fn at(&self, date: NaiveDate) -> Option<f64> {
+        self.point_at(date).map(|point| point.rate)
+    }
+
+    fn point_at(&self, date: NaiveDate) -> Option<&FxPoint> {
+        let after = self.points.partition_point(|point| point.date <= date);
+        if after == 0 {
+            self.points.first()
+        } else {
+            self.points.get(after - 1)
+        }
+    }
+}
+
+fn save_json<T: Serialize>(
+    app: &AppPaths,
+    path: &std::path::Path,
+    version: u32,
+    value: &T,
+) -> Result<(), MoneyError> {
+    if version != MONEY_VERSION {
+        return Err(MoneyError::UnsupportedVersion {
+            path: path.to_path_buf(),
+            version,
+        });
+    }
+    atomic::ensure_private_dir(&app.data_dir).map_err(|source| MoneyError::Io {
+        path: app.data_dir.clone(),
+        source,
+    })?;
+    let bytes = serde_json::to_vec_pretty(value).map_err(|source| MoneyError::Json {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    atomic::write_atomic(path, &bytes, Access::Private).map_err(|source| MoneyError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// models.dev's `api.json` → the prices of [`PRICE_PROVIDERS`]. A body with none
+/// of those providers is an error, not an empty list. A model without
+/// `cost.input` and `cost.output` is left out; a missing `cache_read` /
+/// `cache_write` is 0.0; a cost that is negative or not finite is an error
+/// naming the model; `tiered` is set when it has `cost.tiers`.
+pub fn prices_from_models_dev(
+    body: &serde_json::Value,
+) -> Result<BTreeMap<String, ModelPrice>, MoneyError> {
+    let providers = body
+        .as_object()
+        .ok_or_else(|| MoneyError::ModelsDev("not a JSON object of providers".to_string()))?;
+    let mut prices = BTreeMap::new();
+    let mut found = 0;
+    for provider in PRICE_PROVIDERS {
+        let Some(entry) = providers.get(provider) else {
+            continue;
+        };
+        let models = entry
+            .get("models")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| MoneyError::ModelsDev(format!("{provider} has no list of models")))?;
+        found += 1;
+        for model in models.values() {
+            let Some(id) = model.get("id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let key = price_key(provider, id);
+            let cost = model.get("cost");
+            let number = |name: &str| -> Result<Option<f64>, MoneyError> {
+                let Some(value) = cost.and_then(|cost| cost.get(name)) else {
+                    return Ok(None);
+                };
+                let Some(value) = value.as_f64() else {
+                    return Err(MoneyError::ModelsDev(format!(
+                        "{key} has a cost that is not a number: {name} = {value}"
+                    )));
+                };
+                if !(value.is_finite() && value >= 0.0) {
+                    return Err(MoneyError::ModelsDev(format!(
+                        "{key} has a cost that is negative or not finite: {name} = {value}"
+                    )));
+                }
+                Ok(Some(value))
+            };
+            let (Some(input), Some(output)) = (number("input")?, number("output")?) else {
+                continue;
+            };
+            let cache_write = number("cache_write")?.unwrap_or(0.0);
+            let cache_read = number("cache_read")?.unwrap_or(0.0);
+            let tiered = cost
+                .and_then(|cost| cost.get("tiers"))
+                .is_some_and(|tiers| !tiers.is_null());
+            prices.insert(
+                key,
+                ModelPrice {
+                    input,
+                    output,
+                    cache_write,
+                    cache_read,
+                    tiered,
+                },
+            );
+        }
+    }
+    if found == 0 {
+        return Err(MoneyError::ModelsDev(format!(
+            "the body has none of the providers {}",
+            PRICE_PROVIDERS.join(", ")
+        )));
+    }
+    Ok(prices)
+}
+
+/// A model's key in [`Prices`]: `"<provider>/<model id>"`.
+pub fn price_key(provider: &str, model_id: &str) -> String {
+    format!("{provider}/{model_id}")
+}
+
+/// The dollar rate used at a date (spec §1.4).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rate {
+    /// Units of the settings' currency per 1 USD.
+    pub value: f64,
+    /// The day the looked-up rate is from; `None` for a rate entered by hand
+    /// and for USD.
+    pub date: Option<NaiveDate>,
+    /// Whether the rate comes from the settings (`usdRate`), not a look-up.
+    pub own: bool,
+}
+
+/// The rate to use at `date`: `settings.usd_rate` if set (own), else
+/// [`Fx::at`]. Currency "USD" is always 1.0; without a currency there is no
+/// rate at all. The `Fx` is used as given: the caller starts a new one when the
+/// currency changes (spec §1.4).
+pub fn usd_rate(settings: &Settings, fx: &Fx, date: NaiveDate) -> Option<Rate> {
+    let currency = settings.currency.as_deref()?;
+    if currency == "USD" {
+        return Some(Rate {
+            value: 1.0,
+            date: None,
+            own: false,
+        });
+    }
+    if let Some(value) = settings.usd_rate {
+        return Some(Rate {
+            value,
+            date: None,
+            own: true,
+        });
+    }
+    let point = fx.point_at(date)?;
+    Some(Rate {
+        value: point.rate,
+        date: Some(point.date),
+        own: false,
+    })
+}
+
+/// What one token record costs at API prices, in USD. `None` when the record's
+/// model has no price. The record's model is priced as an Anthropic model
+/// (`anthropic/<model>`), the provider Claude Code's transcripts come from.
+pub fn api_usd(record: &TokenRecord, prices: &Prices) -> Option<f64> {
+    let key = price_key("anthropic", &record.model);
+    let price = prices.at(&key, record.t)?;
+    Some(price.usd(record.input, record.out, record.cw, record.cr))
+}
+
+/// The money value of one percent of one week of an account: monthly price ×
+/// 12 / 52 / 100 (spec §1.4).
+pub fn percent_value(monthly_price: f64) -> f64 {
+    monthly_price * 12.0 / 52.0 / 100.0
+}
+
+/// The two values of one token record, in the settings' currency.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Valued {
+    /// The tokens at API prices, times the rate of the record's day.
+    pub api: Option<f64>,
+    /// The share of the account's subscription that the record's week used.
+    pub subscription: Option<f64>,
+    /// The account that was live on the record's host at its time.
+    pub account: Option<AccountRef>,
+    /// The record's model when it has no API price (spec §1.4.1).
+    pub missing_price_for: Option<String>,
+    /// Whether the record has an API price but no rate to turn it into the
+    /// settings' currency: no currency, or no looked-up point and no own rate.
+    pub missing_rate: bool,
+}
+
+/// One account's weekly window, with what its records are split by.
+struct WeekWindow {
+    account: AccountRef,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    /// The finished window's final percent, or a running window's last sample.
+    used: Option<f64>,
+    /// Whether `used` came from a finished [`WindowRecord`].
+    finished: bool,
+    last_sample: Option<DateTime<Utc>>,
+    /// The sum of [`api_usd`] of every record of this account in this window.
+    api_sum: f64,
+}
+
+/// Every account's price changes, in time order: the moment, the monthly price
+/// and the currency it was entered in (`None` before a currency was set).
+type PriceChanges = BTreeMap<AccountRef, Vec<(DateTime<Utc>, Option<f64>, Option<String>)>>;
+
+/// The value of token records, built once for a range (spec §3.6): the account
+/// of every record, its weekly window, and the account's price at its time.
+pub struct Valuer {
+    timelines: HashMap<String, Timeline>,
+    windows: Vec<WeekWindow>,
+    price_changes: PriceChanges,
+    /// The price as `accounts.json` has it now, for an account without changes.
+    stored_prices: BTreeMap<AccountRef, Option<f64>>,
+    prices: Prices,
+    fx: Fx,
+    settings: Settings,
+}
+
+impl Valuer {
+    /// Reads samples, windows and tokens of `range` widened to whole weekly
+    /// windows: a week that holds a point of the range begins at most seven
+    /// days before it and ends at most seven days after it. Every event over
+    /// all of history is read too, because a record's account and its account's
+    /// price are the last `Live`/`Switch`/`PriceChanged` at or before it, which
+    /// can be older than the range; a price change after the range still names
+    /// the first price, which counts for the past.
+    pub fn build(
+        history: &HistoryDir,
+        range: &Range,
+        prices: &Prices,
+        fx: &Fx,
+        settings: &Settings,
+        accounts: &[Account],
+    ) -> Result<Valuer, MoneyError> {
+        let widened = Range {
+            from: range.from - Duration::days(7),
+            to: range.to + Duration::days(7),
+        };
+        let windows = history.read::<WindowRecord>(&widened, &Hosts::All)?;
+        let samples = history.read::<Sample>(&widened, &Hosts::All)?;
+        let events = history.read::<Event>(
+            &Range {
+                from: DateTime::<Utc>::MIN_UTC,
+                to: DateTime::<Utc>::MAX_UTC,
+            },
+            &Hosts::All,
+        )?;
+        let tokens = history.read::<TokenRecord>(&widened, &Hosts::All)?;
+
+        let mut valuer = Valuer {
+            timelines: timelines(&events.records),
+            windows: Vec::new(),
+            price_changes: BTreeMap::new(),
+            stored_prices: accounts
+                .iter()
+                .map(|account| (AccountRef::of(account), account.price))
+                .collect(),
+            prices: prices.clone(),
+            fx: fx.clone(),
+            settings: settings.clone(),
+        };
+        for hosted in &windows.records {
+            valuer.finished_window(&hosted.record);
+        }
+        for hosted in &samples.records {
+            valuer.sample_window(&hosted.record);
+        }
+        for hosted in &events.records {
+            if let EventKind::PriceChanged {
+                account,
+                amount,
+                currency,
+            } = &hosted.record.kind
+            {
+                valuer
+                    .price_changes
+                    .entry(account.clone())
+                    .or_default()
+                    .push((hosted.record.t, *amount, currency.clone()));
+            }
+        }
+        for hosted in &tokens.records {
+            valuer.add_to_window(hosted, prices);
+        }
+        Ok(valuer)
+    }
+
+    /// The index of the account's window that ends like `end`, adding it when
+    /// it is new.
+    fn window_index(
+        &mut self,
+        account: &AccountRef,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> usize {
+        if let Some(index) = self
+            .windows
+            .iter()
+            .position(|window| &window.account == account && same_reset(window.end, end))
+        {
+            return index;
+        }
+        self.windows.push(WeekWindow {
+            account: account.clone(),
+            start,
+            end,
+            used: None,
+            finished: false,
+            last_sample: None,
+            api_sum: 0.0,
+        });
+        self.windows.len() - 1
+    }
+
+    fn finished_window(&mut self, record: &WindowRecord) {
+        if record.k != crate::api::LimitKind::WeeklyAll {
+            return;
+        }
+        let end = record.end;
+        let start = record.start.unwrap_or(end - Duration::days(7));
+        let index = self.window_index(&record.account, start, end);
+        let window = &mut self.windows[index];
+        window.used = Some(record.final_percent);
+        window.finished = true;
+        window.last_sample = Some(record.last_sample);
+    }
+
+    fn sample_window(&mut self, sample: &Sample) {
+        for limit in &sample.l {
+            if limit.k != crate::api::LimitKind::WeeklyAll {
+                continue;
+            }
+            let Some(end) = limit.r else {
+                continue;
+            };
+            let start = end - Duration::days(7);
+            let index = self.window_index(&sample.account, start, end);
+            let window = &mut self.windows[index];
+            if window.finished {
+                continue;
+            }
+            let newer = window.last_sample.is_none_or(|last| sample.t >= last);
+            if newer {
+                window.last_sample = Some(sample.t);
+                window.used = Some(limit.p);
+            }
+        }
+    }
+
+    fn add_to_window(&mut self, hosted: &Hosted<TokenRecord>, prices: &Prices) {
+        let record = &hosted.record;
+        let Some(account) = self
+            .timelines
+            .get(&hosted.host)
+            .and_then(|timeline| timeline.at(record.t))
+            .cloned()
+        else {
+            return;
+        };
+        let Some(usd) = api_usd(record, prices) else {
+            return;
+        };
+        if let Some(window) = self.windows.iter_mut().find(|window| {
+            window.account == account && window.start <= record.t && record.t < window.end
+        }) {
+            window.api_sum += usd;
+        }
+    }
+
+    /// The money value of one token record of `host`.
+    pub fn value(&self, host: &str, record: &TokenRecord) -> Valued {
+        let usd = api_usd(record, &self.prices);
+        let account = self
+            .timelines
+            .get(host)
+            .and_then(|timeline| timeline.at(record.t))
+            .cloned();
+        let rate = usd_rate(&self.settings, &self.fx, record.t.date_naive());
+        let api = match (usd, rate) {
+            (Some(usd), Some(rate)) => Some(usd * rate.value),
+            _ => None,
+        };
+        let subscription = match (&account, usd) {
+            (Some(account), Some(usd)) => self.subscription(account, record.t, usd),
+            _ => None,
+        };
+        Valued {
+            api,
+            subscription,
+            account,
+            missing_price_for: usd.is_none().then(|| record.model.clone()),
+            missing_rate: usd.is_some() && rate.is_none(),
+        }
+    }
+
+    fn subscription(&self, account: &AccountRef, at: DateTime<Utc>, usd: f64) -> Option<f64> {
+        let window = self
+            .windows
+            .iter()
+            .find(|window| &window.account == account && window.start <= at && at < window.end)?;
+        let used = window.used?;
+        let price = self.price_at(account, at)?;
+        if window.api_sum <= 0.0 {
+            return None;
+        }
+        Some(usd / window.api_sum * used * percent_value(price))
+    }
+
+    /// The account's monthly price at `at`: the last [`EventKind::PriceChanged`]
+    /// at or before it, before the first one the first one; without any change
+    /// the price stored for the account now. A change entered in another
+    /// currency than the current setting's has no value here: prices are never
+    /// mixed (spec §1.4). A change entered before a currency was set (`None`)
+    /// still counts.
+    fn price_at(&self, account: &AccountRef, at: DateTime<Utc>) -> Option<f64> {
+        let (amount, currency) = match self.price_changes.get(account) {
+            Some(changes) if !changes.is_empty() => {
+                let after = changes.partition_point(|(t, _, _)| *t <= at);
+                let (_, amount, currency) = if after == 0 {
+                    changes.first()?
+                } else {
+                    changes.get(after - 1)?
+                };
+                (*amount, currency)
+            }
+            _ => return self.stored_prices.get(account).copied().flatten(),
+        };
+        match currency {
+            Some(currency) if Some(currency.as_str()) != self.settings.currency.as_deref() => None,
+            _ => amount,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    use crate::api::LimitKind;
+    use crate::history::{Source, WindowRecord};
+    use crate::project::ProjectKey;
+
+    const AC_ACC: &str = "6f1c2a9e-1d4b-4c7f-9a3e-8b5d2e6f1c04";
+    const AC_ORG: &str = "a92d7b31-5c8e-4f2a-9d6b-1e3c5a7f9b20";
+
+    const MODELS_DEV: &str = r#"{
+      "anthropic": {"id": "anthropic", "models": {
+        "claude-opus-5-5": {"id": "claude-opus-5-5", "cost": {"input": 4, "output": 20, "cache_read": 0.2, "cache_write": 5}},
+        "claude-haiku-5-5": {"id": "claude-haiku-5-5", "cost": {"input": 0.1, "output": 0.5, "cache_read": 0.01, "cache_write": 0.125,
+          "tiers": [{"input": 0.5, "output": 2.5, "cache_read": 0.05, "cache_write": 0.625, "tier": {"type": "context", "size": 100000}}]}},
+        "claude-no-price": {"id": "claude-no-price"}
+      }},
+      "ollama-cloud": {"id": "ollama-cloud", "models": {"deepseek-v4.1-flash": {"id": "deepseek-v4.1-flash", "cost": {"input": 0.3, "output": 1.2}}}},
+      "somebody-else": {"id": "somebody-else", "models": {"x": {"id": "x", "cost": {"input": 1, "output": 1}}}}
+    }"#;
+
+    fn utc(text: &str) -> DateTime<Utc> {
+        text.parse().expect("test date")
+    }
+
+    fn date(text: &str) -> NaiveDate {
+        text.parse().expect("test date")
+    }
+
+    fn ac() -> AccountRef {
+        AccountRef {
+            acc: AC_ACC.to_string(),
+            org: AC_ORG.to_string(),
+        }
+    }
+
+    fn models_dev() -> serde_json::Value {
+        serde_json::from_str(MODELS_DEV).expect("the models.dev fixture")
+    }
+
+    fn model_list() -> BTreeMap<String, ModelPrice> {
+        prices_from_models_dev(&models_dev()).expect("the fixture's prices")
+    }
+
+    fn priced_prices(at: DateTime<Utc>) -> Prices {
+        let mut prices = Prices::default();
+        prices.take(model_list(), at);
+        prices
+    }
+
+    fn settings_eur() -> Settings {
+        Settings {
+            currency: Some("EUR".to_string()),
+            usd_rate: Some(1.0),
+            ..Settings::default()
+        }
+    }
+
+    fn empty_fx() -> Fx {
+        Fx::default()
+    }
+
+    fn account_with_price(price: Option<f64>) -> Account {
+        serde_json::from_value(json!({
+            "id": "0b4f6a2c8d1e4f7a9c3b5d7e9f1a2b4c",
+            "accountUuid": AC_ACC,
+            "organizationUuid": AC_ORG,
+            "label": "AC",
+            "abbr": "AC",
+            "color": "#3b82f6",
+            "email": "sam@example.com",
+            "orgName": "Acme",
+            "plan": "Team 5x",
+            "price": price,
+            "oauthAccount": {
+                "accountUuid": AC_ACC,
+                "organizationUuid": AC_ORG,
+                "emailAddress": "sam@example.com"
+            },
+            "addedAt": "2026-09-01T00:00:00Z",
+            "loginState": "ok",
+            "autoBurn": true
+        }))
+        .expect("a test account")
+    }
+
+    fn token(t: DateTime<Utc>, model: &str, input: u64, out: u64, cw: u64, cr: u64) -> TokenRecord {
+        TokenRecord {
+            t,
+            session: "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34".to_string(),
+            cwd: "/home/sam/projects/atlas".to_string(),
+            project: ProjectKey::Repo("github.com/acme/atlas".to_string()),
+            model: model.to_string(),
+            input,
+            out,
+            cw,
+            cr,
+            answers: 3,
+            agent_answers: 1,
+        }
+    }
+
+    fn live(at: DateTime<Utc>, account: Option<AccountRef>) -> Event {
+        Event {
+            t: at,
+            kind: EventKind::Live { account },
+        }
+    }
+
+    fn weekly_sample(t: DateTime<Utc>, end: DateTime<Utc>, percent: f64) -> Sample {
+        Sample {
+            t,
+            account: ac(),
+            src: Source::Poll,
+            l: vec![crate::history::LimitSample {
+                k: LimitKind::WeeklyAll,
+                m: None,
+                p: percent,
+                r: Some(end),
+                b: false,
+            }],
+        }
+    }
+
+    fn weekly_window(start: DateTime<Utc>, end: DateTime<Utc>, final_percent: f64) -> WindowRecord {
+        WindowRecord {
+            account: ac(),
+            k: LimitKind::WeeklyAll,
+            m: None,
+            start: Some(start),
+            end,
+            final_percent,
+            lost: None,
+            last_sample: end - Duration::hours(1),
+            plan: None,
+            uncertain: false,
+        }
+    }
+
+    fn range(from: &str, to: &str) -> Range {
+        Range {
+            from: utc(from),
+            to: utc(to),
+        }
+    }
+
+    #[test]
+    fn models_dev_gives_three_providers_only() {
+        let prices = model_list();
+        let keys: Vec<&String> = prices.keys().collect();
+        assert_eq!(
+            keys,
+            vec![
+                "anthropic/claude-haiku-5-5",
+                "anthropic/claude-opus-5-5",
+                "ollama-cloud/deepseek-v4.1-flash",
+            ]
+        );
+
+        let opus = &prices["anthropic/claude-opus-5-5"];
+        assert_eq!(
+            (
+                opus.input,
+                opus.output,
+                opus.cache_write,
+                opus.cache_read,
+                opus.tiered
+            ),
+            (4.0, 20.0, 5.0, 0.2, false)
+        );
+        assert!(prices["anthropic/claude-haiku-5-5"].tiered);
+        let ollama = &prices["ollama-cloud/deepseek-v4.1-flash"];
+        assert_eq!((ollama.input, ollama.output), (0.3, 1.2));
+        assert_eq!(ollama.cache_read, 0.0);
+        assert_eq!(ollama.cache_write, 0.0);
+    }
+
+    #[test]
+    fn a_body_of_another_shape_is_an_error() {
+        assert!(matches!(
+            prices_from_models_dev(&json!([])),
+            Err(MoneyError::ModelsDev(_))
+        ));
+    }
+
+    #[test]
+    fn take_adds_points_only_for_changes() {
+        let t1 = utc("2026-11-01T00:00:00Z");
+        let t2 = utc("2026-11-02T00:00:00Z");
+        let t3 = utc("2026-11-03T00:00:00Z");
+        let mut prices = Prices::default();
+        let list = model_list();
+
+        let first = prices.take(list.clone(), t1).expect("a new list changes");
+        assert_eq!(first.at, t1);
+        assert_eq!(first.added.len(), 3);
+        assert!(first.changed.is_empty());
+        assert!(first.removed.is_empty());
+        assert_eq!(prices.models.len(), 3);
+        assert_eq!(prices.models["anthropic/claude-opus-5-5"].len(), 1);
+
+        assert_eq!(prices.take(list.clone(), t2), None);
+        for points in prices.models.values() {
+            assert_eq!(points.len(), 1, "an unchanged list adds no point");
+        }
+
+        let mut repriced = list;
+        repriced
+            .get_mut("anthropic/claude-opus-5-5")
+            .expect("opus")
+            .output = 18.0;
+        let second = prices.take(repriced, t3).expect("a new price changes");
+        assert_eq!(second.changed, vec!["anthropic/claude-opus-5-5"]);
+        assert!(second.added.is_empty());
+        assert_eq!(prices.models["anthropic/claude-opus-5-5"].len(), 2);
+    }
+
+    #[test]
+    fn a_model_gone_from_the_list_keeps_its_price() {
+        let t1 = utc("2026-11-01T00:00:00Z");
+        let t2 = utc("2026-11-02T00:00:00Z");
+        let mut prices = Prices::default();
+        let mut list = model_list();
+        prices.take(list.clone(), t1);
+        list.remove("anthropic/claude-haiku-5-5");
+
+        let change = prices.take(list, t2).expect("a removed model is a change");
+        assert_eq!(change.removed, vec!["anthropic/claude-haiku-5-5"]);
+        assert_eq!(
+            prices.models["anthropic/claude-haiku-5-5"].len(),
+            1,
+            "a model missing from the list keeps its point"
+        );
+    }
+
+    #[test]
+    fn at_gives_the_price_of_that_day() {
+        let t1 = utc("2026-11-01T00:00:00Z");
+        let t2 = utc("2026-11-02T00:00:00Z");
+        let t3 = utc("2026-11-03T00:00:00Z");
+        let mut prices = Prices::default();
+        let mut list = model_list();
+        prices.take(list.clone(), t1);
+
+        let key = "anthropic/claude-opus-5-5";
+        assert_eq!(prices.at(key, t2).expect("opus").output, 20.0);
+        assert_eq!(
+            prices.at(key, t1).expect("opus").output,
+            20.0,
+            "at the first point"
+        );
+
+        list.get_mut(key).expect("opus").output = 18.0;
+        prices.take(list, t3);
+        assert_eq!(prices.at(key, t2).expect("opus").output, 20.0);
+        assert_eq!(
+            prices
+                .at(key, t3 + Duration::seconds(1))
+                .expect("opus")
+                .output,
+            18.0
+        );
+        assert_eq!(
+            prices.at(key, t1 - Duration::days(1)).expect("opus").output,
+            20.0,
+            "before the first point, the first point"
+        );
+    }
+
+    #[test]
+    fn an_override_wins() {
+        let t1 = utc("2026-11-01T00:00:00Z");
+        let t3 = utc("2026-11-03T00:00:00Z");
+        let mut prices = priced_prices(t1);
+        let key = "anthropic/claude-opus-5-5";
+        prices.overrides.insert(
+            key.to_string(),
+            ModelPrice {
+                input: 1.0,
+                output: 99.0,
+                cache_write: 0.0,
+                cache_read: 0.0,
+                tiered: false,
+            },
+        );
+        assert_eq!(prices.at(key, t3).expect("opus").output, 99.0);
+        assert_eq!(prices.at(key, t1).expect("opus").output, 99.0);
+    }
+
+    #[test]
+    fn api_usd_of_a_record() {
+        let prices = priced_prices(utc("2026-11-01T00:00:00Z"));
+        let record = token(
+            utc("2026-11-10T10:00:00Z"),
+            "claude-opus-5-5",
+            1_000_000,
+            2_000_000,
+            1_000_000,
+            10_000_000,
+        );
+        // 4 + 40 + 5 + 2 USD.
+        assert_eq!(api_usd(&record, &prices), Some(51.0));
+    }
+
+    #[test]
+    fn no_price_no_value() {
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let prices = priced_prices(utc("2026-11-01T00:00:00Z"));
+        let valuer = Valuer::build(
+            &history,
+            &range("2026-11-10T00:00:00Z", "2026-11-11T00:00:00Z"),
+            &prices,
+            &empty_fx(),
+            &settings_eur(),
+            &[],
+        )
+        .expect("a valuer");
+
+        let record = token(
+            utc("2026-11-10T10:00:00Z"),
+            "claude-unknown",
+            1_000_000,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(api_usd(&record, &prices), None);
+        assert_eq!(
+            valuer.value("atlas", &record).missing_price_for,
+            Some("claude-unknown".to_string())
+        );
+    }
+
+    #[test]
+    fn the_rate_is_own_then_looked_up_then_missing() {
+        let mut settings = Settings {
+            currency: Some("EUR".to_string()),
+            usd_rate: Some(0.95),
+            ..Settings::default()
+        };
+        assert_eq!(
+            usd_rate(&settings, &empty_fx(), date("2026-11-14")),
+            Some(Rate {
+                value: 0.95,
+                date: None,
+                own: true,
+            })
+        );
+
+        settings.usd_rate = None;
+        let mut fx = Fx {
+            version: 1,
+            currency: "EUR".to_string(),
+            points: Vec::new(),
+        };
+        fx.take(date("2026-11-13"), 0.90481);
+        assert_eq!(
+            usd_rate(&settings, &fx, date("2026-11-14")),
+            Some(Rate {
+                value: 0.90481,
+                date: Some(date("2026-11-13")),
+                own: false,
+            })
+        );
+
+        assert_eq!(
+            usd_rate(&settings, &empty_fx(), date("2026-11-14")),
+            None,
+            "no rate is no rate"
+        );
+
+        settings.currency = Some("USD".to_string());
+        assert_eq!(
+            usd_rate(&settings, &empty_fx(), date("2026-11-14")),
+            Some(Rate {
+                value: 1.0,
+                date: None,
+                own: false,
+            })
+        );
+    }
+
+    #[test]
+    fn percent_value_of_180_a_month() {
+        let value = percent_value(180.0);
+        assert!((value - 180.0 * 12.0 / 52.0 / 100.0).abs() < 1e-9);
+    }
+
+    /// Two records of one finished week: 30 and 10 USD of tokens, so the 80 %
+    /// that week used are split 75 % / 25 %.
+    fn two_records() -> (
+        HistoryDir,
+        tempfile::TempDir,
+        TokenRecord,
+        TokenRecord,
+        Prices,
+    ) {
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        history
+            .append(&live(utc("2026-11-06T00:00:00Z"), Some(ac())))
+            .expect("a live event");
+        let mut prices = Prices::default();
+        prices.overrides.insert(
+            "anthropic/claude-opus-5-5".to_string(),
+            ModelPrice {
+                input: 30.0,
+                output: 0.0,
+                cache_write: 0.0,
+                cache_read: 0.0,
+                tiered: false,
+            },
+        );
+        prices.overrides.insert(
+            "anthropic/claude-haiku-5-5".to_string(),
+            ModelPrice {
+                input: 10.0,
+                output: 0.0,
+                cache_write: 0.0,
+                cache_read: 0.0,
+                tiered: false,
+            },
+        );
+        let opus = token(
+            utc("2026-11-10T10:00:00Z"),
+            "claude-opus-5-5",
+            1_000_000,
+            0,
+            0,
+            0,
+        );
+        let haiku = token(
+            utc("2026-11-10T11:00:00Z"),
+            "claude-haiku-5-5",
+            1_000_000,
+            0,
+            0,
+            0,
+        );
+        history.append(&opus).expect("a token record");
+        history.append(&haiku).expect("a token record");
+        (history, dir, opus, haiku, prices)
+    }
+
+    #[test]
+    fn subscription_value_splits_the_used_week_by_api_value() {
+        let (history, _dir, opus, haiku, prices) = two_records();
+        history
+            .append(&weekly_window(
+                utc("2026-11-07T00:00:00Z"),
+                utc("2026-11-14T00:00:00Z"),
+                80.0,
+            ))
+            .expect("a finished window");
+        let account = account_with_price(Some(140.0));
+        let valuer = Valuer::build(
+            &history,
+            &range("2026-11-10T00:00:00Z", "2026-11-11T00:00:00Z"),
+            &prices,
+            &empty_fx(),
+            &settings_eur(),
+            &[account],
+        )
+        .expect("a valuer");
+
+        let one = valuer.value("atlas", &opus);
+        let two = valuer.value("atlas", &haiku);
+        assert_eq!(one.account, Some(ac()));
+        assert_eq!(one.api, Some(30.0));
+        assert_eq!(two.api, Some(10.0));
+
+        let week = 80.0 * percent_value(140.0);
+        assert!((one.subscription.expect("a value") - 0.75 * week).abs() < 1e-9);
+        assert!((two.subscription.expect("a value") - 0.25 * week).abs() < 1e-9);
+        assert!(
+            (one.subscription.expect("a value") + two.subscription.expect("a value") - week).abs()
+                < 1e-9
+        );
+    }
+
+    #[test]
+    fn a_running_week_uses_the_percent_so_far() {
+        let (history, _dir, opus, haiku, prices) = two_records();
+        let end = utc("2026-11-14T00:00:00Z");
+        history
+            .append(&weekly_sample(utc("2026-11-13T12:00:00Z"), end, 48.0))
+            .expect("a running window's last sample");
+        let account = account_with_price(Some(140.0));
+        let valuer = Valuer::build(
+            &history,
+            &range("2026-11-10T00:00:00Z", "2026-11-11T00:00:00Z"),
+            &prices,
+            &empty_fx(),
+            &settings_eur(),
+            &[account],
+        )
+        .expect("a valuer");
+
+        let sum = valuer.value("atlas", &opus).subscription.expect("a value")
+            + valuer.value("atlas", &haiku).subscription.expect("a value");
+        assert!((sum - 48.0 * percent_value(140.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_account_without_a_price_has_no_subscription_value() {
+        let (history, _dir, opus, _haiku, prices) = two_records();
+        history
+            .append(&weekly_window(
+                utc("2026-11-07T00:00:00Z"),
+                utc("2026-11-14T00:00:00Z"),
+                80.0,
+            ))
+            .expect("a finished window");
+        let account = account_with_price(None);
+        let valuer = Valuer::build(
+            &history,
+            &range("2026-11-10T00:00:00Z", "2026-11-11T00:00:00Z"),
+            &prices,
+            &empty_fx(),
+            &settings_eur(),
+            &[account],
+        )
+        .expect("a valuer");
+
+        let value = valuer.value("atlas", &opus);
+        assert_eq!(value.subscription, None);
+        assert_eq!(value.api, Some(30.0));
+    }
+
+    #[test]
+    fn tokens_before_the_first_live_event_have_no_account() {
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let prices = priced_prices(utc("2026-11-01T00:00:00Z"));
+        let opus = token(
+            utc("2026-11-10T10:00:00Z"),
+            "claude-opus-5-5",
+            1_000_000,
+            0,
+            0,
+            0,
+        );
+        history.append(&opus).expect("a token record");
+        history
+            .append(&weekly_window(
+                utc("2026-11-07T00:00:00Z"),
+                utc("2026-11-14T00:00:00Z"),
+                80.0,
+            ))
+            .expect("a finished window");
+        // One event after the record: before the first event there is no account.
+        history
+            .append(&live(utc("2026-11-10T12:00:00Z"), Some(ac())))
+            .expect("a later live event");
+        let account = account_with_price(Some(140.0));
+        let valuer = Valuer::build(
+            &history,
+            &range("2026-11-10T00:00:00Z", "2026-11-11T00:00:00Z"),
+            &prices,
+            &empty_fx(),
+            &settings_eur(),
+            &[account],
+        )
+        .expect("a valuer");
+
+        let value = valuer.value("atlas", &opus);
+        assert_eq!(value.account, None);
+        assert_eq!(value.subscription, None);
+    }
+
+    #[test]
+    fn prices_round_trip_and_refuse_another_version() {
+        let dir = tempdir().expect("tempdir");
+        let app = AppPaths::at(&dir.path().join("data"));
+        let t1 = utc("2026-11-01T00:00:00Z");
+        let mut prices = priced_prices(t1);
+        prices.checked_at = Some(utc("2026-11-14T09:00:00Z"));
+        prices.etag = Some("W/\"abc\"".to_string());
+        prices.overrides.insert(
+            "anthropic/claude-opus-5-5".to_string(),
+            ModelPrice {
+                input: 4.0,
+                output: 99.0,
+                cache_write: 5.0,
+                cache_read: 0.2,
+                tiered: false,
+            },
+        );
+        prices.save(&app).expect("saved");
+        assert_eq!(Prices::load(&app).expect("loaded"), prices);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(app.prices_file())
+                .expect("prices.json")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        let fresh = AppPaths::at(&dir.path().join("fresh"));
+        assert_eq!(
+            Prices::load(&fresh).expect("a missing file is empty"),
+            Prices::default()
+        );
+
+        fs::write(
+            app.prices_file(),
+            br#"{"version":2,"models":{},"overrides":{}}"#,
+        )
+        .expect("another version");
+        assert!(matches!(
+            Prices::load(&app),
+            Err(MoneyError::UnsupportedVersion { .. })
+        ));
+    }
+
+    #[test]
+    fn fx_take_replaces_a_date_and_keeps_order() {
+        let dir = tempdir().expect("tempdir");
+        let app = AppPaths::at(&dir.path().join("data"));
+        let mut fx = Fx::default();
+        fx.take(date("2026-11-13"), 0.90);
+        fx.take(date("2026-11-11"), 0.91);
+        fx.take(date("2026-11-13"), 0.92);
+        assert_eq!(
+            fx.points.iter().map(|point| point.date).collect::<Vec<_>>(),
+            vec![date("2026-11-11"), date("2026-11-13")]
+        );
+        assert_eq!(fx.at(date("2026-11-13")), Some(0.92));
+        assert_eq!(fx.at(date("2026-11-12")), Some(0.91));
+        assert_eq!(
+            fx.at(date("2026-11-01")),
+            Some(0.91),
+            "before the first point, the first point"
+        );
+
+        let mut stored = fx.clone();
+        stored.currency = "EUR".to_string();
+        stored.save(&app).expect("saved");
+        assert_eq!(Fx::load(&app).expect("loaded"), stored);
+
+        let fresh = AppPaths::at(&dir.path().join("fresh"));
+        assert_eq!(
+            Fx::load(&fresh).expect("a missing file is empty"),
+            Fx::default()
+        );
+
+        fs::write(
+            app.fx_file(),
+            br#"{"version":2,"currency":"EUR","points":[]}"#,
+        )
+        .expect("another version");
+        assert!(matches!(
+            Fx::load(&app),
+            Err(MoneyError::UnsupportedVersion { .. })
+        ));
+    }
+    #[test]
+    fn proof_a_second_identical_list_without_a_model_is_no_change() {
+        let t1 = utc("2026-11-01T00:00:00Z");
+        let mut prices = Prices::default();
+        let mut list = model_list();
+        prices.take(list.clone(), t1);
+        list.remove("anthropic/claude-haiku-5-5");
+        prices
+            .take(list.clone(), utc("2026-11-02T00:00:00Z"))
+            .expect("the first look-up without haiku changes");
+        // An hour later the same list: nothing new happened.
+        assert_eq!(prices.take(list, utc("2026-11-02T01:00:00Z")), None);
+    }
+
+    #[test]
+    fn proof_a_body_with_none_of_the_three_providers_is_an_error() {
+        // An error object, or any object of another shape, is not a price list.
+        assert!(matches!(
+            prices_from_models_dev(&json!({"message": "rate limited"})),
+            Err(MoneyError::ModelsDev(_))
+        ));
+    }
+
+    #[test]
+    fn proof_the_first_price_counts_for_a_range_before_every_change() {
+        let (history, _dir, opus, haiku, prices) = two_records();
+        for (at, amount) in [
+            ("2026-11-20T00:00:00Z", 100.0),
+            ("2026-12-01T00:00:00Z", 180.0),
+        ] {
+            history
+                .append(&Event {
+                    t: utc(at),
+                    kind: EventKind::PriceChanged {
+                        account: ac(),
+                        amount: Some(amount),
+                        currency: Some("EUR".to_string()),
+                    },
+                })
+                .expect("a price change");
+        }
+        history
+            .append(&weekly_window(
+                utc("2026-11-07T00:00:00Z"),
+                utc("2026-11-14T00:00:00Z"),
+                80.0,
+            ))
+            .expect("a finished window");
+        // The account costs 180 now; its first price ever was 100, entered on 20 Nov.
+        let valuer = Valuer::build(
+            &history,
+            &range("2026-11-10T00:00:00Z", "2026-11-11T00:00:00Z"),
+            &prices,
+            &empty_fx(),
+            &settings_eur(),
+            &[account_with_price(Some(180.0))],
+        )
+        .expect("a valuer");
+        let sum = valuer.value("atlas", &opus).subscription.expect("a value")
+            + valuer.value("atlas", &haiku).subscription.expect("a value");
+        assert!(
+            (sum - 80.0 * percent_value(100.0)).abs() < 1e-9,
+            "the first price counts for the past, got {sum}"
+        );
+    }
+
+    #[test]
+    fn a_negative_cost_is_an_error_naming_the_model() {
+        let body = json!({
+            "anthropic": {"id": "anthropic", "models": {
+                "claude-opus-5-5": {"id": "claude-opus-5-5",
+                    "cost": {"input": -4, "output": 20}}
+            }}
+        });
+        match prices_from_models_dev(&body) {
+            Err(MoneyError::ModelsDev(message)) => {
+                assert!(
+                    message.contains("anthropic/claude-opus-5-5"),
+                    "the error names the model, got {message}"
+                );
+            }
+            other => panic!("a negative cost is an error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_price_in_another_currency_has_no_subscription_value() {
+        let (history, _dir, opus, _haiku, prices) = two_records();
+        history
+            .append(&Event {
+                t: utc("2026-11-06T00:00:00Z"),
+                kind: EventKind::PriceChanged {
+                    account: ac(),
+                    amount: Some(140.0),
+                    currency: Some("USD".to_string()),
+                },
+            })
+            .expect("a price change in USD");
+        history
+            .append(&weekly_window(
+                utc("2026-11-07T00:00:00Z"),
+                utc("2026-11-14T00:00:00Z"),
+                80.0,
+            ))
+            .expect("a finished window");
+
+        let value_of = |history: &HistoryDir| {
+            Valuer::build(
+                history,
+                &range("2026-11-10T00:00:00Z", "2026-11-11T00:00:00Z"),
+                &prices,
+                &empty_fx(),
+                &settings_eur(),
+                &[account_with_price(None)],
+            )
+            .expect("a valuer")
+        };
+        let usd = value_of(&history).value("atlas", &opus);
+        assert_eq!(
+            usd.subscription, None,
+            "a price in USD is not a subscription in EUR"
+        );
+        assert_eq!(usd.api, Some(30.0), "the API value needs no subscription");
+
+        // The same price entered in the current currency does count.
+        history
+            .append(&Event {
+                t: utc("2026-11-06T01:00:00Z"),
+                kind: EventKind::PriceChanged {
+                    account: ac(),
+                    amount: Some(140.0),
+                    currency: Some("EUR".to_string()),
+                },
+            })
+            .expect("a price change in EUR");
+        let eur = value_of(&history).value("atlas", &opus);
+        assert!(
+            (eur.subscription.expect("a value") - 0.75 * 80.0 * percent_value(140.0)).abs() < 1e-9
+        );
+    }
+
+    #[test]
+    fn a_missing_rate_is_named() {
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let prices = priced_prices(utc("2026-11-01T00:00:00Z"));
+        let opus = token(
+            utc("2026-11-10T10:00:00Z"),
+            "claude-opus-5-5",
+            1_000_000,
+            0,
+            0,
+            0,
+        );
+        let value_of = |settings: &Settings| {
+            Valuer::build(
+                &history,
+                &range("2026-11-10T00:00:00Z", "2026-11-11T00:00:00Z"),
+                &prices,
+                &empty_fx(),
+                settings,
+                &[],
+            )
+            .expect("a valuer")
+            .value("atlas", &opus)
+        };
+
+        let no_currency = value_of(&Settings::default());
+        assert_eq!(no_currency.api, None, "without a rate there is no amount");
+        assert!(no_currency.missing_rate, "a missing rate is named");
+        assert_eq!(
+            no_currency.missing_price_for, None,
+            "the model has a price; the rate is what is missing"
+        );
+
+        let with_rate = value_of(&settings_eur());
+        assert_eq!(with_rate.api, Some(4.0));
+        assert!(!with_rate.missing_rate);
+    }
+}

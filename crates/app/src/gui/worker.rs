@@ -1321,6 +1321,19 @@ impl ActionRuntime {
         auto_burn: Option<bool>,
         price: Option<Option<f64>>,
     ) -> ActionReply {
+        // The currency the price is entered in, as the settings hold it at the
+        // time of the change: `PriceChanged` names it (spec §1.4). Only a price
+        // edit needs it, so a label change does not load accounts.json for it.
+        let currency = match price {
+            Some(_) => match self
+                .store()
+                .and_then(|store| store.load().map_err(|error| error.to_string()))
+            {
+                Ok(file) => file.settings.currency,
+                Err(error) => return ActionReply::Failed(error),
+            },
+            None => None,
+        };
         let result = match self.store() {
             Ok(store) => switcher::edit_account(
                 store,
@@ -1336,12 +1349,10 @@ impl ActionRuntime {
         match result {
             Ok(edited) => {
                 if edited.price_changed {
-                    // The currency setting does not exist yet (Task 4); the
-                    // value at the time of the change is therefore `None`.
                     let event = EventKind::PriceChanged {
                         account: AccountRef::of(&edited.account),
                         amount: edited.account.price,
-                        currency: None,
+                        currency,
                     };
                     if let Err(error) = self.record(event) {
                         report_history_error(&error);
@@ -1834,6 +1845,8 @@ mod tests {
             file.accounts.push(account.clone());
             // Record the file backend so `open_store` never probes the real keyring.
             file.secrets_backend = Some(SecretsBackend::File);
+            // The display currency a price change is recorded in (Task 4).
+            file.settings.currency = Some("EUR".to_string());
             store.save(&file).expect("save accounts");
 
             Fixture {
@@ -2189,6 +2202,11 @@ mod tests {
         let value = serde_json::to_value(&prices[0].record.kind).expect("the event as JSON");
         assert_eq!(value["type"], "priceChanged");
         assert_eq!(value["amount"], json!(180.0));
+        assert_eq!(
+            value["currency"],
+            json!("EUR"),
+            "the currency setting at the time of the change"
+        );
     }
 
     /// The mirror copies the live login into the stored account. When the plan

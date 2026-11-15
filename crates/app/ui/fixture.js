@@ -28,6 +28,9 @@ const DEFAULT_SETTINGS = {
   agentsRead: true,
   agentsSwitch: false,
   statuslineFeed: true,
+  currency: "EUR",
+  usdRate: null,
+  lookUpPrices: true,
   statusline: {
     left: [
       { kind: "userHost", color: { rule: "fixed", color: "#22c55e" } },
@@ -520,6 +523,25 @@ function validateFixtureSettings(settings) {
         `host name ${JSON.stringify(name)} must be 1 to 63 characters of A-Z, a-z, 0-9, '.', '_' or '-' and must start with a letter or a digit; set hostName in the settings`
       );
     }
+  }
+  if (
+    merged.currency !== null &&
+    merged.currency !== undefined &&
+    !/^[A-Z]{3}$/.test(String(merged.currency))
+  ) {
+    throw new Error(
+      `currency must be three capital letters, got ${JSON.stringify(merged.currency)}`
+    );
+  }
+  if (
+    merged.usdRate !== null &&
+    merged.usdRate !== undefined &&
+    !(Number.isFinite(merged.usdRate) && merged.usdRate > 0)
+  ) {
+    throw new Error(`usdRate must be above 0, got ${merged.usdRate}`);
+  }
+  if (typeof merged.lookUpPrices !== "boolean") {
+    throw new Error(`lookUpPrices must be true or false, got ${merged.lookUpPrices}`);
   }
   return merged;
 }

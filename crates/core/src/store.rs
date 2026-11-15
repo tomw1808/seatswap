@@ -427,6 +427,10 @@ fn default_statusline_feed() -> bool {
     true
 }
 
+fn default_look_up_prices() -> bool {
+    true
+}
+
 /// A missing status line field takes the preset's value for that field, read
 /// from [`StatuslineConfig::current_line`] so the preset is written once.
 fn default_statusline_left() -> Vec<Segment> {
@@ -512,6 +516,18 @@ pub struct Settings {
     /// The status line's layout; absent in an older file, so the preset loads.
     #[serde(default = "StatuslineConfig::current_line")]
     pub statusline: StatuslineConfig,
+    /// The currency every amount is shown in, three capital letters (spec
+    /// §1.4); `None` until it is set, and never assumed.
+    #[serde(default)]
+    pub currency: Option<String>,
+    /// A dollar rate entered by hand: units of [`Settings::currency`] per 1
+    /// USD, above 0 (spec §1.4). `None` means the looked-up rate is used.
+    #[serde(default)]
+    pub usd_rate: Option<f64>,
+    /// When on, seatswap looks up API prices and the dollar rate (spec §1.4.1);
+    /// default on.
+    #[serde(default = "default_look_up_prices")]
+    pub look_up_prices: bool,
 }
 
 impl Default for Settings {
@@ -541,12 +557,16 @@ impl Default for Settings {
             agents_switch: default_agents_switch(),
             statusline_feed: default_statusline_feed(),
             statusline: StatuslineConfig::current_line(),
+            currency: None,
+            usd_rate: None,
+            look_up_prices: default_look_up_prices(),
         }
     }
 }
 
 impl Settings {
-    /// Check the ranges the spec fixes: percents 1..=100, poll intervals >= 30 s.
+    /// Check the ranges the spec fixes: poll intervals >= 30 s, a currency of
+    /// three capital letters, a positive `usdRate`, and the status line's rules.
     pub fn validate(&self) -> Result<(), StoreError> {
         if self.poll_active_secs < 30 {
             return Err(StoreError::InvalidSetting(format!(
@@ -575,6 +595,22 @@ impl Settings {
         if let Some(name) = &self.host_name {
             crate::paths::host_name(Some(name))
                 .map_err(|e| StoreError::InvalidSetting(e.to_string()))?;
+        }
+        if let Some(currency) = &self.currency {
+            let letters =
+                currency.len() == 3 && currency.bytes().all(|byte| byte.is_ascii_uppercase());
+            if !letters {
+                return Err(StoreError::InvalidSetting(format!(
+                    "currency must be three capital letters, got {currency:?}"
+                )));
+            }
+        }
+        if let Some(rate) = self.usd_rate {
+            if !(rate.is_finite() && rate > 0.0) {
+                return Err(StoreError::InvalidSetting(format!(
+                    "usdRate must be above 0, got {rate}"
+                )));
+            }
         }
         validate_statusline(&self.statusline)?;
         Ok(())
@@ -1975,6 +2011,40 @@ mod tests {
         );
         assert_eq!(file.settings.notify_waiting_hosts, WaitingHosts::ThisHost);
         assert_eq!(file.settings.history_dir, None);
+        assert_eq!(file.settings.currency, None);
+        assert_eq!(file.settings.usd_rate, None);
+        assert!(file.settings.look_up_prices);
+    }
+
+    #[test]
+    fn validate_rejects_a_bad_currency_or_rate() {
+        for currency in ["eur", "EURO", "EU1", "E U"] {
+            let settings = Settings {
+                currency: Some(currency.to_string()),
+                ..Settings::default()
+            };
+            assert!(matches!(
+                settings.validate(),
+                Err(StoreError::InvalidSetting(_))
+            ));
+        }
+        for rate in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let settings = Settings {
+                usd_rate: Some(rate),
+                ..Settings::default()
+            };
+            assert!(matches!(
+                settings.validate(),
+                Err(StoreError::InvalidSetting(_))
+            ));
+        }
+        let good = Settings {
+            currency: Some("EUR".to_string()),
+            usd_rate: Some(0.90481),
+            look_up_prices: false,
+            ..Settings::default()
+        };
+        assert!(good.validate().is_ok());
     }
 
     #[test]
