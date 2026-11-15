@@ -6,7 +6,7 @@
 //! in `seatswap_core`.
 
 use std::fs;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Local, Utc};
@@ -15,7 +15,7 @@ use serde::Serialize;
 
 use seatswap_core::api::{Api, Usage};
 use seatswap_core::atomic::{self, Access};
-use seatswap_core::engine::{suggestion, AccountView, Engine, PollReason, Suggestion};
+use seatswap_core::engine::{suggestion, AccountView, Engine, PollReason, Suggestion, UsageCache};
 use seatswap_core::history::{AccountRef, By, EventKind};
 use seatswap_core::paths::{self, AppPaths, ClaudePaths, PathsError};
 use seatswap_core::store::{self, Account, AccountsFile, LoginState, Settings, Store, StoreError};
@@ -24,6 +24,7 @@ use seatswap_core::switcher::{self, LiveState, SwitchError, UnsavedPolicy};
 use crate::format::{class_name, format_age, format_reset_at, integer_percent, percent, tooltip};
 use crate::gui::ipc;
 use crate::ops;
+use crate::statusline;
 
 /// Colour used when there is no live account or no usage to judge (the grey of
 /// the unknown tray ring, docs/implementation.md icon.rs).
@@ -206,6 +207,9 @@ pub(crate) enum Command {
         #[arg(long)]
         refresh: bool,
     },
+
+    /// Print Claude Code's status line; reads its JSON from standard input.
+    Statusline,
 }
 
 /// Install or remove the bundled skill (spec §6.4).
@@ -304,8 +308,12 @@ pub fn run() -> std::process::ExitCode {
     let mut cli = Cli::parse();
     if let Err(error) = cli.make_folders_absolute() {
         let error = CliError::from(error);
-        eprintln!("seatswap: {error}");
-        return std::process::ExitCode::from(error.exit_code());
+        let (line, code) = folders_error(cli.command.as_ref(), &error);
+        match line {
+            Some(line) => println!("{line}"),
+            None => eprintln!("seatswap: {error}"),
+        }
+        return std::process::ExitCode::from(code);
     }
     let caller = caller(&|name| std::env::var(name).ok());
     #[cfg(feature = "gui")]
@@ -318,7 +326,10 @@ pub fn run() -> std::process::ExitCode {
             }
         };
     }
-    let code = match execute(&mut cli, caller) {
+    // Not `lock()`: `rm` asks its question through `io::stdin()` itself, and
+    // std's stdin lock is not reentrant, so a lock held here would hang it.
+    let mut stdin = io::stdin();
+    let code = match execute(&mut cli, caller, &mut stdin) {
         Ok(()) => 0,
         Err(error) => {
             eprintln!("seatswap: {error}");
@@ -326,6 +337,18 @@ pub fn run() -> std::process::ExitCode {
         }
     };
     std::process::ExitCode::from(code)
+}
+
+/// A folder that cannot be made absolute before any command runs: for the
+/// status line that error is the same one line `seatswap: <reason>` on standard
+/// output and exit 0 as every other status line error; every other command
+/// keeps it on standard error and exits 1. `None` is the command without a
+/// subcommand.
+fn folders_error(command: Option<&Command>, error: &CliError) -> (Option<String>, u8) {
+    match command {
+        Some(Command::Statusline) => (Some(format!("seatswap: {error}")), 0),
+        _ => (None, error.exit_code()),
+    }
 }
 
 /// What a call without a subcommand does (spec §6.1, §6.2): a person starts the
@@ -368,7 +391,7 @@ fn run_gui(cli: &Cli) -> Result<std::process::ExitCode, CliError> {
     ))
 }
 
-fn execute(cli: &mut Cli, caller: Caller) -> Result<(), CliError> {
+fn execute(cli: &mut Cli, caller: Caller, stdin: &mut dyn Read) -> Result<(), CliError> {
     let Some(command) = cli.command.take() else {
         return match no_subcommand(caller) {
             // An agent's call without a subcommand opens the store like any
@@ -384,6 +407,13 @@ fn execute(cli: &mut Cli, caller: Caller) -> Result<(), CliError> {
             }
         };
     };
+    // Claude Code calls the status line every few seconds with `CLAUDECODE` set,
+    // as an agent. It is never gated and never recorded: it runs before any
+    // context is opened, so it cannot touch the history or the store's locks.
+    if matches!(command, Command::Statusline) {
+        println!("{}", statusline(cli, stdin));
+        return Ok(());
+    }
     match caller {
         // A person's call is never gated, and `panel` keeps needing only the
         // data folder: it talks to the running tray app.
@@ -449,7 +479,7 @@ fn run_command(
         } => edit(context, &key, label, abbr, color),
         Command::AgentSkill { action } => agent_skill(&context, action),
         // Handled before the store was opened; kept for exhaustiveness.
-        Command::Panel { .. } => Ok(()),
+        Command::Panel { .. } | Command::Statusline => Ok(()),
         Command::Status {
             json,
             waybar,
@@ -459,12 +489,91 @@ fn run_command(
     }
 }
 
+/// `seatswap statusline`: the one line Claude Code shows. It prints that line
+/// on standard output and never fails the command: every error becomes
+/// `seatswap: <reason>` there, and the exit code stays 0. `stdin` is the
+/// payload's reader: `run` passes the process's standard input, every test
+/// passes bytes, so no test can wait on a terminal.
+fn statusline(cli: &Cli, stdin: &mut dyn Read) -> String {
+    let mut input = Vec::new();
+    let now = Utc::now();
+    match stdin.read_to_end(&mut input) {
+        Ok(_) => statusline_output(cli, &input, now),
+        Err(error) => format!("seatswap: cannot read standard input: {error}"),
+    }
+}
+
+/// The status line built from bytes already read; [`statusline`] without the
+/// process's standard input, so a test can pass the payload itself.
+fn statusline_output(cli: &Cli, stdin: &[u8], now: DateTime<Utc>) -> String {
+    match statusline_line(cli, stdin, now) {
+        Ok(line) => line,
+        Err(reason) => format!("seatswap: {reason}"),
+    }
+}
+
+/// Everything the line needs, read without a lock, without the network and
+/// without opening a secret store: `accounts.json`, the usage cache and Claude
+/// Code's two files.
+fn statusline_line(cli: &Cli, stdin: &[u8], now: DateTime<Utc>) -> Result<String, String> {
+    let app = AppPaths::resolve(cli.data_dir.as_deref()).map_err(|error| error.to_string())?;
+    if !app.accounts_file().is_file() {
+        return Err(format!("no accounts.json in {}", app.data_dir.display()));
+    }
+    let file = store::load_accounts(&app).map_err(|error| error.to_string())?;
+    file.settings
+        .validate()
+        .map_err(|error| error.to_string())?;
+    let paths = resolve_paths(
+        app,
+        cli.claude_config_dir.as_deref(),
+        file.settings.claude_config_dir.as_deref(),
+    )
+    .map_err(|error| error.to_string())?;
+    let (app, claude) = paths.into_parts();
+    let cache = UsageCache::load(&app).map_err(|error| error.to_string())?;
+    let live = switcher::live_state(&claude, &file).map_err(|error| error.to_string())?;
+    let payload = statusline::parse(stdin);
+    let facts = statusline::facts(
+        &payload,
+        &file,
+        &live,
+        &cache,
+        claude.home(),
+        user_name()?,
+        now,
+    )?;
+    Ok(statusline::render::render(
+        &file.settings.statusline,
+        &payload,
+        &facts,
+        statusline::width::terminal_width(),
+        &Local,
+    ))
+}
+
+/// The user name of the line's `user@host`: `$USER` on Unix, `%USERNAME%` on
+/// Windows. Not set is an error the line shows, never a made-up name.
+fn user_name() -> Result<String, String> {
+    #[cfg(windows)]
+    let variable = "USERNAME";
+    #[cfg(not(windows))]
+    let variable = "USER";
+    match std::env::var(variable) {
+        Ok(name) if !name.is_empty() => Ok(name),
+        _ => Err(format!("{variable} is not set")),
+    }
+}
+
 /// The gate table of spec §6.2. A person is always allowed.
 pub(crate) fn gate(command: &Command, caller: Caller, settings: &Settings) -> Gate {
     if caller == Caller::Person {
         return Gate::Allowed;
     }
     match command {
+        // Claude Code calls it every two seconds as an agent, for a line and
+        // nothing else: no setting and no caller can refuse it.
+        Command::Statusline => Gate::Allowed,
         Command::List { .. } | Command::Status { .. } => {
             if settings.agents_read {
                 Gate::Allowed
@@ -546,6 +655,7 @@ fn command_text(command: &Command) -> String {
             }
         },
         Command::Panel { view } => format!("panel {}", view.as_str()),
+        Command::Statusline => "statusline".to_string(),
         Command::Status {
             json,
             waybar,
@@ -1373,7 +1483,8 @@ mod tests {
 
         fn run(&self, command: Command, caller: Caller) -> Result<(), CliError> {
             let mut cli = self.cli(command);
-            execute(&mut cli, caller)
+            let mut stdin: &[u8] = b"";
+            execute(&mut cli, caller, &mut stdin)
         }
 
         fn events(&self) -> Vec<Value> {
@@ -1472,6 +1583,7 @@ mod tests {
                 i3blocks: false,
                 refresh: false,
             },
+            Command::Statusline,
         ]
     }
 
@@ -1641,6 +1753,109 @@ mod tests {
     }
 
     #[test]
+    fn the_statusline_is_never_gated() {
+        // Every setting pair allows it to an agent: Claude Code calls it with
+        // `CLAUDECODE=1` set, and it must print.
+        for read in [false, true] {
+            for switch in [false, true] {
+                assert_eq!(
+                    gate(&Command::Statusline, Caller::Agent, &settings(read, switch)),
+                    Gate::Allowed,
+                    "agentsRead {read}, agentsSwitch {switch}"
+                );
+            }
+        }
+        assert_eq!(
+            gate(
+                &Command::Statusline,
+                Caller::Person,
+                &settings(false, false)
+            ),
+            Gate::Allowed
+        );
+
+        // A run as an agent leaves no `agentCall` event behind.
+        let fixture = Fixture::new();
+        let mut cli = fixture.cli(Command::Statusline);
+        let mut stdin: &[u8] = b"";
+        execute(&mut cli, Caller::Agent, &mut stdin).expect("the status line is allowed");
+        let events = fixture.events();
+        assert!(
+            !events.iter().any(|event| event["type"] == "agentCall"),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn statusline_never_fails() {
+        let fixture = Fixture::new();
+        fs::remove_file(fixture.data_dir.join("accounts.json")).expect("the accounts file");
+        let now = Utc::now();
+
+        let line = statusline_output(&fixture.cli(Command::Statusline), b"", now);
+        assert!(line.starts_with("seatswap: "), "{line}");
+
+        // The command itself is Ok, so the process exits 0.
+        let mut cli = fixture.cli(Command::Statusline);
+        let mut stdin: &[u8] = b"";
+        assert!(execute(&mut cli, Caller::Person, &mut stdin).is_ok());
+    }
+
+    #[test]
+    fn the_statusline_reads_the_bytes_it_is_given() {
+        // The input is a reader the test hands over, never the process's
+        // standard input: a test run on a terminal or an open pipe would hang.
+        let fixture = Fixture::new();
+        fixture.add_account(0);
+        let mut input: &[u8] = br#"{"model":{"id":"claude-fable-5-2","display_name":"Fable 5.2"}}"#;
+        let line = statusline(&fixture.cli(Command::Statusline), &mut input);
+        assert!(line.contains("Fable 5.2"), "{line}");
+    }
+
+    #[test]
+    fn an_unreadable_statusline_input_is_the_lines_one_line() {
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "the pipe closed"))
+            }
+        }
+        let fixture = Fixture::new();
+        let line = statusline(&fixture.cli(Command::Statusline), &mut Broken);
+        assert!(
+            line.starts_with("seatswap: cannot read standard input: "),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn a_folder_error_is_the_status_lines_one_line_and_exit_zero() {
+        let error = CliError::from(PathsError::Absolute {
+            path: PathBuf::from("relative/data"),
+            source: io::Error::new(io::ErrorKind::NotFound, "the current folder was deleted"),
+        });
+
+        // The status line: one line on standard output and exit 0, like every
+        // other status line error.
+        let (line, code) = folders_error(Some(&Command::Statusline), &error);
+        assert_eq!(line, Some(format!("seatswap: {error}")));
+        assert_eq!(code, 0);
+
+        // Every other command keeps the error on standard error and exit 1.
+        for command in all_commands()
+            .into_iter()
+            .filter(|command| !matches!(command, Command::Statusline))
+        {
+            let (line, code) = folders_error(Some(&command), &error);
+            assert_eq!(line, None, "{command:?}");
+            assert_eq!(code, 1, "{command:?}");
+        }
+        let (line, code) = folders_error(None, &error);
+        assert_eq!(line, None);
+        assert_eq!(code, 1);
+    }
+
+    #[test]
     fn the_command_text_leaves_out_free_text() {
         assert_eq!(command_text(&plain_use("PR")), "use PR");
         assert_eq!(
@@ -1660,6 +1875,7 @@ mod tests {
             }),
             "status --json --refresh"
         );
+        assert_eq!(command_text(&Command::Statusline), "statusline");
         assert_eq!(
             command_text(&Command::Edit {
                 key: "PR".to_string(),
@@ -1732,9 +1948,10 @@ mod tests {
         let fixture = Fixture::new();
         let before = fixture.live_bytes();
         let mut cli = fixture.cli_without_command();
+        let mut stdin: &[u8] = b"";
 
-        let error =
-            execute(&mut cli, Caller::Agent).expect_err("an agent may not start the tray app");
+        let error = execute(&mut cli, Caller::Agent, &mut stdin)
+            .expect_err("an agent may not start the tray app");
         assert_eq!(error.exit_code(), 3);
         match error {
             CliError::AgentRefused(text) => assert_eq!(text, AGENTS_MAY_NOT_CHANGE),

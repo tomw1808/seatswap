@@ -7,12 +7,12 @@
 use ab_glyph::{point, Font, FontRef, Glyph, PxScale, ScaleFont};
 use tiny_skia::{FillRule, LineCap, Paint, Path, PathBuilder, Pixmap, Stroke, Transform};
 
+use crate::format::{letter_color, LETTER_DARK};
+
 const FONT_BYTES: &[u8] = include_bytes!("../assets/DejaVuSans-Bold.ttf");
 
 /// The grey of the unfilled part of the ring.
 const RING_GREY: [u8; 3] = [0x55, 0x5b, 0x66];
-/// The dark letter colour (`#0f1115`).
-const LETTER_DARK: [u8; 3] = [0x0f, 0x11, 0x15];
 const WHITE: [u8; 3] = [0xff, 0xff, 0xff];
 
 /// What the tray icon shows for the active account (docs/implementation.md).
@@ -260,10 +260,11 @@ fn draw_letters(pixmap: &mut Pixmap, spec: &IconSpec, geometry: &Geometry) {
     let offset_x = geometry.cx - (min_x + max_x) / 2.0;
     let offset_y = geometry.cy - (min_y + max_y) / 2.0;
 
-    let light_text = spec.monochrome
-        || contrast_ratio(spec.account_color, WHITE)
-            >= contrast_ratio(spec.account_color, LETTER_DARK);
-    let color = if light_text { WHITE } else { LETTER_DARK };
+    let color = if spec.monochrome {
+        WHITE
+    } else {
+        letter_color(spec.account_color)
+    };
 
     let radius_squared = geometry.disc_radius * geometry.disc_radius;
     let width = pixmap.width();
@@ -441,25 +442,6 @@ fn blend_over(data: &mut [u8], width: u32, x: u32, y: u32, color: [u8; 3], cover
     }
     let destination_alpha = data[index + 3] as u32;
     data[index + 3] = (source_alpha + (destination_alpha * inverse + 127) / 255).min(255) as u8;
-}
-
-/// WCAG 2.x relative luminance.
-fn relative_luminance(color: [u8; 3]) -> f32 {
-    fn linear(channel: u8) -> f32 {
-        let value = channel as f32 / 255.0;
-        if value <= 0.04045 {
-            value / 12.92
-        } else {
-            ((value + 0.055) / 1.055).powf(2.4)
-        }
-    }
-    0.2126 * linear(color[0]) + 0.7152 * linear(color[1]) + 0.0722 * linear(color[2])
-}
-
-fn contrast_ratio(a: [u8; 3], b: [u8; 3]) -> f32 {
-    let la = relative_luminance(a);
-    let lb = relative_luminance(b);
-    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
 }
 
 #[cfg(test)]

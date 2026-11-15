@@ -42,13 +42,43 @@ pub(crate) fn format_age(fetched_at: DateTime<Utc>, now: DateTime<Utc>) -> Strin
 /// (`/home/sam/projects/atlas` → `~/projects/atlas`). Only whole path components
 /// match, by the platform's own separator rules: `/home/samuel` stays as it is
 /// for home `/home/sam`, and on Unix `/home/sam\x` is a different folder.
-#[cfg(feature = "gui")]
+/// A `Prefix` component compares ASCII case-insensitively, because a payload's
+/// `cwd` can spell the drive letter in either case (`c:\Users\sam` for home
+/// `C:\Users\sam`, specs/plan/README.md §5).
 pub(crate) fn with_tilde(path: &str, home: &std::path::Path) -> String {
     let path = std::path::Path::new(path);
-    match path.strip_prefix(home) {
-        Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
-        Ok(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
-        Err(_) => path.to_string_lossy().into_owned(),
+    match strip_prefix_components(path, home) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
+        None => path.to_string_lossy().into_owned(),
+    }
+}
+
+/// `path` without the whole `home` prefix, compared component by component.
+/// No `cfg`: on Unix there is no `Prefix` component to meet, so the one rule
+/// costs nothing there.
+fn strip_prefix_components<'a>(
+    path: &'a std::path::Path,
+    home: &std::path::Path,
+) -> Option<&'a std::path::Path> {
+    let mut path_components = path.components();
+    for home_component in home.components() {
+        if !same_component(&path_components.next()?, &home_component) {
+            return None;
+        }
+    }
+    Some(path_components.as_path())
+}
+
+/// Whether two path components are the same: a `Prefix` component (only
+/// Windows has one) compares ASCII case-insensitively, every other component
+/// exactly.
+fn same_component(a: &std::path::Component<'_>, b: &std::path::Component<'_>) -> bool {
+    match (a, b) {
+        (std::path::Component::Prefix(a), std::path::Component::Prefix(b)) => {
+            a.as_os_str().eq_ignore_ascii_case(b.as_os_str())
+        }
+        _ => a == b,
     }
 }
 
@@ -154,7 +184,6 @@ pub(crate) fn tooltip(view: &AccountView, usage: &Usage, now: DateTime<Utc>) -> 
 }
 
 /// `#rrggbb` (either case) → its three channels.
-#[cfg(feature = "gui")]
 pub(crate) fn parse_color(color: &str) -> Option<[u8; 3]> {
     let hex = color.strip_prefix('#')?;
     if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -164,6 +193,41 @@ pub(crate) fn parse_color(color: &str) -> Option<[u8; 3]> {
     let green = u8::from_str_radix(&hex[2..4], 16).ok()?;
     let blue = u8::from_str_radix(&hex[4..6], 16).ok()?;
     Some([red, green, blue])
+}
+
+/// The dark letter colour (`#0f1115`): the one definition, used by the tray
+/// icon and the status line's account segment.
+pub(crate) const LETTER_DARK: [u8; 3] = [0x0f, 0x11, 0x15];
+
+/// The colour a letter on `background` takes: white or [`LETTER_DARK`],
+/// whichever has the higher WCAG contrast ratio. The tray icon and the status
+/// line's account segment share this one rule.
+pub(crate) fn letter_color(background: [u8; 3]) -> [u8; 3] {
+    const WHITE: [u8; 3] = [0xff, 0xff, 0xff];
+    if contrast_ratio(background, WHITE) >= contrast_ratio(background, LETTER_DARK) {
+        WHITE
+    } else {
+        LETTER_DARK
+    }
+}
+
+/// WCAG 2.x relative luminance.
+fn relative_luminance(color: [u8; 3]) -> f32 {
+    fn linear(channel: u8) -> f32 {
+        let value = channel as f32 / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.2126 * linear(color[0]) + 0.7152 * linear(color[1]) + 0.0722 * linear(color[2])
+}
+
+fn contrast_ratio(a: [u8; 3], b: [u8; 3]) -> f32 {
+    let la = relative_luminance(a);
+    let lb = relative_luminance(b);
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
 }
 
 #[cfg(test)]
@@ -405,5 +469,61 @@ mod tests {
         assert_eq!(parse_color("3b82f6"), None);
         assert_eq!(parse_color("#3b82f"), None);
         assert_eq!(parse_color("#3b82fg"), None);
+    }
+
+    #[test]
+    fn a_home_prefix_is_compared_component_by_component() {
+        use std::ffi::OsStr;
+        use std::path::{Component, Path, PathBuf};
+
+        assert!(same_component(
+            &Component::Normal(OsStr::new("atlas")),
+            &Component::Normal(OsStr::new("atlas"))
+        ));
+        assert!(!same_component(
+            &Component::Normal(OsStr::new("atlas")),
+            &Component::Normal(OsStr::new("Atlas"))
+        ));
+        assert!(same_component(&Component::RootDir, &Component::RootDir));
+        assert!(!same_component(&Component::RootDir, &Component::CurDir));
+
+        let home = Path::new("/home/sam");
+        assert_eq!(
+            strip_prefix_components(Path::new("/home/sam/projects/atlas"), home)
+                .map(Path::to_path_buf),
+            Some(PathBuf::from("projects/atlas"))
+        );
+        assert_eq!(
+            strip_prefix_components(Path::new("/home/samuel"), home),
+            None
+        );
+        // A `Prefix` component (a Windows drive letter) cannot be built on
+        // Linux: `PrefixComponent` has no public constructor there. The
+        // `#[cfg(windows)]` test below runs that branch.
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_lower_case_drive_letter_still_becomes_a_tilde() {
+        assert_eq!(
+            with_tilde(
+                r"c:\Users\sam\projects\atlas",
+                std::path::Path::new(r"C:\Users\sam")
+            ),
+            r"~\projects\atlas"
+        );
+    }
+
+    #[test]
+    fn the_dark_letter_colour_is_one_constant() {
+        assert_eq!(LETTER_DARK, [0x0f, 0x11, 0x15]);
+        assert_eq!(letter_color([0xfd, 0xe0, 0x47]), LETTER_DARK);
+    }
+
+    #[test]
+    fn a_letter_is_white_on_dark_and_dark_on_light() {
+        // The same two colours `icon.rs` tests its letters with.
+        assert_eq!(letter_color([0x1e, 0x3a, 0x8a]), [0xff, 0xff, 0xff]);
+        assert_eq!(letter_color([0xfd, 0xe0, 0x47]), [0x0f, 0x11, 0x15]);
     }
 }

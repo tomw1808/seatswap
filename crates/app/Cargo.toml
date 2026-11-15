@@ -44,6 +44,12 @@ ab_glyph = { version = "0.2", optional = true }
 # 4.19: `wait_for_response` with the same typed answer on Linux and Windows.
 notify-rust = { version = "4.19", optional = true }
 
+# Unix: the status line reads its terminal's size without `unsafe` (spec §5.2,
+# decision D5). `termios` gives `tcgetwinsize`; `fs` is the crate's file feature
+# the same call sites build on. No other crate version is used.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.6", features = ["termios", "fs"] }
+
 # Linux: Tauri's tray backend (libappindicator) reports no clicks (every click
 # opens the menu) and drops the tooltip. Enabling tray-icon's StatusNotifierItem
 # backend (ksni) gives left click → panel, right click → menu, and the tooltip;

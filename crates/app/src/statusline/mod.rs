@@ -1,11 +1,23 @@
 //! Claude Code's status line: the payload it writes to standard input (spec
-//! §5.2) and the layout seatswap renders from it (spec §5.4).
+//! §5.2), the numbers seatswap fills in, and the layout it renders (spec §5.4).
 //!
 //! `parse` is the one place a malformed payload is tolerated: Claude Code may
-//! send anything, and the status line must still print. Rendering is step B,
-//! Task 2; until then the test build is the only user.
+//! send anything, and the status line must still print. `facts` gathers what
+//! the line shows besides the payload; `render` fits it to the terminal.
 
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
+
+use seatswap_core::api::Usage;
+use seatswap_core::engine::UsageCache;
+use seatswap_core::paths;
+use seatswap_core::store::{Account, AccountsFile};
+use seatswap_core::switcher::LiveState;
+
+pub(crate) mod render;
+pub(crate) mod width;
+
+use render::{git_branch, AccountFacts, Facts, Limit2};
 
 /// The parts of the payload seatswap reads. Unknown keys are ignored: Claude
 /// Code adds keys with new versions. A key that is missing or `null` is `None`.
@@ -70,6 +82,120 @@ pub(crate) struct RateLimit {
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn parse(stdin: &[u8]) -> Payload {
     serde_json::from_slice(stdin).unwrap_or_default()
+}
+
+/// The 5 h and weekly numbers and the per-model limits the line shows.
+///
+/// The payload's `rate_limits` win; without them the live account's cache entry
+/// fills in (session → five_hour, weekly_all → week, weekly_scoped →
+/// model_limits). The per-model limits only exist in the cache.
+// replaced by feed::merged in step B, Task 3
+fn limits(
+    payload: &Payload,
+    cached: Option<&Usage>,
+    _now: DateTime<Utc>,
+) -> (Option<Limit2>, Option<Limit2>, Vec<(String, f64)>) {
+    let payload_five_hour = payload
+        .rate_limits
+        .as_ref()
+        .and_then(|limits| limits.five_hour.as_ref());
+    let payload_week = payload
+        .rate_limits
+        .as_ref()
+        .and_then(|limits| limits.seven_day.as_ref());
+    let five_hour = match payload_five_hour {
+        Some(limit) => Some(Limit2 {
+            percent: limit.used_percentage,
+            resets_at: DateTime::<Utc>::from_timestamp(limit.resets_at, 0),
+        }),
+        None => cached.and_then(Usage::session).map(cached_limit),
+    };
+    let week = match payload_week {
+        Some(limit) => Some(Limit2 {
+            percent: limit.used_percentage,
+            resets_at: DateTime::<Utc>::from_timestamp(limit.resets_at, 0),
+        }),
+        None => cached.and_then(Usage::weekly_all).map(cached_limit),
+    };
+    let model_limits = cached
+        .map(|usage| {
+            usage
+                .weekly_scoped()
+                .filter_map(|limit| {
+                    limit
+                        .model
+                        .as_ref()
+                        .map(|model| (model.clone(), limit.percent))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    (five_hour, week, model_limits)
+}
+
+fn cached_limit(limit: &seatswap_core::api::Limit) -> Limit2 {
+    Limit2 {
+        percent: limit.percent,
+        resets_at: limit.resets_at,
+    }
+}
+
+/// What the line shows besides the payload: who and where, the live account,
+/// its limits, and the branch of the session's folder. A live login that
+/// matches no stored account shows no account (and no limits from the cache);
+/// no live login at all is an error the command prints as its one line.
+pub(crate) fn facts(
+    payload: &Payload,
+    file: &AccountsFile,
+    live: &LiveState,
+    cache: &UsageCache,
+    home: &std::path::Path,
+    user: String,
+    now: DateTime<Utc>,
+) -> Result<Facts, String> {
+    let host =
+        paths::host_name(file.settings.host_name.as_deref()).map_err(|error| error.to_string())?;
+    let (account, cached) = match live {
+        LiveState::Known { account_id } => {
+            let account: &Account = file
+                .find(account_id)
+                .ok_or_else(|| format!("the live account {account_id} is not in accounts.json"))?;
+            let cached = cache
+                .entries
+                .get(account_id)
+                .and_then(|entry| entry.usage.as_ref());
+            (
+                Some(AccountFacts {
+                    abbr: account.abbr.clone(),
+                    color: account.color.clone(),
+                    plan: account.plan.clone(),
+                }),
+                cached,
+            )
+        }
+        LiveState::Unknown { .. } => (None, None),
+        LiveState::NoLogin => return Err("no live login; run seatswap add".to_string()),
+        LiveState::Ended { .. } => return Err("the live login has ended; log in again".to_string()),
+    };
+    let (five_hour, week, model_limits) = limits(payload, cached, now);
+    let git_branch = payload
+        .workspace
+        .as_ref()
+        .and_then(|workspace| workspace.current_dir.as_deref())
+        .and_then(|folder| git_branch(std::path::Path::new(folder)));
+    Ok(Facts {
+        user,
+        host,
+        home: home.display().to_string(),
+        now,
+        account,
+        five_hour,
+        week,
+        model_limits,
+        // Auto-burn is built in step B, Tasks 4–8; there is no next account yet.
+        burn_next: None,
+        git_branch,
+    })
 }
 
 #[cfg(test)]
