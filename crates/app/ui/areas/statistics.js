@@ -42,7 +42,6 @@ const PAGES = [
   { id: "activity", title: "Activity" },
 ];
 const PAGE_IDS = PAGES.map((page) => page.id);
-const BUILT = new Set(["overview", "weeks", "projects"]);
 
 const state = {
   active: false,
@@ -64,7 +63,6 @@ const state = {
   query: null,
   accountKey: "",
   loadToken: 0,
-  pendingItem: null,
 };
 
 // The page's empty text: exactly the text the plan gives, with the stats pages'
@@ -331,8 +329,7 @@ function selectTab(id) {
   void loadPage();
 }
 
-function open(tab, item) {
-  state.pendingItem = item === undefined ? null : item;
+function open(tab) {
   selectTab(tab);
 }
 
@@ -387,13 +384,6 @@ async function loadPage() {
   state.query = buildQuery();
   showHostError();
 
-  if (!BUILT.has(state.page)) {
-    clear(state.pageHost);
-    state.pageHost.appendChild(
-      h("p", { class: "stats-empty", text: "This page is not built yet." })
-    );
-    return;
-  }
   let module;
   try {
     module = await import(`./statistics/${state.page}.js`);
@@ -498,7 +488,6 @@ export async function render(container, context) {
   state.page = pageFromSub(context.sub) || readChoice(TAB_KEY, PAGE_IDS, "overview");
   state.query = buildQuery();
   state.hostError = null;
-  state.pendingItem = null;
   state.loadToken += 1;
 
   buildRoot(container);
@@ -550,6 +539,5 @@ export function unmount() {
   state.excluded = new Set();
   state.query = null;
   state.accountKey = "";
-  state.pendingItem = null;
   hideTip();
 }

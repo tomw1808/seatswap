@@ -22,6 +22,41 @@ const LEVEL_COLORS = {
   locked: "#ef4444",
 };
 
+// The one table of the models the window names: the id Claude Code writes, the
+// name the pages show and the colour an Activity hour bar paints it with. A
+// model family keeps one colour across its versions; `MODEL_NAMES` is this same
+// table reduced to its names, so no second list of models exists. A model this
+// table does not know has no name of its own and is drawn in the neutral
+// `--muted`; its pages always write its id next to the colour.
+const MODELS = [
+  { id: "claude-opus-5-5", name: "Opus 5.5", color: "var(--focus)" },
+  { id: "claude-opus-5-4", name: "Opus 5.4", color: "var(--focus)" },
+  { id: "claude-fable-5-2", name: "Fable 5.2", color: "var(--warn)" },
+  { id: "claude-fable-5-1", name: "Fable 5.1", color: "var(--warn)" },
+  { id: "claude-mythos-5-2", name: "Mythos 5.2", color: "var(--danger)" },
+  { id: "claude-sonnet-5-5", name: "Sonnet 5.5", color: "var(--pill-text)" },
+  { id: "claude-haiku-5-5", name: "Haiku 5.5", color: "var(--muted)" },
+];
+
+const MODEL_NAMES = Object.fromEntries(MODELS.map((model) => [model.id, model.name]));
+
+// The weekdays Monday first: the statistics pages' weeks and the Rhythm page's
+// heat map start the week on Monday (step-c3, Global Constraints).
+const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+// The colour of a model's Activity bar: the table's colour, or the neutral
+// token for a model the table does not know (the tip still names it).
+function modelColor(model) {
+  const entry = MODELS.find((candidate) => candidate.id === model);
+  return entry ? entry.color : "var(--muted)";
+}
+
+// The model's name from the one table; a model the table does not know keeps
+// its id as the name (its colour is the neutral token, as `modelColor` says).
+function modelName(model) {
+  return MODEL_NAMES[model] !== undefined ? MODEL_NAMES[model] : model;
+}
+
 const TAURI_GLOBAL = typeof window !== "undefined" ? window.__TAURI__ : undefined;
 const HAS_TAURI = Boolean(
   TAURI_GLOBAL && TAURI_GLOBAL.core && typeof TAURI_GLOBAL.core.invoke === "function"
@@ -134,6 +169,61 @@ function shortPercent(value) {
 
 function clear(node) {
   while (node && node.firstChild) node.removeChild(node.firstChild);
+}
+
+// "9 Nov": the statistics pages' date without the weekday (`dateText` writes
+// "Mon 9 Nov"). A bad time is an error, never a made-up date.
+function shortDate(value) {
+  return dateText(value).replace(/^\S+\s+/, "");
+}
+
+// A date as a Monday-first weekday index: 0 = Monday, 6 = Sunday. This is the
+// one place the statistics pages apply the week's Monday-first rule; they name
+// the day with `WEEKDAYS[index]`.
+function weekdayIndex(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    throw new Error(`invalid time ${JSON.stringify(value)}`);
+  }
+  return (date.getDay() + 6) % 7;
+}
+
+// "07" from 7: the hour a label or a time names.
+function pad(number) {
+  return String(number).padStart(2, "0");
+}
+
+// One of the pages' KPI boxes: the label, the value (text or a node such as an
+// amount), an optional sub-line, the whole card's tip and an optional class on
+// the value. The statistics pages share this one box.
+function kpi(label, value, sub, tip, valueClass) {
+  const node = h("div", { class: "stats-kpi" }, [
+    h("span", { class: "stats-kpi-label", text: label }),
+    h("span", { class: `stats-kpi-value${valueClass ? ` ${valueClass}` : ""}` }, value),
+    sub ? h("span", { class: "stats-kpi-sub" }, sub) : null,
+  ]);
+  node.title = tip;
+  return node;
+}
+
+// One legend entry: a coloured (or hatched) box and the name beside it.
+function legendItem(colour, name, hatch) {
+  return h("span", { class: "stats-legend-item" }, [
+    h("span", {
+      class: `stats-legend-box${hatch ? " stats-legend-box-hatch" : ""}`,
+      style: { "--stats-legend-color": colour },
+    }),
+    h("span", { class: "stats-legend-name", text: name, title: name }),
+  ]);
+}
+
+// A card's short line for a list the struct carries empty: "— · no week in the
+// range". The reason is written out, never replaced by a zero or a blank.
+function emptyLine(reason) {
+  if (typeof reason !== "string" || reason === "") {
+    throw new Error(`an empty list needs its reason, not ${JSON.stringify(reason)}`);
+  }
+  return h("p", { class: "stats-empty", text: `— · ${reason}` });
 }
 
 function setStyles(node, styles) {
@@ -481,6 +571,22 @@ function dateTimeText(value) {
   return `${dateText(date)} ${time}`;
 }
 
+// "Mon 17:00": a weekday and a time, without the date, in this computer's local
+// time — how the Forecast writes a reset and how the Activity names an hour.
+function weekdayTimeText(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    throw new Error(`invalid time ${JSON.stringify(value)}`);
+  }
+  const weekday = date.toLocaleDateString("en-GB", { weekday: "short" });
+  const time = date.toLocaleTimeString("en-GB", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  return `${weekday} ${time}`;
+}
+
 // "2 h" or "1.5 h", one decimal only when the value has one.
 function hoursText(value) {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
@@ -506,17 +612,37 @@ function amountText(value, currency) {
   return money(value, currency);
 }
 
+// The amount as an element: a "—" caused by a currency the settings do not set
+// carries that reason as its title.
+function amountNode(value, currency) {
+  const node = h("span", { text: amountText(value, currency) });
+  if (typeof currency !== "string" || !/^[A-Z]{3}$/.test(currency)) {
+    node.title = "no currency set in Settings";
+  }
+  return node;
+}
+
+// The amount in a tooltip: the same "—", with the missing currency's reason
+// beside it (a tooltip has no title of its own).
+function amountTip(value, currency) {
+  const text = amountText(value, currency);
+  if (text === "—" && (typeof currency !== "string" || !/^[A-Z]{3}$/.test(currency))) {
+    return "— (no currency set in Settings)";
+  }
+  return text;
+}
+
 // The snapshot's account view for an id, or null when the snapshot has none.
 function accountView(views, id) {
   if (!Array.isArray(views)) return null;
   return views.find((view) => isObject(view) && view.id === id) || null;
 }
 
-// The name of an account on the statistics pages: its abbreviation in the
-// account's colour, with its label as the title. An id the snapshot does not
-// know (an account no longer stored) is shown as its first eight characters,
-// with the full id as the title.
-function accountName(views, id) {
+// The name of an account on the statistics pages, as data: its abbreviation in
+// the account's colour, its label as the title; an id the snapshot does not know
+// (an account no longer stored) is its first eight characters, titled with the
+// full id.
+function accountLabel(views, id) {
   if (typeof id !== "string" || id === "") {
     throw new Error(`an account name needs an account id, not ${JSON.stringify(id)}`);
   }
@@ -525,15 +651,28 @@ function accountName(views, id) {
   const abbr = known && typeof view.abbr === "string" && view.abbr !== "" ? view.abbr : null;
   const label = known && typeof view.label === "string" && view.label !== "" ? view.label : null;
   const color = known && isColor(view.color) ? view.color : null;
-  const title = known ? [abbr, label].filter(Boolean).join(" · ") || id : id;
-  const style = color
-    ? { background: color, color: contrastText(color) }
-    : { background: "var(--button-bg)", color: "var(--text)" };
+  return {
+    text: abbr || id.slice(0, 8),
+    title: known ? [abbr, label].filter(Boolean).join(" · ") || id : id,
+    style: color
+      ? { background: color, color: contrastText(color) }
+      : { background: "var(--button-bg)", color: "var(--text)" },
+  };
+}
+
+// The account's name as plain text, for a tooltip or a chart's series name: the
+// same rule as `accountName`, which draws the coloured abbreviation.
+function accountNameText(views, id) {
+  return accountLabel(views, id).text;
+}
+
+function accountName(views, id) {
+  const spec = accountLabel(views, id);
   return h("span", {
     class: "stats-acc",
-    text: abbr || id.slice(0, 8),
-    title,
-    style,
+    text: spec.text,
+    title: spec.title,
+    style: spec.style,
   });
 }
 
@@ -728,6 +867,11 @@ export {
   PALETTE,
   TRAY_GREY,
   LEVEL_COLORS,
+  MODELS,
+  MODEL_NAMES,
+  modelColor,
+  modelName,
+  WEEKDAYS,
   TAURI_GLOBAL,
   HAS_TAURI,
   isObject,
@@ -745,6 +889,12 @@ export {
   limitLevel,
   shortPercent,
   clear,
+  shortDate,
+  weekdayIndex,
+  pad,
+  kpi,
+  legendItem,
+  emptyLine,
   setStyles,
   applyProps,
   appendChildren,
@@ -760,10 +910,15 @@ export {
   writeChoice,
   dateText,
   dateTimeText,
+  weekdayTimeText,
   hoursText,
   percentText,
   amountText,
+  amountNode,
+  amountTip,
   accountView,
+  accountLabel,
+  accountNameText,
   accountName,
   textInput,
   selectInput,

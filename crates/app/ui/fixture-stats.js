@@ -823,6 +823,565 @@ function projectDetail(query, key) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Subscriptions (spec §3.3; step-c3 Task 8, part 3)
+// ---------------------------------------------------------------------------
+
+// The mock-up's blocked hours per account over its twelve weeks.
+const BLOCKED_BY_ACCOUNT = { LB: 31, AC: 19, PR: 7 };
+
+// The mock-up's "what if without it" numbers (its weekly series sums to its
+// blocked hours): LB 57 → 141 h, AC 57 → 96 h, PR 57 → 111 h.
+const WHAT_IF = {
+  LB: {
+    blocked: 141,
+    expired: 121,
+    saved: 498,
+    sentence: "Without LB you would have been blocked 84 h more. Keep it.",
+    weekly: [22, 26, 19, 24, 21, 6, 4, 5, 3, 6, 3, 2],
+  },
+  AC: {
+    blocked: 96,
+    expired: 164,
+    saved: 388,
+    sentence:
+      "Before PR was added AC saved you 31 h. In the 7 weeks since, dropping it would have cost 8 h.",
+    weekly: [17, 21, 14, 18, 15, 3, 1, 1.5, 1, 2.5, 1, 1],
+  },
+  PR: {
+    blocked: 111,
+    expired: 114,
+    saved: 582,
+    sentence: "Without PR the blocked hours of August come back: 54 h more in 7 weeks.",
+    weekly: [11, 14, 8, 12, 9, 9, 7, 8, 6, 9, 9, 9],
+  },
+};
+
+function round2(value) {
+  return Math.round(value * 100) / 100;
+}
+
+function allUsedMoney() {
+  let total = 0;
+  for (const account of ACCOUNTS) {
+    for (let index = 0; index < WEEKS.length; index += 1) {
+      total += usedMoney(account, index);
+    }
+  }
+  return total;
+}
+
+function verdictFor(weeks, average, fullWeeks) {
+  if (weeks < 4) return "tooEarly";
+  if (average !== null && average < 40) return "mostlyUnused";
+  if (fullWeeks * 2 >= weeks) return "regularlyFull";
+  return "wellUsed";
+}
+
+function subscriptions(query) {
+  const { indexes, chosen } = chosenAccounts(query);
+  const usedTotal = allUsedMoney();
+  const blockedTotal = sum(indexes.map((index) => BLOCKED[index]));
+  const rows = chosen.map((account) => {
+    const windows = indexes.filter((index) => account.used[index] !== null);
+    const weeks = windows.length;
+    const average = weeks > 0 ? sum(windows.map((index) => account.used[index])) / weeks : null;
+    const used = sum(windows.map((index) => usedMoney(account, index)));
+    const apiValue = weeks > 0 && usedTotal > 0 ? (used / usedTotal) * API_TOTAL : null;
+    const paid = weeklyPrice(account) * weeks;
+    const fullWeeks = windows.filter((index) => account.used[index] >= 100).length;
+    const first = account.used.findIndex((value) => value !== null);
+    return {
+      id: account.id,
+      plan: account.plan,
+      price: account.price,
+      since: weekIso(first),
+      weeks,
+      avgUsed: average === null ? null : round1(average),
+      expiredPercent: average === null ? null : round1(100 - average),
+      expired: weeks > 0 ? round2(sum(windows.map((index) => expiredMoney(account, index)))) : null,
+      fullWeeks,
+      blockedHoursOnIt: round1(
+        BLOCKED_BY_ACCOUNT[account.abbr] * (sum(BLOCKED) > 0 ? blockedTotal / sum(BLOCKED) : 0)
+      ),
+      apiValue,
+      timesPaid: apiValue !== null && paid > 0 ? apiValue / paid : null,
+      verdict: verdictFor(weeks, average, fullWeeks),
+      tokensPerPercent: windows.map((index) => [weekIso(index), TOKENS_PER_PERCENT[account.abbr]]),
+    };
+  });
+  const periods = chosen.map((account) => {
+    const first = account.used.findIndex((value) => value !== null);
+    return {
+      id: account.id,
+      plan: account.plan,
+      price: account.price,
+      from: weekIso(first),
+      to: null,
+    };
+  });
+  return { periods, rows, withoutPrice: [] };
+}
+
+function whatIf(query, without) {
+  if (typeof without !== "string" || without === "") {
+    throw new Error("stats_what_if needs the id of an account");
+  }
+  const { indexes, chosen } = chosenAccounts(query);
+  const account = accountById(without);
+  if (!account) throw new Error(`unknown account ${JSON.stringify(without)}`);
+  const mock = WHAT_IF[account.abbr];
+  const windows = indexes.filter((index) => account.used[index] !== null);
+  const allWindows = account.used.filter((value) => value !== null).length;
+  const blockedHours = round1(sum(indexes.map((index) => mock.weekly[index])));
+  const blockedHoursWas = round1(sum(indexes.map((index) => BLOCKED[index])));
+  const expiredWas = round2(
+    sum(
+      indexes.flatMap((index) =>
+        chosen
+          .filter((candidate) => candidate.used[index] !== null)
+          .map((candidate) => expiredMoney(candidate, index))
+      )
+    )
+  );
+  return {
+    without: account.id,
+    blockedHours: windows.length > 0 ? blockedHours : null,
+    blockedHoursWas,
+    expired: windows.length > 0 ? round2(mock.expired * (windows.length / allWindows)) : null,
+    expiredWas,
+    savedPrice: windows.length > 0 ? round2(weeklyPrice(account) * windows.length) : null,
+    sentence: mock.sentence,
+    weekly: indexes.map((index) => [weekIso(index), BLOCKED[index], mock.weekly[index]]),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Rhythm (spec §3.5; data.py's heat())
+// ---------------------------------------------------------------------------
+
+const ACT_PATTERN = [
+  [[8, 13], [14, 19], [19.5, 24]],
+  [[8, 13], [14, 19], [19.5, 24]],
+  [[8, 13], [14, 19], [19.5, 24]],
+  [[8, 13], [14, 19], [19.5, 24]],
+  [[8, 13], [14, 19], [19.5, 24]],
+  [[9, 13], [15, 21]],
+  [[9, 13], [15, 21]],
+];
+
+const BLOCKED_PER_DAY = [0.4, 0.3, 0.6, 0.9, 1.1, 0.2, 1.3];
+
+function rhythm(query) {
+  chosenAccounts(query);
+  chosenHosts(query);
+  const heat = [];
+  for (let day = 0; day < 7; day += 1) {
+    for (let hour = 0; hour < 24; hour += 1) {
+      const base = ACT_PATTERN[day].some(
+        ([from, to]) => from <= hour + 0.5 && hour + 0.5 < to
+      )
+        ? 1
+        : 0;
+      const n = ((day * 37 + hour * 17 + day * hour * 5) % 11) / 10;
+      let value = base * (0.55 + 0.45 * n);
+      if (base === 0 && [0, 1, 2, 7, 13, 19].includes(hour)) {
+        value = 0.12 * n + ((day + hour) % 4 === 0 ? 0.25 : 0);
+      }
+      if (day >= 5) value *= 0.75;
+      value = Math.max(0, Math.min(1, value));
+      // The mock-up's share of an hour, in output tokens (0 .. 1.2 M).
+      heat.push(Math.round(value * 1200000));
+    }
+  }
+  const perDay = ACT_PATTERN.map((ranges, day) => ({
+    weekday: day,
+    workingHours: round1(sum(ranges.map(([from, to]) => to - from))),
+    blockedHours: BLOCKED_PER_DAY[day],
+  }));
+  return { heat, perDay };
+}
+
+// ---------------------------------------------------------------------------
+// Activity (spec §3.9; mock_activity.py)
+// ---------------------------------------------------------------------------
+
+const ACT_START = Date.parse("2026-08-17T00:00:00.000Z");
+const ACT_NOW = Date.parse("2026-11-12T10:00:00.000Z");
+const ACT_NOW_HOUR = (ACT_NOW - ACT_START) / HOUR;
+const ACT_FIRST = ACT_NOW_HOUR - 168;
+const ACT_DAYS_START = Date.parse("2026-10-30T00:00:00.000Z");
+// mock_activity.py's random stream starts at its own 30 October; the fixture
+// starts the history earlier so its weeks have data, and keeps the stream.
+const ACT_RANDOM_SHIFT = (ACT_DAYS_START - ACT_START) / HOUR;
+const ACT_PROJECT_OF = ["atlas", "atlas", "acme-kb", "ledger", "atlas", "acme-kb", "notes"];
+const ACT_FOLDER_OF = {
+  atlas: "engine",
+  "acme-kb": "ingest",
+  ledger: "ledger",
+  notes: "notes",
+};
+
+function actRandom(hour, salt) {
+  const step = hour - ACT_RANDOM_SHIFT;
+  return ((step * 37 + salt * 101 + Math.floor(step / 7) * 13) % 97) / 96;
+}
+
+function actHostHour(host, hour) {
+  const time = new Date(ACT_START + hour * HOUR);
+  const day = (time.getUTCDay() + 6) % 7;
+  const clock = time.getUTCHours();
+  const date = time.getUTCDate();
+  if (host === "atlas") {
+    const nightRun = (date === 3 || date === 10) && clock < 5;
+    const on = day < 5 ? clock >= 7 || clock < 1 : clock >= 9 && clock < 23;
+    if (nightRun) {
+      return { state: "work", tokens: round2(0.9 + 0.5 * actRandom(hour, 1)), sessions: 1 };
+    }
+    if (!on) return { state: "off", tokens: 0, sessions: 0 };
+    const work = ACT_PATTERN[day].some(
+      ([from, to]) => from <= clock + 0.5 && clock + 0.5 < to
+    );
+    if (!work || actRandom(hour, 2) < 0.08) return { state: "idle", tokens: 0, sessions: 0 };
+    return {
+      state: "work",
+      tokens: round2(0.35 + 0.75 * actRandom(hour, 3)),
+      sessions: 1 + Math.floor(actRandom(hour, 4) * 3.6),
+    };
+  }
+  if (host === "vega") {
+    const evening = [0, 2, 3].includes(day) && clock >= 19 && clock < 24;
+    const weekend = (day === 5 && clock >= 13 && clock < 21) || (day === 6 && clock >= 10 && clock < 19);
+    if (!(evening || weekend)) return { state: "off", tokens: 0, sessions: 0 };
+    if (actRandom(hour, 5) < 0.25) return { state: "idle", tokens: 0, sessions: 0 };
+    return {
+      state: "work",
+      tokens: round2(0.2 + 0.5 * actRandom(hour, 6)),
+      sessions: 1 + Math.floor(actRandom(hour, 7) * 1.9),
+    };
+  }
+  throw new Error(`unknown host ${JSON.stringify(host)}`);
+}
+
+function subscriptionPerMillion() {
+  return allUsedMoney() / TOK_TOTAL;
+}
+
+function valuesOfMillion(millions) {
+  return {
+    api: millions * API_PER_M,
+    apiCurrency: "EUR",
+    apiMissing: null,
+    subscription: millions * subscriptionPerMillion(),
+    currency: "EUR",
+    subscriptionMissing: null,
+  };
+}
+
+function chosenHosts(query) {
+  const all = ["atlas", "vega"];
+  if (!query || typeof query !== "object") throw new Error("a statistics query is missing");
+  if (query.host === null || query.host === undefined) return all;
+  if (typeof query.host !== "string" || !all.includes(query.host)) {
+    throw new Error(`unknown host ${JSON.stringify(query.host)}`);
+  }
+  return [query.host];
+}
+
+function hostLane(host) {
+  const hours = [];
+  let working = 0;
+  let idle = 0;
+  let off = 0;
+  let unknown = 0;
+  let out = 0;
+  for (let step = 0; step < 168; step += 1) {
+    const hour = ACT_FIRST + step;
+    const entry = actHostHour(host, hour);
+    if (entry.state === "work") working += 1;
+    else if (entry.state === "idle") idle += 1;
+    else if (entry.state === "off") off += 1;
+    else unknown += 1;
+    const outTokens = Math.round(entry.tokens * 1000000);
+    out += outTokens;
+    const byModel = [];
+    if (entry.state === "work" && outTokens > 0) {
+      const opus = Math.round(outTokens * 0.7);
+      const sonnet = Math.round(outTokens * 0.22);
+      byModel.push(["claude-opus-5-5", opus], ["claude-sonnet-5-5", sonnet]);
+      byModel.push(["claude-fable-5-2", outTokens - opus - sonnet]);
+    }
+    hours.push({
+      t: new Date(ACT_START + hour * HOUR).toISOString(),
+      state: entry.state,
+      byModel: byModel.filter(([, count]) => count > 0),
+      sessions: entry.sessions,
+      topProject: entry.state === "work" ? ACT_PROJECT_OF[hour % 7] : null,
+      values: valuesOfMillion(entry.tokens),
+    });
+  }
+  return {
+    host,
+    hours,
+    working,
+    idle,
+    off,
+    unknown,
+    tokens: tokenCounts(out),
+    values: valuesOfMillion(out / 1000000),
+  };
+}
+
+function activityDays(hosts) {
+  const days = [];
+  for (let day = 0; day < 14; day += 1) {
+    const start = ACT_DAYS_START + day * DAY;
+    const end = Math.min(start + DAY, ACT_NOW);
+    const out = hosts.map((host) => {
+      let total = 0;
+      for (let hour = Math.ceil((start - ACT_START) / HOUR); hour < ACT_NOW_HOUR; hour += 1) {
+        if (ACT_START + hour * HOUR >= end) break;
+        total += actHostHour(host, hour).tokens * 1000000;
+      }
+      return [host, Math.round(total)];
+    });
+    days.push({ date: new Date(start).toISOString().slice(0, 10), out });
+  }
+  return days;
+}
+
+function activityWeek(index, hosts) {
+  const from = weekTime(index);
+  const to = Math.min(from + 7 * DAY, ACT_NOW);
+  const hours = new Map(hosts.map((host) => [host, new Set()]));
+  const byProject = new Map();
+  let out = 0;
+  let sessions = 0;
+  for (let hour = Math.ceil((from - ACT_START) / HOUR); hour < ACT_NOW_HOUR; hour += 1) {
+    if (ACT_START + hour * HOUR >= to) break;
+    for (const host of hosts) {
+      const entry = actHostHour(host, hour);
+      if (entry.state !== "work") continue;
+      hours.get(host).add(hour);
+      const outTokens = Math.round(entry.tokens * 1000000);
+      out += outTokens;
+      sessions += entry.sessions;
+      const project = ACT_PROJECT_OF[hour % 7];
+      byProject.set(project, (byProject.get(project) || 0) + outTokens);
+    }
+  }
+  let top = null;
+  let best = -1;
+  for (const [project, tokens] of [...byProject].sort((a, b) => a[0].localeCompare(b[0]))) {
+    if (tokens > best) {
+      best = tokens;
+      top = [project, ACT_FOLDER_OF[project]];
+    }
+  }
+  return {
+    week: weekIso(index),
+    workingHours: hosts.map((host) => [host, hours.get(host).size]),
+    tokens: tokenCounts(out),
+    values: valuesOfMillion(out / 1000000),
+    sessions,
+    top,
+  };
+}
+
+function activityLargest() {
+  // mock_activity.py's five largest sessions, largest by output tokens first.
+  const rows = [
+    ["atlas-a6", "atlas", "atlas", "claude-opus-5-5", 11, 12.4, 41],
+    ["atlas-11", "atlas", "atlas", "claude-opus-5-5", 5, 7.9, 17],
+    ["acme-kb-3c", "acme-kb", "atlas", "claude-opus-5-5", 2, 4.4, 9],
+    ["notes-47", "notes", "atlas", "claude-fable-5-2", 6, 5.3, 2],
+    ["atlas-b3", "atlas", "vega", "claude-fable-5-2", 4, 3.9, 4],
+  ];
+  return rows
+    .map(([label, project, host, model, workedHours, millions, agents]) => ({
+      label,
+      project,
+      host,
+      model,
+      workedHours,
+      tokens: tokenCounts(millions * 1000000),
+      values: valuesOfMillion(millions),
+      agents,
+    }))
+    .sort((a, b) => b.tokens.out - a.tokens.out || a.label.localeCompare(b.label));
+}
+
+function activityPeak() {
+  let best = 0;
+  for (const host of ["atlas", "vega"]) {
+    for (let step = 0; step < 168; step += 1) {
+      const out = Math.round(actHostHour(host, ACT_FIRST + step).tokens * 1000000);
+      if (out > best) best = out;
+    }
+  }
+  return tokenCounts(best);
+}
+
+// The minutes sessions waited per day of the range: a few days with 0 to 40
+// minutes, so the bars have something to draw. `?fixture=stats-empty` still
+// answers empty before this is reached.
+function activityWaited(indexes) {
+  const start = weekTime(indexes[0]);
+  const end = Math.min(ACT_NOW, weekTime(indexes[indexes.length - 1]) + 7 * DAY);
+  const rows = [];
+  let day = 0;
+  for (let time = start; time < end; time += DAY, day += 1) {
+    const minutes = Math.round((((day * 17 + 11) % 41) * 10)) / 10;
+    if (minutes === 0) continue;
+    rows.push([new Date(time).toISOString().slice(0, 10), minutes]);
+  }
+  return rows;
+}
+
+function activity(query) {
+  const { indexes } = chosenAccounts(query);
+  const hosts = chosenHosts(query);
+  return {
+    lanes: hosts.map(hostLane),
+    days: activityDays(hosts),
+    weeks: indexes.map((index) => activityWeek(index, hosts)),
+    largest: activityLargest(),
+    waited: activityWaited(indexes),
+    peakHour: activityPeak(),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Forecast (spec §3.4; data.py's forecast('slack') and forecast('stay'))
+// ---------------------------------------------------------------------------
+
+const FORECAST_NOW = Date.parse("2026-11-12T10:00:00.000Z");
+const FORECAST_FROM = "2026-11-12T10:00:00.000Z";
+const FORECAST_TO = new Date(FORECAST_NOW + 7 * 24 * HOUR).toISOString();
+const FORECAST_NO_PLAN = "the forecast needs a reading of every account first";
+const FORECAST_RESETS = {
+  LB: "2026-11-16T17:00:00.000Z",
+  AC: "2026-11-16T02:00:00.000Z",
+  PR: "2026-11-14T19:00:00.000Z",
+};
+const FORECAST_FULL = {
+  LB: "2026-11-15T20:30:00.000Z",
+  AC: "2026-11-15T10:00:00.000Z",
+  PR: "2026-11-14T11:30:00.000Z",
+};
+const FORECAST_LOW = { LB: 86, AC: 90, PR: 97 };
+// The slack plan's percent at each reset, and the same when switching only at
+// 100 % (data.py's forecast('slack') and forecast('stay')).
+const FORECAST_PLANNED_AT_RESET = { LB: 100, AC: 100, PR: 100 };
+const FORECAST_LAZY_AT_RESET = { LB: 90, AC: 80, PR: 100 };
+const FORECAST_RUNS = [
+  ["2026-11-12T10:00:00.000Z", "2026-11-12T12:00:00.000Z", "AC"],
+  ["2026-11-12T12:00:00.000Z", "2026-11-12T13:00:00.000Z", "LB"],
+  ["2026-11-12T14:00:00.000Z", "2026-11-12T15:00:00.000Z", "LB"],
+  ["2026-11-12T15:00:00.000Z", "2026-11-12T17:00:00.000Z", "AC"],
+  ["2026-11-12T17:00:00.000Z", "2026-11-12T19:00:00.000Z", "PR"],
+  ["2026-11-12T19:30:00.000Z", "2026-11-12T20:00:00.000Z", "PR"],
+  ["2026-11-12T20:00:00.000Z", "2026-11-12T22:00:00.000Z", "AC"],
+  ["2026-11-12T22:00:00.000Z", "2026-11-13T00:00:00.000Z", "PR"],
+  ["2026-11-13T08:00:00.000Z", "2026-11-13T10:00:00.000Z", "AC"],
+  ["2026-11-13T10:00:00.000Z", "2026-11-13T13:00:00.000Z", "PR"],
+  ["2026-11-13T14:00:00.000Z", "2026-11-13T17:30:00.000Z", "PR"],
+  ["2026-11-13T17:30:00.000Z", "2026-11-13T19:00:00.000Z", "LB"],
+  ["2026-11-13T19:30:00.000Z", "2026-11-13T20:30:00.000Z", "LB"],
+  ["2026-11-13T20:30:00.000Z", "2026-11-13T22:30:00.000Z", "AC"],
+  ["2026-11-13T22:30:00.000Z", "2026-11-14T00:00:00.000Z", "PR"],
+  ["2026-11-14T09:00:00.000Z", "2026-11-14T11:30:00.000Z", "PR"],
+  ["2026-11-14T11:30:00.000Z", "2026-11-14T13:00:00.000Z", "LB"],
+  ["2026-11-14T15:00:00.000Z", "2026-11-14T16:00:00.000Z", "LB"],
+  ["2026-11-14T16:00:00.000Z", "2026-11-14T18:00:00.000Z", "AC"],
+  ["2026-11-14T18:00:00.000Z", "2026-11-14T20:30:00.000Z", "LB"],
+  ["2026-11-14T20:30:00.000Z", "2026-11-14T21:00:00.000Z", "PR"],
+  ["2026-11-15T09:00:00.000Z", "2026-11-15T10:00:00.000Z", "AC"],
+  ["2026-11-15T10:00:00.000Z", "2026-11-15T12:30:00.000Z", "LB"],
+  ["2026-11-15T12:30:00.000Z", "2026-11-15T13:00:00.000Z", "PR"],
+  ["2026-11-15T15:00:00.000Z", "2026-11-15T17:30:00.000Z", "LB"],
+  ["2026-11-15T17:30:00.000Z", "2026-11-15T20:00:00.000Z", "PR"],
+  ["2026-11-15T20:00:00.000Z", "2026-11-15T20:30:00.000Z", "LB"],
+  ["2026-11-15T20:30:00.000Z", "2026-11-15T21:00:00.000Z", "PR"],
+  ["2026-11-16T08:00:00.000Z", "2026-11-16T10:00:00.000Z", "AC"],
+  ["2026-11-16T10:00:00.000Z", "2026-11-16T13:00:00.000Z", "PR"],
+  ["2026-11-16T14:00:00.000Z", "2026-11-16T16:00:00.000Z", "AC"],
+  ["2026-11-16T16:00:00.000Z", "2026-11-16T17:00:00.000Z", "PR"],
+  ["2026-11-16T17:00:00.000Z", "2026-11-16T19:00:00.000Z", "LB"],
+  ["2026-11-16T19:30:00.000Z", "2026-11-16T21:30:00.000Z", "AC"],
+  ["2026-11-16T21:30:00.000Z", "2026-11-16T23:30:00.000Z", "PR"],
+  ["2026-11-16T23:30:00.000Z", "2026-11-17T00:00:00.000Z", "LB"],
+  ["2026-11-17T08:00:00.000Z", "2026-11-17T10:00:00.000Z", "AC"],
+  ["2026-11-17T10:00:00.000Z", "2026-11-17T13:00:00.000Z", "PR"],
+  ["2026-11-17T14:00:00.000Z", "2026-11-17T16:00:00.000Z", "AC"],
+  ["2026-11-17T16:00:00.000Z", "2026-11-17T18:30:00.000Z", "PR"],
+  ["2026-11-17T18:30:00.000Z", "2026-11-17T19:00:00.000Z", "LB"],
+  ["2026-11-17T19:30:00.000Z", "2026-11-17T21:30:00.000Z", "AC"],
+  ["2026-11-17T21:30:00.000Z", "2026-11-18T00:00:00.000Z", "PR"],
+  ["2026-11-18T08:00:00.000Z", "2026-11-18T10:00:00.000Z", "AC"],
+  ["2026-11-18T10:00:00.000Z", "2026-11-18T13:00:00.000Z", "PR"],
+  ["2026-11-18T14:00:00.000Z", "2026-11-18T16:00:00.000Z", "AC"],
+  ["2026-11-18T16:00:00.000Z", "2026-11-18T18:30:00.000Z", "LB"],
+  ["2026-11-18T18:30:00.000Z", "2026-11-18T19:00:00.000Z", "PR"],
+  ["2026-11-18T19:30:00.000Z", "2026-11-19T00:00:00.000Z", "PR"],
+  ["2026-11-19T08:00:00.000Z", "2026-11-19T10:00:00.000Z", "PR"],
+];
+
+function forecastPage() {
+  const expire = (atReset) =>
+    round2(
+      sum(
+        ACCOUNTS.map(
+          (account) => ((100 - atReset[account.abbr]) / 100) * weeklyPrice(account)
+        )
+      )
+    );
+  const accounts = viewOrder().map((id) => {
+    const account = accountById(id);
+    const abbr = account.abbr;
+    return {
+      id,
+      now: account.now,
+      expected: FORECAST_PLANNED_AT_RESET[abbr],
+      low: FORECAST_LOW[abbr],
+      fullAt: FORECAST_FULL[abbr] === undefined ? null : FORECAST_FULL[abbr],
+      resetsAt: FORECAST_RESETS[abbr],
+      onlyWhenFullExpected: FORECAST_LAZY_AT_RESET[abbr],
+      onlyWhenFullExpires: round2(
+        ((100 - FORECAST_LAZY_AT_RESET[abbr]) / 100) * weeklyPrice(account)
+      ),
+    };
+  });
+  const lanes = viewOrder().map((id) => {
+    const abbr = accountById(id).abbr;
+    return {
+      id,
+      blocks: FORECAST_RUNS.filter(([, , account]) => account === abbr).map(([from, to]) => [
+        from,
+        to,
+      ]),
+      resets: [FORECAST_RESETS[abbr]],
+    };
+  });
+  return {
+    basisWeeks: 12,
+    learning: [],
+    kpis: {
+      expirePlanned: expire(FORECAST_PLANNED_AT_RESET),
+      expireOnlyWhenFull: expire(FORECAST_LAZY_AT_RESET),
+      blockedHours: 0,
+      switches: 42,
+      switchesOnlyWhenFull: 11,
+    },
+    accounts,
+    lanes,
+    blocked: [],
+    from: FORECAST_FROM,
+    to: FORECAST_TO,
+    sentence: "Enough for the week.",
+  };
+}
+
 function statsEmpty() {
   return (
     typeof location !== "undefined" &&
@@ -857,11 +1416,18 @@ export function fixtureStats(command, args) {
     case "stats_project_detail":
       return answer(query, (value) => projectDetail(value, params.key));
     case "stats_subscriptions":
+      return answer(query, subscriptions);
     case "stats_what_if":
+      return answer(query, (value) => whatIf(value, params.without));
     case "stats_forecast":
+      // The forecast never answers "empty": without a plan its one error is the
+      // plain line the page shows.
+      if (statsEmpty()) throw new Error(FORECAST_NO_PLAN);
+      return { data: forecastPage() };
     case "stats_rhythm":
+      return answer(query, rhythm);
     case "stats_activity":
-      throw new Error("unknown command");
+      return answer(query, activity);
     default:
       throw new Error("unknown command");
   }

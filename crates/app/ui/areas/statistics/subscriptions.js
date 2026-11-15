@@ -1,0 +1,428 @@
+// The Subscriptions page (spec §3.3; step-c3 Task 8, part 3): the subscription
+// periods as bars, one row per subscription with its verdict, and the "what if"
+// replay without the chosen row's account. The page formats and draws the
+// struct; every sum, verdict and sentence comes from the Rust page.
+
+import {
+  accountName,
+  accountNameText,
+  accountView,
+  amountNode,
+  amountTip,
+  banner,
+  clear,
+  emptyLine,
+  errorMessage,
+  h,
+  hoursText,
+  isColor,
+  kpi,
+  percentText,
+  shortDate,
+  tokens,
+  weekdayIndex,
+} from "../../common.js";
+import { bars, lines } from "../../charts.js";
+
+const VERDICT_LABELS = {
+  mostlyUnused: "Mostly unused",
+  regularlyFull: "Regularly full",
+  wellUsed: "Well used",
+  tooEarly: "Too early",
+};
+
+const DAY = 86400000;
+
+function verdictTag(verdict) {
+  const label = VERDICT_LABELS[verdict];
+  if (label === undefined) throw new Error(`unknown verdict ${JSON.stringify(verdict)}`);
+  const kind =
+    verdict === "wellUsed"
+      ? "good"
+      : verdict === "mostlyUnused"
+        ? "warn"
+        : verdict === "tooEarly"
+          ? "plain"
+          : "focus";
+  return h("span", { class: `stats-tag stats-tag-${kind}`, text: label });
+}
+
+export async function show(container, env) {
+  const data = await env.call("stats_subscriptions");
+  clear(container);
+
+  const currency = env.currency;
+  const state = { token: 0 };
+  const rowNodes = new Map();
+
+  const root = h("div", { class: "g stats-subscriptions" });
+  container.appendChild(root);
+
+  // -------------------------------------------------------------------------
+  // subscriptions over time
+  // -------------------------------------------------------------------------
+  const periodsCard = h("div", { class: "hcard stats-periods-card" });
+  periodsCard.appendChild(
+    h("div", { class: "ch" }, [
+      h("span", { class: "t", text: "Subscriptions over time" }),
+      h("span", { class: "s", text: "one bar per subscription period, from the week it started" }),
+    ])
+  );
+  const periodsBody = h("div", { class: "stats-periods-body" });
+  periodsCard.appendChild(periodsBody);
+  root.appendChild(periodsCard);
+
+  if (data.periods.length === 0) {
+    periodsBody.appendChild(emptyLine("no plan yet"));
+  } else {
+    const starts = data.periods.map((period) => Date.parse(period.from));
+    const ends = data.periods.map((period) =>
+      period.to === null ? Date.now() : Date.parse(period.to)
+    );
+    for (const time of starts.concat(ends)) {
+      if (Number.isNaN(time)) throw new Error("a subscription period has no readable time");
+    }
+    const start = Math.min(...starts);
+    const end = Math.max(Date.now(), ...ends);
+    if (!(end > start)) throw new Error("the subscription periods do not span any time");
+    const xOf = (time) => ((time - start) / (end - start)) * 100;
+
+    const axis = h("div", { class: "stats-gantt-axis" });
+    axis.appendChild(h("span", { class: "stats-gantt-label" }));
+    const axisTrack = h("div", { class: "stats-gantt-track" });
+    const ticks = [];
+    const firstTick = new Date(start);
+    firstTick.setHours(0, 0, 0, 0);
+    while (firstTick.getTime() < start) firstTick.setDate(firstTick.getDate() + 1);
+    while (weekdayIndex(firstTick) !== 0) firstTick.setDate(firstTick.getDate() + 1);
+    for (let time = firstTick.getTime(); time <= end; time += 7 * DAY) {
+      ticks.push(time);
+    }
+    const stride = Math.max(1, Math.ceil(ticks.length / 13));
+    for (const [index, time] of ticks.entries()) {
+      if (index % stride !== 0) continue;
+      axisTrack.appendChild(
+        h("span", {
+          class: "stats-gantt-tick",
+          style: { left: `${xOf(time)}%` },
+          text: shortDate(new Date(time)),
+        })
+      );
+    }
+    axis.appendChild(axisTrack);
+    periodsBody.appendChild(axis);
+
+    for (const period of data.periods) {
+      const view = accountView(env.accounts, period.id);
+      const color = view && isColor(view.color) ? view.color : "var(--muted)";
+      const from = Date.parse(period.from);
+      const to = period.to === null ? end : Date.parse(period.to);
+      const left = xOf(from);
+      const width = Math.max(0.6, xOf(to) - left);
+      const line = h("div", { class: "stats-gantt-row" });
+      const label = h("span", { class: "stats-gantt-label" }, [
+        accountName(env.accounts, period.id),
+      ]);
+      const plan = period.plan === null || period.plan === undefined ? "—" : period.plan;
+      const price = amountTip(period.price, currency);
+      label.appendChild(
+        h("span", { class: "stats-plan" }, [
+          `${plan} · `,
+          amountNode(period.price, currency),
+          " / month",
+        ])
+      );
+      // Each bar names its own period's start: an account whose plan changed has
+      // two periods, and their labels must not both show the account's first one.
+      label.appendChild(
+        h("span", {
+          class: "stats-plan",
+          text:
+            period.to === null
+              ? `since ${shortDate(period.from)}`
+              : `from ${shortDate(period.from)}`,
+        })
+      );
+      line.appendChild(label);
+      const track = h("div", { class: "stats-gantt-track" });
+      const bar = h("i", {
+        style: { left: `${left}%`, width: `${width}%`, background: color },
+      });
+      bar.title =
+        period.to === null
+          ? `${plan} · ${price} — since ${shortDate(period.from)}, still running`
+          : `${plan} · ${price} — ${shortDate(period.from)} to ${shortDate(period.to)}`;
+      track.appendChild(bar);
+      line.appendChild(track);
+      periodsBody.appendChild(line);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // one row per subscription
+  // -------------------------------------------------------------------------
+  const rowsCard = h("div", { class: "hcard stats-sub-rows-card" });
+  rowsCard.appendChild(
+    h("div", { class: "ch" }, [
+      h("span", { class: "t", text: "Each subscription" }),
+      h("span", { class: "s", text: "a click on a row runs “what if without it”" }),
+      h("span", { class: "sp" }),
+      h("span", { class: "x11 mf", text: "prices as entered per account" }),
+    ])
+  );
+  const rowsBody = h("div", { class: "stats-sub-rows-body" });
+  rowsCard.appendChild(rowsBody);
+  root.appendChild(rowsCard);
+
+  const COLUMNS = [
+    "Account",
+    "Plan",
+    "Price / month",
+    "Since",
+    "Weeks",
+    "Average used",
+    "",
+    "Expired",
+    "Full",
+    "Blocked on it",
+    "At API prices · × paid",
+    "Verdict",
+  ].map((label, index) =>
+    h("span", {
+      class: index === 5 || index === 6 ? "stats-sub-cell-wide" : "n",
+      text: label,
+    })
+  );
+  const head = h("div", { class: "stats-subrow stats-subrow-head" });
+  for (const cell of COLUMNS) head.appendChild(cell);
+  rowsBody.appendChild(head);
+
+  if (data.rows.length === 0) {
+    rowsBody.appendChild(emptyLine("no plan yet"));
+  }
+  for (const row of data.rows) {
+    const view = accountView(env.accounts, row.id);
+    const color = view && isColor(view.color) ? view.color : "var(--muted)";
+    const node = h("div", { class: "stats-subrow", role: "button", tabindex: "0" });
+    node.appendChild(
+      h("span", { class: "stats-sub-cell-account" }, [accountName(env.accounts, row.id)])
+    );
+    node.appendChild(
+      h("span", { text: row.plan === null || row.plan === undefined ? "—" : row.plan })
+    );
+    node.appendChild(h("span", { class: "n" }, [amountNode(row.price, currency)]));
+    node.appendChild(h("span", { class: "mf", text: shortDate(row.since) }));
+    node.appendChild(h("span", { class: "n", text: String(row.weeks) }));
+    const average = h("span", { class: "stats-sub-cell-wide" });
+    const bar = h("span", { class: "stats-ubar" });
+    if (typeof row.avgUsed === "number") {
+      if (row.avgUsed < 0 || row.avgUsed > 100) {
+        throw new Error(`the average used ${row.avgUsed} is not a percent`);
+      }
+      bar.appendChild(h("i", { style: { width: `${row.avgUsed}%`, background: color } }));
+    }
+    average.appendChild(bar);
+    node.appendChild(average);
+    node.appendChild(
+      h("span", {
+        class: "n",
+        text: typeof row.avgUsed === "number" ? percentText(row.avgUsed) : "—",
+      })
+    );
+    const hasExpired =
+      typeof row.expiredPercent === "number" ||
+      (row.expired !== null && row.expired !== undefined);
+    if (hasExpired) {
+      const expired = h("span", { class: "n" });
+      expired.appendChild(
+        document.createTextNode(
+          `${typeof row.expiredPercent === "number" ? percentText(row.expiredPercent) : "—"} · `
+        )
+      );
+      expired.appendChild(amountNode(row.expired, currency));
+      node.appendChild(expired);
+    } else {
+      node.appendChild(h("span", { class: "n" }, [amountNode(row.expired, currency)]));
+    }
+    node.appendChild(h("span", { class: "n", text: `${row.fullWeeks} of ${row.weeks}` }));
+    node.appendChild(h("span", { class: "n", text: hoursText(row.blockedHoursOnIt) }));
+    const api = h("span", {
+      class: "n",
+      title:
+        row.apiValue === null || row.timesPaid === null
+          ? "the API value or a priced week of this subscription is missing"
+          : `${amountTip(row.apiValue, currency)} at API prices over the paid money of its weeks`,
+    });
+    api.appendChild(amountNode(row.apiValue, currency));
+    api.appendChild(
+      document.createTextNode(
+        ` · × ${typeof row.timesPaid === "number" ? row.timesPaid.toFixed(1) : "—"}`
+      )
+    );
+    node.appendChild(api);
+    node.appendChild(h("span", {}, [verdictTag(row.verdict)]));
+    node.addEventListener("click", () => void selectRow(row));
+    node.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      void selectRow(row);
+    });
+    rowNodes.set(row.id, node);
+    rowsBody.appendChild(node);
+  }
+
+  if (data.withoutPrice.length > 0) {
+    const note = h("p", { class: "stats-note" }, ["No price for "]);
+    for (const [index, id] of data.withoutPrice.entries()) {
+      if (index > 0) note.appendChild(document.createTextNode(", "));
+      note.appendChild(accountName(env.accounts, id));
+    }
+    note.appendChild(document.createTextNode(": left out of the money sums."));
+    rowsCard.appendChild(note);
+  }
+
+  // -------------------------------------------------------------------------
+  // what if without it
+  // -------------------------------------------------------------------------
+  const whatCard = h("div", { class: "hcard stats-whatif-card" });
+  const whatHead = h("div", { class: "ch" });
+  const whatBody = h("div", { class: "stats-whatif-body" });
+  whatCard.appendChild(whatHead);
+  whatCard.appendChild(whatBody);
+  root.appendChild(whatCard);
+
+  function renderWhatHead(row) {
+    clear(whatHead);
+    whatHead.appendChild(h("span", { class: "t", text: "What if: the range without" }));
+    whatHead.appendChild(accountName(env.accounts, row.id));
+    whatHead.appendChild(h("span", { class: "sp" }));
+    whatHead.appendChild(
+      h("span", {
+        class: "x11 mf",
+        text: "replayed with the same working hours and the switching rule of each week",
+      })
+    );
+  }
+
+  function renderWhatIf(row, what) {
+    clear(whatBody);
+    const kpis = h("div", { class: "stats-kpis stats-whatif-kpis" });
+    kpis.appendChild(
+      kpi(
+        "Blocked",
+        what.blockedHours === null ? "—" : hoursText(what.blockedHours),
+        `instead of ${hoursText(what.blockedHoursWas)}`,
+        "Blocked | the hours without this account, replayed with the same working hours; never below the recorded hours",
+        what.blockedHours === null ? null : "stats-kpi-value-bad"
+      )
+    );
+    kpis.appendChild(
+      kpi(
+        "Expired unused",
+        amountNode(what.expired, currency),
+        h("span", {}, ["instead of ", amountNode(what.expiredWas, currency)]),
+        "Expired unused | the money the range's weekly windows left unused without this account"
+      )
+    );
+    kpis.appendChild(
+      kpi(
+        "Saved on the price",
+        amountNode(what.savedPrice, currency),
+        "in this range",
+        "Saved on the price | the paid money of this account's weeks of the range"
+      )
+    );
+    const sentence = kpi("In one sentence", what.sentence, null, what.sentence);
+    sentence.classList.add("stats-kpi-sentence");
+    kpis.appendChild(sentence);
+    whatBody.appendChild(kpis);
+
+    const charts = h("div", { class: "stats-whatif-charts" });
+
+    if (what.weekly.length > 0) {
+      const blockedBlock = h("div", { class: "stats-whatif-chart" });
+      blockedBlock.appendChild(
+        h("p", { class: "stats-detail-label", text: "Blocked hours per week" })
+      );
+      const name = accountNameText(env.accounts, row.id);
+      blockedBlock.appendChild(
+        bars({
+          categories: what.weekly.map(([week]) => shortDate(week)),
+          series: [
+            {
+              name: "as it was",
+              color: "var(--muted)",
+              values: what.weekly.map(([, was]) => was),
+              unit: " h",
+              tip: (category, value) => `${category} | as it was: ${hoursText(value)} blocked`,
+            },
+            {
+              name: h("span", {}, ["without ", accountName(env.accounts, row.id)]),
+              color: "var(--danger)",
+              values: what.weekly.map(([, , without]) => without),
+              unit: " h",
+              tip: (category, value) =>
+                `${category} | without ${name}: ${hoursText(value)} blocked`,
+            },
+          ],
+        })
+      );
+      charts.appendChild(blockedBlock);
+    } else {
+      charts.appendChild(emptyLine("no week in the range"));
+    }
+
+    const tokensBlock = h("div", { class: "stats-whatif-chart stats-whatif-tokens" });
+    tokensBlock.appendChild(
+      h("p", { class: "stats-detail-label", text: "Output tokens per percent of the week" })
+    );
+    if (row.tokensPerPercent.length === 0) {
+      tokensBlock.appendChild(emptyLine("no account week in this range"));
+    } else {
+      const view = accountView(env.accounts, row.id);
+      tokensBlock.appendChild(
+        lines({
+          series: [
+            {
+              name: "tokens per percent",
+              color: view && isColor(view.color) ? view.color : "var(--focus)",
+              points: row.tokensPerPercent,
+              tip: (time, value) =>
+                `${shortDate(new Date(time))}: ${tokens(value)} output tokens per percent of the week`,
+            },
+          ],
+          yFormat: (value) => tokens(value),
+        })
+      );
+    }
+    charts.appendChild(tokensBlock);
+    whatBody.appendChild(charts);
+  }
+
+  async function selectRow(row) {
+    const token = ++state.token;
+    for (const [id, node] of rowNodes) {
+      node.classList.toggle("stats-subrow-selected", id === row.id);
+    }
+    renderWhatHead(row);
+    clear(whatBody);
+    whatBody.appendChild(h("p", { class: "stats-empty", text: "replaying…" }));
+    let what;
+    try {
+      what = await env.call("stats_what_if", { without: row.id });
+    } catch (error) {
+      if (token !== state.token) return;
+      clear(whatBody);
+      if (error && error.name === "EmptyRange") {
+        whatBody.appendChild(h("p", { class: "stats-empty", text: errorMessage(error) }));
+      } else {
+        whatBody.appendChild(banner("error", "⚠", errorMessage(error)));
+      }
+      return;
+    }
+    if (token !== state.token) return;
+    renderWhatIf(row, what);
+  }
+
+  if (data.rows.length > 0) await selectRow(data.rows[0]);
+}

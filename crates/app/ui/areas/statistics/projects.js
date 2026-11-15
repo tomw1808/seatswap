@@ -5,26 +5,23 @@
 
 import {
   accountName,
+  accountNameText,
   accountView,
-  amountText,
+  amountNode,
+  amountTip,
   banner,
   clear,
   dateText,
+  emptyLine,
   errorMessage,
   h,
   isColor,
+  modelColor,
+  modelName,
   percentText,
   tokens,
 } from "../../common.js";
 import { lines } from "../../charts.js";
-
-const MODEL_TOKENS = [
-  "var(--focus)",
-  "var(--warn)",
-  "var(--pill-text)",
-  "var(--danger)",
-  "var(--muted)",
-];
 
 function sameKey(first, second) {
   return Boolean(
@@ -63,7 +60,8 @@ function splitBar(node, env) {
   for (const [id, percent] of node.byAccount) {
     const view = id === null ? null : accountView(env.accounts, id);
     const color = view && isColor(view.color) ? view.color : "var(--muted)";
-    const name = view ? view.abbr : id === null ? "unknown account" : id;
+    const name =
+      id === null ? "unknown account" : accountNameText(env.accounts, id);
     const part = h("i", {
       style: { width: `${Math.min(100, Math.max(0, percent))}%`, background: color },
       title: `${name}: ${percentText(percent)}`,
@@ -180,10 +178,8 @@ export async function show(container, env) {
         h("i", { style: { width: `${Math.min(100, Math.max(0, node.share))}%` } })
       );
       row.appendChild(usage);
-      row.appendChild(
-        h("span", { class: "n", text: amountText(node.subscription, env.currency) })
-      );
-      row.appendChild(h("span", { class: "n mf", text: amountText(node.api, env.currency) }));
+      row.appendChild(h("span", { class: "n" }, [amountNode(node.subscription, env.currency)]));
+      row.appendChild(h("span", { class: "n mf" }, [amountNode(node.api, env.currency)]));
       row.appendChild(splitBar(node, env));
       row.appendChild(h("span", { class: "n", text: String(node.sessions) }));
 
@@ -206,13 +202,12 @@ export async function show(container, env) {
 
   function notesBlock() {
     const notes = h("div", { class: "stats-tree-notes" });
-    for (const note of Array.isArray(data.notes) ? data.notes : []) {
+    for (const note of data.notes) {
       notes.appendChild(h("p", { class: "stats-note", text: note }));
     }
-    const perPercent = Array.isArray(data.tokensPerPercent) ? data.tokensPerPercent : [];
-    if (perPercent.length > 0) {
+    if (data.tokensPerPercent.length > 0) {
       const line = h("p", { class: "stats-note" }, ["Tokens per percent of a week: "]);
-      for (const [index, [id, value]] of perPercent.entries()) {
+      for (const [index, [id, value]] of data.tokensPerPercent.entries()) {
         if (index > 0) line.appendChild(document.createTextNode(" · "));
         line.appendChild(accountName(env.accounts, id));
         line.appendChild(document.createTextNode(` ${tokens(value)}`));
@@ -220,13 +215,20 @@ export async function show(container, env) {
       line.appendChild(document.createTextNode("."));
       notes.appendChild(line);
     }
-    if (Array.isArray(data.withoutPrice) && data.withoutPrice.length > 0) {
+    if (data.withoutPrice.length > 0) {
       notes.appendChild(
         h("p", {
           class: "stats-note",
           text: `No price for ${data.withoutPrice.join(", ")}: their tokens add no value.`,
         })
       );
+    }
+    if (
+      data.notes.length === 0 &&
+      data.tokensPerPercent.length === 0 &&
+      data.withoutPrice.length === 0
+    ) {
+      notes.appendChild(emptyLine("no note for this range"));
     }
     return notes;
   }
@@ -242,7 +244,7 @@ export async function show(container, env) {
       ])
     );
     const body = h("div", { class: "stats-tree-body" });
-    body.appendChild(treeRows());
+    body.appendChild(data.nodes.length === 0 ? emptyLine("no session in the range") : treeRows());
     body.appendChild(notesBlock());
     treeCard.appendChild(body);
   }
@@ -256,6 +258,11 @@ export async function show(container, env) {
       ])
     );
     const body = h("div", { class: "stats-matrix-body" });
+    if (data.matrix.accounts.length === 0) {
+      body.appendChild(emptyLine("no session in the range"));
+      matrixCard.appendChild(body);
+      return;
+    }
     const table = h("div", { class: "stats-matrix" });
     const width = `minmax(84px, 1fr)${
       data.matrix.accounts.length > 0
@@ -266,7 +273,6 @@ export async function show(container, env) {
     const head = h("div", { class: "stats-matrix-row stats-matrix-row-head" });
     head.appendChild(h("span", { text: "Organization" }));
     for (const id of data.matrix.accounts) {
-      const view = accountView(env.accounts, id);
       head.appendChild(h("span", { class: "stats-matrix-head-cell" }, [accountName(env.accounts, id)]));
     }
     table.appendChild(head);
@@ -279,20 +285,26 @@ export async function show(container, env) {
         const color = view && isColor(view.color) ? view.color : "var(--muted)";
         const cell = h("span", {
           class: "stats-matrix-cell",
-          text: amountText(value, env.currency),
-          title: `${org} on ${view ? view.abbr : id}: ${amountText(value, env.currency)}`,
+          title: `${org} on ${accountNameText(env.accounts, id)}: ${amountTip(
+            value,
+            env.currency
+          )}`,
           style: { "--stats-matrix-color": color },
-        });
+        }, [amountNode(value, env.currency)]);
         row.appendChild(cell);
       }
       table.appendChild(row);
     }
     body.appendChild(table);
-    const sentences = h("ul", { class: "stats-findings stats-matrix-sentences" });
-    for (const sentence of data.matrix.sentences) {
-      sentences.appendChild(h("li", { text: sentence }));
+    if (data.matrix.sentences.length === 0) {
+      body.appendChild(emptyLine("no sentence for this range"));
+    } else {
+      const sentences = h("ul", { class: "stats-findings stats-matrix-sentences" });
+      for (const sentence of data.matrix.sentences) {
+        sentences.appendChild(h("li", { text: sentence }));
+      }
+      body.appendChild(sentences);
     }
-    body.appendChild(sentences);
     matrixCard.appendChild(body);
   }
 
@@ -301,7 +313,7 @@ export async function show(container, env) {
       if (state.detailEmpty) return h("p", { class: "stats-empty", text: state.detailError });
       return banner("error", "⚠", state.detailError);
     }
-    if (state.detail === null) return h("p", { class: "stats-empty", text: "—" });
+    if (state.detail === null) return emptyLine("no project in the range");
     const detail = state.detail;
     const card = h("div", { class: "stats-detail-body" });
     const kpis = h("div", { class: "stats-mini-kpis" });
@@ -325,17 +337,19 @@ export async function show(container, env) {
     kpis.appendChild(
       h("div", { class: "stats-mini-kpi" }, [
         h("span", { class: "stats-kpi-label", text: "Value" }),
-        h("span", { class: "stats-kpi-value", text: amountText(detail.subscription, env.currency) }),
-        h("span", {
-          class: "stats-kpi-sub",
-          text: `at API prices ${amountText(detail.api, env.currency)}`,
-        }),
+        h("span", { class: "stats-kpi-value" }, [amountNode(detail.subscription, env.currency)]),
+        h("span", { class: "stats-kpi-sub" }, [
+          "at API prices ",
+          amountNode(detail.api, env.currency),
+        ]),
       ])
     );
     card.appendChild(kpis);
 
-    if (detail.hosts.length > 0) {
-      card.appendChild(h("p", { class: "stats-detail-label", text: "Hosts" }));
+    card.appendChild(h("p", { class: "stats-detail-label", text: "Hosts" }));
+    if (detail.hosts.length === 0) {
+      card.appendChild(emptyLine("no host recorded for this project"));
+    } else {
       const hosts = h("div", { class: "stats-chipline" });
       for (const [host, percent] of detail.hosts) {
         hosts.appendChild(
@@ -352,28 +366,27 @@ export async function show(container, env) {
     }
 
     card.appendChild(
-      h("p", { class: "stats-detail-label", text: "Output tokens per week, by model (millions)" })
+      h("p", { class: "stats-detail-label", text: "Output tokens per week, by model" })
     );
     const models = new Map();
     for (const [, rows] of detail.weeklyByModel) {
       for (const [model] of rows) {
-        if (!models.has(model)) models.set(model, MODEL_TOKENS[models.size % MODEL_TOKENS.length]);
+        if (!models.has(model)) models.set(model, modelColor(model));
       }
     }
     const series = [...models.entries()].map(([model, color]) => ({
-      name: model,
+      name: modelName(model),
       color,
       points: detail.weeklyByModel.map(([week, rows]) => {
         const found = rows.find(([name]) => name === model);
-        return [week, found ? found[1] / 1000000 : 0];
+        return [week, found ? found[1] : 0];
       }),
       tip: (time, value) =>
-        `${model} | week from ${dateText(new Date(time))}: ${tokens(
-          Math.round(value * 1000000)
-        )}`,
+        `${modelName(model)} | week from ${dateText(new Date(time))}: ${tokens(Math.round(value))}`,
     }));
     const chart = h("div", { class: "stats-detail-chart stats-model-chart" });
-    chart.appendChild(lines({ series, ySuffix: " M", yDecimals: 0 }));
+    if (series.length === 0) chart.appendChild(emptyLine("no session in the range"));
+    else chart.appendChild(lines({ series, yFormat: (value) => tokens(Math.round(value)), yDecimals: 0 }));
     card.appendChild(chart);
     return card;
   }
@@ -420,9 +433,6 @@ export async function show(container, env) {
   }
 
   paint();
-  const atlas = data.nodes.find(
-    (node) => node.kind === "project" && node.name === "atlas" && node.key !== null
-  );
-  const first = atlas || data.nodes.find((node) => node.kind === "project" && node.key !== null);
+  const first = data.nodes.find((node) => node.kind === "project" && node.key !== null);
   if (first) await selectDetail(first.key);
 }

@@ -4,14 +4,20 @@
 
 import {
   accountName,
+  accountNameText,
   accountView,
-  amountText,
+  amountNode,
+  amountTip,
   clear,
   dateText,
+  emptyLine,
   h,
   hoursText,
   isColor,
+  kpi,
+  legendItem,
   percentText,
+  shortDate,
 } from "../../common.js";
 import { lines, stackedColumns } from "../../charts.js";
 
@@ -23,15 +29,11 @@ const PROJECT_TOKENS = [
   "var(--muted)",
 ];
 
-function shortDate(value) {
-  return dateText(value).replace(/^\S+\s+/, "");
-}
-
 function projectColours(weeks) {
   const colours = new Map();
   let index = 0;
   for (const week of weeks) {
-    for (const [name] of Array.isArray(week.projects) ? week.projects : []) {
+    for (const [name] of week.projects) {
       if (colours.has(name)) continue;
       if (name === "other") colours.set(name, "var(--muted)");
       else {
@@ -41,31 +43,6 @@ function projectColours(weeks) {
     }
   }
   return colours;
-}
-
-function legendItem(colour, name, hatch) {
-  const box = h("span", {
-    class: `stats-legend-box${hatch ? " stats-legend-box-hatch" : ""}`,
-    style: { "--stats-legend-color": colour },
-  });
-  return h(
-    "span",
-    { class: "stats-legend-item", title: name },
-    [box, h("span", { class: "stats-legend-name", text: name })]
-  );
-}
-
-function kpi(label, value, sub, tip, valueClass) {
-  const node = h("div", { class: "stats-kpi" }, [
-    h("span", { class: "stats-kpi-label", text: label }),
-    h("span", {
-      class: `stats-kpi-value${valueClass ? ` ${valueClass}` : ""}`,
-      text: value,
-    }),
-    sub ? h("span", { class: "stats-kpi-sub" }, sub) : null,
-  ]);
-  node.title = tip;
-  return node;
 }
 
 function switchText(switches) {
@@ -82,12 +59,11 @@ export async function show(container, env) {
 
   const kpis = h("div", { class: "stats-kpis" });
   const expiredRows = [];
-  for (const [id, amount] of Array.isArray(data.kpis.expiredByAccount)
-    ? data.kpis.expiredByAccount
-    : []) {
+  for (const [id, amount] of data.kpis.expiredByAccount) {
     if (expiredRows.length > 0) expiredRows.push(" · ");
-    expiredRows.push(accountName(env.accounts, id), ` ${amountText(amount, currency)}`);
+    expiredRows.push(accountName(env.accounts, id), ` ${amountTip(amount, currency)}`);
   }
+  if (expiredRows.length === 0) expiredRows.push("— · no account expired money in the range");
   const cost =
     typeof data.kpis.switchCostPercentOfWindow === "number"
       ? ` · a switch costs ${percentText(data.kpis.switchCostPercentOfWindow)} of its 5 h window`
@@ -95,15 +71,15 @@ export async function show(container, env) {
   kpis.appendChild(
     kpi(
       "Used",
-      amountText(data.kpis.used, currency),
-      `of ${amountText(data.kpis.paid, currency)} paid for the chosen weeks`,
+      amountNode(data.kpis.used, currency),
+      h("span", {}, ["of ", amountNode(data.kpis.paid, currency), " paid for the chosen weeks"]),
       "Used | money used of the priced account weeks; an account without a price is left out"
     )
   );
   kpis.appendChild(
     kpi(
       "Expired unused",
-      amountText(data.kpis.expired, currency),
+      amountNode(data.kpis.expired, currency),
       expiredRows,
       "Expired unused | quota left at a weekly reset, in money; per account, largest first"
     )
@@ -140,7 +116,11 @@ export async function show(container, env) {
   const weeksCard = h("div", { class: "hcard stats-weeks-card" });
   const weeksHead = h("div", { class: "ch" }, [
     h("span", { class: "t", text: "Each week: by account, and by project" }),
-    h("span", { class: "s", text: currency || "—" }),
+    h("span", {
+      class: "s",
+      text: currency || "—",
+      title: currency ? undefined : "no currency set in Settings",
+    }),
     h("span", { class: "sp" }),
   ]);
   const legend = h("div", { class: "stats-legend" });
@@ -162,10 +142,10 @@ export async function show(container, env) {
     // account's hatched expired piece stands above the used pieces of the stack.
     const expiredStack = [];
     const usedStack = [];
-    for (const account of Array.isArray(week.accounts) ? week.accounts : []) {
+    for (const account of week.accounts) {
       const view = accountView(env.accounts, account.id);
       const color = view && isColor(view.color) ? view.color : "var(--muted)";
-      const name = accountName(env.accounts, account.id).textContent;
+      const name = accountNameText(env.accounts, account.id);
       if (account.expired !== null && account.expired !== undefined) {
         expiredStack.push({
           value: account.expired,
@@ -173,7 +153,7 @@ export async function show(container, env) {
           hatch: true,
           tip: `${name} · week from ${label} | expired ${percentText(
             account.expiredPercent
-          )} = ${amountText(account.expired, currency)}${
+          )} = ${amountTip(account.expired, currency)}${
             account.uncertain ? " | uncertain: seatswap was off at the reset" : ""
           }`,
         });
@@ -184,14 +164,14 @@ export async function show(container, env) {
           color,
           tip: `${name} · week from ${label} | used ${percentText(
             account.usedPercent
-          )} = ${amountText(account.used, currency)}`,
+          )} = ${amountTip(account.used, currency)}`,
         });
       }
     }
     const projectStack = week.projects.map(([name, value]) => ({
       value,
       color: colours.get(name) || "var(--muted)",
-      tip: `${name} · week from ${label} | ${amountText(value, currency)}`,
+      tip: `${name} · week from ${label} | ${amountTip(value, currency)}`,
     }));
     return {
       label,
@@ -202,12 +182,16 @@ export async function show(container, env) {
   });
 
   const chartBody = h("div", { class: "stats-chart-body" });
-  chartBody.appendChild(
-    stackedColumns({
-      columns,
-      marks: (data.marks || []).map((mark) => ({ at: mark.at, label: mark.label })),
-    })
-  );
+  if (data.weeks.length === 0) {
+    chartBody.appendChild(emptyLine("no week in the range"));
+  } else {
+    chartBody.appendChild(
+      stackedColumns({
+        columns,
+        marks: data.marks.map((mark) => ({ at: mark.at, label: mark.label })),
+      })
+    );
+  }
   weeksCard.appendChild(chartBody);
   root.appendChild(weeksCard);
 
@@ -217,11 +201,15 @@ export async function show(container, env) {
     h("div", { class: "ch" }, [h("span", { class: "t", text: "What the numbers say" })])
   );
   const findingsBody = h("div", { class: "stats-body" });
-  const list = h("ul", { class: "stats-findings" });
-  for (const finding of Array.isArray(data.findings) ? data.findings : []) {
-    list.appendChild(h("li", { text: finding }));
+  if (data.findings.length === 0) {
+    findingsBody.appendChild(emptyLine("no finding in the range"));
+  } else {
+    const list = h("ul", { class: "stats-findings" });
+    for (const finding of data.findings) {
+      list.appendChild(h("li", { text: finding }));
+    }
+    findingsBody.appendChild(list);
   }
-  findingsBody.appendChild(list);
   findingsCard.appendChild(findingsBody);
   side.appendChild(findingsCard);
 
@@ -233,28 +221,32 @@ export async function show(container, env) {
     ])
   );
   const shareBody = h("div", { class: "stats-chart-body" });
-  shareBody.appendChild(
-    lines({
-      series: [
-        {
-          name: "expired",
-          color: "var(--warn)",
-          area: true,
-          points: data.weeks.map((week) => [week.week, week.expiredShare]),
-          tip: (time, value) =>
-            `expired | week from ${dateText(new Date(time))}: ${percentText(value)} of the value`,
-        },
-      ],
-      yMax: 100,
-      ySuffix: " %",
-      marks: (data.marks || []).map((mark) => ({ at: mark.at, label: mark.label })),
-    })
-  );
+  if (data.weeks.length === 0) {
+    shareBody.appendChild(emptyLine("no week in the range"));
+  } else {
+    shareBody.appendChild(
+      lines({
+        series: [
+          {
+            name: "expired",
+            color: "var(--warn)",
+            area: true,
+            points: data.weeks.map((week) => [week.week, week.expiredShare]),
+            tip: (time, value) =>
+              `expired | week from ${dateText(new Date(time))}: ${percentText(value)} of the value`,
+          },
+        ],
+        yMax: 100,
+        ySuffix: " %",
+        marks: data.marks.map((mark) => ({ at: mark.at, label: mark.label })),
+      })
+    );
+  }
   shareCard.appendChild(shareBody);
   side.appendChild(shareCard);
   root.appendChild(side);
 
-  if (Array.isArray(data.withoutPrice) && data.withoutPrice.length > 0) {
+  if (data.withoutPrice.length > 0) {
     const note = h("p", { class: "stats-note" }, ["No price for "]);
     for (const [index, id] of data.withoutPrice.entries()) {
       if (index > 0) note.appendChild(document.createTextNode(", "));

@@ -7,6 +7,7 @@
 // `time_texts` command; durations are counted here from the view's times.
 
 import {
+  MODEL_NAMES,
   TRAY_GREY,
   clear,
   contrastText,
@@ -38,16 +39,6 @@ const GROUPINGS = [
 
 const DEPARTED_FOR_MS = 60000;
 const MARK_FOR_MS = 3000;
-
-const MODEL_NAMES = {
-  "claude-opus-5-5": "Opus 5.5",
-  "claude-opus-5-4": "Opus 5.4",
-  "claude-fable-5-2": "Fable 5.2",
-  "claude-fable-5-1": "Fable 5.1",
-  "claude-mythos-5-2": "Mythos 5.2",
-  "claude-sonnet-5-5": "Sonnet 5.5",
-  "claude-haiku-5-5": "Haiku 5.5",
-};
 
 const state = {
   active: false,

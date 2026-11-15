@@ -3,7 +3,7 @@
 // in (an account's colour is its view's colour). The one tooltip of every chart
 // lives here: a mark with a `tip` shows it on hover and on keyboard focus.
 
-import { clear, dateText, h } from "./common.js";
+import { WEEKDAYS, appendChildren, clear, dateText, h } from "./common.js";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 
@@ -159,6 +159,14 @@ function markLayer(marks, leftOf, className) {
     const left = leftOf(mark.at);
     if (left === null) continue;
     const line = h("div", { class: "chart-mark", style: { left } });
+    // A label at the chart's edge is aligned inwards so it stays inside its box.
+    const percent = Number.parseFloat(left);
+    line.dataset.align =
+      Number.isFinite(percent) && percent < 10
+        ? "start"
+        : Number.isFinite(percent) && percent > 90
+          ? "end"
+          : "middle";
     line.appendChild(
       h("span", { class: "chart-mark-label", text: String(mark.label), title: String(mark.label) })
     );
@@ -174,7 +182,6 @@ function markLayer(marks, leftOf, className) {
 export function stackedColumns({ columns, marks } = {}) {
   if (!Array.isArray(columns)) throw new Error("stackedColumns needs a list of columns");
   const root = h("div", { class: "chart chart-cols" });
-  const markHost = h("div", { class: "chart-marks" });
   const body = h("div", { class: "chart-cols-body" });
 
   let maxTotal = 0;
@@ -223,10 +230,11 @@ export function stackedColumns({ columns, marks } = {}) {
   const columnTimes = columns
     .map((column) => timeOf(column.at))
     .filter((time) => time !== null);
-  const layer = markLayer(marks, (at) => markPosition(at, columnTimes));
-  if (layer) markHost.appendChild(layer);
-  if (markHost.childNodes.length > 0) root.appendChild(markHost);
+  const layer = markLayer(marks, (at) => markPosition(at, columnTimes), "chart-marks chart-marks-cols");
+  // The marks come after the columns so their labels lie above them, as in the
+  // mock-up (Task 8, part 3, item 7).
   root.appendChild(body);
+  if (layer) root.appendChild(layer);
   return root;
 }
 
@@ -234,7 +242,7 @@ export function stackedColumns({ columns, marks } = {}) {
 // lines — the expired share and the curves
 // ---------------------------------------------------------------------------
 
-export function lines({ series, yMax, marks, ySuffix, yDecimals } = {}) {
+export function lines({ series, yMax, marks, ySuffix, yDecimals, yFormat } = {}) {
   if (!Array.isArray(series)) throw new Error("lines needs a list of series");
   const root = h("div", { class: "chart chart-lines" });
   const plot = h("div", { class: "chart-plot" });
@@ -268,7 +276,10 @@ export function lines({ series, yMax, marks, ySuffix, yDecimals } = {}) {
       h("div", {
         class: "chart-y",
         style: { bottom: `${clampPercent(bottom)}%` },
-        text: `${value.toFixed(decimals)}${suffix}`,
+        text:
+          typeof yFormat === "function"
+            ? String(yFormat(value))
+            : `${value.toFixed(decimals)}${suffix}`,
       })
     );
   }
@@ -380,16 +391,18 @@ export function lines({ series, yMax, marks, ySuffix, yDecimals } = {}) {
 // bars — one bar per category and series
 // ---------------------------------------------------------------------------
 
-export function bars({ categories, series } = {}) {
+export function bars({ categories, series, labelEvery } = {}) {
   if (!Array.isArray(categories)) throw new Error("bars needs a list of categories");
   if (!Array.isArray(series)) throw new Error("bars needs a list of series");
   const root = h("div", { class: "chart chart-bars" });
   const legend = h("div", { class: "chart-legend" });
   for (const entry of series) {
+    const name = h("span", {});
+    appendChildren(name, entry.name === undefined || entry.name === null ? "" : entry.name);
     legend.appendChild(
       h("span", { class: "chart-legend-item" }, [
         h("span", { class: "chart-legend-box", style: { background: entry.color } }),
-        h("span", { text: String(entry.name ?? "") }),
+        name,
       ])
     );
   }
@@ -403,6 +416,7 @@ export function bars({ categories, series } = {}) {
     }
   }
   const scale = max > 0 ? max : 1;
+  const labelStep = Number.isInteger(labelEvery) && labelEvery > 0 ? labelEvery : 1;
   for (const [index, category] of categories.entries()) {
     const group = h("div", { class: "chart-bar-group" });
     for (const entry of series) {
@@ -413,12 +427,21 @@ export function bars({ categories, series } = {}) {
         class: "chart-bar",
         style: { height: `${(value / scale) * 100}%`, background: entry.color },
       });
-      attachTip(bar, `${category} | ${entry.name}: ${value}`);
+      const unit = typeof entry.unit === "string" ? entry.unit : "";
+      const tip =
+        typeof entry.tip === "function"
+          ? entry.tip(category, value)
+          : `${category} | ${entry.name}: ${value}${unit}`;
+      attachTip(bar, tip);
       group.appendChild(bar);
     }
     const col = h("div", { class: "chart-bar-col" }, [
       group,
-      h("span", { class: "chart-col-label", text: String(category), title: String(category) }),
+      h("span", {
+        class: "chart-col-label",
+        text: index % labelStep === 0 ? String(category) : "",
+        title: String(category),
+      }),
     ]);
     body.appendChild(col);
   }
@@ -496,6 +519,221 @@ export function grid({ rows, headers } = {}) {
       rowNode.appendChild(node);
     }
     root.appendChild(rowNode);
+  }
+  return root;
+}
+
+// ---------------------------------------------------------------------------
+// heat — the Rhythm page's 7 × 24 hour map
+// ---------------------------------------------------------------------------
+
+// `values` is row-major, 7 rows of 24 columns, Monday first. The colour strength
+// is the value over the largest one. `tip(row, col, value)` writes the tooltip;
+// the page knows the weekday and hour names.
+export function heat({ rows = 7, cols = 24, values, tip } = {}) {
+  if (!Array.isArray(values)) throw new Error("heat needs a list of values");
+  const expected = rows * cols;
+  if (values.length !== expected) {
+    throw new Error(`heat needs ${expected} values, got ${values.length}`);
+  }
+  let max = 0;
+  for (const value of values) {
+    if (finite(value) && value > max) max = value;
+  }
+  const root = h("div", { class: "chart chart-heat" });
+  root.style.setProperty("--chart-heat-columns", `repeat(${cols}, minmax(0, 1fr))`);
+
+  const axis = h("div", { class: "chart-heat-row chart-heat-axis" });
+  axis.appendChild(h("span", { class: "chart-heat-day" }));
+  for (let col = 0; col < cols; col += 1) {
+    axis.appendChild(
+      h("span", {
+        class: "chart-heat-hour",
+        text: col % 3 === 0 ? String(col) : "",
+      })
+    );
+  }
+  root.appendChild(axis);
+
+  for (let row = 0; row < rows; row += 1) {
+    const line = h("div", { class: "chart-heat-row" });
+    line.appendChild(
+      h("span", { class: "chart-heat-day", text: WEEKDAYS[row] !== undefined ? WEEKDAYS[row] : "" })
+    );
+    for (let col = 0; col < cols; col += 1) {
+      const value = values[row * cols + col];
+      const strength = finite(value) && max > 0 ? clampPercent((value / max) * 100) : 0;
+      const cell = h("div", {
+        class: "chart-heat-cell",
+        style: { "--chart-heat-strength": `${strength}%` },
+      });
+      if (typeof tip === "function") attachTip(cell, tip(row, col, value));
+      line.appendChild(cell);
+    }
+    root.appendChild(line);
+  }
+  return root;
+}
+
+// ---------------------------------------------------------------------------
+// lanes — the Forecast's timeline of the next 7 days
+// ---------------------------------------------------------------------------
+
+// One lane per account: `blocks` are [from, to] pairs, `marks` single times.
+// `color` on a lane paints its blocks; `blockTips` and `markTips` (parallel
+// lists) write their tooltips. `ticks` are { at, label } day ticks.
+export function lanes({ lanes, from, to, ticks } = {}) {
+  if (!Array.isArray(lanes)) throw new Error("lanes needs a list of lanes");
+  const start = timeOf(from);
+  const end = timeOf(to);
+  if (start === null || end === null || end <= start) {
+    throw new Error("lanes needs a from before its to");
+  }
+  const xOf = (time) => clampPercent(((time - start) / (end - start)) * 100);
+  const root = h("div", { class: "chart chart-lanes" });
+
+  const axis = h("div", { class: "chart-lanes-row chart-lanes-axis" });
+  axis.appendChild(h("span", { class: "chart-lanes-label" }));
+  const axisTrack = h("div", { class: "chart-lanes-track" });
+  for (const tick of Array.isArray(ticks) ? ticks : []) {
+    const at = timeOf(tick && tick.at !== undefined ? tick.at : tick);
+    if (at === null || at < start || at > end) continue;
+    const mark = h("span", {
+      class: "chart-lanes-tick",
+      style: { left: `${xOf(at)}%` },
+      text: String(tick && tick.label !== undefined ? tick.label : ""),
+    });
+    axisTrack.appendChild(mark);
+  }
+  axis.appendChild(axisTrack);
+  root.appendChild(axis);
+
+  for (const lane of lanes) {
+    const row = h("div", { class: `chart-lanes-row${lane.className ? ` ${lane.className}` : ""}` });
+    const label = h("span", { class: "chart-lanes-label" });
+    if (lane.label !== undefined && lane.label !== null) {
+      if (typeof lane.label === "string" || typeof lane.label === "number") {
+        label.appendChild(document.createTextNode(String(lane.label)));
+      } else {
+        label.appendChild(lane.label);
+      }
+    }
+    row.appendChild(label);
+    const track = h("div", { class: "chart-lanes-track" });
+    const blocks = Array.isArray(lane.blocks) ? lane.blocks : [];
+    for (const [index, block] of blocks.entries()) {
+      if (!Array.isArray(block) || block.length < 2) continue;
+      const blockStart = timeOf(block[0]);
+      const blockEnd = timeOf(block[1]);
+      if (blockStart === null || blockEnd === null || blockEnd <= blockStart) continue;
+      // A block shorter than the axis's width still gets a visible sliver.
+      const left = xOf(Math.max(start, blockStart));
+      const width = Math.max(0.35, xOf(Math.min(end, blockEnd)) - left);
+      const piece = h("i", {
+        style: { left: `${left}%`, width: `${width}%`, background: lane.color },
+      });
+      const tip = Array.isArray(lane.blockTips) ? lane.blockTips[index] : undefined;
+      attachTip(piece, tip);
+      track.appendChild(piece);
+    }
+    const marks = Array.isArray(lane.marks) ? lane.marks : [];
+    for (const [index, mark] of marks.entries()) {
+      const at = timeOf(mark);
+      if (at === null || at < start || at > end) continue;
+      const line = h("u", { style: { left: `${xOf(at)}%` } });
+      const tip = Array.isArray(lane.markTips) ? lane.markTips[index] : undefined;
+      attachTip(line, tip);
+      track.appendChild(line);
+    }
+    row.appendChild(track);
+    root.appendChild(row);
+  }
+  return root;
+}
+
+// ---------------------------------------------------------------------------
+// hours — the Activity page's hour-per-host lanes
+// ---------------------------------------------------------------------------
+
+// One lane per host; `cells` is one per hour, oldest first. A cell's `state` is
+// "work", "idle", "off" or "unknown". Its `stack` (a list of { value, color })
+// is the bar of that hour, and `strip` the number of sessions working in it.
+// `days` is the axis: { label, span } per day boundary.
+export function hours({ lanes, days } = {}) {
+  if (!Array.isArray(lanes)) throw new Error("hours needs a list of lanes");
+  const firstCells = lanes.length > 0 && Array.isArray(lanes[0].cells) ? lanes[0].cells : [];
+  const count = firstCells.length;
+
+  let maxStack = 0;
+  let maxStrip = 0;
+  for (const lane of lanes) {
+    for (const cell of Array.isArray(lane.cells) ? lane.cells : []) {
+      let total = 0;
+      for (const segment of Array.isArray(cell && cell.stack) ? cell.stack : []) {
+        if (finite(segment && segment.value) && segment.value > 0) total += segment.value;
+      }
+      if (total > maxStack) maxStack = total;
+      if (finite(cell && cell.strip) && cell.strip > maxStrip) maxStrip = cell.strip;
+    }
+  }
+
+  const root = h("div", { class: "chart chart-hours" });
+  const axis = h("div", { class: "chart-hours-row chart-hours-axis" });
+  axis.appendChild(h("span", { class: "chart-hours-label" }));
+  const axisTrack = h("div", { class: "chart-hours-dayaxis" });
+  for (const day of Array.isArray(days) ? days : []) {
+    if (!day) continue;
+    const span = Number.isFinite(day.span) ? Math.max(1, Math.round(day.span)) : 1;
+    axisTrack.appendChild(
+      h("span", { class: "chart-hours-day", style: { flex: String(span) }, text: String(day.label ?? "") })
+    );
+  }
+  axis.appendChild(axisTrack);
+  root.appendChild(axis);
+
+  for (const lane of lanes) {
+    const row = h("div", { class: "chart-hours-row" });
+    const label = h("span", { class: "chart-hours-label" });
+    if (lane.label !== undefined && lane.label !== null) {
+      if (typeof lane.label === "string" || typeof lane.label === "number") {
+        label.appendChild(document.createTextNode(String(lane.label)));
+      } else {
+        label.appendChild(lane.label);
+      }
+    }
+    row.appendChild(label);
+    const track = h("div", { class: "chart-hours-track" });
+    const cells = h("div", { class: "chart-hours-cells" });
+    const strip = h("div", { class: "chart-hours-strip" });
+    for (let index = 0; index < count; index += 1) {
+      const cell = Array.isArray(lane.cells) ? lane.cells[index] : undefined;
+      const state = cell && typeof cell.state === "string" ? cell.state : "unknown";
+      const node = h("div", { class: `chart-hours-cell chart-hours-${state}` });
+      const stack = h("div", { class: "chart-hours-stack" });
+      for (const segment of Array.isArray(cell && cell.stack) ? cell.stack : []) {
+        if (!segment || !finite(segment.value) || segment.value <= 0) continue;
+        const height = maxStack > 0 ? clampPercent((segment.value / maxStack) * 100) : 0;
+        stack.appendChild(
+          h("i", { style: { height: `${height}%`, background: segment.color } })
+        );
+      }
+      node.appendChild(stack);
+      if (cell && typeof cell.tip === "string") attachTip(node, cell.tip);
+      cells.appendChild(node);
+
+      const sessions = finite(cell && cell.strip) ? cell.strip : 0;
+      const stripCell = h("div", { class: "chart-hours-stripcell" });
+      if (sessions > 0 && maxStrip > 0) {
+        stripCell.appendChild(
+          h("i", { style: { height: `${clampPercent((sessions / maxStrip) * 100)}%` } })
+        );
+      }
+      strip.appendChild(stripCell);
+    }
+    track.appendChild(cells);
+    track.appendChild(strip);
+    row.appendChild(track);
+    root.appendChild(row);
   }
   return root;
 }
