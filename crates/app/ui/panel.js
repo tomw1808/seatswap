@@ -12,6 +12,7 @@ import {
   clear,
   contrastText,
   errorMessage,
+  followTheme,
   h,
   isColor,
   isObject,
@@ -162,20 +163,6 @@ function loginWarningText(warning) {
   if (warning.kind === "tomorrow") return `${name} — login ends tomorrow`;
   if (warning.kind === "ended") return `${name} — login ended, log in again`;
   return "";
-}
-
-// ---------------------------------------------------------------------------
-// theme
-// ---------------------------------------------------------------------------
-
-function wireTheme() {
-  if (!window.matchMedia) return;
-  const media = window.matchMedia("(prefers-color-scheme: dark)");
-  if (typeof media.addEventListener === "function") {
-    media.addEventListener("change", () => {
-      if (currentThemeSetting() === "system") applyTheme("system");
-    });
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1477,7 +1464,7 @@ function handleSnapshot(snapshot) {
 
 async function boot() {
   wireStatic();
-  wireTheme();
+  followTheme(currentThemeSetting);
   if (!HAS_TAURI) ensureFixture();
   applyTheme(currentThemeSetting());
   setView(viewFromHash(), { noHash: true });
@@ -1487,8 +1474,7 @@ async function boot() {
     const view = typeof payload === "string" ? payload : payload && payload.view;
     // Sent each time the pop-up opens: start without a keyboard cursor.
     state.cursorId = null;
-    if (view === "settings") openSettings();
-    else if (view === "main" || view === "add") setView(view);
+    if (view === "main" || view === "add") setView(view);
   });
 
   try {

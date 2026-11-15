@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Datelike, Local, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
-use tauri::webview::PageLoadEvent;
 use tauri::{
     AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, State, WebviewUrl, WebviewWindow,
     WebviewWindowBuilder, WindowEvent,
@@ -204,7 +203,7 @@ pub(crate) fn preload(app: &AppHandle) -> Result<(), String> {
 
 /// Show the panel, creating it on first use, and ask it to navigate to `view`.
 pub(crate) fn show(app: &AppHandle, view: &str) -> Result<(), String> {
-    if !matches!(view, "main" | "add" | "settings") {
+    if !matches!(view, "main" | "add") {
         return Err(format!("unknown panel view {view:?}"));
     }
     let (window, created) = match app.get_webview_window(PANEL_LABEL) {
@@ -304,11 +303,8 @@ fn create(app: &AppHandle, view: &str) -> Result<WebviewWindow, String> {
         .skip_taskbar(true)
         .visible(false)
         .focused(false)
-        .on_page_load(move |window, payload| {
-            if payload.event() == PageLoadEvent::Finished {
-                let _ = window.eval(format!("window.location.hash = {initial:?};"));
-            }
-        })
+        // Before the page's scripts run, so the pop-up opens on its view.
+        .initialization_script(format!("window.location.hash = {initial:?};"))
         .build()
         .map_err(|error| error.to_string())?;
 

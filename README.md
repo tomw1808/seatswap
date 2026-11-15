@@ -150,7 +150,7 @@ Clicking an account's badge or ✎ in the pop-up opens that editor.
 | Action | Effect |
 |---|---|
 | Left click on the icon | Open or close the pop-up |
-| Right click | Menu: one entry per account (click to switch), *Open panel…*, *Add account…*, *Settings…* (the large window), *Quit* |
+| Right click | Menu: one entry per account (click to switch), *Open panel…*, *Add account…*, *Settings…*, *Open seatswap…* (the large window), *Quit* |
 | Hover | Tooltip with the active account's session and weekly usage |
 | In the pop-up | ↑/↓ move, Enter switches, 1–9 switch directly, `,` settings in the large window, Esc closes |
 | Account badge or ✎ | That account's editor in the large window (*Settings → Accounts*) |

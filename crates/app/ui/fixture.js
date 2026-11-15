@@ -304,6 +304,7 @@ function makeFixture() {
       planned: { [labId]: isoIn(2 * hour) },
       waiting: { to: privateId, latest: isoIn(40 * 60000), tiedBusy: 1 },
       suggestion: null,
+      manualHoldH: 4,
       measured: {
         windowPercentOfWeek: {
           [privateId]: 8.6,
@@ -364,6 +365,7 @@ function makeFixture() {
       currency: "EUR",
       rate: { value: 0.9048, date: "2026-11-13", own: false },
       lookUp: true,
+      providers: ["anthropic", "openai", "ollama-cloud"],
       modelsWithPrice: 4,
       pricesCheckedAt: isoIn(-2 * 3600000),
       lastChange: {

@@ -811,12 +811,6 @@ text.lv-locked {
   font-weight: 600;
 }
 
-.view-version {
-  font-size: 11px;
-  color: var(--muted);
-  font-variant-numeric: tabular-nums;
-}
-
 .steps {
   margin: 0;
   padding-left: 18px;
@@ -852,92 +846,6 @@ text.lv-locked {
   flex-direction: column;
   gap: 5px;
   margin-top: 6px;
-}
-
-.settings {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.setting {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 148px;
-  align-items: center;
-  column-gap: 9px;
-  row-gap: 3px;
-  font-size: 11.5px;
-}
-
-.setting-label {
-  min-width: 0;
-}
-
-.setting-label .sub {
-  display: block;
-  color: var(--muted);
-  font-size: 9.5px;
-  line-height: 1.3;
-}
-
-.setting-control {
-  display: flex;
-  justify-content: flex-end;
-  align-items: center;
-  gap: 5px;
-  min-width: 0;
-}
-
-.setting-control input[type="number"] {
-  width: 84px;
-  text-align: right;
-  font-variant-numeric: tabular-nums;
-}
-
-.number-control {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 5px;
-  min-width: 0;
-}
-
-.setting-control .unit {
-  color: var(--muted);
-  font-size: 10px;
-  min-width: 14px;
-}
-
-.setting-note {
-  grid-column: 1 / -1;
-  color: var(--muted);
-  font-size: 9.5px;
-  line-height: 1.4;
-}
-
-.setting-group {
-  margin-top: 2px;
-  color: var(--muted);
-  font-size: 9.5px;
-  font-weight: 600;
-  letter-spacing: 0.06em;
-  line-height: 1.3;
-  text-transform: uppercase;
-}
-
-.hotkey-note {
-  grid-column: 1 / -1;
-  padding: 6px 8px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--hover);
-  color: var(--muted);
-  font-size: 10px;
-  line-height: 1.45;
-}
-
-.hotkey-note code {
-  color: var(--text);
 }
 
 .settings-actions {

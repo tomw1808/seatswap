@@ -508,26 +508,28 @@ function toggle(field, label, words = true) {
   return control.node;
 }
 
+// What a number field holds, for the Rust side to check: its number when the
+// text is a number, the text itself when it is not, and null when it is empty.
+function typedNumber(raw) {
+  const text = String(raw).trim();
+  if (text === "") return null;
+  const value = Number(text);
+  return Number.isFinite(value) ? value : text;
+}
+
 function numberField(field, label, options) {
   const value = savedValue(field);
   const input = h("input", {
     type: "number",
     class: "inp num",
     value: value === null || value === undefined ? "" : String(value),
-    min: String(options.min),
     step: String(options.step || 1),
     "aria-label": label,
   });
   const save = async () => {
-    const raw = input.value.trim();
-    const number = Number(raw);
-    if (raw === "" || !Number.isInteger(number) || number < options.min) {
-      fieldError(field, `${label} must be a whole number of at least ${options.min}.`);
-      input.value = String(savedValue(field));
-      return;
-    }
-    await saveField(field, number);
-    input.value = String(savedValue(field));
+    await saveField(field, typedNumber(input.value));
+    const saved = savedValue(field);
+    input.value = saved === null || saved === undefined ? "" : String(saved);
   };
   input.addEventListener("change", save);
   input.addEventListener("keydown", (event) => {
@@ -542,22 +544,45 @@ function numberField(field, label, options) {
   ]);
 }
 
-function textField(field, label, placeholder) {
+const RESTART_NOTE = "takes effect after the tray app restarts";
+
+// The one text-setting field. `options` holds `placeholder`, `note` (shown
+// under the row), `restart` (true when the saved value differs from the one in
+// effect: the restart note then replaces `note`) and `width`. Every text
+// setting saves the same way; a history field reads its view again afterwards.
+function textField(field, label, options) {
+  const settings = options || {};
   const value = savedValue(field);
   const input = textInput({
     value: value === null || value === undefined ? "" : String(value),
-    placeholder,
+    placeholder: settings.placeholder,
     "aria-label": label,
   });
   input.className = "inp tall";
+  if (settings.width) input.style.width = `${settings.width}px`;
+  const noteNode = h("span", { class: "mf" });
+  const showNote = () => {
+    noteNode.textContent = settings.restart === true ? RESTART_NOTE : settings.note || "";
+  };
   input.addEventListener("change", async () => {
     const raw = input.value.trim();
     const next = raw === "" ? null : raw;
     const ok = await saveField(field, next);
-    if (!ok) input.value = savedValue(field) || "";
-    else input.value = next || "";
+    if (!ok) {
+      input.value = savedValue(field) || "";
+      showNote();
+      return;
+    }
+    input.value = next || "";
+    if (settings.restart !== undefined) {
+      // The saved value now differs from the one in effect; read the view again
+      // so the note and the placeholders come from the command, not the page.
+      await loadHistory();
+      if (state.group === "history" && state.right) renderGroup(state.right, "history");
+    }
   });
-  return input;
+  showNote();
+  return setting(label, input, noteNode, field);
 }
 
 // ---------------------------------------------------------------------------
@@ -844,7 +869,6 @@ function ownRateRow() {
     type: "number",
     class: "inp num",
     value: typeof ownValue === "number" ? String(ownValue) : "",
-    min: "0",
     step: "0.0001",
     "aria-label": "Use my own rate",
     disabled: !code || code === "USD",
@@ -865,17 +889,8 @@ function ownRateRow() {
       reset();
       return;
     }
-    const raw = input.value.trim();
-    let next = null;
-    if (raw !== "") {
-      const value = Number(raw);
-      if (!Number.isFinite(value) || value <= 0) {
-        fieldError("usdRate", "The rate must be a number above 0.");
-        reset();
-        return;
-      }
-      next = { currency: code, value };
-    }
+    const value = typedNumber(input.value);
+    const next = value === null ? null : { currency: code, value };
     const ok = await saveField("usdRate", next);
     if (!ok) {
       reset();
@@ -1078,21 +1093,11 @@ function resetPriceInputs(row, inputs) {
   }
 }
 
-async function savePrice(row, inputs, labels) {
+async function savePrice(row, inputs) {
   const field = `price:${row.key}`;
   const price = { tiered: Boolean(row.tiered) };
   for (const [property, input] of Object.entries(inputs)) {
-    const raw = input.value.trim();
-    const value = Number(raw);
-    if (raw === "" || !Number.isFinite(value) || value < 0) {
-      fieldError(
-        field,
-        `The ${labels[property]} price must be a number of 0 or more.`
-      );
-      resetPriceInputs(row, inputs);
-      return;
-    }
-    price[property] = value;
+    price[property] = typedNumber(input.value);
   }
   try {
     await state.context.invoke("set_price_override", { key: row.key, price });
@@ -1134,11 +1139,10 @@ function priceRow(row, times) {
       type: "number",
       class: "inp num price-field",
       value: priceInputValue(row, property),
-      min: "0",
       step: "any",
       "aria-label": `${label} price for ${row.key}`,
     });
-    input.addEventListener("change", () => savePrice(row, inputs, labels));
+    input.addEventListener("change", () => savePrice(row, inputs));
     inputs[property] = input;
     grid.appendChild(h("span", { class: "price-value" }, [input]));
   }
@@ -1173,15 +1177,18 @@ function priceRow(row, times) {
 }
 
 // An own price for any model (spec §1.4.1), including one models.dev does not
-// list: the key is `<provider>/<model id>`, the provider one of the three the
-// look-up reads. The server checks the same rule and refuses another key.
-const PRICE_PROVIDERS = ["anthropic", "openai", "ollama-cloud"];
-
+// list: the key is `<provider>/<model id>`. The providers come from the money
+// view (`money::PRICE_PROVIDERS`); the server refuses a bad key or price.
 function addModelRow() {
   const field = "price:new";
+  const money = isObject(state.money) ? state.money : null;
+  const providers =
+    money && Array.isArray(money.providers)
+      ? money.providers.filter((name) => typeof name === "string" && name !== "")
+      : [];
   const provider = selectInput(
-    PRICE_PROVIDERS.map((name) => [name, name]),
-    PRICE_PROVIDERS[0],
+    providers.map((name) => [name, name]),
+    providers[0],
     () => {}
   );
   provider.setAttribute("aria-label", "Model provider");
@@ -1206,7 +1213,6 @@ function addModelRow() {
       type: "number",
       class: "inp num price-field",
       value: "0",
-      min: "0",
       step: "any",
       "aria-label": `${table} price for the new model`,
     });
@@ -1217,22 +1223,9 @@ function addModelRow() {
   grid.appendChild(h("span", { class: "price-marks" }, [add]));
   add.addEventListener("click", async () => {
     const modelId = model.value.trim();
-    if (modelId === "") {
-      fieldError(field, "A model id is needed after the provider.");
-      return;
-    }
     const price = { tiered: false };
     for (const [property, input] of Object.entries(inputs)) {
-      const raw = input.value.trim();
-      const value = Number(raw);
-      if (raw === "" || !Number.isFinite(value) || value < 0) {
-        fieldError(
-          field,
-          `The ${labels[property]} price must be a number of 0 or more.`
-        );
-        return;
-      }
-      price[property] = value;
+      price[property] = typedNumber(input.value);
     }
     const key = `${provider.value}/${modelId}`;
     add.disabled = true;
@@ -1442,16 +1435,7 @@ function accountRow(row) {
   const storedPrice = () =>
     row.price === null || row.price === undefined ? "" : String(row.price);
   priceInput.addEventListener("change", async () => {
-    const raw = priceInput.value.trim();
-    let amount = null;
-    if (raw !== "") {
-      amount = Number(raw);
-      if (!Number.isFinite(amount) || amount <= 0) {
-        fieldError(field, "The price must be a number above 0 per month.");
-        priceInput.value = storedPrice();
-        return;
-      }
-    }
+    const amount = typedNumber(priceInput.value);
     const sameCurrency =
       amount === null || (code !== null && priceCurrency() === code);
     if (amount === row.price && sameCurrency) {
@@ -1530,11 +1514,6 @@ function chipEditor(row, field, changed) {
   const letters = abbrLetterBoxes(row.abbr || "", {
     onInput: schedule,
     onChange: async (abbr) => {
-      if (!/^[A-Z0-9]{1,2}$/.test(abbr)) {
-        fieldError(field, "The abbreviation must be one or two letters A-Z or digits.");
-        letters.setValue(row.abbr || "");
-        return;
-      }
       if (abbr === row.abbr) {
         letters.setValue(row.abbr || "");
         return;
@@ -1558,14 +1537,6 @@ function chipEditor(row, field, changed) {
 
   async function saveColor(next) {
     if (next === row.color) return;
-    if (!isColor(next)) {
-      fieldError(field, "The colour must be #rrggbb.");
-      hex.setValue(row.color || "");
-      swatches.select(row.color);
-      color = row.color || "";
-      schedule();
-      return;
-    }
     const ok = await saveAccount(row, { color: next }, field);
     if (ok) {
       row.color = next;
@@ -1704,6 +1675,15 @@ function projectKeyText(key) {
   return typeof key.host === "string" && key.host !== ""
     ? `${key.kind}:${key.id}@${key.host}`
     : `${key.kind}:${key.id}`;
+}
+
+// A project's name in a list. A folder project's id has a host, so the same
+// folder on two hosts can be told apart: "~ (home folder) · atlas".
+function projectLabel(name, key) {
+  const text = typeof name === "string" && name !== "" ? name : "?";
+  const host =
+    isObject(key) && typeof key.host === "string" && key.host !== "" ? key.host : null;
+  return host ? `${text} · ${host}` : text;
 }
 
 function sameRef(first, second) {
@@ -1982,12 +1962,14 @@ function joinedLine(project, field) {
   const line = h("div", { class: "proj-joined" }, [h("span", { class: "mf", text: "joined: " })]);
   project.joined.forEach((joined, index) => {
     if (index > 0) line.appendChild(middotSeparator());
-    line.appendChild(h("span", { class: "mono x11", text: joined.name }));
+    line.appendChild(
+      h("span", { class: "mono x11", text: projectLabel(joined.name, joined.key) })
+    );
     const undo = h("button", {
       type: "button",
       class: "hbtn xs ghost",
       text: "undo",
-      "aria-label": `Unjoin ${joined.name}`,
+      "aria-label": `Unjoin ${projectLabel(joined.name, joined.key)}`,
     });
     undo.addEventListener("click", async () => {
       undo.disabled = true;
@@ -2003,7 +1985,10 @@ function joinedLine(project, field) {
 function joinRow(projects) {
   const field = "project:join";
   const rows = projects.projects;
-  const options = rows.map((project, index) => [String(index), project.name]);
+  const options = rows.map((project, index) => [
+    String(index),
+    projectLabel(project.name, project.key),
+  ]);
   const first = selectInput(options, "0", () => {});
   const second = selectInput(options, rows.length > 1 ? "1" : "0", () => {});
   first.setAttribute("aria-label", "Join this project");
@@ -2096,7 +2081,13 @@ function configFolderPlaceholder() {
 }
 
 function generalCard() {
-  const card = panel("General", "", []);
+  const card = panel("General", "", [], [
+    h("span", { class: "mf" }, [
+      "To open the pop-up with a key, bind ",
+      h("code", { text: "seatswap panel" }),
+      " to a key in your desktop's keyboard settings.",
+    ]),
+  ]);
   const body = card.querySelector(".settings-body");
   const times = [];
 
@@ -2155,7 +2146,6 @@ function generalCard() {
     setting(
       "Read the active account every",
       numberField("pollActiveSecs", "Read the active account every", {
-        min: 30,
         step: 30,
         unit: "s",
       }),
@@ -2167,7 +2157,6 @@ function generalCard() {
     setting(
       "Read inactive accounts every",
       numberField("pollInactiveSecs", "Read inactive accounts every", {
-        min: 30,
         step: 30,
         unit: "s",
       }),
@@ -2177,16 +2166,10 @@ function generalCard() {
   );
   body.appendChild(section("Claude Code"));
   body.appendChild(
-    setting(
-      "Claude Code's config folder",
-      textField(
-        "claudeConfigDir",
-        "Claude Code's config folder",
-        configFolderPlaceholder()
-      ),
-      "empty: $CLAUDE_CONFIG_DIR or Claude Code's default folder · takes effect after restarting seatswap",
-      "claudeConfigDir"
-    )
+    textField("claudeConfigDir", "Claude Code's config folder", {
+      placeholder: configFolderPlaceholder(),
+      note: "empty: $CLAUDE_CONFIG_DIR or Claude Code's default folder · takes effect after restarting seatswap",
+    })
   );
   body.appendChild(
     setting(
@@ -2265,6 +2248,8 @@ function switchesNote(view) {
 
 function autoBurnCard() {
   const view = burn();
+  const holdH =
+    view && Number.isInteger(view.manualHoldH) ? view.manualHoldH : null;
   return panel(
     "Auto-burn",
     "switches accounts so that you are blocked as little as possible",
@@ -2299,7 +2284,12 @@ function autoBurnCard() {
       ),
       setting(
         "After a switch by you",
-        h("span", { text: "it waits 4 hours, or until that account is full" })
+        h("span", {
+          text:
+            holdH === null
+              ? "the hold after a switch by you is not known"
+              : `it waits ${holdH} hour${holdH === 1 ? "" : "s"}, or until that account is full`,
+        })
       ),
       setting(
         "While a session would lose its thinking",
@@ -2599,7 +2589,6 @@ function renderCalls(container) {
 // History and hosts (spec §1.5, §3.7; step C1 task 7)
 // ---------------------------------------------------------------------------
 
-const RESTART_NOTE = "takes effect after the tray app restarts";
 // The mock-up's line: a host whose last record is older than this is amber.
 const HOST_STALE_MS = 15 * 60000;
 
@@ -2610,23 +2599,19 @@ function historyCard() {
 
   body.appendChild(section("This host"));
   body.appendChild(
-    restartField(
-      "hostName",
-      "Name of this host",
-      view && typeof view.host === "string" ? view.host : "",
-      "must be different on every host",
-      Boolean(view && typeof view.savedHost === "string")
-    )
+    textField("hostName", "Name of this host", {
+      placeholder: view && typeof view.host === "string" ? view.host : "",
+      note: "must be different on every host",
+      restart: Boolean(view && typeof view.savedHost === "string"),
+    })
   );
   body.appendChild(
-    restartField(
-      "historyDir",
-      "History folder",
-      view && typeof view.dir === "string" ? view.dir : "",
-      "a synced folder shares it with your other hosts",
-      Boolean(view && typeof view.savedDir === "string"),
-      280
-    )
+    textField("historyDir", "History folder", {
+      placeholder: view && typeof view.dir === "string" ? view.dir : "",
+      note: "a synced folder shares it with your other hosts",
+      restart: Boolean(view && typeof view.savedDir === "string"),
+      width: 280,
+    })
   );
 
   body.appendChild(section("Hosts found in the folder"));
@@ -2647,41 +2632,6 @@ function historyCard() {
   body.appendChild(exportRow());
   body.appendChild(importRow());
   return card;
-}
-
-// A field whose new value only reaches the tray app when it restarts. The
-// restart note shows exactly when the saved value differs from the one in
-// effect, as the view says.
-function restartField(field, label, placeholder, baseNote, differs, width) {
-  const value = savedValue(field);
-  const input = textInput({
-    value: value === null || value === undefined ? "" : String(value),
-    placeholder,
-    "aria-label": label,
-  });
-  input.className = "inp tall";
-  if (width) input.style.width = `${width}px`;
-  const noteNode = h("span", { class: "mf" });
-  const showNote = () => {
-    noteNode.textContent = differs ? RESTART_NOTE : baseNote;
-  };
-  input.addEventListener("change", async () => {
-    const raw = input.value.trim();
-    const next = raw === "" ? null : raw;
-    const ok = await saveField(field, next);
-    if (!ok) {
-      input.value = savedValue(field) || "";
-      showNote();
-      return;
-    }
-    input.value = next || "";
-    // The saved value now differs from the one in effect; read the view again
-    // so the note and the placeholders come from the command, not the page.
-    await loadHistory();
-    if (state.group === "history" && state.right) renderGroup(state.right, "history");
-  });
-  showNote();
-  return setting(label, input, noteNode, field);
 }
 
 // Read the host folders when the group opens, after an import and after a

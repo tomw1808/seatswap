@@ -6,8 +6,6 @@
 //! time, and a `snapshot` event reaches each of them.
 
 #[cfg(feature = "gui")]
-use tauri::webview::PageLoadEvent;
-#[cfg(feature = "gui")]
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 /// Window label used by `tauri.conf.json`'s capability and by every command.
@@ -105,15 +103,17 @@ fn create(app: &AppHandle, target: &str) -> Result<(), String> {
             .decorations(true)
             .always_on_top(false)
             .skip_taskbar(false)
-            .on_page_load(move |window, payload| {
-                if payload.event() == PageLoadEvent::Finished {
-                    let _ = window.eval(format!("window.location.hash = {initial:?};"));
-                }
-            })
+            // Before the page's scripts run, so the window opens on its target
+            // instead of drawing Sessions first and jumping.
+            .initialization_script(format!("window.location.hash = {initial:?};"))
             .build()
-            .map_err(|error| error.to_string())?;
-    window.show().map_err(|error| error.to_string())?;
-    window.set_focus().map_err(|error| error.to_string())
+            .map_err(|error| format!("cannot open the window: {error}"))?;
+    window
+        .show()
+        .map_err(|error| format!("cannot show the window: {error}"))?;
+    window
+        .set_focus()
+        .map_err(|error| format!("cannot focus the window: {error}"))
 }
 
 /// `open_window("settings")` from a page: the same as `show`.

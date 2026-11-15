@@ -1008,7 +1008,8 @@ pub struct Snapshot {
 
 **Tauri commands** (all `Result<T, String>`, the error is the human message of the core error):
 `get_snapshot() -> Snapshot` · `refresh_now()` (Poll(Wake)) · `switch_account(key, unsaved: "refuse"|"discard"|"save", label: Option<String>) -> String` (the success sentence; `CurrentNotSaved` sets `pending` and returns Err "not saved") · `cancel_pending()` · `save_current(label: Option<String>)` (sync_live with create) · `edit_account(key, label?, abbr?, color?)` · `remove_account(key)` · `save_setting(field: String, value: serde_json::Value) -> SavedSetting` (one field merged under the app lock, validated, applies startAtLogin) · `set_auto_burn(on)` (`SaveSetting { field: "autoBurn", value: on }`: the same save path, writes `autoBurnSet` only on a change) · `pause_burn(hours: Option<i64>)` (Some = pause, None = resume) · `icon_preview(abbr, color) -> Vec<IconPx { size, rgba: Vec<u8> }>` for 16, 22, 32 (the panel draws them with `ImageData`) · `fit_panel(height: f64)` · `hide_panel()`.
-Event `navigate` (payload `"main"|"add"|"settings"`) when the panel is shown for a menu item.
+Event `navigate` (payload `"main"|"add"`) when the panel is shown for a menu item. The pop-up has no
+settings view; its gear, `,` and the CLI's `panel settings` open the large window at Settings.
 
 **Tray** (`tray.rs`, redrawn on every snapshot): icon from `icon::render` at 22 px ×2 (44 px image) for the active account — ring = `settings.iconLimit` limit (binding/session/week) with its `LoadLevel` colour, `locked` at ≥ 100 %, grey ring while the usage is unknown, a grey "?" disc when no account is live; tooltip as §8.1; tray label (`set_title`) per `trayText`. Linux backend: tray-icon's `ksni` (StatusNotifierItem over D-Bus), switched on in `crates/app/Cargo.toml` next to Tauri's libappindicator, because libappindicator reports no clicks and drops the tooltip; with ksni the item has `ItemIsMenu = false`, a left click arrives as `TrayIconEvent::Click(Left)` (opens the panel), a right click shows the menu, and the tooltip is published (checked on the session bus, 2026-11-10). Without a StatusNotifierWatcher on the bus (plain GNOME without the AppIndicator extension, or a desktop panel that starts after seatswap at login) tray-icon cannot create the item and has no option to wait; `tray::start` then keeps the app running without an icon, says so on stderr at once and in a notification only if no tray has appeared after 30 s (`TRAY_GRACE`: at login Cinnamon starts its tray in the same second as seatswap, so the first try often comes too early) (`seatswap panel` still opens the pop-up), and creates the icon when the name `org.kde.StatusNotifierWatcher` appears (`gio::bus_watch_name`, GTK's own gio). Once the item exists, ksni registers it again whenever the watcher restarts. Menu as §8.3: one item per account (`AC  Acme   97 % · 1h12m` + "✓" for the live one, "logged out" when so), clicking switches with `refuse`; then "Save current login (…)…" when live is unknown; "Open panel…", "Add account…", "Settings…", "Quit". Number formatting is shared with the CLI (one module, `crates/app/src/format.rs`).
 
@@ -1546,7 +1547,8 @@ pub(crate) struct WaitingSwitch { pub to: String, pub latest: DateTime<Utc>, pub
 pub(crate) struct BurnView { pub on: bool, pub paused_until: Option<DateTime<Utc>>,
     pub early: bool, pub why: String, pub learning: Vec<String>, pub line: Option<String>,
     pub planned: BTreeMap<String, DateTime<Utc>>, pub waiting: Option<WaitingSwitch>,
-    pub suggestion: Option<SwitchSuggestion> }
+    pub suggestion: Option<SwitchSuggestion>, pub measured: Option<Measured>,
+    pub manual_hold_h: i64 } // burn::MANUAL_HOLD_H: the page's "it waits {n} hours"
 pub(crate) struct BurnTick<'a> { pub app: &'a AppPaths, pub history: Option<&'a HistoryDir>,
     pub views: &'a [AccountView], pub accounts: &'a [Account], pub settings: &'a Settings,
     pub active: Option<&'a str>, pub now: DateTime<Utc>, pub offset: FixedOffset,
@@ -1699,7 +1701,9 @@ pub(crate) fn parse_target(target: &str) -> Result<(&str, Option<&str>), String>
 
 /// Create (1280 × 800, resizable, decorated, in the taskbar, not always on top) or focus
 /// the window, and send it the target as `open-area` (an existing window) or as its
-/// address `window.html#<target>` (a new one). A refused target is the error text.
+/// address `window.html#<target>` (a new one). The new window's address is set by an
+/// `initialization_script` before the page's scripts run, so it never draws Sessions
+/// first and jumps. A window that cannot be built or shown is an error the caller shows.
 #[cfg(feature = "gui")]
 pub(crate) fn show(app: &AppHandle, target: &str) -> Result<(), String>;
 #[cfg(feature = "gui")]
@@ -1723,9 +1727,10 @@ The CLI and the IPC use the same grammar: `ipc::window_line(target)` is `window 
 pages use. Exported: `PALETTE`, `TRAY_GREY`, `LEVEL_COLORS`, `TAURI_GLOBAL`, `HAS_TAURI`, `isObject`,
 `clamp`, `clone`, `errorMessage`, `isColor`, `hexToRgb`, `rgba`, `rgbToHex`, `mixHex`,
 `relativeLuminance`, `contrastText`, `limitLevel`, `shortPercent`, `clear`, `setStyles`, `applyProps`,
-`appendChildren`, `h`, `banner`, `applyTheme`, `invoke`, `listen`, `money`, `tokens`, `textInput`,
+`appendChildren`, `h`, `banner`, `applyTheme`, `followTheme`, `invoke`, `listen`, `money`, `tokens`, `textInput`,
 `selectInput`, `switchButton`, `sanitizeAbbrChar`, `abbrLetterBoxes`, `colorSwatches`, `hexField`,
-`iconPreview`. `money(amount, currency)` gives `"1,234 EUR"` for `(1234, "EUR")` and two decimals
+`iconPreview`. `followTheme(getSetting)` is the one system light/dark follower both pages call; it
+applies `applyTheme("system")` on a change while `getSetting()` is "system". `money(amount, currency)` gives `"1,234 EUR"` for `(1234, "EUR")` and two decimals
 below 10, `"6.47 EUR"`, and throws on a negative or non-finite amount or a currency that is not
 three capital letters; `tokens(n)` returns `"12.4 M"`, `"845 k"` or `"0"` and throws on an invalid
 count. `window.html`, `window.css` and `window.js` are the second page; `window.js` reads the area
@@ -1767,12 +1772,24 @@ are shown in USD", and `state.money.rateError` is shown under that row. `ownRate
 the currency is USD; a stored rate for another currency leaves the field empty and the row says
 "your rate 0.95 was for EUR and is not used for CHF". `apiPricesRow` adds "{n} models of models.dev's
 list were left out" with the entries in the line's `title` when `leftOut` is not empty.
-`drawPriceList` ends with `addModelRow`: a provider select (the three `PRICE_PROVIDERS`), a model id
-field and the four prices, saving through `set_price_override` with `<provider>/<model id>`, so an
-own price exists even with look-ups off and no list. In the Accounts group the price cell shows the
-amount with `row.priceCurrency`; when that differs from the settings' currency it shows a warning
-mark whose tooltip is "in EUR: enter it again for CHF", and entering the same amount again saves it
-in the new currency.
+`drawPriceList` ends with `addModelRow`: a provider select built from `MoneyView.providers` (filled
+from `money::PRICE_PROVIDERS`), a model id field and the four prices, saving through
+`set_price_override` with `<provider>/<model id>`, so an own price exists even with look-ups off and
+no list. In the Accounts group the price cell shows the amount with `row.priceCurrency`; when that
+differs from the settings' currency it shows a warning mark whose tooltip is "in EUR: enter it again
+for CHF", and entering the same amount again saves it in the new currency.
+
+The page does not repeat the core's checks. A number field sends its number, an empty field `null`,
+and text that is not a number as the text; a text setting sends its text or `null`; the core's
+`Settings::validate`, `store::validate_price`, `validate_abbr`, `validate_color`, and
+`set_price_override` (`money::parse_price_key`, `ModelPrice::validate`) refuse a bad value, and its
+error stays under the row like any refused save. `textField(field, label, { placeholder, note,
+restart, width })` is the one text-setting field: `restart` shows "takes effect after the tray app
+restarts" instead of `note` and reads the history view again after a save. In a list a project's
+name comes from `projectLabel(name, key)`: a folder id with a host adds " · <host>", so the two home
+folders read "~ (home folder) · atlas" and "~ (home folder) · vega". The General card's foot carries
+the pop-up's hotkey hint: "To open the pop-up with a key, bind `seatswap panel` to a key in your
+desktop's keyboard settings."
 
 The save queue is the page's one write path, in this order:
 
@@ -1795,7 +1812,7 @@ under the app lock (`merge_setting`): the field must be a key of the settings' c
 object, the value replaces only it, the result is deserialised and validated, and a typed `~` or
 `~/` in `claudeConfigDir` or `historyDir` is expanded with `format::expand_tilde`. `label`, the
 chip's letters and colour, `autoBurn` and `price` save through `edit_account`; `price` is sent as a
-number, `null` to clear it, or left out to keep it.
+number, the typed text when it is not a number, `null` to clear it, or left out to keep it.
 
 ## store.rs additions — plan, price and the money settings (step C1)
 
@@ -1981,6 +1998,7 @@ const PRICE_EVERY: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Serialize)] pub(crate) struct MoneyView {
     pub currency: Option<String>, pub rate: Option<Rate>, pub look_up: bool,
+    pub providers: Vec<String>, // money::PRICE_PROVIDERS for the add-a-model row
     pub models_with_price: u32, pub prices_checked_at: Option<DateTime<Utc>>,
     pub last_change: Option<PriceChange>, pub left_out: Vec<String>,
     pub rate_error: Option<String>, pub last_error: Option<String> }

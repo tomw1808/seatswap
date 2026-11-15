@@ -14,7 +14,8 @@ use seatswap_core::burn::decide::{Decision, Regime, RegimeWhy, Situation};
 use seatswap_core::burn::live::{self, Learned, Readiness};
 use seatswap_core::burn::plan::{follow, rates_known, Plan, Policy};
 use seatswap_core::burn::{
-    FRESH_MIN, HORIZON_H, LEARN_RETRY_MIN, STALE_ASK_SECS, SWITCH_RELEARN_MIN, SWITCH_RETRY_MIN,
+    FRESH_MIN, HORIZON_H, LEARN_RETRY_MIN, MANUAL_HOLD_H, STALE_ASK_SECS, SWITCH_RELEARN_MIN,
+    SWITCH_RETRY_MIN,
 };
 use seatswap_core::engine::{AccountView, PollReason};
 use seatswap_core::history::{AccountRef, By, EventKind, HistoryDir};
@@ -36,7 +37,7 @@ pub(crate) struct WaitingSwitch {
 }
 
 /// What the pop-up shows of auto-burn (spec §2.5).
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BurnView {
     pub on: bool,
@@ -52,6 +53,27 @@ pub(crate) struct BurnView {
     /// What auto-burn has measured so far (spec §2.13); `None` while there is
     /// no situation to measure.
     pub measured: Option<Measured>,
+    /// How long a switch by hand holds auto-burn back, in hours (spec §2.5):
+    /// the page writes "it waits {n} hours" from it.
+    pub manual_hold_h: i64,
+}
+
+impl Default for BurnView {
+    fn default() -> Self {
+        BurnView {
+            on: false,
+            paused_until: None,
+            early: false,
+            why: String::new(),
+            learning: Vec::new(),
+            line: None,
+            planned: BTreeMap::new(),
+            waiting: None,
+            suggestion: None,
+            measured: None,
+            manual_hold_h: MANUAL_HOLD_H,
+        }
+    }
 }
 
 /// What the last regime was computed from, as the settings page shows it
@@ -534,6 +556,7 @@ impl BurnRuntime {
             waiting: None,
             suggestion: None,
             measured: Some(measured(situation, regime)),
+            manual_hold_h: MANUAL_HOLD_H,
         };
 
         match &decision {
@@ -702,6 +725,7 @@ fn waiting_view(settings: &Settings, learning: Vec<String>) -> BurnView {
         waiting: None,
         suggestion: None,
         measured: None,
+        manual_hold_h: MANUAL_HOLD_H,
     }
 }
 

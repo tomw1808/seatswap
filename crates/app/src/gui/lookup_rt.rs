@@ -33,6 +33,9 @@ pub(crate) struct MoneyView {
     pub currency: Option<String>,
     pub rate: Option<Rate>,
     pub look_up: bool,
+    /// The providers a model key may name, from `money::PRICE_PROVIDERS`; the
+    /// "add a model" row builds its provider select from these.
+    pub providers: Vec<String>,
     pub models_with_price: u32,
     pub prices_checked_at: Option<DateTime<Utc>>,
     pub last_change: Option<PriceChange>,
@@ -365,6 +368,7 @@ impl LookupRuntime {
             currency,
             rate,
             look_up: settings.look_up_prices,
+            providers: providers(),
             models_with_price,
             prices_checked_at: prices.checked_at,
             last_change: prices.last_change,
@@ -394,6 +398,14 @@ impl LookupRuntime {
 /// The view from what is stored, before the first round: no request is sent and
 /// nothing is invented. The currency and the switch are known only after the
 /// settings are read, so they stay missing here.
+/// The providers a model key may name, as the page lists them.
+fn providers() -> Vec<String> {
+    money::PRICE_PROVIDERS
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
 fn stored_view(app: &AppPaths) -> MoneyView {
     let mut error = None;
     let prices = match Prices::load(app) {
@@ -410,6 +422,7 @@ fn stored_view(app: &AppPaths) -> MoneyView {
         currency: None,
         rate: None,
         look_up: false,
+        providers: providers(),
         models_with_price: prices.current().len() as u32,
         prices_checked_at: prices.checked_at,
         last_change: prices.last_change,
@@ -796,6 +809,10 @@ mod tests {
                 own: false,
             }),
             look_up: true,
+            providers: money::PRICE_PROVIDERS
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
             models_with_price: 3,
             prices_checked_at: Some(utc("2026-11-14T09:00:00Z")),
             last_change: Some(PriceChange {
@@ -809,6 +826,10 @@ mod tests {
             last_error: None,
         };
         let json = serde_json::to_value(view).expect("the event's JSON");
+        assert_eq!(
+            json["providers"],
+            json!(["anthropic", "openai", "ollama-cloud"])
+        );
         assert_eq!(json["modelsWithPrice"], json!(3));
         assert_eq!(json["rate"]["value"], json!(0.9048));
         assert_eq!(json["rate"]["date"], json!("2026-11-13"));

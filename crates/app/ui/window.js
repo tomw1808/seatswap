@@ -8,6 +8,7 @@ import {
   banner,
   clear,
   errorMessage,
+  followTheme,
   h,
   invoke,
   isObject,
@@ -73,16 +74,6 @@ function hashTarget() {
 function themeSetting() {
   const settings = state.snapshot && state.snapshot.settings;
   return isObject(settings) && settings.theme ? settings.theme : "system";
-}
-
-function wireTheme() {
-  if (!window.matchMedia) return;
-  const media = window.matchMedia("(prefers-color-scheme: dark)");
-  if (typeof media.addEventListener === "function") {
-    media.addEventListener("change", () => {
-      if (themeSetting() === "system") applyTheme("system");
-    });
-  }
 }
 
 // The area tabs, the current one marked, as the mock-up's `nav()`.
@@ -287,7 +278,7 @@ function show(target, fromOpen = false) {
 async function boot() {
   if (!HAS_TAURI) ensureFixture();
   applyTheme("system");
-  wireTheme();
+  followTheme(themeSetting);
 
   await listen("open-area", (payload) => {
     const target = typeof payload === "string" ? payload : payload && payload.target;

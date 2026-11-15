@@ -517,6 +517,18 @@ function applyTheme(setting) {
   document.documentElement.dataset.theme = resolved;
 }
 
+// Both pages follow the system's light/dark change with this one function.
+// `getSetting` returns the stored theme; only "system" follows the system.
+function followTheme(getSetting) {
+  if (typeof window === "undefined" || !window.matchMedia) return;
+  const media = window.matchMedia("(prefers-color-scheme: dark)");
+  if (typeof media.addEventListener !== "function") return;
+  media.addEventListener("change", () => {
+    if (typeof getSetting !== "function" || getSetting() !== "system") return;
+    applyTheme("system");
+  });
+}
+
 // ---------------------------------------------------------------------------
 // bridge: invoke() and listen() over the Tauri 2 global
 // ---------------------------------------------------------------------------
@@ -597,6 +609,7 @@ export {
   h,
   banner,
   applyTheme,
+  followTheme,
   invoke,
   listen,
   money,
