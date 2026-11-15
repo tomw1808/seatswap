@@ -96,14 +96,7 @@ pub(crate) fn record_plan_change(
     change: &switcher::PlanChange,
     at: DateTime<Utc>,
 ) -> Result<(), HistoryError> {
-    recorder.event(
-        at,
-        EventKind::PlanChanged {
-            account: change.account.clone(),
-            from: change.from.clone(),
-            to: change.to.clone(),
-        },
-    )
+    recorder.event(at, change.event())
 }
 
 /// The one sentence the app uses when the history cannot be written.

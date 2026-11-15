@@ -53,6 +53,11 @@ pub enum HistoryError {
     Paths(#[from] PathsError),
     #[error("{} does not exist", path.display())]
     NoFolder { path: PathBuf },
+    #[error("from {} is not before until {}", from.to_rfc3339(), to.to_rfc3339())]
+    Range {
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    },
     #[error("a {kind:?} record is too long: its line with the newline is more than 4096 bytes")]
     LineTooLong { kind: Kind },
     #[error("a {kind:?} record holds a number that is not finite")]
@@ -406,14 +411,22 @@ pub struct HistoryDir {
     host: String,
 }
 
+/// The one rule for "the history folder of these settings": the root and this
+/// machine's host folder inside it. `historyDir`/`hostName` are used when set;
+/// otherwise the app's history folder and this machine's host name are.
+pub fn location(app: &AppPaths, settings: &Settings) -> Result<(PathBuf, String), HistoryError> {
+    let root = paths::history_root(settings.history_dir.as_deref(), app)?;
+    let host = paths::host_name(settings.host_name.as_deref())?;
+    Ok((root, host))
+}
+
 impl HistoryDir {
     /// Root = `settings.historyDir` or `app.history_dir()`; host =
     /// `paths::host_name(settings.host_name)`. Creates `<root>/<host>/` and its
     /// `host.json` marker with this machine's id (created on first use) and
     /// refuses a folder marked with another machine's id.
     pub fn open(app: &AppPaths, settings: &Settings) -> Result<HistoryDir, HistoryError> {
-        let root = paths::history_root(settings.history_dir.as_deref(), app)?;
-        let host = paths::host_name(settings.host_name.as_deref())?;
+        let (root, host) = location(app, settings)?;
         let history = HistoryDir { root, host };
 
         let host_dir = history.root.join(&history.host);
@@ -1037,6 +1050,56 @@ mod tests {
             marker
         );
         assert_eq!(fs::read(app.machine_id_file()).unwrap(), machine);
+    }
+
+    #[test]
+    fn location_is_the_folder_open_uses() {
+        let app_dir = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let app = AppPaths::at(app_dir.path());
+
+        let explicit = Settings {
+            history_dir: Some(root.path().to_path_buf()),
+            host_name: Some("atlas".to_string()),
+            ..Settings::default()
+        };
+        let (located_root, located_host) = location(&app, &explicit).unwrap();
+        assert_eq!(located_root, root.path());
+        assert_eq!(located_host, "atlas");
+        let opened = HistoryDir::open(&app, &explicit).unwrap();
+        assert_eq!(opened.root(), located_root);
+        assert_eq!(opened.host(), located_host);
+
+        let defaults = Settings::default();
+        let (located_root, located_host) = location(&app, &defaults).unwrap();
+        assert_eq!(located_root, app.history_dir());
+        let opened = HistoryDir::open(&app, &defaults).unwrap();
+        assert_eq!(opened.root(), located_root);
+        assert_eq!(opened.host(), located_host);
+    }
+
+    #[test]
+    fn a_range_takes_open_ends_and_refuses_a_start_that_is_not_before_its_end() {
+        let open = Range::between(None, None).unwrap();
+        assert_eq!(open.from, DateTime::<Utc>::MIN_UTC);
+        assert_eq!(open.to, DateTime::<Utc>::MAX_UTC);
+
+        let days = Range::between(
+            Some(utc("2026-11-09T00:00:00Z")),
+            Some(utc("2026-11-16T00:00:00Z")),
+        )
+        .unwrap();
+        assert_eq!(days.from, utc("2026-11-09T00:00:00Z"));
+        assert_eq!(days.to, utc("2026-11-16T00:00:00Z"));
+
+        let error = Range::between(
+            Some(utc("2026-11-17T00:00:00Z")),
+            Some(utc("2026-11-16T00:00:00Z")),
+        )
+        .unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("2026-11-17T00:00:00+00:00"), "{text}");
+        assert!(text.contains("2026-11-16T00:00:00+00:00"), "{text}");
     }
 
     #[test]

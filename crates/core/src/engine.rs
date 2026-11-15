@@ -24,7 +24,7 @@ use crate::live;
 use crate::locks::{self, LockError};
 use crate::paths::{AppPaths, ClaudePaths};
 use crate::store::{Account, AccountsFile, LoginState, Settings, Store, StoreError};
-use crate::switcher::{LiveState, APP_LOCK_TIMEOUT};
+use crate::switcher::{LiveState, PlanChange, APP_LOCK_TIMEOUT};
 use crate::types::Login;
 
 /// The only usage-cache version this build reads.
@@ -851,20 +851,17 @@ impl<R: Remote> Engine<R> {
         };
         let account_ref = AccountRef::of(account);
         let note = account.note_stored_login(login);
-        let plan = account.plan.clone();
+        let plan_change = note.plan_changed.then(|| PlanChange {
+            account: account_ref,
+            from: note.previous_plan.clone(),
+            to: account.plan.clone(),
+        });
         if note.changed {
             self.store.save(&file)?;
         }
-        if note.plan_changed {
+        if let Some(change) = &plan_change {
             if let Some(recorder) = self.recorder.as_ref() {
-                if let Err(error) = recorder.event(
-                    Utc::now(),
-                    EventKind::PlanChanged {
-                        account: account_ref,
-                        from: note.previous_plan,
-                        to: plan,
-                    },
-                ) {
+                if let Err(error) = recorder.event(Utc::now(), change.event()) {
                     self.set_last_error(id, history_error_text(HistoryErrorKind::Event, &error));
                 }
             }

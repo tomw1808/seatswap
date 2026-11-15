@@ -397,10 +397,10 @@ pub(crate) fn spawn(
     let lookup = Some(lookup_rt::spawn(app.clone(), Api::new(), ui.clone())?);
 
     let sessions = match settings.as_ref().filter(|settings| settings.read_sessions) {
-        Some(settings) => Some(sessions_rt::spawn(
+        Some(_) => Some(sessions_rt::spawn(
             app.clone(),
             claude.clone(),
-            settings.clone(),
+            history.clone(),
             ui,
             engine_tx.clone(),
         )?),

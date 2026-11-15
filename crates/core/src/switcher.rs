@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use crate::history::AccountRef;
+use crate::history::{AccountRef, EventKind};
 use crate::live::{self, LiveError};
 use crate::locks::{self, LockError};
 use crate::paths::ClaudePaths;
@@ -133,6 +133,18 @@ pub struct PlanChange {
     pub account: AccountRef,
     pub from: Option<String>,
     pub to: Option<String>,
+}
+
+impl PlanChange {
+    /// The history event for this change. This is the one place `PlanChanged`
+    /// is built; every path that records a plan change writes this event.
+    pub fn event(&self) -> EventKind {
+        EventKind::PlanChanged {
+            account: self.account.clone(),
+            from: self.from.clone(),
+            to: self.to.clone(),
+        }
+    }
 }
 
 /// The result of a switch.
@@ -1816,6 +1828,27 @@ mod tests {
         assert!(
             !untouched.price_changed,
             "a save that leaves the price alone is not a change"
+        );
+    }
+
+    #[test]
+    fn a_plan_change_event_names_the_account_and_both_plans() {
+        let account = AccountRef {
+            acc: "4b7e2f91-3c5a-4d8e-9f1b-6a2c8e4d7b30".to_string(),
+            org: "e2a6c9d1-7f4b-4a3e-8c5d-1b9f0a7e3c62".to_string(),
+        };
+        let change = PlanChange {
+            account: account.clone(),
+            from: Some("team".to_string()),
+            to: Some("team · max 5x".to_string()),
+        };
+        assert_eq!(
+            change.event(),
+            EventKind::PlanChanged {
+                account,
+                from: Some("team".to_string()),
+                to: Some("team · max 5x".to_string()),
+            }
         );
     }
 

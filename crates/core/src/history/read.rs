@@ -32,6 +32,24 @@ pub struct Range {
     pub to: DateTime<Utc>,
 }
 
+impl Range {
+    /// The range between two optional ends: an open start is
+    /// [`DateTime::<Utc>::MIN_UTC`], an open end is [`DateTime::<Utc>::MAX_UTC`].
+    /// A start that is not before the end is [`HistoryError::Range`], naming
+    /// both.
+    pub fn between(
+        from: Option<DateTime<Utc>>,
+        to: Option<DateTime<Utc>>,
+    ) -> Result<Range, HistoryError> {
+        let from = from.unwrap_or(DateTime::<Utc>::MIN_UTC);
+        let to = to.unwrap_or(DateTime::<Utc>::MAX_UTC);
+        if from >= to {
+            return Err(HistoryError::Range { from, to });
+        }
+        Ok(Range { from, to })
+    }
+}
+
 /// Which hosts to read: every one in the folder, or one named host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Hosts {

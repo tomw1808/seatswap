@@ -25,7 +25,7 @@ use seatswap_core::history::{
 };
 use seatswap_core::money::ModelPrice;
 use seatswap_core::projects::{ProjectEdit, Projects, ProjectsLogRecord};
-use seatswap_core::store::{self, Account};
+use seatswap_core::store::{self, Account, Settings};
 use seatswap_core::switcher::UnsavedPolicy;
 
 use super::format;
@@ -970,20 +970,19 @@ pub(crate) struct ImportResult {
 /// The saved settings' host name and folder when they differ from the ones the
 /// recorder opened at startup; `None` when they agree or no settings are loaded.
 fn saved_history(
-    state: &GuiState,
+    app: &seatswap_core::paths::AppPaths,
+    home: &Path,
+    settings: Option<Settings>,
     history: &HistoryDir,
 ) -> Result<(Option<String>, Option<String>), String> {
-    let snapshot = state.snapshot()?;
-    let Some(settings) = snapshot.settings else {
+    let Some(settings) = settings else {
         return Ok((None, None));
     };
-    let host = seatswap_core::paths::host_name(settings.host_name.as_deref())
-        .map_err(|error| error.to_string())?;
-    let root = seatswap_core::paths::history_root(settings.history_dir.as_deref(), &state.app)
-        .map_err(|error| error.to_string())?;
+    let (root, host) =
+        seatswap_core::history::location(app, &settings).map_err(|error| error.to_string())?;
     Ok((
         (host != history.host()).then_some(host),
-        (root != history.root()).then(|| with_tilde(&root.to_string_lossy(), &state.claude.home)),
+        (root != history.root()).then(|| with_tilde(&root.to_string_lossy(), home)),
     ))
 }
 
@@ -1011,7 +1010,9 @@ fn history_view_of(
 /// The history view of the folder in effect, with the saved values that a
 /// restart would use.
 fn history_view_for(state: &GuiState, history: &HistoryDir) -> Result<HistoryView, String> {
-    let (saved_host, saved_dir) = saved_history(state, history)?;
+    let snapshot = state.snapshot()?;
+    let (saved_host, saved_dir) =
+        saved_history(&state.app, &state.claude.home, snapshot.settings, history)?;
     history_view_of(history, &state.claude.home, saved_host, saved_dir)
 }
 
@@ -1053,18 +1054,7 @@ fn export_range(
     from: Option<DateTime<Utc>>,
     until: Option<DateTime<Utc>>,
 ) -> Result<Range, String> {
-    let range = Range {
-        from: from.unwrap_or(DateTime::<Utc>::MIN_UTC),
-        to: until.unwrap_or(DateTime::<Utc>::MAX_UTC),
-    };
-    if range.from >= range.to {
-        return Err(format!(
-            "from {} is not before until {}",
-            range.from.to_rfc3339(),
-            range.to.to_rfc3339()
-        ));
-    }
-    Ok(range)
+    Range::between(from, until).map_err(|error| error.to_string())
 }
 
 /// Write the history of the range to `to` as CSV or JSON. An existing file is
@@ -1689,6 +1679,29 @@ mod tests {
             serde_json::json!({ "at": "tomorrow", "style": "clock" }),
         );
         assert!(bad_time.is_err());
+    }
+
+    #[test]
+    fn saved_history_is_the_settings_folder() {
+        let tmp = tempfile::tempdir().expect("a temp folder");
+        let app = seatswap_core::paths::AppPaths::at(&tmp.path().join("data"));
+        let home = Path::new("/home/sam");
+        for settings in [
+            Settings {
+                history_dir: Some(tmp.path().join("shared")),
+                host_name: Some("vega".to_string()),
+                ..Settings::default()
+            },
+            Settings::default(),
+        ] {
+            let (root, host) =
+                seatswap_core::history::location(&app, &settings).expect("a history location");
+            let history = HistoryDir::at(&root, &host);
+            let (saved_host, saved_dir) =
+                saved_history(&app, home, Some(settings), &history).expect("the saved history");
+            assert_eq!(saved_host, None, "the saved and the open host agree");
+            assert_eq!(saved_dir, None, "the saved and the open folder agree");
+        }
     }
 
     #[test]

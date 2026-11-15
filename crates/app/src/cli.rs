@@ -1417,19 +1417,19 @@ fn export_day_range(from: Option<&str>, to: Option<&str>) -> Result<Range, CliEr
         }
     }
     let from = match first {
-        Some(day) => utc_midnight(day)?,
-        None => DateTime::<Utc>::MIN_UTC,
+        Some(day) => Some(utc_midnight(day)?),
+        None => None,
     };
     let to = match last {
         Some(day) => {
             let next = day
                 .succ_opt()
                 .ok_or_else(|| CliError::Usage(format!("--to {day}: there is no day after it")))?;
-            utc_midnight(next)?
+            Some(utc_midnight(next)?)
         }
-        None => DateTime::<Utc>::MAX_UTC,
+        None => None,
     };
-    Ok(Range { from, to })
+    Range::between(from, to).map_err(|error| CliError::Message(error.to_string()))
 }
 
 /// Midnight UTC of a day: the export's days are UTC days, not local ones.
@@ -1476,9 +1476,9 @@ fn import_history(context: &Context, folder: &str) -> Result<Imported, CliError>
 }
 
 /// The history folder `status` and `burn` read, without creating it.
-fn history_dir(app: &AppPaths, settings: &Settings) -> Result<HistoryDir, PathsError> {
-    let root = paths::history_root(settings.history_dir.as_deref(), app)?;
-    let host = paths::host_name(settings.host_name.as_deref())?;
+fn history_dir(app: &AppPaths, settings: &Settings) -> Result<HistoryDir, CliError> {
+    let (root, host) = seatswap_core::history::location(app, settings)
+        .map_err(|error| CliError::Message(error.to_string()))?;
     Ok(HistoryDir::at(&root, &host))
 }
 
@@ -3033,6 +3033,19 @@ pub(crate) mod tests {
                     Gate::Refused(AGENTS_MAY_NOT_CHANGE)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn the_cli_history_folder_is_the_settings_folder() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let app = AppPaths::at(tmp.path());
+        for settings in [history_settings(tmp.path()), Settings::default()] {
+            let (root, host) = seatswap_core::history::location(&app, &settings)
+                .expect("the settings name a history folder");
+            let history = history_dir(&app, &settings).expect("the cli history folder");
+            assert_eq!(history.root(), root);
+            assert_eq!(history.host(), host);
         }
     }
 

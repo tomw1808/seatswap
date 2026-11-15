@@ -16,11 +16,11 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use seatswap_core::history::{EventKind, Recorder, SessionRecord};
+use seatswap_core::history::{EventKind, HistoryDir, Recorder, SessionRecord};
 use seatswap_core::paths::{AppPaths, ClaudePaths};
 use seatswap_core::project::{self, ProjectKey};
+use seatswap_core::projects;
 use seatswap_core::sessions::{self, Liveness, SessionFile, SessionStatus, SystemProbe};
-use seatswap_core::store::Settings;
 use seatswap_core::transcripts::{self, RecordedSession, ScanState, SessionSeen};
 use seatswap_core::watcher::{watch_folder, FolderWatch, WatchError};
 
@@ -116,11 +116,12 @@ impl Drop for SessionsHandle {
 }
 
 /// Start the sessions thread. `settings.read_sessions` must already be on; the
-/// caller only starts it then.
+/// caller only starts it then. `history` is the folder the worker opened at
+/// start, shared with the engine and action runtimes.
 pub(crate) fn spawn(
     app: AppPaths,
     claude: ClaudePaths,
-    settings: Settings,
+    history: Result<HistoryDir, String>,
     ui: Sender<UiEvent>,
     engine: Sender<EngineCommand>,
 ) -> Result<SessionsHandle, String> {
@@ -136,7 +137,7 @@ pub(crate) fn spawn(
             run(
                 app,
                 claude,
-                settings,
+                history,
                 ui,
                 engine,
                 thread_stop,
@@ -158,7 +159,7 @@ pub(crate) fn spawn(
 fn run(
     app: AppPaths,
     claude: ClaudePaths,
-    settings: Settings,
+    history: Result<HistoryDir, String>,
     ui: Sender<UiEvent>,
     engine: Sender<EngineCommand>,
     stop: Arc<AtomicBool>,
@@ -166,8 +167,8 @@ fn run(
     watch_wake: Sender<()>,
     latest: Arc<Mutex<Option<SessionsSummary>>>,
 ) {
-    let (recorder, history_error) = match ops::open_history(&app, &settings) {
-        Ok(recorder) => (Some(recorder), None),
+    let (recorder, history_error) = match history {
+        Ok(history) => (Some(Recorder::new(history)), None),
         Err(error) => (None, Some(error)),
     };
     let (mut state, state_error) = load_state(&app);
@@ -464,7 +465,7 @@ pub(crate) fn run_pass(
         summary.waiting.push(Waiting {
             session: session.session_id.clone(),
             label: label_of(session, &project),
-            project: project_name(&project).to_string(),
+            project: projects::default_name(&project),
             since,
         });
         memory
@@ -850,14 +851,7 @@ fn label_of(session: &SessionFile, project: &ProjectKey) -> String {
         return name.clone();
     }
     let prefix: String = session.session_id.chars().take(2).collect();
-    format!("{}-{prefix}", project_name(project))
-}
-
-fn project_name(project: &ProjectKey) -> &str {
-    match project {
-        ProjectKey::Repo(id) => id.rsplit('/').next().unwrap_or(id.as_str()),
-        ProjectKey::Folder(name) => name.as_str(),
-    }
+    format!("{}-{prefix}", projects::default_name(project))
 }
 
 fn add_unavailable(summary: &mut SessionsSummary, text: String) {
@@ -894,6 +888,7 @@ mod tests {
     use std::fs;
 
     use seatswap_core::history::{Event, Hosts, Range};
+    use seatswap_core::store::Settings;
     use tempfile::TempDir;
 
     const SESSION: &str = "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34";

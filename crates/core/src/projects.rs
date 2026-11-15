@@ -646,7 +646,7 @@ fn owner_and_name(repo: &str) -> (Option<String>, String) {
 
 /// A key's default name: the repository's name, or the folder's name. The home
 /// folder's name is `~ (home folder)`, as the mock-up shows it.
-fn default_name(key: &ProjectKey) -> String {
+pub fn default_name(key: &ProjectKey) -> String {
     match key {
         ProjectKey::Repo(repo) => owner_and_name(repo).1,
         ProjectKey::Folder(name) if name == "~" => "~ (home folder)".to_string(),
