@@ -10,7 +10,9 @@
 //! Nothing here reads or writes Claude Code's files directly: only `switcher`,
 //! `engine` and `store` do.
 
+use std::collections::BTreeSet;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -25,6 +27,11 @@ use seatswap_core::engine::Remote;
 use seatswap_core::engine::{
     self, AccountView, Engine, EngineError, LoginWarning, PollReason, Suggestion, UsageCache,
 };
+#[cfg(test)]
+use seatswap_core::history::HistoryDir;
+use seatswap_core::history::{
+    AccountRef, By, Event, EventKind, HistoryError, Hosts, Range, Recorder, SessionCounts,
+};
 use seatswap_core::locks::{self, LockError};
 use seatswap_core::paths::{AppPaths, ClaudePaths};
 use seatswap_core::store::{self, AccountsFile, Settings, Store};
@@ -34,6 +41,7 @@ use seatswap_core::types::Login;
 
 use super::autostart;
 use super::notify;
+use super::sessions_rt::{self, SessionsHandle};
 use crate::ops;
 
 /// How often the engine thread polls even without a command.
@@ -56,9 +64,33 @@ pub(crate) struct Snapshot {
     pub secrets_warning: Option<String>,
     pub last_poll_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
+    /// `None` when `readSessions` is off; the sessions thread fills it in on the
+    /// main thread.
+    pub sessions: Option<SessionsSummary>,
     /// `None` when accounts.json cannot be read: the panel shows the error and
     /// disables Save instead of offering defaults that would overwrite it.
     pub settings: Option<Settings>,
+}
+
+/// Claude Code's running sessions as the panel shows them (spec §1.6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SessionsSummary {
+    pub running: u32,
+    pub busy: u32,
+    pub waiting: Vec<Waiting>,
+    pub unavailable: Option<String>,
+    pub warning: Option<String>,
+}
+
+/// A running session that waits for the person (spec §4.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Waiting {
+    pub session: String,
+    pub label: String,
+    pub project: String,
+    pub since: DateTime<Utc>,
 }
 
 impl Snapshot {
@@ -77,6 +109,7 @@ impl Snapshot {
             secrets_warning,
             last_poll_at: None,
             error,
+            sessions: None,
             settings,
         }
     }
@@ -140,10 +173,13 @@ pub(crate) struct PendingSwitch {
 }
 
 /// Engine thread commands.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) enum EngineCommand {
     Poll(PollReason),
     Publish,
+    /// The sessions thread saw these models in use (lower-case ids), or `None`
+    /// when it cannot tell.
+    ModelsInUse(Option<BTreeSet<String>>),
     Shutdown,
 }
 
@@ -188,15 +224,22 @@ pub(crate) enum ActionReply {
 }
 
 /// What the engine thread hands to the main thread.
+///
+/// The snapshot is much larger than a sessions summary; boxing it would add an
+/// allocation to every tick and change the event's shape for the UI thread.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum UiEvent {
     Snapshot(Snapshot),
+    Sessions(SessionsSummary),
 }
 
 /// The handles the Tauri side keeps.
 pub(crate) struct Worker {
     pub engine: Sender<EngineCommand>,
     pub action: Sender<ActionCommand>,
+    /// Present only while `readSessions` is on; the tray keeps it alive.
+    pub sessions: Option<SessionsHandle>,
 }
 
 pub(crate) fn spawn(
@@ -204,6 +247,7 @@ pub(crate) fn spawn(
     claude: ClaudePaths,
     autostart_args: Vec<String>,
     ui: Sender<UiEvent>,
+    settings: Option<Settings>,
 ) -> Result<Worker, String> {
     let (engine_tx, engine_rx) = mpsc::channel::<EngineCommand>();
     let (action_tx, action_rx) = mpsc::channel::<ActionCommand>();
@@ -211,22 +255,41 @@ pub(crate) fn spawn(
     let action_engine = engine_tx.clone();
     let engine_app = app.clone();
     let engine_claude = claude.clone();
+    let engine_ui = ui.clone();
     thread::Builder::new()
         .name("seatswap-engine".to_string())
-        .spawn(move || EngineRuntime::new(engine_app, engine_claude, ui).run(engine_rx))
+        .spawn(move || EngineRuntime::new(engine_app, engine_claude, engine_ui).run(engine_rx))
         .map_err(|error| format!("cannot start the engine thread: {error}"))?;
+
+    let sessions = match settings.as_ref().filter(|settings| settings.read_sessions) {
+        Some(settings) => Some(sessions_rt::spawn(
+            app.clone(),
+            claude.clone(),
+            settings.clone(),
+            ui,
+            engine_tx.clone(),
+        )?),
+        None => None,
+    };
+    let latest = sessions
+        .as_ref()
+        .map(SessionsHandle::latest)
+        .unwrap_or_else(|| Arc::new(Mutex::new(None)));
 
     let action_claude = claude;
     thread::Builder::new()
         .name("seatswap-action".to_string())
         .spawn(move || {
-            ActionRuntime::new(app, action_claude, autostart_args, action_engine).run(action_rx)
+            ActionRuntime::new(app, action_claude, autostart_args, action_engine)
+                .with_sessions(latest)
+                .run(action_rx)
         })
         .map_err(|error| format!("cannot start the action thread: {error}"))?;
 
     Ok(Worker {
         engine: engine_tx,
         action: action_tx,
+        sessions,
     })
 }
 
@@ -310,6 +373,7 @@ pub(crate) fn build_snapshot(parts: SnapshotParts) -> Snapshot {
         secrets_warning: parts.secrets_warning,
         last_poll_at: parts.last_poll_at,
         error,
+        sessions: None,
         settings,
     }
 }
@@ -321,33 +385,47 @@ struct OpenedEngine {
     engine: Engine<Api>,
     secrets_warning: Option<String>,
     notice: Option<String>,
+    history_error: Option<String>,
 }
 
 fn open_engine(app: &AppPaths, claude: &ClaudePaths) -> Result<OpenedEngine, String> {
-    let (store, warning) = store::open_store(app.clone()).map_err(|error| error.to_string())?;
-    match Engine::new(claude.clone(), store, Api::new()) {
-        Ok(engine) => Ok(OpenedEngine {
-            engine,
-            secrets_warning: warning,
-            notice: None,
-        }),
+    let (store, mut warning) = store::open_store(app.clone()).map_err(|error| error.to_string())?;
+    // The settings only choose where the history goes; a failed load here must
+    // not keep the engine from opening. It opens without a recorder, and
+    // `history_error` says why.
+    let settings = store.load().map(|file| file.settings);
+    let (engine, notice) = match Engine::new(claude.clone(), store, Api::new()) {
+        Ok(engine) => (engine, None),
         Err(EngineError::CacheCorrupt { .. }) => {
             let moved = UsageCache::set_aside(app).map_err(|error| error.to_string())?;
             let (store, second_warning) =
                 store::open_store(app.clone()).map_err(|error| error.to_string())?;
+            warning = warning.or(second_warning);
             let engine = Engine::new(claude.clone(), store, Api::new())
                 .map_err(|error| error.to_string())?;
-            Ok(OpenedEngine {
+            (
                 engine,
-                secrets_warning: warning.or(second_warning),
-                notice: Some(format!(
+                Some(format!(
                     "the usage cache was unreadable and was moved to {}; usage is fetched again",
                     moved.display()
                 )),
-            })
+            )
         }
-        Err(error) => Err(error.to_string()),
-    }
+        Err(error) => return Err(error.to_string()),
+    };
+    let (engine, history_error) = match &settings {
+        Ok(settings) => match ops::open_history(app, settings) {
+            Ok(recorder) => (engine.with_recorder(recorder), None),
+            Err(error) => (engine, Some(error)),
+        },
+        Err(error) => (engine, Some(ops::history_unwritable(error))),
+    };
+    Ok(OpenedEngine {
+        engine,
+        secrets_warning: warning,
+        notice,
+        history_error,
+    })
 }
 
 struct EngineRuntime {
@@ -358,6 +436,12 @@ struct EngineRuntime {
     secrets_warning: Option<String>,
     /// The engine-wide error of the last open/poll attempt.
     open_error: Option<String>,
+    /// The engine thread's history state: why the history cannot be opened,
+    /// or the error of the last failed write. Cleared by the next successful
+    /// `Live` or heartbeat write; `publish()` never touches it.
+    history_error: Option<String>,
+    /// The startup `Live` event has been written.
+    live_written: bool,
     /// A one-shot message (the moved usage cache) for the next snapshot.
     notice: Option<String>,
     snapshot: Snapshot,
@@ -390,6 +474,8 @@ impl EngineRuntime {
             engine: None,
             secrets_warning: None,
             open_error: None,
+            history_error: None,
+            live_written: false,
             notice: None,
             snapshot: Snapshot::empty(None, None, None),
             baseline: ClockBaseline::now(),
@@ -416,12 +502,31 @@ impl EngineRuntime {
                     // hid a suspend; check and update the baseline every time.
                     let (baseline, wake) = wake_step(self.baseline, ClockBaseline::now());
                     self.baseline = baseline;
-                    if wake && !matches!(command, EngineCommand::Shutdown) {
+                    if wake && !matches!(&command, EngineCommand::Shutdown) {
                         self.poll(PollReason::Wake);
                     }
                     match command {
                         EngineCommand::Poll(reason) => self.poll(reason),
                         EngineCommand::Publish => self.publish(),
+                        EngineCommand::ModelsInUse(models) => {
+                            let now = Utc::now();
+                            let views = match self.engine.as_mut() {
+                                Some(engine) => {
+                                    engine.set_models_in_use(models);
+                                    match engine.views(now) {
+                                        Ok(views) => Some(views),
+                                        Err(error) => {
+                                            self.open_error = Some(error.to_string());
+                                            None
+                                        }
+                                    }
+                                }
+                                None => None,
+                            }
+                            .unwrap_or_else(|| self.snapshot.views.clone());
+                            self.capture(views, self.snapshot.last_poll_at);
+                            self.send();
+                        }
                         EngineCommand::Shutdown => return,
                     }
                 }
@@ -445,6 +550,7 @@ impl EngineRuntime {
         match open_engine(&self.app, &self.claude) {
             Ok(opened) => {
                 self.engine = Some(opened.engine);
+                self.history_error = opened.history_error;
                 self.secrets_warning = opened
                     .secrets_warning
                     .or_else(|| self.secrets_warning.clone());
@@ -455,6 +561,7 @@ impl EngineRuntime {
                     });
                 }
                 self.open_error = None;
+                self.write_live_once();
                 true
             }
             Err(error) => {
@@ -464,17 +571,65 @@ impl EngineRuntime {
         }
     }
 
+    /// `EventKind::Live{account}` once, after the first successful open with a
+    /// recorder. An unreadable live state is tried again on the next tick.
+    fn write_live_once(&mut self) {
+        if self.live_written {
+            return;
+        }
+        let now = Utc::now();
+        let account = match store::load_accounts(&self.app) {
+            Ok(file) => match switcher::live_state(&self.claude, &file) {
+                Ok(live) => ops::live_account_ref(&live, &file),
+                Err(_) => return,
+            },
+            Err(_) => return,
+        };
+        let Some(engine) = self.engine.as_mut() else {
+            return;
+        };
+        let Some(recorder) = engine.recorder() else {
+            return;
+        };
+        match recorder.event(now, EventKind::Live { account }) {
+            Ok(()) => {
+                self.live_written = true;
+                self.history_error = None;
+            }
+            Err(error) => self.history_error = Some(ops::history_unwritable(&error)),
+        }
+    }
+
+    /// The engine thread's heartbeat: one `up` line per poll when it has a
+    /// recorder. A failed write is the history state; a successful one clears it.
+    fn heartbeat(&mut self, now: DateTime<Utc>) {
+        let result = self
+            .engine
+            .as_mut()
+            .and_then(|engine| engine.recorder().map(|recorder| recorder.up(now)));
+        match result {
+            Some(Ok(())) => self.history_error = None,
+            Some(Err(error)) => self.history_error = Some(ops::history_unwritable(&error)),
+            None => {}
+        }
+    }
+
     fn poll(&mut self, reason: PollReason) {
         if self.engine.is_none() && !self.open() {
             self.capture(Vec::new(), self.snapshot.last_poll_at);
             self.send();
             return;
         }
+        self.write_live_once();
         let now = Utc::now();
         let result = match self.engine.as_mut() {
             Some(engine) => engine.poll(reason, now),
             None => return,
         };
+        // The heartbeat belongs to the engine thread: it runs with
+        // readSessions off too. Its error is the thread's history state, not
+        // the engine's open error, so `publish()` cannot clear it.
+        self.heartbeat(now);
         match result {
             Ok(views) => {
                 self.open_error = None;
@@ -520,11 +675,15 @@ impl EngineRuntime {
                     .to_string(),
             ),
         };
+        let mut engine_error = self.open_error.clone();
+        if let Some(history_error) = &self.history_error {
+            engine_error = combine(engine_error, history_error.clone());
+        }
         self.snapshot = build_snapshot(SnapshotParts {
             views,
             accounts,
             live,
-            engine_error: self.open_error.clone(),
+            engine_error,
             secrets_warning: self.secrets_warning.clone(),
             last_poll_at,
             pending: None,
@@ -597,6 +756,11 @@ struct ActionRuntime {
     autostart_args: Vec<String>,
     engine: Sender<EngineCommand>,
     store: Option<Store>,
+    /// The recorder, or the sentence that says why there is none.
+    history: Result<Recorder, String>,
+    latest_sessions: Arc<Mutex<Option<SessionsSummary>>>,
+    /// The last account seen live, so an external switch has a `from`.
+    live: Option<AccountRef>,
 }
 
 impl ActionRuntime {
@@ -606,13 +770,47 @@ impl ActionRuntime {
         autostart_args: Vec<String>,
         engine: Sender<EngineCommand>,
     ) -> ActionRuntime {
+        let loaded = store::load_accounts(&app);
+        let history = match &loaded {
+            Ok(file) => ops::open_history(&app, &file.settings),
+            Err(error) => Err(ops::history_unwritable(error)),
+        };
+        let live = loaded.ok().and_then(|file| {
+            switcher::live_state(&claude, &file)
+                .ok()
+                .and_then(|state| ops::live_account_ref(&state, &file))
+        });
         ActionRuntime {
             app,
             claude,
             autostart_args,
             engine,
             store: None,
+            history,
+            latest_sessions: Arc::new(Mutex::new(None)),
+            live,
         }
+    }
+
+    fn with_sessions(mut self, latest: Arc<Mutex<Option<SessionsSummary>>>) -> ActionRuntime {
+        self.latest_sessions = latest;
+        self
+    }
+
+    fn recorder(&self) -> Result<&Recorder, String> {
+        self.history.as_ref().map_err(Clone::clone)
+    }
+
+    fn session_counts(&self) -> Option<SessionCounts> {
+        let latest = match self.latest_sessions.lock() {
+            Ok(latest) => latest,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        latest.as_ref().map(|summary| SessionCounts {
+            running: summary.running,
+            busy: summary.busy,
+            tied: 0,
+        })
     }
 
     fn run(mut self, commands: Receiver<ActionCommand>) {
@@ -680,6 +878,54 @@ impl ActionRuntime {
                     },
                     Err(error) => ops::switched_without_list(&error),
                 };
+                let now = Utc::now();
+                let counts = self.session_counts();
+                let loaded = self
+                    .store()
+                    .and_then(|store| store.load().map_err(|error| error.to_string()));
+                let mut to_ref = None;
+                let mut history_error = None;
+                match loaded {
+                    Ok(file) => match file.find(&outcome.to) {
+                        Some(account) => {
+                            let target = AccountRef::of(account);
+                            to_ref = Some(target.clone());
+                            let from = outcome
+                                .from
+                                .as_deref()
+                                .and_then(|id| file.find(id))
+                                .map(AccountRef::of);
+                            match self.recorder() {
+                                Ok(recorder) => {
+                                    if let Err(error) = ops::record_switch(
+                                        recorder,
+                                        from,
+                                        target,
+                                        By::User,
+                                        None,
+                                        None,
+                                        counts,
+                                        now,
+                                    ) {
+                                        history_error = Some(error.to_string());
+                                    }
+                                }
+                                Err(error) => history_error = Some(error),
+                            }
+                        }
+                        None => {
+                            history_error = Some(format!("the store has no account {}", outcome.to))
+                        }
+                    },
+                    Err(error) => history_error = Some(error),
+                }
+                if let Some(target) = to_ref {
+                    self.live = Some(target);
+                }
+                let reply_message = match history_error {
+                    Some(error) => format!("{message} (not written to the history: {error})"),
+                    None => message.clone(),
+                };
                 let notify_on_switch = match self
                     .store()
                     .and_then(|store| store.load().map_err(|e| e.to_string()))
@@ -696,7 +942,7 @@ impl ActionRuntime {
                 let _ = self
                     .engine
                     .send(EngineCommand::Poll(PollReason::AfterSwitch));
-                ActionReply::Switched(message)
+                ActionReply::Switched(reply_message)
             }
             Err(SwitchError::CurrentNotSaved { email }) => match self.pending_for(key, email) {
                 Ok(pending) => ActionReply::NotSaved(pending),
@@ -816,6 +1062,7 @@ impl ActionRuntime {
                 false
             }
         };
+        let mut lock_busy = false;
         if mirror {
             let claude = self.claude.clone();
             let result = match self.store() {
@@ -825,12 +1072,81 @@ impl ActionRuntime {
             match result {
                 Some(Ok(_)) | None => {}
                 // Claude Code is mid-renewal; its next change calls us again.
-                Some(Err(SwitchError::Lock(LockError::Busy { .. }))) => {}
+                Some(Err(SwitchError::Lock(LockError::Busy { .. }))) => lock_busy = true,
                 Some(Err(error)) => eprintln!("seatswap: watcher: {error}"),
+            }
+        }
+        if !lock_busy {
+            let loaded = self
+                .store()
+                .and_then(|store| store.load().map_err(|error| error.to_string()));
+            match loaded {
+                Ok(file) => match switcher::live_state(&self.claude, &file) {
+                    Ok(state) => {
+                        let current = ops::live_account_ref(&state, &file);
+                        if current != self.live {
+                            if let Some(to) = &current {
+                                let counts = self.session_counts();
+                                match self.recorder() {
+                                    Ok(recorder) => {
+                                        if let Err(error) = record_external_switch(
+                                            recorder,
+                                            self.live.clone(),
+                                            to,
+                                            counts,
+                                            Utc::now(),
+                                        ) {
+                                            eprintln!("seatswap: watcher: {error}");
+                                        }
+                                    }
+                                    Err(error) => eprintln!("seatswap: watcher: {error}"),
+                                }
+                            }
+                            self.live = current;
+                        }
+                    }
+                    Err(error) => eprintln!("seatswap: watcher: {error}"),
+                },
+                Err(error) => eprintln!("seatswap: watcher: {error}"),
             }
         }
         let _ = self.engine.send(EngineCommand::Publish);
     }
+}
+
+/// Write `Switch{by: External}` for a live account, unless this host's events
+/// already hold a switch to the same account in the last 15 s.
+fn record_external_switch(
+    recorder: &Recorder,
+    from: Option<AccountRef>,
+    to: &AccountRef,
+    sessions: Option<SessionCounts>,
+    now: DateTime<Utc>,
+) -> Result<bool, HistoryError> {
+    let read = recorder.dir().read::<Event>(
+        &Range {
+            from: now - chrono::Duration::seconds(15),
+            to: now + chrono::Duration::seconds(1),
+        },
+        &Hosts::One(recorder.dir().host().to_string()),
+    )?;
+    let already = read.records.iter().any(|hosted| {
+        matches!(&hosted.record.kind, EventKind::Switch { to: existing, .. } if existing == to)
+    });
+    if already {
+        return Ok(false);
+    }
+    ops::record_switch(
+        recorder,
+        from,
+        to.clone(),
+        By::External,
+        None,
+        None,
+        sessions,
+        now,
+    )?;
+    Ok(true)
 }
 
 /// A switch waiting for "save or discard?" only when the target key names a
@@ -1184,6 +1500,7 @@ mod tests {
                 "live",
                 "pending",
                 "secretsWarning",
+                "sessions",
                 "settings",
                 "suggestion",
                 "views",
@@ -1432,5 +1749,172 @@ mod tests {
             wall,
             monotonic
         ));
+    }
+
+    #[test]
+    fn an_external_change_is_not_recorded_twice() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let account = AccountRef {
+            acc: ACCOUNT_UUID.to_string(),
+            org: ORG_UUID.to_string(),
+        };
+        let now = Utc::now();
+
+        // A CLI switch to the same account 5 s ago: the watcher must not write
+        // a second event for it.
+        let first = HistoryDir::at(&tmp.path().join("first"), "atlas");
+        let recorder = Recorder::new(HistoryDir::at(first.root(), "atlas"));
+        ops::record_switch(
+            &recorder,
+            None,
+            account.clone(),
+            By::Cli,
+            None,
+            None,
+            None,
+            now - chrono::Duration::seconds(5),
+        )
+        .expect("the CLI switch is written");
+        assert!(
+            !record_external_switch(&recorder, None, &account, None, now)
+                .expect("the events can be read")
+        );
+
+        // With no such event, an external switch is written exactly once.
+        let second = HistoryDir::at(&tmp.path().join("second"), "atlas");
+        let recorder = Recorder::new(HistoryDir::at(second.root(), "atlas"));
+        assert!(record_external_switch(&recorder, None, &account, None, now)
+            .expect("the external switch is written"));
+        let read = second
+            .read::<Event>(
+                &Range {
+                    from: now - chrono::Duration::seconds(1),
+                    to: now + chrono::Duration::seconds(1),
+                },
+                &Hosts::One("atlas".to_string()),
+            )
+            .expect("the events can be read");
+        let switches: Vec<&EventKind> = read
+            .records
+            .iter()
+            .map(|hosted| &hosted.record.kind)
+            .filter(|kind| matches!(kind, EventKind::Switch { .. }))
+            .collect();
+        assert_eq!(switches.len(), 1);
+        match switches[0] {
+            EventKind::Switch { by, to, .. } => {
+                assert_eq!(*by, By::External);
+                assert_eq!(to, &account);
+            }
+            other => panic!("expected a switch, got {other:?}"),
+        }
+    }
+
+    /// A history that cannot be written is shown once. When the history writes
+    /// again, the error is gone: it must not stay in every snapshot.
+    #[test]
+    fn a_history_error_is_cleared_when_the_history_writes_again() {
+        let fixture = Fixture::new();
+        let history_root = fixture.app.history_dir();
+        let host_dir = history_root.join("atlas");
+        fs::create_dir_all(&host_dir).expect("history folder");
+        // A folder where the events file belongs: every append fails.
+        let events = host_dir.join(format!("events-{}.jsonl", Utc::now().format("%Y-%m")));
+        fs::create_dir_all(&events).expect("the blocked events file");
+
+        let store = Store::new(
+            fixture.app.clone(),
+            Box::new(FileSecrets::new(fixture.app.secrets_dir())),
+        );
+        let engine = Engine::new(fixture.claude.clone(), store, Api::new())
+            .expect("engine")
+            .with_recorder(Recorder::new(HistoryDir::at(&history_root, "atlas")));
+        let (ui, _rx) = mpsc::channel();
+        let mut runtime = EngineRuntime {
+            app: fixture.app.clone(),
+            claude: fixture.claude.clone(),
+            ui,
+            engine: Some(engine),
+            secrets_warning: None,
+            open_error: None,
+            history_error: None,
+            live_written: false,
+            notice: None,
+            snapshot: Snapshot::empty(None, None, None),
+            baseline: ClockBaseline::now(),
+        };
+
+        runtime.write_live_once();
+        assert!(
+            runtime.history_error.is_some(),
+            "the failed write must be reported: {:?}",
+            runtime.history_error
+        );
+
+        // The history works again: the error must be gone.
+        fs::remove_dir(&events).expect("the blocked events file is gone");
+        runtime.write_live_once();
+        assert!(runtime.live_written, "the live event is written");
+        assert!(
+            runtime.history_error.is_none(),
+            "the history error must be cleared when the history writes again: {:?}",
+            runtime.history_error
+        );
+    }
+
+    /// `publish()` writes nothing to the history, so it must not clear the
+    /// engine thread's history error: the error stays until a write succeeds.
+    #[test]
+    fn a_heartbeat_error_survives_a_publish() {
+        let fixture = Fixture::new();
+        let history_root = fixture.app.history_dir();
+        let host_dir = history_root.join("atlas");
+        fs::create_dir_all(&host_dir).expect("history folder");
+        // A folder where the up file belongs: every heartbeat write fails.
+        let up = host_dir.join(format!("up-{}.jsonl", Utc::now().format("%Y-%m")));
+        fs::create_dir_all(&up).expect("the blocked up file");
+
+        let store = Store::new(
+            fixture.app.clone(),
+            Box::new(FileSecrets::new(fixture.app.secrets_dir())),
+        );
+        let engine = Engine::new(fixture.claude.clone(), store, Api::new())
+            .expect("engine")
+            .with_recorder(Recorder::new(HistoryDir::at(&history_root, "atlas")));
+        let (ui, _rx) = mpsc::channel();
+        let mut runtime = EngineRuntime {
+            app: fixture.app.clone(),
+            claude: fixture.claude.clone(),
+            ui,
+            engine: Some(engine),
+            secrets_warning: None,
+            open_error: None,
+            history_error: None,
+            live_written: false,
+            notice: None,
+            snapshot: Snapshot::empty(None, None, None),
+            baseline: ClockBaseline::now(),
+        };
+
+        runtime.heartbeat(Utc::now());
+        assert!(
+            runtime
+                .history_error
+                .as_deref()
+                .is_some_and(|text| text.starts_with("the history cannot be written:")),
+            "the failed heartbeat must be reported: {:?}",
+            runtime.history_error
+        );
+
+        runtime.publish();
+        let error = runtime
+            .snapshot
+            .error
+            .as_deref()
+            .expect("the heartbeat error is shown");
+        assert!(
+            error.contains("the history cannot be written:"),
+            "publish() must not clear the history error: {error}"
+        );
     }
 }

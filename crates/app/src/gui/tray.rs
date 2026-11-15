@@ -650,6 +650,7 @@ mod tests {
             secrets_warning: None,
             last_poll_at: None,
             error: error.map(str::to_string),
+            sessions: None,
             settings: Some(Settings::default()),
         }
     }

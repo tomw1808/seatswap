@@ -198,12 +198,89 @@ fn run(
     names: WatchedNames,
     on_change: impl Fn() + Send + 'static,
 ) {
+    run_debounced(
+        events,
+        stop,
+        |event| names.is_change(event),
+        || !locks::claude_locks_busy(&claude),
+        on_change,
+    );
+}
+
+/// One folder, watched non-recursively. Dropping it stops the watcher thread and
+/// joins it, so no callback runs after `drop` returned.
+pub struct FolderWatch {
+    backend: Option<RecommendedWatcher>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Drop for FolderWatch {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        drop(self.backend.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Watch one folder non-recursively and call `on_change` on its own thread after
+/// the event stream has been quiet for [`DEBOUNCE`]. Read access is ignored: the
+/// callback reads the folder, which would otherwise make it trigger itself.
+pub fn watch_folder(
+    folder: &Path,
+    on_change: impl Fn() + Send + 'static,
+) -> Result<FolderWatch, WatchError> {
+    ensure_folder(folder)?;
+    let (events, received) = mpsc::channel();
+    let mut backend = RecommendedWatcher::new(events, notify::Config::default())?;
+    backend.watch(folder, RecursiveMode::NonRecursive)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let spawned = thread::Builder::new()
+        .name("seatswap-folder-watch".to_string())
+        .spawn(move || {
+            run_debounced(
+                received,
+                thread_stop,
+                |event| !is_read_access(&event.kind),
+                || true,
+                on_change,
+            );
+        });
+    let thread = match spawned {
+        Ok(thread) => thread,
+        Err(source) => {
+            return Err(WatchError::Io {
+                path: folder.to_path_buf(),
+                source,
+            });
+        }
+    };
+    Ok(FolderWatch {
+        backend: Some(backend),
+        stop,
+        thread: Some(thread),
+    })
+}
+
+/// The debounce loop shared by [`watch`] and [`watch_folder`]: wait for an event
+/// that `is_change` accepts, then after [`DEBOUNCE`] quiet and while `ready`
+/// holds, call `on_change` once.
+fn run_debounced(
+    events: Receiver<notify::Result<Event>>,
+    stop: Arc<AtomicBool>,
+    is_change: impl Fn(&Event) -> bool,
+    ready: impl Fn() -> bool,
+    on_change: impl Fn(),
+) {
     let mut phase = Phase::Idle;
     loop {
         if stop.load(Ordering::SeqCst) {
             return;
         }
-        if matches!(phase, Phase::WaitingForLocks) && !locks::claude_locks_busy(&claude) {
+        if matches!(phase, Phase::WaitingForLocks) && ready() {
             if stop.load(Ordering::SeqCst) {
                 return;
             }
@@ -217,7 +294,7 @@ fn run(
         };
         match received {
             Ok(Ok(event)) => {
-                if names.is_change(&event) {
+                if is_change(&event) {
                     phase = Phase::Quiet {
                         until: Instant::now() + DEBOUNCE,
                     };

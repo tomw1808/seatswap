@@ -309,6 +309,7 @@ mod tests {
             secrets_warning: None,
             last_poll_at: None,
             error: None,
+            sessions: None,
             settings: Some(Settings::default()),
         }
     }

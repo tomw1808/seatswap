@@ -14,7 +14,7 @@ use crate::api::LimitKind;
 use crate::atomic::{self, Access};
 use crate::paths::{self, AppPaths, PathsError};
 use crate::project::ProjectKey;
-use crate::store::Settings;
+use crate::store::{Account, Settings};
 
 mod read;
 mod write;
@@ -108,6 +108,16 @@ pub trait Record: Serialize + DeserializeOwned {
 pub struct AccountRef {
     pub acc: String,
     pub org: String,
+}
+
+impl AccountRef {
+    /// The one way to name a stored account in the history.
+    pub fn of(account: &Account) -> AccountRef {
+        AccountRef {
+            acc: account.account_uuid.clone(),
+            org: account.organization_uuid.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -361,10 +371,7 @@ impl HistoryDir {
     /// `host.json` marker with this machine's id (created on first use) and
     /// refuses a folder marked with another machine's id.
     pub fn open(app: &AppPaths, settings: &Settings) -> Result<HistoryDir, HistoryError> {
-        let root = match &settings.history_dir {
-            Some(dir) => dir.clone(),
-            None => app.history_dir(),
-        };
+        let root = paths::history_root(settings.history_dir.as_deref(), app)?;
         let host = paths::host_name(settings.host_name.as_deref())?;
         let history = HistoryDir { root, host };
 

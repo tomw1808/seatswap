@@ -30,6 +30,8 @@ pub enum PathsError {
     },
     #[error("{0}; set hostName in the settings")]
     HostName(String),
+    #[error("historyDir must be an absolute path, got {0}")]
+    HistoryDir(String),
 }
 
 /// Claude Code's files for one config folder.
@@ -37,6 +39,10 @@ pub enum PathsError {
 pub struct ClaudePaths {
     /// `~/.claude`, or `$CLAUDE_CONFIG_DIR`.
     pub config_dir: PathBuf,
+    /// The user's home folder this config folder was resolved against. Project
+    /// identity and transcript token records need it; it is stored here so no
+    /// other module reads the environment again.
+    pub home: PathBuf,
     /// `<config_dir>/.credentials.json`: the live login (Linux, Windows).
     pub credentials_file: PathBuf,
     /// `.claude.json`: the account identity (`oauthAccount`) and much else.
@@ -80,9 +86,16 @@ impl ClaudePaths {
         };
         ClaudePaths {
             config_dir: config_dir.to_path_buf(),
+            home: home.to_path_buf(),
             credentials_file: config_dir.join(".credentials.json"),
             identity_file,
         }
+    }
+
+    /// The user's home folder. Every module that needs it takes it from here
+    /// instead of reading the environment itself.
+    pub fn home(&self) -> &Path {
+        &self.home
     }
 
     /// Claude Code's renewal lock: `<config_dir>/.oauth_refresh.lock` (spec §2.6).
@@ -214,6 +227,29 @@ impl AppPaths {
             return Err(PathsError::SocketPathTooLong { path });
         }
         Ok(path)
+    }
+}
+
+/// Check a `historyDir`: it must be absolute. A relative folder is an error,
+/// never silently resolved against the current folder.
+pub fn check_history_dir(path: &Path) -> Result<(), PathsError> {
+    if path.is_absolute() {
+        Ok(())
+    } else {
+        Err(PathsError::HistoryDir(path.display().to_string()))
+    }
+}
+
+/// The history folder's root: the explicit `historyDir` setting when it is
+/// absolute, else `app.history_dir()`. A relative explicit folder is an error,
+/// never silently resolved against the current folder.
+pub fn history_root(explicit: Option<&Path>, app: &AppPaths) -> Result<PathBuf, PathsError> {
+    match explicit {
+        Some(path) => {
+            check_history_dir(path)?;
+            Ok(path.to_path_buf())
+        }
+        None => Ok(app.history_dir()),
     }
 }
 

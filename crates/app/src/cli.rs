@@ -14,6 +14,7 @@ use serde::Serialize;
 
 use seatswap_core::api::{Api, Usage};
 use seatswap_core::engine::{suggestion, AccountView, Engine, PollReason, Suggestion};
+use seatswap_core::history::{AccountRef, By};
 use seatswap_core::paths::{self, AppPaths, ClaudePaths, PathsError};
 use seatswap_core::store::{self, Account, AccountsFile, LoginState, Settings, Store, StoreError};
 use seatswap_core::switcher::{self, LiveState, SwitchError, UnsavedPolicy};
@@ -404,10 +405,35 @@ fn use_account(
     discard_current: bool,
 ) -> Result<(), CliError> {
     let policy = unsaved_policy(save_current, discard_current);
-    let outcome = switcher::switch_to(&context.claude, &context.store, key, policy, Utc::now())
+    let now = Utc::now();
+    let outcome = switcher::switch_to(&context.claude, &context.store, key, policy, now)
         .map_err(switch_error)?;
     print_switch(&context.store, &outcome.to);
+    record_cli_switch(&context, &outcome, now);
     Ok(())
+}
+
+/// The switch is done; a history that cannot be written is a warning, never a
+/// failed command.
+fn record_cli_switch(context: &Context, outcome: &switcher::SwitchOutcome, at: DateTime<Utc>) {
+    let result = (|| -> Result<(), String> {
+        let file = context.store.load().map_err(|error| error.to_string())?;
+        let target = file
+            .find(&outcome.to)
+            .ok_or_else(|| format!("the store has no account {}", outcome.to))?;
+        let to = AccountRef::of(target);
+        let from = outcome
+            .from
+            .as_deref()
+            .and_then(|id| file.find(id))
+            .map(AccountRef::of);
+        let recorder = ops::open_history(context.store.app_paths(), &context.settings)?;
+        ops::record_switch(&recorder, from, to, By::Cli, None, None, None, at)
+            .map_err(|error| error.to_string())
+    })();
+    if let Err(error) = result {
+        eprintln!("warning: the switch was not written to the history: {error}");
+    }
 }
 
 /// The switch already happened, so an account list that cannot name it is a
@@ -453,6 +479,7 @@ fn next_account(
     let outcome = switcher::switch_to(&context.claude, &context.store, &target, policy, now)
         .map_err(switch_error)?;
     print_switch(&context.store, &outcome.to);
+    record_cli_switch(&context, &outcome, now);
     Ok(())
 }
 

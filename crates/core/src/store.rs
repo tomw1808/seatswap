@@ -329,12 +329,8 @@ impl Settings {
             }
         }
         if let Some(dir) = &self.history_dir {
-            if !dir.is_absolute() {
-                return Err(StoreError::InvalidSetting(format!(
-                    "historyDir must be an absolute path, got {}",
-                    dir.display()
-                )));
-            }
+            crate::paths::check_history_dir(dir)
+                .map_err(|error| StoreError::InvalidSetting(error.to_string()))?;
         }
         if let Some(name) = &self.host_name {
             crate::paths::host_name(Some(name))

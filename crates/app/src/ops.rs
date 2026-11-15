@@ -4,9 +4,68 @@
 
 use chrono::{DateTime, Utc};
 
-use seatswap_core::paths::ClaudePaths;
-use seatswap_core::store::{Account, Store};
+use seatswap_core::history::{
+    AccountRef, By, EventKind, HistoryDir, HistoryError, Recorder, SessionCounts,
+};
+use seatswap_core::paths::{AppPaths, ClaudePaths};
+#[cfg(feature = "gui")]
+use seatswap_core::store::AccountsFile;
+use seatswap_core::store::{Account, Settings, Store};
 use seatswap_core::switcher::{self, LiveState};
+
+/// The one place a switch is written to the history, for the CLI and the GUI.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_switch(
+    recorder: &Recorder,
+    from: Option<AccountRef>,
+    to: AccountRef,
+    by: By,
+    reason: Option<String>,
+    cwd: Option<String>,
+    sessions: Option<SessionCounts>,
+    at: DateTime<Utc>,
+) -> Result<(), HistoryError> {
+    recorder.event(
+        at,
+        EventKind::Switch {
+            from,
+            to,
+            by,
+            reason,
+            cwd,
+            sessions,
+            waited_secs: None,
+        },
+    )
+}
+
+/// The one sentence the app uses when the history cannot be written.
+pub(crate) fn history_unwritable(error: &dyn std::fmt::Display) -> String {
+    format!("the history cannot be written: {error}")
+}
+
+/// Open the history folder with the same rule everywhere. The text is the one
+/// every front end shows when the history cannot be written.
+pub(crate) fn open_history(app: &AppPaths, settings: &Settings) -> Result<Recorder, String> {
+    HistoryDir::open(app, settings)
+        .map(Recorder::new)
+        .map_err(|error| history_unwritable(&error))
+}
+
+/// The account the live state names, when it is a stored account.
+#[cfg(feature = "gui")]
+pub(crate) fn live_account_ref(live: &LiveState, file: &AccountsFile) -> Option<AccountRef> {
+    let account_id = match live {
+        LiveState::Known { account_id } => account_id,
+        LiveState::Ended {
+            account_id: Some(account_id),
+        } => account_id,
+        LiveState::Ended { account_id: None } | LiveState::NoLogin | LiveState::Unknown { .. } => {
+            return None
+        }
+    };
+    file.find(account_id).map(AccountRef::of)
+}
 
 /// Save the live login as an account (or update the stored copy). A login that
 /// is missing, ended or still unknown saved nothing and is an error here, so
@@ -226,5 +285,47 @@ mod tests {
             switch_message(&store, &account.id),
             Ok("Switched to AC — Acme".to_string())
         );
+    }
+
+    #[test]
+    fn record_switch_writes_one_event() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let history = HistoryDir::at(tmp.path(), "atlas");
+        let recorder = Recorder::new(seatswap_core::history::HistoryDir::at(
+            history.root(),
+            "atlas",
+        ));
+        let to = AccountRef {
+            acc: ACCOUNT_UUID.to_string(),
+            org: ORG_UUID.to_string(),
+        };
+        let at = Utc::now();
+        record_switch(
+            &recorder,
+            None,
+            to,
+            By::User,
+            None,
+            None,
+            Some(SessionCounts {
+                running: 2,
+                busy: 1,
+                tied: 0,
+            }),
+            at,
+        )
+        .expect("the switch is written");
+
+        let file = tmp
+            .path()
+            .join("atlas")
+            .join(format!("events-{}.jsonl", at.format("%Y-%m")));
+        let text = fs::read_to_string(&file).expect("the events file");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        let value: serde_json::Value = serde_json::from_str(lines[0]).expect("JSON");
+        assert_eq!(value["type"], "switch");
+        assert_eq!(value["by"], "user");
+        assert_eq!(value["to"]["acc"], ACCOUNT_UUID);
     }
 }

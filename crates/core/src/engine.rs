@@ -491,7 +491,7 @@ impl<R: Remote> Engine<R> {
         match self.remote.usage(&token) {
             Ok(usage) => self.record_success(
                 id,
-                &account_ref(account),
+                &AccountRef::of(account),
                 account.plan.as_deref(),
                 usage,
                 now,
@@ -507,7 +507,7 @@ impl<R: Remote> Engine<R> {
                     Some(token) => match self.remote.usage(&token) {
                         Ok(usage) => self.record_success(
                             id,
-                            &account_ref(account),
+                            &AccountRef::of(account),
                             account.plan.as_deref(),
                             usage,
                             now,
@@ -561,7 +561,7 @@ impl<R: Remote> Engine<R> {
             Ok(usage) => {
                 self.record_success(
                     id,
-                    &account_ref(account),
+                    &AccountRef::of(account),
                     account.plan.as_deref(),
                     usage,
                     now,
@@ -614,12 +614,9 @@ impl<R: Remote> Engine<R> {
             // Removed meanwhile: nothing to refresh or save.
             return Ok(());
         };
-        let account_uuid = current.account_uuid.clone();
-        let organization_uuid = current.organization_uuid.clone();
-        let current_ref = AccountRef {
-            acc: account_uuid.clone(),
-            org: organization_uuid.clone(),
-        };
+        let current_ref = AccountRef::of(current);
+        let account_uuid = current_ref.acc.clone();
+        let organization_uuid = current_ref.org.clone();
         let plan = current.plan.clone();
 
         // Make sure the account did not become the live one. If the identity
@@ -957,13 +954,6 @@ fn blocker_rank(blocker: &Blocker) -> u8 {
         Blocker::Week => 0,
         Blocker::Model(_) => 1,
         Blocker::Session => 2,
-    }
-}
-
-fn account_ref(account: &Account) -> AccountRef {
-    AccountRef {
-        acc: account.account_uuid.clone(),
-        org: account.organization_uuid.clone(),
     }
 }
 

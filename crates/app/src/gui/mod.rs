@@ -19,6 +19,8 @@ pub(crate) mod panel;
 #[cfg(feature = "gui")]
 pub(crate) mod registry;
 #[cfg(feature = "gui")]
+pub(crate) mod sessions_rt;
+#[cfg(feature = "gui")]
 pub(crate) mod tray;
 #[cfg(feature = "gui")]
 pub(crate) mod worker;
@@ -48,6 +50,10 @@ use notify::Notification;
 use tauri::{AppHandle, Emitter, Manager};
 
 #[cfg(feature = "gui")]
+use sessions_rt::SessionsHandle;
+#[cfg(feature = "gui")]
+use worker::SessionsSummary;
+#[cfg(feature = "gui")]
 use worker::{ActionCommand, ActionReply, EngineCommand, PendingSwitch, Snapshot, UiEvent};
 
 /// Everything the Tauri commands and the tray share. The snapshot is updated
@@ -55,6 +61,8 @@ use worker::{ActionCommand, ActionReply, EngineCommand, PendingSwitch, Snapshot,
 #[cfg(feature = "gui")]
 pub(crate) struct GuiState {
     snapshot: Mutex<Snapshot>,
+    /// The latest sessions summary; every snapshot is emitted with it.
+    sessions: Mutex<Option<SessionsSummary>>,
     pub(crate) engine: std::sync::mpsc::Sender<EngineCommand>,
     pub(crate) action: std::sync::mpsc::Sender<ActionCommand>,
     deduper: Mutex<notify::Deduper>,
@@ -64,6 +72,7 @@ pub(crate) struct GuiState {
     panel: Mutex<panel::PanelState>,
     tray: Mutex<Option<tauri::tray::TrayIcon>>,
     _watcher: Mutex<Option<seatswap_core::watcher::Watcher>>,
+    _sessions: Mutex<Option<SessionsHandle>>,
     startup_error: Option<String>,
     /// A normal quit sets this before the engine thread stops, so the UI
     /// disconnect is not mistaken for a crash.
@@ -242,7 +251,13 @@ fn setup(
     };
 
     let (ui_tx, ui_rx) = mpsc::channel();
-    let worker = worker::spawn(app.clone(), claude.clone(), autostart_args.clone(), ui_tx)?;
+    let mut worker = worker::spawn(
+        app.clone(),
+        claude.clone(),
+        autostart_args.clone(),
+        ui_tx,
+        settings.clone(),
+    )?;
 
     let watcher = {
         let action = worker.action.clone();
@@ -269,9 +284,11 @@ fn setup(
         Some(startup_errors.join("; "))
     };
     let initial = Snapshot::empty(startup_error.clone(), None, settings);
+    let sessions = worker.sessions.take();
 
     tauri_app.manage(GuiState {
         snapshot: Mutex::new(initial.clone()),
+        sessions: Mutex::new(None),
         engine: worker.engine.clone(),
         action: worker.action.clone(),
         deduper: Mutex::new(notify::Deduper::new()),
@@ -279,6 +296,7 @@ fn setup(
         panel: Mutex::new(panel::PanelState::new()),
         tray: Mutex::new(None),
         _watcher: Mutex::new(watcher),
+        _sessions: Mutex::new(sessions),
         startup_error,
         exiting: AtomicBool::new(false),
     });
@@ -360,12 +378,19 @@ struct ListenerHolder {
 fn handle_ui_event(app: &AppHandle, event: UiEvent) {
     match event {
         UiEvent::Snapshot(snapshot) => apply_snapshot(app, snapshot),
+        UiEvent::Sessions(summary) => {
+            let state = app.state::<GuiState>();
+            *lock(&state.sessions) = Some(summary);
+            let snapshot = lock(&state.snapshot).clone();
+            apply_snapshot(app, snapshot);
+        }
     }
 }
 
 #[cfg(feature = "gui")]
 fn apply_snapshot(app: &AppHandle, mut snapshot: Snapshot) {
     let state = app.state::<GuiState>();
+    snapshot.sessions = lock(&state.sessions).clone();
     if let Some(startup) = &state.startup_error {
         snapshot.error = Some(match snapshot.error.take() {
             Some(engine) => format!("{engine}; {startup}"),

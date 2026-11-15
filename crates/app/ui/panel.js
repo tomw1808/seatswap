@@ -2497,6 +2497,20 @@ function makeFixture() {
     secretsWarning: null,
     lastPollAt: isoIn(-12000),
     error: null,
+    sessions: {
+      running: 2,
+      busy: 1,
+      waiting: [
+        {
+          session: "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34",
+          label: "atlas-7c",
+          project: "atlas",
+          since: isoIn(-4 * 60000),
+        },
+      ],
+      unavailable: null,
+      warning: null,
+    },
     settings: Object.assign({}, DEFAULT_SETTINGS),
   };
 }
