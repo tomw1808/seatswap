@@ -25,12 +25,12 @@ use seatswap_core::history::{
 };
 use seatswap_core::money::ModelPrice;
 use seatswap_core::projects::{ProjectEdit, Projects, ProjectsLogRecord};
-use seatswap_core::store::{self, Account, Settings};
+use seatswap_core::store::{self, Account};
 use seatswap_core::switcher::UnsavedPolicy;
 
 use super::format;
 use super::lookup_rt::{price_rows, MoneyView, PriceRow};
-use super::worker::{ActionCommand, ActionReply, EngineCommand, Snapshot};
+use super::worker::{ActionCommand, ActionReply, EngineCommand, SavedSetting, Snapshot};
 use super::GuiState;
 use crate::agent_skill::{self, SkillStatus};
 use crate::format::{expand_tilde, with_tilde};
@@ -565,7 +565,7 @@ fn switch_reply(
             clear_pending()?;
             Err(message)
         }
-        ActionReply::Done => {
+        ActionReply::Done | ActionReply::Saved(_) => {
             clear_pending()?;
             Err("the action thread gave an unexpected reply".to_string())
         }
@@ -653,51 +653,54 @@ pub(crate) async fn remove_account(state: State<'_, GuiState>, key: String) -> R
 }
 
 #[tauri::command]
-pub(crate) async fn save_settings(
+pub(crate) async fn save_setting(
     state: State<'_, GuiState>,
-    settings: Settings,
-) -> Result<(), String> {
+    field: String,
+    value: serde_json::Value,
+) -> Result<SavedSetting, String> {
     let action = state.action.clone();
-    let saved = settings.clone();
     let reply = tauri::async_runtime::spawn_blocking(move || {
-        request(&action, |reply| ActionCommand::SaveSettings {
-            settings,
+        request(&action, |reply| ActionCommand::SaveSetting {
+            field,
+            value,
             reply,
         })
     })
     .await
     .map_err(|error| error.to_string())??;
     match reply {
-        ActionReply::Done => {
-            state.remember_settings(saved);
-            Ok(())
+        ActionReply::Saved(saved) => {
+            state.remember_settings(saved.settings.clone());
+            Ok(saved)
         }
         ActionReply::Failed(message) => Err(message),
         _ => Err("the action thread gave an unexpected reply".to_string()),
     }
 }
 
-/// Turn auto-burn on or off from the pop-up. It saves through the same settings
-/// path as the settings page, so the change is written to the history in one
-/// place (`worker::save_settings`).
+/// Turn auto-burn on or off from the pop-up. It sends the one field through the
+/// same settings path as the settings page, so the change is merged under the
+/// app lock and written to the history in one place (`worker::save_setting`).
 #[tauri::command]
 pub(crate) async fn set_auto_burn(state: State<'_, GuiState>, on: bool) -> Result<(), String> {
-    let snapshot = state.snapshot()?;
-    let mut settings = snapshot
-        .settings
-        .ok_or_else(|| "the settings are not loaded".to_string())?;
-    settings.auto_burn = on;
     let action = state.action.clone();
     let reply = tauri::async_runtime::spawn_blocking(move || {
-        request(&action, |reply| ActionCommand::SaveSettings {
-            settings,
+        request(&action, |reply| ActionCommand::SaveSetting {
+            field: "autoBurn".to_string(),
+            value: serde_json::Value::Bool(on),
             reply,
         })
     })
     .await
     .map_err(|error| error.to_string())??;
     match reply {
-        ActionReply::Done => Ok(()),
+        ActionReply::Saved(saved) => {
+            state.remember_settings(saved.settings);
+            match saved.warning {
+                Some(warning) => Err(warning),
+                None => Ok(()),
+            }
+        }
         ActionReply::Failed(message) => Err(message),
         _ => Err("the action thread gave an unexpected reply".to_string()),
     }

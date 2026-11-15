@@ -421,6 +421,11 @@ impl BurnRuntime {
                 });
             }
             Ok(ActionReply::Done) => sent.reply = None,
+            Ok(ActionReply::Saved(_)) => {
+                sent.reply = None;
+                sent.error =
+                    Some("auto-burn: the action thread gave an unexpected reply".to_string());
+            }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
                 sent.reply = None;

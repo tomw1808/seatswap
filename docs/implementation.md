@@ -1007,7 +1007,7 @@ pub struct Snapshot {
 ```
 
 **Tauri commands** (all `Result<T, String>`, the error is the human message of the core error):
-`get_snapshot() -> Snapshot` · `refresh_now()` (Poll(Wake)) · `switch_account(key, unsaved: "refuse"|"discard"|"save", label: Option<String>) -> String` (the success sentence; `CurrentNotSaved` sets `pending` and returns Err "not saved") · `cancel_pending()` · `save_current(label: Option<String>)` (sync_live with create) · `edit_account(key, label?, abbr?, color?)` · `remove_account(key)` · `save_settings(settings: Settings)` (validated; applies startAtLogin) · `set_auto_burn(on)` (the same save path, writes `autoBurnSet` only on a change) · `pause_burn(hours: Option<i64>)` (Some = pause, None = resume) · `icon_preview(abbr, color) -> Vec<IconPx { size, rgba: Vec<u8> }>` for 16, 22, 32 (the panel draws them with `ImageData`) · `fit_panel(height: f64)` · `hide_panel()`.
+`get_snapshot() -> Snapshot` · `refresh_now()` (Poll(Wake)) · `switch_account(key, unsaved: "refuse"|"discard"|"save", label: Option<String>) -> String` (the success sentence; `CurrentNotSaved` sets `pending` and returns Err "not saved") · `cancel_pending()` · `save_current(label: Option<String>)` (sync_live with create) · `edit_account(key, label?, abbr?, color?)` · `remove_account(key)` · `save_setting(field: String, value: serde_json::Value) -> SavedSetting` (one field merged under the app lock, validated, applies startAtLogin) · `set_auto_burn(on)` (`SaveSetting { field: "autoBurn", value: on }`: the same save path, writes `autoBurnSet` only on a change) · `pause_burn(hours: Option<i64>)` (Some = pause, None = resume) · `icon_preview(abbr, color) -> Vec<IconPx { size, rgba: Vec<u8> }>` for 16, 22, 32 (the panel draws them with `ImageData`) · `fit_panel(height: f64)` · `hide_panel()`.
 Event `navigate` (payload `"main"|"add"|"settings"`) when the panel is shown for a menu item.
 
 **Tray** (`tray.rs`, redrawn on every snapshot): icon from `icon::render` at 22 px ×2 (44 px image) for the active account — ring = `settings.iconLimit` limit (binding/session/week) with its `LoadLevel` colour, `locked` at ≥ 100 %, grey ring while the usage is unknown, a grey "?" disc when no account is live; tooltip as §8.1; tray label (`set_title`) per `trayText`. Linux backend: tray-icon's `ksni` (StatusNotifierItem over D-Bus), switched on in `crates/app/Cargo.toml` next to Tauri's libappindicator, because libappindicator reports no clicks and drops the tooltip; with ksni the item has `ItemIsMenu = false`, a left click arrives as `TrayIconEvent::Click(Left)` (opens the panel), a right click shows the menu, and the tooltip is published (checked on the session bus, 2026-11-10). Without a StatusNotifierWatcher on the bus (plain GNOME without the AppIndicator extension, or a desktop panel that starts after seatswap at login) tray-icon cannot create the item and has no option to wait; `tray::start` then keeps the app running without an icon, says so on stderr at once and in a notification only if no tray has appeared after 30 s (`TRAY_GRACE`: at login Cinnamon starts its tray in the same second as seatswap, so the first try often comes too early) (`seatswap panel` still opens the pop-up), and creates the icon when the name `org.kde.StatusNotifierWatcher` appears (`gio::bus_watch_name`, GTK's own gio). Once the item exists, ksni registers it again whenever the watcher restarts. Menu as §8.3: one item per account (`AC  Acme   97 % · 1h12m` + "✓" for the live one, "logged out" when so), clicking switches with `refuse`; then "Save current login (…)…" when live is unknown; "Open panel…", "Add account…", "Settings…", "Quit". Number formatting is shared with the CLI (one module, `crates/app/src/format.rs`).
@@ -1018,7 +1018,7 @@ Event `navigate` (payload `"main"|"add"|"settings"`) when the panel is shown for
 
 **Single instance and `seatswap panel`** (`ipc.rs`): the tray app takes `acquire_file_lock(gui_lock, 0)`. Busy → another instance runs: send `open-panel main` to `gui_socket` and exit 0. Held → name the socket only now (the lock created the data folder on first start, and the name needs its real path), remove a leftover socket, listen on it (mode 0600 on Unix; on Windows the file has the data folder's permissions). Windows uses the same Unix socket through `uds_windows` (`std::os::windows::net` is not stable yet); there is no runtime folder, so the socket is `<data>\gui.sock`. One line per connection: `open-panel <view>` → `ok`, anything else → `error unknown command`.
 
-**Autostart** (`autostart.rs`, one entry point `apply_autostart(enabled, arguments)`): at start and on `save_settings`. The entry is text: a program path or folder argument that is not valid Unicode is `AutostartError::NotUnicode` on both platforms (the one `path_text`), never a path with replaced characters. Linux: `startAtLogin` on → write `autostart_file($XDG_CONFIG_HOME or ~/.config)` with `Exec=<current_exe>` via `write_atomic` (`Access::Shared`); off → remove it if present. Windows: on → the string value `seatswap` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` = `"<folder of current_exe>\seatswap-tray.exe" "<arg>" …` (each part in double quotes, `"` written `\"`, a run of backslashes before a `"` or at the end doubled); a missing `seatswap-tray.exe` (`NoTrayProgram`), a path that is not valid Unicode (`NotUnicode`) or a command over 260 UTF-16 units (`CommandTooLong`) is an error, never shortened; off → delete the value (missing is fine). `gui/registry.rs` (Windows only) is the one module that names `winreg`: `set_string`, `get_string` (tests only), `delete_value`, all under `HKEY_CURRENT_USER`.
+**Autostart** (`autostart.rs`, one entry point `apply_autostart(enabled, arguments)`): at start and on every `save_setting`. The entry is text: a program path or folder argument that is not valid Unicode is `AutostartError::NotUnicode` on both platforms (the one `path_text`), never a path with replaced characters. Linux: `startAtLogin` on → write `autostart_file($XDG_CONFIG_HOME or ~/.config)` with `Exec=<current_exe>` via `write_atomic` (`Access::Shared`); off → remove it if present. Windows: on → the string value `seatswap` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` = `"<folder of current_exe>\seatswap-tray.exe" "<arg>" …` (each part in double quotes, `"` written `\"`, a run of backslashes before a `"` or at the end doubled); a missing `seatswap-tray.exe` (`NoTrayProgram`), a path that is not valid Unicode (`NotUnicode`) or a command over 260 UTF-16 units (`CommandTooLong`) is an error, never shortened; off → delete the value (missing is fine). `gui/registry.rs` (Windows only) is the one module that names `winreg`: `set_string`, `get_string` (tests only), `delete_value`, all under `HKEY_CURRENT_USER`.
 
 **Panel UI** (`ui/`, plain HTML/CSS/JS, no build step, `window.__TAURI__` with `app.withGlobalTauri: true`): §11.1–11.2. Views `main` and `add` (the §6.1 steps; shows the unknown live login with a label field and "Save" when there is one); a `settings` request now opens the large window at Settings (step C1), because the pop-up has no settings view. The main view's footer carries the sessions line of §11.1 from `snapshot.sessions`. Every time on the page (reset countdowns, the header's poll age, a card's "usage 5 min ago") is an element with `data-time` + `data-time-style` whose text comes from the command `time_texts([{at, style}]) → [text]` (`countdown` → `format_reset_at`, `clock` → `format_reset_clock`, `age` → `format_age`), asked after each render and every second, so the page has no copy of these rules. Without `window.__TAURI__` it runs on a built-in fixture snapshot so it can be opened in a browser; there `time_texts` answers with stand-ins (the plain clock time, "a moment ago").
 
@@ -1577,7 +1577,7 @@ otherwise the lazy plan's next account and its first use), removes it when auto-
 paused or nothing is planned, and rewrites at least every `burn_next::REWRITE_AFTER_MIN` minutes.
 The runtime remembers the warnings it printed with `worker::PrintedWarnings`, shared rather than a
 second `BTreeSet`. `BurnView` is part of `Snapshot.burn`; the
-settings toggle calls `worker::save_settings` and writes `EventKind::AutoBurnSet`, the pause calls
+settings toggle calls `worker::save_setting` and writes `EventKind::AutoBurnSet`, the pause calls
 `ActionCommand::PauseBurn { hours }` and writes `EventKind::AutoBurn`.
 
 ## app: CLI — `burn` and `status` (step B)
@@ -1644,12 +1644,12 @@ pub(crate) enum ActionCommand { …, PauseBurn { hours: Option<i64> } } // Some:
 #[tauri::command] pub(crate) fn pause_burn(state: State<GuiState>, hours: Option<i64>) -> Result<(), String>;
 ```
 
-`SaveSettings` compares the old and new `auto_burn`; only a change writes `EventKind::AutoBurnSet`.
-`PauseBurn` refuses `hours <= 0`, writes `EventKind::AutoBurn { on, paused_until }` and sends
+`SaveSetting` merges one field into the stored settings; only a change of `auto_burn` writes
+`EventKind::AutoBurnSet`. `PauseBurn` refuses `hours <= 0`, writes `EventKind::AutoBurn { on, paused_until }` and sends
 `EngineCommand::HistoryChanged`. The engine reads `feed.json` on `Feed` and calls `apply_feed`; it
 does the same once at start, so a feed written while no tray app ran is not lost. The pop-up's
-`set_auto_burn` goes through `SaveSettings` (one write path), and `pause_burn` is the Pause 4 h /
-Resume button.
+`set_auto_burn` sends `SaveSetting { field: "autoBurn", value: on }` (one write path), and `pause_burn`
+is the Pause 4 h / Resume button.
 
 ## Files step B writes
 
@@ -1730,42 +1730,58 @@ below 10, `"6.47 EUR"`, and throws on a negative or non-finite amount or a curre
 three capital letters; `tokens(n)` returns `"12.4 M"`, `"845 k"` or `"0"` and throws on an invalid
 count. `window.html`, `window.css` and `window.js` are the second page; `window.js` reads the area
 from `location.hash`, draws the tabs, imports `./areas/<area>.js` on demand and calls its
-`render(container, { sub, snapshot, invoke, listen })`. A module that does not exist yet shows
-"Comes with a later version."; a module that throws shows its error in the area. `crates/app/
-capabilities/default.json` names both windows: `"windows": ["panel", "main"]`.
+`render(container, { sub, snapshot, invoke, listen, fromOpen })`. A module that does not exist yet
+shows "Comes with a later version."; a module that throws shows its error in the area. A `snapshot`
+calls the current area's `update(snapshot)` when it has one and has rendered, and `render` only for
+an area without `update`. The old content stays until the area replaces it. `fromOpen` is true when
+an `open-area` request caused the render, so an item it names is applied even when the address
+already names the same item. `crates/app/capabilities/default.json` names both windows:
+`"windows": ["panel", "main"]`.
 
 ## The Settings page and its save queue (step C1)
 
-`areas/settings.js` exports `render(container, context)`; the seven groups are `general`,
-`accounts`, `auto-burn`, `notifications`, `projects`, `agents`, `history`. The address is
-`settings/<group>[?<item>]`, with `groupFrom` accepting the aliases `gen`, `acc`, `autoburn`/`burn`,
-`noti`, `proj`, `hist`; an item opens that account's editor. A group click writes
+`areas/settings.js` exports `render(container, context)` and `update(snapshot)`; the seven groups
+are `general`, `accounts`, `auto-burn`, `notifications`, `projects`, `agents`, `history`. The
+address is `settings/<group>[?<item>]`, with `groupFrom` accepting the aliases `gen`, `acc`,
+`autoburn`/`burn`, `noti`, `proj`, `hist`; an item opens that account's editor (and an `open-area`
+request applies it even when the address already names it). A group click writes
 `settings/<group>` and the `hashchange` redraws it.
+
+`update(snapshot)` stores the snapshot and its settings the way `takeSettings` does, then redraws
+the open group in place from the stored views. It sends no save. While an input, select or textarea
+inside the area has focus it draws nothing; the next snapshot after that field lost focus draws.
+The only view it reads is the projects view, when the snapshot's list of account ids changed and
+the Accounts group is open. `render` reads money (`loadMoney`), the
+price list, projects (`loadProjects`), history (`loadHistory`), the agent skill and the agent calls
+only when their group is opened. A save or edit that changes a view (the money rows, an own price,
+a project edit, a saved host setting, the agent skill) reads that view again; `listenMoney` handles
+`UiEvent::Money`, and the price list is also read then while it is open. Every view keeps a request
+token so a slow reply cannot overwrite a newer one (`moneyToken`, `priceToken`, `projectsToken`,
+`historyToken`, `skillToken`, `callsToken`). A render or update keeps the old content until the new
+one replaces it, so the area is never blank while a view loads.
 
 The save queue is the page's one write path, in this order:
 
 ```js
 function queuedSave(run)            // every save runs on `state.saving`, one after another
-function saveField(field, value)    // a setting: invokes save_settings with a clone of state.settings and sets one key
+function saveField(field, value)    // a setting: invokes save_setting with one field and its value
 function saveAccount(account, patch, field) // invokes edit_account { key, ...patch }; the patch is one of label, abbr, color, autoBurn, price
 async function saveNow(field, value) // refuses without state.settings; keeps the server's error text
 ```
 
 `state.pendingSaves` counts the queued and running saves. `takeSettings(snapshot)` ignores the
 snapshot's settings while it is above 0, so a poll cannot undo a save that has not answered yet.
-`saveNow` updates `state.settings` and `state.snapshot.settings` only after `save_settings`
-succeeded; a "settings saved; start at login could not be set: …" answer keeps the saved values
-and shows that text, because only the autostart entry failed. A refused save leaves the error under
-its row (`fieldError`) and the caller puts the control back to `savedValue(field)`. `label`, the
+`saveNow` sends `save_setting(field, value)` and takes `settings` from the reply as the page's copy
+(`state.settings` and `state.snapshot.settings`); the reply's `warning` ("settings saved; start at
+login could not be set: …") keeps the saved values and is shown under the row, because only the
+autostart entry failed. A refused save leaves the error under its row, and `setting()` builds that
+error line from `state.errors[field]`, so the next redraw keeps it until that field saves
+successfully; the caller puts the control back to `savedValue(field)`. The worker merges one field
+under the app lock (`merge_setting`): the field must be a key of the settings' camelCase JSON
+object, the value replaces only it, the result is deserialised and validated, and a typed `~` or
+`~/` in `claudeConfigDir` or `historyDir` is expanded with `format::expand_tilde`. `label`, the
 chip's letters and colour, `autoBurn` and `price` save through `edit_account`; `price` is sent as a
 number, `null` to clear it, or left out to keep it.
-
-The page loads its extra views through the commands: `loadMoney` (and `listenMoney` for
-`UiEvent::Money`) for the Money section and the price list, `loadProjects` for Accounts and
-Projects, `loadHistory` when the History group opens or a host setting is saved. Each keeps a
-request token so a slow reply cannot overwrite a newer one (`moneyToken`, `projectsToken`,
-`historyToken`). The Money section's price list is read only when "Show…" is pressed
-(`price_list`); an own price saves through `set_price_override` and refreshes the view.
 
 ## store.rs additions — plan, price and the money settings (step C1)
 
@@ -2080,10 +2096,12 @@ to this host's own log only, then returns the new resolution.
 (`plan`, `price`, `orgName`, `autoBurn`, login end); `UiEvent` gains `Money(MoneyView)`;
 `Worker.lookup: Option<LookupHandle>` is the thread; `Worker.history` is the one `HistoryDir`.
 `AccountRow { id, label, abbr, color, email, orgName, plan, price, autoBurn, loginEndsAtMs,
-loginDaysLeft, isActive }`. `save_settings` validates the whole `Settings`, takes the app lock,
-writes `accounts.json`, then writes the one history event of a change (only `AutoBurnSet` for
-`autoBurn` today) and applies the autostart entry; an autostart failure answers
-`settings saved; start at login could not be set: <error>`.
+loginDaysLeft, isActive }`. `save_setting(field, value)` takes the app lock, loads
+`accounts.json`, replaces that one field with `merge_setting`, validates the whole `Settings` and
+writes the file, then writes the one history event of a change (only `AutoBurnSet` for `autoBurn`
+today) and applies the autostart entry; it answers `SavedSetting { settings, warning }`, where an
+autostart failure is `warning` = `settings saved; start at login could not be set: <error>`, not a
+failed save. `remember_settings` puts the reply's merged settings into the snapshot.
 
 ## app: CLI — `window`, `prices` and `history` (step C1)
 

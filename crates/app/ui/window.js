@@ -42,6 +42,10 @@ const state = {
 const modules = new Map();
 // A later hash or `open-area` wins over a dynamic import still in flight.
 let renderToken = 0;
+// The module that last rendered, so a snapshot can update it in place.
+let rendered = { area: null, module: null, busy: false, snapshot: null };
+// The target an `open-area` asked for; its `hashchange` is an open request.
+let openTarget = null;
 
 function findArea(id) {
   return AREAS.find((area) => area.id === id) || null;
@@ -159,18 +163,20 @@ function renderSnapshotBanner() {
   if (text) host.appendChild(banner("error", "⚠", String(text)));
 }
 
-// Render the current area into the container. A module that is not there yet
-// says so; a module that fails to render says what went wrong.
-async function renderArea() {
+// Render the current area into the container. The old content stays until the
+// module replaces it, so a slow load is not a blank area. A module that is not
+// there yet says so; a module that fails to render says what went wrong.
+async function renderArea(options = {}) {
   const container = document.getElementById("area");
   if (!container) return;
   const token = ++renderToken;
   renderSnapshotBanner();
-  clear(container);
-  if (state.error) container.appendChild(message(state.error, "error"));
 
   const area = findArea(state.area);
   if (!area) {
+    rendered = { area: null, module: null, busy: false, snapshot: state.snapshot };
+    clear(container);
+    if (state.error) container.appendChild(message(state.error, "error"));
     container.appendChild(
       message(`Unknown area ${JSON.stringify(state.target === null ? "" : state.target)}.`)
     );
@@ -180,41 +186,102 @@ async function renderArea() {
   const module = await loadArea(area.id);
   if (token !== renderToken) return;
   if (!module || typeof module.render !== "function") {
+    rendered = { area: area.id, module: null, busy: false, snapshot: state.snapshot };
+    clear(container);
+    if (state.error) container.appendChild(message(state.error, "error"));
     container.appendChild(message(NOT_YET));
     return;
   }
+  const snapshot = state.snapshot;
+  rendered = { area: area.id, module: null, busy: true, snapshot };
   try {
     await module.render(container, {
       sub: state.sub,
-      snapshot: state.snapshot,
+      snapshot,
       invoke,
       listen,
+      fromOpen: options.fromOpen === true,
     });
   } catch (error) {
     if (token !== renderToken) return;
+    rendered = { area: area.id, module: null, busy: false, snapshot };
     clear(container);
     container.appendChild(
       message(`Cannot show ${area.title}: ${errorMessage(error)}`, "error")
     );
+    return;
+  }
+  if (token !== renderToken) return;
+  rendered = { area: area.id, module, busy: false, snapshot };
+  // A snapshot arrived while the module rendered: apply it now.
+  if (state.snapshot !== snapshot) {
+    if (typeof module.update === "function") await updateArea();
+    else await renderArea();
   }
 }
 
-// Show a target and, unless it is the address already, put it there too.
-function open(target) {
-  if (location.hash.slice(1) === target) {
-    show(target);
+// A snapshot updates an area that has an `update` in place; an area without one
+// is rendered again, and so is one that has not rendered yet. An update takes
+// the latest snapshot even when another one arrives while it runs.
+async function updateArea() {
+  const current = rendered;
+  if (!state.area || current.busy) return;
+  if (current.area !== state.area) return; // its render is starting or in flight
+  if (!current.module) {
+    await renderArea();
     return;
   }
+  if (typeof current.module.update !== "function") {
+    await renderArea();
+    return;
+  }
+  current.busy = true;
+  try {
+    let snapshot = state.snapshot;
+    do {
+      current.snapshot = snapshot;
+      await current.module.update(snapshot);
+      snapshot = state.snapshot;
+    } while (rendered === current && snapshot !== current.snapshot);
+  } catch (error) {
+    if (rendered !== current) return;
+    const container = document.getElementById("area");
+    const area = findArea(state.area);
+    if (container) {
+      clear(container);
+      container.appendChild(
+        message(
+          `Cannot update ${area ? area.title : "the area"}: ${errorMessage(error)}`,
+          "error"
+        )
+      );
+    }
+    rendered = { area: state.area, module: null, busy: false, snapshot: state.snapshot };
+    return;
+  } finally {
+    current.busy = false;
+  }
+}
+
+// Show a target and, unless it is the address already, put it there too. An
+// `open-area` request tells the area's render, so an item it names is applied
+// even when the address already names the same item.
+function open(target) {
+  if (location.hash.slice(1) === target) {
+    show(target, true);
+    return;
+  }
+  openTarget = target;
   location.hash = target;
 }
 
-function show(target) {
+function show(target, fromOpen = false) {
   state.target = typeof target === "string" ? target : "";
   const parsed = parseTarget(state.target);
   state.area = parsed ? parsed.area : null;
   state.sub = parsed ? parsed.sub : null;
   renderHead();
-  renderArea();
+  renderArea({ fromOpen });
 }
 
 async function boot() {
@@ -229,12 +296,22 @@ async function boot() {
   await listen("snapshot", (payload) => {
     if (!isObject(payload)) return;
     state.snapshot = payload;
+    // A failed first read drew its message into the area: a full render
+    // takes it away. Otherwise the area updates in place.
+    const hadError = state.error !== null;
     state.error = null;
     applyTheme(themeSetting());
-    renderArea();
+    renderSnapshotBanner();
+    if (hadError) renderArea();
+    else updateArea();
   });
 
-  window.addEventListener("hashchange", () => show(hashTarget()));
+  window.addEventListener("hashchange", () => {
+    const target = hashTarget();
+    const fromOpen = openTarget === target;
+    openTarget = null;
+    show(target, fromOpen);
+  });
 
   if (HAS_TAURI) {
     try {

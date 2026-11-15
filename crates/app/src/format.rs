@@ -63,7 +63,12 @@ pub(crate) fn expand_tilde(path: &str, home: &std::path::Path) -> std::path::Pat
         return home.to_path_buf();
     }
     let prefix = format!("~{}", std::path::MAIN_SEPARATOR);
-    match path.strip_prefix(&prefix) {
+    let rest = path.strip_prefix(&prefix);
+    // Windows also accepts the `/` a person types from the examples, beside
+    // the `\` the History field shows.
+    #[cfg(windows)]
+    let rest = rest.or_else(|| path.strip_prefix("~/"));
+    match rest {
         Some(rest) => home.join(rest),
         None => std::path::PathBuf::from(path),
     }

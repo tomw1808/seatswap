@@ -45,7 +45,7 @@ use super::burn_rt::{BurnRuntime, BurnTick};
 use super::lookup_rt::{self, LookupHandle, MoneyView};
 use super::notify;
 use super::sessions_rt::{self, SessionsHandle};
-use crate::format::with_tilde;
+use crate::format::{expand_tilde, with_tilde};
 use crate::ops;
 
 /// How often the engine thread polls even without a command.
@@ -300,8 +300,9 @@ pub(crate) enum ActionCommand {
         key: String,
         reply: Sender<ActionReply>,
     },
-    SaveSettings {
-        settings: Settings,
+    SaveSetting {
+        field: String,
+        value: serde_json::Value,
         reply: Sender<ActionReply>,
     },
     /// The watcher saw a change; mirror it when `mirrorLive` is on.
@@ -310,11 +311,21 @@ pub(crate) enum ActionCommand {
     PauseBurn { hours: Option<i64> },
 }
 
+/// One saved setting: the settings as they are after the merge, and a warning
+/// when the settings were saved but the autostart entry could not be written.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SavedSetting {
+    pub(crate) settings: Settings,
+    pub(crate) warning: Option<String>,
+}
+
 #[derive(Debug)]
 pub(crate) enum ActionReply {
     Done,
     Switched(String),
     NotSaved(PendingSwitch),
+    Saved(SavedSetting),
     Failed(String),
 }
 
@@ -1123,8 +1134,12 @@ impl ActionRuntime {
                 ActionCommand::Remove { key, reply } => {
                     let _ = reply.send(self.remove(&key));
                 }
-                ActionCommand::SaveSettings { settings, reply } => {
-                    let _ = reply.send(self.save_settings(settings));
+                ActionCommand::SaveSetting {
+                    field,
+                    value,
+                    reply,
+                } => {
+                    let _ = reply.send(self.save_setting(field, value));
                 }
                 ActionCommand::SyncLive => self.sync_live(),
                 ActionCommand::PauseBurn { hours } => {
@@ -1411,22 +1426,21 @@ impl ActionRuntime {
         }
     }
 
-    fn save_settings(&mut self, settings: Settings) -> ActionReply {
-        if let Err(error) = settings.validate() {
-            return ActionReply::Failed(error.to_string());
-        }
-        let result = (|| -> Result<Settings, String> {
+    fn save_setting(&mut self, field: String, value: serde_json::Value) -> ActionReply {
+        let home = self.claude.home.clone();
+        let result = (|| -> Result<(Settings, Settings), String> {
             let store = self.store()?;
             let _lock = locks::acquire_app_lock(store.app_paths(), switcher::APP_LOCK_TIMEOUT)
                 .map_err(|error| error.to_string())?;
             let mut file = store.load().map_err(|error| error.to_string())?;
             let previous = file.settings.clone();
+            let settings = merge_setting(&previous, &field, value, &home)?;
             file.settings = settings.clone();
             store.save(&file).map_err(|error| error.to_string())?;
-            Ok(previous)
+            Ok((previous, settings))
         })();
-        let previous = match result {
-            Ok(previous) => previous,
+        let (previous, settings) = match result {
+            Ok(saved) => saved,
             Err(error) => return ActionReply::Failed(error),
         };
         // The setting is saved; its history event is one place, also used when
@@ -1439,16 +1453,11 @@ impl ActionRuntime {
                 Err(error) => report_history_error(&error),
             }
         }
-        if let Err(error) =
-            autostart::apply_autostart(settings.start_at_login, &self.autostart_args)
-        {
-            // The settings themselves are saved; say so instead of claiming
-            // that the whole save failed.
-            let _ = self.engine.send(EngineCommand::Publish);
-            return ActionReply::Failed(autostart_failure_message(&error));
-        }
+        let warning = autostart::apply_autostart(settings.start_at_login, &self.autostart_args)
+            .err()
+            .map(|error| autostart_failure_message(&error));
         let _ = self.engine.send(EngineCommand::Publish);
-        ActionReply::Done
+        ActionReply::Saved(SavedSetting { settings, warning })
     }
 
     fn sync_live(&mut self) {
@@ -1549,6 +1558,45 @@ impl ActionRuntime {
 fn report_history_error(error: &str) {
     eprintln!("seatswap: {error}");
     notify::send_error(error);
+}
+
+/// The settings with one field replaced, checked as a whole. `field` must name
+/// a key of the settings' JSON object; a bad value is the field's name followed
+/// by serde's text, and an invalid value is [`Settings::validate`]'s error.
+/// A `~/` typed into one of the two path settings is the home folder.
+fn merge_setting(
+    settings: &Settings,
+    field: &str,
+    value: serde_json::Value,
+    home: &Path,
+) -> Result<Settings, String> {
+    let mut object =
+        serde_json::to_value(settings).map_err(|error| format!("settings: {error}"))?;
+    let entries = object
+        .as_object_mut()
+        .ok_or_else(|| "the settings are not a JSON object".to_string())?;
+    if !entries.contains_key(field) {
+        return Err(format!("unknown setting {field}"));
+    }
+    let value = match value {
+        serde_json::Value::String(text)
+            if matches!(field, "claudeConfigDir" | "historyDir")
+                && (text == "~" || text.starts_with("~/")) =>
+        {
+            let expanded = expand_tilde(&text, home);
+            let text = expanded
+                .into_os_string()
+                .into_string()
+                .map_err(|_| format!("{field}: the home folder is not valid UTF-8"))?;
+            serde_json::Value::String(text)
+        }
+        other => other,
+    };
+    entries.insert(field.to_string(), value);
+    let merged: Settings =
+        serde_json::from_value(object).map_err(|error| format!("{field}: {error}"))?;
+    merged.validate().map_err(|error| error.to_string())?;
+    Ok(merged)
 }
 
 /// The history event a settings save writes, or `None` when the save changes
@@ -2135,7 +2183,7 @@ mod tests {
     /// Turning auto-burn on or off writes `AutoBurnSet`, not the pause/resume
     /// event: a toggle must not end a manual switch's hold. The event a save
     /// writes comes from `settings_change_event`, so this needs no
-    /// `save_settings` (which applies `startAtLogin`).
+    /// `save_setting` (which applies `startAtLogin`).
     #[test]
     fn a_toggle_writes_auto_burn_set() {
         let fixture = Fixture::new();
@@ -2194,6 +2242,92 @@ mod tests {
         assert_eq!(
             events.records[0].record.kind,
             EventKind::AutoBurnSet { on: true }
+        );
+    }
+
+    #[test]
+    fn merge_setting_changes_one_field_and_keeps_the_others() {
+        let settings = Settings {
+            auto_burn: true,
+            ..Settings::default()
+        };
+        let merged = merge_setting(&settings, "currency", json!("EUR"), Path::new("/home/sam"))
+            .expect("the currency is merged");
+        assert_eq!(merged.currency.as_deref(), Some("EUR"));
+        assert!(merged.auto_burn, "another writer's autoBurn is kept");
+        assert_eq!(
+            merged.poll_active_secs, settings.poll_active_secs,
+            "every other field is kept"
+        );
+    }
+
+    #[test]
+    fn merge_setting_refuses_an_unknown_field() {
+        let error = merge_setting(
+            &Settings::default(),
+            "noSuchSetting",
+            json!(true),
+            Path::new("/home/sam"),
+        )
+        .expect_err("an unknown field is refused");
+        assert_eq!(error, "unknown setting noSuchSetting");
+    }
+
+    #[test]
+    fn merge_setting_names_the_field_of_a_bad_value() {
+        let error = merge_setting(
+            &Settings::default(),
+            "pollActiveSecs",
+            json!("x"),
+            Path::new("/home/sam"),
+        )
+        .expect_err("a string is not a poll interval");
+        assert!(error.starts_with("pollActiveSecs: "), "{error}");
+    }
+
+    #[test]
+    fn merge_setting_refuses_an_invalid_value() {
+        let error = merge_setting(
+            &Settings::default(),
+            "currency",
+            json!("eur"),
+            Path::new("/home/sam"),
+        )
+        .expect_err("a currency is three capital letters");
+        assert!(
+            error.contains("currency must be three capital letters"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn merge_setting_expands_a_tilde_in_the_two_path_settings() {
+        let home = Path::new("/home/sam");
+        let history = merge_setting(&Settings::default(), "historyDir", json!("~/hist"), home)
+            .expect("the history folder is a path");
+        assert_eq!(
+            history.history_dir,
+            Some(std::path::PathBuf::from("/home/sam/hist"))
+        );
+        let config = merge_setting(
+            &Settings::default(),
+            "claudeConfigDir",
+            json!("~/claude"),
+            home,
+        )
+        .expect("the config folder is a path");
+        assert_eq!(
+            config.claude_config_dir,
+            Some(std::path::PathBuf::from("/home/sam/claude"))
+        );
+        // Only the two path settings expand: the host name stays "~x" and is
+        // refused by its own rule, exactly as it would be without this merge.
+        let error = merge_setting(&Settings::default(), "hostName", json!("~x"), home)
+            .expect_err("a host name may not start with ~");
+        assert!(error.contains("host name \"~x\""), "{error}");
+        assert!(
+            !error.contains("/home/sam"),
+            "the host name is not a path: {error}"
         );
     }
 

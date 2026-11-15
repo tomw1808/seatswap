@@ -217,7 +217,7 @@ Tests (throw-away key, rule 2.4): set then get; overwrite; delete; delete of a m
 
 ### 6.5 `gui/autostart.rs`
 
-Stays the one entry point: `apply_autostart(enabled, arguments) -> Result<(), String>`, called at start and on `save_settings` as today. `AutostartError` and `startup_arguments` are shared. Only where the entry is stored differs.
+Stays the one entry point: `apply_autostart(enabled, arguments) -> Result<(), String>`, called at start and on every `save_setting` as today. `AutostartError` and `startup_arguments` are shared. Only where the entry is stored differs.
 
 - `#[cfg(not(windows))]`: the XDG code exactly as it is (`config_home_from`, `config_home`, `quote_argument`, `exec_line`, `apply`), with `Access::Shared`.
 - `#[cfg(windows)]`:

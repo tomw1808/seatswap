@@ -1,13 +1,14 @@
 // The Settings area of the large window (spec §3.7): seven groups on the left,
-// the chosen group's card on the right. Every control saves at once through
-// `save_settings`; a refused save shows its error under the row and puts the
-// control back to the saved value. Plain ES2020, no framework.
+// the chosen group's card on the right. Every control saves one field at once
+// through `save_setting`; a refused save shows its error under the row and puts
+// the control back to the saved value. A snapshot updates the open group in
+// place from the stored views; it never re-reads them. Plain ES2020, no
+// framework.
 
 import {
   abbrLetterBoxes,
   applyTheme,
   clear,
-  clone,
   colorSwatches,
   contrastText,
   errorMessage,
@@ -65,15 +66,30 @@ const state = {
   confirmRemoveId: null,
   right: null,
   errors: Object.create(null),
+  // The account ids the last snapshot held: only a change in this list makes
+  // the Accounts group read the projects again.
+  accountIds: null,
+  // The agents' skill and calls, read when the Agents group opens.
+  skill: null,
+  skillError: null,
+  skillLoaded: false,
   skillToken: 0,
+  calls: null,
+  callsError: null,
+  callsLoaded: false,
   callsToken: 0,
   // The money view from the look-up thread, the price list under API prices,
   // and the request tokens that keep a slow reply from overwriting a newer one.
   money: null,
   moneyError: null,
+  moneyLoaded: false,
   moneyToken: 0,
   moneyListening: false,
   moneyOpen: false,
+  priceRows: null,
+  priceError: null,
+  priceLoaded: false,
+  priceToken: 0,
   // Saves run one after another, each built from the settings as the one
   // before left them, so a quick second change never carries a stale copy.
   saving: Promise.resolve(),
@@ -82,11 +98,13 @@ const state = {
   // that keeps a slow reply from overwriting a newer one.
   projects: null,
   projectsError: null,
+  projectsLoaded: false,
   projectsToken: 0,
   // The host folders of the history (spec §1.5), the view loaded when the
   // group is opened, and what the export and import rows are holding.
   history: null,
   historyError: null,
+  historyLoaded: false,
   historyToken: 0,
   exportPath: "",
   exportResult: "",
@@ -118,23 +136,45 @@ function labelOf(id) {
 // the page and its seven groups
 // ---------------------------------------------------------------------------
 
+// The account ids a snapshot holds, as one comparable text: only a changed
+// list makes the Accounts group read the projects again.
+function accountIdsOf(snapshot) {
+  const rows = Array.isArray(snapshot.accounts)
+    ? snapshot.accounts
+    : Array.isArray(snapshot.views)
+      ? snapshot.views
+      : [];
+  return rows
+    .map((row) => (isObject(row) && typeof row.id === "string" ? row.id : ""))
+    .filter((id) => id !== "")
+    .sort()
+    .join("\u0000");
+}
+
+// True while the person types in the area: a redraw then would take the field
+// away. The next snapshot after it lost focus may draw.
+function focusInside() {
+  const active = document.activeElement;
+  if (!active || !state.container || !state.container.contains(active)) return false;
+  return active.tagName === "INPUT" || active.tagName === "SELECT" || active.tagName === "TEXTAREA";
+}
+
+// Open a group: replace the old content only once the views it needs are
+// stored, so the old group stays visible while it loads.
 export async function render(container, context) {
   const snapshot = isObject(context.snapshot) ? context.snapshot : {};
   const parsed = groupFrom(context.sub);
   const group = parsed.group;
   const groupChanged = group !== state.group;
   const sameTarget = state.sub === context.sub;
+  const openRequest = context.fromOpen === true;
   state.sub = context.sub;
-  if (parsed.item && !sameTarget) {
+  if (parsed.item && (!sameTarget || openRequest)) {
     state.selectedId = parsed.item;
     state.openEditorId = parsed.item;
   }
-  const active = document.activeElement;
-  const typing =
-    active && active.tagName === "INPUT" && container.contains(active);
-  if (typing && group === state.group && state.container === container) {
-    // A snapshot arrived while a number or text field was being typed in: keep
-    // the control (and what was typed) until it is saved on change.
+  if (focusInside() && group === state.group && state.container === container && !openRequest) {
+    // Keep the control (and what was typed) until it is saved on change.
     state.snapshot = snapshot;
     takeSettings(snapshot);
     state.context = context;
@@ -145,12 +185,24 @@ export async function render(container, context) {
   state.context = context;
   state.container = container;
   state.group = group;
+  state.accountIds = accountIdsOf(snapshot);
   listenMoney(context);
-  await loadMoney(context);
-  if (group === "accounts" || group === "projects") await loadProjects();
-  // The hosts table is read once when the group opens; a snapshot in between
+  if (group === "general" && (groupChanged || !state.moneyLoaded)) {
+    await loadMoney(context);
+  }
+  if (group === "general" && state.moneyOpen && !state.priceLoaded) {
+    await loadPriceList();
+  }
+  if ((group === "accounts" || group === "projects") && (groupChanged || !state.projectsLoaded)) {
+    await loadProjects();
+  }
+  // The hosts table is read when the group opens; a snapshot in between
   // redraws it from the stored view.
-  if (group === "history" && groupChanged) await loadHistory();
+  if (group === "history" && (groupChanged || !state.historyLoaded)) await loadHistory();
+  if (group === "agents") {
+    if (groupChanged || !state.skillLoaded) await loadSkillView();
+    if (groupChanged || !state.callsLoaded) await loadCallsView();
+  }
 
   clear(container);
   const right = h("div", { class: "col settings-col" });
@@ -166,6 +218,26 @@ export async function render(container, context) {
   ]);
   container.appendChild(grid);
   renderGroup(right, state.group);
+}
+
+// A snapshot: store it, then redraw the open group from the stored views. No
+// command is sent for a redraw. While a field has focus nothing is redrawn;
+// the next snapshot after it lost focus draws. The only view read here is the
+// projects view, and only when the snapshot's account list changed.
+export async function update(snapshot) {
+  const next = isObject(snapshot) ? snapshot : {};
+  state.snapshot = next;
+  takeSettings(next);
+  if (!state.container || !state.right) return;
+  if (focusInside()) return;
+  const group = state.group;
+  const right = state.right;
+  const ids = accountIdsOf(next);
+  const accountsChanged = state.accountIds !== null && ids !== state.accountIds;
+  state.accountIds = ids;
+  if (accountsChanged && group === "accounts") await loadProjects();
+  if (state.right !== right || state.group !== group || focusInside()) return;
+  renderGroup(right, group);
 }
 
 function groupButton(group, right) {
@@ -247,7 +319,8 @@ function section(text) {
 }
 
 function setting(label, control, note, field) {
-  const error = h("div", { class: "row-error", hidden: true });
+  const text = field ? state.errors[field] || "" : "";
+  const error = h("div", { class: "row-error", hidden: text === "", text });
   const noteNode = note
     ? typeof note === "string"
       ? h("span", { class: "mf" }, note)
@@ -272,7 +345,7 @@ function note(children) {
 }
 
 // ---------------------------------------------------------------------------
-// saving: one control, the whole settings object, no Save button
+// saving: one control, one field, no Save button
 // ---------------------------------------------------------------------------
 
 function fieldError(field, text) {
@@ -321,24 +394,22 @@ async function saveNow(field, value) {
     fieldError(field, "The settings could not be read; nothing is saved.");
     return false;
   }
-  const settings = clone(state.settings);
-  settings[field] = value;
   try {
-    await state.context.invoke("save_settings", { settings });
-    state.settings = settings;
-    if (state.snapshot) state.snapshot.settings = settings;
-    fieldError(field, null);
+    const saved = await state.context.invoke("save_setting", { field, value });
+    if (!isObject(saved) || !isObject(saved.settings)) {
+      throw new Error("save_setting returned an unexpected reply");
+    }
+    state.settings = saved.settings;
+    if (state.snapshot) state.snapshot.settings = saved.settings;
+    // A warning is not a refused save: the settings are saved. It stays under
+    // the row like an error, and the next successful save of the field clears
+    // it.
+    const warning =
+      typeof saved.warning === "string" && saved.warning !== "" ? saved.warning : null;
+    fieldError(field, warning);
     return true;
   } catch (error) {
-    const text = errorMessage(error);
-    if (text.startsWith("settings saved; start at login could not be set:")) {
-      // The settings themselves are saved; only the autostart entry failed.
-      state.settings = settings;
-      if (state.snapshot) state.snapshot.settings = settings;
-      fieldError(field, text);
-      return true;
-    }
-    fieldError(field, text);
+    fieldError(field, errorMessage(error));
     return false;
   }
 }
@@ -462,6 +533,7 @@ async function loadMoney(context) {
     if (token !== state.moneyToken) return;
     state.moneyError = errorMessage(error);
   }
+  if (token === state.moneyToken) state.moneyLoaded = true;
 }
 
 function listenMoney(context) {
@@ -472,7 +544,15 @@ function listenMoney(context) {
       if (!isObject(view)) return;
       state.money = view;
       state.moneyError = null;
-      renderMoney();
+      state.moneyLoaded = true;
+      const draw = async () => {
+        if (state.moneyOpen) {
+          state.priceLoaded = false;
+          await loadPriceList();
+        }
+        renderMoney();
+      };
+      draw().catch((error) => console.error(`money event: ${errorMessage(error)}`));
     })
   ).catch((error) => {
     state.moneyListening = false;
@@ -484,8 +564,7 @@ function listenMoney(context) {
 // person is typing in a field right now.
 function renderMoney() {
   if (state.group !== "general" || !state.right) return;
-  const active = document.activeElement;
-  if (active && (active.tagName === "INPUT" || active.tagName === "SELECT")) return;
+  if (focusInside()) return;
   renderGroup(state.right, "general");
 }
 
@@ -507,14 +586,29 @@ async function refreshMoney() {
     if (token !== state.moneyToken) return;
     state.moneyError = errorMessage(error);
   }
-  if (state.group === "general" && state.right) renderGroup(state.right, "general");
+  if (token !== state.moneyToken) return;
+  state.moneyLoaded = true;
+  if (state.moneyOpen) {
+    state.priceLoaded = false;
+    await loadPriceList();
+  }
+  if (state.group === "general" && state.right && !focusInside()) {
+    renderGroup(state.right, "general");
+  }
 }
 
-// After an own price: read the view again, but do not ask the internet.
+// After an own price: read the view and the price list again, but do not ask
+// the internet.
 async function reloadMoney() {
   if (!state.context) return;
   await loadMoney(state.context);
-  if (state.group === "general" && state.right) renderGroup(state.right, "general");
+  if (state.moneyOpen) {
+    state.priceLoaded = false;
+    await loadPriceList();
+  }
+  if (state.group === "general" && state.right && !focusInside()) {
+    renderGroup(state.right, "general");
+  }
 }
 
 // The page's times all come from `time_texts`; the Rust side formats them.
@@ -743,9 +837,14 @@ function apiPricesRow(times) {
     text: state.moneyOpen ? "Hide" : "Show…",
     "aria-expanded": state.moneyOpen ? "true" : "false",
   });
-  show.addEventListener("click", () => {
+  show.addEventListener("click", async () => {
     state.moneyOpen = !state.moneyOpen;
-    renderGroup(state.right, "general");
+    if (state.moneyOpen && !state.priceLoaded) {
+      // Show the old card at once, then replace the list when it is read.
+      renderGroup(state.right, "general");
+      await loadPriceList();
+    }
+    if (state.group === "general" && state.right) renderGroup(state.right, "general");
   });
   const control = h("span", { class: "money-prices-head" }, [
     h("span", { text }),
@@ -813,21 +912,39 @@ function apiPricesRow(times) {
   return row;
 }
 
-async function loadPriceList(container) {
-  clear(container);
-  container.appendChild(h("div", { class: "lr mf", text: "loading the price list…" }));
-  let rows;
+// Read the price list once per opening or change; the card draws it from the
+// stored rows, so a snapshot never asks for it again.
+async function loadPriceList() {
+  if (!state.context) return;
+  const token = ++state.priceToken;
   try {
-    rows = await state.context.invoke("price_list", {});
+    const rows = await state.context.invoke("price_list", {});
+    if (token !== state.priceToken) return;
+    if (!Array.isArray(rows)) throw new Error("price_list returned an unexpected reply");
+    state.priceRows = rows;
+    state.priceError = null;
   } catch (error) {
-    clear(container);
+    if (token !== state.priceToken) return;
+    state.priceRows = null;
+    state.priceError = errorMessage(error);
+  }
+  if (token === state.priceToken) state.priceLoaded = true;
+}
+
+function drawPriceList(container) {
+  clear(container);
+  if (state.priceError) {
     container.appendChild(
-      h("div", { class: "row-error price-list-error", text: errorMessage(error) })
+      h("div", { class: "row-error price-list-error", text: state.priceError })
     );
     return;
   }
-  clear(container);
-  if (!Array.isArray(rows) || rows.length === 0) {
+  if (!state.priceLoaded || state.priceRows === null) {
+    container.appendChild(h("div", { class: "lr mf", text: "loading the price list…" }));
+    return;
+  }
+  const rows = state.priceRows;
+  if (rows.length === 0) {
     container.appendChild(
       h("div", {
         class: "lr mf",
@@ -854,7 +971,7 @@ async function loadPriceList(container) {
       text: "USD per million tokens. A field saves that model's own price; a tiered model uses its base price.",
     })
   );
-  await fillTimeNodes(times);
+  fillTimeNodes(times);
 }
 
 function priceInputValue(row, property) {
@@ -1343,6 +1460,7 @@ function setProjects(view, error) {
 }
 
 async function loadProjects() {
+  if (!state.context) return;
   const token = ++state.projectsToken;
   try {
     const view = await state.context.invoke("projects_view", {});
@@ -1353,6 +1471,7 @@ async function loadProjects() {
     if (token !== state.projectsToken) return;
     setProjects(null, errorMessage(error));
   }
+  if (token === state.projectsToken) state.projectsLoaded = true;
 }
 
 function projectKeyText(key) {
@@ -1770,7 +1889,7 @@ function generalCard() {
   if (state.moneyOpen) {
     const list = h("div", { class: "price-list" });
     body.appendChild(list);
-    loadPriceList(list);
+    drawPriceList(list);
   }
 
   body.appendChild(section("Look"));
@@ -1840,7 +1959,7 @@ function generalCard() {
     setting(
       "Claude Code's config folder",
       textField("claudeConfigDir", "Claude Code's config folder", "/home/you/.claude"),
-      "",
+      "empty: $CLAUDE_CONFIG_DIR or Claude Code's default folder · takes effect after restarting seatswap",
       "claudeConfigDir"
     )
   );
@@ -2054,10 +2173,18 @@ function notificationsCard() {
 // ---------------------------------------------------------------------------
 
 function agentsCard() {
-  const skillControl = h("span", { class: "row" }, [
-    h("span", { class: "mf", text: "loading…" }),
-  ]);
+  const skillControl = h("span", { class: "row" });
   const skillNote = h("span", { class: "mf" });
+  if (isObject(state.skill)) {
+    showSkill(skillControl, skillNote, state.skill);
+  } else if (state.skillError) {
+    skillControl.appendChild(
+      h("span", { class: "sw bad", text: "could not read" })
+    );
+    skillNote.textContent = state.skillError;
+  } else {
+    skillControl.appendChild(h("span", { class: "mf", text: "loading…" }));
+  }
   const skillRow = setting("Agent skill", skillControl, skillNote, "skill");
   const callRows = h("div", { class: "col calls" });
   const calls = h("div", { class: "col" }, [
@@ -2113,9 +2240,8 @@ function agentsCard() {
     })
   );
 
-  // Fill the two rows that need the app, after the card is in the page.
-  loadSkill(skillControl, skillNote);
-  loadCalls(callRows);
+  // Draw the two rows that need the app from the stored views.
+  renderCalls(callRows);
   return card;
 }
 
@@ -2128,6 +2254,8 @@ function skillButton(label, force, control, noteNode) {
       try {
         const status = await state.context.invoke("skill_install", { force });
         fieldError("skill", null);
+        state.skill = status;
+        state.skillError = null;
         showSkill(control, noteNode, status);
       } catch (error) {
         fieldError("skill", errorMessage(error));
@@ -2156,52 +2284,70 @@ function showSkill(control, noteNode, status) {
   }
 }
 
-async function loadSkill(control, noteNode) {
+async function loadSkillView() {
+  if (!state.context) return;
   const token = ++state.skillToken;
   try {
     const status = await state.context.invoke("skill_status", {});
     if (token !== state.skillToken) return;
-    showSkill(control, noteNode, status);
+    if (!isObject(status)) throw new Error("skill_status returned an unexpected reply");
+    state.skill = status;
+    state.skillError = null;
   } catch (error) {
     if (token !== state.skillToken) return;
-    clear(control);
-    control.appendChild(h("span", { class: "sw bad", text: "could not read" }));
-    fieldError("skill", errorMessage(error));
+    state.skill = null;
+    state.skillError = errorMessage(error);
   }
+  if (token === state.skillToken) state.skillLoaded = true;
 }
 
-async function loadCalls(container) {
+async function loadCallsView() {
+  if (!state.context) return;
   const token = ++state.callsToken;
   try {
     const rows = await state.context.invoke("agent_calls", { limit: 20 });
     if (token !== state.callsToken) return;
-    renderCalls(container, rows);
+    if (!Array.isArray(rows)) throw new Error("agent_calls returned an unexpected reply");
+    // The clock text is part of the stored row, so a redraw needs no command.
+    let whens = rows.map(() => "?");
+    try {
+      whens = await state.context.invoke("time_texts", {
+        times: rows.map((row) => ({ at: row.at, style: "clock" })),
+      });
+      if (!Array.isArray(whens) || whens.length !== rows.length) {
+        throw new Error("time_texts returned an unexpected reply");
+      }
+    } catch (error) {
+      console.error(`agent call times: ${errorMessage(error)}`);
+      whens = rows.map(() => "?");
+    }
+    if (token !== state.callsToken) return;
+    state.calls = rows.map((row, index) => Object.assign({}, row, { when: whens[index] }));
+    state.callsError = null;
   } catch (error) {
     if (token !== state.callsToken) return;
-    clear(container);
-    container.appendChild(message(errorMessage(error)));
+    state.calls = null;
+    state.callsError = errorMessage(error);
   }
+  if (token === state.callsToken) state.callsLoaded = true;
 }
 
-async function renderCalls(container, rows) {
+function renderCalls(container) {
   clear(container);
-  if (!Array.isArray(rows) || rows.length === 0) {
+  if (state.callsError) {
+    container.appendChild(message(state.callsError));
+    return;
+  }
+  const rows = Array.isArray(state.calls) ? state.calls : null;
+  if (rows === null) {
+    container.appendChild(h("div", { class: "lr mf", text: "loading…" }));
+    return;
+  }
+  if (rows.length === 0) {
     container.appendChild(h("div", { class: "lr" }, [h("span", { text: "No calls yet." })]));
     return;
   }
-  let whens = rows.map(() => "?");
-  try {
-    whens = await state.context.invoke("time_texts", {
-      times: rows.map((row) => ({ at: row.at, style: "clock" })),
-    });
-    if (!Array.isArray(whens) || whens.length !== rows.length) {
-      throw new Error("time_texts returned an unexpected reply");
-    }
-  } catch (error) {
-    console.error(`agent call times: ${errorMessage(error)}`);
-  }
-  for (let index = 0; index < rows.length; index += 1) {
-    const row = rows[index];
+  for (const row of rows) {
     container.appendChild(
       h(
         "div",
@@ -2210,7 +2356,7 @@ async function renderCalls(container, rows) {
           style: { gridTemplateColumns: "96px minmax(0, 1fr) 170px 110px" },
         },
         [
-          h("span", { class: "mf", text: whens[index] }),
+          h("span", { class: "mf", text: row.when || "?" }),
           h("span", { class: "mono x11", text: `seatswap ${row.command}` }),
           h("span", { class: "mf", text: row.cwd || "—" }),
           h("span", {}, [
@@ -2327,6 +2473,7 @@ async function loadHistory() {
     if (token !== state.historyToken) return;
     state.historyError = errorMessage(error);
   }
+  if (token === state.historyToken) state.historyLoaded = true;
 }
 
 // The hosts table: Host · Last record · Since · Size, 28 px rows as the mock-up.

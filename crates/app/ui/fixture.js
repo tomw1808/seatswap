@@ -724,6 +724,32 @@ function validateFixtureSettings(settings) {
   return merged;
 }
 
+// One field replaced, the way the worker's `merge_setting` does it: the field
+// must be a settings key, the two path settings expand a typed `~/`, and the
+// result is validated as a whole.
+function fixtureSaveSetting(fixture, field, value) {
+  const base = Object.assign({}, DEFAULT_SETTINGS, fixture.settings || {});
+  if (!Object.prototype.hasOwnProperty.call(base, field)) {
+    throw new Error(`unknown setting ${field}`);
+  }
+  const next = clone(base);
+  next[field] = value === undefined ? null : value;
+  if (
+    (field === "claudeConfigDir" || field === "historyDir") &&
+    typeof next[field] === "string" &&
+    (next[field] === "~" || next[field].startsWith("~/"))
+  ) {
+    next[field] = fixtureExpand(next[field]);
+  }
+  fixture.settings = validateFixtureSettings(next);
+  if (fixture.burn) {
+    fixture.burn.on = fixture.settings.autoBurn;
+    if (fixture.settings.autoBurn) fixture.burn.suggestion = null;
+  }
+  fixture.lastPollAt = fixture.lastPollAt || new Date().toISOString();
+  return { settings: clone(fixture.settings), warning: null };
+}
+
 // ---------------------------------------------------------------------------
 // Projects and organizations (spec §3.6) in the fixture. This is the page's
 // stand-in for core::projects, over the fixture's few rows: the same rules —
@@ -1219,9 +1245,7 @@ export async function fixtureInvoke(command, args) {
         throw new Error("set_auto_burn needs a boolean on");
       }
       if (!fixture.burn) throw new Error("auto-burn is not loaded");
-      fixture.settings = Object.assign({}, fixture.settings, { autoBurn: args.on });
-      fixture.burn.on = args.on;
-      if (args.on) fixture.burn.suggestion = null;
+      fixtureSaveSetting(fixture, "autoBurn", args.on);
       fixture.lastPollAt = new Date().toISOString();
       return null;
     }
@@ -1241,12 +1265,8 @@ export async function fixtureInvoke(command, args) {
       return null;
     }
 
-    case "save_settings":
-      fixture.settings = validateFixtureSettings(args.settings || {});
-      if (fixture.burn) fixture.burn.on = fixture.settings.autoBurn;
-      if (fixture.burn && fixture.settings.autoBurn) fixture.burn.suggestion = null;
-      fixture.lastPollAt = fixture.lastPollAt || new Date().toISOString();
-      return null;
+    case "save_setting":
+      return fixtureSaveSetting(fixture, String(args.field || ""), args.value);
 
     case "open_window":
       return null;

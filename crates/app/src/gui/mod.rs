@@ -197,7 +197,7 @@ pub(crate) fn run(
             panel::save_current,
             panel::edit_account,
             panel::remove_account,
-            panel::save_settings,
+            panel::save_setting,
             panel::set_auto_burn,
             panel::pause_burn,
             panel::money_view,
