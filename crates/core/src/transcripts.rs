@@ -83,6 +83,25 @@ pub struct UserTurn {
     pub at: DateTime<Utc>,
 }
 
+/// The four token counts of some answers: input, output, cache write, cache read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Tokens {
+    pub input: u64,
+    pub out: u64,
+    pub cw: u64,
+    pub cr: u64,
+}
+
+impl std::ops::AddAssign for Tokens {
+    fn add_assign(&mut self, other: Tokens) {
+        self.input += other.input;
+        self.out += other.out;
+        self.cw += other.cw;
+        self.cr += other.cr;
+    }
+}
+
 /// One `agent-<id>.meta.json` file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentMeta {
@@ -92,6 +111,10 @@ pub struct AgentMeta {
     pub description: Option<String>,
     pub finished: bool,
     pub spawn_depth: u32,
+    /// The `toolUseId` of the call that started the agent.
+    pub tool_use_id: Option<String>,
+    /// The agent that made the call; `None` when the session made it.
+    pub parent: Option<String>,
 }
 
 /// How far a transcript was read, and the ids of the answers it gave.
@@ -121,10 +144,44 @@ pub struct SessionSeen {
     pub last_model: Option<String>,
     pub last_user_turn: Option<DateTime<Utc>>,
     pub thinking_since_user: u32,
+    /// The tokens of the session's answers and of its agents'. A state file
+    /// written before this field loads with zero: the sums then start at the
+    /// answers read from that point on, and the old transcripts are not read
+    /// again for them.
+    #[serde(default)]
+    pub totals: Tokens,
+    /// [`Self::totals`], per model.
+    #[serde(default)]
+    pub by_model: BTreeMap<String, Tokens>,
+    /// What the session's agents did, per agent id.
+    #[serde(default)]
+    pub agents: BTreeMap<String, AgentSeen>,
+    /// The `tool_use` id of an `Agent` or `Task` call, and the agent that made
+    /// it: `None` when the call is in the main transcript.
+    #[serde(default)]
+    pub spawns: BTreeMap<String, Option<String>>,
+    /// The answers of the last 60 minutes: one entry per minute (its start in
+    /// UTC) with the minute's tokens, oldest first.
+    #[serde(default)]
+    pub recent: Vec<(DateTime<Utc>, Tokens)>,
     /// The session record last written from this session, so a restart does not
     /// write the same record again. Absent in an old state file means none.
     #[serde(default)]
     pub recorded: Option<RecordedSession>,
+}
+
+/// What one agent of a session did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSeen {
+    /// The agent's first answer.
+    pub first: DateTime<Utc>,
+    /// The agent's last answer.
+    pub last: DateTime<Utc>,
+    /// The model of its last answer.
+    pub model: Option<String>,
+    pub tokens: Tokens,
+    pub answers: u32,
 }
 
 /// The session record last written from a [`SessionSeen`].
@@ -221,6 +278,38 @@ impl ScanState {
     /// Mark one project folder for the next [`save`](Self::save).
     pub fn mark_changed(&mut self, folder: &str) {
         self.changed.insert(folder.to_string());
+    }
+
+    /// Forget a session that is not running and whose last answer (its own or an
+    /// agent's) is more than
+    /// one hour before `now`: its sums leave `sessions`, while its files'
+    /// offsets stay, so its transcript is not read again. Its folder is marked
+    /// changed, so the next [`save`](Self::save) writes it. Returns how many
+    /// sessions left.
+    pub fn forget_closed(&mut self, running: &BTreeSet<String>, now: DateTime<Utc>) -> usize {
+        let closed: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(session, seen)| {
+                // The session's last answer is its own or one of its agents',
+                // whichever is newer: an agent that still works keeps it.
+                let last = seen
+                    .agents
+                    .values()
+                    .map(|agent| agent.last)
+                    .fold(seen.last, DateTime::max);
+                !running.contains(*session) && now.signed_duration_since(last) > Duration::hours(1)
+            })
+            .map(|(session, _)| session.clone())
+            .collect();
+        let mut forgotten = 0;
+        for session in closed {
+            if let Some(seen) = self.sessions.remove(&session) {
+                self.mark_changed(&seen.folder);
+                forgotten += 1;
+            }
+        }
+        forgotten
     }
 
     /// Write the state files of the project folders that changed since the last
@@ -414,8 +503,24 @@ pub fn scan(
     files.retain(|candidate| {
         candidate.len != next.files.get(&candidate.key).map_or(0, |file| file.offset)
     });
-    // Running sessions come before a backlog.
-    files.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.key.cmp(&b.key)));
+    // Running sessions come before a backlog. Within one session its main
+    // transcript comes before its agents, so an agent's answers meet the
+    // session its transcript makes even when the budget stops the scan early.
+    let mut newest: HashMap<String, DateTime<Utc>> = HashMap::new();
+    for candidate in &files {
+        let entry = newest
+            .entry(candidate.session.clone())
+            .or_insert(candidate.mtime);
+        if candidate.mtime > *entry {
+            *entry = candidate.mtime;
+        }
+    }
+    files.sort_by(|a, b| {
+        newest[&b.session]
+            .cmp(&newest[&a.session])
+            .then_with(|| a.agent.is_some().cmp(&b.agent.is_some()))
+            .then_with(|| a.key.cmp(&b.key))
+    });
 
     let mut run = ScanRun {
         state: &mut next,
@@ -423,6 +528,7 @@ pub fn scan(
         used: 0,
         answers: Vec::new(),
         user_turns: Vec::new(),
+        spawns: Vec::new(),
         warnings: Vec::new(),
     };
     let mut complete = true;
@@ -443,9 +549,12 @@ pub fn scan(
     let ScanRun {
         answers,
         user_turns,
+        spawns,
         warnings,
         ..
     } = run;
+    remember_spawns(&mut next, &spawns);
+    sum_answers(&mut next, &answers);
     Ok(Scan {
         answers,
         user_turns,
@@ -455,9 +564,104 @@ pub fn scan(
     })
 }
 
-/// The agents a session started, from their `*.meta.json` files. Unreadable
+/// Put this scan's `Agent` and `Task` calls into their sessions' `spawns`.
+fn remember_spawns(state: &mut ScanState, spawns: &[Spawn]) {
+    for spawn in spawns {
+        if let Some(seen) = state.sessions.get_mut(&spawn.session) {
+            seen.spawns
+                .insert(spawn.tool_use_id.clone(), spawn.agent.clone());
+        }
+    }
+}
+
+/// Add this scan's answers to the sums of their session. Only the answers this
+/// scan counted are here: the message-id rule kept every other one out, so an
+/// answer read twice is summed once.
+fn sum_answers(state: &mut ScanState, answers: &[Answer]) {
+    let mut touched: BTreeSet<String> = BTreeSet::new();
+    for answer in answers {
+        let Some(seen) = state.sessions.get_mut(&answer.session) else {
+            // An agent's transcript without its session's main transcript: there
+            // is no session to hold its sums (a main transcript makes one).
+            continue;
+        };
+        let tokens = Tokens {
+            input: answer.input,
+            out: answer.output,
+            cw: answer.cache_write,
+            cr: answer.cache_read,
+        };
+        seen.totals += tokens;
+        *seen.by_model.entry(answer.model.clone()).or_default() += tokens;
+        if let Some(agent) = &answer.agent {
+            let entry = seen
+                .agents
+                .entry(agent.clone())
+                .or_insert_with(|| AgentSeen {
+                    first: answer.at,
+                    last: answer.at,
+                    model: None,
+                    tokens: Tokens::default(),
+                    answers: 0,
+                });
+            if answer.at < entry.first {
+                entry.first = answer.at;
+            }
+            if answer.at >= entry.last {
+                entry.last = answer.at;
+                entry.model = Some(answer.model.clone());
+            }
+            entry.tokens += tokens;
+            entry.answers += 1;
+        }
+        let minute = minute_start(answer.at);
+        match seen
+            .recent
+            .binary_search_by_key(&minute, |(start, _)| *start)
+        {
+            Ok(index) => seen.recent[index].1 += tokens,
+            Err(index) => seen.recent.insert(index, (minute, tokens)),
+        }
+        touched.insert(answer.session.clone());
+    }
+    for session in touched {
+        if let Some(seen) = state.sessions.get_mut(&session) {
+            prune_recent(seen);
+        }
+    }
+}
+
+/// Keep only the minutes within 60 minutes of the newest answer: at most 60.
+fn prune_recent(seen: &mut SessionSeen) {
+    let Some((newest, _)) = seen.recent.last().copied() else {
+        return;
+    };
+    let oldest = newest - Duration::minutes(60);
+    seen.recent.retain(|(minute, _)| *minute > oldest);
+}
+
+/// The tokens of the answers in the 60 minutes before `now`: the sum of
+/// [`SessionSeen::recent`]'s minutes whose start is after `now - 60 min`.
+pub fn last_hour(seen: &SessionSeen, now: DateTime<Utc>) -> Tokens {
+    let after = now - Duration::minutes(60);
+    let mut tokens = Tokens::default();
+    for (minute, of_minute) in &seen.recent {
+        if *minute > after {
+            tokens += *of_minute;
+        }
+    }
+    tokens
+}
+
+/// The agents a session started, from their `*.meta.json` files. `spawns` maps
+/// the `tool_use` id of an `Agent` or `Task` call to the agent that made it
+/// (`None`: the main transcript), and gives each agent its parent. Unreadable
 /// files are left out.
-pub fn agents_of(claude: &ClaudePaths, session: &str) -> Vec<AgentMeta> {
+pub fn agents_of(
+    claude: &ClaudePaths,
+    session: &str,
+    spawns: &BTreeMap<String, Option<String>>,
+) -> Vec<AgentMeta> {
     let mut out = Vec::new();
     let dir = claude.projects_dir();
     let Ok(entries) = fs::read_dir(&dir) else {
@@ -492,6 +696,12 @@ pub fn agents_of(claude: &ClaudePaths, session: &str) -> Vec<AgentMeta> {
             let Ok(meta) = serde_json::from_slice::<AgentMetaFile>(&bytes) else {
                 continue;
             };
+            let parent = meta
+                .tool_use_id
+                .as_ref()
+                .and_then(|id| spawns.get(id))
+                .cloned()
+                .flatten();
             out.push(AgentMeta {
                 session: session.to_string(),
                 agent: agent.to_string(),
@@ -499,6 +709,8 @@ pub fn agents_of(claude: &ClaudePaths, session: &str) -> Vec<AgentMeta> {
                 description: meta.description,
                 finished: meta.finished.unwrap_or(false),
                 spawn_depth: meta.spawn_depth,
+                tool_use_id: meta.tool_use_id,
+                parent,
             });
         }
     }
@@ -626,6 +838,14 @@ struct FileScan {
     unreadable: usize,
 }
 
+/// An `Agent` or `Task` call of a `tool_use` block: the id its meta file names,
+/// and the agent that made the call (`None`: the main transcript).
+struct Spawn {
+    session: String,
+    agent: Option<String>,
+    tool_use_id: String,
+}
+
 /// The scan as it runs.
 struct ScanRun<'a> {
     state: &'a mut ScanState,
@@ -633,6 +853,7 @@ struct ScanRun<'a> {
     used: u64,
     answers: Vec<Answer>,
     user_turns: Vec<UserTurn>,
+    spawns: Vec<Spawn>,
     warnings: Vec<String>,
 }
 
@@ -856,6 +1077,7 @@ impl ScanRun<'_> {
             file.unreadable += 1;
             return;
         };
+        self.record_spawns(reading, message);
         let (Some(id), Some(model), Some(usage)) = (
             message.id.as_deref(),
             message.model.as_deref(),
@@ -914,6 +1136,31 @@ impl ScanRun<'_> {
         if reading.agent.is_none() {
             self.observe(reading, at, Some(&cwd), Some(model));
             file.events.push(Event::Answer(index));
+        }
+    }
+
+    /// The `Agent` and `Task` calls of an assistant line, also when the line
+    /// repeats an answer already counted: only the block's `type`, `id` and
+    /// `name` are read.
+    fn record_spawns(&mut self, reading: &Reading, message: &Message) {
+        let Some(content) = message.content.as_ref() else {
+            return;
+        };
+        for block in &content.blocks {
+            if block.kind.as_deref() != Some("tool_use") {
+                continue;
+            }
+            if !matches!(block.name.as_deref(), Some("Agent") | Some("Task")) {
+                continue;
+            }
+            let Some(id) = block.id.as_deref() else {
+                continue;
+            };
+            self.spawns.push(Spawn {
+                session: reading.session.to_string(),
+                agent: reading.agent.map(str::to_string),
+                tool_use_id: id.to_string(),
+            });
         }
     }
 
@@ -976,6 +1223,11 @@ impl ScanRun<'_> {
                 last_model: model.map(str::to_string),
                 last_user_turn: None,
                 thinking_since_user: 0,
+                totals: Tokens::default(),
+                by_model: BTreeMap::new(),
+                agents: BTreeMap::new(),
+                spawns: BTreeMap::new(),
+                recent: Vec::new(),
                 recorded: None,
             });
         if at >= seen.last {
@@ -1272,6 +1524,12 @@ pub(crate) fn hour_start(at: DateTime<Utc>) -> DateTime<Utc> {
         - Duration::nanoseconds(i64::from(at.nanosecond()))
 }
 
+/// The start of the minute `at` falls in, in UTC.
+fn minute_start(at: DateTime<Utc>) -> DateTime<Utc> {
+    at - Duration::seconds(i64::from(at.second()))
+        - Duration::nanoseconds(i64::from(at.nanosecond()))
+}
+
 /// A group of [`TokenRecord`], keyed by session, hour and model.
 type GroupKey = (DateTime<Utc>, String, String);
 
@@ -1343,17 +1601,21 @@ struct Usage {
     cache_read_input_tokens: Option<u64>,
 }
 
+/// A content block, as far as seatswap looks at it: its `type`, and for a
+/// `tool_use` block its `id` and `name`. Its text and its input are not kept.
 #[derive(Deserialize)]
 struct Block {
     #[serde(rename = "type")]
     kind: Option<String>,
+    id: Option<String>,
+    name: Option<String>,
 }
 
 /// `message.content` as far as seatswap looks at it: whether it is a string,
-/// and the `type` of each block. Text of it is not kept.
+/// and each block. Of a text block nothing but its type is kept.
 struct Content {
     is_string: bool,
-    blocks: Vec<Option<String>>,
+    blocks: Vec<Block>,
 }
 
 impl Content {
@@ -1363,14 +1625,18 @@ impl Content {
             || self
                 .blocks
                 .iter()
-                .any(|kind| kind.as_deref() == Some("text"))
+                .any(|block| block_kind(block) == Some("text"))
     }
 
     fn thinking(&self) -> bool {
         self.blocks
             .iter()
-            .any(|kind| matches!(kind.as_deref(), Some(kind) if THINKING_BLOCKS.contains(&kind)))
+            .any(|block| matches!(block_kind(block), Some(kind) if THINKING_BLOCKS.contains(&kind)))
     }
+}
+
+fn block_kind(block: &Block) -> Option<&str> {
+    block.kind.as_deref()
 }
 
 impl<'de> Deserialize<'de> for Content {
@@ -1394,7 +1660,7 @@ impl<'de> Deserialize<'de> for Content {
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Content, A::Error> {
                 let mut blocks = Vec::new();
                 while let Some(block) = seq.next_element::<Block>()? {
-                    blocks.push(block.kind);
+                    blocks.push(block);
                 }
                 Ok(Content {
                     is_string: false,
@@ -1408,7 +1674,7 @@ impl<'de> Deserialize<'de> for Content {
 }
 
 /// One `agent-<id>.meta.json`: `agentType` and `description` are optional,
-/// `spawnDepth` is in every file.
+/// `spawnDepth` and `toolUseId` are in every file.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AgentMetaFile {
@@ -1417,6 +1683,7 @@ struct AgentMetaFile {
     /// Absent while the agent runs; `false` was never seen.
     finished: Option<bool>,
     spawn_depth: u32,
+    tool_use_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -1472,6 +1739,17 @@ mod tests {
         kinds: &[&str],
         usage: (u64, u64, u64, u64),
     ) -> String {
+        assistant_with_content(id, at, cwd, model, blocks(kinds), usage)
+    }
+
+    fn assistant_with_content(
+        id: &str,
+        at: &str,
+        cwd: &str,
+        model: &str,
+        content: Vec<serde_json::Value>,
+        usage: (u64, u64, u64, u64),
+    ) -> String {
         serde_json::json!({
             "type": "assistant",
             "uuid": "0b6f4c1a-2d3e-4f50-8a9b-0c1d2e3f4a5b",
@@ -1488,7 +1766,7 @@ mod tests {
                 "type": "message",
                 "role": "assistant",
                 "model": model,
-                "content": blocks(kinds),
+                "content": content,
                 "stop_reason": "tool_use",
                 "usage": {
                     "input_tokens": usage.0,
@@ -1500,6 +1778,23 @@ mod tests {
             }
         })
         .to_string()
+    }
+
+    /// An answer line with one `tool_use` block that started an agent.
+    fn agent_call(id: &str, at: &str, tool_use_id: &str, name: &str) -> String {
+        assistant_with_content(
+            id,
+            at,
+            ENGINE,
+            OPUS,
+            vec![serde_json::json!({
+                "type": "tool_use",
+                "id": tool_use_id,
+                "name": name,
+                "input": {}
+            })],
+            USAGE,
+        )
     }
 
     fn answer(id: &str, at: &str) -> String {
@@ -1578,13 +1873,13 @@ mod tests {
         .to_string()
     }
 
-    fn meta_json(finished: Option<bool>) -> String {
+    fn meta_of(finished: Option<bool>, tool_use_id: &str, spawn_depth: u32) -> String {
         let mut value = serde_json::json!({
             "agentType": "general-purpose",
             "description": "fix the failing tests",
             "isBuiltIn": true,
-            "spawnDepth": 1,
-            "toolUseId": "toolu_01Nkn4"
+            "spawnDepth": spawn_depth,
+            "toolUseId": tool_use_id
         });
         if let Some(finished) = finished {
             value["finished"] = serde_json::json!(finished);
@@ -1943,9 +2238,14 @@ mod tests {
         let (_tmp, claude, _app) = fixture();
         let dir = folder(&claude, FOLDER).join(SESSION).join("subagents");
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("agent-a875.meta.json"), meta_json(Some(true))).unwrap();
+        fs::write(
+            dir.join("agent-a875.meta.json"),
+            meta_of(Some(true), "toolu_01Nkn4", 1),
+        )
+        .unwrap();
 
-        let metas = agents_of(&claude, SESSION);
+        // No scan state here, so no call is known: no agent has a parent.
+        let metas = agents_of(&claude, SESSION, &BTreeMap::new());
 
         assert_eq!(
             metas,
@@ -1956,6 +2256,8 @@ mod tests {
                 description: Some("fix the failing tests".to_string()),
                 finished: true,
                 spawn_depth: 1,
+                tool_use_id: Some("toolu_01Nkn4".to_string()),
+                parent: None,
             }]
         );
     }
@@ -1965,9 +2267,14 @@ mod tests {
         let (_tmp, claude, _app) = fixture();
         let dir = folder(&claude, FOLDER).join(SESSION).join("subagents");
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("agent-a875.meta.json"), meta_json(None)).unwrap();
+        fs::write(
+            dir.join("agent-a875.meta.json"),
+            meta_of(None, "toolu_01Nkn4", 1),
+        )
+        .unwrap();
 
-        let metas = agents_of(&claude, SESSION);
+        // No scan state here, so no call is known: no agent has a parent.
+        let metas = agents_of(&claude, SESSION, &BTreeMap::new());
 
         assert_eq!(metas.len(), 1);
         assert!(!metas[0].finished);
@@ -2854,5 +3161,342 @@ mod tests {
 
         assert_eq!(scan.answers.len(), 2, "{:?}", scan.answers);
         assert!(scan.warnings.is_empty(), "{:?}", scan.warnings);
+    }
+
+    /// Two answers of one agent: theirs is the agent's count and part of the
+    /// session's.
+    #[test]
+    fn agent_sums_are_kept_per_agent() {
+        let (_tmp, claude, _app) = fixture();
+        write_lines(
+            &folder(&claude, FOLDER),
+            &format!("{SESSION}.jsonl"),
+            &[assistant_line(
+                "msg_main",
+                AT,
+                ENGINE,
+                OPUS,
+                &["text"],
+                (2, 100, 26173, 28126),
+            )],
+        );
+        write_lines(
+            &folder(&claude, FOLDER).join(SESSION).join("subagents"),
+            "agent-a875.jsonl",
+            &[
+                assistant_line(
+                    "msg_agent_a",
+                    "2026-11-12T09:42:00.000Z",
+                    ENGINE,
+                    OPUS,
+                    &["text"],
+                    (2, 300, 0, 0),
+                ),
+                assistant_line(
+                    "msg_agent_b",
+                    "2026-11-12T09:43:00.000Z",
+                    ENGINE,
+                    OPUS,
+                    &["text"],
+                    (2, 500, 0, 0),
+                ),
+            ],
+        );
+
+        let (state, _scan) = scan_run(&claude);
+
+        let seen = &state.sessions[SESSION];
+        let agent = &seen.agents["a875"];
+        assert_eq!(agent.tokens.out, 800);
+        assert_eq!(agent.answers, 2);
+        assert_eq!(agent.first, at("2026-11-12T09:42:00.000Z"));
+        assert_eq!(agent.last, at("2026-11-12T09:43:00.000Z"));
+        assert_eq!(agent.model.as_deref(), Some(OPUS));
+        assert_eq!(
+            seen.totals.out, 900,
+            "the session's answers and its agent's"
+        );
+        assert_eq!(seen.by_model[OPUS].out, 900);
+    }
+
+    #[test]
+    fn an_agent_started_by_an_agent_has_it_as_parent() {
+        let (_tmp, claude, _app) = fixture();
+        write_lines(
+            &folder(&claude, FOLDER),
+            &format!("{SESSION}.jsonl"),
+            &[agent_call("msg_main", AT, "toolu_01Nkn4", "Agent")],
+        );
+        let dir = folder(&claude, FOLDER).join(SESSION).join("subagents");
+        write_lines(
+            &dir,
+            "agent-a875.jsonl",
+            &[agent_call(
+                "msg_agent",
+                "2026-11-12T09:42:00.000Z",
+                "toolu_02",
+                "Agent",
+            )],
+        );
+        fs::write(
+            dir.join("agent-b111.meta.json"),
+            meta_of(Some(true), "toolu_02", 2),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("agent-c222.meta.json"),
+            meta_of(Some(true), "toolu_01Nkn4", 1),
+        )
+        .unwrap();
+
+        let (state, _scan) = scan_run(&claude);
+        let metas = agents_of(&claude, SESSION, &state.sessions[SESSION].spawns);
+
+        let started_by_agent = metas
+            .iter()
+            .find(|meta| meta.agent == "b111")
+            .expect("the meta of b111");
+        assert_eq!(started_by_agent.tool_use_id.as_deref(), Some("toolu_02"));
+        assert_eq!(started_by_agent.parent.as_deref(), Some("a875"));
+        let started_by_session = metas
+            .iter()
+            .find(|meta| meta.agent == "c222")
+            .expect("the meta of c222");
+        assert_eq!(
+            started_by_session.parent, None,
+            "its call is in the main transcript"
+        );
+    }
+
+    #[test]
+    fn the_last_hour_forgets_older_minutes() {
+        let (_tmp, claude, _app) = fixture();
+        let path = write_lines(
+            &folder(&claude, FOLDER),
+            &format!("{SESSION}.jsonl"),
+            &[
+                assistant_line(
+                    "msg_early",
+                    "2026-11-12T09:05:00.000Z",
+                    ENGINE,
+                    OPUS,
+                    &["text"],
+                    (0, 100, 0, 0),
+                ),
+                assistant_line(
+                    "msg_late",
+                    "2026-11-12T09:50:00.000Z",
+                    ENGINE,
+                    OPUS,
+                    &["text"],
+                    (0, 200, 0, 0),
+                ),
+            ],
+        );
+
+        let (mut state, _scan) = scan_run(&claude);
+        let seen = &state.sessions[SESSION];
+        assert_eq!(last_hour(seen, at("2026-11-12T10:10:00Z")).out, 200);
+        assert_eq!(last_hour(seen, at("2026-11-12T10:55:00Z")).out, 0);
+        assert_eq!(seen.recent.len(), 2, "09:05 and 09:50");
+
+        // A hundred more minutes: every minute older than an hour is dropped.
+        let first = at("2026-11-12T11:00:00Z");
+        for minute in 0..100 {
+            let when = first + Duration::minutes(minute);
+            append(
+                &path,
+                &assistant_line(
+                    &format!("msg_minute_{minute}"),
+                    &when.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    ENGINE,
+                    OPUS,
+                    &["text"],
+                    (0, 1, 0, 0),
+                ),
+            );
+        }
+        scan_commit(&claude, &mut state, BUDGET);
+
+        assert!(
+            state.sessions[SESSION].recent.len() <= 60,
+            "the last hour holds at most 60 minutes, not {}",
+            state.sessions[SESSION].recent.len()
+        );
+        assert_eq!(state.sessions[SESSION].recent.len(), 60);
+    }
+
+    #[test]
+    fn a_closed_session_leaves_the_state_after_an_hour() {
+        let (_tmp, claude, app) = fixture();
+        write_lines(
+            &folder(&claude, FOLDER),
+            &format!("{SESSION}.jsonl"),
+            &[assistant_line(
+                "msg_a",
+                AT,
+                ENGINE,
+                OPUS,
+                &["text"],
+                (0, 100, 0, 0),
+            )],
+        );
+        let (mut state, _scan) = scan_run(&claude);
+        let last = state.sessions[SESSION].last;
+        state.save(&claude, &app, last).unwrap();
+        assert!(state.changed.is_empty(), "the scan's change was written");
+
+        let running = BTreeSet::from([SESSION.to_string()]);
+        assert_eq!(state.forget_closed(&running, last + Duration::hours(2)), 0);
+        assert!(
+            state.sessions.contains_key(SESSION),
+            "a running session stays"
+        );
+
+        let none = BTreeSet::new();
+        assert_eq!(state.forget_closed(&none, last + Duration::minutes(60)), 0);
+        assert!(
+            state.sessions.contains_key(SESSION),
+            "one hour is not more than one hour"
+        );
+
+        assert_eq!(state.forget_closed(&none, last + Duration::minutes(61)), 1);
+        assert!(!state.sessions.contains_key(SESSION));
+        assert!(state.files.contains_key(KEY), "its offset stays");
+        assert!(
+            state.changed.contains(FOLDER),
+            "the next save writes the folder without it"
+        );
+    }
+
+    #[test]
+    fn an_old_state_file_without_the_sums_loads() {
+        let (_tmp, _claude, app) = fixture();
+        let dir = app.transcripts_state_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let old = serde_json::json!({
+            "version": 1,
+            "files": {},
+            "sessions": {
+                SESSION: {
+                    "folder": FOLDER,
+                    "cwd": ENGINE,
+                    "first": "2026-11-12T09:41:07.412Z",
+                    "last": "2026-11-12T09:41:07.412Z",
+                    "lastModel": OPUS,
+                    "lastUserTurn": null,
+                    "thinkingSinceUser": 1
+                }
+            }
+        });
+        fs::write(dir.join(format!("{FOLDER}.json")), old.to_string()).unwrap();
+
+        let state = ScanState::load(&app).unwrap();
+
+        let seen = &state.sessions[SESSION];
+        assert_eq!(seen.totals, Tokens::default());
+        assert!(seen.by_model.is_empty());
+        assert!(seen.agents.is_empty());
+        assert!(seen.spawns.is_empty());
+        assert!(seen.recent.is_empty());
+    }
+
+    #[test]
+    fn an_answer_read_twice_is_summed_once() {
+        let (_tmp, claude, _app) = fixture();
+        // One answer, two lines with the same message id and the same usage.
+        let path = write_lines(
+            &folder(&claude, FOLDER),
+            &format!("{SESSION}.jsonl"),
+            &[
+                assistant_line("msg_01QmB7xT", AT, ENGINE, OPUS, &["thinking"], USAGE),
+                assistant_line("msg_01QmB7xT", AT, ENGINE, OPUS, &["tool_use"], USAGE),
+            ],
+        );
+
+        let (mut state, first) = scan_run(&claude);
+        assert_eq!(first.answers.len(), 1, "{:?}", first.answers);
+        assert_eq!(state.sessions[SESSION].totals.out, USAGE.1);
+
+        // Its line is read again by the next scan: still counted once.
+        append(
+            &path,
+            &assistant_line("msg_01QmB7xT", AT, ENGINE, OPUS, &["text"], USAGE),
+        );
+        scan_commit(&claude, &mut state, BUDGET);
+
+        assert_eq!(state.sessions[SESSION].totals.out, USAGE.1);
+        assert_eq!(state.sessions[SESSION].by_model[OPUS].out, USAGE.1);
+        assert_eq!(state.sessions[SESSION].recent.len(), 1);
+    }
+
+    /// The last answer of a session is the newest answer of its agents too:
+    /// the sums of a session hold the answers of its agents. A session whose
+    /// agent still works must therefore not be forgotten. When it is, the
+    /// agent's next answers have no session to be summed into (`sum_answers`
+    /// skips them) and their offset moves on: the tokens are gone for good.
+    #[test]
+    fn a_session_whose_agent_answers_is_not_forgotten() {
+        let (_tmp, claude, _app) = fixture();
+        write_lines(
+            &folder(&claude, FOLDER),
+            &format!("{SESSION}.jsonl"),
+            &[assistant_line(
+                "msg_main",
+                AT,
+                ENGINE,
+                OPUS,
+                &["text"],
+                (0, 100, 0, 0),
+            )],
+        );
+        let path = write_lines(
+            &folder(&claude, FOLDER).join(SESSION).join("subagents"),
+            "agent-a875.jsonl",
+            &[assistant_line(
+                "msg_agent_a",
+                AT,
+                ENGINE,
+                OPUS,
+                &["text"],
+                (0, 300, 0, 0),
+            )],
+        );
+
+        let (mut state, _scan) = scan_run(&claude);
+        assert_eq!(
+            state.sessions[SESSION].totals.out, 400,
+            "the agent's answer is part of the session's sums"
+        );
+
+        // Two hours later the agent answers again; the main transcript is quiet.
+        append(
+            &path,
+            &assistant_line(
+                "msg_agent_b",
+                "2026-11-12T11:41:00.000Z",
+                ENGINE,
+                OPUS,
+                &["text"],
+                (0, 500, 0, 0),
+            ),
+        );
+        scan_commit(&claude, &mut state, BUDGET);
+        assert_eq!(
+            state.sessions[SESSION].totals.out, 900,
+            "the agent's second answer is summed, too"
+        );
+        assert_eq!(state.sessions[SESSION].agents["a875"].answers, 2);
+
+        // The session's last answer is the agent's: it is not a closed session.
+        assert_eq!(
+            state.forget_closed(&BTreeSet::new(), at("2026-11-12T11:42:00Z")),
+            0,
+            "the session's agent answered a minute ago"
+        );
+        assert!(
+            state.sessions.contains_key(SESSION),
+            "a session whose agent answers stays in the state"
+        );
     }
 }

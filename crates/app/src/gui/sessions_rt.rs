@@ -587,7 +587,7 @@ pub(crate) fn run_pass(
         }
     }
 
-    let running_ids: HashSet<String> = running
+    let running_ids: BTreeSet<String> = running
         .sessions
         .iter()
         .map(|session| session.session_id.clone())
@@ -721,6 +721,15 @@ pub(crate) fn run_pass(
         }
     }
 
+    // A session that is not running and whose last answer is more than an hour
+    // old leaves the state; its files' offsets stay, so its transcript is not
+    // read again. As with the closed records: when a session file could not be
+    // read this pass, the thread cannot tell which session ended, so it forgets
+    // none.
+    if running.skipped.is_empty() {
+        state.forget_closed(&running_ids, now);
+    }
+
     let models = models_in_use(&running.sessions, state);
     let (_, tied_busy) = tied_sessions(&running.sessions, state);
     PassOutcome {
@@ -740,7 +749,7 @@ fn session_record(
     memory: &mut SessionMemory,
     now: DateTime<Utc>,
 ) -> Result<SessionRecord, String> {
-    let agents = transcripts::agents_of(claude, session);
+    let agents = transcripts::agents_of(claude, session, &seen.spawns);
     let started = count_u32(
         agents.len(),
         &format!("the number of agents started in session {session}"),
@@ -1213,6 +1222,11 @@ mod tests {
                 last_model: Some("claude-opus-5-5".to_string()),
                 last_user_turn: None,
                 thinking_since_user: 0,
+                totals: Default::default(),
+                by_model: Default::default(),
+                agents: Default::default(),
+                spawns: Default::default(),
+                recent: Default::default(),
                 recorded: None,
             },
         );
@@ -1369,6 +1383,11 @@ mod tests {
                 last_model: Some("claude-opus-5-5".to_string()),
                 last_user_turn: None,
                 thinking_since_user: 0,
+                totals: Default::default(),
+                by_model: Default::default(),
+                agents: Default::default(),
+                spawns: Default::default(),
+                recent: Default::default(),
                 recorded: None,
             },
         );
@@ -1998,6 +2017,11 @@ mod tests {
                 last_model: Some("claude-opus-5-5".to_string()),
                 last_user_turn: None,
                 thinking_since_user: 0,
+                totals: Default::default(),
+                by_model: Default::default(),
+                agents: Default::default(),
+                spawns: Default::default(),
+                recent: Default::default(),
                 recorded: None,
             },
         );
@@ -2299,6 +2323,53 @@ mod tests {
             read.records.len(),
             1,
             "one answer is counted once, not once per start"
+        );
+    }
+
+    /// A session file that cannot be parsed leaves the thread unable to tell
+    /// which sessions are still running: it must not forget one of them, the
+    /// same way it must not close one of them.
+    #[test]
+    fn a_session_file_that_cannot_be_read_does_not_forget_the_session() {
+        let (tmp, claude, _app) = fixture();
+        let first = time("2026-11-14T09:56:00Z");
+        // The file is half-written: it does not parse any more, so the thread
+        // cannot tell which session is still running.
+        fs::write(claude.sessions_dir().join("500.json"), "{\"pid\":500,").unwrap();
+        let mut state = ScanState::default();
+        state.sessions.insert(
+            SESSION.to_string(),
+            SessionSeen {
+                folder: "-home-sam-projects-atlas".to_string(),
+                cwd: "/home/sam/projects/atlas".to_string(),
+                first,
+                last: first,
+                last_model: Some("claude-opus-5-5".to_string()),
+                last_user_turn: None,
+                thinking_since_user: 0,
+                totals: Default::default(),
+                by_model: Default::default(),
+                agents: Default::default(),
+                spawns: Default::default(),
+                recent: Default::default(),
+                recorded: None,
+            },
+        );
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        run_pass(
+            &_app,
+            &claude,
+            &probe(&[]),
+            None,
+            &mut state,
+            &mut memory,
+            first + chrono::Duration::hours(2),
+            None,
+        );
+
+        assert!(
+            state.sessions.contains_key(SESSION),
+            "a session file that cannot be read must not make the thread forget a session"
         );
     }
 }
