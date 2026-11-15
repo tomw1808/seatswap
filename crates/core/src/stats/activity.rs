@@ -82,6 +82,9 @@ pub struct HostLane {
     /// first.
     pub hours: Vec<HourCell>,
     pub working: u32,
+    /// The lane's output tokens over its working hours; `None` without a
+    /// working hour in the lane.
+    pub per_working_hour: Option<f64>,
     pub idle: u32,
     pub off: u32,
     pub unknown: u32,
@@ -135,8 +138,8 @@ pub struct BigSession {
     pub tokens: Tokens,
     pub values: Values,
     /// `agents_started` of the session's newest [`SessionRecord`], any time;
-    /// 0 without one.
-    pub agents: u32,
+    /// `None` without one (a running session has no record yet).
+    pub agents: Option<u32>,
 }
 
 /// The Activity page: the lanes, the days, the weeks, the largest sessions,
@@ -387,6 +390,7 @@ fn host_lanes(
     for host in hosts {
         let mut hours = Vec::with_capacity(168);
         let (mut working, mut idle, mut off, mut unknown) = (0, 0, 0, 0);
+        let mut lane_out = 0;
         for step in 0..168 {
             let t = first + Duration::hours(step);
             let key = (host.clone(), t);
@@ -398,6 +402,7 @@ fn host_lanes(
             if let Some(bucket) = by_hour.get(&key) {
                 for entry in bucket {
                     has_tokens = true;
+                    lane_out += entry.record.out;
                     *by_model.entry(entry.record.model.as_str()).or_insert(0) += entry.record.out;
                     sessions.insert(entry.record.session.as_str());
                     let project = ctx
@@ -438,11 +443,17 @@ fn host_lanes(
             });
         }
 
+        let per_working_hour = if working > 0 {
+            Some(lane_out as f64 / working as f64)
+        } else {
+            None
+        };
         let (tokens, valued) = totals.get(host.as_str()).cloned().unwrap_or_default();
         lanes.push(HostLane {
             host: host.clone(),
             hours,
             working,
+            per_working_hour,
             idle,
             off,
             unknown,
@@ -613,8 +624,7 @@ fn largest_sessions(ctx: &Ctx, entries: &[Entry]) -> Result<Vec<BigSession>, Sta
         .map(|sum| {
             let agents_started = agents
                 .get(&(sum.host.clone(), sum.session.clone()))
-                .map(|(_, started)| *started)
-                .unwrap_or(0);
+                .map(|(_, started)| *started);
             BigSession {
                 label: session_label(&sum.project, &sum.session),
                 project: sum.project,
@@ -825,6 +835,45 @@ mod tests {
         assert_eq!(first.label, "atlas-s3");
         assert_eq!(first.tokens.out, 3_000_000);
         assert_eq!(first.worked_hours, 2);
+    }
+
+    /// A 30-day range holds tokens of the weeks before the lane too. The
+    /// lane's `per_working_hour` divides only the lane's own output tokens by
+    /// its working hours; a host without a working hour in the lane has none.
+    #[test]
+    fn per_working_hour_counts_the_lanes_own_tokens() {
+        let tiny = tiny();
+        let vega = HistoryDir::at(tiny.dir.path(), "vega");
+        vega.append(&UpRecord {
+            t: utc("2026-11-14T10:00:00Z"),
+        })
+        .expect("the vega up record");
+        fs::write(
+            tiny.dir.path().join("vega/host.json"),
+            "{\"machineId\":\"0b4e7c22-6a1d-4e3f-8c59-2d7a9e1b4f60\"}",
+        )
+        .expect("the vega marker");
+
+        // 19 Oct .. 19 Nov holds atlas's token records of 3 Nov (2 M),
+        // 8 Nov (1 M), 11 Nov (1 M) and 14 Nov (3 M); the lane holds only
+        // those of 14 Nov.
+        let range = Range {
+            from: utc("2026-10-19T00:00:00Z"),
+            to: tiny.now,
+        };
+        let page = activity_in(&tiny.ctx(), &range, &all()).unwrap();
+
+        let atlas = lane(&page, "atlas");
+        assert_eq!(
+            atlas.tokens.out, 7_000_000,
+            "the lane's tokens cover the whole range"
+        );
+        assert_eq!(atlas.working, 2);
+        assert_eq!(atlas.per_working_hour, Some(1_500_000.0));
+
+        let vega = lane(&page, "vega");
+        assert_eq!(vega.working, 0, "vega has no token record in the lane");
+        assert_eq!(vega.per_working_hour, None);
     }
 
     #[test]
@@ -1158,8 +1207,35 @@ mod tests {
             .iter()
             .find(|session| session.host == "vega")
             .expect("the vega s3");
-        assert_eq!(atlas.agents, 0);
-        assert_eq!(vega.agents, 2);
+        assert_eq!(
+            atlas.agents,
+            Some(0),
+            "atlas's own s3 record has started no agent"
+        );
+        assert_eq!(vega.agents, Some(2));
+    }
+
+    /// A running session has tokens but no [`SessionRecord`] yet, so its
+    /// agents are not known: `None`, not 0.
+    #[test]
+    fn a_session_without_a_record_has_no_agents() {
+        let tiny = tiny();
+        tiny.history
+            .append(&record(
+                "2026-11-15T10:00:00Z",
+                "s9",
+                "/home/sam/projects/atlas/engine",
+                atlas(),
+                5_000_000,
+            ))
+            .expect("the s9 record");
+        let page = activity_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        let s9 = page
+            .largest
+            .iter()
+            .find(|session| session.label == "atlas-s9")
+            .expect("the s9 session");
+        assert_eq!(s9.agents, None);
     }
 
     /// A range that ends at midnight (Last week) ends its lanes with the hour

@@ -184,15 +184,17 @@ export async function show(container, env) {
     );
 
     const perHour = lanes.map((lane) => {
-      if (lane.working <= 0) return `${lane.host} — (no working hour in the last 7 days)`;
-      return `${lane.host} ${tokens(lane.tokens.out / lane.working)}`;
+      if (lane.perWorkingHour === null || lane.perWorkingHour === undefined) {
+        return `${lane.host} — (no working hour in the last 7 days)`;
+      }
+      return `${lane.host} ${tokens(lane.perWorkingHour)}`;
     });
     kpis.appendChild(
       kpi(
-        "Per working hour",
+        "Per working hour · last 7 days",
         perHour.join(" · "),
-        "output tokens of the range over the working hours of the last 7 days",
-        "Per working hour | each host's output tokens of the range over its working hours of the last 7 days",
+        "output tokens of the last 7 days in the working hours of those days",
+        "Per working hour · last 7 days | each host's output tokens of the last 7 days over its working hours of those days",
         "stats-kpi-value-small"
       )
     );
@@ -556,7 +558,16 @@ export async function show(container, env) {
           amountNode(session.values.api, session.values.apiCurrency),
         ])
       );
-      row.appendChild(h("span", { class: "n", text: String(session.agents) }));
+      const agentsKnown = session.agents !== null && session.agents !== undefined;
+      row.appendChild(
+        h("span", {
+          class: "n",
+          text: agentsKnown ? String(session.agents) : "—",
+          title: agentsKnown
+            ? undefined
+            : "the session is still running: its agents are counted when it ends",
+        })
+      );
       view.appendChild(row);
     }
     return view;

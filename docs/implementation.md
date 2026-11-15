@@ -2851,14 +2851,15 @@ pub struct HourCell { pub t: DateTime<Utc>, pub state: HourState,
     pub by_model: Vec<(String, u64)>, pub sessions: u32, pub top_project: Option<String>,
     pub values: Values }
 pub struct HostLane { pub host: String, pub hours: Vec<HourCell>, pub working: u32,
-    pub idle: u32, pub off: u32, pub unknown: u32, pub tokens: Tokens, pub values: Values }
+    pub per_working_hour: Option<f64>, pub idle: u32, pub off: u32, pub unknown: u32,
+    pub tokens: Tokens, pub values: Values }
 pub struct DayTokens { pub date: NaiveDate, pub out: Vec<(String, u64)> }
 pub struct ActivityWeek { pub week: DateTime<Utc>, pub working_hours: Vec<(String, u32)>,
     pub tokens: Tokens, pub values: Values, pub sessions: u32,
     pub top: Option<(String, String)> }
 pub struct BigSession { pub label: String, pub project: String, pub host: String,
     pub model: Option<String>, pub worked_hours: u32, pub tokens: Tokens,
-    pub values: Values, pub agents: u32 }
+    pub values: Values, pub agents: Option<u32> }
 pub struct ActivityPage { pub lanes: Vec<HostLane>, pub days: Vec<DayTokens>,
     pub weeks: Vec<ActivityWeek>, pub largest: Vec<BigSession>,
     pub waited: Vec<(NaiveDate, f64)>, pub peak_hour: Tokens }
@@ -2899,7 +2900,9 @@ Page details that are easy to miss:
 - `rhythm` divides the heat map and both per-day numbers by the range's calendar weeks (a partial
   week counts as one). `activity` lanes are the 168 hours ending with the hour holding `range.to`,
   the day chart the 14 local dates ending with the date holding `range.to`, and the largest sessions
-  are the 20 with the most output tokens.
+  are the 20 with the most output tokens. `HostLane::per_working_hour` is the lane's own output
+  tokens over its working hours (`None` without one); `BigSession::agents` is `None` while the
+  session has no `SessionRecord`.
 
 ## `stats_*` commands in `gui/window.rs` (step C3)
 

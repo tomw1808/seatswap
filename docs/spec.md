@@ -1275,13 +1275,14 @@ holds the range's end. Each hour is one of four states, decided in this order:
 An hour's tooltip holds its output tokens per model, its sessions and the project that used most;
 the strip below each lane shows how many sessions worked in that hour. On top, per host: hours
 working, on but idle, off and not known, the tokens of the whole range and their two values, and
-the whole range's output tokens over the working hours of the last 7 days; the highest hour of the
+the output tokens of the last 7 days over its working hours; the highest hour of the
 range is all chosen hosts together. A switch picks what the hour bars measure: tokens (per model) ·
 subscription value · API value (the two values exist per hour only). Below the lanes: output tokens
 per day for the last 14 days, one bar per host; one row per calendar week with its working hours per
 host, tokens and their two values, sessions, and the project and folder that used most; and the
 largest sessions of the range, at most 20, by output tokens, with project, host, model, hours worked,
-tokens and their two values, and agents. The minutes sessions waited for you per local day come from
+tokens and their two values, and the agents it started once the session has ended (a running
+session has none yet). The minutes sessions waited for you per local day come from
 the `Waited` events; they follow the host choice but no account chip, because a wait names no
 account.
 

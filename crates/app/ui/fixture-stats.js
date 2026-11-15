@@ -1151,6 +1151,7 @@ function hostLane(host) {
     host,
     hours,
     working,
+    perWorkingHour: working > 0 ? out / working : null,
     idle,
     off,
     unknown,
@@ -1219,7 +1220,7 @@ function activityLargest() {
   // mock_activity.py's five largest sessions, largest by output tokens first.
   const rows = [
     ["atlas-a6", "atlas", "atlas", "claude-opus-5-5", 11, 12.4, 41],
-    ["atlas-11", "atlas", "atlas", "claude-opus-5-5", 5, 7.9, 17],
+    ["atlas-11", "atlas", "atlas", "claude-opus-5-5", 5, 7.9, null],
     ["acme-kb-3c", "acme-kb", "atlas", "claude-opus-5-5", 2, 4.4, 9],
     ["notes-47", "notes", "atlas", "claude-fable-5-2", 6, 5.3, 2],
     ["atlas-b3", "atlas", "vega", "claude-fable-5-2", 4, 3.9, 4],
