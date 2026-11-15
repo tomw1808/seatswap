@@ -70,6 +70,16 @@ pub enum PlanError {
     UnknownActive { id: String },
     #[error("two accounts have the id {id}")]
     DuplicateAccount { id: String },
+    #[error("last_switch_at {at} is after now {now}")]
+    LastSwitchAfterNow {
+        at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    },
+    #[error("oldest_reading {at} is after now {now}")]
+    OldestReadingAfterNow {
+        at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    },
 }
 
 impl Inputs {
@@ -158,11 +168,39 @@ pub struct Plan {
     pub full_at: BTreeMap<String, DateTime<Utc>>,
 }
 
-/// Whether the account can work at `at` (spec §2.3): it may be used, its login
-/// is fine, its week is below 100 %, its 5 h window is below 100 % or over, and
-/// no per-model limit blocks it.
+/// Whether the account is blocked at `at` as far as its login and its limits say
+/// (spec §2.3, §2.7): its login has ended, its week is at 100 % or more, its 5 h
+/// window is at 100 % and has not ended, or a per-model limit blocks it.
+/// `may_use` is not part of this: an account auto-burn may not use is still
+/// unblocked while it can work, and is left only when [`blocked`] is true
+/// (spec §2.6). This is the one copy of the limits rule; [`usable`] builds on it.
+pub fn blocked(account: &AccountState, at: DateTime<Utc>) -> bool {
+    View::of(account, at).blocked(at)
+}
+
+/// Whether the account can work at `at` (spec §2.3): auto-burn may use it and it
+/// is not [`blocked`].
 pub fn usable(account: &AccountState, at: DateTime<Utc>) -> bool {
-    View::of(account, at).usable(at)
+    account.may_use && !blocked(account, at)
+}
+
+/// The time the account is usable again as far as its limits say (spec §2.5):
+/// the latest reset among the limits that block at `at` — its weekly reset when
+/// its week is at 100 %, its 5 h reset when its window is at 100 % and has not
+/// ended. `None` when its login ended, a per-model limit blocks it, or nothing
+/// blocks at `at`. This is the one copy of the rule; the decision uses it.
+pub fn usable_again(account: &AccountState, at: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    View::of(account, at).usable_again(at)
+}
+
+/// Whether the account's rates are known (spec §2.3): its `c` and, for an
+/// account with a 5 h limit, its `s`. This is the one rule [`View::rates`] and
+/// the decision's regime use.
+pub(crate) fn rates_known(account: &AccountState) -> bool {
+    match account.rates {
+        None => false,
+        Some(rates) => account.session.is_none() || rates.s.is_some(),
+    }
 }
 
 /// The work units this account can still take before its weekly reset, minus
@@ -214,9 +252,14 @@ pub fn choose(inputs: &Inputs, at: DateTime<Utc>) -> Option<String> {
 /// [`Inputs::now`] means that week is over: the account is played from 0 % with
 /// its next reset. A 5 h window opens at the first step with work after the
 /// previous one ended and lasts 5 h.
+///
+/// An active account auto-burn may not use (`may_use` false) stays `current`
+/// under both policies while it is not [`blocked`]: neither plan leaves it by an
+/// eager move. Once it is blocked it is left, and it is never chosen again,
+/// because [`choose`] only takes usable accounts (spec §2.6: S1 still leaves it
+/// when it gets blocked).
 pub fn follow(inputs: &Inputs, policy: Policy) -> Plan {
     let step = Duration::minutes(STEP_MIN);
-    let steps = HORIZON_H * 60 / STEP_MIN;
     let horizon_end = inputs.now + Duration::hours(HORIZON_H);
     let typical = inputs.rhythm.typical_hour();
     let mut views: Vec<View<'_>> = inputs
@@ -234,23 +277,20 @@ pub fn follow(inputs: &Inputs, policy: Policy) -> Plan {
         .active
         .as_ref()
         .and_then(|id| views.iter().position(|view| &view.account.id == id))
-        .filter(|&index| views[index].usable(inputs.now));
+        .filter(|&index| !views[index].blocked(inputs.now));
     let mut last_switch: Option<DateTime<Utc>> = None;
     let mut blocked_wu = 0.0;
     let mut switches = 0u32;
     let mut segments: Vec<Segment> = Vec::new();
 
-    for index in 0..steps {
-        let t = inputs.now + Duration::minutes(STEP_MIN * index);
-
+    for (t, work) in step_walk(inputs, inputs.now) {
         for view in &mut views {
             view.clear_resets(t, horizon_end);
         }
 
-        let work = step_work(inputs, t);
         let choice = match current {
-            Some(index) if views[index].usable(t) => {
-                if policy == Policy::Eager && typical > 0.0 {
+            Some(index) if !views[index].blocked(t) => {
+                if policy == Policy::Eager && typical > 0.0 && views[index].usable(t) {
                     eager_move(&views, inputs, t, index, typical, last_switch).or(Some(index))
                 } else {
                     Some(index)
@@ -356,11 +396,10 @@ impl<'a> View<'a> {
     /// The rates the account can be planned with. `None` while they are
     /// unknown, including a capped account whose `s` is not learned yet.
     fn rates(&self) -> Option<Rates> {
-        let rates = self.account.rates?;
-        if self.capped() && rates.s.is_none() {
-            None
+        if rates_known(self.account) {
+            self.account.rates
         } else {
-            Some(rates)
+            None
         }
     }
 
@@ -404,11 +443,42 @@ impl<'a> View<'a> {
         self.week >= 100.0 || self.window_blocked(at)
     }
 
+    /// An account is blocked when its login has ended, its week is at 100 % or
+    /// its 5 h window is at 100 % and not over, or a per-model limit blocks it.
+    fn blocked(&self, at: DateTime<Utc>) -> bool {
+        !self.account.login_ok || self.account.model_blocked || self.is_full(at)
+    }
+
+    /// The latest reset among the limits that block at `at`: the weekly reset
+    /// when the week is at 100 %, the 5 h reset when the window is at 100 % and
+    /// not over. `None` when the login ended, a per-model limit blocks, or
+    /// nothing blocks.
+    fn usable_again(&self, at: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        if !self.account.login_ok || self.account.model_blocked {
+            return None;
+        }
+        let mut latest: Option<DateTime<Utc>> = None;
+        if self.week >= 100.0 {
+            latest = Some(self.reset);
+        }
+        if self.window_blocked(at) {
+            if let Some(reset) = self
+                .account
+                .session
+                .as_ref()
+                .and_then(|state| state.resets_at)
+            {
+                latest = Some(match latest {
+                    Some(current) => current.max(reset),
+                    None => reset,
+                });
+            }
+        }
+        latest
+    }
+
     fn usable(&self, at: DateTime<Utc>) -> bool {
-        self.account.may_use
-            && self.account.login_ok
-            && !self.account.model_blocked
-            && !self.is_full(at)
+        self.account.may_use && !self.blocked(at)
     }
 
     fn slack(&self, inputs: &Inputs, at: DateTime<Utc>) -> Option<f64> {
@@ -417,15 +487,14 @@ impl<'a> View<'a> {
         let mut view = *self;
         let horizon_end = inputs.now + Duration::hours(HORIZON_H);
         let mut usable_wu = 0.0;
-        let mut cursor = at;
-        let step = Duration::minutes(STEP_MIN);
-        while cursor < view.reset {
+        for (cursor, work) in step_walk(inputs, at) {
+            if cursor >= view.reset {
+                break;
+            }
             view.clear_resets(cursor, horizon_end);
-            let work = step_work(inputs, cursor);
             if work > 0.0 {
                 usable_wu += view.apply(cursor, work);
             }
-            cursor += step;
         }
         Some(usable_wu - (100.0 - week) / rates.c)
     }
@@ -544,6 +613,20 @@ fn next_reset(reset: DateTime<Utc>, at: DateTime<Utc>) -> DateTime<Utc> {
 
 fn step_work(inputs: &Inputs, at: DateTime<Utc>) -> f64 {
     inputs.rhythm.at(at, inputs.offset) * STEP_FRACTION
+}
+
+/// The plan's step walk from `from` over [`HORIZON_H`]: every [`STEP_MIN`] step
+/// with the work of the rhythm hour that holds its start, a quarter of
+/// [`Rhythm::at`]. [`follow`] plays every step, [`slack`] stops at the weekly
+/// reset, and the decision's wait walks the same steps; there is no second loop.
+pub(crate) fn step_walk(
+    inputs: &Inputs,
+    from: DateTime<Utc>,
+) -> impl Iterator<Item = (DateTime<Utc>, f64)> + '_ {
+    (0..HORIZON_H * 60 / STEP_MIN).map(move |index| {
+        let at = from + Duration::minutes(STEP_MIN * index);
+        (at, step_work(inputs, at))
+    })
 }
 
 /// The setup the plan's tests share with the later auto-burn tests (Tasks 6
@@ -881,6 +964,42 @@ mod tests {
         assert_eq!(eager.segments, lazy.segments);
         assert_eq!(eager.switches, 0);
         assert!((eager.blocked_wu - 0.0).abs() < EPS);
+    }
+
+    #[test]
+    fn an_active_account_auto_burn_may_not_use_stays_until_blocked() {
+        let mut inputs = inputs();
+        inputs.active = Some("AC".to_string());
+        inputs.accounts[1].may_use = false;
+        // AC's c of 100 fills its week after 1 wu, one hour of the test rhythm.
+        // Both policies keep it until then instead of starting on LB, and it is
+        // never chosen again after it is left.
+        inputs.accounts[1].rates = Some(Rates {
+            c: 100.0,
+            s: Some(100.0),
+        });
+        for policy in [Policy::Lazy, Policy::Eager] {
+            let plan = follow(&inputs, policy);
+            assert_eq!(
+                plan.segments[0].account.as_deref(),
+                Some("AC"),
+                "{policy:?}"
+            );
+            assert_eq!(plan.segments[0].from, now());
+            assert_eq!(
+                plan.segments[0].to,
+                now() + Duration::hours(1),
+                "{policy:?}"
+            );
+            assert!(
+                plan.segments
+                    .iter()
+                    .skip(1)
+                    .all(|segment| segment.account.as_deref() != Some("AC")),
+                "{policy:?}: {:?}",
+                plan.segments
+            );
+        }
     }
 
     #[test]

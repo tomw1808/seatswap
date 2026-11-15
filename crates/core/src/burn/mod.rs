@@ -4,8 +4,10 @@
 
 use chrono::{DateTime, Datelike, FixedOffset, Timelike, Utc};
 
+pub mod decide;
 pub mod plan;
 pub mod rates;
+pub mod tied;
 
 /// An account's rates are known from this much work on it (spec §2.3, "while
 /// learning").
@@ -22,6 +24,19 @@ pub const HORIZON_H: i64 = 168;
 pub const MIN_DWELL_MIN: i64 = 30;
 /// The margin of S2, in typical working hours (spec §2.5).
 pub const SLACK_MARGIN_H: f64 = 2.0;
+/// A switch made by hand holds the early rule back this many hours (spec §2.5).
+pub const MANUAL_HOLD_H: i64 = 4;
+/// Early switching must save at least this much, in typical working hours
+/// (spec §2.5).
+pub const MIN_GAIN_H: f64 = 0.5;
+/// Early switching must also save at least this many times what its extra
+/// switches cost (spec §2.5).
+pub const GAIN_FACTOR: f64 = 2.0;
+/// A measured switch cost needs at least this many switches (spec §2.5).
+pub const MIN_COST_SAMPLES: u32 = 3;
+/// A decision needs readings at most this many minutes old for every account
+/// auto-burn may use (spec §2.5).
+pub const FRESH_MIN: i64 = 20;
 
 /// One output token against one input token (spec §2.3).
 const OUTPUT_WEIGHT: f64 = 5.0;
