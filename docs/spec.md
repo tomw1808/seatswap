@@ -249,6 +249,8 @@ They use the `keyring` crate, with service `seatswap` and the account `id` as th
 
 The history has seven kinds of file, one JSON object per line, one file per month and kind: `samples-YYYY-MM.jsonl` (one line per usage answer the tray app receives, per account, when a number or a reset time changed, and at least once an hour while the app runs), `windows-YYYY-MM.jsonl` (a window that ended), `events-YYYY-MM.jsonl` (a switch; a limit crossing 100 %, as `blocked`, `unblocked`, `allBlocked` or `anyUsable`; an `accountAdded` or `accountRemoved` when the CLI or the tray app creates or removes an account; a `loginEnded` or `loginRenewed` when the tray app's poll sees an account's login end or work again; a `planChanged` when the plan label changes; a `priceChanged` when an account's monthly price changes; `live`; an `agentCall`; a wait), `tokens-YYYY-MM.jsonl` (what the sessions used, one line per session, hour and model), `sessions-YYYY-MM.jsonl` (a session's summary when it changes and when it closes, also for a session that is seen in a transcript but no longer runs), `projects-YYYY-MM.jsonl` (the project log: one line per rename, join, unjoin, organization assignment or organization edit, §11.6), and `up-YYYY-MM.jsonl` (at most one line per 5 minutes while seatswap runs on this host). The CLI writes the account events (`accountAdded`, `accountRemoved`); the tray app's engine writes the login events (`loginEnded`, `loginRenewed`) with the poll's time, and the app writes `planChanged` and `priceChanged` when it stores a login or a price edit changes them.
 
+Next to the history files, each host writes one live report into its own host folder, `<host>/sessions-now.json` (§11.4): what is running on that host, for the other hosts' Sessions area. It is not history: the import never copies it and a host folder's size leaves it out.
+
 A line is at most 4096 bytes; a longer record is an error, never cut. Times are UTC, RFC 3339; a reset time is rounded up to the full minute before it is stored. An account is named by `acc` (its `accountUuid`) and `org` (its `organizationUuid`), never by seatswap's local account id. A token line carries the project's identity as it was found at that moment, so it stays right after a folder is moved or its transcript is deleted. The transcript offsets move past an answer only after its token line was written: a pass without a working history reads the same answers again instead of losing them.
 
 Appending is one write of the whole line plus an fsync (`atomic::append_line`). Reading opens only the month files that overlap the asked range and merges the hosts in time order. A torn last line, or a line of a shape this version does not know, is skipped and named in a warning, never guessed; the app prints each warning once as `seatswap: history: <warning>` on standard error.
@@ -455,9 +457,25 @@ no modes and no tuning settings: every threshold is a constant in the code (see 
   auto-burn stays on it: S3 is reached only when the active account is blocked (or there is none)
   and `choose` finds no usable account. An active account auto-burn may not use is also not a
   reason for S2.
-- **Going back restores a session's earlier thinking, but this is not built yet.** Choosing
-  between two accounts whose slack is within 2 typical working hours by which one has more
-  running-session thinking on it is not implemented; the build decides on slack alone.
+- **Going back restores a session's earlier thinking.** When every usable account has a learned
+  slack, the choice is not only the least slack. Every usable account whose slack is at most
+  2 typical working hours above the least one is a candidate (two slacks within 1e-9 count as
+  equal), and among the candidates the account that produced more of the thinking the running
+  sessions still hold wins; with none, or with equal counts, the usual order decides: slack, weekly
+  reset, account id. The count is per minute: for every running session on a model whose thinking is
+  tied to the account (§2.11), each answer with thinking since the user's last message adds one to
+  the minute of its start, and that minute belongs to the account that was live on this host then,
+  as the switch history says. A minute without a known account is left out. It needs learned rates
+  (without a slack there is nothing to compare), `readSessions` on, and the sessions thread's list of
+  running sessions; the command line does not know the running sessions and plans without the
+  counts. The plan and the decision use the same choice, so the pop-up names the account auto-burn
+  will switch to.
+- **An early switch still needs its distance.** S2 to the account that holds the thinking needs that
+  account's slack to be at least 2 typical working hours below the active account's, as for any S2.
+  Until it is, auto-burn stays, even when the account with the least slack would have passed; it
+  moves when the account with the thinking is that far below, or when another account is clearly
+  more urgent. The "wait for a quiet moment" rule of §2.12 applies as before. With `readSessions`
+  off nothing is held back.
 
 #### 7.4.1 The regime
 
@@ -540,8 +558,8 @@ is a reading too, so a running session can keep the numbers fresh without a requ
 
 - **Usable again.** When an account that a limit blocked is usable again and is not the active account, seatswap sends `PR is usable again: its 5 h window reset.` The reason is `its 5 h window reset`, `its week reset` or `its {model} week reset`. It is sent at most once per account and reset minute, and only while `notifyUsableAgain` is on. The poll 30 s after the reset time (§7.1) is what makes it timely. It is sent only when the block ended because its reset time passed (the previous `blocked_until` is at or before now): a per-model block whose last session on that model closed, or a block the server lifted early, sends nothing and does not use up the once-per-reset.
 - **All accounts are full.** When every account whose login still works is blocked by a limit, and the previous snapshot had a usable account, seatswap sends `All accounts are full. Next: AC at 14:40.` once; without a next reset time it is `All accounts are full.` An account whose usage is not known yet is not usable but not blocked either, so it does not count as full. Only accounts whose login still works count.
-- **Waiting for you.** A session that is still waiting 15 s after it entered `waiting` sends `acme-kb-dd is waiting for you (acme-kb, on atlas).` The label is the session's name, or `<project>-<first two hex digits of the session id>` when the session has no name. The host part is left out when this host's name cannot be read: `acme-kb-dd is waiting for you (acme-kb).` It is sent once per session and wait, and only while `notifyWaiting` is on. When the session stops waiting, its notification is withdrawn.
-- A waiting notification does not time out where the desktop allows that (Linux). On Windows it follows the system's rules; the pop-up keeps the count either way. A click opens the pop-up.
+- **Waiting for you.** A session that is still waiting 15 s after it entered `waiting` sends `acme-kb-dd is waiting for you (acme-kb, on atlas).` The label is the session's name, or `<project>-<first two hex digits of the session id>` when the session has no name. The host part is left out when this host's name cannot be read: `acme-kb-dd is waiting for you (acme-kb).` It is sent once per session and wait, and only while `notifyWaiting` is on. When the session stops waiting, its notification is withdrawn. With `notifyWaitingHosts` set to all hosts, another host's waiting session notifies here too, with that host's name; it arrives with the delay of the shared history folder (`sessions-now.json`, §11.4), so the 15 s counts from the session's own `since`.
+- A waiting notification does not time out where the desktop allows that (Linux). On Windows it follows the system's rules; the pop-up keeps the count either way. A click opens the Sessions area at that session, opened and marked for 3 seconds; a session that is no longer listed says so there.
 
 ### 7.6 `seatswap statusline` and the feed
 
@@ -784,10 +802,10 @@ They give real click handling and exact placement on those desktops. They're not
 | `claudeConfigDir` | `$CLAUDE_CONFIG_DIR` or `~/.claude` | |
 | `historyDir` | `null` (`<data folder>/history`) | text, an absolute folder; point it at a synced folder to share the history with other hosts |
 | `hostName` | `null` (the machine's host name) | text, 1–63 characters of `A–Z a–z 0–9 . _ -` that must start with a letter or a digit, stored in lower case; the name this host writes its history under |
-| `readSessions` | on | read Claude Code's session files and transcripts: model, busy or idle, waits and tokens per folder. Message text is never stored |
+| `readSessions` | on | read Claude Code's session files and transcripts: model, busy or idle, waits, tokens per folder, agents and their thinking. The Sessions area needs it; turning it on takes effect after a restart. Message text is never stored |
 | `notifyUsableAgain` | on | the "usable again" notification (§7.5) |
-| `notifyWaiting` | on | the "waiting for you" notification (§7.5) |
-| `notifyWaitingHosts` | `thisHost` | `thisHost` · `allHosts`: whose waiting sessions notify; only this host's are known yet |
+| `notifyWaiting` | on | the "waiting for you" notification (§7.5); a click opens the Sessions area at that session |
+| `notifyWaitingHosts` | `thisHost` | `thisHost` · `allHosts`: whose waiting sessions notify. Other hosts report through the shared history folder, so their notifications come with the delay of the sync (§4.1, §11.4) |
 | `notifyLoginEnds` | on | the login warnings at 5 days, 1 day and when a login ended (§7.5). `bool`; Settings → Notifications, "A login ends" |
 | `currency` | none | `null` or three capital letters (`"EUR"`); `Option<String>`; the currency every amount is shown in. Until it is set, amounts in money stay missing (§11.5). Settings → General, section Money, "Currency" |
 | `usdRate` | none | `null` or `{ "currency": "EUR", "value": 0.95 }`: units of that currency per 1 USD, value above 0; `Option<OwnRate>`. It is used only while its currency is `currency`; an entered rate wins over the looked-up one (§11.5). Settings → General, Money, "Use my own rate" |
@@ -880,17 +898,18 @@ the app's `snapshot`.
   `seatswap panel settings` sends the same line as `seatswap window settings`.
 - A page's `open_window` command, which takes the same target.
 
-A target is an area, optionally followed by `/<sub>` and optionally `?<item>`: `settings`,
-`settings/accounts`, `settings/accounts?<account id>`, `statistics/forecast`. The areas are
-`sessions`, `statistics`, `statusline` and `settings`; a sub-area and an item may hold only `a-z`,
-`0-9` and `-`, and there is at most one `/`. Anything else is refused with the reason, which
-`seatswap window` prints as a usage error. A newly created window loads `window.html#<target>`; an
+A target is an area, optionally followed by `/<sub>` and, for the sessions area only, optionally by
+`?<item>`: `settings`, `settings/accounts`, `settings/accounts?<account id>`, `sessions?<session id>`,
+`statistics/forecast`. The areas are `sessions`, `statistics`, `statusline` and `settings`; a
+sub-area and an item may hold only `a-z`, `0-9` and `-`, and there is at most one `/`. An item after
+`?` without a `/` is refused for every area except sessions. Anything else is refused with the
+reason, which `seatswap window` prints as a usage error. A newly created window loads `window.html#<target>`; an
 already open one is shown, un-minimized, focused and sent `open-area`. The pop-up keeps its own
 `navigate` event, because an event reaches every window.
 
 **The areas.** Four tabs at the top left, in this order: Sessions · Statistics · Status line ·
-Settings. An empty address opens Sessions. In this version only Settings has a page; the other
-three say "Comes with a later version." The area's title and its subtitle stand above the card, and
+Settings. An empty address opens Sessions. Sessions and Settings have a page; Statistics and Status
+line say "Comes with a later version." The area's title and its subtitle stand above the card, and
 the snapshot's error is a banner above both. The theme follows the `theme` setting and the system,
 as in the pop-up.
 
@@ -948,6 +967,88 @@ pending, an incoming snapshot does not overwrite the page's own copy.
   Export writes CSV or JSON to a file the person names (an existing file is refused); import copies
   another history folder's host folders in by hand and never writes this host's own folder or a
   same-named folder of another machine.
+
+### The Sessions area
+
+The first area, and what an empty address opens: every running Claude Code session on this host and,
+through the shared history folder, on the user's other hosts, live, with its agents, tokens and
+their two values. It is read from Claude Code's session files and transcripts, so it needs
+`readSessions` (default on); turning that on takes effect after a restart, and with it off the area
+says so.
+
+**Numbers on top.**
+- Sessions running, and on how many hosts; busy, with how many are waiting for you.
+- Agents running, and how many completed today.
+- The total of exactly the sessions in the view: their tokens, subscription value and API value; the
+  last hour's tokens.
+- The sessions whose thinking is tied to the account (§2.11), and how many of them are busy.
+- The account in use, with its week.
+
+**The tree.** Two orders, switched at the top and remembered: by project → provider and model →
+session, or by provider → model → session with the project after the session's name. Every group
+row shows how many running and closed sessions it holds, how many are busy, how many agents are
+running, and the totals of its tokens and their two values; every total counts exactly the sessions
+in the view — a grey row that has left is shown but no longer counted. A session's row has:
+
+| Column | Content |
+|---|---|
+| Name | the session's name; opens to its agents |
+| Model | the model of its last answer, with a mark when its thinking is tied to the account |
+| Status | busy · idle · waiting for you, with how long; for a closed session, when it closed |
+| Agents | running · completed, the running number in the busy colour (grey at zero), completed always grey |
+| Tokens | output tokens of the session and its agents since it started |
+| Last hour | output tokens in the last 60 minutes, empty when there were none |
+| Subscription value | the value of those tokens in the account's plan (§11.5) |
+| API value | the same tokens at API prices (§11.5) |
+| Host | where it runs; for another host, the age of its last report |
+
+A session opens to its agents, grouped by provider and model. One row per agent has kind, task,
+running or completed, tokens and both values, and its own agents as "1 running · 2 done". An agent
+that started agents opens the same way, to any depth. Completed agents are folded into one
+"38 completed" row that opens.
+
+**Around the tree.**
+- *By model*: sessions, busy ones and the last hour's tokens per model.
+- *If you switched now*: how many sessions would work without their earlier thinking, how many of
+  those are busy, how many would send their conversation again and how many pay nothing (§2.11),
+  with a Switch… button that opens the pop-up.
+- *Last hour*: output tokens by project.
+
+**Closed sessions and hosts.**
+- **Closed sessions**: none (the default) · last 24 hours · last 7 days · last 30 days. They stand in
+  the same tree, in their project and model group, in grey, with the time they closed. Every total
+  follows the choice: the numbers on top and each group's total count exactly the sessions that are
+  listed. They come from the history's session and token records, so they are there after Claude
+  Code has deleted the transcript.
+- **Hosts**: all, or one. Each host writes what is running on it into its own report in the shared
+  history folder (`<host>/sessions-now.json`, below). Another host's row carries the age of its
+  report ("vega · 2 min ago"); a host whose report is older than 15 minutes says "no report since …"
+  instead of running. Without a shared history folder only this host is shown and no report is
+  written.
+
+**How it updates.** While the area is open, the sessions thread watches the session files and the
+running sessions' transcripts and pushes its view: a change is on screen within about a second, at
+most two redraws a second, with a trailing one so the last numbers always arrive, and once a minute
+for the durations and "last hour". Rows keep their place and open rows stay open; a new session or
+agent appears in its group. A session that left turns grey for 60 seconds and is then removed, or,
+with closed sessions shown, it is already there as a closed row. Other hosts' rows change when their
+report arrives. The thread reads the session files and transcripts whether or not the window is
+open; the transcript folder watches and the pushes exist only while the area is subscribed.
+
+**The link `sessions?<session id>`.** The waiting notification's click (§7.5) opens that session:
+the area opens it, marks it for 3 seconds and scrolls to it. A session that is no longer listed says
+so.
+
+**The report other hosts read.** `<history root>/<host>/sessions-now.json` is pretty JSON, written
+atomically with mode 0600 in this host's own folder: `{ "at": "…", "sessions": [ … ] }`, the rows of
+this host's Sessions area at that moment. It holds the session rows and their agents' kind, model,
+running or finished state, times, tokens and values. It never holds an agent's task text (it is set
+to null before writing) and no message text ever reaches it: none leaves the transcript parser. It
+is written when the rows changed and the last write is at least 30 seconds old, at once when a
+running session leaves the list, and as a heartbeat every 5 minutes when nothing changed, so a quiet
+host is not taken for a stale one; an empty list is a report too. A report more than 15 minutes
+before now is stale, and its sessions say "no report"; a time in the future is fresh. The import
+never copies the file and a host folder's size leaves it out (§5).
 
 ---
 

@@ -863,7 +863,8 @@ impl Scan {
 /// The caller's state is not changed; the result carries the state to `commit`.
 pub fn scan(claude: &ClaudePaths, state: &ScanState, budget_bytes: u64)
     -> Result<Scan, TranscriptError>;
-pub fn agents_of(claude: &ClaudePaths, session: &str) -> Vec<AgentMeta>;
+pub fn agents_of(claude: &ClaudePaths, session: &str,
+    spawns: &BTreeMap<String, Option<String>>) -> Vec<AgentMeta>;
 /// One TokenRecord per (session, hour, model); an agent's answers go to its parent session and use
 /// the parent's folder when known. The group's cwd is that of its earliest answer.
 pub fn token_records(answers: &[Answer], state: &ScanState, home: &Path) -> Vec<TokenRecord>;
@@ -871,6 +872,40 @@ pub fn token_records(answers: &[Answer], state: &ScanState, home: &Path) -> Vec<
 
 Only numbers and names leave the parser: time, folder, model, block kinds, token counts, session
 and agent ids. Message text is never stored, logged, put into a warning or sent anywhere.
+
+## transcripts additions — per-agent sums, who started whom, the last hour (step C2)
+
+```rust
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)] #[serde(rename_all = "camelCase")]
+pub struct Tokens { pub input: u64, pub out: u64, pub cw: u64, pub cr: u64 }
+impl std::ops::AddAssign for Tokens;
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)] #[serde(rename_all = "camelCase")]
+pub struct AgentSeen { pub first: DateTime<Utc>, pub last: DateTime<Utc>, pub model: Option<String>,
+    pub tokens: Tokens, pub answers: u32 }
+// SessionSeen gains, all `#[serde(default)]` so a state file from before C2 loads:
+pub totals: Tokens,                                  // the session and its agents
+pub by_model: BTreeMap<String, Tokens>,
+pub agents: BTreeMap<String, AgentSeen>,
+pub spawns: BTreeMap<String, Option<String>>,        // tool_use id -> the agent that made it; None: the session
+pub recent: Vec<(DateTime<Utc>, Tokens)>,            // one entry per minute, the last 60 minutes
+// AgentMeta gains:
+pub tool_use_id: Option<String>, pub parent: Option<String>   // the agent that started it; None: the session
+pub fn last_hour(seen: &SessionSeen, now: DateTime<Utc>) -> Tokens;
+pub fn agents_of(claude: &ClaudePaths, session: &str, spawns: &BTreeMap<String, Option<String>>)
+    -> Vec<AgentMeta>;
+impl ScanState { pub fn forget_closed(&mut self, running: &BTreeSet<String>, now: DateTime<Utc>) -> usize; }
+```
+
+`scan` adds every answer this scan counted to its session's `totals`, `by_model` and (for an agent
+answer) `agents`; the same message id rule keeps an answer read twice from being summed twice. An
+answer only goes to a session whose main transcript has made one: an agent transcript alone has
+nowhere to put it. A `tool_use` block named `Agent` or `Task` adds its id and the agent that made the
+call to `spawns` (only the id and the name are read from the block); `agents_of` looks each meta's
+`toolUseId` up there and sets `parent`. `recent` is one entry per minute; it is pruned to the
+60 minutes before the newest answer, and `last_hour` adds the entries whose minute starts after
+`now - 60 min`. `forget_closed` drops a session that is not running and whose latest answer — its own
+or one of its agents', whichever is newer — is more than an hour old; its files' offsets stay, so the
+bytes already read are not read again, and the folder is marked changed for the next save.
 
 ## engine.rs additions — usable, models in use, due at a reset (step A)
 
@@ -1453,6 +1488,43 @@ is the latest of any non-auto switch's `MANUAL_HOLD_H` and an `autoBurn` pause; 
 manual hold; a manual hold ends at the first block of the account switched to, from the history or
 the state now, and stays ended. `next_account` is the target of a
 `Switch`/`Wait`, otherwise the first account of the lazy plan other than the active one.
+
+## burn changes — going back restores (step C2)
+
+```rust
+// burn/plan.rs
+pub struct AccountState { /* … */ pub thinking_held: u32 }
+fn pick(views: &[View<'_>], at: DateTime<Utc>, walk: &Walk<'_>, typical: f64) -> Option<usize>;
+
+// burn/live.rs
+pub fn thinking_held(thinking: &[(DateTime<Utc>, u32)], events: &[Hosted<Event>], host: &str)
+    -> BTreeMap<AccountRef, u32>;
+pub fn situation(learned: &Learned, views: &[AccountView], accounts: &[Account],
+    active: Option<&str>, now: DateTime<Utc>, offset: FixedOffset, tied_busy: u32,
+    thinking: &[(DateTime<Utc>, u32)]) -> Result<Readiness, PlanError>;
+```
+
+`thinking_held` builds `Timeline::of(events, host)` and gives each minute's count to
+`Timeline::at(minute)`; a minute without a known live account is left out, and the map has no entry
+for an account without thinking. `situation` looks each account's `AccountRef::of` up there and
+fills `AccountState.thinking_held` (0 when none), then passes `tied_busy` through unchanged.
+
+`pick`, the one choice `choose` and the plan's steps use, keeps its old branch when any usable
+account has no slack: the fixed order. In the branch where every usable account has one, the
+candidates are the accounts whose slack is at most `SLACK_MARGIN_H × typical` (plus the `1e-9`
+tie noise) above the least; the highest `thinking_held` wins, and equal counts — including all 0 —
+fall back to slack, weekly reset and id, exactly as before. `decide`'s early switch (step 5) still
+requires the chosen target to be at least `SLACK_MARGIN_H × typical` below the active account, so a
+thinking account inside that margin keeps auto-burn on the active one until it is that far below or
+another account is clearly more urgent. With `readSessions` off no rates are learned, `pick` takes
+the fixed-order branch, and nothing is held back.
+
+The list reaches the decision from the sessions thread: `PassOutcome.thinking` →
+`EngineCommand::ModelsInUse { models, tied_busy, thinking }` → `EngineRuntime.thinking` (emptied
+with `tied_busy` when `models` is `None`) → `BurnTick.thinking` → `live::situation`. The CLI's
+`burn plan` and `status` pass `&[]` because they do not know the running sessions, and the replay
+sets every `thinking_held` to 0, so both plan as before. `Timeline::of` is `pub(super)` and
+`Timeline::at` is `pub(crate)` for this one reader.
 
 ## engine.rs additions — feed, stale poll, 30 s near full (step B)
 
@@ -2294,12 +2366,35 @@ settings` sends `window settings` instead of a pop-up view.
 
 ## Step C2: the Sessions area and the other hosts (spec §3.8, §4.1)
 
+### live_sessions (step C2)
+
 `core::live_sessions` owns the rows and the small report another host reads.
 
 ```rust
 // live_sessions.rs
+pub const CACHE_LIFE_MIN: i64 = 60;      // idle/waiting longer: a switch pays nothing extra
 pub const REPORT_EVERY_SECS: i64 = 30;
 pub const REPORT_STALE_MIN: i64 = 15;
+#[serde(rename_all = "camelCase")] pub enum LiveStatus { Busy, Idle, Waiting, Closed, Other(String) }
+#[serde(rename_all = "camelCase")] pub struct Values { pub api: Option<f64>,
+    pub api_currency: Option<String>, pub api_missing: Option<String>,
+    pub subscription: Option<f64>, pub currency: Option<String>,
+    pub subscription_missing: Option<String> }
+impl Values { pub fn of(valued: &[Valued], settings: &Settings) -> Values;
+              pub fn sum(parts: &[&Values]) -> Values; }
+#[serde(rename_all = "camelCase")] pub struct LiveAgent { pub agent: String,
+    pub parent: Option<String>, pub kind: Option<String>, pub task: Option<String>,
+    pub model: Option<String>, pub running: bool, pub first: Option<DateTime<Utc>>,
+    pub last: Option<DateTime<Utc>>, pub tokens: Tokens, pub values: Values }
+#[serde(rename_all = "camelCase")] pub struct LiveSession { pub session: String, pub host: String,
+    pub label: String, pub project_id: ProjectId, pub project: String, pub org: Option<String>,
+    pub cwd: String, pub provider: String, pub model: Option<String>, pub tied: bool,
+    pub status: LiveStatus, pub since: DateTime<Utc>, pub started: DateTime<Utc>,
+    pub agents_running: u32, pub agents_done: u32, pub agents: Vec<LiveAgent>,
+    pub tokens: Tokens, pub last_hour: Tokens, pub values: Values }
+pub struct Rows { pub sessions: Vec<LiveSession>, pub warnings: Vec<String> }
+pub enum SwitchKind { Free, Resend, LosesThinking }
+pub fn switch_kind(session: &LiveSession, thinking_since_user: u32, now: DateTime<Utc>) -> SwitchKind;
 pub enum Pricing<'a> { Known { valuer: &'a Valuer, settings: &'a Settings },
     Unknown { reason: String } }
 pub fn running(files: &[SessionFile], state: &ScanState,
@@ -2321,13 +2416,24 @@ pub fn other_hosts(history: &HistoryDir, now: DateTime<Utc>)
     -> Result<OtherHosts, HistoryError>;
 
 // history/mod.rs
-const SESSIONS_NOW_FILE: &str = "sessions-now.json";      // one host's live state, not history
+pub(crate) const SESSIONS_NOW_FILE: &str = "sessions-now.json";  // one host's live state, not history
 impl HistoryDir { pub fn sessions_now_file(&self, host: &str) -> PathBuf; }
 
 // projects.rs: the one project read the pop-up and the sessions thread share
 pub fn load(history: &HistoryDir, accounts: &[Account])
     -> Result<(Projects, Vec<String>), HistoryError>;
 ```
+
+`running` builds one row per session file. A session file whose `startedAt` or `statusUpdatedAt` is
+not a valid time is not a row; its reason is a `Rows::warnings` line. A row's tokens are
+`SessionSeen.by_model` valued as one record per model, dated at the session's last answer; an agent's
+tokens are one record with its model at its last answer, and an agent without a model has both values
+missing. `switch_kind` answers what a switch costs a row in the "If you switched now" card: `Free`
+for a closed one, one without a model, or an idle or waiting one older than `CACHE_LIFE_MIN`; else
+`LosesThinking` when the row is tied and `thinking_since_user > 0`; else `Resend`. `closed` reads
+the last `SessionRecord` of each session and keeps the closed ones whose `last` is in `[since, now)`,
+sums every `TokenRecord` of the session (several lines for one hour and model) and gives the row the
+label `<project>-<first two characters of the session id>` and no agents.
 
 `live_sessions::Values::sum(parts: &[&Values]) -> Values` is the one sum rule: each half is added
 only when every part has it, a missing part makes the sum unknown with the first part's reason, parts
@@ -2348,6 +2454,8 @@ file and the reason while the other reports are still returned; only failing to 
 an error. A report more than `REPORT_STALE_MIN` before `now` is stale: its sessions say
 `Other("no report")`; a future `at` is fresh. The import skips `SESSIONS_NOW_FILE`, and the month
 file listing and the export never see it.
+
+### the sessions thread: passes, the report and the commands (step C2)
 
 The sessions thread (`gui/sessions_rt.rs`) keeps a rows context of two parts built apart: the
 `Projects` and a `Valuer` for the day up to `now` with the settings from `load_accounts`. A part
@@ -2370,10 +2478,33 @@ that fails stores an empty one with its error. Every waiting session of a fresh 
 `SessionsSummary.waiting` with its host. `waiting: Vec<Waiting>` carries
 `Waiting.host: Option<String>` (`None` = this host); this host's name is `GuiState.history.host()`.
 `Deduper` shows another host's wait only with `notifyWaitingHosts: AllHosts`; a click opens the
-large window at `sessions?<session id>` (`window::parse_target` accepts the id and refuses an item
-after any other area).
+large window at `sessions?<session id>` (`window::parse_target` accepts the id and refuses a bare
+item after any other area).
 
-### The Sessions view and its commands (step C2, Task 4)
+One pass is `run_pass` (the tests' entry) inside `one_pass`, which also saves the transcript state:
+
+```rust
+// gui/sessions_rt.rs
+pub(crate) struct PassOutcome { pub summary: SessionsSummary, pub models: Option<BTreeSet<String>>,
+    pub tied_busy: u32, pub thinking: Vec<(DateTime<Utc>, u32)>, pub wake_soon: bool }
+pub(crate) fn run_pass(app: &AppPaths, claude: &ClaudePaths, probe: &dyn Liveness,
+    recorder: Option<&Recorder>, state: &mut ScanState, memory: &mut SessionMemory,
+    now: DateTime<Utc>, state_error: Option<&str>) -> PassOutcome;
+impl SessionsHandle { pub(crate) fn latest(&self) -> Arc<Mutex<Option<SessionsSummary>>>;
+                      pub(crate) fn client(&self) -> SessionsClient;
+                      pub(crate) fn stop(&mut self); }
+```
+
+A pass reads the session files, scans what is new in the transcripts (at most
+`SCAN_BUDGET = 64 MiB`), writes the token and session records and the wait records, builds the rows,
+writes this host's report and reads the other hosts. A session record is rewritten at most every
+`RECORD_EVERY_SECS = 600` while its summary changes; a closed session gets exactly one closing
+record. The thread's regular wake is `WAKE = 60 s`, and `AFTER_INCOMPLETE = 1 s` follows a scan that
+did not finish; the session folder is watched all the time, the transcript folders only while the
+window is subscribed. `PassOutcome.thinking` is the running tied sessions' answers with thinking,
+minute by minute, and `tied_busy` of them the busy ones; both go to the burn tick (below).
+
+### window.rs: the sessions view, its sums and the commands (step C2, Task 4)
 
 The sessions thread owns the facts the view is made of and answers the window over one
 `SessionsClient`, the same pattern as the look-up's client:
@@ -2483,3 +2614,24 @@ The three commands are registered with the others and are `async`, like `money_v
 client call on `tauri::async_runtime::spawn_blocking`. The large window's `Destroyed` event sends
 `Unsubscribe`. `gui::handle_ui_event` fills `view.in_use` and emits `sessions-view` with
 `emit_to(WINDOW_LABEL, …)`, so only the large window receives it.
+
+## Files step C2 writes
+
+- `<history root>/<host>/sessions-now.json` — this host's live report for the other hosts' Sessions
+  area (step C2's one new file). Pretty JSON, atomic, `Access::Private`, written in this host's own
+  folder: `HostReport { at, sessions: Vec<LiveSession> }`, where every agent's `task` is `null` and
+  no message text is in it. It is written when the rows changed and the last write is at least 30 s
+  old, at once when a running session left the list, and as a 5-minute heartbeat; a failed write is
+  the history warning on the summary. `HistoryDir::sessions_now_file` is the only path to it. The
+  import never copies it and `folder_bytes` leaves it out of a host folder's size; no reader of the
+  history sees it as a record.
+- `<data folder>/transcripts-state/<folder>.json` — the scan state that already existed, with the
+  fields step C2 added: `totals`, `byModel`, `agents`, `spawns`, `recent` and `thinking` (which
+  replaced the single `thinkingSinceUser` number) on `SessionSeen`, all `#[serde(default)]`, so a
+  state written before step C2 loads with zero/empty sums and an empty `thinking`, and `recent`
+  starts at that point; the old transcripts are not read again for them. The state version stays 1.
+  The file is still written per changed project folder only, atomically and private; a session that
+  left the state keeps its files' offsets in `files`, so its old bytes are not read again.
+- The history files keep the shapes step A gave them. The sessions thread writes the same
+  `tokens-YYYY-MM.jsonl`, `sessions-YYYY-MM.jsonl` and wait event lines; step C2 adds no file kind
+  there.

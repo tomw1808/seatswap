@@ -34,11 +34,17 @@ read or write that yet.
 
 - **One-click switch** from the tray menu or the pop-up, or `seatswap use AC`. Running Claude
   Code sessions pick up the new login on their next request.
-- **A large window with Settings.** The gear in the pop-up (or `,`) opens a full window: Sessions,
-  Statistics, Status line and Settings. Settings is there now — every setting, plus the account
-  editor that used to sit in the pop-up; the other three areas come with a later version.
-  `seatswap window [AREA]` opens it from a terminal, and so do the tray's *Settings…* and *Open
-  seatswap…*. Every control saves at once.
+- **A large window with Sessions and Settings.** The gear in the pop-up (or `,`) opens a full
+  window: Sessions, Statistics, Status line and Settings. Sessions and Settings are there now —
+  every setting, plus the account editor that used to sit in the pop-up; Statistics and Status line
+  come with a later version. `seatswap window [AREA]` opens it from a terminal, and so do the
+  tray's *Settings…* and *Open seatswap…*. Every control saves at once.
+- **The Sessions area.** It shows every running Claude Code session on this host and, through the
+  shared history folder, on your other hosts: live, with its agents to any depth, its tokens and
+  what they are worth, and the sessions that closed in the last 24 hours, 7 or 30 days. Numbers on
+  top, two groupings and a card for what a switch would cost the running sessions. It updates by
+  itself (at most twice a second) and needs *Read Claude Code's session files* (on by default);
+  turning it on takes effect after a restart.
 - **Money.** seatswap shows what tokens and subscriptions are worth: API prices from
   [models.dev](https://models.dev) and the dollar rate from
   [Frankfurter](https://frankfurter.dev), each kept with its dates, so past days keep the price of
@@ -68,7 +74,9 @@ read or write that yet.
   numbers and names leave the transcripts: model, token counts, folder, session id; never message
   text.
 - **Notifications that matter.** When a blocked account is usable again, when the last usable
-  account fills up, or when a session has waited for you for 15 s.
+  account fills up, or when a session has waited for you for 15 s. A click on a waiting notification
+  opens the Sessions area at that session; with *For sessions on: all hosts*, another host's waiting
+  sessions notify here too, with the delay of the shared folder.
 - **Agent settings.** Two switches decide whether agents may read usage and may switch accounts;
   `seatswap agent-skill install` adds a skill that tells them how.
 - **Logins kept fresh.** Stored logins of inactive accounts are refreshed before they expire, and

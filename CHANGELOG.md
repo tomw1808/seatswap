@@ -35,6 +35,13 @@ All notable changes to this project are documented here. The format follows
 - The plan level on every account, such as "Team 5x".
 - `seatswap window [AREA]` for the large window, `seatswap prices [--refresh]` for the stored API
   prices, and `seatswap history export --format csv|json` / `seatswap history import <folder>`.
+- The Sessions area of the large window: every running session on this host and the user's other
+  hosts, live, with its agents, tokens and their subscription and API values, the closed sessions
+  of the last 24 hours, 7 or 30 days, and the account in use.
+- The waiting notification for other hosts: with *For sessions on: all hosts*, a session waiting on
+  another host notifies here too, and a click opens the Sessions area at that session.
+- Auto-burn goes back to the account that produced the running sessions' thinking when two accounts
+  are about equally good.
 
 ### Changed
 - Settings and the account editor moved from the pop-up to the large window; the gear, `,` and an
