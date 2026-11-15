@@ -17,6 +17,7 @@ use serde_json::Value;
 
 use crate::api::{Api, ApiError, Limit, LimitKind, Usage};
 use crate::atomic::{self, write_atomic, Access};
+use crate::feed::{self, Feed};
 use crate::history::{AccountRef, EventKind, HistoryError, Recorder, Source};
 use crate::live;
 use crate::locks::{self, LockError};
@@ -112,6 +113,11 @@ pub struct CacheEntry {
     pub usage: Option<Usage>,
     /// When `usage` was fetched.
     pub fetched_at: Option<DateTime<Utc>>,
+    /// When the status line last fed these numbers (spec §5.3). The cache is
+    /// older than `fetched_at` and `fed_at` both; a feed is applied only when
+    /// its `at` is later than each.
+    #[serde(default)]
+    pub fed_at: Option<DateTime<Utc>>,
     /// When the last poll was attempted, successful or not. Due times run from
     /// the later of this and `fetched_at`, so a non-transient failure is not
     /// retried on every tick.
@@ -387,6 +393,64 @@ impl<R: Remote> Engine<R> {
         Ok(views)
     }
 
+    /// Merge the status line's numbers into the cache entry of the account they
+    /// belong to (spec §5.3), when `feed.at` is later than both that entry's
+    /// `fetched_at` and `fed_at` and [`feed::merged`] changes the reading.
+    /// Only then does it move `fed_at`, save the cache and record the merged
+    /// reading as a sample with [`Source::Statusline`], through the same
+    /// recorder the poll uses; a history error becomes the account's
+    /// `last_error` and never a failed call. Returns the id of the account it
+    /// changed, `None` when the feed is older or changes nothing.
+    pub fn apply_feed(
+        &mut self,
+        feed: &Feed,
+        _now: DateTime<Utc>,
+    ) -> Result<Option<String>, EngineError> {
+        let file = self.store.load()?;
+        let Some(id) = feed::account_for(feed, &self.cache, &file.accounts) else {
+            return Ok(None);
+        };
+        let Some(account) = file.find(&id) else {
+            return Ok(None);
+        };
+        let Some(entry) = self.cache.entries.get(&id) else {
+            return Ok(None);
+        };
+        if entry
+            .fetched_at
+            .is_some_and(|fetched_at| feed.at <= fetched_at)
+            || entry.fed_at.is_some_and(|fed_at| feed.at <= fed_at)
+        {
+            return Ok(None);
+        }
+        let Some(usage) = entry.usage.clone() else {
+            return Ok(None);
+        };
+
+        let merged = feed::merged(&usage, feed);
+        if merged == usage {
+            return Ok(None);
+        }
+        let account_ref = AccountRef::of(account);
+        let plan = account.plan.clone();
+        let entry = self.cache.entries.entry(id.clone()).or_default();
+        entry.usage = Some(merged.clone());
+        entry.fed_at = Some(feed.at);
+        if let Some(recorder) = self.recorder.as_mut() {
+            if let Err(error) = recorder.reading(
+                &account_ref,
+                plan.as_deref(),
+                &merged,
+                feed.at,
+                Source::Statusline,
+            ) {
+                self.set_last_error(&id, history_error_text(HistoryErrorKind::Reading, &error));
+            }
+        }
+        self.cache.save(self.store.app_paths())?;
+        Ok(Some(id))
+    }
+
     /// Views from the cache without any network call. The active account first,
     /// then the account list's order.
     pub fn views(&self, now: DateTime<Utc>) -> Result<Vec<AccountView>, EngineError> {
@@ -439,7 +503,7 @@ impl<R: Remote> Engine<R> {
             usable,
             blocked_until,
             blocker,
-            fetched_at: entry.and_then(|entry| entry.fetched_at),
+            fetched_at: entry.and_then(|entry| entry.fetched_at.max(entry.fed_at)),
             last_error: entry.and_then(|entry| entry.last_error.clone()),
         }
     }
@@ -1187,6 +1251,7 @@ mod tests {
     use serde_json::json;
 
     use crate::api::{Limit, LimitKind, Severity};
+    use crate::feed::{Feed, FeedLimit};
     use crate::history::{HistoryDir, Recorder};
     use crate::paths::AppPaths;
     use crate::store::FileSecrets;
@@ -2698,6 +2763,12 @@ mod tests {
         (root.clone(), HistoryDir::at(&root, "vega"))
     }
 
+    fn ts(text: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(text)
+            .expect("an RFC 3339 test time")
+            .with_timezone(&Utc)
+    }
+
     fn view_by_id(engine: &Engine<FakeRemote>, id: &str, now: DateTime<Utc>) -> AccountView {
         engine
             .views(now)
@@ -3387,6 +3458,273 @@ mod tests {
             state_event_types(&root),
             vec!["allBlocked"],
             "a restart writes no second event for the same block"
+        );
+    }
+
+    fn weekly_reset() -> DateTime<Utc> {
+        ts("2026-11-16T02:00:00.336716Z")
+    }
+
+    fn weekly_usage(percent: f64, reset: DateTime<Utc>) -> Usage {
+        usage_of(vec![
+            limit_of(
+                LimitKind::Session,
+                10.0,
+                Some(ts("2026-11-14T19:30:00.336716Z")),
+                None,
+                true,
+            ),
+            limit_of(LimitKind::WeeklyAll, percent, Some(reset), None, true),
+        ])
+    }
+
+    fn feed_at(at: DateTime<Utc>, seven_day_percent: f64) -> Feed {
+        Feed {
+            at,
+            five_hour: Some(FeedLimit {
+                percent: 12.0,
+                resets_at: ts("2026-11-14T19:30:00.336716Z"),
+            }),
+            seven_day: Some(FeedLimit {
+                percent: seven_day_percent,
+                resets_at: weekly_reset(),
+            }),
+            model: Some("claude-fable-5-2".to_string()),
+        }
+    }
+
+    #[test]
+    fn apply_feed_updates_the_cache_and_writes_a_sample() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = Fixture::new(&tmp);
+        let (root, dir) = history_at(&tmp);
+        let (_app, _fake, engine) = fixture.into_engine();
+        let mut engine = engine.with_recorder(Recorder::new(dir));
+        let fetched = ts("2026-11-14T10:00:00Z");
+        cache_usage(
+            &mut engine,
+            A_ID,
+            weekly_usage(40.0, weekly_reset()),
+            fetched,
+        );
+        let feed = feed_at(ts("2026-11-14T10:01:00Z"), 48.0);
+
+        assert_eq!(
+            engine.apply_feed(&feed, feed.at).unwrap().as_deref(),
+            Some(A_ID)
+        );
+
+        let view = view_by_id(&engine, A_ID, feed.at);
+        let usage = view.usage.expect("the cached usage");
+        assert_eq!(usage.weekly_all().map(|limit| limit.percent), Some(48.0));
+        assert_eq!(usage.session().map(|limit| limit.percent), Some(12.0));
+        assert_eq!(view.fetched_at, Some(feed.at));
+
+        let lines = read_json_lines(&root.join("vega/samples-2026-11.jsonl"));
+        let sample = lines
+            .iter()
+            .find(|line| line["src"] == "statusline")
+            .expect("the feed is written as a statusline sample");
+        let week = sample["l"]
+            .as_array()
+            .and_then(|limits| limits.iter().find(|limit| limit["k"] == "weekly_all"))
+            .and_then(|limit| limit["p"].as_f64());
+        assert_eq!(
+            week,
+            Some(48.0),
+            "the sample carries the fed week: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_stale_session_window_in_the_feed_does_not_replace_a_newer_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = Fixture::new(&tmp);
+        let (root, dir) = history_at(&tmp);
+        let (_app, _fake, engine) = fixture.into_engine();
+        let mut engine = engine.with_recorder(Recorder::new(dir));
+        let fetched = ts("2026-11-14T10:00:00Z");
+        cache_usage(
+            &mut engine,
+            A_ID,
+            weekly_usage(40.0, weekly_reset()),
+            fetched,
+        );
+        // The session has not sent a request since the previous 5 h window: its
+        // 99 % carries a reset in the past, not the newer window in the cache.
+        let feed = Feed {
+            at: ts("2026-11-14T10:01:00Z"),
+            five_hour: Some(FeedLimit {
+                percent: 99.0,
+                resets_at: ts("2026-11-14T09:00:00Z"),
+            }),
+            seven_day: Some(FeedLimit {
+                percent: 40.0,
+                resets_at: weekly_reset(),
+            }),
+            model: Some("claude-fable-5-2".to_string()),
+        };
+
+        assert_eq!(engine.apply_feed(&feed, feed.at).unwrap(), None);
+
+        let entry = engine.cache.entries.get(A_ID).expect("A's entry");
+        let session = entry
+            .usage
+            .as_ref()
+            .and_then(Usage::session)
+            .expect("A's session");
+        assert_eq!(session.percent, 10.0);
+        assert_eq!(
+            session.resets_at,
+            Some(ts("2026-11-14T19:30:00.336716Z")),
+            "the cached 5 h window stays"
+        );
+        assert_eq!(entry.fed_at, None);
+        let samples = root.join("vega/samples-2026-11.jsonl");
+        assert!(
+            !samples.exists() || read_json_lines(&samples).is_empty(),
+            "an unchanged reading writes no sample"
+        );
+    }
+
+    #[test]
+    fn the_weekly_percent_of_a_feed_never_goes_down_within_one_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = Fixture::new(&tmp);
+        let (_app, _fake, mut engine) = fixture.into_engine();
+        let fetched = ts("2026-11-14T10:00:00Z");
+        cache_usage(
+            &mut engine,
+            A_ID,
+            weekly_usage(52.0, weekly_reset()),
+            fetched,
+        );
+        let feed = Feed {
+            at: ts("2026-11-14T10:01:00Z"),
+            five_hour: None,
+            seven_day: Some(FeedLimit {
+                percent: 50.0,
+                resets_at: weekly_reset(),
+            }),
+            model: Some("claude-fable-5-2".to_string()),
+        };
+
+        assert_eq!(engine.apply_feed(&feed, feed.at).unwrap(), None);
+
+        let entry = engine.cache.entries.get(A_ID).expect("A's entry");
+        assert_eq!(
+            entry
+                .usage
+                .as_ref()
+                .and_then(Usage::weekly_all)
+                .map(|limit| limit.percent),
+            Some(52.0)
+        );
+        assert_eq!(entry.fed_at, None);
+    }
+
+    #[test]
+    fn an_older_feed_changes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = Fixture::new(&tmp);
+        let (_app, _fake, mut engine) = fixture.into_engine();
+        let fetched = ts("2026-11-14T10:00:00Z");
+        cache_usage(
+            &mut engine,
+            A_ID,
+            weekly_usage(40.0, weekly_reset()),
+            fetched,
+        );
+        let feed = feed_at(ts("2026-11-14T09:59:00Z"), 48.0);
+
+        assert_eq!(engine.apply_feed(&feed, feed.at).unwrap(), None);
+
+        let entry = engine.cache.entries.get(A_ID).expect("A's entry");
+        assert_eq!(
+            entry
+                .usage
+                .as_ref()
+                .and_then(Usage::weekly_all)
+                .map(|l| l.percent),
+            Some(40.0)
+        );
+        assert_eq!(entry.fed_at, None);
+    }
+
+    #[test]
+    fn a_feed_of_the_account_before_the_switch_is_not_stored_for_the_new_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fixture = Fixture::new(&tmp);
+        // B is the live account (LB); the feed still carries A's weekly reset
+        // (AC), because the session has not sent a request since the switch.
+        let b_identity = identity(B_UUID, B_ORG, "Private", "private@example.com");
+        write_live(&fixture.claude, &b_stored_login(), &b_identity);
+        fixture.save_file();
+        let (_app, _fake, mut engine) = fixture.into_engine();
+        let fetched = ts("2026-11-14T10:00:00Z");
+        cache_usage(
+            &mut engine,
+            A_ID,
+            weekly_usage(40.0, weekly_reset()),
+            fetched,
+        );
+        cache_usage(
+            &mut engine,
+            B_ID,
+            usage_of(vec![limit_of(
+                LimitKind::WeeklyAll,
+                30.0,
+                Some(ts("2026-11-16T17:00:00.336716Z")),
+                None,
+                true,
+            )]),
+            fetched,
+        );
+
+        let feed = feed_at(ts("2026-11-14T10:01:00Z"), 48.0);
+
+        assert_eq!(
+            engine.apply_feed(&feed, feed.at).unwrap().as_deref(),
+            Some(A_ID)
+        );
+        assert_eq!(
+            engine
+                .cache
+                .entries
+                .get(A_ID)
+                .and_then(|entry| entry.usage.as_ref())
+                .and_then(Usage::weekly_all)
+                .map(|limit| limit.percent),
+            Some(48.0)
+        );
+        let b = engine.cache.entries.get(B_ID).expect("B's entry");
+        assert_eq!(
+            b.usage
+                .as_ref()
+                .and_then(Usage::weekly_all)
+                .map(|l| l.percent),
+            Some(30.0)
+        );
+        assert_eq!(b.fed_at, None);
+    }
+
+    #[test]
+    fn a_fed_entry_is_still_due_by_its_poll_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = Fixture::new(&tmp);
+        let (_app, _fake, mut engine) = fixture.into_engine();
+        cache_usage(&mut engine, A_ID, weekly_usage(40.0, weekly_reset()), t0());
+        let feed = feed_at(at(60), 48.0);
+        engine.apply_feed(&feed, feed.at).unwrap();
+        let settings = Settings::default();
+
+        assert!(
+            !engine.due(A_ID, true, PollReason::Timer, at(119), &settings),
+            "the feed's time must not delay the poll"
+        );
+        assert!(
+            engine.due(A_ID, true, PollReason::Timer, at(120), &settings),
+            "the entry is due 120 s after its fetched_at"
         );
     }
 }

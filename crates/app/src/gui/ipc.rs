@@ -61,25 +61,59 @@ pub(crate) enum IpcError {
     Paths(#[from] PathsError),
     #[error("the tray app answered: {0}")]
     Reply(String),
+    #[error("the running tray app is older than this seatswap; restart it")]
+    OlderTray,
 }
 
 /// Tell the running tray app to open `view` (`main`, `add`, `settings`).
 pub(crate) fn send_open_panel(app: &AppPaths, view: &str) -> Result<(), IpcError> {
-    let socket = match app.gui_socket(paths::runtime_dir().as_deref()) {
+    let socket = socket_for(app)?;
+    send_open_panel_at(&socket, view)
+}
+
+/// Tell the running tray app that the status line has written a fresh feed.
+/// No tray app running is not an error: the file waits for the next start.
+pub(crate) fn send_feed(app: &AppPaths) -> Result<(), IpcError> {
+    let socket = match socket_for(app) {
         Ok(socket) => socket,
+        Err(IpcError::NotRunning) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    send_feed_at(&socket)
+}
+
+/// The socket half of [`send_feed`], split out so tests can name the path.
+fn send_feed_at(socket: &std::path::Path) -> Result<(), IpcError> {
+    match send_at(socket, "feed\n") {
+        Err(IpcError::NotRunning) => Ok(()),
+        // The previous tray app knows no `feed` command. Saying it is old is
+        // the only useful answer; every other reply keeps its own error.
+        Err(IpcError::Reply(reply)) if reply == "error unknown command" => Err(IpcError::OlderTray),
+        result => result,
+    }
+}
+
+/// The socket of a running tray app, or the reason no tray app can hold one.
+fn socket_for(app: &AppPaths) -> Result<PathBuf, IpcError> {
+    match app.gui_socket(paths::runtime_dir().as_deref()) {
+        Ok(socket) => Ok(socket),
         // No data folder: no tray app can hold its lock there.
         Err(PathsError::DataDir { source, .. })
             if source.kind() == std::io::ErrorKind::NotFound =>
         {
-            return Err(IpcError::NotRunning)
+            Err(IpcError::NotRunning)
         }
-        Err(error) => return Err(error.into()),
-    };
-    send_open_panel_at(&socket, view)
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// The socket half of [`send_open_panel`], split out so tests can name the path.
 pub(crate) fn send_open_panel_at(socket: &std::path::Path, view: &str) -> Result<(), IpcError> {
+    send_at(socket, &format!("open-panel {view}\n"))
+}
+
+/// One command line to the tray app, then its one-line answer.
+fn send_at(socket: &std::path::Path, line: &str) -> Result<(), IpcError> {
     // A failed connect is the documented "no tray app is running" case.
     let stream = UnixStream::connect(socket).map_err(|_| IpcError::NotRunning)?;
     stream
@@ -91,7 +125,7 @@ pub(crate) fn send_open_panel_at(socket: &std::path::Path, view: &str) -> Result
         })?;
     let mut writer = stream;
     writer
-        .write_all(format!("open-panel {view}\n").as_bytes())
+        .write_all(line.as_bytes())
         .map_err(|source| IpcError::Io {
             path: socket.to_path_buf(),
             source,
@@ -100,17 +134,27 @@ pub(crate) fn send_open_panel_at(socket: &std::path::Path, view: &str) -> Result
         path: socket.to_path_buf(),
         source,
     })?);
-    let mut line = String::new();
-    reader.read_line(&mut line).map_err(|source| IpcError::Io {
-        path: socket.to_path_buf(),
-        source,
-    })?;
-    let reply = line.trim();
+    let mut reply = String::new();
+    reader
+        .read_line(&mut reply)
+        .map_err(|source| IpcError::Io {
+            path: socket.to_path_buf(),
+            source,
+        })?;
+    let reply = reply.trim();
     if reply == "ok" {
         Ok(())
     } else {
         Err(IpcError::Reply(reply.to_string()))
     }
+}
+
+/// One parsed line from a client: open a panel view, or take a fresh feed.
+#[cfg(feature = "gui")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IpcCommand {
+    OpenPanel(String),
+    Feed,
 }
 
 /// A running listener. Dropping it stops the thread, removes the socket and
@@ -129,9 +173,9 @@ impl Listener {
     /// instance is running and is reported as [`IpcError::AlreadyRunning`].
     pub(crate) fn start(
         app: &AppPaths,
-        on_open: impl Fn(&str) + Send + Sync + 'static,
+        on_command: impl Fn(IpcCommand) + Send + Sync + 'static,
     ) -> Result<Listener, IpcError> {
-        Self::start_in(app, paths::runtime_dir().as_deref(), on_open)
+        Self::start_in(app, paths::runtime_dir().as_deref(), on_command)
     }
 
     /// [`start`](Self::start) with the runtime folder given (`None`: the socket
@@ -140,9 +184,9 @@ impl Listener {
     pub(crate) fn start_in(
         app: &AppPaths,
         runtime_dir: Option<&std::path::Path>,
-        on_open: impl Fn(&str) + Send + Sync + 'static,
+        on_command: impl Fn(IpcCommand) + Send + Sync + 'static,
     ) -> Result<Listener, IpcError> {
-        let on_open: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(on_open);
+        let on_command: Arc<dyn Fn(IpcCommand) + Send + Sync> = Arc::new(on_command);
         let lock = match locks::acquire_file_lock(&app.gui_lock(), Duration::ZERO) {
             Ok(lock) => lock,
             Err(LockError::Busy { .. }) => return Err(IpcError::AlreadyRunning),
@@ -192,10 +236,10 @@ impl Listener {
                         Ok((stream, _)) => {
                             // A silent client gets its own short-lived thread, so it
                             // never delays the next connection or the app's exit.
-                            let on_open = Arc::clone(&on_open);
+                            let on_command = Arc::clone(&on_command);
                             if let Err(error) = thread::Builder::new()
                                 .name("seatswap-ipc-connection".to_string())
-                                .spawn(move || handle_connection(stream, on_open.as_ref()))
+                                .spawn(move || handle_connection(stream, on_command.as_ref()))
                             {
                                 eprintln!("seatswap: ipc connection: {error}");
                             }
@@ -239,7 +283,7 @@ impl Drop for Listener {
 }
 
 #[cfg(feature = "gui")]
-fn handle_connection(mut stream: UnixStream, on_open: &dyn Fn(&str)) {
+fn handle_connection(mut stream: UnixStream, on_command: &dyn Fn(IpcCommand)) {
     if stream
         .set_read_timeout(Some(IO_TIMEOUT))
         .and_then(|()| stream.set_write_timeout(Some(IO_TIMEOUT)))
@@ -254,8 +298,8 @@ fn handle_connection(mut stream: UnixStream, on_open: &dyn Fn(&str)) {
     let mut line = String::new();
     let reply = match reader.read_line(&mut line) {
         Ok(_) => match parse_command(line.trim()) {
-            Some(view) => {
-                on_open(view);
+            Some(command) => {
+                on_command(command);
                 "ok\n"
             }
             None => "error unknown command\n",
@@ -265,10 +309,13 @@ fn handle_connection(mut stream: UnixStream, on_open: &dyn Fn(&str)) {
     let _ = stream.write_all(reply.as_bytes());
 }
 
-/// `open-panel <view>`, with the three views the panel has. Anything else is
-/// an unknown command and never panics.
+/// `open-panel <view>`, with the three views the panel has, or `feed`.
+/// Anything else is an unknown command and never panics.
 #[cfg(feature = "gui")]
-fn parse_command(line: &str) -> Option<&str> {
+fn parse_command(line: &str) -> Option<IpcCommand> {
+    if line == "feed" {
+        return Some(IpcCommand::Feed);
+    }
     let mut parts = line.split_whitespace();
     if parts.next() != Some("open-panel") {
         return None;
@@ -278,7 +325,7 @@ fn parse_command(line: &str) -> Option<&str> {
         return None;
     }
     match view {
-        "main" | "add" | "settings" => Some(view),
+        "main" | "add" | "settings" => Some(IpcCommand::OpenPanel(view.to_string())),
         _ => None,
     }
 }
@@ -317,15 +364,15 @@ mod tests {
         let app = app(&tmp);
         let (opened, received) = mpsc::channel();
         let socket = app.gui_socket(None).expect("socket path");
-        let listener = Listener::start_in(&app, None, move |view| {
-            let _ = opened.send(view.to_string());
+        let listener = Listener::start_in(&app, None, move |command| {
+            let _ = opened.send(command);
         })
         .expect("listener");
 
         assert_eq!(ask(&socket, "open-panel add\n"), "ok\n");
         assert_eq!(
-            received.recv_timeout(Duration::from_secs(2)).as_deref(),
-            Ok("add")
+            received.recv_timeout(Duration::from_secs(2)),
+            Ok(IpcCommand::OpenPanel("add".to_string()))
         );
         drop(listener);
         assert!(!socket.exists(), "drop removes the socket");
@@ -337,8 +384,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let app = app(&tmp);
         let (opened, received) = mpsc::channel();
-        let _listener = Listener::start_in(&app, None, move |view| {
-            let _ = opened.send(view.to_string());
+        let _listener = Listener::start_in(&app, None, move |command| {
+            let _ = opened.send(command);
         })
         .expect("listener");
 
@@ -432,15 +479,74 @@ mod tests {
         );
 
         let (opened, received) = mpsc::channel();
-        let _listener = Listener::start_in(&app, None, move |view| {
-            let _ = opened.send(view.to_string());
+        let _listener = Listener::start_in(&app, None, move |command| {
+            let _ = opened.send(command);
         })
         .expect("listener despite the leftover socket");
         send_open_panel_at(&socket, "settings").expect("the new listener answers");
         assert_eq!(
-            received.recv_timeout(Duration::from_secs(2)).as_deref(),
-            Ok("settings")
+            received.recv_timeout(Duration::from_secs(2)),
+            Ok(IpcCommand::OpenPanel("settings".to_string()))
         );
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn feed_is_a_known_command() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let app = app(&tmp);
+        let socket = app.gui_socket(None).expect("socket path");
+        let (opened, received) = mpsc::channel();
+        let _listener = Listener::start_in(&app, None, move |command| {
+            let _ = opened.send(command);
+        })
+        .expect("listener");
+
+        assert_eq!(ask(&socket, "feed\n"), "ok\n");
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(2)),
+            Ok(IpcCommand::Feed)
+        );
+        assert_eq!(parse_command("feed extra"), None);
+    }
+
+    #[test]
+    fn send_feed_without_a_socket_is_ok() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let app = seatswap_core::paths::AppPaths::at(&tmp.path().join("data"));
+        match send_feed(&app) {
+            Ok(()) => {}
+            Err(error) => panic!("no tray app is running, so a feed is not an error: {error}"),
+        }
+    }
+
+    /// A tray app of the previous version answers `feed` with
+    /// `error unknown command`; the line must say what to do about it.
+    #[cfg(unix)]
+    #[test]
+    fn a_tray_app_that_does_not_know_the_feed_is_reported_as_older() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket = tmp.path().join("gui.sock");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket).expect("the fake tray app's socket");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("the feed connection");
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().expect("the read side"))
+                .read_line(&mut line)
+                .expect("the command line");
+            assert_eq!(line, "feed\n");
+            stream
+                .write_all(b"error unknown command\n")
+                .expect("the old app's reply");
+        });
+
+        match send_feed_at(&socket) {
+            Err(IpcError::OlderTray) => {}
+            Err(error) => panic!("expected the older-tray error, got {error}"),
+            Ok(()) => panic!("an unknown command is an error, not success"),
+        }
+        server.join().expect("the fake tray app");
     }
 
     #[test]

@@ -6,6 +6,7 @@
 //! - `atomic`   the one way to write a file (temp file + fsync + rename, mode kept)
 //!   and the only module that knows file modes and private files and folders
 //! - `burn`     auto-burn: work units, rhythm, rates, slack, plans, the decision (spec §2)
+//! - `feed`     the status line's live numbers: its file, its account, and merging them
 //! - `history`  the history folder: record types, appending, reading a range, merging hosts
 //! - `project`  from a folder to the project's identity
 //! - `sessions` Claude Code's session files and which are alive
@@ -22,6 +23,7 @@ pub mod api;
 pub mod atomic;
 pub mod burn;
 pub mod engine;
+pub mod feed;
 pub mod history;
 pub mod live;
 pub mod locks;

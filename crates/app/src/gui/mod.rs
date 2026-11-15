@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "gui")]
 use std::sync::mpsc;
 #[cfg(feature = "gui")]
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 #[cfg(feature = "gui")]
 use std::thread;
 
@@ -240,12 +240,23 @@ fn setup(
     // `open-panel main` to the instance that is already running and exits 0.
     let handle = tauri_app.handle().clone();
     let listener_action = handle.clone();
-    let listener = match ipc::Listener::start(&app, move |view| {
-        let handle = listener_action.clone();
-        let view = view.to_string();
-        let _ = listener_action.run_on_main_thread(move || {
-            let _ = panel::show(&handle, &view);
-        });
+    // The listener can receive a feed before the worker exists; the slot is
+    // filled as soon as it does, and a feed before that is simply dropped.
+    let engine_slot: Arc<std::sync::OnceLock<mpsc::Sender<EngineCommand>>> =
+        Arc::new(std::sync::OnceLock::new());
+    let listener_engine = Arc::clone(&engine_slot);
+    let listener = match ipc::Listener::start(&app, move |command| match command {
+        ipc::IpcCommand::OpenPanel(view) => {
+            let handle = listener_action.clone();
+            let _ = listener_action.run_on_main_thread(move || {
+                let _ = panel::show(&handle, &view);
+            });
+        }
+        ipc::IpcCommand::Feed => {
+            if let Some(engine) = listener_engine.get() {
+                let _ = engine.send(EngineCommand::Feed);
+            }
+        }
     }) {
         Ok(listener) => Some(listener),
         Err(ipc::IpcError::AlreadyRunning) => {
@@ -279,6 +290,7 @@ fn setup(
         ui_tx,
         settings.clone(),
     )?;
+    let _ = engine_slot.set(worker.engine.clone());
 
     let watcher = {
         let action = worker.action.clone();

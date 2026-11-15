@@ -524,6 +524,10 @@ fn statusline_line(cli: &Cli, stdin: &[u8], now: DateTime<Utc>) -> Result<String
     file.settings
         .validate()
         .map_err(|error| error.to_string())?;
+    let payload = statusline::parse(stdin);
+    if let Err(reason) = statusline::publish_feed(&app, &file.settings, &payload, now) {
+        return Err(format!("feed: {reason}"));
+    }
     let paths = resolve_paths(
         app,
         cli.claude_config_dir.as_deref(),
@@ -533,7 +537,6 @@ fn statusline_line(cli: &Cli, stdin: &[u8], now: DateTime<Utc>) -> Result<String
     let (app, claude) = paths.into_parts();
     let cache = UsageCache::load(&app).map_err(|error| error.to_string())?;
     let live = switcher::live_state(&claude, &file).map_err(|error| error.to_string())?;
-    let payload = statusline::parse(stdin);
     let facts = statusline::facts(
         &payload,
         &file,
@@ -1356,7 +1359,7 @@ fn i3blocks_lines(views: &[AccountView], now: DateTime<Utc>) -> (String, String,
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use chrono::Utc;
@@ -1365,6 +1368,23 @@ mod tests {
     use seatswap_core::engine::AccountView;
     use seatswap_core::paths::ClaudePaths;
     use seatswap_core::store::{FileSecrets, LoginState, Settings, Store};
+
+    /// The status line of an explicit data and Claude config folder, for the
+    /// statusline module's tests. The command itself builds its `Cli` from the
+    /// process's arguments; this only hands the same bytes through the same path.
+    pub(crate) fn statusline_output_at(
+        app: &AppPaths,
+        claude: &ClaudePaths,
+        stdin: &[u8],
+        now: DateTime<Utc>,
+    ) -> String {
+        let cli = Cli {
+            data_dir: Some(app.data_dir.clone()),
+            claude_config_dir: Some(claude.config_dir.clone()),
+            command: Some(Command::Statusline),
+        };
+        statusline_output(&cli, stdin, now)
+    }
 
     const FIRST_ACCOUNT_UUID: &str = "4b7e2f91-3c5a-4d8e-9f1b-6a2c8e4d7b30";
     const FIRST_ORG_UUID: &str = "e2a6c9d1-7f4b-4a3e-8c5d-1b9f0a7e3c62";

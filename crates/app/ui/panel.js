@@ -36,6 +36,7 @@ const DEFAULT_SETTINGS = {
   notifyWaitingHosts: "thisHost",
   agentsRead: true,
   agentsSwitch: false,
+  statuslineFeed: true,
   statusline: {
     left: [
       { kind: "userHost", color: { rule: "fixed", color: "#22c55e" } },

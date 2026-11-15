@@ -28,6 +28,7 @@ use seatswap_core::engine::Remote;
 use seatswap_core::engine::{
     self, AccountView, Engine, EngineError, LoginWarning, PollReason, Suggestion, UsageCache,
 };
+use seatswap_core::feed;
 #[cfg(test)]
 use seatswap_core::history::HistoryDir;
 use seatswap_core::history::{
@@ -179,6 +180,8 @@ pub(crate) struct PendingSwitch {
 pub(crate) enum EngineCommand {
     Poll(PollReason),
     Publish,
+    /// The status line wrote `feed.json`; read it and merge it into the cache.
+    Feed,
     /// The sessions thread saw these models in use (lower-case ids), or `None`
     /// when it cannot tell.
     ModelsInUse(Option<BTreeSet<String>>),
@@ -510,6 +513,7 @@ impl EngineRuntime {
                     match command {
                         EngineCommand::Poll(reason) => self.poll(reason),
                         EngineCommand::Publish => self.publish(),
+                        EngineCommand::Feed => self.apply_feed(),
                         EngineCommand::ModelsInUse(models) => {
                             let now = Utc::now();
                             let views = match self.engine.as_mut() {
@@ -657,6 +661,53 @@ impl EngineRuntime {
                 self.open_error = Some(error.to_string());
                 let views = self.snapshot.views.clone();
                 self.capture(views, self.snapshot.last_poll_at);
+            }
+        }
+        self.send();
+    }
+
+    /// Read the status line's feed and merge it into the cache. A read or apply
+    /// error is the engine thread's open error, as a failed poll is; the
+    /// snapshot is published either way.
+    fn apply_feed(&mut self) {
+        if self.engine.is_none() && !self.open() {
+            self.capture(Vec::new(), self.snapshot.last_poll_at);
+            self.send();
+            return;
+        }
+        let now = Utc::now();
+        let result = match feed::read(&self.app) {
+            Ok(Some(feed)) => match self.engine.as_mut() {
+                Some(engine) => engine
+                    .apply_feed(&feed, now)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
+                None => Ok(()),
+            },
+            Ok(None) => Ok(()),
+            Err(error) => Err(format!(
+                "cannot read {}: {error}",
+                self.app.feed_file().display()
+            )),
+        };
+        match result {
+            Ok(()) => {
+                self.open_error = None;
+                let views = match self.engine.as_ref() {
+                    Some(engine) => match engine.views(now) {
+                        Ok(views) => views,
+                        Err(error) => {
+                            self.open_error = Some(error.to_string());
+                            self.snapshot.views.clone()
+                        }
+                    },
+                    None => self.snapshot.views.clone(),
+                };
+                self.capture(views, self.snapshot.last_poll_at);
+            }
+            Err(error) => {
+                self.open_error = Some(error);
+                self.capture(self.snapshot.views.clone(), self.snapshot.last_poll_at);
             }
         }
         self.send();

@@ -184,6 +184,10 @@ impl AppPaths {
     pub fn usage_cache_file(&self) -> PathBuf {
         self.data_dir.join("usage-cache.json")
     }
+    /// The status line's live numbers, waiting for the tray app (spec §5.3).
+    pub fn feed_file(&self) -> PathBuf {
+        self.data_dir.join("feed.json")
+    }
     /// seatswap's own lock, keeps two seatswap processes apart.
     pub fn switch_lock(&self) -> PathBuf {
         self.data_dir.join("switch.lock")

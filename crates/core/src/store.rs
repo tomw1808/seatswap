@@ -406,6 +406,10 @@ fn default_agents_switch() -> bool {
     false
 }
 
+fn default_statusline_feed() -> bool {
+    true
+}
+
 /// A missing status line field takes the preset's value for that field, read
 /// from [`StatuslineConfig::current_line`] so the preset is written once.
 fn default_statusline_left() -> Vec<Segment> {
@@ -478,6 +482,10 @@ pub struct Settings {
     pub agents_read: bool,
     #[serde(default = "default_agents_switch")]
     pub agents_switch: bool,
+    /// When on, `seatswap statusline` writes the payload's live numbers to
+    /// `feed.json` for the tray app (spec §5.3); default on.
+    #[serde(default = "default_statusline_feed")]
+    pub statusline_feed: bool,
     /// The status line's layout; absent in an older file, so the preset loads.
     #[serde(default = "StatuslineConfig::current_line")]
     pub statusline: StatuslineConfig,
@@ -507,6 +515,7 @@ impl Default for Settings {
             notify_waiting_hosts: default_notify_waiting_hosts(),
             agents_read: default_agents_read(),
             agents_switch: default_agents_switch(),
+            statusline_feed: default_statusline_feed(),
             statusline: StatuslineConfig::current_line(),
         }
     }
@@ -1902,6 +1911,7 @@ mod tests {
         let file = store.load().unwrap();
         assert!(file.settings.read_sessions);
         assert!(!file.settings.agents_switch);
+        assert!(file.settings.statusline_feed);
         assert_eq!(file.settings.notify_waiting_hosts, WaitingHosts::ThisHost);
         assert_eq!(file.settings.history_dir, None);
     }
