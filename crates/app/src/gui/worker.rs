@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use serde::Serialize;
 
 use seatswap_core::api::Api;
@@ -26,7 +26,7 @@ use seatswap_core::api::ApiError;
 #[cfg(test)]
 use seatswap_core::engine::Remote;
 use seatswap_core::engine::{
-    self, AccountView, Engine, EngineError, LoginWarning, PollReason, Suggestion, UsageCache,
+    AccountView, Engine, EngineError, LoginWarning, PollReason, UsageCache,
 };
 use seatswap_core::feed;
 #[cfg(test)]
@@ -36,12 +36,13 @@ use seatswap_core::history::{
 };
 use seatswap_core::locks::{self, LockError};
 use seatswap_core::paths::{AppPaths, ClaudePaths};
-use seatswap_core::store::{self, AccountsFile, Settings, Store};
+use seatswap_core::store::{self, Account, AccountsFile, Settings, Store};
 use seatswap_core::switcher::{self, LiveState, SwitchError, UnsavedPolicy};
 #[cfg(test)]
 use seatswap_core::types::Login;
 
 use super::autostart;
+use super::burn_rt::{BurnRuntime, BurnTick};
 use super::notify;
 use super::sessions_rt::{self, SessionsHandle};
 use crate::format::with_tilde;
@@ -61,7 +62,7 @@ pub(crate) struct Snapshot {
     pub views: Vec<AccountView>,
     pub active_id: Option<String>,
     pub live: LiveView,
-    pub suggestion: Option<Suggestion>,
+    pub burn: Option<super::burn_rt::BurnView>,
     pub warnings: Vec<LoginWarning>,
     pub pending: Option<PendingSwitch>,
     pub secrets_warning: Option<String>,
@@ -81,6 +82,10 @@ pub(crate) struct Snapshot {
 pub(crate) struct SessionsSummary {
     pub running: u32,
     pub busy: u32,
+    /// Sessions whose last model ties its thinking to the account (spec §2.11).
+    pub tied: u32,
+    /// Of those, the sessions that are busy now.
+    pub tied_busy: u32,
     pub waiting: Vec<Waiting>,
     pub unavailable: Option<String>,
     pub warning: Option<String>,
@@ -106,7 +111,7 @@ impl Snapshot {
             views: Vec::new(),
             active_id: None,
             live: LiveView::NoLogin,
-            suggestion: None,
+            burn: None,
             warnings: Vec::new(),
             pending: None,
             secrets_warning,
@@ -183,8 +188,17 @@ pub(crate) enum EngineCommand {
     /// The status line wrote `feed.json`; read it and merge it into the cache.
     Feed,
     /// The sessions thread saw these models in use (lower-case ids), or `None`
-    /// when it cannot tell.
-    ModelsInUse(Option<BTreeSet<String>>),
+    /// when it cannot tell, and how many sessions are on a model whose thinking
+    /// is tied to the account (spec §2.11).
+    ModelsInUse {
+        models: Option<BTreeSet<String>>,
+        /// Kept for the pop-up's tied count; burn only needs the busy ones.
+        #[allow(dead_code)]
+        tied: u32,
+        tied_busy: u32,
+    },
+    /// A pause or resume was written to the history; learn it before deciding.
+    HistoryChanged,
     Shutdown,
 }
 
@@ -195,6 +209,8 @@ pub(crate) enum ActionCommand {
         key: String,
         unsaved: UnsavedPolicy,
         label: Option<String>,
+        by: By,
+        reason: Option<String>,
         reply: Sender<ActionReply>,
     },
     SaveCurrent {
@@ -218,6 +234,10 @@ pub(crate) enum ActionCommand {
     },
     /// The watcher saw a change; mirror it when `mirrorLive` is on.
     SyncLive,
+    /// Pause auto-burn for `hours`, or resume with `None`. The pop-up sends it
+    /// (Task 9); the handler and its history event live here already.
+    #[allow(dead_code)]
+    PauseBurn { hours: Option<i64> },
 }
 
 #[derive(Debug)]
@@ -258,12 +278,18 @@ pub(crate) fn spawn(
     let (action_tx, action_rx) = mpsc::channel::<ActionCommand>();
 
     let action_engine = engine_tx.clone();
+    let engine_action = action_tx.clone();
+    let engine_commands = engine_tx.clone();
     let engine_app = app.clone();
     let engine_claude = claude.clone();
     let engine_ui = ui.clone();
     thread::Builder::new()
         .name("seatswap-engine".to_string())
-        .spawn(move || EngineRuntime::new(engine_app, engine_claude, engine_ui).run(engine_rx))
+        .spawn(move || {
+            EngineRuntime::new(engine_app, engine_claude, engine_ui)
+                .with_burn_channels(engine_action, engine_commands)
+                .run(engine_rx)
+        })
         .map_err(|error| format!("cannot start the engine thread: {error}"))?;
 
     let sessions = match settings.as_ref().filter(|settings| settings.read_sessions) {
@@ -328,7 +354,7 @@ pub(crate) struct SnapshotParts {
 /// the real rules.
 pub(crate) fn build_snapshot(parts: SnapshotParts) -> Snapshot {
     let mut error = parts.engine_error;
-    let (settings, live, suggestion, warnings) = match parts.accounts {
+    let (settings, live, warnings) = match parts.accounts {
         Ok(file) => {
             let live = match parts.live {
                 Ok(state) => LiveView::from(state),
@@ -340,13 +366,12 @@ pub(crate) fn build_snapshot(parts: SnapshotParts) -> Snapshot {
             (
                 Some(file.settings.clone()),
                 live,
-                engine::suggestion(&parts.views, &file.settings),
-                engine::login_warnings(&parts.views),
+                seatswap_core::engine::login_warnings(&parts.views),
             )
         }
         Err(store_error) => {
             error = combine(error, format!("cannot read accounts.json: {store_error}"));
-            (None, LiveView::NoLogin, None, Vec::new())
+            (None, LiveView::NoLogin, Vec::new())
         }
     };
     for view in &parts.views {
@@ -372,7 +397,7 @@ pub(crate) fn build_snapshot(parts: SnapshotParts) -> Snapshot {
         views: parts.views,
         active_id,
         live,
-        suggestion,
+        burn: None,
         warnings,
         pending: parts.pending,
         secrets_warning: parts.secrets_warning,
@@ -451,6 +476,11 @@ struct EngineRuntime {
     notice: Option<String>,
     snapshot: Snapshot,
     baseline: ClockBaseline,
+    burn: BurnRuntime,
+    /// The sessions thread's busy sessions on a thinking-tied model. It is 0
+    /// when the sessions thread cannot tell (with `readSessions` off): nothing
+    /// is held back then (spec §2.12).
+    tied_busy: u32,
 }
 
 /// The wall and monotonic clocks at one moment. Wake detection compares two of
@@ -484,6 +514,8 @@ impl EngineRuntime {
             notice: None,
             snapshot: Snapshot::empty(None, None, None),
             baseline: ClockBaseline::now(),
+            burn: BurnRuntime::new(),
+            tied_busy: 0,
         };
         runtime.open();
         // Show the real settings even when the engine could not open.
@@ -494,6 +526,15 @@ impl EngineRuntime {
             .unwrap_or_default();
         runtime.capture(views, None);
         runtime
+    }
+
+    fn with_burn_channels(
+        mut self,
+        action: Sender<ActionCommand>,
+        engine: Sender<EngineCommand>,
+    ) -> EngineRuntime {
+        self.burn = std::mem::take(&mut self.burn).with_channels(action, engine);
+        self
     }
 
     fn run(mut self, commands: Receiver<EngineCommand>) {
@@ -514,7 +555,10 @@ impl EngineRuntime {
                         EngineCommand::Poll(reason) => self.poll(reason),
                         EngineCommand::Publish => self.publish(),
                         EngineCommand::Feed => self.apply_feed(),
-                        EngineCommand::ModelsInUse(models) => {
+                        EngineCommand::ModelsInUse {
+                            models, tied_busy, ..
+                        } => {
+                            self.tied_busy = if models.is_some() { tied_busy } else { 0 };
                             let now = Utc::now();
                             let views = match self.engine.as_mut() {
                                 Some(engine) => {
@@ -532,6 +576,10 @@ impl EngineRuntime {
                             .unwrap_or_else(|| self.snapshot.views.clone());
                             self.capture(views, self.snapshot.last_poll_at);
                             self.send();
+                        }
+                        EngineCommand::HistoryChanged => {
+                            self.burn.force_learn();
+                            self.publish();
                         }
                         EngineCommand::Shutdown => return,
                     }
@@ -748,6 +796,7 @@ impl EngineRuntime {
         if let Some(history_error) = &self.history_error {
             engine_error = combine(engine_error, history_error.clone());
         }
+        let accounts_for_burn = accounts.as_ref().ok().map(|file| file.accounts.clone());
         self.snapshot = build_snapshot(SnapshotParts {
             views,
             accounts,
@@ -758,6 +807,45 @@ impl EngineRuntime {
             pending: None,
             notice: self.notice.take(),
         });
+        self.update_burn(accounts_for_burn);
+    }
+
+    /// Run auto-burn after the snapshot is built: learn, decide, send. Its error
+    /// joins the snapshot's error; a warning is printed once.
+    fn update_burn(&mut self, accounts: Option<Vec<Account>>) {
+        let (Some(accounts), Some(settings)) = (accounts, self.snapshot.settings.as_ref().cloned())
+        else {
+            return;
+        };
+        let now = Utc::now();
+        let history = self
+            .engine
+            .as_mut()
+            .and_then(|engine| engine.recorder())
+            .map(|recorder| recorder.dir());
+        let tick = BurnTick {
+            history,
+            views: &self.snapshot.views,
+            accounts: &accounts,
+            settings: &settings,
+            active: self.snapshot.active_id.as_deref(),
+            now,
+            offset: *Local::now().offset(),
+            tied_busy: self.tied_busy,
+        };
+        let report = self.burn.after_snapshot(&tick);
+        self.snapshot.burn = report.view;
+        if let Some(error) = report.error {
+            self.snapshot.error = combine(self.snapshot.error.take(), error);
+        }
+        for warning in report.warnings {
+            eprintln!("seatswap: warning: {warning}");
+        }
+        if let Some(text) = report.notification {
+            if settings.notify_on_switch {
+                notify::send_switch(&text);
+            }
+        }
     }
 
     fn send(&self) {
@@ -882,7 +970,7 @@ impl ActionRuntime {
         latest.as_ref().map(|summary| SessionCounts {
             running: summary.running,
             busy: summary.busy,
-            tied: None,
+            tied: Some(summary.tied),
         })
     }
 
@@ -893,9 +981,11 @@ impl ActionRuntime {
                     key,
                     unsaved,
                     label,
+                    by,
+                    reason,
                     reply,
                 } => {
-                    let result = self.switch(&key, unsaved, label);
+                    let result = self.switch(&key, unsaved, label, by, reason);
                     let _ = reply.send(result);
                 }
                 ActionCommand::SaveCurrent { label, reply } => {
@@ -917,6 +1007,12 @@ impl ActionRuntime {
                     let _ = reply.send(self.save_settings(settings));
                 }
                 ActionCommand::SyncLive => self.sync_live(),
+                ActionCommand::PauseBurn { hours } => {
+                    if let Err(error) = self.pause_burn(hours) {
+                        notify::send_error(&error);
+                    }
+                    let _ = self.engine.send(EngineCommand::HistoryChanged);
+                }
             }
         }
     }
@@ -947,7 +1043,14 @@ impl ActionRuntime {
         }
     }
 
-    fn switch(&mut self, key: &str, unsaved: UnsavedPolicy, label: Option<String>) -> ActionReply {
+    fn switch(
+        &mut self,
+        key: &str,
+        unsaved: UnsavedPolicy,
+        label: Option<String>,
+        by: By,
+        reason: Option<String>,
+    ) -> ActionReply {
         let policy = match (unsaved, label) {
             (UnsavedPolicy::Save { .. }, Some(label)) => UnsavedPolicy::Save { label: Some(label) },
             (policy, _) => policy,
@@ -988,15 +1091,8 @@ impl ActionRuntime {
                             match self.recorder() {
                                 Ok(recorder) => {
                                     if let Err(error) = ops::record_switch(
-                                        recorder,
-                                        from,
-                                        target,
-                                        saved_new,
-                                        By::User,
-                                        None,
-                                        None,
-                                        counts,
-                                        now,
+                                        recorder, from, target, saved_new, by, reason, None,
+                                        counts, now,
                                     ) {
                                         history_error = Some(error.to_string());
                                     }
@@ -1009,6 +1105,11 @@ impl ActionRuntime {
                         }
                     },
                     Err(error) => history_error = Some(error),
+                }
+                if to_ref.is_some() && history_error.is_none() {
+                    // The event is written: the next learn must see the switch
+                    // (its hold and its cost) before the next snapshot decides.
+                    let _ = self.engine.send(EngineCommand::HistoryChanged);
                 }
                 if let Some(target) = to_ref {
                     self.live = Some(target);
@@ -1026,6 +1127,9 @@ impl ActionRuntime {
                 };
                 for notice in switch_notices(&message, notify_on_switch) {
                     match notice {
+                        // An automatic switch has its own text (spec §2.5); the
+                        // engine thread sends it once the switch has landed.
+                        SwitchNotice::Switched(_) if by == By::Auto => {}
                         SwitchNotice::Switched(text) => notify::send_switch(&text),
                         SwitchNotice::Error(text) => notify::send_error(&text),
                     }
@@ -1055,6 +1159,29 @@ impl ActionRuntime {
         let file = self.store()?.load().map_err(|error| error.to_string())?;
         let live = switcher::live_state(&self.claude, &file).map_err(|error| error.to_string())?;
         pending_switch(&file, &live, key, email)
+    }
+
+    /// Pause auto-burn for `hours`, or resume with `None`, as one history
+    /// event (spec §2.5). A zero or negative pause is refused, never clamped.
+    fn pause_burn(&mut self, hours: Option<i64>) -> Result<(), String> {
+        let now = Utc::now();
+        let paused_until = match hours {
+            Some(hours) if hours <= 0 => {
+                return Err(format!("a pause must be at least one hour, got {hours}"))
+            }
+            Some(hours) => Some(now + chrono::Duration::hours(hours)),
+            None => None,
+        };
+        let on = self
+            .store()?
+            .load()
+            .map_err(|error| error.to_string())?
+            .settings
+            .auto_burn;
+        let recorder = self.recorder()?;
+        recorder
+            .event(now, EventKind::AutoBurn { on, paused_until })
+            .map_err(|error| ops::history_unwritable(&error))
     }
 
     fn save_current(&mut self, label: Option<String>) -> ActionReply {
@@ -1690,6 +1817,7 @@ mod tests {
             keys,
             [
                 "activeId",
+                "burn",
                 "error",
                 "lastPollAt",
                 "live",
@@ -1697,7 +1825,6 @@ mod tests {
                 "secretsWarning",
                 "sessions",
                 "settings",
-                "suggestion",
                 "views",
                 "warnings",
             ]
@@ -2104,6 +2231,8 @@ mod tests {
             notice: None,
             snapshot: Snapshot::empty(None, None, None),
             baseline: ClockBaseline::now(),
+            burn: BurnRuntime::new(),
+            tied_busy: 0,
         };
 
         runtime.write_live_once();
@@ -2156,6 +2285,8 @@ mod tests {
             notice: None,
             snapshot: Snapshot::empty(None, None, None),
             baseline: ClockBaseline::now(),
+            burn: BurnRuntime::new(),
+            tied_busy: 0,
         };
 
         runtime.heartbeat(Utc::now());

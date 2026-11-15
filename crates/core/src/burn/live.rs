@@ -1,0 +1,614 @@
+//! The reading side of auto-burn (spec §2.3, §2.5, §2.12): one pass over the
+//! history and one translation of the tray app's views into the plan's inputs.
+//! The CLI and the tray app both call these, so neither builds a `Situation`
+//! by hand.
+
+use std::collections::BTreeMap;
+
+use chrono::{DateTime, Duration, FixedOffset, Utc};
+
+use crate::api::Limit;
+use crate::engine::{AccountView, Blocker};
+use crate::history::{
+    AccountRef, By, Event, EventKind, HistoryDir, HistoryError, Hosted, Hosts, Range, Sample,
+    TokenRecord,
+};
+use crate::store::{Account, LoginState};
+
+use super::cost::switch_cost;
+use super::decide::Situation;
+use super::plan::{blocked, AccountState, Inputs, PlanError, SessionState};
+use super::rates::{rates, rhythm};
+use super::{Rates, Rhythm, MANUAL_HOLD_H, RATES_DAYS, RHYTHM_WEEKS};
+
+/// Everything a decision is built from, read once: the rhythm, the accounts'
+/// rates, the measured switch cost, the read warnings and the events of the last
+/// [`RATES_DAYS`] days.
+#[derive(Debug, Clone)]
+pub struct Learned {
+    pub rhythm: Rhythm,
+    pub rates: BTreeMap<AccountRef, Rates>,
+    pub cost: Option<super::decide::SwitchCost>,
+    pub warnings: Vec<String>,
+    /// The events of the last [`RATES_DAYS`] days, every host, sorted by time.
+    pub events: Vec<Hosted<Event>>,
+    /// This history folder's host. Only its switch events hold auto-burn back.
+    pub host: String,
+}
+
+/// What [`situation`] found: a checked `Situation`, or the accounts that have a
+/// login but no reading yet.
+#[allow(clippy::large_enum_variant)]
+pub enum Readiness {
+    Ready(Situation),
+    /// Accounts with a login and no weekly reading. The caller treats this
+    /// exactly as [`super::decide::Decision::Stale`]: poll them, do not switch.
+    Unread {
+        accounts: Vec<String>,
+    },
+    /// No account at all can go into the inputs (every account is logged out).
+    /// The caller decides nothing and shows no view.
+    NoAccounts,
+}
+
+/// Read the history once: samples and tokens of [`RHYTHM_WEEKS`] weeks, events
+/// of [`RATES_DAYS`] days. The rates are computed for `accounts` only; an
+/// account with too little work has no entry.
+pub fn learn(
+    history: &HistoryDir,
+    now: DateTime<Utc>,
+    offset: FixedOffset,
+    accounts: &[Account],
+) -> Result<Learned, HistoryError> {
+    let weeks = Range {
+        from: now - Duration::weeks(RHYTHM_WEEKS),
+        to: now,
+    };
+    let days = Range {
+        from: now - Duration::days(RATES_DAYS),
+        to: now,
+    };
+    let samples = history.read::<Sample>(&weeks, &Hosts::All)?;
+    let tokens = history.read::<TokenRecord>(&weeks, &Hosts::All)?;
+    let events = history.read::<Event>(&days, &Hosts::All)?;
+
+    let mut warnings = Vec::new();
+    warnings.extend(samples.warnings);
+    warnings.extend(tokens.warnings);
+    warnings.extend(events.warnings);
+
+    let rhythm = rhythm(&tokens.records, now, offset);
+    let mut learned_rates = BTreeMap::new();
+    for account in accounts {
+        let account_ref = AccountRef::of(account);
+        if let Some(account_rates) = rates(
+            &account_ref,
+            &samples.records,
+            &tokens.records,
+            &events.records,
+            now,
+        ) {
+            learned_rates.insert(account_ref, account_rates);
+        }
+    }
+    let cost = switch_cost(
+        &events.records,
+        &samples.records,
+        &tokens.records,
+        &learned_rates,
+        &days,
+    );
+
+    Ok(Learned {
+        rhythm,
+        rates: learned_rates,
+        cost,
+        warnings,
+        events: events.records,
+        host: history.host().to_string(),
+    })
+}
+
+/// Turn the views into [`Inputs`], check them, and derive the two hold times
+/// from the learned events (spec §2.5, §2.12).
+///
+/// A logged-out account is in the inputs when it has a reading, with
+/// `login_ok` false: the plan treats it as blocked. An account with a login but
+/// no reading makes the whole situation [`Readiness::Unread`]; a logged-out
+/// account without a reading is left out. When no account at all can go into
+/// the inputs, the situation is [`Readiness::NoAccounts`].
+#[allow(clippy::too_many_arguments)]
+pub fn situation(
+    learned: &Learned,
+    views: &[AccountView],
+    accounts: &[Account],
+    active: Option<&str>,
+    now: DateTime<Utc>,
+    offset: FixedOffset,
+    tied_busy: u32,
+) -> Result<Readiness, PlanError> {
+    let mut unread = Vec::new();
+    let mut states = Vec::new();
+    let mut oldest_reading: Option<DateTime<Utc>> = None;
+
+    for account in accounts {
+        let view = views.iter().find(|view| view.id == account.id);
+        let logged_out = view.is_some_and(|view| view.login_state == LoginState::LoggedOut);
+        match view.and_then(reading_of) {
+            Some((week, week_resets_at, session, fetched_at)) => {
+                let login_ok = view.is_some_and(|view| view.login_state == LoginState::Ok);
+                states.push(AccountState {
+                    id: account.id.clone(),
+                    may_use: account.auto_burn,
+                    login_ok,
+                    week_percent: week.percent,
+                    week_resets_at,
+                    session,
+                    model_blocked: view.is_some_and(model_blocked),
+                    rates: learned.rates.get(&AccountRef::of(account)).copied(),
+                });
+                if login_ok {
+                    oldest_reading = Some(match oldest_reading {
+                        Some(oldest) => oldest.min(fetched_at),
+                        None => fetched_at,
+                    });
+                }
+            }
+            None if !logged_out && (account.auto_burn || active == Some(account.id.as_str())) => {
+                unread.push(account.id.clone())
+            }
+            None => {}
+        }
+    }
+
+    if !unread.is_empty() {
+        return Ok(Readiness::Unread { accounts: unread });
+    }
+    let Some(oldest_reading) = oldest_reading else {
+        // No account with a login has a reading: there is nothing to decide
+        // from (every account is logged out, or there are none).
+        return Ok(Readiness::NoAccounts);
+    };
+
+    let last_switch_at = last_switch_at(learned, now);
+    let manual_hold_until = manual_hold_until(learned, accounts, &states, now);
+
+    let situation = Situation {
+        inputs: Inputs {
+            now,
+            offset,
+            accounts: states,
+            active: active.map(str::to_string),
+            rhythm: learned.rhythm.clone(),
+        },
+        cost: learned.cost,
+        last_switch_at,
+        manual_hold_until,
+        tied_busy,
+        oldest_reading,
+    };
+    situation.check()?;
+    Ok(Readiness::Ready(situation))
+}
+
+/// The weekly limit and the session state of a view, plus when the reading was
+/// fetched. `None` when there is no usage, no weekly limit with a reset, or no
+/// fetch time: a value auto-burn cannot plan from.
+type Reading<'a> = (
+    &'a Limit,
+    DateTime<Utc>,
+    Option<SessionState>,
+    DateTime<Utc>,
+);
+
+fn reading_of(view: &AccountView) -> Option<Reading<'_>> {
+    let fetched_at = view.fetched_at?;
+    let usage = view.usage.as_ref()?;
+    let week = usage.weekly_all()?;
+    let week_resets_at = week.resets_at?;
+    let session = usage.session().map(|session| SessionState {
+        percent: session.percent,
+        resets_at: session.resets_at,
+    });
+    Some((week, week_resets_at, session, fetched_at))
+}
+
+fn model_blocked(view: &AccountView) -> bool {
+    matches!(&view.blocker, Some(Blocker::Model(_)))
+}
+
+/// The last `Switch` event of this host, of any `by`.
+fn last_switch_at(learned: &Learned, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    learned
+        .events
+        .iter()
+        .filter(|hosted| hosted.host == learned.host && hosted.record.t <= now)
+        .filter(|hosted| matches!(hosted.record.kind, EventKind::Switch { .. }))
+        .map(|hosted| hosted.record.t)
+        .max()
+}
+
+/// The latest of a manual switch's [`MANUAL_HOLD_H`] hold and an `AutoBurn`
+/// pause, less the manual hold that ended because its account is blocked now.
+/// A resume (`paused_until: None`) ends a manual hold that came before it.
+fn manual_hold_until(
+    learned: &Learned,
+    accounts: &[Account],
+    states: &[AccountState],
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let mut manual: Option<(DateTime<Utc>, AccountRef)> = None;
+    let mut paused: Option<DateTime<Utc>> = None;
+    for hosted in &learned.events {
+        if hosted.host != learned.host || hosted.record.t > now {
+            continue;
+        }
+        match &hosted.record.kind {
+            EventKind::Switch {
+                to,
+                by: By::User | By::Cli,
+                ..
+            } => {
+                manual = Some((hosted.record.t, to.clone()));
+            }
+            EventKind::AutoBurn { paused_until, .. } => {
+                paused = *paused_until;
+                if paused_until.is_none() {
+                    manual = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let manual_until = manual.and_then(|(at, to)| {
+        let until = at + Duration::hours(MANUAL_HOLD_H);
+        if until <= now {
+            return None;
+        }
+        let id = accounts
+            .iter()
+            .find(|account| AccountRef::of(account) == to)
+            .map(|account| account.id.as_str());
+        let target_blocked = id
+            .and_then(|id| states.iter().find(|state| state.id == id))
+            .is_some_and(|state| blocked(state, now));
+        if target_blocked {
+            None
+        } else {
+            Some(until)
+        }
+    });
+    let paused_until = paused.filter(|until| *until > now);
+    manual_until.max(paused_until)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use chrono::FixedOffset;
+
+    use crate::api::{Limit, LimitKind, Severity, Usage};
+    use crate::burn::plan::{follow, Policy};
+    use crate::types::OAuthAccount;
+
+    const ORG: &str = "e92d7b31-5c8e-4f2a-9d6b-1e3c5a7f9b20";
+    const PR_ACC: &str = "4b7e2f91-3c5a-4d8e-9f1b-6a2c8e4d7b30";
+    const AC_ACC: &str = "8e1d5b7a-6c3f-4a2b-9d8e-1f2a3b4c5d6e";
+    const RESET: &str = "2026-11-16T02:00:00Z";
+
+    fn utc(text: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(text)
+            .expect("a test time")
+            .with_timezone(&Utc)
+    }
+
+    fn offset() -> FixedOffset {
+        FixedOffset::east_opt(0).expect("UTC")
+    }
+
+    fn account(id: &str, abbr: &str, acc: &str, auto_burn: bool) -> Account {
+        Account {
+            id: id.to_string(),
+            account_uuid: acc.to_string(),
+            organization_uuid: ORG.to_string(),
+            label: abbr.to_string(),
+            abbr: abbr.to_string(),
+            color: "#3b82f6".to_string(),
+            email: None,
+            org_name: None,
+            plan: Some("Team".to_string()),
+            oauth_account: OAuthAccount(serde_json::Map::new()),
+            added_at: utc("2026-11-01T00:00:00Z"),
+            last_used_at: None,
+            login_state: LoginState::Ok,
+            login_ends_at_ms: None,
+            auto_burn,
+        }
+    }
+
+    fn limit(kind: LimitKind, percent: f64, resets_at: Option<DateTime<Utc>>) -> Limit {
+        Limit {
+            kind,
+            percent,
+            severity: Severity::Normal,
+            resets_at,
+            model: None,
+            is_active: false,
+        }
+    }
+
+    fn usage(week: f64, session: Option<f64>, reset: DateTime<Utc>) -> Usage {
+        let mut limits = vec![limit(LimitKind::WeeklyAll, week, Some(reset))];
+        if let Some(session) = session {
+            limits.push(limit(LimitKind::Session, session, Some(utc(RESET))));
+        }
+        Usage {
+            limits,
+            extra_usage_enabled: false,
+        }
+    }
+
+    fn view(
+        id: &str,
+        abbr: &str,
+        week: f64,
+        session: Option<f64>,
+        fetched_at: DateTime<Utc>,
+    ) -> AccountView {
+        AccountView {
+            id: id.to_string(),
+            label: abbr.to_string(),
+            abbr: abbr.to_string(),
+            color: "#3b82f6".to_string(),
+            email: None,
+            plan: None,
+            is_active: false,
+            login_state: LoginState::Ok,
+            login_ends_at_ms: None,
+            login_days_left: None,
+            usage: Some(usage(week, session, utc(RESET))),
+            usable: true,
+            blocked_until: None,
+            blocker: None,
+            fetched_at: Some(fetched_at),
+            last_error: None,
+        }
+    }
+
+    fn learned(host: &str, events: Vec<Hosted<Event>>) -> Learned {
+        Learned {
+            rhythm: Rhythm { wu: [0.0; 168] },
+            rates: BTreeMap::new(),
+            cost: None,
+            warnings: Vec::new(),
+            events,
+            host: host.to_string(),
+        }
+    }
+
+    fn switch_event(host: &str, at: DateTime<Utc>, to: AccountRef, by: By) -> Hosted<Event> {
+        Hosted {
+            host: host.to_string(),
+            record: Event {
+                t: at,
+                kind: EventKind::Switch {
+                    from: None,
+                    to,
+                    by,
+                    reason: None,
+                    cwd: None,
+                    sessions: None,
+                    waited_secs: None,
+                },
+            },
+        }
+    }
+
+    fn ready(
+        learned: &Learned,
+        views: &[AccountView],
+        accounts: &[Account],
+        active: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Situation {
+        match situation(learned, views, accounts, active, now, offset(), 0)
+            .expect("the views are valid")
+        {
+            Readiness::Ready(situation) => situation,
+            Readiness::Unread { accounts } => panic!("unread accounts: {accounts:?}"),
+            Readiness::NoAccounts => panic!("no account can go into the inputs"),
+        }
+    }
+
+    #[test]
+    fn a_manual_hold_ends_when_its_account_is_blocked() {
+        let now = utc("2026-11-10T12:00:00Z");
+        let pr = account("pr", "PR", PR_ACC, true);
+        let ac = account("ac", "AC", AC_ACC, true);
+        // AC was switched to by hand an hour ago and is now at 100 % of its week.
+        let event = switch_event(
+            "atlas",
+            now - Duration::hours(1),
+            AccountRef::of(&ac),
+            By::User,
+        );
+        let learned = learned("atlas", vec![event]);
+        let views = vec![
+            view("pr", "PR", 10.0, None, now - Duration::minutes(1)),
+            view("ac", "AC", 100.0, Some(10.0), now - Duration::minutes(1)),
+        ];
+        let situation = ready(&learned, &views, &[pr, ac], Some("ac"), now);
+        assert_eq!(
+            situation.manual_hold_until, None,
+            "the blocked account ends the hold early"
+        );
+        assert_eq!(situation.last_switch_at, Some(now - Duration::hours(1)));
+    }
+
+    #[test]
+    fn an_account_without_a_reading_makes_the_situation_stale() {
+        let now = utc("2026-11-10T12:00:00Z");
+        let pr = account("pr", "PR", PR_ACC, true);
+        let ac = account("ac", "AC", AC_ACC, true);
+        let learned = learned("atlas", Vec::new());
+        let mut no_reading = view("ac", "AC", 10.0, None, now - Duration::minutes(1));
+        no_reading.usage = None;
+        no_reading.fetched_at = None;
+        let views = vec![
+            view("pr", "PR", 10.0, None, now - Duration::minutes(1)),
+            no_reading,
+        ];
+        let readiness = situation(&learned, &views, &[pr, ac], Some("pr"), now, offset(), 0)
+            .expect("the accounts are valid");
+        match readiness {
+            Readiness::Unread { accounts } => assert_eq!(accounts, vec!["ac".to_string()]),
+            Readiness::Ready(_) => panic!("AC has no reading"),
+            Readiness::NoAccounts => panic!("PR still goes into the inputs"),
+        }
+    }
+
+    #[test]
+    fn a_manual_hold_lasts_four_hours() {
+        let now = utc("2026-11-10T12:00:00Z");
+        let pr = account("pr", "PR", PR_ACC, true);
+        let ac = account("ac", "AC", AC_ACC, true);
+        let switch = switch_event(
+            "atlas",
+            now - Duration::hours(1),
+            AccountRef::of(&ac),
+            By::Cli,
+        );
+        let learned = learned("atlas", vec![switch]);
+        let views = vec![
+            view("pr", "PR", 10.0, None, now - Duration::minutes(1)),
+            view("ac", "AC", 10.0, Some(10.0), now - Duration::minutes(1)),
+        ];
+        let situation = ready(&learned, &views, &[pr, ac], Some("ac"), now);
+        assert_eq!(situation.manual_hold_until, Some(now + Duration::hours(3)));
+    }
+
+    #[test]
+    fn an_unread_account_auto_burn_may_not_use_is_left_out() {
+        let now = utc("2026-11-10T12:00:00Z");
+        let pr = account("pr", "PR", PR_ACC, true);
+        let ac = account("ac", "AC", AC_ACC, false);
+        let learned = learned("atlas", Vec::new());
+        let mut no_reading = view("ac", "AC", 10.0, None, now - Duration::minutes(1));
+        no_reading.usage = None;
+        let views = vec![
+            view("pr", "PR", 10.0, None, now - Duration::minutes(1)),
+            no_reading,
+        ];
+        let situation = ready(&learned, &views, &[pr, ac], Some("pr"), now);
+        assert_eq!(situation.inputs.accounts.len(), 1);
+        assert_eq!(situation.inputs.accounts[0].id, "pr");
+    }
+
+    #[test]
+    fn the_plan_starts_on_the_active_account() {
+        let now = utc("2026-11-10T12:00:00Z");
+        let pr = account("pr", "PR", PR_ACC, true);
+        let learned = learned("atlas", Vec::new());
+        let views = vec![view("pr", "PR", 10.0, None, now - Duration::minutes(1))];
+        let situation = ready(&learned, &views, &[pr], Some("pr"), now);
+        let plan = follow(&situation.inputs, Policy::Lazy);
+        assert_eq!(plan.segments[0].account.as_deref(), Some("pr"));
+    }
+
+    #[test]
+    fn a_logged_out_account_does_not_make_the_situation_stale() {
+        let now = utc("2026-11-10T12:00:00Z");
+        let pr = account("pr", "PR", PR_ACC, true);
+        let ac = account("ac", "AC", AC_ACC, true);
+        let mut logged_out = view("pr", "PR", 20.0, None, now - Duration::hours(3));
+        logged_out.login_state = LoginState::LoggedOut;
+        let fresh = view("ac", "AC", 10.0, None, now - Duration::minutes(2));
+        let learned = learned("atlas", Vec::new());
+        let views = vec![logged_out, fresh];
+        let situation = ready(&learned, &views, &[pr, ac], Some("ac"), now);
+        assert_eq!(
+            situation.oldest_reading,
+            now - Duration::minutes(2),
+            "the logged-out account's old reading is not counted"
+        );
+        let pr_state = situation
+            .inputs
+            .accounts
+            .iter()
+            .find(|state| state.id == "pr")
+            .expect("the logged-out account with a reading is in the inputs");
+        assert!(!pr_state.login_ok);
+    }
+
+    #[test]
+    fn the_oldest_reading_counts_every_account_with_a_login() {
+        let now = utc("2026-11-10T12:00:00Z");
+        let pr = account("pr", "PR", PR_ACC, true);
+        // Auto-burn may not use AC, but its reading still counts for freshness.
+        let ac = account("ac", "AC", AC_ACC, false);
+        let learned = learned("atlas", Vec::new());
+        let views = vec![
+            view("pr", "PR", 20.0, None, now - Duration::minutes(5)),
+            view("ac", "AC", 10.0, None, now - Duration::minutes(30)),
+        ];
+        let situation = ready(&learned, &views, &[pr, ac], Some("pr"), now);
+        assert_eq!(situation.oldest_reading, now - Duration::minutes(30));
+    }
+
+    #[test]
+    fn no_account_is_no_accounts_not_unread() {
+        let now = utc("2026-11-10T12:00:00Z");
+        let pr = account("pr", "PR", PR_ACC, true);
+        let ac = account("ac", "AC", AC_ACC, true);
+        let mut no_pr = view("pr", "PR", 10.0, None, now - Duration::minutes(1));
+        no_pr.login_state = LoginState::LoggedOut;
+        no_pr.usage = None;
+        no_pr.fetched_at = None;
+        let mut no_ac = view("ac", "AC", 10.0, None, now - Duration::minutes(1));
+        no_ac.login_state = LoginState::LoggedOut;
+        no_ac.usage = None;
+        no_ac.fetched_at = None;
+        let learned = learned("atlas", Vec::new());
+        let readiness = situation(&learned, &[no_pr, no_ac], &[pr, ac], None, now, offset(), 0)
+            .expect("the accounts are valid");
+        match readiness {
+            Readiness::NoAccounts => {}
+            Readiness::Ready(_) => panic!("no account can go into the inputs"),
+            Readiness::Unread { accounts } => {
+                panic!("logged-out accounts are not unread: {accounts:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn resume_ends_a_manual_hold() {
+        let now = utc("2026-11-10T12:00:00Z");
+        let pr = account("pr", "PR", PR_ACC, true);
+        let ac = account("ac", "AC", AC_ACC, true);
+        let switch = switch_event(
+            "atlas",
+            now - Duration::hours(1),
+            AccountRef::of(&ac),
+            By::User,
+        );
+        let resume = Hosted {
+            host: "atlas".to_string(),
+            record: Event {
+                t: now - Duration::minutes(30),
+                kind: EventKind::AutoBurn {
+                    on: true,
+                    paused_until: None,
+                },
+            },
+        };
+        let learned = learned("atlas", vec![switch, resume]);
+        let views = vec![
+            view("pr", "PR", 10.0, None, now - Duration::minutes(1)),
+            view("ac", "AC", 10.0, None, now - Duration::minutes(1)),
+        ];
+        let situation = ready(&learned, &views, &[pr, ac], Some("ac"), now);
+        assert_eq!(situation.manual_hold_until, None);
+    }
+}

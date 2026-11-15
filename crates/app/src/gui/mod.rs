@@ -13,6 +13,8 @@ pub(crate) mod ipc;
 #[cfg(feature = "gui")]
 pub(crate) mod autostart;
 #[cfg(feature = "gui")]
+pub(crate) mod burn_rt;
+#[cfg(feature = "gui")]
 pub(crate) mod notify;
 #[cfg(feature = "gui")]
 pub(crate) mod panel;
@@ -41,6 +43,8 @@ use std::thread;
 #[cfg(feature = "gui")]
 use chrono::{DateTime, Local, Utc};
 
+#[cfg(feature = "gui")]
+use seatswap_core::history::By;
 #[cfg(feature = "gui")]
 use seatswap_core::paths::{self, AppPaths};
 #[cfg(feature = "gui")]
@@ -463,9 +467,7 @@ fn apply_snapshot(app: &AppHandle, mut snapshot: Snapshot) {
     for notification in due {
         match notification {
             Notification::Suggestion(suggestion) => {
-                let from = view_abbr(&snapshot, &suggestion.from_id);
-                let to = view_abbr(&snapshot, &suggestion.to_id);
-                notify::send_suggestion(app.clone(), &suggestion, &from, &to);
+                notify::send_suggestion(app.clone(), &suggestion);
             }
             Notification::LoginWarning(warning) => {
                 let id = notify::warning_id(&warning).to_string();
@@ -680,6 +682,8 @@ pub(crate) fn request_switch(
             key,
             unsaved,
             label,
+            by: By::User,
+            reason: None,
             reply,
         })) {
             notify::send_error(&error);

@@ -88,6 +88,10 @@ pub struct Account {
     pub login_state: LoginState,
     /// `refreshTokenExpiresAt` of the stored login, ms since the epoch.
     pub login_ends_at_ms: Option<i64>,
+    /// Whether auto-burn may switch to this account (spec §2.6). An older file
+    /// without the key loads with `true`.
+    #[serde(default = "default_account_auto_burn")]
+    pub auto_burn: bool,
 }
 
 /// Whether the stored login can still be used (spec §6.2).
@@ -330,8 +334,6 @@ impl StatuslineConfig {
 
 const DEFAULT_POLL_ACTIVE_SECS: u64 = 120;
 const DEFAULT_POLL_INACTIVE_SECS: u64 = 900;
-const DEFAULT_SUGGEST_AT: u32 = 90;
-const DEFAULT_SUGGEST_TARGET_BELOW: u32 = 50;
 const DEFAULT_HOTKEY: &str = "Ctrl+Alt+C";
 
 fn default_tray_text() -> TrayText {
@@ -350,12 +352,16 @@ fn default_poll_inactive_secs() -> u64 {
     DEFAULT_POLL_INACTIVE_SECS
 }
 
-fn default_suggest_at() -> u32 {
-    DEFAULT_SUGGEST_AT
+fn default_account_auto_burn() -> bool {
+    true
 }
 
-fn default_suggest_target_below() -> u32 {
-    DEFAULT_SUGGEST_TARGET_BELOW
+fn default_auto_burn() -> bool {
+    false
+}
+
+fn default_suggest_switches() -> bool {
+    true
 }
 
 fn default_notify_on_switch() -> bool {
@@ -443,10 +449,12 @@ pub struct Settings {
     pub poll_active_secs: u64,
     #[serde(default = "default_poll_inactive_secs")]
     pub poll_inactive_secs: u64,
-    #[serde(default = "default_suggest_at")]
-    pub suggest_at: u32,
-    #[serde(default = "default_suggest_target_below")]
-    pub suggest_target_below: u32,
+    /// When on, auto-burn switches by itself; default off.
+    #[serde(default = "default_auto_burn")]
+    pub auto_burn: bool,
+    /// When auto-burn is off, whether a switch is suggested; default on.
+    #[serde(default = "default_suggest_switches")]
+    pub suggest_switches: bool,
     #[serde(default = "default_notify_on_switch")]
     pub notify_on_switch: bool,
     #[serde(default = "default_mirror_live")]
@@ -498,8 +506,8 @@ impl Default for Settings {
             icon_limit: default_icon_limit(),
             poll_active_secs: default_poll_active_secs(),
             poll_inactive_secs: default_poll_inactive_secs(),
-            suggest_at: default_suggest_at(),
-            suggest_target_below: default_suggest_target_below(),
+            auto_burn: default_auto_burn(),
+            suggest_switches: default_suggest_switches(),
             notify_on_switch: default_notify_on_switch(),
             mirror_live: default_mirror_live(),
             refresh_inactive: default_refresh_inactive(),
@@ -524,8 +532,6 @@ impl Default for Settings {
 impl Settings {
     /// Check the ranges the spec fixes: percents 1..=100, poll intervals >= 30 s.
     pub fn validate(&self) -> Result<(), StoreError> {
-        percent("suggestAt", self.suggest_at)?;
-        percent("suggestTargetBelow", self.suggest_target_below)?;
         if self.poll_active_secs < 30 {
             return Err(StoreError::InvalidSetting(format!(
                 "pollActiveSecs must be at least 30 s, got {}",
@@ -602,16 +608,6 @@ fn validate_statusline(config: &StatuslineConfig) -> Result<(), StoreError> {
         }
     }
     Ok(())
-}
-
-fn percent(name: &str, value: u32) -> Result<(), StoreError> {
-    if (1..=100).contains(&value) {
-        Ok(())
-    } else {
-        Err(StoreError::InvalidSetting(format!(
-            "{name} must be 1..=100, got {value}"
-        )))
-    }
 }
 
 /// `accounts.json` with its version. Only version 1 exists; a different version
@@ -1122,6 +1118,7 @@ pub fn new_account(
             LoginState::Ok
         },
         login_ends_at_ms: login.refresh_token_expires_at_ms(),
+        auto_burn: true,
     })
 }
 
@@ -1389,8 +1386,8 @@ mod tests {
         let file = store.load().unwrap();
         assert_eq!(file.settings.poll_active_secs, 120);
         assert_eq!(file.settings.poll_inactive_secs, 900);
-        assert_eq!(file.settings.suggest_at, 90);
-        assert_eq!(file.settings.suggest_target_below, 50);
+        assert!(!file.settings.auto_burn);
+        assert!(file.settings.suggest_switches);
         assert_eq!(file.settings.tray_text, TrayText::PercentReset);
         assert_eq!(file.settings.icon_limit, IconLimit::Binding);
         assert_eq!(file.settings.theme, Theme::System);
@@ -1748,22 +1745,6 @@ mod tests {
         assert!(Settings::default().validate().is_ok());
 
         let mut settings = Settings {
-            suggest_at: 0,
-            ..Settings::default()
-        };
-        assert!(matches!(
-            settings.validate(),
-            Err(StoreError::InvalidSetting(_))
-        ));
-        settings.suggest_at = 101;
-        assert!(matches!(
-            settings.validate(),
-            Err(StoreError::InvalidSetting(_))
-        ));
-        settings.suggest_at = 100;
-        assert!(settings.validate().is_ok());
-
-        settings = Settings {
             poll_active_secs: 10,
             ..Settings::default()
         };
@@ -1781,14 +1762,21 @@ mod tests {
             ..Settings::default()
         };
         assert!(settings.validate().is_err());
+    }
 
-        settings = Settings {
-            suggest_target_below: 0,
-            ..Settings::default()
-        };
-        assert!(settings.validate().is_err());
-        settings.suggest_target_below = 101;
-        assert!(settings.validate().is_err());
+    #[test]
+    fn an_older_file_with_suggest_at_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(&tmp.path().join("app"));
+        fs::create_dir_all(store.app_paths().data_dir.clone()).unwrap();
+        fs::write(
+            store.app_paths().accounts_file(),
+            br#"{"version":1,"accounts":[],"settings":{"suggestAt":90,"suggestTargetBelow":50}}"#,
+        )
+        .unwrap();
+        let file = store.load().unwrap();
+        assert!(!file.settings.auto_burn);
+        assert!(file.settings.suggest_switches);
     }
 
     fn settings_with_statusline(config: StatuslineConfig) -> Settings {

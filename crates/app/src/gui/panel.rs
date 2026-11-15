@@ -17,6 +17,7 @@ use tauri::{
 };
 
 use seatswap_core::engine::PollReason;
+use seatswap_core::history::By;
 use seatswap_core::store::{self, Settings};
 use seatswap_core::switcher::UnsavedPolicy;
 
@@ -520,6 +521,8 @@ pub(crate) async fn switch_account(
             key,
             unsaved,
             label,
+            by: By::User,
+            reason: None,
             reply,
         })
     })

@@ -15,12 +15,16 @@ use serde::Serialize;
 
 use seatswap_core::api::{Api, Usage};
 use seatswap_core::atomic::{self, Access};
-use seatswap_core::engine::{suggestion, AccountView, Engine, PollReason, Suggestion, UsageCache};
-use seatswap_core::history::{AccountRef, By, EventKind, Recorder};
+use seatswap_core::burn::decide::{decide, regime};
+use seatswap_core::burn::live::{self, Readiness};
+use seatswap_core::burn::plan::{follow, Policy};
+use seatswap_core::engine::{AccountView, Engine, PollReason, UsageCache};
+use seatswap_core::history::{AccountRef, By, EventKind, HistoryDir, Recorder};
 use seatswap_core::paths::{self, AppPaths, ClaudePaths, PathsError};
 use seatswap_core::store::{self, Account, AccountsFile, LoginState, Settings, Store, StoreError};
 use seatswap_core::switcher::{self, LiveState, SwitchError, UnsavedPolicy};
 
+use crate::burn_text;
 use crate::format::{class_name, format_age, format_reset_at, integer_percent, percent, tooltip};
 use crate::gui::ipc;
 use crate::ops;
@@ -1111,7 +1115,27 @@ fn status(
             .iter()
             .find(|view| view.is_active)
             .map(|view| view.id.clone());
-        let suggestion = suggestion(&views, &context.settings).map(SuggestionJson::from);
+        let suggestion = if context.settings.auto_burn || !context.settings.suggest_switches {
+            None
+        } else {
+            let accounts = engine.store().load()?.accounts;
+            // Read-only: a status call must not create the history folder.
+            let root = paths::history_root(
+                context.settings.history_dir.as_deref(),
+                engine.store().app_paths(),
+            )?;
+            let host = paths::host_name(context.settings.host_name.as_deref())?;
+            let history = HistoryDir::at(&root, &host);
+            status_suggestion(
+                &history,
+                &views,
+                &accounts,
+                &context.settings,
+                active.as_deref(),
+                now,
+                *Local::now().offset(),
+            )?
+        };
         let output = StatusJson {
             views: &views,
             active,
@@ -1131,6 +1155,40 @@ fn status(
         println!("no live account");
     }
     Ok(())
+}
+
+/// The suggestion `status --json` prints: the planner's own decision, never a
+/// second rule beside it (spec §2.5).
+#[allow(clippy::too_many_arguments)]
+fn status_suggestion(
+    history: &HistoryDir,
+    views: &[AccountView],
+    accounts: &[Account],
+    settings: &Settings,
+    active: Option<&str>,
+    now: DateTime<Utc>,
+    offset: chrono::FixedOffset,
+) -> Result<Option<SuggestionJson>, CliError> {
+    if settings.auto_burn || !settings.suggest_switches {
+        return Ok(None);
+    }
+    let active = active.filter(|id| accounts.iter().any(|account| account.id == *id));
+    let learned = live::learn(history, now, offset, accounts)
+        .map_err(|error| CliError::Message(format!("cannot read the history: {error}")))?;
+    let readiness = live::situation(&learned, views, accounts, active, now, offset, 0)
+        .map_err(|error| CliError::Message(error.to_string()))?;
+    let Readiness::Ready(situation) = readiness else {
+        return Ok(None);
+    };
+    let regime = regime(&situation);
+    let decision = decide(&situation, &regime);
+    let plan = follow(&situation.inputs, Policy::Lazy);
+    let suggestion = burn_text::suggestion(&decision, &plan, active, views, now, offset)
+        .map_err(|error| CliError::Message(error.to_string()))?;
+    Ok(suggestion.map(|suggestion| SuggestionJson {
+        to_id: suggestion.to,
+        text: suggestion.text,
+    }))
 }
 
 fn account_views(
@@ -1280,23 +1338,8 @@ struct StatusJson<'a> {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SuggestionJson {
-    from_id: String,
     to_id: String,
-    from_percent: f64,
-    to_percent: f64,
-    from_resets_at: Option<DateTime<Utc>>,
-}
-
-impl From<Suggestion> for SuggestionJson {
-    fn from(suggestion: Suggestion) -> SuggestionJson {
-        SuggestionJson {
-            from_id: suggestion.from_id,
-            to_id: suggestion.to_id,
-            from_percent: suggestion.from_percent,
-            to_percent: suggestion.to_percent,
-            from_resets_at: suggestion.from_resets_at,
-        }
-    }
+    text: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1365,9 +1408,12 @@ pub(crate) mod tests {
     use chrono::Utc;
     use serde_json::{json, Value};
 
+    use chrono::FixedOffset;
+    use seatswap_core::api::{Limit, LimitKind, Severity, Usage};
     use seatswap_core::engine::AccountView;
     use seatswap_core::paths::ClaudePaths;
     use seatswap_core::store::{FileSecrets, LoginState, Settings, Store};
+    use seatswap_core::types::OAuthAccount;
 
     /// The status line of an explicit data and Claude config folder, for the
     /// statusline module's tests. The command itself builds its `Cli` from the
@@ -2356,6 +2402,107 @@ pub(crate) mod tests {
         assert_eq!(events[added]["account"]["acc"], json!(THIRD_ACCOUNT_UUID));
         assert_eq!(events[added]["plan"], json!("Team"));
         assert_eq!(events[switched]["to"]["acc"], json!(FIRST_ACCOUNT_UUID));
+    }
+
+    fn burn_account(id: &str, abbr: &str, acc: &str) -> Account {
+        Account {
+            id: id.to_string(),
+            account_uuid: acc.to_string(),
+            organization_uuid: FIRST_ORG_UUID.to_string(),
+            label: abbr.to_string(),
+            abbr: abbr.to_string(),
+            color: "#3b82f6".to_string(),
+            email: None,
+            org_name: None,
+            plan: Some("Team".to_string()),
+            oauth_account: OAuthAccount(serde_json::Map::new()),
+            added_at: Utc::now(),
+            last_used_at: None,
+            login_state: LoginState::Ok,
+            login_ends_at_ms: None,
+            auto_burn: true,
+        }
+    }
+
+    fn burn_view(
+        id: &str,
+        abbr: &str,
+        week: f64,
+        session: bool,
+        reset: DateTime<Utc>,
+        fetched_at: DateTime<Utc>,
+    ) -> AccountView {
+        let mut limits = vec![Limit {
+            kind: LimitKind::WeeklyAll,
+            percent: week,
+            severity: Severity::Normal,
+            resets_at: Some(reset),
+            model: None,
+            is_active: false,
+        }];
+        if session {
+            limits.push(Limit {
+                kind: LimitKind::Session,
+                percent: 10.0,
+                severity: Severity::Normal,
+                resets_at: Some(reset),
+                model: None,
+                is_active: false,
+            });
+        }
+        AccountView {
+            id: id.to_string(),
+            label: abbr.to_string(),
+            abbr: abbr.to_string(),
+            color: "#3b82f6".to_string(),
+            email: None,
+            plan: None,
+            is_active: false,
+            login_state: LoginState::Ok,
+            login_ends_at_ms: None,
+            login_days_left: None,
+            usage: Some(Usage {
+                limits,
+                extra_usage_enabled: false,
+            }),
+            usable: true,
+            blocked_until: None,
+            blocker: None,
+            fetched_at: Some(fetched_at),
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn status_json_suggestion_is_the_planners() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let history = HistoryDir::at(tmp.path(), "atlas");
+        let now = Utc::now();
+        let reset = DateTime::parse_from_rfc3339("2026-11-16T02:00:00Z")
+            .expect("a test time")
+            .with_timezone(&Utc);
+        let accounts = vec![
+            burn_account("pr", "PR", FIRST_ACCOUNT_UUID),
+            burn_account("ac", "AC", SECOND_ACCOUNT_UUID),
+        ];
+        let views = vec![
+            burn_view("pr", "PR", 100.0, false, reset, now),
+            burn_view("ac", "AC", 10.0, true, reset, now),
+        ];
+        let offset = FixedOffset::east_opt(0).expect("UTC");
+        let suggestion = status_suggestion(
+            &history,
+            &views,
+            &accounts,
+            &Settings::default(),
+            Some("pr"),
+            now,
+            offset,
+        )
+        .expect("the history reads")
+        .expect("the planner suggests a switch");
+        assert_eq!(suggestion.to_id, "ac");
+        assert!(suggestion.text.starts_with("Switch to AC now:"));
     }
 
     #[test]

@@ -157,6 +157,13 @@ pub struct Segment {
     pub to: DateTime<Utc>,
 }
 
+/// Which limit fills an account in the plan: its week or its 5 h window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fill {
+    Window,
+    Week,
+}
+
 /// The next [`HORIZON_H`] hours played in [`STEP_MIN`] steps (spec §2.4).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Plan {
@@ -168,6 +175,8 @@ pub struct Plan {
     /// The first step at which each account is full: its week or its 5 h
     /// window is at 100 %.
     pub full_at: BTreeMap<String, DateTime<Utc>>,
+    /// Which limit made the account full at `full_at`.
+    pub full_by: BTreeMap<String, Fill>,
 }
 
 /// Whether the account is blocked at `at` as far as its login and its limits say
@@ -198,7 +207,7 @@ pub fn usable_again(account: &AccountState, at: DateTime<Utc>) -> Option<DateTim
 /// Whether the account's rates are known (spec §2.3): its `c` and, for an
 /// account with a 5 h limit, its `s`. This is the one rule [`View::rates`] and
 /// the decision's regime use.
-pub(crate) fn rates_known(account: &AccountState) -> bool {
+pub fn rates_known(account: &AccountState) -> bool {
     match account.rates {
         None => false,
         Some(rates) => account.session.is_none() || rates.s.is_some(),
@@ -385,6 +394,7 @@ pub(super) fn play(inputs: &Inputs, policy: Policy, walk: &Walk<'_>, typical: f6
         view.clear_resets(inputs.now, end);
         if view.is_full(inputs.now) {
             view.full_at = Some(inputs.now);
+            view.full_by = Some(view.fill());
         }
     }
     let mut current: Option<usize> = inputs
@@ -427,7 +437,9 @@ pub(super) fn play(inputs: &Inputs, policy: Policy, walk: &Walk<'_>, typical: f6
                     worked_wu += work;
                     views[index].apply(t, work);
                     if views[index].full_at.is_none() && views[index].is_full(t) {
+                        let fill = views[index].fill();
                         views[index].full_at = Some(t);
+                        views[index].full_by = Some(fill);
                     }
                 }
             }
@@ -469,6 +481,10 @@ pub(super) fn play(inputs: &Inputs, policy: Policy, walk: &Walk<'_>, typical: f6
                 .iter()
                 .filter_map(|view| view.full_at.map(|at| (view.account.id.clone(), at)))
                 .collect(),
+            full_by: views
+                .iter()
+                .filter_map(|view| view.full_by.map(|fill| (view.account.id.clone(), fill)))
+                .collect(),
         },
         worked_wu,
         expired: views
@@ -489,6 +505,7 @@ struct View<'a> {
     window_end: Option<DateTime<Utc>>,
     reset: DateTime<Utc>,
     full_at: Option<DateTime<Utc>>,
+    full_by: Option<Fill>,
     left_at_reset: Option<f64>,
     /// The week-% unused at every weekly reset this view passed.
     expired: f64,
@@ -513,6 +530,7 @@ impl<'a> View<'a> {
             window_end,
             reset: next_reset(account.week_resets_at, at),
             full_at: None,
+            full_by: None,
             left_at_reset: None,
             expired: 0.0,
             resets_passed: 0,
@@ -576,6 +594,16 @@ impl<'a> View<'a> {
     /// 100 % and not over: the one rule [`usable`] uses too.
     fn is_full(&self, at: DateTime<Utc>) -> bool {
         self.week >= 100.0 || self.window_blocked(at)
+    }
+
+    /// The limit that is full at this state: the week when both are full, the
+    /// one the account is blocked by first.
+    fn fill(&self) -> Fill {
+        if self.week >= 100.0 {
+            Fill::Week
+        } else {
+            Fill::Window
+        }
     }
 
     /// An account is blocked when its login has ended, its week is at 100 % or

@@ -85,6 +85,8 @@ pub struct Regime {
 /// Why the decision switches (spec §2.5, §2.6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reason {
+    /// No account was in use at the reading.
+    NoneActive,
     /// The active account is blocked (or the login ended or a model blocks it).
     ActiveFull { until: Option<DateTime<Utc>> },
     /// The target's 5 h window has room.
@@ -106,6 +108,7 @@ pub enum Decision {
         to: String,
         latest: DateTime<Utc>,
         tied_busy: u32,
+        reason: Reason,
     },
     AllFull {
         next: Option<(String, DateTime<Utc>)>,
@@ -175,7 +178,8 @@ pub fn regime(situation: &Situation) -> Regime {
 /// The one decision of auto-burn (spec §2.5, §2.6), in this order:
 /// 1. a reading older than [`FRESH_MIN`] minutes → [`Decision::Stale`];
 /// 2. and 3. the active account is [`blocked`] or there is none: [`choose`] names
-///    a target → [`Decision::Switch`] with [`Reason::ActiveFull`], else
+///    a target → [`Decision::Switch`] with [`Reason::ActiveFull`] (or
+///    [`Reason::NoneActive`] when there is no active account), else
 ///    [`Decision::AllFull`];
 /// 4. a manual hold in the future → [`Decision::Stay`];
 /// 5. early switching ([`Regime::early`]) and [`choose`] names another account
@@ -210,7 +214,7 @@ pub fn decide(situation: &Situation, regime: &Regime) -> Decision {
         return match choose(inputs, now) {
             Some(to) => Decision::Switch {
                 to,
-                reason: Reason::ActiveFull { until: None },
+                reason: Reason::NoneActive,
             },
             None => Decision::AllFull {
                 next: next_free(inputs),
@@ -267,6 +271,7 @@ pub fn decide(situation: &Situation, regime: &Regime) -> Decision {
             to,
             latest: latest_reaching(inputs, target_slack),
             tied_busy: situation.tied_busy,
+            reason,
         }
     }
 }
@@ -596,6 +601,7 @@ mod tests {
                 to: "AC".to_string(),
                 latest: now() + Duration::hours(6),
                 tied_busy: 1,
+                reason: Reason::WindowOpen,
             }
         );
     }

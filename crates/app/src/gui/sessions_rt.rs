@@ -41,6 +41,8 @@ const RECORD_EVERY_SECS: i64 = 10 * 60;
 pub(crate) struct PassOutcome {
     pub summary: SessionsSummary,
     pub models: Option<BTreeSet<String>>,
+    pub tied: u32,
+    pub tied_busy: u32,
     pub wake_soon: bool,
 }
 
@@ -215,6 +217,8 @@ fn run(
                 let mut summary = SessionsSummary {
                     running: 0,
                     busy: 0,
+                    tied: 0,
+                    tied_busy: 0,
                     waiting: Vec::new(),
                     unavailable: None,
                     warning: None,
@@ -241,6 +245,8 @@ fn run(
                 PassOutcome {
                     summary,
                     models: None,
+                    tied: 0,
+                    tied_busy: 0,
                     wake_soon: false,
                 }
             }
@@ -257,7 +263,11 @@ fn run(
             return;
         }
         if engine
-            .send(EngineCommand::ModelsInUse(outcome.models))
+            .send(EngineCommand::ModelsInUse {
+                models: outcome.models,
+                tied: outcome.tied,
+                tied_busy: outcome.tied_busy,
+            })
             .is_err()
         {
             return;
@@ -360,6 +370,8 @@ pub(crate) fn run_pass(
     let mut summary = SessionsSummary {
         running: 0,
         busy: 0,
+        tied: 0,
+        tied_busy: 0,
         waiting: Vec::new(),
         unavailable: None,
         warning: state_error.map(str::to_string),
@@ -374,6 +386,8 @@ pub(crate) fn run_pass(
             return PassOutcome {
                 summary,
                 models: None,
+                tied: 0,
+                tied_busy: 0,
                 wake_soon: false,
             };
         }
@@ -386,6 +400,8 @@ pub(crate) fn run_pass(
             return PassOutcome {
                 summary,
                 models: None,
+                tied: 0,
+                tied_busy: 0,
                 wake_soon: false,
             };
         }
@@ -402,6 +418,8 @@ pub(crate) fn run_pass(
             return PassOutcome {
                 summary,
                 models: None,
+                tied: 0,
+                tied_busy: 0,
                 wake_soon: false,
             };
         }
@@ -710,9 +728,12 @@ pub(crate) fn run_pass(
     }
 
     let models = models_in_use(&running.sessions, state);
+    let (tied, tied_busy) = tied_sessions(&running.sessions, state);
     PassOutcome {
         summary,
         models,
+        tied,
+        tied_busy,
         wake_soon: !scan_complete,
     }
 }
@@ -796,6 +817,30 @@ fn models_in_use(running: &[SessionFile], state: &ScanState) -> Option<BTreeSet<
         models.insert(model.to_lowercase());
     }
     Some(models)
+}
+
+/// The sessions whose model ties its thinking to the account, and of those the
+/// ones busy now (spec §2.11).
+fn tied_sessions(running: &[SessionFile], state: &ScanState) -> (u32, u32) {
+    let mut tied = 0u32;
+    let mut busy = 0u32;
+    for session in running {
+        let Some(seen) = state.sessions.get(&session.session_id) else {
+            continue;
+        };
+        if !seen
+            .last_model
+            .as_deref()
+            .is_some_and(seatswap_core::burn::tied::thinking_tied)
+        {
+            continue;
+        }
+        tied += 1;
+        if session.status == SessionStatus::Busy && seen.thinking_since_user > 0 {
+            busy += 1;
+        }
+    }
+    (tied, busy)
 }
 
 fn label_of(session: &SessionFile, project: &ProjectKey) -> String {

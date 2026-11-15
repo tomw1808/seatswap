@@ -13,25 +13,25 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(all(unix, not(target_os = "macos")))]
 use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Utc};
 use notify_rust::Notification as DesktopNotification;
 use notify_rust::NotificationResponse;
 #[cfg(all(unix, not(target_os = "macos")))]
 use notify_rust::Timeout;
 
-use seatswap_core::engine::{all_blocked, Blocker, LoginWarning, Suggestion};
+use seatswap_core::engine::{all_blocked, Blocker, LoginWarning};
 use seatswap_core::store::LoginState;
 use seatswap_core::switcher::UnsavedPolicy;
 
-use super::format;
 #[cfg(windows)]
 use super::registry;
 use super::worker::{LiveView, Snapshot, Waiting};
+use crate::burn_text::SwitchSuggestion;
 
 /// What the de-duplicator decided to show.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Notification {
-    Suggestion(Suggestion),
+    Suggestion(SwitchSuggestion),
     LoginWarning(LoginWarning),
     UnknownLogin {
         email: Option<String>,
@@ -86,8 +86,8 @@ struct PreviousView {
 /// - each wait once per session and start, and its end when it is over.
 #[derive(Debug, Default)]
 pub(crate) struct Deduper {
-    /// One entry per from-account and reset minute (docs/implementation.md).
-    suggestions: HashSet<(String, Option<i64>)>,
+    /// One entry per target account and hour (spec §2.5).
+    suggestions: HashSet<(String, i64)>,
     warnings: HashSet<(String, WarningLevel)>,
     /// Every unknown identity seen this run, so A -> B -> A announces A once.
     unknown: HashSet<(Option<String>, Option<String>)>,
@@ -114,15 +114,14 @@ impl Deduper {
     pub(crate) fn due(&mut self, snapshot: &Snapshot, now: DateTime<Utc>) -> Vec<Notification> {
         let mut due = Vec::new();
 
-        if let Some(suggestion) = &snapshot.suggestion {
-            // Rounded to the minute: a snapshot a few milliseconds later in the
-            // same window is still the same suggestion.
-            let key = (
-                suggestion.from_id.clone(),
-                suggestion
-                    .from_resets_at
-                    .map(|reset| reset.timestamp() / 60),
-            );
+        if let Some(suggestion) = snapshot
+            .burn
+            .as_ref()
+            .and_then(|burn| burn.suggestion.as_ref())
+        {
+            // One notification per target and hour: a suggestion repeated by
+            // the next snapshot in the same hour is the same suggestion.
+            let key = (suggestion.to.clone(), now.timestamp().div_euclid(3600));
             if self.suggestions.insert(key) {
                 due.push(Notification::Suggestion(suggestion.clone()));
             }
@@ -433,25 +432,9 @@ fn clickable() -> DesktopNotification {
 
 /// A switch suggestion with a "Switch" action. Clicking the body opens the
 /// panel instead (spec §7.4).
-pub(crate) fn send_suggestion(
-    app: tauri::AppHandle,
-    suggestion: &Suggestion,
-    from_name: &str,
-    to_name: &str,
-) {
-    let body = format!(
-        "{from_name} is at {} %{}. Switch to {to_name} ({} %)?",
-        format::integer_percent(suggestion.from_percent),
-        suggestion
-            .from_resets_at
-            .map(|resets| format!(
-                " (resets {})",
-                format::format_reset_clock(resets, Utc::now(), &Local)
-            ))
-            .unwrap_or_default(),
-        format::integer_percent(suggestion.to_percent)
-    );
-    let to_id = suggestion.to_id.clone();
+pub(crate) fn send_suggestion(app: tauri::AppHandle, suggestion: &SwitchSuggestion) {
+    let body = suggestion.text.clone();
+    let to_id = suggestion.to.clone();
     // Waiting for an action blocks, so it gets its own thread.
     thread::spawn(move || {
         let shown = clickable().body(&body).action("switch", "Switch").show();
@@ -700,10 +683,12 @@ mod tests {
     use seatswap_core::engine::AccountView;
     use seatswap_core::store::{LoginState, Settings};
 
+    use crate::format;
+    use crate::gui::burn_rt::BurnView;
     use crate::gui::worker::SessionsSummary;
 
     fn snapshot(
-        suggestion: Option<Suggestion>,
+        suggestion: Option<SwitchSuggestion>,
         warnings: Vec<LoginWarning>,
         live: LiveView,
     ) -> Snapshot {
@@ -711,7 +696,10 @@ mod tests {
             views: Vec::new(),
             active_id: None,
             live,
-            suggestion,
+            burn: suggestion.map(|suggestion| BurnView {
+                suggestion: Some(suggestion),
+                ..BurnView::default()
+            }),
             warnings,
             pending: None,
             secrets_warning: None,
@@ -722,13 +710,10 @@ mod tests {
         }
     }
 
-    fn suggestion(resets_at: Option<DateTime<Utc>>) -> Suggestion {
-        Suggestion {
-            from_id: "as".to_string(),
-            to_id: "p".to_string(),
-            from_percent: 97.0,
-            to_percent: 12.0,
-            from_resets_at: resets_at,
+    fn suggestion(to: &str, text: &str) -> SwitchSuggestion {
+        SwitchSuggestion {
+            to: to.to_string(),
+            text: text.to_string(),
         }
     }
 
@@ -789,7 +774,7 @@ mod tests {
                 .map(|view| view.id.clone()),
             views,
             live: LiveView::NoLogin,
-            suggestion: None,
+            burn: None,
             warnings: Vec::new(),
             pending: None,
             secrets_warning: None,
@@ -813,6 +798,8 @@ mod tests {
         SessionsSummary {
             running: waiting.len() as u32 + busy,
             busy,
+            tied: 0,
+            tied_busy: 0,
             waiting,
             unavailable: None,
             warning: None,
@@ -887,69 +874,68 @@ mod tests {
     }
 
     #[test]
-    fn a_suggestion_a_p_b_p_a_p_fires_a_p_once() {
+    fn a_suggestion_to_the_same_target_fires_once_an_hour() {
         let mut deduper = Deduper::new();
-        let reset = Some(Utc::now() + chrono::Duration::hours(1));
-        let make = |from: &str, to: &str| Suggestion {
-            from_id: from.to_string(),
-            to_id: to.to_string(),
-            from_percent: 97.0,
-            to_percent: 12.0,
-            from_resets_at: reset,
-        };
-        let a_to_p = snapshot(Some(make("a", "p")), Vec::new(), LiveView::NoLogin);
-        let b_to_p = snapshot(Some(make("b", "p")), Vec::new(), LiveView::NoLogin);
-        let a_to_p_again = snapshot(Some(make("a", "p")), Vec::new(), LiveView::NoLogin);
-        let now = Utc::now();
+        let now = utc("2026-11-10T12:00:00Z");
+        let a_to_p = snapshot(
+            Some(suggestion("p", "Switch to P now: its 5 h window is open.")),
+            Vec::new(),
+            LiveView::NoLogin,
+        );
+        let a_to_p_again = snapshot(
+            Some(suggestion("p", "Switch to P now: its 5 h window is open.")),
+            Vec::new(),
+            LiveView::NoLogin,
+        );
         assert_eq!(deduper.due(&a_to_p, now).len(), 1);
-        assert_eq!(deduper.due(&b_to_p, now).len(), 1);
         assert!(
             deduper.due(&a_to_p_again, now).is_empty(),
-            "a suggestion already announced this run must stay quiet"
+            "a suggestion to the same target announced this hour must stay quiet"
         );
     }
 
     #[test]
-    fn a_suggestion_is_keyed_by_the_reset_minute() {
+    fn a_suggestion_is_keyed_by_the_hour() {
         let mut deduper = Deduper::new();
-        // Start at a minute boundary so 20 s later is still the same minute.
         let now = utc("2026-11-10T12:00:00Z");
-        let minute = now.timestamp();
-        let reset = DateTime::<Utc>::from_timestamp(minute + 3600, 0).expect("valid timestamp");
-        let first = snapshot(Some(suggestion(Some(reset))), Vec::new(), LiveView::NoLogin);
-        let same_minute = snapshot(
-            Some(suggestion(Some(reset + chrono::Duration::seconds(20)))),
+        let first = snapshot(
+            Some(suggestion(
+                "p",
+                "Switch to P now: its week resets on Mon 02:00.",
+            )),
             Vec::new(),
             LiveView::NoLogin,
         );
         assert_eq!(deduper.due(&first, now).len(), 1);
-        assert!(deduper.due(&same_minute, now).is_empty());
-
-        let next_minute = snapshot(
-            Some(suggestion(Some(reset + chrono::Duration::seconds(60)))),
-            Vec::new(),
-            LiveView::NoLogin,
+        assert!(deduper
+            .due(&first, now + chrono::Duration::minutes(59))
+            .is_empty());
+        assert_eq!(
+            deduper.due(&first, now + chrono::Duration::hours(1)).len(),
+            1,
+            "the next hour may announce the same suggestion again"
         );
-        assert_eq!(deduper.due(&next_minute, now).len(), 1);
     }
 
     #[test]
-    fn a_suggestion_fires_once_per_reset_window() {
+    fn different_targets_are_announced_separately() {
         let mut deduper = Deduper::new();
         let now = Utc::now();
-        let reset = Some(now + chrono::Duration::hours(1));
-
-        let first = snapshot(Some(suggestion(reset)), Vec::new(), LiveView::NoLogin);
-        assert_eq!(deduper.due(&first, now).len(), 1);
-        assert!(
-            deduper.due(&first, now).is_empty(),
-            "the same window must not repeat"
+        let to_p = snapshot(
+            Some(suggestion("p", "Switch to P now: its 5 h window is open.")),
+            Vec::new(),
+            LiveView::NoLogin,
         );
-
-        // A new reset window may be announced again.
-        let next_reset = Some(now + chrono::Duration::hours(6));
-        let second = snapshot(Some(suggestion(next_reset)), Vec::new(), LiveView::NoLogin);
-        assert_eq!(deduper.due(&second, now).len(), 1);
+        let to_ac = snapshot(
+            Some(suggestion(
+                "ac",
+                "Switch to AC now: its week resets on Mon 02:00.",
+            )),
+            Vec::new(),
+            LiveView::NoLogin,
+        );
+        assert_eq!(deduper.due(&to_p, now).len(), 1);
+        assert_eq!(deduper.due(&to_ac, now).len(), 1);
     }
 
     #[test]

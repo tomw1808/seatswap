@@ -645,7 +645,7 @@ mod tests {
                 .map(|view| view.id.clone()),
             views,
             live: LiveView::NoLogin,
-            suggestion: None,
+            burn: None,
             warnings: Vec::new(),
             pending: None,
             secrets_warning: None,

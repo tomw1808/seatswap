@@ -210,6 +210,7 @@ mod tests {
             last_used_at: None,
             login_state: LoginState::Ok,
             login_ends_at_ms: None,
+            auto_burn: true,
         }
     }
 

@@ -17,6 +17,7 @@ use serde_json::Value;
 
 use crate::api::{Api, ApiError, Limit, LimitKind, Usage};
 use crate::atomic::{self, write_atomic, Access};
+use crate::burn::FRESH_MIN;
 use crate::feed::{self, Feed};
 use crate::history::{AccountRef, EventKind, HistoryError, Recorder, Source};
 use crate::live;
@@ -35,6 +36,9 @@ const ACCESS_TOKEN_MARGIN_MS: i64 = 60_000;
 const PANEL_ACTIVE_AFTER_SECS: u64 = 30;
 /// A pop-up opening refreshes an inactive account when its data is older than this.
 const PANEL_INACTIVE_AFTER_SECS: u64 = 5 * 60;
+/// The active account is polled this often while its binding limit is at least
+/// 90 % and below 100 % (spec §2.5).
+pub(crate) const NEAR_FULL_POLL_SECS: u64 = 30;
 const BASE_BACKOFF_SECS: u64 = 60;
 const MAX_BACKOFF_SECS: u64 = 30 * 60;
 const WAITING_MESSAGE: &str = "waiting for Claude Code to renew its login";
@@ -236,6 +240,8 @@ pub enum PollReason {
     AfterSwitch,
     /// The machine woke up.
     Wake,
+    /// Auto-burn asks for a reading older than `burn::FRESH_MIN`.
+    Stale,
 }
 
 /// Why a usage answer blocks an account (spec §2.7).
@@ -273,17 +279,6 @@ pub struct AccountView {
     pub blocker: Option<Blocker>,
     pub fetched_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
-}
-
-/// A suggested switch (spec §7.4).
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Suggestion {
-    pub from_id: String,
-    pub to_id: String,
-    pub from_percent: f64,
-    pub to_percent: f64,
-    pub from_resets_at: Option<DateTime<Utc>>,
 }
 
 /// A login that ends soon or has ended (spec §6.3).
@@ -524,6 +519,32 @@ impl<R: Remote> Engine<R> {
             // A transient failure is retried when its back-off ends, as before.
             return now >= backoff_until;
         }
+        let interval_secs = match reason {
+            PollReason::Stale => {
+                // A stale ask only refreshes readings that are really old; a
+                // fresh reading (or one in back-off, handled above) is left
+                // alone.
+                return entry.and_then(last_activity).is_none_or(|last| {
+                    now.signed_duration_since(last) > chrono::Duration::minutes(FRESH_MIN)
+                });
+            }
+            PollReason::Wake => return true,
+            PollReason::AfterSwitch if is_active => return true,
+            PollReason::PanelOpened => {
+                if is_active {
+                    PANEL_ACTIVE_AFTER_SECS
+                } else {
+                    PANEL_INACTIVE_AFTER_SECS
+                }
+            }
+            PollReason::Timer | PollReason::AfterSwitch => {
+                if is_active {
+                    settings.poll_active_secs
+                } else {
+                    settings.poll_inactive_secs
+                }
+            }
+        };
         // A blocked account is polled 30 s after its reset, whatever the
         // interval; only a reading or an attempt before that moment is old
         // enough. An attempt at or after the reset used the rule up.
@@ -544,23 +565,15 @@ impl<R: Remote> Engine<R> {
         let Some(last) = entry.and_then(last_activity) else {
             return true;
         };
-        let interval_secs = match reason {
-            PollReason::Wake => return true,
-            PollReason::AfterSwitch if is_active => return true,
-            PollReason::PanelOpened => {
-                if is_active {
-                    PANEL_ACTIVE_AFTER_SECS
-                } else {
-                    PANEL_INACTIVE_AFTER_SECS
-                }
-            }
-            PollReason::Timer | PollReason::AfterSwitch => {
-                if is_active {
-                    settings.poll_active_secs
-                } else {
-                    settings.poll_inactive_secs
-                }
-            }
+        let near_full = is_active
+            && entry
+                .and_then(|entry| entry.usage.as_ref())
+                .and_then(Usage::binding)
+                .is_some_and(|limit| (90.0..100.0).contains(&limit.percent));
+        let interval_secs = if near_full {
+            NEAR_FULL_POLL_SECS
+        } else {
+            interval_secs
         };
         age_at_least(now, last, interval_secs)
     }
@@ -1154,35 +1167,6 @@ fn history_error_text(kind: HistoryErrorKind, error: &HistoryError) -> String {
     format!("{prefix}{error}")
 }
 
-/// §7.4: the active account's binding limit is at least `suggest_at` and another
-/// Ok account is under `suggest_target_below`; the lowest such candidate wins.
-pub fn suggestion(views: &[AccountView], settings: &Settings) -> Option<Suggestion> {
-    let active = views.iter().find(|view| view.is_active)?;
-    let from_limit = active.usage.as_ref()?.binding()?;
-    if from_limit.percent < f64::from(settings.suggest_at) {
-        return None;
-    }
-    let (candidate, to_percent) = views
-        .iter()
-        .filter(|view| !view.is_active && view.login_state == LoginState::Ok)
-        .filter_map(|view| {
-            let limit = view.usage.as_ref()?.binding()?;
-            if limit.percent < f64::from(settings.suggest_target_below) {
-                Some((view, limit.percent))
-            } else {
-                None
-            }
-        })
-        .min_by(|(_, left), (_, right)| left.total_cmp(right))?;
-    Some(Suggestion {
-        from_id: active.id.clone(),
-        to_id: candidate.id.clone(),
-        from_percent: from_limit.percent,
-        to_percent,
-        from_resets_at: from_limit.resets_at,
-    })
-}
-
 /// §6.3: 5..=2 days left → [`LoginWarning::Soon`], 0..=1 → `Tomorrow`,
 /// negative → `Ended`; 6 or more days is not a warning.
 pub fn login_warnings(views: &[AccountView]) -> Vec<LoginWarning> {
@@ -1397,6 +1381,7 @@ mod tests {
             last_used_at: None,
             login_state: LoginState::Ok,
             login_ends_at_ms,
+            auto_burn: true,
         }
     }
 
@@ -2005,10 +1990,10 @@ mod tests {
         let fixture = Fixture::new(&tmp);
         let fake = fixture.fake.clone();
         for _ in 0..4 {
-            fake.script_usage_ok(&live_access(), 97.0);
+            fake.script_usage_ok(&live_access(), 50.0);
         }
-        fake.script_usage_ok(&live_access(), 97.0);
-        fake.script_usage_ok(&live_access(), 97.0);
+        fake.script_usage_ok(&live_access(), 50.0);
+        fake.script_usage_ok(&live_access(), 50.0);
         fake.script_refresh_ok(
             &b_refresh_token(),
             login(
@@ -2527,45 +2512,6 @@ mod tests {
     }
 
     #[test]
-    fn suggestion_picks_the_lowest_candidate_below_the_target() {
-        let settings = Settings::default();
-        let resets_at = Some(at(3600));
-        let mut active = view(A_ID, true, LoginState::Ok, Some(97.0), Some(10));
-        active.usage = Some(usage_with(97.0, resets_at));
-
-        let views = vec![
-            active.clone(),
-            view(B_ID, false, LoginState::Ok, Some(30.0), Some(10)),
-            view("cccc", false, LoginState::Ok, Some(12.0), Some(10)),
-            view("dddd", false, LoginState::LoggedOut, Some(5.0), Some(10)),
-            view("eeee", false, LoginState::Ok, Some(60.0), Some(10)),
-        ];
-        let picked = suggestion(&views, &settings).unwrap();
-        assert_eq!(picked.from_id, A_ID);
-        assert_eq!(picked.to_id, "cccc");
-        assert_eq!(picked.from_percent, 97.0);
-        assert_eq!(picked.to_percent, 12.0);
-        assert_eq!(picked.from_resets_at, resets_at);
-
-        let mut below = views.clone();
-        below[0].usage = Some(usage_with(89.0, None));
-        assert!(suggestion(&below, &settings).is_none());
-
-        let none_below = vec![
-            active,
-            view(B_ID, false, LoginState::Ok, Some(50.0), Some(10)),
-            view("cccc", false, LoginState::Ok, Some(80.0), Some(10)),
-        ];
-        assert!(suggestion(&none_below, &settings).is_none());
-
-        let unknown_active = vec![
-            view(A_ID, true, LoginState::Ok, None, Some(10)),
-            view(B_ID, false, LoginState::Ok, Some(12.0), Some(10)),
-        ];
-        assert!(suggestion(&unknown_active, &settings).is_none());
-    }
-
-    #[test]
     fn login_warnings_boundaries() {
         let views = vec![
             view("six", false, LoginState::Ok, None, Some(6)),
@@ -2611,24 +2557,7 @@ mod tests {
     }
 
     #[test]
-    fn suggestion_and_login_warning_json_shapes() {
-        let suggestion = Suggestion {
-            from_id: "a".to_string(),
-            to_id: "b".to_string(),
-            from_percent: 97.0,
-            to_percent: 12.0,
-            from_resets_at: Some(at(3600)),
-        };
-        assert_eq!(
-            serde_json::to_value(&suggestion).unwrap(),
-            json!({
-                "fromId": "a",
-                "toId": "b",
-                "fromPercent": 97.0,
-                "toPercent": 12.0,
-                "fromResetsAt": "2026-11-10T13:00:00Z"
-            })
-        );
+    fn login_warning_json_shapes() {
         assert_eq!(
             serde_json::to_value(LoginWarning::Soon {
                 id: "a".to_string(),
@@ -3159,6 +3088,94 @@ mod tests {
     }
 
     #[test]
+    fn near_full_is_polled_every_thirty_seconds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = Fixture::new(&tmp);
+        let (_app, _fake, mut engine) = fixture.into_engine();
+        let settings = Settings::default();
+        let now = at(9000);
+        let fetched = now - chrono::Duration::seconds(31);
+
+        cache_usage(&mut engine, A_ID, usage_with(91.0, Some(at(9600))), fetched);
+        assert!(
+            engine.due(A_ID, true, PollReason::Timer, now, &settings),
+            "91 % is near full and 31 s is older than the 30 s poll"
+        );
+
+        cache_usage(&mut engine, A_ID, usage_with(89.0, Some(at(9600))), fetched);
+        assert!(
+            !engine.due(A_ID, true, PollReason::Timer, now, &settings),
+            "89 % keeps the account's poll interval"
+        );
+
+        cache_usage(&mut engine, A_ID, usage_with(90.0, Some(at(9600))), fetched);
+        assert!(
+            engine.due(A_ID, true, PollReason::Timer, now, &settings),
+            "90 % is near full and 31 s is older than the 30 s poll"
+        );
+    }
+
+    #[test]
+    fn a_blocked_active_account_is_not_polled_every_thirty_seconds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = Fixture::new(&tmp);
+        let (_app, _fake, mut engine) = fixture.into_engine();
+        let settings = Settings::default();
+        let now = at(9000);
+        cache_usage(
+            &mut engine,
+            A_ID,
+            usage_with(100.0, Some(at(9600))),
+            now - chrono::Duration::seconds(31),
+        );
+        assert!(
+            !engine.due(A_ID, true, PollReason::Timer, now, &settings),
+            "a full active account keeps the reset rule, not the 30 s poll"
+        );
+    }
+
+    #[test]
+    fn a_stale_poll_polls_only_old_readings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = Fixture::new(&tmp);
+        let (_app, _fake, mut engine) = fixture.into_engine();
+        let settings = Settings::default();
+        let now = at(9000);
+
+        cache_usage(
+            &mut engine,
+            A_ID,
+            usage_with(20.0, Some(at(9600))),
+            now - chrono::Duration::minutes(21),
+        );
+        cache_usage(
+            &mut engine,
+            B_ID,
+            usage_with(20.0, Some(at(9600))),
+            now - chrono::Duration::minutes(1),
+        );
+        assert!(
+            engine.due(A_ID, true, PollReason::Stale, now, &settings),
+            "21 minutes is older than FRESH_MIN"
+        );
+        assert!(
+            !engine.due(B_ID, false, PollReason::Stale, now, &settings),
+            "a fresh reading is not polled for a stale ask"
+        );
+
+        engine
+            .cache
+            .entries
+            .get_mut(A_ID)
+            .expect("A's entry")
+            .backoff_until = Some(now + chrono::Duration::minutes(1));
+        assert!(
+            !engine.due(A_ID, true, PollReason::Stale, now, &settings),
+            "an account in back-off is not polled"
+        );
+    }
+
+    #[test]
     fn all_blocked_and_any_usable_are_written_once() {
         let tmp = tempfile::tempdir().unwrap();
         let fixture = Fixture::new(&tmp);
@@ -3183,7 +3200,7 @@ mod tests {
         engine.poll(PollReason::Timer, t0()).unwrap();
         assert_eq!(state_event_types(&root), vec!["allBlocked"]);
 
-        engine.poll(PollReason::Timer, at(60)).unwrap();
+        engine.poll(PollReason::Timer, at(10)).unwrap();
         assert_eq!(
             state_event_types(&root),
             vec!["allBlocked"],
@@ -3350,11 +3367,12 @@ mod tests {
         let host_dir = root.join("vega");
         fs::create_dir_all(&host_dir).unwrap();
         fs::set_permissions(&host_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let fake = fixture.fake.clone();
         let (_app, _fake, engine) = fixture.into_engine();
         let mut engine = engine.with_recorder(Recorder::new(HistoryDir::at(&root, "vega")));
         let blocked = usage_with(100.0, Some(at(3600)));
         cache_usage(&mut engine, A_ID, blocked.clone(), t0());
-        cache_usage(&mut engine, B_ID, blocked, t0());
+        cache_usage(&mut engine, B_ID, blocked.clone(), t0());
 
         let views = engine.poll(PollReason::Timer, t0()).unwrap();
         let a = views.iter().find(|view| view.id == A_ID).unwrap();
@@ -3365,7 +3383,8 @@ mod tests {
         );
 
         fs::set_permissions(&host_dir, fs::Permissions::from_mode(0o755)).unwrap();
-        let views = engine.poll(PollReason::Timer, at(60)).unwrap();
+        fake.script_usage_ok(&live_access(), 100.0);
+        let views = engine.poll(PollReason::Timer, at(31)).unwrap();
         let a = views.iter().find(|view| view.id == A_ID).unwrap();
         assert_eq!(
             a.last_error, None,
@@ -3449,11 +3468,12 @@ mod tests {
 
         // The app restarts: a new engine reads the same cache and the same
         // history, and nothing changed in between.
+        fake.script_usage_ok(&live_access(), 100.0);
         let store = Store::new(app.clone(), Box::new(FileSecrets::new(app.secrets_dir())));
         let mut engine = Engine::new(claude, store, fake)
             .unwrap()
             .with_recorder(Recorder::new(HistoryDir::at(&root, "vega")));
-        engine.poll(PollReason::Timer, at(60)).unwrap();
+        engine.poll(PollReason::Timer, at(31)).unwrap();
         assert_eq!(
             state_event_types(&root),
             vec!["allBlocked"],
