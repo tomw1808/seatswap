@@ -105,7 +105,7 @@ pub trait Record: Serialize + DeserializeOwned {
 }
 
 /// An account by the ids the server uses, never by seatswap's local id.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct AccountRef {
     pub acc: String,
     pub org: String,

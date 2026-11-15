@@ -1,0 +1,92 @@
+//! Auto-burn (spec §2): what a session's tokens cost in work units, the weekly
+//! rhythm of work, and each account's rates. The plans, the decision, the cost
+//! of a switch and the replay join these types in the tasks after this one.
+
+use chrono::{DateTime, Datelike, FixedOffset, Timelike, Utc};
+
+pub mod rates;
+
+/// An account's rates are known from this much work on it (spec §2.3, "while
+/// learning").
+pub const LEARN_MIN_WU: f64 = 20.0;
+/// The rhythm averages this many weeks; the newer two count double.
+pub const RHYTHM_WEEKS: i64 = 4;
+/// Rates are learned from the samples of this many days.
+pub const RATES_DAYS: i64 = 14;
+
+/// One output token against one input token (spec §2.3).
+const OUTPUT_WEIGHT: f64 = 5.0;
+/// One token written to the cache against one input token.
+const CACHE_WRITE_WEIGHT: f64 = 1.25;
+/// One token read from the cache against one input token.
+const CACHE_READ_WEIGHT: f64 = 0.1;
+/// The hours of the week.
+const HOURS: usize = 168;
+
+/// How much one of the [`RHYTHM_WEEKS`] weeks weighs in the rhythm: the two
+/// newer ones weigh 2, the two older ones 1.
+fn week_weight(week: i64) -> f64 {
+    if week < 2 {
+        2.0
+    } else {
+        1.0
+    }
+}
+
+/// Work in work units: a million weighted tokens (spec §2.3). The one place the
+/// four kinds of token are weighed.
+pub fn work_units(input: u64, output: u64, cache_write: u64, cache_read: u64) -> f64 {
+    (input as f64
+        + OUTPUT_WEIGHT * output as f64
+        + CACHE_WRITE_WEIGHT * cache_write as f64
+        + CACHE_READ_WEIGHT * cache_read as f64)
+        / 1_000_000.0
+}
+
+/// Work units per clock hour of the week, in the local time of the offset the
+/// rhythm was learned in; index 0 is Monday 00:00.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rhythm {
+    pub wu: [f64; HOURS],
+}
+
+impl Rhythm {
+    /// The work units of the hour that holds `t`.
+    pub fn at(&self, t: DateTime<Utc>, offset: FixedOffset) -> f64 {
+        self.wu[hour_of_week(t, offset)]
+    }
+
+    /// The mean over the hours that have work, 0.0 when there is none: the
+    /// "work of a typical working hour" of spec §2.3.
+    pub fn typical_hour(&self) -> f64 {
+        let mut sum = 0.0;
+        let mut hours = 0usize;
+        for wu in &self.wu {
+            if *wu > 0.0 {
+                sum += *wu;
+                hours += 1;
+            }
+        }
+        if hours == 0 {
+            0.0
+        } else {
+            sum / hours as f64
+        }
+    }
+}
+
+/// The index of the hour of the week that holds `t`: Monday 00:00 local is 0.
+pub(crate) fn hour_of_week(t: DateTime<Utc>, offset: FixedOffset) -> usize {
+    let local = t.with_timezone(&offset);
+    local.weekday().num_days_from_monday() as usize * 24 + local.hour() as usize
+}
+
+/// One account's rates (spec §2.3): `c` is the percent of its week one work
+/// unit costs, `s` the percent of one 5 h window. `s` is `None` for an account
+/// without a session limit, or until enough work is known for it. Neither rate
+/// is ever 0 or below: a rate that cannot be positive is unknown, not a number.
+#[derive(Debug, Clone, Copy)]
+pub struct Rates {
+    pub c: f64,
+    pub s: Option<f64>,
+}
