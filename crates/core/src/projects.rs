@@ -13,6 +13,30 @@ use crate::history::{AccountRef, Hosted, Kind, Record, SessionRecord};
 use crate::project::ProjectKey;
 use crate::store::Account;
 
+/// A project in the project log and the page: a repository is one project on every host;
+/// a folder project is the folder on one host (spec §3.6).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectId {
+    #[serde(flatten)]
+    pub key: ProjectKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+}
+
+impl ProjectId {
+    /// `host` is kept for a folder key only.
+    pub fn of(key: &ProjectKey, host: &str) -> ProjectId {
+        ProjectId {
+            key: key.clone(),
+            host: match key {
+                ProjectKey::Repo(_) => None,
+                ProjectKey::Folder(_) => Some(host.to_string()),
+            },
+        }
+    }
+}
+
 /// One edit of the project log (spec §3.6): what a person changed in the
 /// settings. The log is append-only and merged over all hosts; for the same
 /// thing the later record wins.
@@ -25,20 +49,20 @@ use crate::store::Account;
 pub enum ProjectEdit {
     /// A project's shown name, 1..=40 characters.
     Rename {
-        key: ProjectKey,
+        key: ProjectId,
         name: String,
     },
     /// `key`'s tokens count for `into`.
     Join {
-        key: ProjectKey,
-        into: ProjectKey,
+        key: ProjectId,
+        into: ProjectId,
     },
     Unjoin {
-        key: ProjectKey,
+        key: ProjectId,
     },
     /// The organization a project belongs to; `None` = unassigned.
     Assign {
-        key: ProjectKey,
+        key: ProjectId,
         org: Option<String>,
     },
     /// The shown name of an organization; its identity stays `org`.
@@ -51,10 +75,10 @@ pub enum ProjectEdit {
         org: String,
         into: String,
     },
-    /// The organization's own subscriptions, the whole list.
-    OrgAccounts {
-        org: String,
-        accounts: Vec<AccountRef>,
+    /// One account's organization; `None` = no organization.
+    AccountOrg {
+        account: AccountRef,
+        org: Option<String>,
     },
 }
 
@@ -63,31 +87,40 @@ impl ProjectEdit {
     /// nothing; the page shows the error text under the row.
     pub fn validate(&self) -> Result<(), ProjectsError> {
         match self {
-            ProjectEdit::Rename { name, .. } => validate_name("project", name),
+            ProjectEdit::Rename { key, name } => {
+                validate_project_id(key)?;
+                validate_name("project", name)
+            }
             ProjectEdit::OrgRename { name, .. } => validate_name("organization", name),
             ProjectEdit::Join { key, into } => {
+                validate_project_id(key)?;
+                validate_project_id(into)?;
                 if key == into {
                     return Err(ProjectsError::JoinIntoItself { what: "project" });
                 }
                 Ok(())
             }
             ProjectEdit::OrgJoin { org, into } => {
-                if org.trim().is_empty() {
-                    return Err(ProjectsError::EmptyOrg);
-                }
+                validate_identity(org)?;
                 if org == into {
                     return Err(ProjectsError::JoinIntoItself {
                         what: "organization",
                     });
                 }
-                validate_name("organization", into)
+                validate_identity(into)
             }
-            ProjectEdit::Assign { org, .. } => match org {
-                Some(org) => validate_name("organization", org),
+            ProjectEdit::Assign { key, org } => {
+                validate_project_id(key)?;
+                match org {
+                    Some(org) => validate_identity(org),
+                    None => Ok(()),
+                }
+            }
+            ProjectEdit::AccountOrg { org, .. } => match org {
+                Some(org) => validate_identity(org),
                 None => Ok(()),
             },
-            ProjectEdit::OrgAccounts { org, .. } => validate_name("organization", org),
-            ProjectEdit::Unjoin { .. } => Ok(()),
+            ProjectEdit::Unjoin { key } => validate_project_id(key),
         }
     }
 }
@@ -100,10 +133,33 @@ pub enum ProjectsError {
     NameBlank { what: &'static str },
     #[error("an organization name must not be empty")]
     EmptyOrg,
+    #[error("a folder project id must name the host it was seen on")]
+    FolderWithoutHost,
+    #[error("a repository project id is the same on every host, but has host {host}")]
+    RepoHasHost { host: String },
     #[error("a {what} cannot be joined into itself")]
     JoinIntoItself { what: &'static str },
     #[error(transparent)]
     History(#[from] crate::history::HistoryError),
+}
+
+/// An id keeps a host only for a folder key: a repository is the same on every
+/// host, and a folder without a host is not a project.
+fn validate_project_id(id: &ProjectId) -> Result<(), ProjectsError> {
+    match (&id.key, &id.host) {
+        (ProjectKey::Repo(_), Some(host)) => Err(ProjectsError::RepoHasHost { host: host.clone() }),
+        (ProjectKey::Folder(_), None) => Err(ProjectsError::FolderWithoutHost),
+        _ => Ok(()),
+    }
+}
+
+/// An organization identity comes from a login's `orgName` or a repository
+/// owner, not from typing, so it only has to be non-blank.
+fn validate_identity(org: &str) -> Result<(), ProjectsError> {
+    if org.trim().is_empty() {
+        return Err(ProjectsError::EmptyOrg);
+    }
+    Ok(())
 }
 
 /// A name is 1..=40 Unicode characters, not only spaces, and is never cut.
@@ -139,7 +195,7 @@ impl Record for ProjectsLogRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Project {
-    pub key: ProjectKey,
+    pub key: ProjectId,
     pub name: String,
     pub repo: Option<String>,
     pub org: Option<String>,
@@ -155,7 +211,7 @@ pub struct Project {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JoinedKey {
-    pub key: ProjectKey,
+    pub key: ProjectId,
     /// The key's default name (a joined key's own rename does not show).
     pub name: String,
 }
@@ -163,15 +219,15 @@ pub struct JoinedKey {
 impl Project {
     /// What a key that no session named looks like: its default name, its
     /// repository and owner, and nothing seen.
-    fn default_of(key: &ProjectKey) -> Project {
+    fn default_of(id: &ProjectId) -> Project {
         Project {
-            key: key.clone(),
-            name: default_name(key),
-            repo: match key {
+            key: id.clone(),
+            name: default_name(&id.key),
+            repo: match &id.key {
                 ProjectKey::Repo(repo) => Some(repo.clone()),
                 ProjectKey::Folder(_) => None,
             },
-            org: default_org(key),
+            org: default_org(&id.key),
             joined: Vec::new(),
             folders: BTreeMap::new(),
             sessions: 0,
@@ -194,7 +250,7 @@ pub struct Org {
 }
 
 /// A stored account with the reference the history uses, so the page can write
-/// whole `OrgAccounts` lists.
+/// one `AccountOrg` edit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountEntry {
@@ -216,11 +272,11 @@ pub struct Projects {
     /// not a row of `projects`: the later `Rename`/`Assign` of a key, and the
     /// joins (project and organization) it was put into.
     #[serde(skip)]
-    names: BTreeMap<ProjectKey, String>,
+    names: BTreeMap<ProjectId, String>,
     #[serde(skip)]
-    assigned: BTreeMap<ProjectKey, Option<String>>,
+    assigned: BTreeMap<ProjectId, Option<String>>,
     #[serde(skip)]
-    joins: BTreeMap<ProjectKey, (ProjectKey, usize)>,
+    joins: BTreeMap<ProjectId, (ProjectId, usize)>,
     #[serde(skip)]
     org_join: BTreeMap<String, (String, usize)>,
 }
@@ -232,20 +288,21 @@ impl Projects {
     /// cycle drops the earlier of the records that form it.
     ///
     /// An account is in one organization. It starts in the root of its
-    /// `org_name` (none without one); then each `OrgAccounts` record, in log
-    /// order, moves every account it names to its root and drops every account
-    /// in that root that it does not name. An account no record ever named
-    /// keeps its default.
+    /// `org_name` (none without one); then each `AccountOrg` record, in log
+    /// order, puts that account in the root of its organization, or in none.
+    /// Nothing else moves an account.
     pub fn resolve(
         log: &[Hosted<ProjectsLogRecord>],
         sessions: &[Hosted<SessionRecord>],
         accounts: &[Account],
     ) -> Projects {
         // What the sessions named: folders per host and distinct session ids.
-        let mut folders: BTreeMap<ProjectKey, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
-        let mut sessions_of: BTreeMap<ProjectKey, BTreeSet<String>> = BTreeMap::new();
+        // A folder key carries its host; a repository key is the same on every
+        // host (spec §3.6).
+        let mut folders: BTreeMap<ProjectId, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
+        let mut sessions_of: BTreeMap<ProjectId, BTreeSet<String>> = BTreeMap::new();
         for hosted in sessions {
-            let key = hosted.record.project.clone();
+            let key = ProjectId::of(&hosted.record.project, &hosted.host);
             folders
                 .entry(key.clone())
                 .or_default()
@@ -268,14 +325,14 @@ impl Projects {
                 .then_with(|| a.host.cmp(&b.host))
         });
 
-        let mut names: BTreeMap<ProjectKey, String> = BTreeMap::new();
-        let mut assigned: BTreeMap<ProjectKey, Option<String>> = BTreeMap::new();
-        let mut joins: BTreeMap<ProjectKey, (ProjectKey, usize)> = BTreeMap::new();
+        let mut names: BTreeMap<ProjectId, String> = BTreeMap::new();
+        let mut assigned: BTreeMap<ProjectId, Option<String>> = BTreeMap::new();
+        let mut joins: BTreeMap<ProjectId, (ProjectId, usize)> = BTreeMap::new();
         let mut org_join: BTreeMap<String, (String, usize)> = BTreeMap::new();
         let mut org_names: BTreeMap<String, String> = BTreeMap::new();
-        // The account lists in the order they apply, after every `OrgJoin` is
-        // resolved: one rule per account (see below).
-        let mut org_account_lists: Vec<(String, Vec<AccountRef>)> = Vec::new();
+        // The per-account organization edits in the order they apply, after
+        // every `OrgJoin` is resolved: the latest record for an account wins.
+        let mut account_org_edits: Vec<(AccountRef, Option<String>)> = Vec::new();
         for (order, hosted) in ordered.into_iter().enumerate() {
             match &hosted.record.edit {
                 ProjectEdit::Rename { key, name } => {
@@ -309,18 +366,18 @@ impl Projects {
                     break_join_cycle(&mut org_join, org, into);
                     org_join.insert(org.clone(), (into.clone(), order));
                 }
-                ProjectEdit::OrgAccounts { org, accounts } => {
-                    org_account_lists.push((org.clone(), accounts.clone()));
+                ProjectEdit::AccountOrg { account, org } => {
+                    account_org_edits.push((account.clone(), org.clone()));
                 }
             }
         }
 
         // Every key the sessions or the log named, grouped under the key it is
         // joined into.
-        let mut keys: BTreeSet<ProjectKey> = folders.keys().cloned().collect();
+        let mut keys: BTreeSet<ProjectId> = folders.keys().cloned().collect();
         keys.extend(joins.keys().cloned());
         keys.extend(joins.values().map(|(into, _)| into.clone()));
-        let mut groups: BTreeMap<ProjectKey, Vec<ProjectKey>> = BTreeMap::new();
+        let mut groups: BTreeMap<ProjectId, Vec<ProjectId>> = BTreeMap::new();
         for key in keys {
             groups.entry(join_root(&joins, &key)).or_default().push(key);
         }
@@ -351,19 +408,19 @@ impl Projects {
                 .filter(|member| **member != root)
                 .map(|member| JoinedKey {
                     key: member.clone(),
-                    name: default_name(member),
+                    name: default_name(&member.key),
                 })
                 .collect();
             let org = match assigned.get(&root) {
                 Some(org) => org.clone(),
-                None => default_org(&root),
+                None => default_org(&root.key),
             };
             projects.push(Project {
                 name: names
                     .get(&root)
                     .cloned()
-                    .unwrap_or_else(|| default_name(&root)),
-                repo: match &root {
+                    .unwrap_or_else(|| default_name(&root.key)),
+                repo: match &root.key {
                     ProjectKey::Repo(repo) => Some(repo.clone()),
                     ProjectKey::Folder(_) => None,
                 },
@@ -397,15 +454,13 @@ impl Projects {
         identities.extend(org_names.keys().cloned());
         identities.extend(org_join.keys().cloned());
         identities.extend(org_join.values().map(|(into, _)| into.clone()));
-        identities.extend(org_account_lists.iter().map(|(org, _)| org.clone()));
+        identities.extend(account_org_edits.iter().filter_map(|(_, org)| org.clone()));
 
         // One rule decides an account's organization. It starts in the root of
         // its `org_name` (none when it has no `org_name`). Then each
-        // `OrgAccounts` record, in log order, takes every account it names to
-        // the record's root, and drops every account that is in that root and
-        // that it does not name. An account no record ever named keeps its
-        // default, so a new account whose `org_name` matches an organization
-        // shows in it.
+        // `AccountOrg` record, in log order, puts that one account in the
+        // record's root, or in none. Nothing else moves it, so an account only
+        // another host stores keeps its own organization.
         let mut account_org: BTreeMap<AccountRef, String> = BTreeMap::new();
         for account in accounts {
             if let Some(org) = &account.org_name {
@@ -414,12 +469,14 @@ impl Projects {
                 }
             }
         }
-        for (org, list) in &org_account_lists {
-            let root = join_root(&org_join, org);
-            let named: BTreeSet<AccountRef> = list.iter().cloned().collect();
-            account_org.retain(|account, current| current != &root || named.contains(account));
-            for account in named {
-                account_org.insert(account, root.clone());
+        for (account, org) in &account_org_edits {
+            match org {
+                Some(org) => {
+                    account_org.insert(account.clone(), join_root(&org_join, org));
+                }
+                None => {
+                    account_org.remove(account);
+                }
             }
         }
 
@@ -502,12 +559,12 @@ impl Projects {
         }
     }
 
-    /// The project `key` belongs to after joins: the one it is joined into.
-    /// A key no session named (a token record of a project seen only there)
+    /// The project `id` belongs to after joins: the one it is joined into.
+    /// An id no session named (a token record of a project seen only there)
     /// follows the log too: its default, with a later name or assignment, is
     /// not stored in `projects`.
-    pub fn of(&self, key: &ProjectKey) -> Project {
-        let root = join_root(&self.joins, key);
+    pub fn of(&self, id: &ProjectId) -> Project {
+        let root = join_root(&self.joins, id);
         if let Some(project) = self.projects.iter().find(|project| project.key == root) {
             return project.clone();
         }
@@ -517,7 +574,7 @@ impl Projects {
         }
         let org = match self.assigned.get(&root) {
             Some(org) => org.clone(),
-            None => default_org(&root),
+            None => default_org(&root.key),
         };
         project.org = org.map(|org| join_root(&self.org_join, &org));
         project
@@ -615,25 +672,32 @@ mod tests {
         text.parse::<DateTime<Utc>>().expect("a test time")
     }
 
-    fn repo(id: &str) -> ProjectKey {
-        ProjectKey::Repo(id.to_string())
+    fn repo(id: &str) -> ProjectId {
+        ProjectId {
+            key: ProjectKey::Repo(id.to_string()),
+            host: None,
+        }
     }
 
-    fn folder(name: &str) -> ProjectKey {
-        ProjectKey::Folder(name.to_string())
+    fn folder(name: &str, host: &str) -> ProjectId {
+        ProjectId::of(&ProjectKey::Folder(name.to_string()), host)
     }
 
     const SESSION_A: &str = "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34";
     const SESSION_B: &str = "2b7d9c1e-5a4f-4c3b-9e8d-7f6a5b4c3d2e";
     const AC_ACC: &str = "6f1c2a9e-1d4b-4c7f-9a3e-8b5d2e6f1c04";
     const AC_ORG: &str = "a92d7b31-5c8e-4f2a-9d6b-1e3c5a7f9b20";
+    const PR_ACC: &str = "4d8b1f3a-7c2e-4a9d-8b6f-1e5c3a7d9b42";
+    const PR_ORG: &str = "9e3c5a7f-1b2d-4e8a-9c6f-3a1d5b7e9c24";
+    const LB_ACC: &str = "1a7f3c5e-9b2d-4f6a-8c1e-5d3b7a9f2c64";
+    const LB_ORG: &str = "7c1e5a9b-3d2f-4a8c-9e6b-1f5d3c7a9b28";
 
     fn session(
         host: &str,
         at: &str,
         id: &str,
         cwd: &str,
-        project: ProjectKey,
+        project: ProjectId,
     ) -> Hosted<SessionRecord> {
         Hosted {
             host: host.to_string(),
@@ -641,7 +705,7 @@ mod tests {
                 t: utc(at),
                 session: id.to_string(),
                 cwd: cwd.to_string(),
-                project,
+                project: project.key,
                 entrypoint: Some("cli".to_string()),
                 first: utc(at),
                 last: utc(at),
@@ -660,20 +724,40 @@ mod tests {
     }
 
     fn account(id: &str, org_name: Option<&str>) -> Account {
+        account_with(
+            id,
+            AC_ACC,
+            AC_ORG,
+            "Acme",
+            "AC",
+            "sam@acme.example",
+            org_name,
+        )
+    }
+
+    fn account_with(
+        id: &str,
+        account_uuid: &str,
+        organization_uuid: &str,
+        label: &str,
+        abbr: &str,
+        email: &str,
+        org_name: Option<&str>,
+    ) -> Account {
         serde_json::from_value(json!({
             "id": id,
-            "accountUuid": AC_ACC,
-            "organizationUuid": AC_ORG,
-            "label": "Acme",
-            "abbr": "AC",
+            "accountUuid": account_uuid,
+            "organizationUuid": organization_uuid,
+            "label": label,
+            "abbr": abbr,
             "color": "#3b82f6",
-            "email": "sam@acme.example",
+            "email": email,
             "orgName": org_name,
             "plan": "Team 5x",
             "oauthAccount": {
-                "accountUuid": AC_ACC,
-                "organizationUuid": AC_ORG,
-                "emailAddress": "sam@acme.example"
+                "accountUuid": account_uuid,
+                "organizationUuid": organization_uuid,
+                "emailAddress": email
             },
             "addedAt": "2026-09-01T00:00:00Z",
             "loginState": "ok",
@@ -712,7 +796,7 @@ mod tests {
             "2026-11-14T10:00:00Z",
             SESSION_A,
             "/home/sam/notes",
-            folder("notes"),
+            folder("notes", "atlas"),
         )];
         let projects = Projects::resolve(&[], &sessions, &[]);
         assert_eq!(projects.projects.len(), 1);
@@ -723,7 +807,7 @@ mod tests {
 
     #[test]
     fn the_home_folder_has_its_own_name() {
-        let key = folder("~");
+        let key = folder("~", "atlas");
         let sessions = vec![session(
             "atlas",
             "2026-11-14T10:00:00Z",
@@ -846,7 +930,7 @@ mod tests {
     #[test]
     fn join_moves_the_sessions() {
         let atlas = repo("github.com/sam/atlas");
-        let old = folder("atlas-old");
+        let old = folder("atlas-old", "atlas");
         let sessions = vec![
             session(
                 "atlas",
@@ -880,7 +964,7 @@ mod tests {
                 .joined
                 .iter()
                 .map(|joined| joined.key.clone())
-                .collect::<Vec<ProjectKey>>(),
+                .collect::<Vec<ProjectId>>(),
             vec![old.clone()]
         );
         assert_eq!(project.joined[0].name, "atlas-old");
@@ -890,8 +974,8 @@ mod tests {
 
     #[test]
     fn a_join_cycle_keeps_the_later_record() {
-        let a = folder("a");
-        let b = folder("b");
+        let a = folder("a", "atlas");
+        let b = folder("b", "atlas");
         let sessions = vec![
             session(
                 "atlas",
@@ -935,7 +1019,7 @@ mod tests {
                 .joined
                 .iter()
                 .map(|joined| joined.key.clone())
-                .collect::<Vec<ProjectKey>>(),
+                .collect::<Vec<ProjectId>>(),
             vec![b]
         );
         assert_eq!(project.sessions, 2);
@@ -1018,7 +1102,7 @@ mod tests {
             }
         );
 
-        let unknown_folder = folder("notes");
+        let unknown_folder = folder("notes", "atlas");
         assert_eq!(
             projects.of(&unknown_folder),
             Project {
@@ -1038,20 +1122,56 @@ mod tests {
         let record = ProjectsLogRecord {
             t: utc("2026-11-14T10:00:00Z"),
             edit: ProjectEdit::Join {
-                key: folder("atlas-old"),
+                key: folder("atlas-old", "atlas"),
                 into: repo("github.com/sam/atlas"),
             },
         };
         let line = serde_json::to_string(&record).expect("a log line");
         assert!(line.contains("\"edit\":\"join\""), "{line}");
         assert!(line.contains("\"t\":\"2026-11-14T10:00:00Z\""), "{line}");
+        assert!(
+            line.contains("\"kind\":\"folder\",\"id\":\"atlas-old\",\"host\":\"atlas\""),
+            "{line}"
+        );
+        assert!(
+            line.contains("\"into\":{\"kind\":\"repo\",\"id\":\"github.com/sam/atlas\"}"),
+            "{line}"
+        );
         let read: ProjectsLogRecord = serde_json::from_str(&line).expect("the line reads back");
         assert_eq!(read, record);
     }
 
     #[test]
+    fn a_project_id_names_a_host_only_for_a_folder() {
+        let folder_key = ProjectKey::Folder("notes".to_string());
+        let repo_key = ProjectKey::Repo("github.com/sam/atlas".to_string());
+        assert_eq!(
+            ProjectId::of(&folder_key, "atlas").host.as_deref(),
+            Some("atlas")
+        );
+        assert_eq!(ProjectId::of(&repo_key, "atlas").host, None);
+
+        let rename = |key: ProjectId| ProjectEdit::Rename {
+            key,
+            name: "Notes".to_string(),
+        };
+        assert!(rename(ProjectId {
+            key: folder_key,
+            host: None,
+        })
+        .validate()
+        .is_err());
+        assert!(rename(ProjectId {
+            key: repo_key,
+            host: Some("atlas".to_string()),
+        })
+        .validate()
+        .is_err());
+    }
+
+    #[test]
     fn a_name_is_one_to_forty_characters() {
-        let key = folder("atlas");
+        let key = folder("atlas", "atlas");
         let rename = |name: &str| ProjectEdit::Rename {
             key: key.clone(),
             name: name.to_string(),
@@ -1106,9 +1226,9 @@ mod tests {
             edit(
                 "atlas",
                 "2026-11-14T10:05:00Z",
-                ProjectEdit::OrgAccounts {
-                    org: "acme".to_string(),
-                    accounts: vec![acme_account()],
+                ProjectEdit::AccountOrg {
+                    account: acme_account(),
+                    org: Some("acme".to_string()),
                 },
             ),
         ];
@@ -1133,16 +1253,16 @@ mod tests {
     #[test]
     fn proof_an_account_can_leave_a_joined_default_organization() {
         // "Acme Inc." (the account's org_name) is joined into "acme"; the page
-        // then writes the whole list of "acme" without the account.
+        // then moves the one account to no organization.
         let accounts = vec![account("acme-local", Some("Acme Inc."))];
         let log = vec![
             org_join("2026-11-14T10:00:00Z", "Acme Inc.", "acme"),
             edit(
                 "atlas",
                 "2026-11-14T10:05:00Z",
-                ProjectEdit::OrgAccounts {
-                    org: "acme".to_string(),
-                    accounts: vec![],
+                ProjectEdit::AccountOrg {
+                    account: acme_account(),
+                    org: None,
                 },
             ),
         ];
@@ -1176,15 +1296,99 @@ mod tests {
     }
 
     #[test]
-    fn proof_a_new_organization_name_is_one_to_forty_characters() {
-        let edit = ProjectEdit::Assign {
-            key: folder("atlas"),
-            org: Some("o".repeat(41)),
-        };
-        assert!(
-            edit.validate().is_err(),
-            "a 41-character organization name was accepted"
-        );
+    fn an_organization_identity_is_not_held_to_the_name_rule() {
+        // The account's orgName comes from the login, not from typing: 41
+        // characters are an organization identity all the same.
+        let long = format!("{}x", "Acme Inc. ".repeat(4));
+        assert_eq!(long.chars().count(), 41);
+        assert!(ProjectEdit::Assign {
+            key: folder("atlas", "atlas"),
+            org: Some(long.clone()),
+        }
+        .validate()
+        .is_ok());
+        assert!(ProjectEdit::AccountOrg {
+            account: acme_account(),
+            org: Some(long.clone()),
+        }
+        .validate()
+        .is_ok());
+        assert!(ProjectEdit::OrgJoin {
+            org: long.clone(),
+            into: "acme".to_string(),
+        }
+        .validate()
+        .is_ok());
+        assert!(ProjectEdit::OrgJoin {
+            org: "acme".to_string(),
+            into: long.clone(),
+        }
+        .validate()
+        .is_ok());
+        assert!(ProjectEdit::OrgRename {
+            org: long.clone(),
+            name: "Acme".to_string(),
+        }
+        .validate()
+        .is_ok());
+
+        // A 41-character orgName and the edits that name it all work.
+        let key = folder("atlas", "atlas");
+        let accounts = vec![account("acme-local", Some(&long))];
+        let log = vec![
+            edit(
+                "atlas",
+                "2026-11-14T10:00:00Z",
+                ProjectEdit::Assign {
+                    key: key.clone(),
+                    org: Some(long.clone()),
+                },
+            ),
+            org_join("2026-11-14T10:05:00Z", &long, "acme"),
+            edit(
+                "atlas",
+                "2026-11-14T10:10:00Z",
+                ProjectEdit::OrgRename {
+                    org: "acme".to_string(),
+                    name: "Acme".to_string(),
+                },
+            ),
+        ];
+        let projects = Projects::resolve(&log, &[], &accounts);
+        assert_eq!(projects.of(&key).org.as_deref(), Some("acme"));
+        let org = projects
+            .orgs
+            .iter()
+            .find(|org| org.id == "acme")
+            .expect("the joined organization");
+        assert_eq!(org.name, "Acme");
+        assert_eq!(org.accounts, vec![acme_account()]);
+
+        // Non-blank is still required, and a shown name is still 1..=40.
+        assert!(ProjectEdit::Assign {
+            key: folder("atlas", "atlas"),
+            org: Some(" ".to_string()),
+        }
+        .validate()
+        .is_err());
+        assert!(ProjectEdit::AccountOrg {
+            account: acme_account(),
+            org: Some(" ".to_string()),
+        }
+        .validate()
+        .is_err());
+        assert!(ProjectEdit::OrgJoin {
+            org: " ".to_string(),
+            into: "acme".to_string(),
+        }
+        .validate()
+        .is_err());
+        assert!(ProjectEdit::OrgRename {
+            org: long,
+            name: "a".repeat(41),
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]
@@ -1193,17 +1397,17 @@ mod tests {
             edit(
                 "atlas",
                 "2026-11-14T10:00:00Z",
-                ProjectEdit::OrgAccounts {
-                    org: "acme".to_string(),
-                    accounts: vec![acme_account()],
+                ProjectEdit::AccountOrg {
+                    account: acme_account(),
+                    org: Some("acme".to_string()),
                 },
             ),
             edit(
                 "atlas",
                 "2026-11-14T10:05:00Z",
-                ProjectEdit::OrgAccounts {
-                    org: "zeta".to_string(),
-                    accounts: vec![acme_account()],
+                ProjectEdit::AccountOrg {
+                    account: acme_account(),
+                    org: Some("zeta".to_string()),
                 },
             ),
         ];
@@ -1223,22 +1427,22 @@ mod tests {
                 "atlas",
                 "2026-11-14T10:00:00Z",
                 ProjectEdit::Join {
-                    key: folder("atlas"),
-                    into: folder("ledger"),
+                    key: folder("atlas", "atlas"),
+                    into: folder("ledger", "atlas"),
                 },
             ),
             edit(
                 "atlas",
                 "2026-11-14T10:05:00Z",
                 ProjectEdit::Rename {
-                    key: folder("ledger"),
+                    key: folder("ledger", "atlas"),
                     name: "Ledger".to_string(),
                 },
             ),
         ];
         let projects = Projects::resolve(&log, &[], &[]);
-        let found = projects.of(&folder("atlas"));
-        assert_eq!(found.key, folder("ledger"));
+        let found = projects.of(&folder("atlas", "atlas"));
+        assert_eq!(found.key, folder("ledger", "atlas"));
         assert_eq!(found.name, "Ledger");
     }
 
@@ -1249,13 +1453,137 @@ mod tests {
                 "atlas",
                 "2026-11-14T10:00:00Z",
                 ProjectEdit::Assign {
-                    key: folder("atlas"),
+                    key: folder("atlas", "atlas"),
                     org: Some("Acme Inc.".to_string()),
                 },
             ),
             org_join("2026-11-14T10:05:00Z", "Acme Inc.", "acme"),
         ];
         let projects = Projects::resolve(&log, &[], &[]);
-        assert_eq!(projects.of(&folder("atlas")).org.as_deref(), Some("acme"));
+        assert_eq!(
+            projects.of(&folder("atlas", "atlas")).org.as_deref(),
+            Some("acme")
+        );
+    }
+
+    #[test]
+    fn moving_one_account_keeps_an_account_only_another_host_stores() {
+        // Vega stores PR with orgName "Acme Inc."; atlas does not store PR.
+        // Atlas moves LB into "Acme Inc.". PR stays in it, because the one
+        // account edit moves only LB.
+        let pr = account_with(
+            "pr-local",
+            PR_ACC,
+            PR_ORG,
+            "Private",
+            "PR",
+            "sam.private@mail.example",
+            Some("Acme Inc."),
+        );
+        let lb = account_with(
+            "lb-local",
+            LB_ACC,
+            LB_ORG,
+            "Lab",
+            "LB",
+            "sam@lab.example",
+            None,
+        );
+        let accounts = vec![pr.clone(), lb.clone()];
+        let log = vec![edit(
+            "atlas",
+            "2026-11-14T10:00:00Z",
+            ProjectEdit::AccountOrg {
+                account: AccountRef::of(&lb),
+                org: Some("Acme Inc.".to_string()),
+            },
+        )];
+        let projects = Projects::resolve(&log, &[], &accounts);
+        let acme = projects
+            .orgs
+            .iter()
+            .find(|org| org.id == "Acme Inc.")
+            .expect("the organization is there");
+        assert!(acme.accounts.contains(&AccountRef::of(&pr)), "{acme:?}");
+        assert!(acme.accounts.contains(&AccountRef::of(&lb)), "{acme:?}");
+        assert_eq!(acme.accounts.len(), 2, "{acme:?}");
+    }
+
+    #[test]
+    fn the_latest_account_org_record_wins() {
+        // The records arrive out of order; the later one (acme) decides.
+        let accounts = vec![account("acme-local", Some("Acme Inc."))];
+        let log = vec![
+            edit(
+                "vega",
+                "2026-11-14T10:05:00Z",
+                ProjectEdit::AccountOrg {
+                    account: acme_account(),
+                    org: Some("acme".to_string()),
+                },
+            ),
+            edit(
+                "atlas",
+                "2026-11-14T10:00:00Z",
+                ProjectEdit::AccountOrg {
+                    account: acme_account(),
+                    org: Some("Acme Inc.".to_string()),
+                },
+            ),
+        ];
+        let projects = Projects::resolve(&log, &[], &accounts);
+        let holders: Vec<&str> = projects
+            .orgs
+            .iter()
+            .filter(|org| org.accounts.contains(&acme_account()))
+            .map(|org| org.id.as_str())
+            .collect();
+        assert_eq!(holders, vec!["acme"], "{:?}", projects.orgs);
+    }
+
+    #[test]
+    fn folder_projects_are_per_host_until_joined() {
+        let atlas = folder("notes", "atlas");
+        let vega = folder("notes", "vega");
+        let sessions = vec![
+            session(
+                "atlas",
+                "2026-11-14T10:00:00Z",
+                SESSION_A,
+                "/home/sam/notes",
+                atlas.clone(),
+            ),
+            session(
+                "vega",
+                "2026-11-14T11:00:00Z",
+                SESSION_B,
+                "/home/sam/notes",
+                vega.clone(),
+            ),
+        ];
+        let projects = Projects::resolve(&[], &sessions, &[]);
+        assert_eq!(projects.projects.len(), 2, "{:?}", projects.projects);
+        assert!(projects.projects.iter().any(|project| project.key == atlas));
+        assert!(projects.projects.iter().any(|project| project.key == vega));
+        assert_eq!(projects.of(&atlas).name, "notes");
+        assert_eq!(projects.of(&vega).name, "notes");
+
+        // Joining the folder on vega into the one on atlas makes one project.
+        let log = vec![edit(
+            "atlas",
+            "2026-11-14T12:00:00Z",
+            ProjectEdit::Join {
+                key: vega.clone(),
+                into: atlas.clone(),
+            },
+        )];
+        let joined = Projects::resolve(&log, &sessions, &[]);
+        assert_eq!(joined.projects.len(), 1, "{:?}", joined.projects);
+        let project = &joined.projects[0];
+        assert_eq!(project.key, atlas);
+        assert_eq!(project.sessions, 2);
+        assert_eq!(project.folders.len(), 2);
+        assert_eq!(project.joined.len(), 1);
+        assert_eq!(project.joined[0].key, vega);
     }
 }

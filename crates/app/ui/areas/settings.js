@@ -1477,7 +1477,9 @@ async function loadProjects() {
 
 function projectKeyText(key) {
   if (!isObject(key) || typeof key.id !== "string") return "?";
-  return key.id;
+  return typeof key.host === "string" && key.host !== ""
+    ? `${key.kind}:${key.id}@${key.host}`
+    : `${key.kind}:${key.id}`;
 }
 
 function sameRef(first, second) {
@@ -1495,16 +1497,6 @@ function orgOfAccount(projects, id) {
   if (!ref) return null;
   const orgs = Array.isArray(projects.orgs) ? projects.orgs : [];
   return orgs.find((org) => (org.accounts || []).some((account) => sameRef(account, ref))) || null;
-}
-
-function addRef(accounts, ref) {
-  const list = Array.isArray(accounts) ? accounts : [];
-  return list.some((account) => sameRef(account, ref)) ? list : [...list, ref];
-}
-
-function removeRef(accounts, ref) {
-  const list = Array.isArray(accounts) ? accounts : [];
-  return list.filter((account) => !sameRef(account, ref));
 }
 
 // One project edit through the window's command, queued with the settings
@@ -1527,10 +1519,8 @@ function saveProject(edit, field) {
   });
 }
 
-// The Accounts group's organization column: the organizations plus "none". One
-// change is one edit: moving the account to an organization writes that
-// organization's list with the account; moving it to "none" writes the losing
-// organization's list without it.
+// The Accounts group's organization column: the organizations plus "none".
+// One change is one edit for this account: it moves only this account.
 function accountOrgCell(row, field) {
   const projects = isObject(state.projects) ? state.projects : null;
   if (!projects) {
@@ -1569,26 +1559,18 @@ function saveAccountOrg(row, orgId, field) {
       fieldError(field, "The account is not in the stored list; nothing is saved.");
       return false;
     }
-    const from = orgOfAccount(projects, row.id);
+    const current = orgOfAccount(projects, row.id);
     const to = orgId === "" ? null : projects.orgs.find((org) => org.id === orgId) || null;
     if (orgId !== "" && !to) {
       fieldError(field, `unknown organization ${orgId}`);
       return false;
     }
-    if ((from ? from.id : "") === (to ? to.id : "")) {
+    if ((current ? current.id : "") === (to ? to.id : "")) {
       fieldError(field, null);
       return true;
     }
-    if (!from && !to) {
-      fieldError(field, null);
-      return true;
-    }
-    // One edit: the gaining organization's whole list with the account added,
-    // or the losing organization's whole list with it removed. The core's
-    // per-account rule moves the account out of the other organization.
-    const edit = to
-      ? { edit: "orgAccounts", org: to.id, accounts: addRef(to.accounts, ref) }
-      : { edit: "orgAccounts", org: from.id, accounts: removeRef(from.accounts, ref) };
+    // One edit names this one account, so no other account moves.
+    const edit = { edit: "accountOrg", account: ref, org: to ? to.id : null };
     try {
       const view = await state.context.invoke("projects_edit", { edit });
       if (!isObject(view)) throw new Error("projects_edit returned an unexpected reply");

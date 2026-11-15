@@ -1076,24 +1076,31 @@ reports; it executes nothing. From a folder it walks up to the repository root a
 `origin` remote. The project's identity is that address, normalised: host lower-cased, no protocol,
 no user or token, no port, no `.git`, no trailing `/` (`github.com/acme/atlas`). Without a remote it
 is the repository's folder name; outside a repository, the first folder under the home folder, or
-`~` for the home folder itself. The key is `repo:<host/path>` or `folder:<name>`.
+`~` for the home folder itself. The key is `repo:<host/path>` or `folder:<name>`. A repository key
+is the same on every host; a folder key also names its host (`{"kind":"folder","id":"notes",
+"host":"atlas"}`), because a folder project is per host until it is joined by hand.
 
 **Names.** A project's default name is the repository's last path part (`atlas`), the folder's name,
-or `~ (home folder)` for `~`. A rename is 1 to 40 characters and may not be only spaces. A renamed
-project keeps its key, so a later rename wins and the past keeps counting under the same project.
+or `~ (home folder)` for `~`. A folder project's default name stays its folder name; the page shows
+the host beside it in the folders column. A rename is 1 to 40 characters and may not be only
+spaces. A renamed project keeps its key, so a later rename wins and the past keeps counting under
+the same project.
 
 **Organizations.** A project's default organization is the repository's owner (`acme` for
 `github.com/acme/atlas`); a folder has none. An account's first organization is its login's
-`orgName`; without one it has none. An account sits in exactly one organization: naming it in an
-organization's account list moves it there and out of the one it was in. Organizations have an
-identity, which a rename does not change, and a shown name, which starts as that identity.
+`orgName`; without one it has none. An account sits in exactly one organization. Each change of an
+account's organization is one `accountOrg` record for that account; the latest such record, in log
+order, puts the account in the root of its organization, or in none. Nothing else moves an account,
+so moving one account never drops another — even one only another host stores. Organizations have
+an identity, which a rename does not change, and a shown name, which starts as that identity.
 Organizations can be joined like projects; their accounts and projects then count for the
 organization they were joined into.
 
 **Sessions and folders.** A project's folders per host and its session count come from the session
 records of every host, over all time: distinct session ids, and the folders the sessions ran in. A
 key that no session ever named is not a row of the Projects group. A project seen on two hosts in
-two folders is one project; the folders are listed per host.
+two folders is one project; the folders are listed per host. A folder project seen on two hosts is
+two projects until they are joined.
 
 **The shared project log.** Every edit is one line in the host's own
 `projects-YYYY-MM.jsonl` under the history root, appended and never rewritten. Every host reads all
@@ -1108,26 +1115,29 @@ row shows the reason.
 | `rename` | `key`, `name` | the project's shown name |
 | `join` | `key`, `into` | `key`'s tokens count for `into`; `key` gets no row of its own |
 | `unjoin` | `key` | undo a join |
-| `assign` | `key`, `org` (a name, or `null` for none) | the project's organization; creating an organization is an `assign` with a new name |
+| `assign` | `key`, `org` (an identity, or `null` for none) | the project's organization; creating an organization is an `assign` with a new name |
 | `orgRename` | `org`, `name` | an organization's shown name; `org` stays its identity |
 | `orgJoin` | `org`, `into` | `org`'s accounts and projects count for `into` |
-| `orgAccounts` | `org`, `accounts` | the organization's whole account list |
+| `accountOrg` | `account`, `org` (an identity, or `null` for none) | one account's organization |
 
-A name is 1 to 40 characters and not only spaces; an organization name is not empty; a project or
-an organization cannot be joined into itself. The Projects group shows each project with its
-repository, its folders per host, its organization (chosen from the list or created in place), its
-session count and the keys joined into it, each with an undo. Under it, the organizations with
-their accounts and project counts. Changes apply to the past too, because the history stores the
-repository's identity, not the shown name.
+A shown project or organization name is 1 to 40 characters and not only spaces. An organization
+identity is only checked to be non-empty: it comes from a login's `orgName` or a repository owner,
+not from typing. A project or an organization cannot be joined into itself. A folder project id
+names its host; a repository id does not, because a repository is one project on every host. The
+Projects group shows each project with its repository, its folders per host, its organization
+(chosen from the list or created in place), its session count and the keys joined into it, each
+with an undo. Under it, the organizations with their accounts and project counts. Changes apply to
+the past too, because the history stores the repository's identity, not the shown name.
 
-**The file.** One line per edit, camelCase, the project key as `{"kind":"repo","id":"…"}` or
-`{"kind":"folder","id":"…"}`:
+**The file.** One line per edit, camelCase, the project id as `{"kind":"repo","id":"…"}` or
+`{"kind":"folder","id":"…","host":"…"}`:
 
 ```json
-{"t":"2026-11-15T12:25:05Z","edit":"join","key":{"kind":"folder","id":"atlas-old"},"into":{"kind":"repo","id":"github.com/acme/atlas"}}
+{"t":"2026-11-15T12:25:05Z","edit":"join","key":{"kind":"folder","id":"atlas-old","host":"atlas"},"into":{"kind":"repo","id":"github.com/acme/atlas"}}
 {"t":"2026-11-15T12:30:00Z","edit":"assign","key":{"kind":"repo","id":"github.com/acme/atlas"},"org":"acme"}
 {"t":"2026-11-15T12:31:00Z","edit":"orgRename","org":"acme","name":"Acme"}
-{"t":"2026-11-15T12:32:00Z","edit":"orgAccounts","org":"acme","accounts":[{"acc":"6f1c2a9e-…","org":"a92d7b31-…"}]}
+{"t":"2026-11-15T12:32:00Z","edit":"accountOrg","account":{"acc":"6f1c2a9e-…","org":"a92d7b31-…"},"org":"acme"}
+{"t":"2026-11-15T12:33:00Z","edit":"accountOrg","account":{"acc":"6f1c2a9e-…","org":"a92d7b31-…"},"org":null}
 ```
 
 ---

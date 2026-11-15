@@ -398,65 +398,98 @@ function makeFixture() {
         since: isoIn(-5 * 86400000),
       },
     ],
-    // The Projects group (spec §3.6): what the session records named, and the
-    // log the page appends to. `fixtureResolveProjects` applies the log.
-    projects: [
-      {
-        key: { kind: "repo", id: "github.com/acme/acme-kb" },
-        name: "acme-kb",
-        repo: "github.com/acme/acme-kb",
-        org: "acme",
-        folders: { atlas: ["~/projects/acme-kb"] },
-        sessions: 212,
-      },
-      {
-        key: { kind: "repo", id: "github.com/acme/acme-notes" },
-        name: "acme-notes",
-        repo: "github.com/acme/acme-notes",
-        org: "acme",
-        folders: { atlas: ["~/projects/acme-notes"] },
-        sessions: 41,
-      },
-      {
-        key: { kind: "repo", id: "github.com/sam/atlas" },
-        name: "atlas",
-        repo: "github.com/sam/atlas",
-        org: "sam",
-        folders: {
-          atlas: ["~/projects/atlas"],
-          vega: ["~/src/atlas"],
+    // The Projects group (spec §3.6): a fixed view the two project commands
+    // read and update. The real app resolves the shared log in Rust.
+    projectView: {
+      projects: [
+        {
+          key: { kind: "repo", id: "github.com/acme/acme-kb" },
+          name: "acme-kb",
+          repo: "github.com/acme/acme-kb",
+          org: "acme",
+          joined: [],
+          folders: { atlas: ["~/projects/acme-kb"] },
+          sessions: 212,
         },
-        sessions: 268,
-      },
-      {
-        key: { kind: "repo", id: "github.com/sam/ledger" },
-        name: "ledger",
-        repo: "github.com/sam/ledger",
-        org: "sam",
-        folders: {
-          atlas: ["~/projects/ledger"],
-          vega: ["~/ledger"],
+        {
+          key: { kind: "repo", id: "github.com/acme/acme-notes" },
+          name: "acme-notes",
+          repo: "github.com/acme/acme-notes",
+          org: "acme",
+          joined: [],
+          folders: { atlas: ["~/projects/acme-notes"] },
+          sessions: 41,
         },
-        sessions: 97,
-      },
-      {
-        key: { kind: "repo", id: "github.com/sam/seatswap" },
-        name: "seatswap",
-        repo: "github.com/sam/seatswap",
-        org: "sam",
-        folders: { atlas: ["~/projects/seatswap"] },
-        sessions: 63,
-      },
-      {
-        key: { kind: "folder", id: "~" },
-        name: "~ (home folder)",
-        repo: null,
-        org: null,
-        folders: { atlas: ["~"], vega: ["~"] },
-        sessions: 22,
-      },
-    ],
-    projectLog: [],
+        {
+          key: { kind: "repo", id: "github.com/sam/atlas" },
+          name: "atlas",
+          repo: "github.com/sam/atlas",
+          org: "sam",
+          joined: [],
+          folders: {
+            atlas: ["~/projects/atlas"],
+            vega: ["~/src/atlas"],
+          },
+          sessions: 268,
+        },
+        {
+          key: { kind: "repo", id: "github.com/sam/ledger" },
+          name: "ledger",
+          repo: "github.com/sam/ledger",
+          org: "sam",
+          joined: [],
+          folders: {
+            atlas: ["~/projects/ledger"],
+            vega: ["~/ledger"],
+          },
+          sessions: 97,
+        },
+        {
+          key: { kind: "repo", id: "github.com/sam/seatswap" },
+          name: "seatswap",
+          repo: "github.com/sam/seatswap",
+          org: "sam",
+          joined: [],
+          folders: { atlas: ["~/projects/seatswap"] },
+          sessions: 63,
+        },
+        {
+          key: { kind: "folder", id: "~", host: "atlas" },
+          name: "~ (home folder)",
+          repo: null,
+          org: null,
+          joined: [],
+          folders: { atlas: ["~"] },
+          sessions: 12,
+        },
+        {
+          key: { kind: "folder", id: "~", host: "vega" },
+          name: "~ (home folder)",
+          repo: null,
+          org: null,
+          joined: [],
+          folders: { vega: ["~"] },
+          sessions: 10,
+        },
+      ],
+      orgs: [
+        {
+          id: "acme",
+          name: "acme",
+          accounts: [{ acc: acmeId, org: "org:acme" }],
+          projects: 2,
+        },
+        {
+          id: "sam",
+          name: "sam",
+          accounts: [
+            { acc: privateId, org: "org:sam" },
+            { acc: labId, org: "org:sam" },
+          ],
+          projects: 3,
+        },
+      ],
+    },
     // The History and hosts group (spec §1.5, §3.7): the host folders of the
     // history, and the files an export in this browser has "written".
     history: {
@@ -751,279 +784,44 @@ function fixtureSaveSetting(fixture, field, value) {
 }
 
 // ---------------------------------------------------------------------------
-// Projects and organizations (spec §3.6) in the fixture. This is the page's
-// stand-in for core::projects, over the fixture's few rows: the same rules —
-// the log in order, a later record wins, a join follows the chain and drops
-// the earlier record of a cycle, an organization is its identity with a shown
-// name. It is only for checking the page in a browser; the app resolves in
-// Rust.
+// Projects and organizations (spec §3.6) in the fixture: a fixed view that
+// `projects_view` returns and `projects_edit` changes in place. The real app
+// resolves the shared log in core::projects; this is only for checking the
+// page in a browser.
 // ---------------------------------------------------------------------------
 
-function fixtureKeyText(key) {
-  if (!isObject(key)) return "";
-  return `${key.kind}:${key.id}`;
-}
-
-function fixtureKeyFromText(text) {
-  const mark = text.indexOf(":");
-  if (mark < 0) return { kind: "folder", id: text };
-  return { kind: text.slice(0, mark), id: text.slice(mark + 1) };
-}
-
-function fixtureKeyName(key) {
-  if (!isObject(key)) return "?";
-  if (key.kind === "repo") {
-    const parts = String(key.id).split("/").filter((part) => part !== "");
-    return parts.length > 0 ? parts[parts.length - 1] : String(key.id);
-  }
-  // The home folder's name is `~ (home folder)`, as the core shows it.
-  if (key.id === "~") return "~ (home folder)";
-  return String(key.id);
-}
-
-function fixtureRefText(ref) {
-  return `${ref && ref.acc}\u0000${ref && ref.org}`;
-}
-
-// The reference the fixture's history uses for an account row. Only the
-// fixture builds it; the app reads the real one from `projects_view`.
 function fixtureAccountRef(view) {
   return { acc: view.id, org: `org:${view.orgName || view.id}` };
 }
 
-function fixtureProjectRoot(joins, key) {
-  let current = key;
-  const seen = new Set();
-  for (;;) {
-    const edge = joins.get(current);
-    if (!edge) return current;
-    if (seen.has(current)) return current;
-    seen.add(current);
-    current = edge.into;
-  }
+function fixtureIdText(id) {
+  if (!isObject(id) || typeof id.id !== "string") return "";
+  return typeof id.host === "string" && id.host !== ""
+    ? `${id.kind}:${id.id}\u0000${id.host}`
+    : `${id.kind}:${id.id}`;
 }
 
-function fixtureBreakJoinCycle(joins, key, into) {
-  for (;;) {
-    const edges = [];
-    const seen = new Set();
-    let node = into;
-    let closes = node === key;
-    while (!closes) {
-      const edge = joins.get(node);
-      if (!edge) break;
-      if (seen.has(node)) return;
-      seen.add(node);
-      edges.push({ node, order: edge.order });
-      node = edge.into;
-      closes = node === key;
-    }
-    if (!closes || edges.length === 0) return;
-    edges.sort((a, b) => a.order - b.order);
-    joins.delete(edges[0].node);
-  }
+function fixtureSameRef(first, second) {
+  return Boolean(first && second && first.acc === second.acc && first.org === second.org);
 }
 
-function fixtureOrgRoot(orgJoin, org) {
-  let current = org;
-  const seen = new Set();
-  for (;;) {
-    const edge = orgJoin.get(current);
-    if (!edge) return current;
-    if (seen.has(current)) return current;
-    seen.add(current);
-    current = edge.into;
-  }
-}
-
-function fixtureResolveProjects(fixture) {
-  const rows = new Map();
-  const keyOf = new Map();
-  for (const row of Array.isArray(fixture.projects) ? fixture.projects : []) {
-    rows.set(fixtureKeyText(row.key), clone(row));
-    keyOf.set(fixtureKeyText(row.key), row.key);
-  }
-  const names = new Map();
-  const assigned = new Map();
-  const joins = new Map();
-  const orgJoin = new Map();
-  const orgNames = new Map();
-  // The account lists in the order they apply, after every `OrgJoin`: one rule
-  // per account.
-  const orgAccountLists = [];
-  const log = Array.isArray(fixture.projectLog) ? fixture.projectLog : [];
-  log.forEach((record, order) => {
-    const edit = isObject(record.edit) ? record.edit : {};
-    switch (edit.edit) {
-      case "rename":
-        names.set(fixtureKeyText(edit.key), String(edit.name));
-        break;
-      case "join": {
-        const key = fixtureKeyText(edit.key);
-        const into = fixtureKeyText(edit.into);
-        keyOf.set(key, edit.key);
-        keyOf.set(into, edit.into);
-        if (key === into) break;
-        fixtureBreakJoinCycle(joins, key, into);
-        joins.set(key, { into, order });
-        break;
-      }
-      case "unjoin":
-        joins.delete(fixtureKeyText(edit.key));
-        break;
-      case "assign":
-        assigned.set(fixtureKeyText(edit.key), isObject(edit) && "org" in edit ? edit.org : null);
-        keyOf.set(fixtureKeyText(edit.key), edit.key);
-        break;
-      case "orgRename":
-        orgNames.set(String(edit.org), String(edit.name));
-        break;
-      case "orgJoin": {
-        const org = String(edit.org);
-        const into = String(edit.into);
-        if (org === into) break;
-        fixtureBreakJoinCycle(orgJoin, org, into);
-        orgJoin.set(org, { into, order });
-        break;
-      }
-      case "orgAccounts":
-        orgAccountLists.push({
-          org: String(edit.org),
-          accounts: Array.isArray(edit.accounts) ? clone(edit.accounts) : [],
-          order,
-        });
-        break;
-      default:
-        break;
-    }
-  });
-
-  const keys = new Set(rows.keys());
-  for (const [key, edge] of joins) {
-    keys.add(key);
-    keys.add(edge.into);
-  }
-  const groups = new Map();
-  for (const key of keys) {
-    const root = fixtureProjectRoot(joins, key);
-    if (!groups.has(root)) groups.set(root, []);
-    groups.get(root).push(key);
-  }
-
-  const projects = [];
-  for (const [root, members] of groups) {
-    const memberKeys = members.filter((member) => rows.has(member));
-    if (memberKeys.length === 0) continue;
-    const folders = {};
-    let sessions = 0;
-    for (const member of memberKeys) {
-      const row = rows.get(member);
-      for (const [host, list] of Object.entries(row.folders || {})) {
-        const target = folders[host] || (folders[host] = []);
-        for (const cwd of list) if (!target.includes(cwd)) target.push(cwd);
-      }
-      sessions += Number(row.sessions) || 0;
-    }
-    for (const list of Object.values(folders)) list.sort();
-    const home = rows.get(root);
-    const key = keyOf.get(root) || fixtureKeyFromText(root);
-    const joined = memberKeys
-      .filter((member) => member !== root)
-      .sort()
-      .map((member) => {
-        const joinedKey = keyOf.get(member) || fixtureKeyFromText(member);
-        return { key: joinedKey, name: fixtureKeyName(joinedKey) };
-      });
-    projects.push({
-      key,
-      name: names.has(root) ? names.get(root) : home ? home.name : fixtureKeyName(key),
-      repo: home ? home.repo : key.kind === "repo" ? key.id : null,
-      org: assigned.has(root) ? assigned.get(root) : home ? home.org : null,
-      joined,
-      folders,
-      sessions,
-    });
-  }
-
-  const identities = new Set();
-  for (const project of projects) if (project.org) identities.add(project.org);
-  for (const view of Array.isArray(fixture.views) ? fixture.views : []) {
-    if (typeof view.orgName === "string" && view.orgName !== "") identities.add(view.orgName);
-  }
-  for (const name of orgNames.keys()) identities.add(name);
-  for (const name of orgJoin.keys()) identities.add(name);
-  for (const edge of orgJoin.values()) identities.add(edge.into);
-  for (const record of orgAccountLists) identities.add(record.org);
-  for (const project of projects) {
-    if (project.org) project.org = fixtureOrgRoot(orgJoin, project.org);
-  }
-
-  const byRoot = new Map();
-  for (const identity of identities) {
-    const root = fixtureOrgRoot(orgJoin, identity);
-    if (!byRoot.has(root)) byRoot.set(root, []);
-    byRoot.get(root).push(identity);
-  }
-
-  // One rule per account: it starts in the root of its `orgName`; then each
-  // `OrgAccounts` record, in log order, takes every account it names to its
-  // root and drops every account in that root that it does not name. An account
-  // no record ever named keeps its default.
-  const accountOrg = new Map();
-  for (const view of Array.isArray(fixture.views) ? fixture.views : []) {
-    if (typeof view.orgName !== "string" || view.orgName.trim() === "") continue;
-    const ref = fixtureAccountRef(view);
-    accountOrg.set(fixtureRefText(ref), { ref, root: fixtureOrgRoot(orgJoin, view.orgName) });
-  }
-  for (const record of orgAccountLists) {
-    const root = fixtureOrgRoot(orgJoin, record.org);
-    const named = new Map();
-    for (const ref of record.accounts) named.set(fixtureRefText(ref), ref);
-    for (const [text, entry] of [...accountOrg]) {
-      if (entry.root === root && !named.has(text)) accountOrg.delete(text);
-    }
-    for (const [text, ref] of named) accountOrg.set(text, { ref, root });
-  }
-  const accountsIn = new Map();
-  for (const entry of accountOrg.values()) {
-    if (!accountsIn.has(entry.root)) accountsIn.set(entry.root, []);
-    accountsIn.get(entry.root).push(entry.ref);
-  }
-  for (const list of accountsIn.values()) {
-    list.sort(
-      (a, b) => String(a.acc).localeCompare(String(b.acc)) || String(a.org).localeCompare(String(b.org))
-    );
-  }
-
-  const orgs = [];
-  for (const [root] of byRoot) {
-    orgs.push({
-      id: root,
-      name: orgNames.has(root) ? orgNames.get(root) : root,
-      accounts: accountsIn.get(root) || [],
-      projects: projects.filter((project) => project.org === root).length,
-    });
-  }
-  orgs.sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
-
-  const orgLabel = (id) => {
-    if (!id) return "";
-    const org = orgs.find((entry) => entry.id === id);
-    return org ? org.name : id;
+function fixtureProjectView(fixture) {
+  return {
+    projects: clone(fixture.projectView.projects),
+    orgs: clone(fixture.projectView.orgs),
+    accountRefs: fixture.views.map((view) => ({
+      id: view.id,
+      account: fixtureAccountRef(view),
+    })),
   };
-  projects.sort(
-    (a, b) =>
-      Number(a.org === null) - Number(b.org === null) ||
-      orgLabel(a.org).localeCompare(orgLabel(b.org)) ||
-      a.name.localeCompare(b.name) ||
-      fixtureKeyText(a.key).localeCompare(fixtureKeyText(b.key))
-  );
+}
 
-  const accountRefs = (Array.isArray(fixture.views) ? fixture.views : []).map((view) => ({
-    id: view.id,
-    account: fixtureAccountRef(view),
-  }));
-  return { projects, orgs, accountRefs };
+function fixtureFindProject(projects, id) {
+  return projects.find((project) => fixtureIdText(project.key) === fixtureIdText(id)) || null;
+}
+
+function fixtureFindOrg(orgs, id) {
+  return orgs.find((org) => org.id === id) || null;
 }
 
 function fixtureCheckName(what, value) {
@@ -1036,45 +834,117 @@ function fixtureCheckName(what, value) {
   return text;
 }
 
-// The same refusals as `ProjectEdit::validate`, and nothing is appended when
-// one throws.
+function fixtureCheckIdentity(value) {
+  const text = String(value === undefined || value === null ? "" : value);
+  if (text.trim() === "") throw new Error("an organization name must not be empty");
+  return text;
+}
+
+// The same refusals as `ProjectEdit::validate`, then the fixed view is changed
+// directly; nothing is appended when a check throws.
 function fixtureEditProject(fixture, edit) {
   if (!isObject(edit)) throw new Error("projects_edit needs an edit");
+  const view = fixture.projectView;
   switch (String(edit.edit || "")) {
-    case "rename":
-      fixtureCheckName("project", edit.name);
+    case "rename": {
+      const project = fixtureFindProject(view.projects, edit.key);
+      if (!project) throw new Error("unknown project");
+      project.name = fixtureCheckName("project", edit.name);
       break;
-    case "orgRename":
-      fixtureCheckName("organization", edit.name);
+    }
+    case "orgRename": {
+      const org = fixtureFindOrg(view.orgs, String(edit.org));
+      if (!org) throw new Error(`unknown organization ${String(edit.org)}`);
+      org.name = fixtureCheckName("organization", edit.name);
       break;
-    case "join":
-      if (fixtureKeyText(edit.key) === fixtureKeyText(edit.into)) {
+    }
+    case "join": {
+      if (fixtureIdText(edit.key) === fixtureIdText(edit.into)) {
         throw new Error("a project cannot be joined into itself");
       }
+      const from = fixtureFindProject(view.projects, edit.key);
+      const into = fixtureFindProject(view.projects, edit.into);
+      if (!from || !into) throw new Error("unknown project");
+      for (const [host, list] of Object.entries(from.folders || {})) {
+        const folders = into.folders[host] || (into.folders[host] = []);
+        for (const cwd of list) if (!folders.includes(cwd)) folders.push(cwd);
+      }
+      into.sessions = (Number(into.sessions) || 0) + (Number(from.sessions) || 0);
+      into.joined = [...(into.joined || []), { key: clone(from.key), name: from.name }];
+      view.projects = view.projects.filter((project) => project !== from);
       break;
-    case "assign":
+    }
+    case "unjoin": {
+      for (const project of view.projects) {
+        const joined = Array.isArray(project.joined) ? project.joined : [];
+        const found = joined.find(
+          (entry) => fixtureIdText(entry.key) === fixtureIdText(edit.key)
+        );
+        if (!found) continue;
+        project.joined = joined.filter((entry) => entry !== found);
+        view.projects.push({
+          key: clone(found.key),
+          name: found.name,
+          repo: found.key.kind === "repo" ? found.key.id : null,
+          org: null,
+          joined: [],
+          folders: {},
+          sessions: 0,
+        });
+        break;
+      }
+      break;
+    }
+    case "assign": {
+      const project = fixtureFindProject(view.projects, edit.key);
+      if (!project) throw new Error("unknown project");
+      const org =
+        edit.org === null || edit.org === undefined ? null : fixtureCheckIdentity(edit.org);
+      if (org !== null && !fixtureFindOrg(view.orgs, org)) {
+        view.orgs.push({ id: org, name: org, accounts: [], projects: 0 });
+      }
+      project.org = org;
+      break;
+    }
+    case "orgJoin": {
+      const org = fixtureCheckIdentity(edit.org);
+      const into = fixtureCheckIdentity(edit.into);
+      if (org === into) throw new Error("an organization cannot be joined into itself");
+      const source = fixtureFindOrg(view.orgs, org);
+      const target = fixtureFindOrg(view.orgs, into);
+      if (!source || !target) throw new Error("unknown organization");
+      for (const account of source.accounts || []) {
+        if (!target.accounts.some((entry) => fixtureSameRef(entry, account))) {
+          target.accounts.push(account);
+        }
+      }
+      for (const project of view.projects) if (project.org === org) project.org = into;
+      view.orgs = view.orgs.filter((entry) => entry !== source);
+      break;
+    }
+    case "accountOrg": {
+      const ref =
+        fixture.views
+          .map((view) => fixtureAccountRef(view))
+          .find((entry) => fixtureSameRef(entry, edit.account)) || null;
+      if (!ref) throw new Error("unknown account");
+      for (const org of view.orgs) {
+        org.accounts = (org.accounts || []).filter((entry) => !fixtureSameRef(entry, ref));
+      }
       if (edit.org !== null && edit.org !== undefined) {
-        fixtureCheckName("organization", edit.org);
+        const org = fixtureCheckIdentity(edit.org);
+        const target = fixtureFindOrg(view.orgs, org);
+        if (!target) throw new Error(`unknown organization ${org}`);
+        target.accounts.push(ref);
       }
       break;
-    case "orgJoin":
-      if (String(edit.org || "").trim() === "") {
-        throw new Error("an organization name must not be empty");
-      }
-      if (String(edit.org) === String(edit.into)) {
-        throw new Error("an organization cannot be joined into itself");
-      }
-      fixtureCheckName("organization", edit.into);
-      break;
-    case "orgAccounts":
-      fixtureCheckName("organization", edit.org);
-      break;
-    case "unjoin":
-      break;
+    }
     default:
       throw new Error(`unknown project edit ${String(edit.edit)}`);
   }
-  fixture.projectLog.push({ at: new Date().toISOString(), edit: clone(edit) });
+  for (const org of view.orgs) {
+    org.projects = view.projects.filter((project) => project.org === org.id).length;
+  }
 }
 
 export async function fixtureInvoke(command, args) {
@@ -1088,8 +958,7 @@ export async function fixtureInvoke(command, args) {
     case "get_snapshot": {
       const snapshot = clone(fixture);
       snapshot.accounts = fixture.views.map((view) => clone(view));
-      delete snapshot.projects;
-      delete snapshot.projectLog;
+      delete snapshot.projectView;
       return snapshot;
     }
 
@@ -1389,11 +1258,11 @@ export async function fixtureInvoke(command, args) {
       });
 
     case "projects_view":
-      return clone(fixtureResolveProjects(fixture));
+      return clone(fixtureProjectView(fixture));
 
     case "projects_edit": {
       fixtureEditProject(fixture, args.edit);
-      return clone(fixtureResolveProjects(fixture));
+      return clone(fixtureProjectView(fixture));
     }
 
     case "history_view":

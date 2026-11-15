@@ -1977,28 +1977,38 @@ negative, non-finite or not a number is refused.
 ```rust
 #[serde(tag = "edit", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum ProjectEdit {
-    Rename { key: ProjectKey, name: String },
-    Join { key: ProjectKey, into: ProjectKey },
-    Unjoin { key: ProjectKey },
-    Assign { key: ProjectKey, org: Option<String> },
+    Rename { key: ProjectId, name: String },
+    Join { key: ProjectId, into: ProjectId },
+    Unjoin { key: ProjectId },
+    Assign { key: ProjectId, org: Option<String> },
     OrgRename { org: String, name: String },
     OrgJoin { org: String, into: String },
-    OrgAccounts { org: String, accounts: Vec<AccountRef> },
+    AccountOrg { account: AccountRef, org: Option<String> },
 }
 impl ProjectEdit { pub fn validate(&self) -> Result<(), ProjectsError>; }
-// project and organization names: 1..=40 characters, not only spaces; an organization name not empty;
-// a project or organization cannot be joined into itself.
+// project and organization shown names: 1..=40 characters, not only spaces;
+// an organization identity (Assign.org, AccountOrg.org, OrgJoin.org/into) only non-empty,
+// because it comes from a login's orgName or a repository owner, not from typing;
+// a project or organization cannot be joined into itself; a folder id names its host,
+// a repository id does not.
+
+#[serde(rename_all = "camelCase")]
+pub struct ProjectId {
+    #[serde(flatten)] pub key: ProjectKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub host: Option<String>,
+}
+impl ProjectId { pub fn of(key: &ProjectKey, host: &str) -> ProjectId; } // host kept for a folder key only
 
 pub enum ProjectsError { NameLength { what, length }, NameBlank { what }, EmptyOrg,
-    JoinIntoItself { what }, History(HistoryError) }
+    FolderWithoutHost, RepoHasHost { host }, JoinIntoItself { what }, History(HistoryError) }
 
 pub struct ProjectsLogRecord { pub t: DateTime<Utc>, #[serde(flatten)] pub edit: ProjectEdit }
 impl Record for ProjectsLogRecord { const KIND: Kind = Kind::Projects; } // "projects"
 
-pub struct Project { pub key: ProjectKey, pub name: String, pub repo: Option<String>,
+pub struct Project { pub key: ProjectId, pub name: String, pub repo: Option<String>,
     pub org: Option<String>, pub joined: Vec<JoinedKey>, pub folders: BTreeMap<String, Vec<String>>,
     pub sessions: u32 }
-pub struct JoinedKey { pub key: ProjectKey, pub name: String } // the key's default name
+pub struct JoinedKey { pub key: ProjectId, pub name: String } // the key's default name
 pub struct Org { pub id: String, pub name: String, pub accounts: Vec<AccountRef>, pub projects: u32 }
 pub struct AccountEntry { pub id: String, pub account: AccountRef } // the store's id and its AccountRef
 pub struct Projects { pub projects: Vec<Project>, pub orgs: Vec<Org>,
@@ -2007,23 +2017,25 @@ pub struct Projects { pub projects: Vec<Project>, pub orgs: Vec<Org>,
 impl Projects {
     pub fn resolve(log: &[Hosted<ProjectsLogRecord>], sessions: &[Hosted<SessionRecord>],
                    accounts: &[Account]) -> Projects;
-    pub fn of(&self, key: &ProjectKey) -> Project; // a key that is not a row, with the log's names/joins
+    pub fn of(&self, id: &ProjectId) -> Project; // an id that is not a row, with the log's names/joins
 }
 ```
 
-`resolve` first collects each session key's folders per host and its distinct session ids. It then
-applies the log in time order, ties by host name and then by line order: `Rename` and `Assign` for
-the same key replace the previous; `Join` follows the chain and, when it would close a cycle, drops
-the earliest record of that cycle; `Unjoin` removes the key's join; `OrgRename` and `OrgJoin` work
-the same for organizations. Keys are grouped under their join root; a group with no session is not
-a row. A project's name is the last rename of its root or the root's default name; its organization
-is the last assignment of the root or the root's default (the repository owner); its `joined` keys
-carry their default names, because a joined key's own rename is not shown. Organization identities
-come from every project's organization, every account's `org_name`, every `OrgRename` and every
-`OrgAccounts` organization, and both ends of every `OrgJoin`, joined by `OrgJoin`; `OrgAccounts`
-lists are applied in log order, and for each account the last list that names it decides its
-organization, so an account sits in exactly one. `Projects::of` uses the same maps for a key
-without a row.
+`resolve` first collects each session's `ProjectId::of(key, host)`: a repository id has no host and
+is the same project everywhere, a folder id carries its host, so the same folder name on two hosts is
+two projects until a `Join` makes one. It then applies the log in time order, ties by host name and
+then by line order: `Rename` and `Assign` for the same id replace the previous; `Join` follows the
+chain and, when it would close a cycle, drops the earliest record of that cycle; `Unjoin` removes
+the id's join; `OrgRename` and `OrgJoin` work the same for organizations. Ids are grouped under
+their join root; a group with no session is not a row. A project's name is the last rename of its
+root or the root key's default name; its organization is the last assignment of the root or the
+root key's default (the repository owner); its `joined` ids carry their default names, because a
+joined id's own rename is not shown. Organization identities come from every project's
+organization, every account's `org_name`, every `OrgRename` and every `AccountOrg` organization, and
+both ends of every `OrgJoin`, joined by `OrgJoin`. `AccountOrg` records are applied in log order:
+the latest record for an account puts that one account in that organization's root, or in none.
+Nothing else moves an account, so an edit for one account leaves every other account where it is.
+`Projects::of` uses the same maps for an id without a row.
 
 ## app: history additions — hosts, import and export (step C1)
 

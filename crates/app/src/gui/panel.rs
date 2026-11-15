@@ -1251,6 +1251,7 @@ mod tests {
     use seatswap_core::history::Recorder;
     use seatswap_core::paths::ClaudePaths;
     use seatswap_core::project::ProjectKey;
+    use seatswap_core::projects::ProjectId;
 
     fn monitor() -> Rect {
         Rect {
@@ -1390,7 +1391,7 @@ mod tests {
     fn a_name_over_40_characters_is_refused() {
         let tmp = tempfile::tempdir().expect("a temp folder");
         let history = HistoryDir::at(tmp.path(), "atlas");
-        let key = ProjectKey::Folder("atlas".to_string());
+        let key = ProjectId::of(&ProjectKey::Folder("atlas".to_string()), "atlas");
         let at = DateTime::parse_from_rfc3339("2026-11-14T10:00:00Z")
             .expect("a test time")
             .with_timezone(&Utc);
