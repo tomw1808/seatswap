@@ -11,6 +11,7 @@
 //! `engine` and `store` do.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -42,6 +43,7 @@ use seatswap_core::types::Login;
 use super::autostart;
 use super::notify;
 use super::sessions_rt::{self, SessionsHandle};
+use crate::format::with_tilde;
 use crate::ops;
 
 /// How often the engine thread polls even without a command.
@@ -1088,17 +1090,29 @@ impl ActionRuntime {
                             if let Some(to) = &current {
                                 let counts = self.session_counts();
                                 match self.recorder() {
-                                    Ok(recorder) => {
-                                        if let Err(error) = record_external_switch(
-                                            recorder,
-                                            self.live.clone(),
-                                            to,
-                                            counts,
-                                            Utc::now(),
-                                        ) {
-                                            eprintln!("seatswap: watcher: {error}");
+                                    Ok(recorder) => match record_external_switch(
+                                        recorder,
+                                        self.live.clone(),
+                                        to,
+                                        counts,
+                                        Utc::now(),
+                                    ) {
+                                        Ok(RecentSwitch::Already { by: By::Agent, cwd }) => {
+                                            if let Some(account) =
+                                                file.find_by_identity(&to.acc, &to.org)
+                                            {
+                                                notify::send_switch(&agent_switch_message(
+                                                    &account.abbr,
+                                                    cwd.as_deref(),
+                                                    self.claude.home(),
+                                                ));
+                                            }
                                         }
-                                    }
+                                        Ok(_) => {}
+                                        Err(error) => {
+                                            eprintln!("seatswap: watcher: {error}")
+                                        }
+                                    },
                                     Err(error) => eprintln!("seatswap: watcher: {error}"),
                                 }
                             }
@@ -1114,15 +1128,24 @@ impl ActionRuntime {
     }
 }
 
+/// What [`record_external_switch`] found: it wrote a new external switch, or a
+/// switch to the same account is already in this host's last 15 s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RecentSwitch {
+    Written,
+    Already { by: By, cwd: Option<String> },
+}
+
 /// Write `Switch{by: External}` for a live account, unless this host's events
-/// already hold a switch to the same account in the last 15 s.
+/// already hold a switch to the same account in the last 15 s; that event's
+/// `by` and `cwd` are returned so an agent's switch can be announced.
 fn record_external_switch(
     recorder: &Recorder,
     from: Option<AccountRef>,
     to: &AccountRef,
     sessions: Option<SessionCounts>,
     now: DateTime<Utc>,
-) -> Result<bool, HistoryError> {
+) -> Result<RecentSwitch, HistoryError> {
     let read = recorder.dir().read::<Event>(
         &Range {
             from: now - chrono::Duration::seconds(15),
@@ -1130,11 +1153,21 @@ fn record_external_switch(
         },
         &Hosts::One(recorder.dir().host().to_string()),
     )?;
-    let already = read.records.iter().any(|hosted| {
-        matches!(&hosted.record.kind, EventKind::Switch { to: existing, .. } if existing == to)
-    });
-    if already {
-        return Ok(false);
+    let already = read
+        .records
+        .iter()
+        .rev()
+        .find_map(|hosted| match &hosted.record.kind {
+            EventKind::Switch {
+                to: existing,
+                by,
+                cwd,
+                ..
+            } if existing == to => Some((*by, cwd.clone())),
+            _ => None,
+        });
+    if let Some((by, cwd)) = already {
+        return Ok(RecentSwitch::Already { by, cwd });
     }
     ops::record_switch(
         recorder,
@@ -1146,7 +1179,19 @@ fn record_external_switch(
         sessions,
         now,
     )?;
-    Ok(true)
+    Ok(RecentSwitch::Written)
+}
+
+/// The tray app announces every switch an agent made (spec §6.2), whatever
+/// `notifyOnSwitch` says.
+fn agent_switch_message(abbr: &str, cwd: Option<&str>, home: &Path) -> String {
+    match cwd {
+        Some(cwd) => format!(
+            "An agent switched to {abbr} (from {}).",
+            with_tilde(cwd, home)
+        ),
+        None => format!("An agent switched to {abbr}."),
+    }
 }
 
 /// A switch waiting for "save or discard?" only when the target key names a
@@ -1775,16 +1820,23 @@ mod tests {
             now - chrono::Duration::seconds(5),
         )
         .expect("the CLI switch is written");
-        assert!(
-            !record_external_switch(&recorder, None, &account, None, now)
-                .expect("the events can be read")
+        assert_eq!(
+            record_external_switch(&recorder, None, &account, None, now)
+                .expect("the events can be read"),
+            RecentSwitch::Already {
+                by: By::Cli,
+                cwd: None
+            }
         );
 
         // With no such event, an external switch is written exactly once.
         let second = HistoryDir::at(&tmp.path().join("second"), "atlas");
         let recorder = Recorder::new(HistoryDir::at(second.root(), "atlas"));
-        assert!(record_external_switch(&recorder, None, &account, None, now)
-            .expect("the external switch is written"));
+        assert_eq!(
+            record_external_switch(&recorder, None, &account, None, now)
+                .expect("the external switch is written"),
+            RecentSwitch::Written
+        );
         let read = second
             .read::<Event>(
                 &Range {
@@ -1808,6 +1860,19 @@ mod tests {
             }
             other => panic!("expected a switch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_agent_switch_is_announced_with_the_folder() {
+        let home = std::path::Path::new("/home/sam");
+        assert_eq!(
+            agent_switch_message("PR", Some("/home/sam/projects/atlas"), home),
+            "An agent switched to PR (from ~/projects/atlas)."
+        );
+        assert_eq!(
+            agent_switch_message("PR", None, home),
+            "An agent switched to PR."
+        );
     }
 
     /// A history that cannot be written is shown once. When the history writes

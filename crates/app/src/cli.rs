@@ -5,6 +5,7 @@
 //! decision about an account, a usage percentage or which login is live is made
 //! in `seatswap_core`.
 
+use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
@@ -13,8 +14,9 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use seatswap_core::api::{Api, Usage};
+use seatswap_core::atomic::{self, Access};
 use seatswap_core::engine::{suggestion, AccountView, Engine, PollReason, Suggestion};
-use seatswap_core::history::{AccountRef, By};
+use seatswap_core::history::{AccountRef, By, EventKind};
 use seatswap_core::paths::{self, AppPaths, ClaudePaths, PathsError};
 use seatswap_core::store::{self, Account, AccountsFile, LoginState, Settings, Store, StoreError};
 use seatswap_core::switcher::{self, LiveState, SwitchError, UnsavedPolicy};
@@ -26,6 +28,39 @@ use crate::ops;
 /// Colour used when there is no live account or no usage to judge (the grey of
 /// the unknown tray ring, docs/implementation.md icon.rs).
 const NO_LOAD_COLOR: &str = "#555b66";
+
+/// The skill shipped with the program (spec §6.4).
+const AGENT_SKILL: &str = include_str!("../assets/agent-skill/SKILL.md");
+
+const AGENTS_MAY_NOT_READ: &str = "agents may not read usage (seatswap settings → Agents)";
+const AGENTS_MAY_NOT_SWITCH: &str = "agents may not switch accounts (seatswap settings → Agents)";
+const AGENTS_MAY_NOT_CHANGE: &str = "agents may not change seatswap's accounts or settings";
+
+/// Who started this call (spec §6.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Caller {
+    Person,
+    Agent,
+}
+
+/// Agent when `CLAUDECODE` is exactly `1`, or `AI_AGENT` is set and not empty.
+/// `env` is the environment to read, never the process's own.
+pub(crate) fn caller(env: &dyn Fn(&str) -> Option<String>) -> Caller {
+    if env("CLAUDECODE").as_deref() == Some("1") {
+        return Caller::Agent;
+    }
+    if env("AI_AGENT").is_some_and(|value| !value.is_empty()) {
+        return Caller::Agent;
+    }
+    Caller::Person
+}
+
+/// What an agent may do with one command (spec §6.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Gate {
+    Allowed,
+    Refused(&'static str),
+}
 
 /// The command line of `seatswap`.
 #[derive(Debug, Parser)]
@@ -64,7 +99,7 @@ impl Cli {
 }
 
 #[derive(Debug, Subcommand)]
-enum Command {
+pub(crate) enum Command {
     /// List the stored accounts and their cached usage.
     List {
         /// Poll the usage before printing.
@@ -139,6 +174,12 @@ enum Command {
         color: Option<String>,
     },
 
+    /// Install or remove seatswap's agent skill in Claude Code's config folder.
+    AgentSkill {
+        #[command(subcommand)]
+        action: SkillAction,
+    },
+
     /// Ask the running tray app to open its pop-up.
     Panel {
         /// Which view the pop-up opens on.
@@ -167,9 +208,26 @@ enum Command {
     },
 }
 
+/// Install or remove the bundled skill (spec §6.4).
+#[derive(Debug, Subcommand)]
+pub(crate) enum SkillAction {
+    /// Write the skill into Claude Code's config folder.
+    Install {
+        /// Replace a skill file that differs from the bundled one.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove the skill and its folder when it is empty.
+    Uninstall {
+        /// Remove a skill file that differs from the bundled one.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
 /// The view `seatswap panel` asks the running tray app to open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum PanelView {
+pub(crate) enum PanelView {
     Main,
     Add,
     Settings,
@@ -204,6 +262,10 @@ pub enum CliError {
     #[error("{0}")]
     UnsavedCurrent(String),
 
+    /// The agent gate refused this call; exits 3 and is recorded first.
+    #[error("{0}")]
+    AgentRefused(&'static str),
+
     #[error(transparent)]
     Store(#[from] StoreError),
 
@@ -230,6 +292,7 @@ impl CliError {
     fn exit_code(&self) -> u8 {
         match self {
             CliError::UnsavedCurrent(_) => 2,
+            CliError::AgentRefused(_) => 3,
             _ => 1,
         }
     }
@@ -244,8 +307,9 @@ pub fn run() -> std::process::ExitCode {
         eprintln!("seatswap: {error}");
         return std::process::ExitCode::from(error.exit_code());
     }
+    let caller = caller(&|name| std::env::var(name).ok());
     #[cfg(feature = "gui")]
-    if cli.command.is_none() {
+    if cli.command.is_none() && no_subcommand(caller) == NoSubcommand::StartApp {
         return match run_gui(&cli) {
             Ok(code) => code,
             Err(error) => {
@@ -254,7 +318,7 @@ pub fn run() -> std::process::ExitCode {
             }
         };
     }
-    let code = match execute(&mut cli) {
+    let code = match execute(&mut cli, caller) {
         Ok(()) => 0,
         Err(error) => {
             eprintln!("seatswap: {error}");
@@ -262,6 +326,34 @@ pub fn run() -> std::process::ExitCode {
         }
     };
     std::process::ExitCode::from(code)
+}
+
+/// What a call without a subcommand does (spec §6.1, §6.2): a person starts the
+/// tray app in a `gui` build, or sees the help text without `gui`; an agent may
+/// not start the app at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoSubcommand {
+    #[cfg(feature = "gui")]
+    StartApp,
+    #[cfg(not(feature = "gui"))]
+    PrintHelp,
+    Refuse,
+}
+
+fn no_subcommand(caller: Caller) -> NoSubcommand {
+    match caller {
+        Caller::Agent => NoSubcommand::Refuse,
+        Caller::Person => {
+            #[cfg(feature = "gui")]
+            {
+                NoSubcommand::StartApp
+            }
+            #[cfg(not(feature = "gui"))]
+            {
+                NoSubcommand::PrintHelp
+            }
+        }
+    }
 }
 
 /// Start the tray app. A store that cannot be opened is not fatal: the tray
@@ -276,34 +368,77 @@ fn run_gui(cli: &Cli) -> Result<std::process::ExitCode, CliError> {
     ))
 }
 
-fn execute(cli: &mut Cli) -> Result<(), CliError> {
+fn execute(cli: &mut Cli, caller: Caller) -> Result<(), CliError> {
     let Some(command) = cli.command.take() else {
-        // No subcommand without the `gui` feature: print help. With `gui`,
-        // run() started the tray app above.
-        Cli::command().print_help().map_err(CliError::Io)?;
-        println!();
-        return Ok(());
+        return match no_subcommand(caller) {
+            // An agent's call without a subcommand opens the store like any
+            // other agent call, so the refusal can be recorded with its cwd.
+            NoSubcommand::Refuse => refuse_no_subcommand(cli),
+            // A person: without `gui` the help text. With `gui`, `run()` starts
+            // the tray app before `execute`, so this is only reached by an
+            // in-process test, which gets the help text too.
+            _person => {
+                Cli::command().print_help().map_err(CliError::Io)?;
+                println!();
+                Ok(())
+            }
+        };
     };
-    // `panel` only needs the data folder: it talks to the running tray app.
-    let panel_view = match &command {
-        Command::Panel { view } => Some(*view),
-        _ => None,
-    };
-    if let Some(view) = panel_view {
-        return panel(cli, view);
+    match caller {
+        // A person's call is never gated, and `panel` keeps needing only the
+        // data folder: it talks to the running tray app.
+        Caller::Person => {
+            if let Command::Panel { view } = &command {
+                return panel(cli, *view);
+            }
+            let context = open_context(cli)?;
+            run_command(context, command, By::Cli, None)
+        }
+        // An agent's call needs the settings and a history to record it, so the
+        // context is opened before the gate and before any command does anything.
+        Caller::Agent => {
+            let context = open_context(cli)?;
+            let cwd = current_cwd();
+            let verdict = gate(&command, caller, &context.settings);
+            record_agent_call(
+                &context,
+                &command_text(&command),
+                matches!(verdict, Gate::Allowed),
+                cwd.clone(),
+            );
+            match verdict {
+                Gate::Allowed => run_command(context, command, By::Agent, cwd),
+                Gate::Refused(text) => Err(CliError::AgentRefused(text)),
+            }
+        }
     }
+}
+
+/// A bare `seatswap` from an agent is a refused agent call: it opens the store
+/// like the other agent commands, records the refusal, then exits 3.
+fn refuse_no_subcommand(cli: &Cli) -> Result<(), CliError> {
     let context = open_context(cli)?;
+    record_agent_call(&context, "(no subcommand)", false, current_cwd());
+    Err(CliError::AgentRefused(AGENTS_MAY_NOT_CHANGE))
+}
+
+fn run_command(
+    context: Context,
+    command: Command,
+    by: By,
+    cwd: Option<String>,
+) -> Result<(), CliError> {
     match command {
         Command::List { refresh } => list(context, refresh),
         Command::Use {
             key,
             save_current,
             discard_current,
-        } => use_account(context, &key, save_current, discard_current),
+        } => use_account(context, &key, save_current, discard_current, by, cwd),
         Command::Next {
             save_current,
             discard_current,
-        } => next_account(context, save_current, discard_current),
+        } => next_account(context, save_current, discard_current, by, cwd),
         Command::Add { label } => add(context, label),
         Command::Rm { key, yes } => remove(context, &key, yes),
         Command::Edit {
@@ -312,6 +447,7 @@ fn execute(cli: &mut Cli) -> Result<(), CliError> {
             abbr,
             color,
         } => edit(context, &key, label, abbr, color),
+        Command::AgentSkill { action } => agent_skill(&context, action),
         // Handled before the store was opened; kept for exhaustiveness.
         Command::Panel { .. } => Ok(()),
         Command::Status {
@@ -320,6 +456,165 @@ fn execute(cli: &mut Cli) -> Result<(), CliError> {
             i3blocks,
             refresh,
         } => status(context, json, waybar, i3blocks, refresh),
+    }
+}
+
+/// The gate table of spec §6.2. A person is always allowed.
+pub(crate) fn gate(command: &Command, caller: Caller, settings: &Settings) -> Gate {
+    if caller == Caller::Person {
+        return Gate::Allowed;
+    }
+    match command {
+        Command::List { .. } | Command::Status { .. } => {
+            if settings.agents_read {
+                Gate::Allowed
+            } else {
+                Gate::Refused(AGENTS_MAY_NOT_READ)
+            }
+        }
+        Command::Use {
+            save_current,
+            discard_current,
+            ..
+        }
+        | Command::Next {
+            save_current,
+            discard_current,
+            ..
+        } => {
+            if save_current.is_some() || *discard_current {
+                Gate::Refused(AGENTS_MAY_NOT_CHANGE)
+            } else if settings.agents_switch {
+                Gate::Allowed
+            } else {
+                Gate::Refused(AGENTS_MAY_NOT_SWITCH)
+            }
+        }
+        Command::Add { .. }
+        | Command::Rm { .. }
+        | Command::Edit { .. }
+        | Command::AgentSkill { .. }
+        | Command::Panel { .. } => Gate::Refused(AGENTS_MAY_NOT_CHANGE),
+    }
+}
+
+/// The subcommand, its positional values and the names of its flags, without
+/// free-text values (`--label`, `--abbr`, `--color`, `--save-current`).
+fn command_text(command: &Command) -> String {
+    match command {
+        Command::List { refresh } => flags("list", &[("--refresh", *refresh)]),
+        Command::Use {
+            key,
+            save_current,
+            discard_current,
+        } => flags(
+            &format!("use {key}"),
+            &[
+                ("--save-current", save_current.is_some()),
+                ("--discard-current", *discard_current),
+            ],
+        ),
+        Command::Next {
+            save_current,
+            discard_current,
+        } => flags(
+            "next",
+            &[
+                ("--save-current", save_current.is_some()),
+                ("--discard-current", *discard_current),
+            ],
+        ),
+        Command::Add { label } => flags("add", &[("--label", label.is_some())]),
+        Command::Rm { key, yes } => flags(&format!("rm {key}"), &[("--yes", *yes)]),
+        Command::Edit {
+            key,
+            label,
+            abbr,
+            color,
+        } => flags(
+            &format!("edit {key}"),
+            &[
+                ("--label", label.is_some()),
+                ("--abbr", abbr.is_some()),
+                ("--color", color.is_some()),
+            ],
+        ),
+        Command::AgentSkill { action } => match action {
+            SkillAction::Install { force } => flags("agent-skill install", &[("--force", *force)]),
+            SkillAction::Uninstall { force } => {
+                flags("agent-skill uninstall", &[("--force", *force)])
+            }
+        },
+        Command::Panel { view } => format!("panel {}", view.as_str()),
+        Command::Status {
+            json,
+            waybar,
+            i3blocks,
+            refresh,
+        } => flags(
+            "status",
+            &[
+                ("--json", *json),
+                ("--waybar", *waybar),
+                ("--i3blocks", *i3blocks),
+                ("--refresh", *refresh),
+            ],
+        ),
+    }
+}
+
+fn flags(base: &str, flags: &[(&str, bool)]) -> String {
+    let mut text = base.to_string();
+    for (name, set) in flags {
+        if *set {
+            text.push(' ');
+            text.push_str(name);
+        }
+    }
+    text
+}
+
+/// Every agent call is one `agentCall` event, allowed or refused. A history
+/// that cannot be written is one warning and never changes the call's result.
+fn record_agent_call(context: &Context, command: &str, allowed: bool, cwd: Option<String>) {
+    let result = (|| -> Result<(), String> {
+        let recorder = ops::open_history(context.store.app_paths(), &context.settings)?;
+        recorder
+            .event(
+                Utc::now(),
+                EventKind::AgentCall {
+                    command: command.to_string(),
+                    cwd,
+                    allowed,
+                },
+            )
+            .map_err(|error| ops::history_unwritable(&error))
+    })();
+    if let Err(message) = result {
+        eprintln!("seatswap: warning: {message}");
+    }
+}
+
+fn current_cwd() -> Option<String> {
+    match record_cwd(std::env::current_dir()) {
+        Ok(cwd) => Some(cwd),
+        Err(reason) => {
+            eprintln!("seatswap: warning: {reason}; the agent call is recorded without a folder");
+            None
+        }
+    }
+}
+
+/// The folder to record for an agent call: its text only when `current_dir`
+/// could be read and its name is valid UTF-8; otherwise the reason it is left
+/// out. A record is never silently given a replaced name or dropped.
+fn record_cwd(dir: io::Result<PathBuf>) -> Result<String, String> {
+    match dir {
+        Ok(path) => match path.to_str() {
+            Some(text) => Ok(text.to_string()),
+            None => Err("the current folder's name is not UTF-8".to_string()),
+        },
+        Err(error) => Err(format!("the current folder cannot be read: {error}")),
     }
 }
 
@@ -403,19 +698,27 @@ fn use_account(
     key: &str,
     save_current: Option<Option<String>>,
     discard_current: bool,
+    by: By,
+    cwd: Option<String>,
 ) -> Result<(), CliError> {
     let policy = unsaved_policy(save_current, discard_current);
     let now = Utc::now();
     let outcome = switcher::switch_to(&context.claude, &context.store, key, policy, now)
         .map_err(switch_error)?;
     print_switch(&context.store, &outcome.to);
-    record_cli_switch(&context, &outcome, now);
+    record_cli_switch(&context, &outcome, by, cwd, now);
     Ok(())
 }
 
 /// The switch is done; a history that cannot be written is a warning, never a
 /// failed command.
-fn record_cli_switch(context: &Context, outcome: &switcher::SwitchOutcome, at: DateTime<Utc>) {
+fn record_cli_switch(
+    context: &Context,
+    outcome: &switcher::SwitchOutcome,
+    by: By,
+    cwd: Option<String>,
+    at: DateTime<Utc>,
+) {
     let result = (|| -> Result<(), String> {
         let file = context.store.load().map_err(|error| error.to_string())?;
         let target = file
@@ -428,7 +731,7 @@ fn record_cli_switch(context: &Context, outcome: &switcher::SwitchOutcome, at: D
             .and_then(|id| file.find(id))
             .map(AccountRef::of);
         let recorder = ops::open_history(context.store.app_paths(), &context.settings)?;
-        ops::record_switch(&recorder, from, to, By::Cli, None, None, None, at)
+        ops::record_switch(&recorder, from, to, by, None, cwd, None, at)
             .map_err(|error| error.to_string())
     })();
     if let Err(error) = result {
@@ -449,6 +752,8 @@ fn next_account(
     context: Context,
     save_current: Option<Option<String>>,
     discard_current: bool,
+    by: By,
+    cwd: Option<String>,
 ) -> Result<(), CliError> {
     let policy = unsaved_policy(save_current, discard_current);
     let now = Utc::now();
@@ -479,7 +784,7 @@ fn next_account(
     let outcome = switcher::switch_to(&context.claude, &context.store, &target, policy, now)
         .map_err(switch_error)?;
     print_switch(&context.store, &outcome.to);
-    record_cli_switch(&context, &outcome, now);
+    record_cli_switch(&context, &outcome, by, cwd, now);
     Ok(())
 }
 
@@ -541,6 +846,100 @@ fn edit(
         color.as_deref(),
     )?;
     println!("Updated {} — {}", account.abbr, account.label);
+    Ok(())
+}
+
+/// `agent-skill install` / `uninstall`: the file below
+/// `<claude config dir>/skills/seatswap/`. Nothing outside these two commands
+/// writes to Claude Code's config folder.
+fn agent_skill(context: &Context, action: SkillAction) -> Result<(), CliError> {
+    let folder = context.claude.config_dir.join("skills").join("seatswap");
+    let path = folder.join("SKILL.md");
+    match action {
+        SkillAction::Install { force } => install_skill(&folder, &path, force),
+        SkillAction::Uninstall { force } => uninstall_skill(&folder, &path, force),
+    }
+}
+
+fn install_skill(folder: &Path, path: &Path, force: bool) -> Result<(), CliError> {
+    let bundled = AGENT_SKILL.as_bytes();
+    match fs::read(path) {
+        Ok(existing) if existing == bundled => {
+            println!("already installed: {}", path.display());
+            return Ok(());
+        }
+        Ok(_) if !force => {
+            return Err(CliError::Message(format!(
+                "{} already exists and differs from seatswap's bundled skill; use --force to replace it",
+                path.display()
+            )))
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(CliError::Store(StoreError::Io {
+                path: path.to_path_buf(),
+                source,
+            }))
+        }
+    }
+    atomic::ensure_private_dir(folder).map_err(|source| {
+        CliError::Store(StoreError::Io {
+            path: folder.to_path_buf(),
+            source,
+        })
+    })?;
+    atomic::write_atomic(path, bundled, Access::Private).map_err(|source| {
+        CliError::Store(StoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    })?;
+    println!("{}", path.display());
+    Ok(())
+}
+
+fn uninstall_skill(folder: &Path, path: &Path, force: bool) -> Result<(), CliError> {
+    let existing = match fs::read(path) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            println!("not installed: {}", path.display());
+            return Ok(());
+        }
+        Err(source) => {
+            return Err(CliError::Store(StoreError::Io {
+                path: path.to_path_buf(),
+                source,
+            }))
+        }
+    };
+    if existing != AGENT_SKILL.as_bytes() && !force {
+        return Err(CliError::Message(format!(
+            "{} differs from seatswap's bundled skill; use --force to remove it",
+            path.display()
+        )));
+    }
+    fs::remove_file(path).map_err(|source| {
+        CliError::Store(StoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    })?;
+    println!("removed {}", path.display());
+    match fs::remove_dir(folder) {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+            ) => {}
+        Err(source) => {
+            return Err(CliError::Store(StoreError::Io {
+                path: folder.to_path_buf(),
+                source,
+            }))
+        }
+    }
     Ok(())
 }
 
@@ -804,5 +1203,803 @@ fn i3blocks_lines(views: &[AccountView], now: DateTime<Utc>) -> (String, String,
             (status_line(view, now), short, color.to_string())
         }
         None => ("—".to_string(), "—".to_string(), NO_LOAD_COLOR.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use chrono::Utc;
+    use serde_json::{json, Value};
+
+    use seatswap_core::engine::AccountView;
+    use seatswap_core::paths::ClaudePaths;
+    use seatswap_core::store::{FileSecrets, LoginState, Settings, Store};
+
+    const FIRST_ACCOUNT_UUID: &str = "4b7e2f91-3c5a-4d8e-9f1b-6a2c8e4d7b30";
+    const FIRST_ORG_UUID: &str = "e2a6c9d1-7f4b-4a3e-8c5d-1b9f0a7e3c62";
+    const SECOND_ACCOUNT_UUID: &str = "8e1d5b7a-6c3f-4a2b-9d8e-1f2a3b4c5d6e";
+    const SECOND_ORG_UUID: &str = "5f2c8a1b-9d4e-4f6a-8b3c-7e2d1a9c4b5e";
+
+    struct Fixture {
+        _tmp: tempfile::TempDir,
+        home: PathBuf,
+        config_dir: PathBuf,
+        data_dir: PathBuf,
+    }
+
+    fn live(index: usize) -> (String, String, String, &'static str, &'static str) {
+        match index {
+            0 => (
+                FIRST_ACCOUNT_UUID.to_string(),
+                FIRST_ORG_UUID.to_string(),
+                "one@example.com".to_string(),
+                "Acme",
+                "Acme",
+            ),
+            _ => (
+                SECOND_ACCOUNT_UUID.to_string(),
+                SECOND_ORG_UUID.to_string(),
+                "two@example.com".to_string(),
+                "Private",
+                "Private",
+            ),
+        }
+    }
+
+    fn credentials_json(org_uuid: &str) -> String {
+        json!({
+            "claudeAiOauth": {
+                "accessToken": format!("sk-ant-oat01-{}", "a".repeat(95)),
+                "refreshToken": format!("sk-ant-ort01-{}", "b".repeat(95)),
+                "expiresAt": 1_794_356_040_000_i64,
+                "refreshTokenExpiresAt": 1_796_772_840_000_i64,
+                "scopes": ["user:inference", "user:profile"],
+                "subscriptionType": "team",
+                "subscriptionTypeSource": "profile",
+                "rateLimitTier": "default_claude_max_5x"
+            },
+            "organizationUuid": org_uuid
+        })
+        .to_string()
+    }
+
+    fn identity_json(account_uuid: &str, org_uuid: &str, email: &str, org_name: &str) -> String {
+        json!({
+            "numStartups": 41,
+            "oauthAccount": {
+                "accountUuid": account_uuid,
+                "emailAddress": email,
+                "organizationUuid": org_uuid,
+                "organizationName": org_name,
+                "organizationRole": "admin",
+                "billingType": "stripe_subscription",
+                "hasExtraUsageEnabled": false
+            },
+            "projects": {}
+        })
+        .to_string()
+    }
+
+    impl Fixture {
+        fn new() -> Fixture {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let home = tmp.path().to_path_buf();
+            let config_dir = home.join("claude");
+            let data_dir = home.join("data");
+            fs::create_dir_all(&config_dir).expect("config folder");
+            fs::create_dir_all(&data_dir).expect("data folder");
+            fs::write(
+                data_dir.join("accounts.json"),
+                json!({
+                    "version": 1,
+                    "accounts": [],
+                    "settings": {"hostName": "atlas"},
+                    "secretsBackend": "file"
+                })
+                .to_string(),
+            )
+            .expect("accounts file");
+            let fixture = Fixture {
+                _tmp: tmp,
+                home,
+                config_dir,
+                data_dir,
+            };
+            fixture.write_live(0);
+            fixture
+        }
+
+        fn write_live(&self, index: usize) {
+            let (account_uuid, org_uuid, email, org_name, _label) = live(index);
+            fs::write(
+                self.config_dir.join(".credentials.json"),
+                credentials_json(&org_uuid),
+            )
+            .expect("credentials");
+            fs::write(
+                self.config_dir.join(".claude.json"),
+                identity_json(&account_uuid, &org_uuid, &email, org_name),
+            )
+            .expect("identity");
+        }
+
+        fn claude(&self) -> ClaudePaths {
+            ClaudePaths::for_config_dir(&self.config_dir, &self.home)
+        }
+
+        fn store(&self) -> Store {
+            Store::new(
+                AppPaths::at(&self.data_dir),
+                Box::new(FileSecrets::new(self.data_dir.join("secrets"))),
+            )
+        }
+
+        fn add_account(&self, index: usize) {
+            let (_, _, _, _, label) = live(index);
+            ops::save_live_login(
+                &self.claude(),
+                &self.store(),
+                Some(label.to_string()),
+                Utc::now(),
+            )
+            .expect("the live login is saved");
+        }
+
+        fn set_agents(&self, read: bool, switch: bool) {
+            let store = self.store();
+            let mut file = store.load().expect("accounts");
+            file.settings.agents_read = read;
+            file.settings.agents_switch = switch;
+            store.save(&file).expect("settings saved");
+        }
+
+        fn cli(&self, command: Command) -> Cli {
+            Cli {
+                data_dir: Some(self.data_dir.clone()),
+                claude_config_dir: Some(self.config_dir.clone()),
+                command: Some(command),
+            }
+        }
+
+        fn cli_without_command(&self) -> Cli {
+            Cli {
+                data_dir: Some(self.data_dir.clone()),
+                claude_config_dir: Some(self.config_dir.clone()),
+                command: None,
+            }
+        }
+
+        fn run(&self, command: Command, caller: Caller) -> Result<(), CliError> {
+            let mut cli = self.cli(command);
+            execute(&mut cli, caller)
+        }
+
+        fn events(&self) -> Vec<Value> {
+            let folder = self.data_dir.join("history").join("atlas");
+            let mut names = Vec::new();
+            if let Ok(entries) = fs::read_dir(&folder) {
+                for entry in entries {
+                    let entry = entry.expect("history entry");
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if name.starts_with("events-") && name.ends_with(".jsonl") {
+                        names.push(entry.path());
+                    }
+                }
+            }
+            names.sort();
+            let mut values = Vec::new();
+            for name in names {
+                let text = fs::read_to_string(name).expect("events file");
+                for line in text.lines() {
+                    values.push(serde_json::from_str(line).expect("an event line"));
+                }
+            }
+            values
+        }
+
+        fn live_bytes(&self) -> (Vec<u8>, Vec<u8>) {
+            (
+                fs::read(self.config_dir.join(".credentials.json")).expect("credentials"),
+                fs::read(self.config_dir.join(".claude.json")).expect("identity"),
+            )
+        }
+    }
+
+    fn settings(read: bool, switch: bool) -> Settings {
+        Settings {
+            agents_read: read,
+            agents_switch: switch,
+            ..Settings::default()
+        }
+    }
+
+    fn plain_use(key: &str) -> Command {
+        Command::Use {
+            key: key.to_string(),
+            save_current: None,
+            discard_current: false,
+        }
+    }
+
+    fn plain_next() -> Command {
+        Command::Next {
+            save_current: None,
+            discard_current: false,
+        }
+    }
+
+    fn all_commands() -> Vec<Command> {
+        vec![
+            Command::List { refresh: false },
+            Command::List { refresh: true },
+            plain_use("PR"),
+            Command::Use {
+                key: "PR".to_string(),
+                save_current: Some(None),
+                discard_current: false,
+            },
+            Command::Use {
+                key: "PR".to_string(),
+                save_current: None,
+                discard_current: true,
+            },
+            plain_next(),
+            Command::Add { label: None },
+            Command::Rm {
+                key: "PR".to_string(),
+                yes: true,
+            },
+            Command::Edit {
+                key: "PR".to_string(),
+                label: None,
+                abbr: None,
+                color: None,
+            },
+            Command::AgentSkill {
+                action: SkillAction::Install { force: false },
+            },
+            Command::AgentSkill {
+                action: SkillAction::Uninstall { force: false },
+            },
+            Command::Panel {
+                view: PanelView::Main,
+            },
+            Command::Status {
+                json: false,
+                waybar: false,
+                i3blocks: false,
+                refresh: false,
+            },
+        ]
+    }
+
+    fn env(pairs: &[(&str, &str)]) -> Caller {
+        caller(&|name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.to_string())
+        })
+    }
+
+    #[test]
+    fn a_person_is_never_gated() {
+        let settings = settings(false, false);
+        for command in all_commands() {
+            assert_eq!(
+                gate(&command, Caller::Person, &settings),
+                Gate::Allowed,
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_agent_is_detected_by_either_marker() {
+        assert_eq!(env(&[("CLAUDECODE", "1")]), Caller::Agent);
+        assert_eq!(
+            env(&[("AI_AGENT", "claude-code_2-1-322_agent")]),
+            Caller::Agent
+        );
+        assert_eq!(env(&[("CLAUDECODE", "0")]), Caller::Person);
+        assert_eq!(env(&[("AI_AGENT", "")]), Caller::Person);
+        assert_eq!(env(&[]), Caller::Person);
+    }
+
+    #[test]
+    fn a_cwd_is_recorded_only_when_it_is_utf8() {
+        assert_eq!(
+            record_cwd(Ok(PathBuf::from("/home/sam/projects/atlas"))),
+            Ok("/home/sam/projects/atlas".to_string())
+        );
+        let reason = record_cwd(Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "denied",
+        )))
+        .expect_err("a folder that cannot be read is not recorded");
+        assert!(reason.contains("cannot be read"), "{reason}");
+
+        #[cfg(unix)]
+        {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+
+            let path = PathBuf::from(OsStr::from_bytes(b"/home/sam/\xff"));
+            let reason =
+                record_cwd(Ok(path)).expect_err("a name that is not UTF-8 is not recorded");
+            assert!(reason.contains("not UTF-8"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn the_gate_table() {
+        // list and status: agentsRead decides, whatever agentsSwitch says.
+        for read in [false, true] {
+            for switch in [false, true] {
+                let settings = settings(read, switch);
+                let expected = if read {
+                    Gate::Allowed
+                } else {
+                    Gate::Refused(AGENTS_MAY_NOT_READ)
+                };
+                for command in [
+                    Command::List { refresh: false },
+                    Command::List { refresh: true },
+                    Command::Status {
+                        json: true,
+                        waybar: false,
+                        i3blocks: false,
+                        refresh: false,
+                    },
+                    Command::Status {
+                        json: false,
+                        waybar: true,
+                        i3blocks: false,
+                        refresh: true,
+                    },
+                ] {
+                    assert_eq!(
+                        gate(&command, Caller::Agent, &settings),
+                        expected,
+                        "agentsRead {read}, agentsSwitch {switch}: {command:?}"
+                    );
+                }
+            }
+        }
+
+        // use and next without the unsaved-current flags: agentsSwitch decides,
+        // whatever agentsRead says.
+        for read in [false, true] {
+            for switch in [false, true] {
+                let settings = settings(read, switch);
+                let expected = if switch {
+                    Gate::Allowed
+                } else {
+                    Gate::Refused(AGENTS_MAY_NOT_SWITCH)
+                };
+                for command in [plain_use("PR"), plain_next()] {
+                    assert_eq!(
+                        gate(&command, Caller::Agent, &settings),
+                        expected,
+                        "agentsRead {read}, agentsSwitch {switch}: {command:?}"
+                    );
+                }
+            }
+        }
+
+        // Everything that changes accounts or settings is always refused.
+        for (read, switch) in [(false, false), (false, true), (true, false), (true, true)] {
+            let settings = settings(read, switch);
+            for command in [
+                Command::Use {
+                    key: "PR".to_string(),
+                    save_current: Some(None),
+                    discard_current: false,
+                },
+                Command::Use {
+                    key: "PR".to_string(),
+                    save_current: None,
+                    discard_current: true,
+                },
+                Command::Next {
+                    save_current: Some(Some("x".to_string())),
+                    discard_current: false,
+                },
+                Command::Next {
+                    save_current: None,
+                    discard_current: true,
+                },
+                Command::Add { label: None },
+                Command::Rm {
+                    key: "PR".to_string(),
+                    yes: true,
+                },
+                Command::Edit {
+                    key: "PR".to_string(),
+                    label: Some("Acme".to_string()),
+                    abbr: None,
+                    color: Some("#3b82f6".to_string()),
+                },
+                Command::AgentSkill {
+                    action: SkillAction::Install { force: true },
+                },
+                Command::AgentSkill {
+                    action: SkillAction::Uninstall { force: false },
+                },
+                Command::Panel {
+                    view: PanelView::Settings,
+                },
+            ] {
+                assert_eq!(
+                    gate(&command, Caller::Agent, &settings),
+                    Gate::Refused(AGENTS_MAY_NOT_CHANGE)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_command_text_leaves_out_free_text() {
+        assert_eq!(command_text(&plain_use("PR")), "use PR");
+        assert_eq!(
+            command_text(&Command::Use {
+                key: "PR".to_string(),
+                save_current: Some(None),
+                discard_current: false,
+            }),
+            "use PR --save-current"
+        );
+        assert_eq!(
+            command_text(&Command::Status {
+                json: true,
+                waybar: false,
+                i3blocks: false,
+                refresh: true,
+            }),
+            "status --json --refresh"
+        );
+        assert_eq!(
+            command_text(&Command::Edit {
+                key: "PR".to_string(),
+                label: Some("Private".to_string()),
+                abbr: None,
+                color: Some("#3b82f6".to_string()),
+            }),
+            "edit PR --label --color"
+        );
+        assert_eq!(
+            command_text(&Command::AgentSkill {
+                action: SkillAction::Install { force: true },
+            }),
+            "agent-skill install --force"
+        );
+        assert_eq!(
+            command_text(&Command::AgentSkill {
+                action: SkillAction::Uninstall { force: true },
+            }),
+            "agent-skill uninstall --force"
+        );
+        assert_eq!(
+            command_text(&Command::Panel {
+                view: PanelView::Settings,
+            }),
+            "panel settings"
+        );
+    }
+
+    #[test]
+    fn a_refused_call_exits_3_and_is_recorded() {
+        let fixture = Fixture::new();
+        fixture.add_account(0);
+        fixture.write_live(1);
+        fixture.add_account(1);
+        fixture.set_agents(false, false);
+        let before = fixture.live_bytes();
+
+        let error = fixture
+            .run(plain_use("PR"), Caller::Agent)
+            .expect_err("an agent may not switch here");
+        assert_eq!(error.exit_code(), 3);
+        match error {
+            CliError::AgentRefused(text) => assert_eq!(text, AGENTS_MAY_NOT_SWITCH),
+            other => panic!("expected AgentRefused, got {other:?}"),
+        }
+
+        let events = fixture.events();
+        let call = events
+            .iter()
+            .find(|event| event["type"] == "agentCall")
+            .expect("an agentCall event");
+        assert_eq!(call["allowed"], false);
+        assert_eq!(call["command"], "use PR");
+        assert!(call["cwd"].is_string(), "{call}");
+        assert_eq!(fixture.live_bytes(), before);
+    }
+
+    #[test]
+    fn the_no_subcommand_decision_depends_on_the_caller() {
+        assert_eq!(no_subcommand(Caller::Agent), NoSubcommand::Refuse);
+        #[cfg(feature = "gui")]
+        assert_eq!(no_subcommand(Caller::Person), NoSubcommand::StartApp);
+        #[cfg(not(feature = "gui"))]
+        assert_eq!(no_subcommand(Caller::Person), NoSubcommand::PrintHelp);
+    }
+
+    #[test]
+    fn an_agent_without_a_subcommand_is_refused_and_recorded() {
+        let fixture = Fixture::new();
+        let before = fixture.live_bytes();
+        let mut cli = fixture.cli_without_command();
+
+        let error =
+            execute(&mut cli, Caller::Agent).expect_err("an agent may not start the tray app");
+        assert_eq!(error.exit_code(), 3);
+        match error {
+            CliError::AgentRefused(text) => assert_eq!(text, AGENTS_MAY_NOT_CHANGE),
+            other => panic!("expected AgentRefused, got {other:?}"),
+        }
+
+        let events = fixture.events();
+        let call = events
+            .iter()
+            .find(|event| event["type"] == "agentCall")
+            .expect("an agentCall event");
+        assert_eq!(call["allowed"], false);
+        assert_eq!(call["command"], "(no subcommand)");
+        assert!(call["cwd"].is_string(), "{call}");
+        assert_eq!(fixture.live_bytes(), before);
+    }
+
+    #[test]
+    fn an_allowed_agent_switch_is_recorded_as_agent() {
+        let fixture = Fixture::new();
+        fixture.add_account(0);
+        fixture.write_live(1);
+        fixture.add_account(1);
+        fixture.set_agents(true, true);
+
+        fixture
+            .run(plain_use("AC"), Caller::Agent)
+            .expect("an allowed agent switch");
+
+        let events = fixture.events();
+        let switch = events
+            .iter()
+            .find(|event| event["type"] == "switch")
+            .expect("a switch event");
+        assert_eq!(switch["by"], "agent");
+        assert!(switch["cwd"].is_string(), "{switch}");
+        let call = events
+            .iter()
+            .find(|event| event["type"] == "agentCall")
+            .expect("an agentCall event");
+        assert_eq!(call["allowed"], true);
+        assert_eq!(call["command"], "use AC");
+    }
+
+    #[test]
+    fn skill_install_writes_the_bundled_text() {
+        let fixture = Fixture::new();
+        let path = fixture.config_dir.join("skills/seatswap/SKILL.md");
+
+        fixture
+            .run(
+                Command::AgentSkill {
+                    action: SkillAction::Install { force: false },
+                },
+                Caller::Person,
+            )
+            .expect("the skill is installed");
+        assert_eq!(
+            fs::read_to_string(&path).expect("the skill file"),
+            AGENT_SKILL
+        );
+        let modified = fs::metadata(&path)
+            .expect("skill metadata")
+            .modified()
+            .expect("modification time");
+
+        // A second install writes nothing.
+        fixture
+            .run(
+                Command::AgentSkill {
+                    action: SkillAction::Install { force: false },
+                },
+                Caller::Person,
+            )
+            .expect("a second install is a no-op");
+        assert_eq!(
+            fs::read_to_string(&path).expect("the skill file"),
+            AGENT_SKILL
+        );
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("skill metadata")
+                .modified()
+                .expect("modification time"),
+            modified
+        );
+
+        // A different file is not replaced without --force.
+        fs::write(&path, "another skill").expect("a changed skill");
+        let error = fixture
+            .run(
+                Command::AgentSkill {
+                    action: SkillAction::Install { force: false },
+                },
+                Caller::Person,
+            )
+            .expect_err("the changed file is kept");
+        match error {
+            CliError::Message(text) => {
+                assert!(text.contains(&path.display().to_string()), "{text}");
+                assert!(text.contains("--force"), "{text}");
+            }
+            other => panic!("expected a message, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read_to_string(&path).expect("the changed skill"),
+            "another skill"
+        );
+
+        // --force replaces it.
+        fixture
+            .run(
+                Command::AgentSkill {
+                    action: SkillAction::Install { force: true },
+                },
+                Caller::Person,
+            )
+            .expect("--force replaces the changed file");
+        assert_eq!(
+            fs::read_to_string(&path).expect("the skill file"),
+            AGENT_SKILL
+        );
+    }
+
+    #[test]
+    fn skill_uninstall_removes_the_file_and_the_empty_folder() {
+        let fixture = Fixture::new();
+        let folder = fixture.config_dir.join("skills/seatswap");
+        let path = folder.join("SKILL.md");
+        fixture
+            .run(
+                Command::AgentSkill {
+                    action: SkillAction::Install { force: false },
+                },
+                Caller::Person,
+            )
+            .expect("the skill is installed");
+        assert!(path.is_file());
+
+        fixture
+            .run(
+                Command::AgentSkill {
+                    action: SkillAction::Uninstall { force: false },
+                },
+                Caller::Person,
+            )
+            .expect("the skill is removed");
+        assert!(!path.exists());
+        assert!(!folder.exists());
+    }
+
+    #[test]
+    fn skill_uninstall_keeps_an_edited_file_unless_forced() {
+        let fixture = Fixture::new();
+        let folder = fixture.config_dir.join("skills/seatswap");
+        let path = folder.join("SKILL.md");
+        fs::create_dir_all(&folder).expect("the skill folder");
+        fs::write(&path, "my own skill").expect("an edited skill");
+        let edited = fs::read(&path).expect("the edited bytes");
+
+        let error = fixture
+            .run(
+                Command::AgentSkill {
+                    action: SkillAction::Uninstall { force: false },
+                },
+                Caller::Person,
+            )
+            .expect_err("an edited skill is kept");
+        match error {
+            CliError::Message(text) => assert_eq!(
+                text,
+                format!(
+                    "{} differs from seatswap's bundled skill; use --force to remove it",
+                    path.display()
+                )
+            ),
+            other => panic!("expected a message, got {other:?}"),
+        }
+        assert!(path.is_file());
+        assert_eq!(fs::read(&path).expect("the kept skill"), edited);
+
+        fixture
+            .run(
+                Command::AgentSkill {
+                    action: SkillAction::Uninstall { force: true },
+                },
+                Caller::Person,
+            )
+            .expect("--force removes the edited skill");
+        assert!(!path.exists());
+        assert!(!folder.exists());
+    }
+
+    #[test]
+    fn a_skill_file_error_names_its_path() {
+        // `skills` is a file, not a folder.
+        let fixture = Fixture::new();
+        let skills = fixture.config_dir.join("skills");
+        fs::write(&skills, "not a folder").expect("a file where the folder goes");
+        for action in [
+            SkillAction::Install { force: false },
+            SkillAction::Uninstall { force: false },
+        ] {
+            let error = fixture
+                .run(Command::AgentSkill { action }, Caller::Person)
+                .expect_err("a file where the folder goes is an error");
+            let text = error.to_string();
+            assert!(text.contains(&skills.display().to_string()), "{text}");
+        }
+
+        // `SKILL.md` is a folder, not a file.
+        let fixture = Fixture::new();
+        let path = fixture.config_dir.join("skills/seatswap/SKILL.md");
+        fs::create_dir_all(&path).expect("a folder where the skill goes");
+        for action in [
+            SkillAction::Install { force: false },
+            SkillAction::Uninstall { force: false },
+        ] {
+            let error = fixture
+                .run(Command::AgentSkill { action }, Caller::Person)
+                .expect_err("a folder where the skill goes is an error");
+            let text = error.to_string();
+            assert!(text.contains(&path.display().to_string()), "{text}");
+        }
+    }
+
+    #[test]
+    fn status_json_has_usable() {
+        let views = vec![account_view(true), account_view(false)];
+        let output = StatusJson {
+            views: &views,
+            active: None,
+            suggestion: None,
+        };
+        let value = serde_json::to_value(&output).expect("status JSON");
+        let views = value["views"].as_array().expect("views");
+        assert_eq!(views.len(), 2);
+        for view in views {
+            assert!(
+                view.get("usable").and_then(Value::as_bool).is_some(),
+                "{view}"
+            );
+        }
+        assert_eq!(views[0]["usable"], true);
+        assert_eq!(views[1]["usable"], false);
+    }
+
+    fn account_view(usable: bool) -> AccountView {
+        AccountView {
+            id: "id".to_string(),
+            label: "Acme".to_string(),
+            abbr: "AC".to_string(),
+            color: "#3b82f6".to_string(),
+            email: Some("one@example.com".to_string()),
+            plan: None,
+            is_active: false,
+            login_state: LoginState::Ok,
+            login_ends_at_ms: None,
+            login_days_left: None,
+            usage: None,
+            usable,
+            blocked_until: None,
+            blocker: None,
+            fetched_at: None,
+            last_error: None,
+        }
     }
 }

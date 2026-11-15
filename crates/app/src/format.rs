@@ -38,6 +38,20 @@ pub(crate) fn format_age(fetched_at: DateTime<Utc>, now: DateTime<Utc>) -> Strin
     format!("{} d ago", hours / 24)
 }
 
+/// A path with the home folder at its start shown as `~`
+/// (`/home/sam/projects/atlas` → `~/projects/atlas`). Only whole path components
+/// match, by the platform's own separator rules: `/home/samuel` stays as it is
+/// for home `/home/sam`, and on Unix `/home/sam\x` is a different folder.
+#[cfg(feature = "gui")]
+pub(crate) fn with_tilde(path: &str, home: &std::path::Path) -> String {
+    let path = std::path::Path::new(path);
+    match path.strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Ok(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
+        Err(_) => path.to_string_lossy().into_owned(),
+    }
+}
+
 /// Time to a reset (spec §11), the one rule for the panel, tray and CLI:
 /// under 24 h hours and minutes (`35m`, `1h05m`), up to 48 h days and hours
 /// (`1d18h`), beyond 48 h the local weekday and clock time (`Sun 02:00`).
@@ -281,6 +295,34 @@ mod tests {
         assert_eq!(format_age(now - Duration::minutes(5), now), "5 min ago");
         assert_eq!(format_age(now - Duration::hours(2), now), "2 h ago");
         assert_eq!(format_age(now - Duration::days(3), now), "3 d ago");
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn a_home_folder_becomes_a_tilde() {
+        let home = std::path::Path::new("/home/sam");
+        assert_eq!(
+            with_tilde("/home/sam/projects/atlas", home),
+            "~/projects/atlas"
+        );
+        assert_eq!(with_tilde("/home/sam", home), "~");
+        assert_eq!(with_tilde("/home/samuel", home), "/home/samuel");
+        assert_eq!(
+            with_tilde("/home/samuel/projects", home),
+            "/home/samuel/projects"
+        );
+        assert_eq!(with_tilde("/srv/atlas", home), "/srv/atlas");
+        // A backslash is a separator only where the platform says it is.
+        #[cfg(unix)]
+        assert_eq!(with_tilde("/home/sam\\x", home), "/home/sam\\x");
+        #[cfg(windows)]
+        assert_eq!(
+            with_tilde(
+                r"C:\Users\sam\projects",
+                std::path::Path::new(r"C:\Users\sam")
+            ),
+            r"~\projects"
+        );
     }
 
     #[test]

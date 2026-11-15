@@ -198,6 +198,10 @@ impl Fixture {
             .env("HOME", self.home.path())
             .env_remove("CLAUDE_CONFIG_DIR")
             .env_remove("XDG_CONFIG_HOME")
+            // A worker's shell has CLAUDECODE=1 and AI_AGENT set; GitHub's has
+            // neither. A test that wants an agent sets them itself.
+            .env_remove("CLAUDECODE")
+            .env_remove("AI_AGENT")
             // With no runtime folder the socket is <data>/gui.sock, which the
             // panel test binds.
             .env_remove("XDG_RUNTIME_DIR")
@@ -208,6 +212,20 @@ impl Fixture {
     fn run(&self, args: &[&str]) -> Output {
         self.command().args(args).output().expect("run seatswap")
     }
+}
+
+/// Set `agentsSwitch` in the fake store explicitly.
+fn set_agents_switch(fixture: &Fixture, value: bool) {
+    let mut accounts = fixture.accounts();
+    let object = accounts.as_object_mut().expect("accounts object");
+    let settings = object
+        .entry("settings".to_string())
+        .or_insert_with(|| json!({}));
+    settings["agentsSwitch"] = json!(value);
+    write_private(
+        &fixture.data_dir.join("accounts.json"),
+        accounts.to_string().as_bytes(),
+    );
 }
 
 /// Write `bytes`; on Unix also set mode 0600, as Claude Code does.
@@ -677,5 +695,63 @@ fn panel_sends_the_view_to_the_running_app() {
     assert_eq!(
         received.join().expect("listener thread").trim(),
         "open-panel settings"
+    );
+}
+
+#[test]
+fn the_program_refuses_an_agent_that_may_not_switch() {
+    let fixture = Fixture::new();
+    assert_ok(&fixture.run(&["add"]));
+    fixture.write_live(&Live::second());
+    assert_ok(&fixture.run(&["add", "--label", "Private"]));
+    set_agents_switch(&fixture, false);
+
+    let before_credentials = fs::read(fixture.path(".credentials.json")).expect("credentials");
+    let before_identity = fs::read(fixture.path(".claude.json")).expect("identity");
+
+    let refused = fixture
+        .command()
+        .env("CLAUDECODE", "1")
+        .args(["use", "AC"])
+        .output()
+        .expect("run seatswap");
+    assert_code(&refused, 3);
+    assert!(
+        stderr(&refused)
+            .lines()
+            .any(|line| line
+                == "seatswap: agents may not switch accounts (seatswap settings → Agents)"),
+        "{}",
+        stderr(&refused)
+    );
+    assert_eq!(
+        fs::read(fixture.path(".credentials.json")).expect("credentials"),
+        before_credentials,
+        "a refused switch must not touch the live login"
+    );
+    assert_eq!(
+        fs::read(fixture.path(".claude.json")).expect("identity"),
+        before_identity,
+        "a refused switch must not touch the live identity"
+    );
+}
+
+#[test]
+fn the_program_treats_a_plain_shell_as_a_person() {
+    let fixture = Fixture::new();
+    assert_ok(&fixture.run(&["add"]));
+    fixture.write_live(&Live::second());
+    assert_ok(&fixture.run(&["add", "--label", "Private"]));
+    set_agents_switch(&fixture, false);
+
+    let switched = fixture.run(&["use", "AC"]);
+    assert_ok(&switched);
+    assert_eq!(
+        fixture.credentials()["claudeAiOauth"]["accessToken"],
+        json!(Live::first().access_token())
+    );
+    assert_eq!(
+        fixture.identity()["oauthAccount"]["accountUuid"],
+        json!(FIRST_ACCOUNT_UUID)
     );
 }
