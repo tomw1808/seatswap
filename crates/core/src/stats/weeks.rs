@@ -16,10 +16,10 @@ use crate::projects::ProjectId;
 use crate::transcripts::Tokens;
 
 use super::{
-    account_abbr, account_id, account_position, account_weeks_valued, blocked_by_week,
-    blocked_spans, hours_text, lost_percent, money_of, money_text, percent_text, range_of,
-    switch_counts, top_three, week_columns, working_hours, working_rhythm, AccountWeek, Ctx, Query,
-    RangeKey, StatsError, SwitchCounts,
+    account_abbr, account_chosen, account_id, account_position, account_weeks_valued,
+    blocked_by_week, blocked_spans, hours_text, lost_percent, money_of, money_text, percent_text,
+    range_of, switch_counts, top_three, week_columns, working_hours, working_rhythm, AccountWeek,
+    Ctx, Query, RangeKey, StatsError, SwitchCounts,
 };
 
 /// The Weeks page: the grid of account weeks and the curves of the last 14
@@ -172,7 +172,7 @@ pub(crate) fn weeks_in(ctx: &Ctx, range: &Range, q: &Query) -> Result<WeeksPage,
     let mut rows = Vec::new();
     let mut recent = Vec::new();
     for account in ctx.accounts {
-        if !q.accounts.is_empty() && !q.accounts.iter().any(|id| id == &account.id) {
+        if !account_chosen(ctx, q, Some(&AccountRef::of(account))) {
             continue;
         }
         let reference = AccountRef::of(account);
@@ -434,14 +434,8 @@ pub fn week_summary(ctx: &Ctx, q: &Query, week: DateTime<Utc>) -> Result<WeekSum
     for hosted in &token_read.records {
         let record = &hosted.record;
         let value = valuer.value(&hosted.host, record);
-        if !q.accounts.is_empty() {
-            let chosen = value.account.as_ref().is_some_and(|account| {
-                let id = account_id(ctx, account);
-                q.accounts.iter().any(|chosen| chosen == &id)
-            });
-            if !chosen {
-                continue;
-            }
+        if !account_chosen(ctx, q, value.account.as_ref()) {
+            continue;
         }
         records_seen = true;
         tokens += Tokens {

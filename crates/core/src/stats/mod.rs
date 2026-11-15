@@ -17,6 +17,7 @@ use crate::projects::{Projects, ProjectsLogRecord};
 use crate::store::{Account, Settings};
 
 pub mod overview;
+pub mod projects;
 pub mod weeks;
 
 #[derive(Debug, thiserror::Error)]
@@ -163,14 +164,8 @@ pub(crate) fn account_weeks_valued(
         if midpoint < range.from || midpoint >= range.to {
             continue;
         }
-        let stored = stored_account(ctx, &window.account);
-        if !q.accounts.is_empty() {
-            let Some(account) = stored else {
-                continue;
-            };
-            if !q.accounts.iter().any(|id| id == &account.id) {
-                continue;
-            }
+        if !account_chosen(ctx, q, Some(&window.account)) {
+            continue;
         }
         let (price, price_missing) = match valuer.price_at(&window.account, midpoint) {
             Ok(price) => (Some(price), None),
@@ -320,12 +315,42 @@ pub(crate) fn week_of_record<'a>(
     })
 }
 
+/// The output tokens of each account's records whose window is one of its
+/// account weeks, keyed by the account and the calendar week of that window.
+pub(crate) fn output_by_account_week<'a>(
+    weeks: &[AccountWeek],
+    records: impl IntoIterator<Item = (&'a AccountRef, &'a TokenRecord)>,
+) -> BTreeMap<(AccountRef, DateTime<Utc>), u64> {
+    let mut by_week: BTreeMap<(AccountRef, DateTime<Utc>), u64> = BTreeMap::new();
+    for (account, record) in records {
+        let Some(week) = week_of_record(weeks, account, record.t) else {
+            continue;
+        };
+        *by_week.entry((account.clone(), week.week)).or_insert(0) += record.out;
+    }
+    by_week
+}
+
 /// The id a page writes for `reference`: the stored account's id, or the
 /// reference's account id when it is no longer stored.
 pub(crate) fn account_id(ctx: &Ctx, reference: &AccountRef) -> String {
     stored_account(ctx, reference)
         .map(|account| account.id.clone())
         .unwrap_or_else(|| reference.acc.clone())
+}
+
+/// Whether the query chooses `account`: every account when `q.accounts` is
+/// empty, else only the one whose [`account_id`] is named. A record without a
+/// known account is never chosen by a filter.
+pub(crate) fn account_chosen(ctx: &Ctx, q: &Query, account: Option<&AccountRef>) -> bool {
+    if q.accounts.is_empty() {
+        return true;
+    }
+    let Some(account) = account else {
+        return false;
+    };
+    let id = account_id(ctx, account);
+    q.accounts.iter().any(|chosen| chosen == &id)
 }
 
 /// The abbreviation a page writes for `reference`: the stored account's, or the
@@ -371,7 +396,7 @@ pub(crate) fn money_text(amount: f64, currency: &str) -> String {
 }
 
 /// A whole number with a comma every three digits: `1204` → `1,204`.
-fn thousands(whole: i64) -> String {
+pub(crate) fn thousands(whole: i64) -> String {
     let digits = whole.unsigned_abs().to_string();
     let mut text = String::new();
     for (index, digit) in digits.chars().enumerate() {
@@ -456,13 +481,8 @@ pub fn blocked_spans(ctx: &Ctx, range: &Range, q: &Query) -> Result<Vec<BlockedS
             if interval_host != &host {
                 continue;
             }
-            if !q.accounts.is_empty() {
-                let Some(stored) = stored_account(ctx, account) else {
-                    continue;
-                };
-                if !q.accounts.iter().any(|id| id == &stored.id) {
-                    continue;
-                }
+            if !account_chosen(ctx, q, Some(account)) {
+                continue;
             }
             let start = (*blocked_from).max(range.from);
             let end = (*blocked_to).min(range.to);
@@ -1451,6 +1471,27 @@ pub(crate) mod tests {
         let weeks = account_weeks(&tiny.ctx(), &two_weeks(), &query).unwrap();
         assert_eq!(weeks.len(), 2);
         assert!(weeks.iter().all(|week| week.account == tiny.lb_ref()));
+    }
+
+    /// An account no longer in the store is chosen by the id `account_id`
+    /// gives it: its account uuid, on every page.
+    #[test]
+    fn a_removed_account_is_chosen_by_its_id() {
+        let tiny = tiny();
+        let accounts = vec![tiny.accounts[0].clone()];
+        let ctx = Ctx {
+            accounts: &accounts,
+            ..tiny.ctx()
+        };
+        let query = Query {
+            range: RangeKey::All,
+            accounts: vec![tiny.ac().account_uuid.clone()],
+            host: None,
+        };
+
+        let weeks = account_weeks(&ctx, &two_weeks(), &query).unwrap();
+        assert_eq!(weeks.len(), 2, "AC's two finished weeks");
+        assert!(weeks.iter().all(|week| week.account == tiny.ac_ref()));
     }
 
     /// A block is a record of one host: atlas blocked LB at 10:00 and
