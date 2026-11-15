@@ -66,7 +66,9 @@ use tauri::{AppHandle, Emitter, Manager};
 #[cfg(feature = "gui")]
 use lookup_rt::{LookupClient, LookupHandle};
 #[cfg(feature = "gui")]
-use sessions_rt::SessionsHandle;
+use sessions_rt::{SessionsClient, SessionsHandle};
+#[cfg(feature = "gui")]
+use window::SessionsView;
 #[cfg(feature = "gui")]
 use worker::SessionsSummary;
 #[cfg(feature = "gui")]
@@ -94,6 +96,8 @@ pub(crate) struct GuiState {
     pub(crate) history: Result<seatswap_core::history::HistoryDir, String>,
     /// The latest sessions summary; every snapshot is emitted with it.
     sessions: Mutex<Option<SessionsSummary>>,
+    /// The sessions thread's commands; `None` while `readSessions` is off.
+    pub(crate) sessions_client: Option<SessionsClient>,
     pub(crate) engine: std::sync::mpsc::Sender<EngineCommand>,
     pub(crate) action: std::sync::mpsc::Sender<ActionCommand>,
     /// The look-up thread's view, and the handle that keeps the thread alive.
@@ -133,6 +137,25 @@ impl GuiState {
     pub(crate) fn remember_settings(&self, settings: seatswap_core::store::Settings) {
         lock(&self.snapshot).settings = Some(settings);
     }
+
+    /// The sessions thread's client; when `readSessions` is off, the one text
+    /// every sessions command answers with.
+    pub(crate) fn sessions_commands(&self) -> Result<SessionsClient, String> {
+        self.sessions_client
+            .clone()
+            .ok_or_else(|| sessions_rt::SESSIONS_OFF.to_string())
+    }
+}
+
+/// The one way a view learns the account in use: the snapshot's active view.
+/// Used for the command's answer and for every pushed view.
+#[cfg(feature = "gui")]
+pub(crate) fn fill_in_use(view: &mut SessionsView, snapshot: &Snapshot) {
+    view.in_use = snapshot
+        .views
+        .iter()
+        .find(|account| account.is_active)
+        .map(|account| account.id.clone());
 }
 
 #[cfg(feature = "gui")]
@@ -217,6 +240,9 @@ pub(crate) fn run(
             panel::history_import,
             panel::history_export,
             window::open_window,
+            window::sessions_view,
+            window::sessions_subscribe,
+            window::sessions_unsubscribe,
         ])
         .build(tauri::generate_context!());
     match result {
@@ -387,6 +413,7 @@ fn setup(
         claude: claude.clone(),
         history,
         sessions: Mutex::new(None),
+        sessions_client: sessions.as_ref().map(SessionsHandle::client),
         engine: worker.engine.clone(),
         action: worker.action.clone(),
         lookup,
@@ -488,6 +515,12 @@ fn handle_ui_event(app: &AppHandle, event: UiEvent) {
         }
         UiEvent::Money(view) => {
             let _ = app.emit("money", &view);
+        }
+        UiEvent::SessionsView(mut view) => {
+            let state = app.state::<GuiState>();
+            let snapshot = lock(&state.snapshot).clone();
+            fill_in_use(&mut view, &snapshot);
+            let _ = app.emit_to(window::WINDOW_LABEL, "sessions-view", &view);
         }
     }
 }

@@ -1034,9 +1034,10 @@ pub(crate) struct PassOutcome { pub summary: SessionsSummary, pub models: Option
                                 pub wake_soon: bool }
 pub(crate) struct SessionMemory { /* home, project per cwd, waits, last session record, closed */ }
 impl SessionMemory { pub(crate) fn new(home: PathBuf) -> SessionMemory; }
-pub(crate) struct SessionsHandle { /* stop flag, wake sender, join handle, latest summary */ }
+pub(crate) struct SessionsHandle { /* stop flag, command sender, join handle, latest summary */ }
 impl SessionsHandle {
     pub(crate) fn latest(&self) -> Arc<Mutex<Option<SessionsSummary>>>;
+    pub(crate) fn client(&self) -> SessionsClient;
     pub(crate) fn stop(&mut self);           // also joins the thread; Drop stops it
 }
 pub(crate) fn spawn(app: AppPaths, claude: ClaudePaths, settings: Settings,
@@ -2323,3 +2324,99 @@ that fails stores an empty one with its error. Every waiting session of a fresh 
 `Deduper` shows another host's wait only with `notifyWaitingHosts: AllHosts`; a click opens the
 large window at `sessions?<session id>` (`window::parse_target` accepts the id and refuses an item
 after any other area).
+
+### The Sessions view and its commands (step C2, Task 4)
+
+The sessions thread owns the facts the view is made of and answers the window over one
+`SessionsClient`, the same pattern as the look-up's client:
+
+```rust
+// gui/sessions_rt.rs
+pub(crate) const SESSIONS_OFF: &str =
+    "reading sessions is off: turn on \"Read Claude Code's session files\" in Settings → General and restart seatswap";
+enum SessionsCommand { View { options: SessionsOptions, reply: Sender<Result<SessionsView, String>> },
+                      Subscribe(SessionsOptions), Unsubscribe, Stop, Wake }
+#[derive(Clone)] pub(crate) struct SessionsClient { /* sender */ }
+impl SessionsClient {
+    pub(crate) fn view(&self, options: SessionsOptions) -> Result<SessionsView, String>;
+    pub(crate) fn subscribe(&self, options: SessionsOptions) -> Result<(), String>;
+    pub(crate) fn unsubscribe(&self) -> Result<(), String>;
+}
+impl SessionsHandle { pub(crate) fn client(&self) -> SessionsClient; }
+```
+
+`Wake` is the folder watchers' plain wake. The command channel is also the thread's wake channel.
+When `readSessions` is off no thread runs, `GuiState.sessions_client` is `None`, and
+`GuiState::sessions_commands()` answers every command with `SESSIONS_OFF`; turning the setting on
+takes effect after restarting seatswap, because the thread starts only with the app.
+
+After every pass `SessionMemory` keeps this host's `Rows`, each running session's
+`thinking_since_user`, the last `OtherHosts` read, the summary's `unavailable` text, the settings'
+currency, the last pass time and the history's host (`None` without a history). It keeps the
+subscription's options (`Option<SessionsOptions>`, `None` while nothing is subscribed) apart from a
+command's; `publish_view` always uses the subscription's. A `View` command is answered from those
+facts over `window::view_of`, without a pass, for the options it sends; another closed choice reads
+that choice's closed rows once and keeps them beside the subscription's.
+
+```rust
+// gui/window.rs
+pub(crate) enum ClosedSince { None, Day, Week, Month }        // 24 h, 7 d, 30 d before now
+impl ClosedSince { pub(crate) fn since(self, now: DateTime<Utc>) -> Option<DateTime<Utc>>; }
+pub(crate) struct SessionsOptions { pub closed: ClosedSince, pub host: Option<String> }
+pub(crate) struct HostState { pub host: String, pub at: DateTime<Utc>, pub stale: bool, pub this: bool }
+pub(crate) struct SwitchEffect { pub loses_thinking: u32, pub loses_thinking_busy: u32,
+                                 pub resend: u32, pub free: u32 }
+pub(crate) struct SessionsView { pub at: DateTime<Utc>, pub this_host: Option<String>,
+    pub hosts: Vec<HostState>, pub sessions: Vec<LiveSession>,
+    pub switch_effect: SwitchEffect, pub in_use: Option<String>,
+    pub currency: Option<String>, pub unavailable: Option<String> }
+pub(crate) fn view_of(at: DateTime<Utc>, this_host: Option<String>, running: &[LiveSession],
+    closed: &[LiveSession], other_hosts: &[OtherHost], thinking: &BTreeMap<String, u32>,
+    unavailable: Option<&str>, currency: Option<&str>, options: &SessionsOptions) -> SessionsView;
+```
+
+`view_of` is pure. This host's running rows come first in their order, then the other hosts' by
+name, then the closed rows newest first; `options.host` keeps one host and a host that is not in
+`hosts` gives an empty list. `hosts` starts with this host (`this: true`, `at` the pass time, never
+stale) when there is a history, then the other hosts by name. `switch_effect` counts this host's
+running rows only, whatever `options.host` and `closed` say; `loses_thinking_busy` is the busy part
+of `loses_thinking`. `in_use` is set by the one function `gui::fill_in_use(&mut view, &snapshot)`,
+for the command's answer and every pushed view.
+
+The closed rows are valued with a `Valuer` built for exactly `[since, now]` (`build_pricing` now
+takes the range), with the rows context's projects; a part that is missing is `None` /
+`Pricing::Unknown` as for the running rows. Each choice's result is kept with its `ClosedSince`, its
+read time, its failure and the time it was last asked for; the passes refresh only the
+subscription's choice, while a `View` command's choice is read and kept beside it. A choice is read
+when it is not held, a running session of this host left the list, or `CLOSED_EVERY_SECS` (60 s)
+passed; a choice nobody asked for in `CLOSED_KEEP_SECS` (300 s) is dropped. `ClosedSince::None`
+reads nothing.
+
+The view's currency is the settings' currency, read with the accounts file whether or not the prices
+and the dollar rate could be read; with an accounts file that cannot be read it is `None` and that
+failure is in `unavailable`.
+
+A pass that cannot read the running sessions still leaves a view: it records the pass time, the
+summary's `unavailable` text, the settings' currency, the other hosts' last read and the closed rows,
+and pushes a view through the throttle. This host's running rows are then empty (they are not known,
+never the old ones), while the other hosts and the closed rows are listed; `sessions_view` answers
+that view, not "no pass yet". A `SystemProbe` that cannot be built takes the same path.
+
+While subscribed, the thread watches the transcript folders of the running sessions and their
+agents. The folders come from the keys `ScanState` already holds (`<folder>/<session>.jsonl`,
+`<folder>/<session>/subagents/agent-<id>.jsonl`), then `projects_dir` is prefixed; the watches
+follow the running list and are dropped on `Unsubscribe`. A pass then sends
+`UiEvent::SessionsView(view)` through a `ViewThrottle`, which takes the time as an argument: at most
+one view per `VIEW_EVERY_MS` (500 ms) with a trailing one, and one every 60 s even when nothing
+changed. Without a subscription no view is sent and no transcript folder is watched.
+
+The commands never starve the passes: after a pass the thread computes one deadline for its next
+pass (the 60 s wake, the 1 s after an incomplete scan, or the pending trailing view, whichever is
+first) and every `recv_timeout` waits only for the rest of it. Handling a `View`, `Subscribe` or
+`Unsubscribe` never moves the deadline later; a `Subscribe` or a watcher wake starts the next pass
+at once.
+
+The three commands are registered with the others and are `async`, like `money_view`; each runs its
+client call on `tauri::async_runtime::spawn_blocking`. The large window's `Destroyed` event sends
+`Unsubscribe`. `gui::handle_ui_event` fills `view.in_use` and emits `sessions-view` with
+`emit_to(WINDOW_LABEL, …)`, so only the large window receives it.

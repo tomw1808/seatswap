@@ -6,7 +6,18 @@
 //! time, and a `snapshot` event reaches each of them.
 
 #[cfg(feature = "gui")]
-use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+use std::collections::BTreeMap;
+
+#[cfg(feature = "gui")]
+use chrono::{DateTime, Duration, Utc};
+#[cfg(feature = "gui")]
+use serde::{Deserialize, Serialize};
+
+#[cfg(feature = "gui")]
+use seatswap_core::live_sessions::{switch_kind, LiveSession, LiveStatus, OtherHost, SwitchKind};
+
+#[cfg(feature = "gui")]
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 /// Window label used by `tauri.conf.json`'s capability and by every command.
 #[cfg(feature = "gui")]
@@ -136,6 +147,21 @@ fn create(app: &AppHandle, target: &str) -> Result<(), String> {
             .initialization_script(format!("window.location.hash = {initial:?};"))
             .build()
             .map_err(|error| format!("cannot open the window: {error}"))?;
+    let handle = app.clone();
+    window.on_window_event(move |event| {
+        if matches!(event, tauri::WindowEvent::Destroyed) {
+            let Some(state) = handle.try_state::<super::GuiState>() else {
+                return;
+            };
+            let Ok(client) = state.sessions_commands() else {
+                return;
+            };
+            // The sessions thread may be in a pass: never hold the main thread.
+            std::thread::spawn(move || {
+                let _ = client.unsubscribe();
+            });
+        }
+    });
     window
         .show()
         .map_err(|error| format!("cannot show the window: {error}"))?;
@@ -149,6 +175,217 @@ fn create(app: &AppHandle, target: &str) -> Result<(), String> {
 #[tauri::command]
 pub(crate) fn open_window(app: AppHandle, target: String) -> Result<(), String> {
     show(&app, &target)
+}
+
+/// The sessions view. The sessions thread answers from what it holds; the
+/// command runs on a blocking thread, so a pass never holds up the window.
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub(crate) async fn sessions_view(
+    state: State<'_, super::GuiState>,
+    options: SessionsOptions,
+) -> Result<SessionsView, String> {
+    let client = state.sessions_commands()?;
+    let snapshot = state.snapshot()?;
+    let mut view = tauri::async_runtime::spawn_blocking(move || client.view(options))
+        .await
+        .map_err(|error| error.to_string())??;
+    super::fill_in_use(&mut view, &snapshot);
+    Ok(view)
+}
+
+/// Ask the sessions thread to push a view after every pass, for `options`.
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub(crate) async fn sessions_subscribe(
+    state: State<'_, super::GuiState>,
+    options: SessionsOptions,
+) -> Result<(), String> {
+    let client = state.sessions_commands()?;
+    tauri::async_runtime::spawn_blocking(move || client.subscribe(options))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+/// Stop the pushed views; the thread drops the transcript folder watches.
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub(crate) async fn sessions_unsubscribe(state: State<'_, super::GuiState>) -> Result<(), String> {
+    let client = state.sessions_commands()?;
+    tauri::async_runtime::spawn_blocking(move || client.unsubscribe())
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+/// How far back the closed sessions are listed (spec §3.8).
+#[cfg(feature = "gui")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum ClosedSince {
+    /// The default: closed sessions are not listed at all.
+    #[default]
+    None,
+    Day,
+    Week,
+    Month,
+}
+
+#[cfg(feature = "gui")]
+impl ClosedSince {
+    /// The first moment a closed session may have closed: 24 h, 7 d or 30 d
+    /// before `now`; `None` for [`ClosedSince::None`].
+    pub(crate) fn since(self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let days = match self {
+            ClosedSince::None => return None,
+            ClosedSince::Day => 1,
+            ClosedSince::Week => 7,
+            ClosedSince::Month => 30,
+        };
+        Some(now - Duration::days(days))
+    }
+}
+
+/// What the Sessions area asks for. `host` is `None` for all hosts.
+#[cfg(feature = "gui")]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SessionsOptions {
+    pub closed: ClosedSince,
+    pub host: Option<String>,
+}
+
+/// One host the view knows about.
+#[cfg(feature = "gui")]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct HostState {
+    pub host: String,
+    /// When its rows were last known (`this` host: the pass time).
+    pub at: DateTime<Utc>,
+    /// Another host's report is older than `REPORT_STALE_MIN`; never this host.
+    pub stale: bool,
+    pub this: bool,
+}
+
+/// What a switch now costs this host's running sessions (spec §2.11).
+#[cfg(feature = "gui")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SwitchEffect {
+    pub loses_thinking: u32,
+    pub loses_thinking_busy: u32,
+    pub resend: u32,
+    pub free: u32,
+}
+
+/// What the Sessions area shows (spec §3.8). The totals and groups are computed
+/// by the page from `sessions`, so they always agree with the list.
+#[cfg(feature = "gui")]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SessionsView {
+    /// The pass time this view was built from.
+    pub at: DateTime<Utc>,
+    /// The history's host name; `None` when the thread runs without a history.
+    pub this_host: Option<String>,
+    /// This host first, then the other hosts by name.
+    pub hosts: Vec<HostState>,
+    /// This host's running rows in their order, then the other hosts' by host,
+    /// then the closed ones newest first.
+    pub sessions: Vec<LiveSession>,
+    /// This host's running sessions only, whatever the host filter says.
+    pub switch_effect: SwitchEffect,
+    /// The id of the account in use; filled in by `gui::fill_in_use`.
+    pub in_use: Option<String>,
+    pub currency: Option<String>,
+    pub unavailable: Option<String>,
+}
+
+/// The one way the held facts become what the page shows. `at` is the pass
+/// time; `other_hosts` is the last other-host read; `thinking` is each running
+/// session's answers with thinking since the user's last turn.
+#[cfg(feature = "gui")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn view_of(
+    at: DateTime<Utc>,
+    this_host: Option<String>,
+    running: &[LiveSession],
+    closed: &[LiveSession],
+    other_hosts: &[OtherHost],
+    thinking: &BTreeMap<String, u32>,
+    unavailable: Option<&str>,
+    currency: Option<&str>,
+    options: &SessionsOptions,
+) -> SessionsView {
+    let mut hosts = Vec::new();
+    if let Some(host) = &this_host {
+        hosts.push(HostState {
+            host: host.clone(),
+            at,
+            stale: false,
+            this: true,
+        });
+    }
+    let mut others: Vec<&OtherHost> = other_hosts.iter().collect();
+    others.sort_by(|a, b| a.host.cmp(&b.host));
+    for other in &others {
+        hosts.push(HostState {
+            host: other.host.clone(),
+            at: other.at,
+            stale: other.stale,
+            this: false,
+        });
+    }
+
+    let filter = options.host.as_deref();
+    let known = filter.is_none_or(|wanted| hosts.iter().any(|host| host.host == wanted));
+    let mut sessions = Vec::new();
+    if known {
+        let this_host_listed =
+            filter.is_none() || (this_host.is_some() && filter == this_host.as_deref());
+        if this_host_listed {
+            sessions.extend(running.iter().cloned());
+        }
+        for other in &others {
+            if filter.is_none() || filter == Some(other.host.as_str()) {
+                sessions.extend(other.sessions.iter().cloned());
+            }
+        }
+        if let Some(since) = options.closed.since(at) {
+            let mut closed_rows: Vec<&LiveSession> = closed
+                .iter()
+                .filter(|row| row.since >= since && row.since < at)
+                .filter(|row| filter.is_none() || filter == Some(row.host.as_str()))
+                .collect();
+            closed_rows.sort_by_key(|row| std::cmp::Reverse(row.since));
+            sessions.extend(closed_rows.into_iter().cloned());
+        }
+    }
+
+    let mut switch_effect = SwitchEffect::default();
+    for row in running {
+        match switch_kind(row, thinking.get(&row.session).copied().unwrap_or(0), at) {
+            SwitchKind::LosesThinking => {
+                switch_effect.loses_thinking += 1;
+                if row.status == LiveStatus::Busy {
+                    switch_effect.loses_thinking_busy += 1;
+                }
+            }
+            SwitchKind::Resend => switch_effect.resend += 1,
+            SwitchKind::Free => switch_effect.free += 1,
+        }
+    }
+
+    SessionsView {
+        at,
+        this_host,
+        hosts,
+        sessions,
+        switch_effect,
+        in_use: None,
+        currency: currency.map(str::to_string),
+        unavailable: unavailable.map(str::to_string),
+    }
 }
 
 #[cfg(test)]
@@ -193,5 +430,488 @@ mod tests {
             "\"settings?accounts\" is read as the sub-area accounts"
         );
         assert!(parse_target("statistics?x").is_err());
+    }
+
+    // ---- the Sessions view (spec §3.8) ----
+
+    #[cfg(feature = "gui")]
+    use seatswap_core::history::HistoryDir;
+    #[cfg(feature = "gui")]
+    use seatswap_core::live_sessions::{other_hosts, write_report, Values};
+    #[cfg(feature = "gui")]
+    use seatswap_core::store::Settings;
+    #[cfg(feature = "gui")]
+    use seatswap_core::transcripts::Tokens;
+
+    #[cfg(feature = "gui")]
+    const ATLAS: &str = "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34";
+    #[cfg(feature = "gui")]
+    const VEGA: &str = "dd5e0c1a-3b7f-4c2d-9e8a-6f1b2c3d4e5f";
+    #[cfg(feature = "gui")]
+    const CLOSED_RECENT: &str = "11a2b3c4-d5e6-4f70-8a9b-0c1d2e3f4a5b";
+    #[cfg(feature = "gui")]
+    const CLOSED_OLD: &str = "2b7d9c1e-5a4f-4c3b-9e8d-7f6a5b4c3d2e";
+
+    #[cfg(feature = "gui")]
+    fn time(text: &str) -> DateTime<Utc> {
+        text.parse().expect("a test time")
+    }
+
+    #[cfg(feature = "gui")]
+    fn row(
+        session: &str,
+        host: &str,
+        status: LiveStatus,
+        model: Option<&str>,
+        since: DateTime<Utc>,
+    ) -> LiveSession {
+        LiveSession {
+            session: session.to_string(),
+            host: host.to_string(),
+            label: format!("acme-kb-{}", session.chars().take(2).collect::<String>()),
+            project: "acme-kb".to_string(),
+            org: None,
+            cwd: "/home/sam/projects/acme-kb".to_string(),
+            provider: "Claude Code".to_string(),
+            model: model.map(str::to_string),
+            tied: model
+                .map(seatswap_core::burn::tied::thinking_tied)
+                .unwrap_or(false),
+            status,
+            since,
+            started: since,
+            agents_running: 0,
+            agents_done: 0,
+            agents: Vec::new(),
+            tokens: Tokens::default(),
+            last_hour: Tokens::default(),
+            values: Values::of(&[], &Settings::default()),
+        }
+    }
+
+    #[cfg(feature = "gui")]
+    fn id(index: u32) -> String {
+        format!("{index:08x}-1111-4111-8111-111111111111")
+    }
+
+    #[cfg(feature = "gui")]
+    fn options(closed: ClosedSince, host: Option<&str>) -> SessionsOptions {
+        SessionsOptions {
+            closed,
+            host: host.map(str::to_string),
+        }
+    }
+
+    /// A vega report as `write_report` writes it, read back by this host.
+    #[cfg(feature = "gui")]
+    fn vega_report(
+        root: &std::path::Path,
+        now: DateTime<Utc>,
+        sessions: Vec<LiveSession>,
+    ) -> Vec<OtherHost> {
+        std::fs::create_dir_all(root.join("vega")).expect("the vega folder");
+        std::fs::write(
+            root.join("vega").join("host.json"),
+            "{\"machineId\":\"made-up\"}",
+        )
+        .expect("the host marker");
+        let vega = HistoryDir::at(root, "vega");
+        write_report(&vega, &sessions, now).expect("a vega report");
+        let atlas = HistoryDir::at(root, "atlas");
+        other_hosts(&atlas, now).expect("the other hosts").hosts
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn the_view_lists_this_host_and_other_hosts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let now = time("2026-11-14T10:00:00Z");
+        let other = vega_report(
+            tmp.path(),
+            now,
+            vec![row(
+                VEGA,
+                "vega",
+                LiveStatus::Busy,
+                Some("claude-opus-5-5"),
+                now - Duration::minutes(2),
+            )],
+        );
+        let view = view_of(
+            now,
+            Some("atlas".to_string()),
+            &[row(
+                ATLAS,
+                "atlas",
+                LiveStatus::Busy,
+                Some("claude-opus-5-5"),
+                now - Duration::minutes(3),
+            )],
+            &[],
+            &other,
+            &BTreeMap::new(),
+            None,
+            Some("EUR"),
+            &SessionsOptions::default(),
+        );
+
+        assert_eq!(view.sessions.len(), 2, "{:?}", view.sessions);
+        assert_eq!(view.sessions[0].session, ATLAS);
+        assert_eq!(view.sessions[1].session, VEGA);
+        assert_eq!(view.hosts.len(), 2);
+        assert_eq!(view.hosts[0].host, "atlas");
+        assert!(view.hosts[0].this);
+        assert_eq!(view.hosts[1].host, "vega");
+        assert!(!view.hosts[1].this);
+        assert_eq!(view.this_host.as_deref(), Some("atlas"));
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn closed_none_lists_only_running() {
+        let now = time("2026-11-14T10:00:00Z");
+        let view = view_of(
+            now,
+            Some("atlas".to_string()),
+            &[row(
+                ATLAS,
+                "atlas",
+                LiveStatus::Busy,
+                Some("claude-opus-5-5"),
+                now - Duration::minutes(3),
+            )],
+            &[row(
+                CLOSED_RECENT,
+                "atlas",
+                LiveStatus::Closed,
+                Some("claude-opus-5-5"),
+                now - Duration::hours(3),
+            )],
+            &[],
+            &BTreeMap::new(),
+            None,
+            None,
+            &options(ClosedSince::None, None),
+        );
+
+        assert_eq!(view.sessions.len(), 1);
+        assert_eq!(view.sessions[0].status, LiveStatus::Busy);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn closed_day_adds_the_closed_ones() {
+        let now = time("2026-11-14T10:00:00Z");
+        let recent = row(
+            CLOSED_RECENT,
+            "atlas",
+            LiveStatus::Closed,
+            Some("claude-opus-5-5"),
+            now - Duration::hours(3),
+        );
+        let old = row(
+            CLOSED_OLD,
+            "atlas",
+            LiveStatus::Closed,
+            Some("claude-opus-5-5"),
+            now - Duration::hours(30),
+        );
+        let day = view_of(
+            now,
+            Some("atlas".to_string()),
+            &[],
+            &[recent.clone(), old.clone()],
+            &[],
+            &BTreeMap::new(),
+            None,
+            None,
+            &options(ClosedSince::Day, None),
+        );
+        assert!(day.sessions.iter().any(|row| row.session == CLOSED_RECENT));
+        assert!(
+            !day.sessions.iter().any(|row| row.session == CLOSED_OLD),
+            "a session closed 30 h ago is not in the day"
+        );
+        assert_eq!(day.sessions[0].status, LiveStatus::Closed);
+
+        let week = view_of(
+            now,
+            Some("atlas".to_string()),
+            &[],
+            &[recent, old],
+            &[],
+            &BTreeMap::new(),
+            None,
+            None,
+            &options(ClosedSince::Week, None),
+        );
+        assert_eq!(week.sessions.len(), 2);
+        assert_eq!(week.sessions[0].session, CLOSED_RECENT, "newest first");
+        assert_eq!(week.sessions[1].session, CLOSED_OLD);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn a_host_filter_keeps_only_that_host() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let now = time("2026-11-14T10:00:00Z");
+        let other = vega_report(
+            tmp.path(),
+            now,
+            vec![row(
+                VEGA,
+                "vega",
+                LiveStatus::Busy,
+                Some("claude-opus-5-5"),
+                now - Duration::minutes(2),
+            )],
+        );
+        let running = [row(
+            ATLAS,
+            "atlas",
+            LiveStatus::Busy,
+            Some("claude-opus-5-5"),
+            now - Duration::minutes(3),
+        )];
+        let vega = view_of(
+            now,
+            Some("atlas".to_string()),
+            &running,
+            &[],
+            &other,
+            &BTreeMap::new(),
+            None,
+            None,
+            &options(ClosedSince::None, Some("vega")),
+        );
+        assert_eq!(vega.sessions.len(), 1);
+        assert_eq!(vega.sessions[0].host, "vega");
+        assert_eq!(vega.hosts.len(), 2, "the list of hosts stays complete");
+
+        let unknown = view_of(
+            now,
+            Some("atlas".to_string()),
+            &running,
+            &[],
+            &other,
+            &BTreeMap::new(),
+            None,
+            None,
+            &options(ClosedSince::None, Some("nope")),
+        );
+        assert!(unknown.sessions.is_empty());
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn the_switch_effect_counts_each_kind() {
+        let now = time("2026-11-14T10:00:00Z");
+        let mut running = Vec::new();
+        let mut thinking = BTreeMap::new();
+        // 3 losing: one busy, two idle but only recently.
+        running.push(row(
+            &id(0),
+            "atlas",
+            LiveStatus::Busy,
+            Some("claude-fable-5-2"),
+            now,
+        ));
+        for index in 1..3 {
+            running.push(row(
+                &id(index),
+                "atlas",
+                LiveStatus::Idle,
+                Some("claude-fable-5-2"),
+                now - Duration::minutes(10),
+            ));
+        }
+        for index in 0..3 {
+            thinking.insert(id(index), 1);
+        }
+        // 2 resend: idle on a model whose thinking survives, no thinking held.
+        for index in 3..5 {
+            running.push(row(
+                &id(index),
+                "atlas",
+                LiveStatus::Idle,
+                Some("claude-opus-5-5"),
+                now - Duration::minutes(10),
+            ));
+        }
+        // 4 free: idle for longer than the stored copy lives.
+        for index in 5..9 {
+            running.push(row(
+                &id(index),
+                "atlas",
+                LiveStatus::Idle,
+                Some("claude-opus-5-5"),
+                now - Duration::minutes(61),
+            ));
+        }
+        let view = view_of(
+            now,
+            Some("atlas".to_string()),
+            &running,
+            &[],
+            &[],
+            &thinking,
+            None,
+            None,
+            &SessionsOptions::default(),
+        );
+        assert_eq!(
+            view.switch_effect,
+            SwitchEffect {
+                loses_thinking: 3,
+                loses_thinking_busy: 1,
+                resend: 2,
+                free: 4,
+            }
+        );
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn the_switch_effect_counts_only_this_host() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let now = time("2026-11-14T10:00:00Z");
+        let other = vega_report(
+            tmp.path(),
+            now,
+            vec![row(
+                VEGA,
+                "vega",
+                LiveStatus::Busy,
+                Some("claude-fable-5-2"),
+                now,
+            )],
+        );
+        let mut thinking = BTreeMap::new();
+        thinking.insert(ATLAS.to_string(), 1);
+        thinking.insert(VEGA.to_string(), 1);
+        let view = view_of(
+            now,
+            Some("atlas".to_string()),
+            &[row(
+                ATLAS,
+                "atlas",
+                LiveStatus::Busy,
+                Some("claude-fable-5-2"),
+                now,
+            )],
+            &[row(
+                CLOSED_RECENT,
+                "atlas",
+                LiveStatus::Closed,
+                Some("claude-fable-5-2"),
+                now - Duration::hours(1),
+            )],
+            &other,
+            &thinking,
+            None,
+            None,
+            &options(ClosedSince::Day, None),
+        );
+        assert_eq!(
+            view.switch_effect,
+            SwitchEffect {
+                loses_thinking: 1,
+                loses_thinking_busy: 1,
+                resend: 0,
+                free: 0,
+            },
+            "another host's row and a closed row do not change this host's switch cost"
+        );
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn a_view_without_a_history_lists_this_hosts_sessions() {
+        let now = time("2026-11-14T10:00:00Z");
+        let view = view_of(
+            now,
+            None,
+            &[row(
+                ATLAS,
+                "",
+                LiveStatus::Busy,
+                Some("claude-opus-5-5"),
+                now,
+            )],
+            &[],
+            &[],
+            &BTreeMap::new(),
+            Some("the history cannot be read"),
+            None,
+            &SessionsOptions::default(),
+        );
+        assert_eq!(view.this_host, None);
+        assert!(view.hosts.is_empty());
+        assert_eq!(view.sessions.len(), 1);
+        assert_eq!(view.sessions[0].host, "");
+        assert_eq!(
+            view.unavailable.as_deref(),
+            Some("the history cannot be read")
+        );
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn in_use_is_the_active_account() {
+        use seatswap_core::engine::AccountView;
+        use seatswap_core::store::LoginState;
+
+        fn account_view(id: &str, is_active: bool) -> AccountView {
+            AccountView {
+                id: id.to_string(),
+                label: id.to_string(),
+                abbr: "AC".to_string(),
+                color: "#3b82f6".to_string(),
+                email: None,
+                plan: None,
+                auto_burn: true,
+                is_active,
+                login_state: LoginState::Ok,
+                login_ends_at_ms: None,
+                login_days_left: None,
+                usage: None,
+                usable: true,
+                blocked_until: None,
+                blocker: None,
+                fetched_at: None,
+                last_error: None,
+            }
+        }
+
+        let now = time("2026-11-14T10:00:00Z");
+        let mut view = view_of(
+            now,
+            Some("atlas".to_string()),
+            &[],
+            &[],
+            &[],
+            &BTreeMap::new(),
+            None,
+            None,
+            &SessionsOptions::default(),
+        );
+        assert_eq!(view.in_use, None);
+        let snapshot = super::super::worker::Snapshot {
+            views: vec![account_view("id-ac", false), account_view("id-lb", true)],
+            accounts: Vec::new(),
+            active_id: Some("id-lb".to_string()),
+            live: super::super::worker::LiveView::NoLogin,
+            burn: None,
+            warnings: Vec::new(),
+            pending: None,
+            secrets_warning: None,
+            last_poll_at: None,
+            error: None,
+            sessions: None,
+            settings: None,
+            claude_config_dir: String::new(),
+        };
+        super::super::fill_in_use(&mut view, &snapshot);
+        assert_eq!(view.in_use.as_deref(), Some("id-lb"));
     }
 }

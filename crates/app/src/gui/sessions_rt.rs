@@ -7,18 +7,18 @@
 //! thread and the models in use to the engine thread.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 
 use seatswap_core::history::{EventKind, HistoryDir, Range, Recorder, SessionRecord};
-use seatswap_core::live_sessions::{self, LiveSession, LiveStatus};
+use seatswap_core::live_sessions::{self, LiveSession, LiveStatus, OtherHost, Rows};
 use seatswap_core::money::{Fx, Prices, Valuer};
 use seatswap_core::paths::{AppPaths, ClaudePaths};
 use seatswap_core::project::{self, ProjectKey};
@@ -28,8 +28,15 @@ use seatswap_core::store::{self, Settings};
 use seatswap_core::transcripts::{self, RecordedSession, ScanState, SessionSeen};
 use seatswap_core::watcher::{watch_folder, FolderWatch, WatchError};
 
+use super::window::{view_of, ClosedSince, SessionsOptions, SessionsView};
 use super::worker::{EngineCommand, SessionsSummary, UiEvent, Waiting};
 use crate::ops;
+
+/// What the three sessions commands say when `readSessions` is off. The label
+/// is the one the Settings page gives the toggle; a restart is needed because
+/// the thread starts only with the app.
+pub(crate) const SESSIONS_OFF: &str =
+    "reading sessions is off: turn on \"Read Claude Code's session files\" in Settings → General and restart seatswap";
 
 /// The regular wake, so a session folder that cannot be watched still works.
 const WAKE: Duration = Duration::from_secs(60);
@@ -37,6 +44,14 @@ const WAKE: Duration = Duration::from_secs(60);
 const AFTER_INCOMPLETE: Duration = Duration::from_secs(1);
 /// One transcript scan reads at most this much.
 const SCAN_BUDGET: u64 = 64 * 1024 * 1024;
+/// At most one pushed view in this window; one inside it follows when it is
+/// over, so the last view always holds the final numbers (spec §3.8).
+const VIEW_EVERY_MS: i64 = 500;
+/// The closed rows are read again at least this often (the minute pass).
+const CLOSED_EVERY_SECS: i64 = 60;
+/// A closed choice only a command asked for is dropped this long after its last
+/// ask, so a page that changes its mind often does not grow the kept rows.
+const CLOSED_KEEP_SECS: i64 = 300;
 /// A session record is rewritten at most this often while its summary changes.
 const RECORD_EVERY_SECS: i64 = 10 * 60;
 /// The projects, values and settings the rows are built with are at most this
@@ -58,6 +73,90 @@ pub(crate) struct PassOutcome {
     pub wake_soon: bool,
 }
 
+/// What the window sends to the sessions thread. `Wake` is the folder
+/// watchers' plain wake; the other commands are the three Tauri commands.
+enum SessionsCommand {
+    View {
+        options: SessionsOptions,
+        reply: Sender<Result<SessionsView, String>>,
+    },
+    Subscribe(SessionsOptions),
+    Unsubscribe,
+    Stop,
+    Wake,
+}
+
+/// The commands share with the thread, like the look-up's client.
+#[derive(Clone)]
+pub(crate) struct SessionsClient {
+    commands: Sender<SessionsCommand>,
+}
+
+impl SessionsClient {
+    pub(crate) fn view(&self, options: SessionsOptions) -> Result<SessionsView, String> {
+        let (reply, received) = mpsc::channel();
+        super::send_to_worker(self.commands.send(SessionsCommand::View { options, reply }))?;
+        super::worker_reply(received.recv())?
+    }
+
+    pub(crate) fn subscribe(&self, options: SessionsOptions) -> Result<(), String> {
+        super::send_to_worker(self.commands.send(SessionsCommand::Subscribe(options)))
+    }
+
+    pub(crate) fn unsubscribe(&self) -> Result<(), String> {
+        super::send_to_worker(self.commands.send(SessionsCommand::Unsubscribe))
+    }
+}
+
+/// At most one view per [`VIEW_EVERY_MS`], with a trailing one. The time is an
+/// argument, so a test drives it without sleeping.
+#[derive(Debug, Default)]
+struct ViewThrottle {
+    /// The last view sent.
+    last_sent: Option<DateTime<Utc>>,
+    /// A view was wanted inside the window and has to follow when it is over.
+    pending: bool,
+}
+
+impl ViewThrottle {
+    /// Whether a view is due now: a change or the minute pass, but never within
+    /// [`VIEW_EVERY_MS`] of the last one. A wanted view inside the window is
+    /// remembered and sent by the next pass after it.
+    fn due(&mut self, now: DateTime<Utc>, changed: bool) -> bool {
+        let minute = is_due(self.last_sent, now, 60);
+        let wanted = changed || minute || self.pending;
+        if !wanted {
+            return false;
+        }
+        if self.last_sent.is_some_and(|last| {
+            now >= last && now.signed_duration_since(last).num_milliseconds() < VIEW_EVERY_MS
+        }) {
+            self.pending = true;
+            return false;
+        }
+        self.pending = false;
+        self.last_sent = Some(now);
+        true
+    }
+
+    /// How long until a pending view may be sent; `None` when none is pending
+    /// (a clock that moved back makes it due now).
+    fn wait(&self, now: DateTime<Utc>) -> Option<Duration> {
+        if !self.pending {
+            return None;
+        }
+        let last = self.last_sent?;
+        let until = last + ChronoDuration::milliseconds(VIEW_EVERY_MS);
+        let wait = until.signed_duration_since(now);
+        if wait <= ChronoDuration::zero() {
+            return Some(Duration::ZERO);
+        }
+        u64::try_from(wait.num_milliseconds())
+            .ok()
+            .map(Duration::from_millis)
+    }
+}
+
 /// The projects and the pricing the rows are built with. They are built and
 /// rebuilt apart from each other: a failing one does not keep the other from
 /// being built, and the rows are built with what is there.
@@ -69,6 +168,18 @@ struct RowsContext {
     pricing: Option<PricingBuilt>,
     /// Why the pricing could not be built, and when that was tried.
     pricing_failure: Option<ContextFailure>,
+    /// The settings' currency from the accounts file, read whether or not the
+    /// prices could be read.
+    currency: Option<String>,
+}
+
+/// The closed rows read for one `ClosedSince`, with when they were read, when
+/// that choice was last asked for and why their values are missing.
+struct ClosedRows {
+    rows: Rows,
+    read_at: DateTime<Utc>,
+    asked_at: DateTime<Utc>,
+    failure: Option<String>,
 }
 
 struct ProjectsBuilt {
@@ -116,6 +227,32 @@ pub(crate) struct SessionMemory {
     /// Why there is no history, when the thread started without one: the rows
     /// then say why their values are missing.
     history_error: Option<String>,
+    /// The rows of the last pass, which the view is built from.
+    rows: Option<Rows>,
+    /// Each running session's answers with thinking since the user's last turn.
+    thinking: BTreeMap<String, u32>,
+    /// The last summary's `unavailable`, shown by the view.
+    unavailable: Option<String>,
+    /// The settings' currency the rows were valued with.
+    currency: Option<String>,
+    /// The history's host; `None` when the thread runs without a history.
+    this_host: Option<String>,
+    /// The last pass's time, the view's `at`.
+    at: Option<DateTime<Utc>>,
+    /// The closed rows the view may ask for, each with the choice it was read
+    /// for; a choice is kept for [`CLOSED_KEEP_SECS`] after its last ask.
+    closed_rows: BTreeMap<ClosedSince, ClosedRows>,
+    /// The subscription's options; `None` while nothing is subscribed. A
+    /// command's options are never kept here.
+    subscription: Option<SessionsOptions>,
+    /// Where pushed views go.
+    ui: Option<Sender<UiEvent>>,
+    /// The last pushed view, so a pass that changed nothing is not pushed.
+    last_pushed: Option<SessionsView>,
+    throttle: ViewThrottle,
+    /// The transcript folders of the running sessions and their agents, from
+    /// the keys the `ScanState` knows.
+    transcript_folders: BTreeSet<PathBuf>,
 }
 
 impl SessionMemory {
@@ -133,7 +270,78 @@ impl SessionMemory {
             other_hosts: None,
             last_other_hosts_at: None,
             history_error: None,
+            rows: None,
+            thinking: BTreeMap::new(),
+            unavailable: None,
+            currency: None,
+            this_host: None,
+            at: None,
+            closed_rows: BTreeMap::new(),
+            subscription: None,
+            ui: None,
+            last_pushed: None,
+            throttle: ViewThrottle::default(),
+            transcript_folders: BTreeSet::new(),
         }
+    }
+
+    /// Start pushing views for `options`: the next pass sends the first one.
+    fn subscribe(&mut self, options: SessionsOptions) {
+        self.subscription = Some(options);
+        self.last_pushed = None;
+        self.throttle = ViewThrottle::default();
+    }
+
+    /// Stop pushing views. The caller drops the transcript folder watches.
+    fn unsubscribe(&mut self) {
+        self.subscription = None;
+        self.last_pushed = None;
+        self.throttle = ViewThrottle::default();
+        self.transcript_folders.clear();
+    }
+
+    /// The view the subscription pushes, or `None` when nothing is subscribed
+    /// or before the first pass.
+    fn view(&self) -> Option<SessionsView> {
+        let options = self.subscription.as_ref()?;
+        self.view_for(options)
+    }
+
+    /// The view for `options`, from what the thread holds. The command's answer
+    /// and the pushed view both come through here; a command's options never
+    /// replace the subscription's.
+    fn view_for(&self, options: &SessionsOptions) -> Option<SessionsView> {
+        let at = self.at?;
+        let rows = self.rows.as_ref()?;
+        let other: &[OtherHost] = self
+            .other_hosts
+            .as_ref()
+            .map(|hosts| hosts.hosts.as_slice())
+            .unwrap_or(&[]);
+        let closed = self.closed_rows.get(&options.closed);
+        let closed_sessions = closed
+            .map(|read| read.rows.sessions.as_slice())
+            .unwrap_or(&[]);
+        let closed_failure = closed.and_then(|read| read.failure.as_deref());
+        let unavailable = match (&self.unavailable, closed_failure) {
+            // A broken accounts file fails both reads with the same text: say it once.
+            (Some(first), Some(second)) if first.contains(second) => Some(first.clone()),
+            (Some(first), Some(second)) => Some(format!("{first}; {second}")),
+            (Some(first), None) => Some(first.clone()),
+            (None, Some(second)) => Some(second.to_string()),
+            (None, None) => None,
+        };
+        Some(view_of(
+            at,
+            self.this_host.clone(),
+            &rows.sessions,
+            closed_sessions,
+            other,
+            &self.thinking,
+            unavailable.as_deref(),
+            self.currency.as_deref(),
+            options,
+        ))
     }
 
     fn project_for(&mut self, cwd: &str) -> ProjectKey {
@@ -180,7 +388,11 @@ fn prepare_rows_context<'a>(
     history: &HistoryDir,
     now: DateTime<Utc>,
     summary: &mut SessionsSummary,
-) -> (Option<&'a projects::Projects>, live_sessions::Pricing<'a>) {
+) -> (
+    Option<&'a projects::Projects>,
+    live_sessions::Pricing<'a>,
+    Option<String>,
+) {
     let projects_due = part_needs_build(
         context.projects.as_ref().map(|built| built.built),
         context.projects_failure.as_ref(),
@@ -194,6 +406,12 @@ fn prepare_rows_context<'a>(
     if projects_due || pricing_due {
         let accounts = store::load_accounts(app)
             .map_err(|error| format!("the accounts cannot be read: {error}"));
+        // The view's currency comes from the settings with the accounts file,
+        // whether or not the prices and the dollar rate can be read.
+        context.currency = accounts
+            .as_ref()
+            .ok()
+            .and_then(|file| file.settings.currency.clone());
         if projects_due {
             match &accounts {
                 Ok(file) => match projects::load(history, &file.accounts) {
@@ -222,7 +440,15 @@ fn prepare_rows_context<'a>(
         }
         if pricing_due {
             match &accounts {
-                Ok(file) => match build_pricing(app, history, now, file) {
+                Ok(file) => match build_pricing(
+                    app,
+                    history,
+                    &Range {
+                        from: now - ChronoDuration::days(1),
+                        to: now,
+                    },
+                    file,
+                ) {
                     Ok((valuer, settings)) => {
                         context.pricing = Some(PricingBuilt {
                             valuer,
@@ -277,31 +503,23 @@ fn prepare_rows_context<'a>(
             reason: pricing_failure.unwrap_or_else(|| "the values cannot be read".to_string()),
         },
     };
-    (projects, pricing)
+    let currency = context.currency.clone();
+    (projects, pricing, currency)
 }
 
 /// Read the prices, the dollar rate and the accounts and build the valuer for
-/// the day up to `now`. Any failure is the error text the sessions area shows.
+/// `range`. Any failure is the error text the sessions area shows.
 fn build_pricing(
     app: &AppPaths,
     history: &HistoryDir,
-    now: DateTime<Utc>,
+    range: &Range,
     file: &store::AccountsFile,
 ) -> Result<(Valuer, Settings), String> {
     let prices =
         Prices::load(app).map_err(|error| format!("the prices cannot be read: {error}"))?;
     let fx = Fx::load(app).map_err(|error| format!("the dollar rate cannot be read: {error}"))?;
-    let range = Range::between(Some(now - ChronoDuration::days(1)), Some(now))
-        .map_err(|error| error.to_string())?;
-    let valuer = Valuer::build(
-        history,
-        &range,
-        &prices,
-        &fx,
-        &file.settings,
-        &file.accounts,
-    )
-    .map_err(|error| format!("the values cannot be read: {error}"))?;
+    let valuer = Valuer::build(history, range, &prices, &fx, &file.settings, &file.accounts)
+        .map_err(|error| format!("the values cannot be read: {error}"))?;
     Ok((valuer, file.settings.clone()))
 }
 
@@ -314,7 +532,8 @@ struct WaitingMemory {
 /// stops and joins the thread.
 pub(crate) struct SessionsHandle {
     stop: Arc<AtomicBool>,
-    wake: Sender<()>,
+    commands: Sender<SessionsCommand>,
+    client: SessionsClient,
     thread: Option<JoinHandle<()>>,
     latest: Arc<Mutex<Option<SessionsSummary>>>,
 }
@@ -326,9 +545,14 @@ impl SessionsHandle {
         Arc::clone(&self.latest)
     }
 
+    /// The client the three sessions commands use.
+    pub(crate) fn client(&self) -> SessionsClient {
+        self.client.clone()
+    }
+
     pub(crate) fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        let _ = self.wake.send(());
+        let _ = self.commands.send(SessionsCommand::Stop);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -352,11 +576,14 @@ pub(crate) fn spawn(
     engine: Sender<EngineCommand>,
 ) -> Result<SessionsHandle, String> {
     let stop = Arc::new(AtomicBool::new(false));
-    let (wake, wake_rx) = mpsc::channel::<()>();
+    let (commands, command_rx) = mpsc::channel::<SessionsCommand>();
     let latest = Arc::new(Mutex::new(None));
     let thread_stop = Arc::clone(&stop);
     let thread_latest = Arc::clone(&latest);
-    let watch_wake = wake.clone();
+    let watch_wake = commands.clone();
+    let client = SessionsClient {
+        commands: commands.clone(),
+    };
     let thread = thread::Builder::new()
         .name("seatswap-sessions".to_string())
         .spawn(move || {
@@ -367,7 +594,7 @@ pub(crate) fn spawn(
                 ui,
                 engine,
                 thread_stop,
-                wake_rx,
+                command_rx,
                 watch_wake,
                 thread_latest,
             )
@@ -375,7 +602,8 @@ pub(crate) fn spawn(
         .map_err(|error| format!("cannot start the sessions thread: {error}"))?;
     Ok(SessionsHandle {
         stop,
-        wake,
+        commands,
+        client,
         thread: Some(thread),
         latest,
     })
@@ -389,8 +617,8 @@ fn run(
     ui: Sender<UiEvent>,
     engine: Sender<EngineCommand>,
     stop: Arc<AtomicBool>,
-    wake_rx: Receiver<()>,
-    watch_wake: Sender<()>,
+    commands: Receiver<SessionsCommand>,
+    watch_wake: Sender<SessionsCommand>,
     latest: Arc<Mutex<Option<SessionsSummary>>>,
 ) {
     let (recorder, history_error) = match history {
@@ -400,8 +628,11 @@ fn run(
     let (mut state, state_error) = load_state(&app);
     let mut memory = SessionMemory::new(claude.home().to_path_buf());
     memory.history_error = history_error.clone();
+    memory.ui = Some(ui.clone());
     let mut watch: Option<FolderWatch> = None;
     let mut last_watch_error: Option<String> = None;
+    let mut transcript_watches: BTreeMap<PathBuf, FolderWatch> = BTreeMap::new();
+    let mut last_transcript_watch_error: Option<String> = None;
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -410,7 +641,7 @@ fn run(
         if watch.is_none() {
             let wake = watch_wake.clone();
             match watch_folder(&claude.sessions_dir(), move || {
-                let _ = wake.send(());
+                let _ = wake.send(SessionsCommand::Wake);
             }) {
                 Ok(found) => watch = Some(found),
                 // The folder is made when the first session starts; the 60 s
@@ -469,14 +700,16 @@ fn run(
                     state_error.as_deref(),
                     &mut summary,
                 );
-                PassOutcome {
-                    summary,
-                    models: None,
-                    tied_busy: 0,
-                    wake_soon: false,
-                }
+                pass_without_running(&app, recorder.as_ref(), &mut memory, now, summary)
             }
         };
+
+        update_transcript_watches(
+            &mut transcript_watches,
+            &memory.transcript_folders,
+            &watch_wake,
+            &mut last_transcript_watch_error,
+        );
 
         {
             let mut shared = match latest.lock() {
@@ -498,14 +731,77 @@ fn run(
             return;
         }
 
-        let wait = if outcome.wake_soon {
+        let mut wait = if outcome.wake_soon {
             AFTER_INCOMPLETE
         } else {
             WAKE
         };
-        match wake_rx.recv_timeout(wait) {
-            Ok(()) | Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return,
+        if let Some(pending) = memory.throttle.wait(now) {
+            if pending < wait {
+                wait = pending;
+            }
+        }
+        // One deadline for the next pass. A command handled below waits only
+        // for the rest of it; a `View` or `Unsubscribe` never moves it later.
+        let deadline = Instant::now() + wait;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match commands.recv_timeout(remaining) {
+                Ok(SessionsCommand::Wake) => break,
+                Ok(SessionsCommand::View { options, reply }) => {
+                    let answer = answer_view(&mut memory, options, &app, recorder.as_ref());
+                    let _ = reply.send(answer);
+                }
+                Ok(SessionsCommand::Subscribe(options)) => {
+                    memory.subscribe(options);
+                    break;
+                }
+                Ok(SessionsCommand::Unsubscribe) => {
+                    memory.unsubscribe();
+                    transcript_watches.clear();
+                }
+                Ok(SessionsCommand::Stop) | Err(RecvTimeoutError::Disconnected) => return,
+                Err(RecvTimeoutError::Timeout) => break,
+            }
+            // A command handled past the deadline never keeps the next pass
+            // waiting: the deadline is the pass's, not the command's.
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+    }
+}
+
+/// Keep exactly the transcript folders of the running sessions and their
+/// agents: a folder that left the list is dropped, a new one is watched. The
+/// path comes from the `ScanState` key, never from a second naming rule.
+fn update_transcript_watches(
+    watches: &mut BTreeMap<PathBuf, FolderWatch>,
+    folders: &BTreeSet<PathBuf>,
+    wake: &Sender<SessionsCommand>,
+    last_error: &mut Option<String>,
+) {
+    watches.retain(|folder, _| folders.contains(folder));
+    for folder in folders {
+        if watches.contains_key(folder) {
+            continue;
+        }
+        let wake = wake.clone();
+        match watch_folder(folder, move || {
+            let _ = wake.send(SessionsCommand::Wake);
+        }) {
+            Ok(found) => {
+                watches.insert(folder.clone(), found);
+            }
+            Err(WatchError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            }
+            Err(error) => {
+                let text = format!("{}: {error}", folder.display());
+                if last_error.as_deref() != Some(text.as_str()) {
+                    eprintln!("seatswap: sessions watcher: {text}");
+                    *last_error = Some(text);
+                }
+            }
         }
     }
 }
@@ -571,6 +867,7 @@ fn one_pass(
         now,
         state_error,
     );
+    memory.unavailable = outcome.summary.unavailable.clone();
     if let Some(error) = history_error {
         // The order the pop-up shows: the history error first, then the state.
         prepend_warning(&mut outcome.summary, error.to_string());
@@ -608,12 +905,7 @@ pub(crate) fn run_pass(
                 &mut summary,
                 format!("running sessions cannot be read: {error}"),
             );
-            return PassOutcome {
-                summary,
-                models: None,
-                tied_busy: 0,
-                wake_soon: false,
-            };
+            return pass_without_running(app, recorder, memory, now, summary);
         }
     };
 
@@ -947,16 +1239,26 @@ pub(crate) fn run_pass(
         state.forget_closed(&running_ids, now);
     }
 
+    // A session that left the list is reported at once and its closed rows
+    // are read again; otherwise both follow their own "is it time" rules.
+    let closed_now = running.skipped.is_empty()
+        && memory
+            .running_ids
+            .iter()
+            .any(|session| !running_ids.contains(session));
+
     // The rows of this host, and the report the other hosts read. The session
     // files alone are enough to build them: a history that cannot be read gives
     // the projects' default names and says why the values are missing, so a
     // waiting session still notifies.
+    let mut currency = None;
     let rows = match recorder {
         Some(recorder) => {
             let mut context = memory.rows_context.take().unwrap_or_default();
             let rows = {
-                let (projects, pricing) =
+                let (projects, pricing, settings_currency) =
                     prepare_rows_context(&mut context, app, recorder.dir(), now, &mut summary);
+                currency = settings_currency;
                 live_rows(
                     &running.sessions,
                     state,
@@ -1008,14 +1310,9 @@ pub(crate) fn run_pass(
         }
     }
 
-    // A session that left the list is reported at once; otherwise the report
-    // follows the rows at most every [`live_sessions::REPORT_EVERY_SECS`], with
-    // a heartbeat so another host does not see a quiet host as stale.
-    let closed_now = running.skipped.is_empty()
-        && memory
-            .running_ids
-            .iter()
-            .any(|session| !running_ids.contains(session));
+    // The report follows the rows at most every
+    // [`live_sessions::REPORT_EVERY_SECS`], with a heartbeat so another host
+    // does not see a quiet host as stale.
     if running.skipped.is_empty() {
         if let (Some(recorder), Some(rows)) = (recorder, rows.as_ref()) {
             write_report_if_due(
@@ -1030,49 +1327,31 @@ pub(crate) fn run_pass(
         }
     }
 
-    // The other hosts' waiting sessions. Their reports are read at most every
-    // [`live_sessions::REPORT_EVERY_SECS`], like this host writes its own; the
-    // last read is used on every pass in between, so a wait and a warning stay
-    // put until the next read. A read that fails replaces it with an empty one
-    // and its error.
-    if let Some(recorder) = recorder {
-        if is_due(
-            memory.last_other_hosts_at,
-            now,
-            live_sessions::REPORT_EVERY_SECS,
-        ) {
-            memory.last_other_hosts_at = Some(now);
-            memory.other_hosts = Some(match live_sessions::other_hosts(recorder.dir(), now) {
-                Ok(other) => other,
-                Err(error) => live_sessions::OtherHosts {
-                    hosts: Vec::new(),
-                    warnings: vec![format!("the other hosts' reports cannot be read: {error}")],
-                },
-            });
-        }
-        if let Some(other) = &memory.other_hosts {
-            for warning in &other.warnings {
-                add_warning(&mut summary, warning.clone());
-            }
-            for host in &other.hosts {
-                if host.stale {
-                    continue;
-                }
-                for session in &host.sessions {
-                    if session.status != LiveStatus::Waiting {
-                        continue;
-                    }
-                    summary.waiting.push(Waiting {
-                        session: session.session.clone(),
-                        label: session.label.clone(),
-                        project: session.project.clone(),
-                        since: session.since,
-                        host: Some(host.host.clone()),
-                    });
-                }
-            }
-        }
-    }
+    read_other_hosts(recorder, memory, now, &mut summary);
+
+    // What the view is made of, kept for the commands and the pushes.
+    memory.rows = rows;
+    memory.this_host = recorder.map(|recorder| recorder.dir().host().to_string());
+    memory.at = Some(now);
+    memory.currency = currency;
+    memory.thinking = running
+        .sessions
+        .iter()
+        .filter_map(|session| {
+            state
+                .sessions
+                .get(&session.session_id)
+                .map(|seen| (session.session_id.clone(), seen.thinking_since_user))
+        })
+        .collect();
+    refresh_closed_rows(app, recorder, memory, now, closed_now, &mut summary);
+    memory.unavailable = summary.unavailable.clone();
+    memory.transcript_folders = if memory.subscription.is_some() {
+        transcript_folders(state, &running.sessions, &claude.projects_dir())
+    } else {
+        BTreeSet::new()
+    };
+    publish_view(memory, now);
 
     let models = models_in_use(&running.sessions, state);
     let (_, tied_busy) = tied_sessions(&running.sessions, state);
@@ -1082,6 +1361,349 @@ pub(crate) fn run_pass(
         tied_busy,
         wake_soon: !scan_complete,
     }
+}
+
+/// Read the other hosts' reports when due, and add their warnings and waiting
+/// sessions to the summary. Their reports are read at most every
+/// [`live_sessions::REPORT_EVERY_SECS`], like this host writes its own; the
+/// last read is used on every pass in between, so a wait and a warning stay put
+/// until the next read. A read that fails replaces it with an empty one and its
+/// error.
+fn read_other_hosts(
+    recorder: Option<&Recorder>,
+    memory: &mut SessionMemory,
+    now: DateTime<Utc>,
+    summary: &mut SessionsSummary,
+) {
+    let Some(recorder) = recorder else {
+        return;
+    };
+    if is_due(
+        memory.last_other_hosts_at,
+        now,
+        live_sessions::REPORT_EVERY_SECS,
+    ) {
+        memory.last_other_hosts_at = Some(now);
+        memory.other_hosts = Some(match live_sessions::other_hosts(recorder.dir(), now) {
+            Ok(other) => other,
+            Err(error) => live_sessions::OtherHosts {
+                hosts: Vec::new(),
+                warnings: vec![format!("the other hosts' reports cannot be read: {error}")],
+            },
+        });
+    }
+    let Some(other) = &memory.other_hosts else {
+        return;
+    };
+    for warning in &other.warnings {
+        add_warning(summary, warning.clone());
+    }
+    for host in &other.hosts {
+        if host.stale {
+            continue;
+        }
+        for session in &host.sessions {
+            if session.status != LiveStatus::Waiting {
+                continue;
+            }
+            summary.waiting.push(Waiting {
+                session: session.session.clone(),
+                label: session.label.clone(),
+                project: session.project.clone(),
+                since: session.since,
+                host: Some(host.host.clone()),
+            });
+        }
+    }
+}
+
+/// A pass that cannot read the running sessions still leaves a view, not "no
+/// pass yet": this host's running rows are empty (they are not known, never the
+/// old ones), while the other hosts' reports and the closed rows are kept. The
+/// summary's `unavailable` text is the view's, and the pass time is recorded.
+fn pass_without_running(
+    app: &AppPaths,
+    recorder: Option<&Recorder>,
+    memory: &mut SessionMemory,
+    now: DateTime<Utc>,
+    mut summary: SessionsSummary,
+) -> PassOutcome {
+    memory.rows = Some(no_rows());
+    memory.thinking.clear();
+    memory.this_host = recorder.map(|recorder| recorder.dir().host().to_string());
+    memory.at = Some(now);
+    memory.currency = match recorder {
+        Some(recorder) => {
+            let mut context = memory.rows_context.take().unwrap_or_default();
+            // The settings' currency, the projects and the pricing the closed
+            // rows need; the running rows are not built.
+            let currency = {
+                let (_, _, currency) =
+                    prepare_rows_context(&mut context, app, recorder.dir(), now, &mut summary);
+                currency
+            };
+            memory.rows_context = Some(context);
+            currency
+        }
+        None => None,
+    };
+    read_other_hosts(recorder, memory, now, &mut summary);
+    refresh_closed_rows(app, recorder, memory, now, false, &mut summary);
+    memory.unavailable = summary.unavailable.clone();
+    // No running session is known, so there is no transcript folder to watch.
+    memory.transcript_folders.clear();
+    publish_view(memory, now);
+    PassOutcome {
+        summary,
+        models: None,
+        tied_busy: 0,
+        wake_soon: false,
+    }
+}
+
+/// The view a `View` command answers: from what the thread holds, without a
+/// pass. Its options are the command's own; the subscription's are not touched.
+/// Another closed choice reads that choice's closed rows once and keeps them.
+fn answer_view(
+    memory: &mut SessionMemory,
+    options: SessionsOptions,
+    app: &AppPaths,
+    recorder: Option<&Recorder>,
+) -> Result<SessionsView, String> {
+    let at = memory
+        .at
+        .ok_or_else(|| "the sessions thread has not finished a pass yet".to_string())?;
+    if let Some(recorder) = recorder {
+        read_closed_rows(memory, app, recorder, options.closed, at, false);
+    }
+    memory
+        .view_for(&options)
+        .ok_or_else(|| "the sessions thread has not finished a pass yet".to_string())
+}
+
+/// Refresh the closed rows of the subscription's choice after a pass, and drop
+/// a choice no command has asked for in [`CLOSED_KEEP_SECS`]. `ClosedSince::None`
+/// reads nothing.
+fn refresh_closed_rows(
+    app: &AppPaths,
+    recorder: Option<&Recorder>,
+    memory: &mut SessionMemory,
+    now: DateTime<Utc>,
+    closed_now: bool,
+    summary: &mut SessionsSummary,
+) {
+    let choice = memory.subscription.as_ref().map(|options| options.closed);
+    let Some(recorder) = recorder else {
+        memory.closed_rows.clear();
+        return;
+    };
+    if let Some(choice) = choice {
+        read_closed_rows(memory, app, recorder, choice, now, closed_now);
+    }
+    memory.closed_rows.retain(|_, read| {
+        now.signed_duration_since(read.asked_at).num_seconds() < CLOSED_KEEP_SECS
+    });
+    // The closed rows belong to the window: their failure is the view's
+    // `unavailable` (see `SessionMemory::view_for`), not the pop-up's. The
+    // history read's warnings are passed on like every other history warning.
+    if let Some(read) = choice.and_then(|choice| memory.closed_rows.get(&choice)) {
+        for warning in &read.rows.warnings {
+            add_warning(summary, warning.clone());
+        }
+    }
+}
+
+/// Read `choice`'s closed rows when they are not held, a running session of this
+/// host left the list (`closed_now`), or [`CLOSED_EVERY_SECS`] passed. The
+/// result is kept with that choice until its next read or its last ask is
+/// [`CLOSED_KEEP_SECS`] old.
+fn read_closed_rows(
+    memory: &mut SessionMemory,
+    app: &AppPaths,
+    recorder: &Recorder,
+    choice: ClosedSince,
+    now: DateTime<Utc>,
+    closed_now: bool,
+) {
+    if choice == ClosedSince::None {
+        memory.closed_rows.remove(&ClosedSince::None);
+        return;
+    }
+    let due = match memory.closed_rows.get(&choice) {
+        None => true,
+        Some(read) => closed_now || is_due(Some(read.read_at), now, CLOSED_EVERY_SECS),
+    };
+    if !due {
+        if let Some(read) = memory.closed_rows.get_mut(&choice) {
+            read.asked_at = now;
+        }
+        return;
+    }
+    let Some(since) = choice.since(now) else {
+        return;
+    };
+    let projects = memory
+        .rows_context
+        .as_ref()
+        .and_then(|context| context.projects.as_ref())
+        .map(|built| built.projects.clone());
+    let (rows, failure) = closed_rows_for(app, recorder.dir(), since, now, projects.as_ref());
+    memory.closed_rows.insert(
+        choice,
+        ClosedRows {
+            rows,
+            read_at: now,
+            asked_at: now,
+            failure,
+        },
+    );
+}
+
+/// The closed rows over `[since, now]`, with a valuer built for exactly that
+/// range. A missing part is `None` / `Pricing::Unknown`, as for the running
+/// rows; the error text is the summary's `unavailable`.
+fn closed_rows_for(
+    app: &AppPaths,
+    history: &HistoryDir,
+    since: DateTime<Utc>,
+    now: DateTime<Utc>,
+    projects: Option<&projects::Projects>,
+) -> (Rows, Option<String>) {
+    let range = Range {
+        from: since,
+        to: now,
+    };
+    let file = match store::load_accounts(app) {
+        Ok(file) => file,
+        Err(error) => {
+            let text = format!("the accounts cannot be read: {error}");
+            return (no_rows(), Some(text));
+        }
+    };
+    let (failure, rows) = match build_pricing(app, history, &range, &file) {
+        Ok((valuer, settings)) => (
+            None,
+            live_sessions::closed(
+                history,
+                since,
+                now,
+                projects,
+                &live_sessions::Pricing::Known {
+                    valuer: &valuer,
+                    settings: &settings,
+                },
+            ),
+        ),
+        Err(text) => (
+            Some(text.clone()),
+            live_sessions::closed(
+                history,
+                since,
+                now,
+                projects,
+                &live_sessions::Pricing::Unknown { reason: text },
+            ),
+        ),
+    };
+    match rows {
+        Ok(rows) => (rows, failure),
+        Err(error) => {
+            let text = format!("the closed sessions cannot be read: {error}");
+            (no_rows(), Some(text))
+        }
+    }
+}
+
+/// No closed rows: the reason is returned beside them, never as a warning.
+fn no_rows() -> Rows {
+    Rows {
+        sessions: Vec::new(),
+        warnings: Vec::new(),
+    }
+}
+
+/// The transcript folders of the running sessions and their agents, from the
+/// keys the `ScanState` already knows: `<folder>/<session>.jsonl` and
+/// `<folder>/<session>/subagents/agent-<id>.jsonl`.
+fn transcript_folders(
+    state: &ScanState,
+    running: &[SessionFile],
+    projects_dir: &Path,
+) -> BTreeSet<PathBuf> {
+    let runs: HashMap<&str, &str> = running
+        .iter()
+        .filter_map(|session| {
+            state
+                .sessions
+                .get(&session.session_id)
+                .map(|seen| (session.session_id.as_str(), seen.folder.as_str()))
+        })
+        .collect();
+    let mut folders = BTreeSet::new();
+    // The main transcript's folder is the project folder the session sees.
+    for folder in runs.values() {
+        if !folder.is_empty() {
+            folders.insert(projects_dir.join(folder));
+        }
+    }
+    // The agents' folders are the deeper keys of the same session.
+    for key in state.files.keys() {
+        let Some((folder, rest)) = key.split_once('/') else {
+            continue;
+        };
+        let session = rest.split(['/', '.']).next().unwrap_or_default();
+        if runs
+            .get(session)
+            .is_some_and(|expected| *expected == folder)
+        {
+            if let Some(parent) = Path::new(key).parent() {
+                if !parent.as_os_str().is_empty() {
+                    folders.insert(projects_dir.join(parent));
+                }
+            }
+        }
+    }
+    folders
+}
+
+/// Push the view after a pass while subscribed: at most one per
+/// [`VIEW_EVERY_MS`], with a trailing one, and the minute pass even when
+/// nothing changed. Without a subscription nothing is sent.
+fn publish_view(memory: &mut SessionMemory, now: DateTime<Utc>) {
+    if memory.subscription.is_none() {
+        return;
+    }
+    let Some(view) = memory.view() else {
+        return;
+    };
+    let changed = memory
+        .last_pushed
+        .as_ref()
+        .is_none_or(|last| !same_pushed(last, &view));
+    if !memory.throttle.due(now, changed) {
+        return;
+    }
+    memory.last_pushed = Some(view.clone());
+    if let Some(ui) = &memory.ui {
+        let _ = ui.send(UiEvent::SessionsView(view));
+    }
+}
+
+/// Whether two pushed views hold the same facts. The times move with every
+/// pass and are not a change (the minute pass covers them).
+fn same_pushed(first: &SessionsView, second: &SessionsView) -> bool {
+    first.this_host == second.this_host
+        && first.sessions == second.sessions
+        && first.switch_effect == second.switch_effect
+        && first.currency == second.currency
+        && first.unavailable == second.unavailable
+        && first.in_use == second.in_use
+        && first.hosts.len() == second.hosts.len()
+        && first
+            .hosts
+            .iter()
+            .zip(&second.hosts)
+            .all(|(a, b)| a.host == b.host && a.stale == b.stale && a.this == b.this)
 }
 
 /// The rows of this host from the session files, with the project look-up the
@@ -3165,6 +3787,580 @@ mod tests {
             report_of(&root, "atlas").at,
             back,
             "the rows changed and the last report is far away from now: it is due"
+        );
+    }
+
+    fn transcript_folder(claude: &ClaudePaths, folder: &str) -> PathBuf {
+        let path = claude.projects_dir().join(folder);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn append_transcript(claude: &ClaudePaths, folder: &str, session: &str, line: &str) {
+        use std::io::Write;
+        let dir = transcript_folder(claude, folder);
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(format!("{session}.jsonl")))
+            .unwrap();
+        writeln!(file, "{line}").unwrap();
+    }
+
+    fn views(received: &Receiver<UiEvent>) -> Vec<SessionsView> {
+        let mut out = Vec::new();
+        while let Ok(event) = received.try_recv() {
+            if let UiEvent::SessionsView(view) = event {
+                out.push(view);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn nothing_is_emitted_without_a_subscription() {
+        let (tmp, claude, app) = fixture();
+        let recorder = Recorder::new(history(&tmp.path().join("history")));
+        let now = time("2026-11-14T10:00:00Z");
+        write_session(
+            &claude,
+            800,
+            &session_json(
+                800,
+                SESSION,
+                "/home/sam/projects/acme-kb",
+                Some("acme-kb-7c"),
+                "busy",
+                now.timestamp_millis(),
+            ),
+        );
+        append_transcript(
+            &claude,
+            "-home-sam-projects-acme-kb",
+            SESSION,
+            &transcript_line(
+                SESSION,
+                "msg_01",
+                now,
+                "/home/sam/projects/acme-kb",
+                "claude-opus-5-5",
+                (2, 100, 26_173, 28_126),
+            ),
+        );
+        let (sent, received) = mpsc::channel();
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        memory.ui = Some(sent);
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[800]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            now,
+            None,
+        );
+        assert!(
+            views(&received).is_empty(),
+            "a pass without a subscription sends no view"
+        );
+    }
+
+    #[test]
+    fn a_transcript_change_emits_at_most_two_views_a_second() {
+        let (tmp, claude, app) = fixture();
+        let recorder = Recorder::new(history(&tmp.path().join("history")));
+        let now = time("2026-11-14T10:00:00Z");
+        write_session(
+            &claude,
+            801,
+            &session_json(
+                801,
+                SESSION,
+                "/home/sam/projects/acme-kb",
+                Some("acme-kb-7c"),
+                "busy",
+                now.timestamp_millis(),
+            ),
+        );
+        append_transcript(
+            &claude,
+            "-home-sam-projects-acme-kb",
+            SESSION,
+            &transcript_line(
+                SESSION,
+                "msg_01",
+                now,
+                "/home/sam/projects/acme-kb",
+                "claude-opus-5-5",
+                (2, 1, 26_173, 28_126),
+            ),
+        );
+        let (sent, received) = mpsc::channel();
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        memory.ui = Some(sent);
+        memory.subscribe(SessionsOptions::default());
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[801]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            now,
+            None,
+        );
+        let mut emitted = views(&received);
+        assert_eq!(emitted.len(), 1, "the first pass sends one view");
+
+        for index in 1..=10 {
+            let at = now + chrono::Duration::milliseconds(index * 90);
+            append_transcript(
+                &claude,
+                "-home-sam-projects-acme-kb",
+                SESSION,
+                &transcript_line(
+                    SESSION,
+                    &format!("msg_{:02}", index + 1),
+                    at,
+                    "/home/sam/projects/acme-kb",
+                    "claude-opus-5-5",
+                    (2, 100, 26_173, 28_126),
+                ),
+            );
+            run_pass(
+                &app,
+                &claude,
+                &probe(&[801]),
+                Some(&recorder),
+                &mut state,
+                &mut memory,
+                at,
+                None,
+            );
+            emitted.extend(views(&received));
+        }
+        let within_one_second = emitted
+            .iter()
+            .filter(|view| view.at < now + chrono::Duration::seconds(1))
+            .count();
+        assert!(
+            within_one_second <= 2,
+            "{within_one_second} views within one second: {emitted:?}"
+        );
+
+        let trailing = now + chrono::Duration::milliseconds(1_040);
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[801]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            trailing,
+            None,
+        );
+        emitted.extend(views(&received));
+        let last = emitted.last().expect("the trailing view");
+        assert_eq!(
+            last.sessions[0].tokens.out, 1_001,
+            "the last view holds the final numbers"
+        );
+        assert_eq!(last.at, trailing);
+    }
+
+    #[test]
+    fn a_broken_prices_file_is_said_once_in_the_view_and_in_the_pop_up() {
+        let (tmp, claude, app) = fixture();
+        let recorder = Recorder::new(history(&tmp.path().join("history")));
+        fs::write(app.prices_file(), "{not json").unwrap();
+        let now = time("2026-11-14T10:00:00Z");
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        memory.subscription = Some(SessionsOptions {
+            closed: ClosedSince::Day,
+            host: None,
+        });
+
+        let outcome = run_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            now,
+            None,
+        );
+        let pop_up = outcome.summary.unavailable.expect("the pop-up says why");
+        assert_eq!(
+            pop_up.matches("the prices cannot be read").count(),
+            1,
+            "{pop_up}"
+        );
+        let view = memory.view().expect("a view after a pass");
+        let window = view.unavailable.expect("the window says why");
+        assert_eq!(
+            window.matches("the prices cannot be read").count(),
+            1,
+            "{window}"
+        );
+    }
+
+    #[test]
+    fn closed_rows_are_read_once_per_choice() {
+        let (tmp, claude, app) = fixture();
+        let history = history(&tmp.path().join("history"));
+        let recorder = Recorder::new(history.clone());
+        let now = time("2026-11-14T10:00:00Z");
+        let closed_at = now - chrono::Duration::hours(3);
+        history
+            .append(&SessionRecord {
+                t: closed_at,
+                session: "11a2b3c4-d5e6-4f70-8a9b-0c1d2e3f4a5b".to_string(),
+                cwd: "/home/sam/projects/acme-kb".to_string(),
+                project: ProjectKey::Repo("github.com/sam/acme-kb".to_string()),
+                entrypoint: Some("cli".to_string()),
+                first: closed_at - chrono::Duration::hours(1),
+                last: closed_at,
+                agents_started: 0,
+                agents_finished: 0,
+                closed: true,
+            })
+            .unwrap();
+        history
+            .append(&seatswap_core::history::TokenRecord {
+                t: closed_at - chrono::Duration::minutes(10),
+                session: "11a2b3c4-d5e6-4f70-8a9b-0c1d2e3f4a5b".to_string(),
+                cwd: "/home/sam/projects/acme-kb".to_string(),
+                project: ProjectKey::Repo("github.com/sam/acme-kb".to_string()),
+                model: "claude-opus-5-5".to_string(),
+                input: 0,
+                out: 4_000_000,
+                cw: 0,
+                cr: 0,
+                answers: 1,
+                agent_answers: 0,
+            })
+            .unwrap();
+        let (sent, _received) = mpsc::channel();
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        memory.ui = Some(sent);
+        memory.subscription = Some(SessionsOptions {
+            closed: ClosedSince::Day,
+            host: None,
+        });
+
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            now,
+            None,
+        );
+        assert_eq!(
+            memory
+                .closed_rows
+                .get(&ClosedSince::Day)
+                .map(|read| read.read_at),
+            Some(now)
+        );
+        assert_eq!(
+            memory
+                .closed_rows
+                .get(&ClosedSince::Day)
+                .map(|read| read.rows.sessions.len()),
+            Some(1)
+        );
+
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            now + chrono::Duration::seconds(10),
+            None,
+        );
+        assert_eq!(
+            memory
+                .closed_rows
+                .get(&ClosedSince::Day)
+                .map(|read| read.read_at),
+            Some(now),
+            "a later pass with the same choice does not read the closed rows again"
+        );
+
+        memory.subscription = Some(SessionsOptions {
+            closed: ClosedSince::Week,
+            host: None,
+        });
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            now + chrono::Duration::seconds(20),
+            None,
+        );
+        assert_eq!(
+            memory
+                .closed_rows
+                .get(&ClosedSince::Week)
+                .map(|read| read.read_at),
+            Some(now + chrono::Duration::seconds(20)),
+            "a changed choice reads again"
+        );
+        assert_eq!(
+            memory
+                .closed_rows
+                .get(&ClosedSince::Week)
+                .map(|read| read.rows.sessions.len()),
+            Some(1)
+        );
+    }
+
+    /// The pushed view is the view of the *subscription* (the plan: the event
+    /// is "the view for the subscribed options"). A `View` command with other
+    /// options answers its own question; it must not take the subscription's
+    /// place.
+    #[test]
+    fn a_view_command_with_other_options_does_not_change_the_subscription() {
+        let (tmp, claude, app) = fixture();
+        let history = history(&tmp.path().join("history"));
+        let recorder = Recorder::new(history.clone());
+        let now = time("2026-11-14T10:00:00Z");
+        let closed_at = now - chrono::Duration::hours(3);
+        history
+            .append(&SessionRecord {
+                t: closed_at,
+                session: "11a2b3c4-d5e6-4f70-8a9b-0c1d2e3f4a5b".to_string(),
+                cwd: "/home/sam/projects/acme-kb".to_string(),
+                project: ProjectKey::Repo("github.com/sam/acme-kb".to_string()),
+                entrypoint: Some("cli".to_string()),
+                first: closed_at - chrono::Duration::hours(1),
+                last: closed_at,
+                agents_started: 0,
+                agents_finished: 0,
+                closed: true,
+            })
+            .unwrap();
+        write_session(
+            &claude,
+            900,
+            &session_json(
+                900,
+                SESSION,
+                "/home/sam/projects/acme-kb",
+                Some("acme-kb-7c"),
+                "busy",
+                now.timestamp_millis(),
+            ),
+        );
+        let (sent, received) = mpsc::channel();
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        memory.ui = Some(sent);
+        // The subscription wants no closed rows.
+        memory.subscribe(SessionsOptions::default());
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[900]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            now,
+            None,
+        );
+
+        // The window asks once for the closed rows.
+        let answer = answer_view(
+            &mut memory,
+            SessionsOptions {
+                closed: ClosedSince::Day,
+                host: None,
+            },
+            &app,
+            Some(&recorder),
+        )
+        .expect("the command's answer");
+        assert!(
+            answer
+                .sessions
+                .iter()
+                .any(|row| row.status == LiveStatus::Closed),
+            "the command's answer holds the closed rows"
+        );
+
+        // The next pushed view is still the subscription's view.
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[900]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            now + chrono::Duration::seconds(61),
+            None,
+        );
+        let pushed = views(&received);
+        let last = pushed.last().expect("a pushed view");
+        assert!(
+            last.sessions
+                .iter()
+                .all(|row| row.status != LiveStatus::Closed),
+            "the pushed view is the subscription's view (closed: none), but it holds {} rows",
+            last.sessions.len()
+        );
+    }
+
+    /// A pass that cannot read the session files must say so in the window's
+    /// view, not only in the pop-up: the window would otherwise keep showing
+    /// the old rows and never learn why they are stale.
+    #[test]
+    fn a_pass_that_cannot_read_the_session_files_says_why_in_the_view() {
+        let (tmp, claude, app) = fixture();
+        let recorder = Recorder::new(history(&tmp.path().join("history")));
+        let now = time("2026-11-14T10:00:00Z");
+        // The sessions folder is a file: it cannot be read.
+        fs::remove_dir_all(claude.sessions_dir()).unwrap();
+        fs::write(claude.sessions_dir(), "not a folder").unwrap();
+        let (sent, _received) = mpsc::channel();
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        memory.ui = Some(sent);
+        memory.subscribe(SessionsOptions::default());
+
+        let outcome = run_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            now,
+            None,
+        );
+        assert!(
+            outcome
+                .summary
+                .unavailable
+                .as_deref()
+                .unwrap_or_default()
+                .contains("running sessions cannot be read"),
+            "the pop-up says why: {:?}",
+            outcome.summary.unavailable
+        );
+        let view = memory
+            .view()
+            .expect("the window's view says why too, not 'no pass yet'");
+        assert!(
+            view.unavailable
+                .as_deref()
+                .unwrap_or_default()
+                .contains("running sessions cannot be read"),
+            "the window says why: {:?}",
+            view.unavailable
+        );
+    }
+
+    /// The view carries the settings' currency, not the currency of a valuer
+    /// that could be built: the settings are read even when the prices cannot
+    /// be read.
+    #[test]
+    fn the_view_has_the_settings_currency_when_the_prices_cannot_be_read() {
+        let (tmp, claude, app) = fixture();
+        let recorder = Recorder::new(history(&tmp.path().join("history")));
+        fs::write(
+            app.accounts_file(),
+            serde_json::json!({
+                "version": 1,
+                "settings": { "currency": "EUR" },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(app.prices_file(), "{not json").unwrap();
+        let now = time("2026-11-14T10:00:00Z");
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        memory.subscribe(SessionsOptions::default());
+
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            now,
+            None,
+        );
+        let view = memory.view().expect("a view after the pass");
+        assert_eq!(
+            view.currency.as_deref(),
+            Some("EUR"),
+            "the view carries the settings' currency"
+        );
+    }
+
+    /// The commands must not starve the thread: after a command the thread has
+    /// to wait out the *rest* of its window, not a whole window again. With a
+    /// window that is over and over again, the passes (and with them the
+    /// pending view) would never come.
+    #[test]
+    fn the_commands_do_not_starve_the_passes() {
+        use std::time::Instant;
+        let (tmp, claude, app) = fixture();
+        // The projects folder cannot be read: the scan fails, so the thread
+        // asks for the next pass in a second.
+        fs::write(claude.projects_dir(), "not a folder").unwrap();
+        let (ui, received) = mpsc::channel();
+        let (engine, _engine_rx) = mpsc::channel();
+        let mut handle = spawn(
+            app,
+            claude,
+            Ok(history(&tmp.path().join("history"))),
+            ui,
+            engine,
+        )
+        .expect("the sessions thread");
+        let client = handle.client();
+        let first = received
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the first pass");
+        assert!(
+            matches!(first, UiEvent::Sessions(_)),
+            "the first pass sends its summary"
+        );
+
+        // Now the window asks for a view again and again, as a page that polls
+        // would.
+        let start = Instant::now();
+        let mut passes = 0;
+        while start.elapsed() < std::time::Duration::from_secs(3) {
+            let _ = client.view(SessionsOptions::default());
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            while let Ok(event) = received.try_recv() {
+                if matches!(event, UiEvent::Sessions(_)) {
+                    passes += 1;
+                }
+            }
+        }
+        handle.stop();
+        assert!(
+            passes >= 2,
+            "the thread must not starve its passes: {passes} passes in 3 s"
         );
     }
 }

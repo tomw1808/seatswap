@@ -349,6 +349,9 @@ pub(crate) enum UiEvent {
     Snapshot(Snapshot),
     Sessions(SessionsSummary),
     Money(MoneyView),
+    /// A pushed Sessions area view; the main thread fills `in_use` and sends
+    /// it to the large window only.
+    SessionsView(super::window::SessionsView),
 }
 
 /// The handles the Tauri side keeps.

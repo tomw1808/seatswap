@@ -2175,7 +2175,7 @@ function generalCard() {
     setting(
       "Read Claude Code's session files",
       toggle("readSessions", "Read Claude Code's session files"),
-      "model, busy or idle, tokens per folder · never message text",
+      "model, busy or idle, tokens per folder · never message text · takes effect after restarting seatswap",
       "readSessions"
     )
   );
