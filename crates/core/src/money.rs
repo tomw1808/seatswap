@@ -81,6 +81,24 @@ impl ModelPrice {
             + cache_read as f64 * self.cache_read)
             / MICRO
     }
+
+    /// The one price-validity rule (spec §1.4.1): each of the four numbers is
+    /// finite and 0 or more. The text names the field.
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("input", self.input),
+            ("output", self.output),
+            ("cache write", self.cache_write),
+            ("cache read", self.cache_read),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(format!(
+                    "the {name} price must be a number of 0 or more, got {value}"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One model's price from one moment on.
@@ -404,18 +422,26 @@ fn save_json<T: Serialize>(
     })
 }
 
+/// models.dev's list reduced to [`PRICE_PROVIDERS`]: the prices it could read,
+/// and the models it left out with the reason (`"<key>: <reason>"`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelsDevList {
+    pub prices: BTreeMap<String, ModelPrice>,
+    pub left_out: Vec<String>,
+}
+
 /// models.dev's `api.json` → the prices of [`PRICE_PROVIDERS`]. A body with none
 /// of those providers is an error, not an empty list. A model without
 /// `cost.input` and `cost.output` is left out; a missing `cache_read` /
-/// `cache_write` is 0.0; a cost that is negative or not finite is an error
-/// naming the model; `tiered` is set when it has `cost.tiers`.
-pub fn prices_from_models_dev(
-    body: &serde_json::Value,
-) -> Result<BTreeMap<String, ModelPrice>, MoneyError> {
+/// `cache_write` is 0.0; a cost that is not a number, negative or not finite
+/// leaves that model out of the list and names it in [`ModelsDevList::left_out`],
+/// never failing the whole list; `tiered` is set when it has `cost.tiers`.
+pub fn prices_from_models_dev(body: &serde_json::Value) -> Result<ModelsDevList, MoneyError> {
     let providers = body
         .as_object()
         .ok_or_else(|| MoneyError::ModelsDev("not a JSON object of providers".to_string()))?;
     let mut prices = BTreeMap::new();
+    let mut left_out = Vec::new();
     let mut found = 0;
     for provider in PRICE_PROVIDERS {
         let Some(entry) = providers.get(provider) else {
@@ -432,40 +458,38 @@ pub fn prices_from_models_dev(
             };
             let key = price_key(provider, id);
             let cost = model.get("cost");
-            let number = |name: &str| -> Result<Option<f64>, MoneyError> {
+            let number = |name: &str| -> Result<Option<f64>, String> {
                 let Some(value) = cost.and_then(|cost| cost.get(name)) else {
                     return Ok(None);
                 };
-                let Some(value) = value.as_f64() else {
-                    return Err(MoneyError::ModelsDev(format!(
-                        "{key} has a cost that is not a number: {name} = {value}"
-                    )));
+                value
+                    .as_f64()
+                    .map(Some)
+                    .ok_or_else(|| format!("the {name} cost is not a number: {value}"))
+            };
+            let parse = || -> Result<Option<ModelPrice>, String> {
+                let (Some(input), Some(output)) = (number("input")?, number("output")?) else {
+                    return Ok(None);
                 };
-                if !(value.is_finite() && value >= 0.0) {
-                    return Err(MoneyError::ModelsDev(format!(
-                        "{key} has a cost that is negative or not finite: {name} = {value}"
-                    )));
-                }
-                Ok(Some(value))
-            };
-            let (Some(input), Some(output)) = (number("input")?, number("output")?) else {
-                continue;
-            };
-            let cache_write = number("cache_write")?.unwrap_or(0.0);
-            let cache_read = number("cache_read")?.unwrap_or(0.0);
-            let tiered = cost
-                .and_then(|cost| cost.get("tiers"))
-                .is_some_and(|tiers| !tiers.is_null());
-            prices.insert(
-                key,
-                ModelPrice {
+                let price = ModelPrice {
                     input,
                     output,
-                    cache_write,
-                    cache_read,
-                    tiered,
-                },
-            );
+                    cache_write: number("cache_write")?.unwrap_or(0.0),
+                    cache_read: number("cache_read")?.unwrap_or(0.0),
+                    tiered: cost
+                        .and_then(|cost| cost.get("tiers"))
+                        .is_some_and(|tiers| !tiers.is_null()),
+                };
+                price.validate()?;
+                Ok(Some(price))
+            };
+            match parse() {
+                Ok(Some(price)) => {
+                    prices.insert(key, price);
+                }
+                Ok(None) => {}
+                Err(reason) => left_out.push(format!("{key}: {reason}")),
+            }
         }
     }
     if found == 0 {
@@ -474,7 +498,7 @@ pub fn prices_from_models_dev(
             PRICE_PROVIDERS.join(", ")
         )));
     }
-    Ok(prices)
+    Ok(ModelsDevList { prices, left_out })
 }
 
 /// A model's key in [`Prices`]: `"<provider>/<model id>"`.
@@ -495,10 +519,10 @@ pub struct Rate {
     pub own: bool,
 }
 
-/// The rate to use at `date`: `settings.usd_rate` if set (own), else
-/// [`Fx::at`]. Currency "USD" is always 1.0; without a currency there is no
-/// rate at all. The `Fx` is used as given: the caller starts a new one when the
-/// currency changes (spec §1.4).
+/// The rate to use at `date`: `settings.usdRate` when it was entered for the
+/// settings' currency (own), else a point of `fx` looked up for that same
+/// currency. A rate of another currency is never used. Currency "USD" is always
+/// 1.0; without a currency there is no rate at all.
 pub fn usd_rate(settings: &Settings, fx: &Fx, date: NaiveDate) -> Option<Rate> {
     let currency = settings.currency.as_deref()?;
     if currency == "USD" {
@@ -508,12 +532,19 @@ pub fn usd_rate(settings: &Settings, fx: &Fx, date: NaiveDate) -> Option<Rate> {
             own: false,
         });
     }
-    if let Some(value) = settings.usd_rate {
+    if let Some(own) = settings
+        .usd_rate
+        .as_ref()
+        .filter(|own| own.currency == currency)
+    {
         return Some(Rate {
-            value,
+            value: own.value,
             date: None,
             own: true,
         });
+    }
+    if fx.currency != currency {
+        return None;
     }
     let point = fx.point_at(date)?;
     Some(Rate {
@@ -527,7 +558,10 @@ pub fn usd_rate(settings: &Settings, fx: &Fx, date: NaiveDate) -> Option<Rate> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Looked {
     NotModified,
-    Taken(Option<PriceChange>),
+    Taken {
+        change: Option<PriceChange>,
+        left_out: Vec<String>,
+    },
 }
 
 /// One look-up of models.dev's list (spec §1.4.1): load `prices.json` for its
@@ -548,11 +582,14 @@ pub fn look_up_prices(api: &Api, app: &AppPaths, now: DateTime<Utc>) -> Result<L
         }
         Fetched::New { etag, body } => {
             let list = prices_from_models_dev(&body)?;
-            let change = prices.take(list, now);
+            let change = prices.take(list.prices, now);
             prices.etag = etag;
             prices.checked_at = Some(now);
             prices.save(app)?;
-            Ok(Looked::Taken(change))
+            Ok(Looked::Taken {
+                change,
+                left_out: list.left_out,
+            })
         }
     }
 }
@@ -591,9 +628,15 @@ pub fn look_up_rate(
 }
 
 /// What one token record costs at API prices, in USD. `None` when the record's
-/// model has no price. The record's model is priced as an Anthropic model
-/// (`anthropic/<model>`), the provider Claude Code's transcripts come from.
+/// model has no price. A record whose four token counts are all 0 costs nothing,
+/// so it has the value 0 even when its model has no price (Claude Code writes
+/// such records with model `<synthetic>`). The record's model is priced as an
+/// Anthropic model (`anthropic/<model>`), the provider Claude Code's transcripts
+/// come from.
 pub fn api_usd(record: &TokenRecord, prices: &Prices) -> Option<f64> {
+    if record.input == 0 && record.out == 0 && record.cw == 0 && record.cr == 0 {
+        return Some(0.0);
+    }
     let key = price_key("anthropic", &record.model);
     let price = prices.at(&key, record.t)?;
     Some(price.usd(record.input, record.out, record.cw, record.cr))
@@ -605,20 +648,62 @@ pub fn percent_value(monthly_price: f64) -> f64 {
     monthly_price * 12.0 / 52.0 / 100.0
 }
 
+/// Why a value is missing (spec §1.4: the window says so). `Display` is the text a page shows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum Missing {
+    NoCurrency,
+    NoPrice { model: String },
+    NoAccount,
+    NoAccountPrice,
+    PriceInOtherCurrency { currency: String },
+    PriceWithoutCurrency,
+    NoReading,
+    UnpricedInWeek { model: String },
+}
+
+impl std::fmt::Display for Missing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Missing::NoCurrency => f.write_str("set a currency in Settings → General"),
+            Missing::NoPrice { model } => write!(f, "no price for {model}"),
+            Missing::NoAccount => f.write_str("no account was in use at that time"),
+            Missing::NoAccountPrice => f.write_str("the account has no monthly price"),
+            Missing::PriceInOtherCurrency { currency } => write!(
+                f,
+                "the account's price is in {currency}; enter it again in the current currency"
+            ),
+            Missing::PriceWithoutCurrency => f.write_str(
+                "the account's price was entered before a currency was set; enter it again",
+            ),
+            Missing::NoReading => f.write_str("no reading of that week's usage"),
+            Missing::UnpricedInWeek { model } => {
+                write!(
+                    f,
+                    "that week also has tokens of {model}, which has no price"
+                )
+            }
+        }
+    }
+}
+
 /// The two values of one token record, in the settings' currency.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Valued {
-    /// The tokens at API prices, times the rate of the record's day.
+    /// The tokens at API prices, times the rate of the record's day. Without a
+    /// rate of the settings' currency this is the USD value (spec §1.4).
     pub api: Option<f64>,
     /// The share of the account's subscription that the record's week used.
     pub subscription: Option<f64>,
     /// The account that was live on the record's host at its time.
     pub account: Option<AccountRef>,
-    /// The record's model when it has no API price (spec §1.4.1).
-    pub missing_price_for: Option<String>,
-    /// Whether the record has an API price but no rate to turn it into the
-    /// settings' currency: no currency, or no looked-up point and no own rate.
-    pub missing_rate: bool,
+    /// The currency `api` is in: the settings' currency with a rate, "USD"
+    /// without one, and `None` when `api` is `None`.
+    pub api_currency: Option<String>,
+    /// Why `api` is `None`; `None` when it has a value.
+    pub api_missing: Option<Missing>,
+    /// Why `subscription` is `None`; `None` when it has a value.
+    pub subscription_missing: Option<Missing>,
 }
 
 /// One account's weekly window, with what its records are split by.
@@ -633,6 +718,9 @@ struct WeekWindow {
     last_sample: Option<DateTime<Utc>>,
     /// The sum of [`api_usd`] of every record of this account in this window.
     api_sum: f64,
+    /// The first record of this account in this window that has tokens but no
+    /// price, in read order: no subscription value of the window can be split.
+    unpriced: Option<String>,
 }
 
 /// Every account's price changes, in time order: the moment, the monthly price
@@ -744,6 +832,7 @@ impl Valuer {
             finished: false,
             last_sample: None,
             api_sum: 0.0,
+            unpriced: None,
         });
         self.windows.len() - 1
     }
@@ -793,77 +882,137 @@ impl Valuer {
         else {
             return;
         };
-        let Some(usd) = api_usd(record, prices) else {
+        let Some(index) = self.windows.iter().position(|window| {
+            window.account == account && window.start <= record.t && record.t < window.end
+        }) else {
             return;
         };
-        if let Some(window) = self.windows.iter_mut().find(|window| {
-            window.account == account && window.start <= record.t && record.t < window.end
-        }) {
-            window.api_sum += usd;
+        // A record without tokens adds nothing anywhere and is never "unpriced".
+        if record.input == 0 && record.out == 0 && record.cw == 0 && record.cr == 0 {
+            return;
+        }
+        match api_usd(record, prices) {
+            Some(usd) => self.windows[index].api_sum += usd,
+            None => {
+                let window = &mut self.windows[index];
+                if window.unpriced.is_none() {
+                    window.unpriced = Some(record.model.clone());
+                }
+            }
         }
     }
 
     /// The money value of one token record of `host`.
     pub fn value(&self, host: &str, record: &TokenRecord) -> Valued {
-        let usd = api_usd(record, &self.prices);
         let account = self
             .timelines
             .get(host)
             .and_then(|timeline| timeline.at(record.t))
             .cloned();
+        let usd = api_usd(record, &self.prices);
         let rate = usd_rate(&self.settings, &self.fx, record.t.date_naive());
-        let api = match (usd, rate) {
-            (Some(usd), Some(rate)) => Some(usd * rate.value),
-            _ => None,
+        let (api, api_currency, api_missing) = match (usd, rate) {
+            (None, _) => (
+                None,
+                None,
+                Some(Missing::NoPrice {
+                    model: record.model.clone(),
+                }),
+            ),
+            (Some(_), None) if self.settings.currency.is_none() => {
+                (None, None, Some(Missing::NoCurrency))
+            }
+            (Some(usd), Some(rate)) => {
+                (Some(usd * rate.value), self.settings.currency.clone(), None)
+            }
+            (Some(usd), None) => (Some(usd), Some("USD".to_string()), None),
         };
-        let subscription = match (&account, usd) {
-            (Some(account), Some(usd)) => self.subscription(account, record.t, usd),
-            _ => None,
+        let (subscription, subscription_missing) = match (usd, &account) {
+            (None, _) => (
+                None,
+                Some(Missing::NoPrice {
+                    model: record.model.clone(),
+                }),
+            ),
+            (Some(_), None) => (None, Some(Missing::NoAccount)),
+            (Some(usd), Some(account)) => match self.subscription(account, record.t, usd) {
+                Ok(value) => (Some(value), None),
+                Err(missing) => (None, Some(missing)),
+            },
         };
         Valued {
             api,
             subscription,
             account,
-            missing_price_for: usd.is_none().then(|| record.model.clone()),
-            missing_rate: usd.is_some() && rate.is_none(),
+            api_currency,
+            api_missing,
+            subscription_missing,
         }
     }
 
-    fn subscription(&self, account: &AccountRef, at: DateTime<Utc>, usd: f64) -> Option<f64> {
+    fn subscription(
+        &self,
+        account: &AccountRef,
+        at: DateTime<Utc>,
+        usd: f64,
+    ) -> Result<f64, Missing> {
         let window = self
             .windows
             .iter()
-            .find(|window| &window.account == account && window.start <= at && at < window.end)?;
-        let used = window.used?;
+            .find(|window| &window.account == account && window.start <= at && at < window.end)
+            .ok_or(Missing::NoReading)?;
+        let used = window.used.ok_or(Missing::NoReading)?;
         let price = self.price_at(account, at)?;
-        if window.api_sum <= 0.0 {
-            return None;
+        if let Some(model) = &window.unpriced {
+            return Err(Missing::UnpricedInWeek {
+                model: model.clone(),
+            });
         }
-        Some(usd / window.api_sum * used * percent_value(price))
+        // The week has no API value to split (all its prices are 0, or it holds
+        // only records without tokens): this record's share is 0.
+        if window.api_sum <= 0.0 {
+            return Ok(0.0);
+        }
+        Ok(usd / window.api_sum * used * percent_value(price))
     }
 
     /// The account's monthly price at `at`: the last [`EventKind::PriceChanged`]
     /// at or before it, before the first one the first one; without any change
-    /// the price stored for the account now. A change entered in another
-    /// currency than the current setting's has no value here: prices are never
-    /// mixed (spec §1.4). A change entered before a currency was set (`None`)
-    /// still counts.
-    fn price_at(&self, account: &AccountRef, at: DateTime<Utc>) -> Option<f64> {
+    /// the price stored for the account now. A price is only counted in the
+    /// currency it was entered in (spec §1.4): a change in another currency is
+    /// [`Missing::PriceInOtherCurrency`], a change without a currency
+    /// [`Missing::PriceWithoutCurrency`]. A stored price has no change event
+    /// that names the currency it was entered in, so it is
+    /// [`Missing::PriceWithoutCurrency`] too; only an account without any stored
+    /// price is [`Missing::NoAccountPrice`].
+    fn price_at(&self, account: &AccountRef, at: DateTime<Utc>) -> Result<f64, Missing> {
         let (amount, currency) = match self.price_changes.get(account) {
             Some(changes) if !changes.is_empty() => {
                 let after = changes.partition_point(|(t, _, _)| *t <= at);
                 let (_, amount, currency) = if after == 0 {
-                    changes.first()?
+                    changes.first()
                 } else {
-                    changes.get(after - 1)?
-                };
+                    changes.get(after - 1)
+                }
+                .ok_or(Missing::NoAccountPrice)?;
                 (*amount, currency)
             }
-            _ => return self.stored_prices.get(account).copied().flatten(),
+            _ => {
+                return match self.stored_prices.get(account).copied().flatten() {
+                    Some(_) => Err(Missing::PriceWithoutCurrency),
+                    None => Err(Missing::NoAccountPrice),
+                };
+            }
         };
+        let amount = amount.ok_or(Missing::NoAccountPrice)?;
         match currency {
-            Some(currency) if Some(currency.as_str()) != self.settings.currency.as_deref() => None,
-            _ => amount,
+            Some(currency) if Some(currency.as_str()) != self.settings.currency.as_deref() => {
+                Err(Missing::PriceInOtherCurrency {
+                    currency: currency.clone(),
+                })
+            }
+            Some(_) => Ok(amount),
+            None => Err(Missing::PriceWithoutCurrency),
         }
     }
 }
@@ -878,6 +1027,7 @@ mod tests {
     use crate::api::LimitKind;
     use crate::history::{Source, WindowRecord};
     use crate::project::ProjectKey;
+    use crate::store::OwnRate;
 
     const AC_ACC: &str = "6f1c2a9e-1d4b-4c7f-9a3e-8b5d2e6f1c04";
     const AC_ORG: &str = "a92d7b31-5c8e-4f2a-9d6b-1e3c5a7f9b20";
@@ -913,7 +1063,9 @@ mod tests {
     }
 
     fn model_list() -> BTreeMap<String, ModelPrice> {
-        prices_from_models_dev(&models_dev()).expect("the fixture's prices")
+        prices_from_models_dev(&models_dev())
+            .expect("the fixture's prices")
+            .prices
     }
 
     fn priced_prices(at: DateTime<Utc>) -> Prices {
@@ -925,7 +1077,10 @@ mod tests {
     fn settings_eur() -> Settings {
         Settings {
             currency: Some("EUR".to_string()),
-            usd_rate: Some(1.0),
+            usd_rate: Some(OwnRate {
+                currency: "EUR".to_string(),
+                value: 1.0,
+            }),
             ..Settings::default()
         }
     }
@@ -978,6 +1133,17 @@ mod tests {
         Event {
             t: at,
             kind: EventKind::Live { account },
+        }
+    }
+
+    fn price_changed(at: DateTime<Utc>, amount: Option<f64>, currency: Option<&str>) -> Event {
+        Event {
+            t: at,
+            kind: EventKind::PriceChanged {
+                account: ac(),
+                amount,
+                currency: currency.map(str::to_string),
+            },
         }
     }
 
@@ -1264,8 +1430,10 @@ mod tests {
         );
         assert_eq!(api_usd(&record, &prices), None);
         assert_eq!(
-            valuer.value("atlas", &record).missing_price_for,
-            Some("claude-unknown".to_string())
+            valuer.value("atlas", &record).api_missing,
+            Some(Missing::NoPrice {
+                model: "claude-unknown".to_string()
+            })
         );
     }
 
@@ -1273,7 +1441,10 @@ mod tests {
     fn the_rate_is_own_then_looked_up_then_missing() {
         let mut settings = Settings {
             currency: Some("EUR".to_string()),
-            usd_rate: Some(0.95),
+            usd_rate: Some(OwnRate {
+                currency: "EUR".to_string(),
+                value: 0.95,
+            }),
             ..Settings::default()
         };
         assert_eq!(
@@ -1384,6 +1555,13 @@ mod tests {
     fn subscription_value_splits_the_used_week_by_api_value() {
         let (history, _dir, opus, haiku, prices) = two_records();
         history
+            .append(&price_changed(
+                utc("2026-11-06T00:00:00Z"),
+                Some(140.0),
+                Some("EUR"),
+            ))
+            .expect("the account's price");
+        history
             .append(&weekly_window(
                 utc("2026-11-07T00:00:00Z"),
                 utc("2026-11-14T00:00:00Z"),
@@ -1420,6 +1598,13 @@ mod tests {
     fn a_running_week_uses_the_percent_so_far() {
         let (history, _dir, opus, haiku, prices) = two_records();
         let end = utc("2026-11-14T00:00:00Z");
+        history
+            .append(&price_changed(
+                utc("2026-11-06T00:00:00Z"),
+                Some(140.0),
+                Some("EUR"),
+            ))
+            .expect("the account's price");
         history
             .append(&weekly_sample(utc("2026-11-13T12:00:00Z"), end, 48.0))
             .expect("a running window's last sample");
@@ -1462,6 +1647,7 @@ mod tests {
 
         let value = valuer.value("atlas", &opus);
         assert_eq!(value.subscription, None);
+        assert_eq!(value.subscription_missing, Some(Missing::NoAccountPrice));
         assert_eq!(value.api, Some(30.0));
     }
 
@@ -1504,6 +1690,7 @@ mod tests {
         let value = valuer.value("atlas", &opus);
         assert_eq!(value.account, None);
         assert_eq!(value.subscription, None);
+        assert_eq!(value.subscription_missing, Some(Missing::NoAccount));
     }
 
     #[test]
@@ -1662,21 +1849,107 @@ mod tests {
     }
 
     #[test]
-    fn a_negative_cost_is_an_error_naming_the_model() {
+    fn a_negative_cost_leaves_the_model_out_and_names_it() {
         let body = json!({
             "anthropic": {"id": "anthropic", "models": {
                 "claude-opus-5-5": {"id": "claude-opus-5-5",
-                    "cost": {"input": -4, "output": 20}}
+                    "cost": {"input": -4, "output": 20}},
+                "claude-haiku-5-5": {"id": "claude-haiku-5-5",
+                    "cost": {"input": 0.1, "output": 0.5}}
             }}
         });
-        match prices_from_models_dev(&body) {
-            Err(MoneyError::ModelsDev(message)) => {
-                assert!(
-                    message.contains("anthropic/claude-opus-5-5"),
-                    "the error names the model, got {message}"
-                );
-            }
-            other => panic!("a negative cost is an error, got {other:?}"),
+        let list = prices_from_models_dev(&body).expect("the rest of the list is read");
+        assert!(
+            !list.prices.contains_key("anthropic/claude-opus-5-5"),
+            "a model with a negative cost is left out"
+        );
+        assert!(
+            list.prices.contains_key("anthropic/claude-haiku-5-5"),
+            "the other models are kept"
+        );
+        assert_eq!(
+            list.left_out.len(),
+            1,
+            "one model is named: {:?}",
+            list.left_out
+        );
+        let entry = &list.left_out[0];
+        assert!(
+            entry.starts_with("anthropic/claude-opus-5-5: "),
+            "the left-out entry names the model, got {entry}"
+        );
+        assert!(
+            entry.contains("input") && entry.contains("-4"),
+            "the left-out entry names the field and the value, got {entry}"
+        );
+    }
+
+    #[test]
+    fn a_cost_that_is_not_a_number_leaves_the_model_out_and_names_it() {
+        let body = json!({
+            "anthropic": {"id": "anthropic", "models": {
+                "claude-opus-5-5": {"id": "claude-opus-5-5",
+                    "cost": {"input": "four", "output": 20}},
+                "claude-haiku-5-5": {"id": "claude-haiku-5-5",
+                    "cost": {"input": 0.1, "output": 0.5}}
+            }}
+        });
+        let list = prices_from_models_dev(&body).expect("the rest of the list is read");
+        assert!(list.prices.contains_key("anthropic/claude-haiku-5-5"));
+        assert_eq!(list.left_out.len(), 1);
+        assert!(
+            list.left_out[0].starts_with("anthropic/claude-opus-5-5: ")
+                && list.left_out[0].contains("input"),
+            "got {:?}",
+            list.left_out
+        );
+    }
+
+    #[test]
+    fn a_price_must_be_finite_and_zero_or_more() {
+        let good = ModelPrice {
+            input: 0.0,
+            output: 4.0,
+            cache_write: 1.5,
+            cache_read: 0.2,
+            tiered: false,
+        };
+        assert_eq!(good.validate(), Ok(()));
+        for (field, price) in [
+            (
+                "input",
+                ModelPrice {
+                    input: -1.0,
+                    ..good.clone()
+                },
+            ),
+            (
+                "output",
+                ModelPrice {
+                    output: f64::NAN,
+                    ..good.clone()
+                },
+            ),
+            (
+                "cache write",
+                ModelPrice {
+                    cache_write: f64::INFINITY,
+                    ..good.clone()
+                },
+            ),
+            (
+                "cache read",
+                ModelPrice {
+                    cache_read: -0.1,
+                    ..good.clone()
+                },
+            ),
+        ] {
+            let error = price.validate().expect_err("an invalid price");
+            assert!(
+                error.contains(field),
+                "the error names {field}, got {error}"
+            );
         }
     }
 
@@ -1717,6 +1990,12 @@ mod tests {
             usd.subscription, None,
             "a price in USD is not a subscription in EUR"
         );
+        assert_eq!(
+            usd.subscription_missing,
+            Some(Missing::PriceInOtherCurrency {
+                currency: "USD".to_string()
+            })
+        );
         assert_eq!(usd.api, Some(30.0), "the API value needs no subscription");
 
         // The same price entered in the current currency does count.
@@ -1733,6 +2012,270 @@ mod tests {
         let eur = value_of(&history).value("atlas", &opus);
         assert!(
             (eur.subscription.expect("a value") - 0.75 * 80.0 * percent_value(140.0)).abs() < 1e-9
+        );
+    }
+
+    #[test]
+    fn unpriced_tokens_make_the_weeks_value_unknown() {
+        let (history, _dir, opus, _haiku, prices) = two_records();
+        history
+            .append(&price_changed(
+                utc("2026-11-06T00:00:00Z"),
+                Some(140.0),
+                Some("EUR"),
+            ))
+            .expect("the account's price");
+        let unknown = token(
+            utc("2026-11-10T12:00:00Z"),
+            "claude-unknown",
+            1_000_000,
+            0,
+            0,
+            0,
+        );
+        history
+            .append(&unknown)
+            .expect("a token record without a price");
+        history
+            .append(&weekly_window(
+                utc("2026-11-07T00:00:00Z"),
+                utc("2026-11-14T00:00:00Z"),
+                80.0,
+            ))
+            .expect("a finished window");
+        let valuer = Valuer::build(
+            &history,
+            &range("2026-11-10T00:00:00Z", "2026-11-11T00:00:00Z"),
+            &prices,
+            &empty_fx(),
+            &settings_eur(),
+            &[account_with_price(Some(140.0))],
+        )
+        .expect("a valuer");
+
+        let value = valuer.value("atlas", &opus);
+        assert_eq!(
+            value.subscription, None,
+            "the priced records must not share the unpriced one's tokens"
+        );
+        assert_eq!(
+            value.subscription_missing,
+            Some(Missing::UnpricedInWeek {
+                model: "claude-unknown".to_string()
+            })
+        );
+        assert_eq!(value.api, Some(30.0), "the API value is still known");
+    }
+
+    #[test]
+    fn zero_tokens_are_never_unpriced() {
+        let (history, _dir, opus, _haiku, prices) = two_records();
+        history
+            .append(&price_changed(
+                utc("2026-11-06T00:00:00Z"),
+                Some(140.0),
+                Some("EUR"),
+            ))
+            .expect("the account's price");
+        let synthetic = token(utc("2026-11-10T12:00:00Z"), "<synthetic>", 0, 0, 0, 0);
+        history.append(&synthetic).expect("a record without tokens");
+        history
+            .append(&weekly_window(
+                utc("2026-11-07T00:00:00Z"),
+                utc("2026-11-14T00:00:00Z"),
+                80.0,
+            ))
+            .expect("a finished window");
+        let valuer = Valuer::build(
+            &history,
+            &range("2026-11-10T00:00:00Z", "2026-11-11T00:00:00Z"),
+            &prices,
+            &empty_fx(),
+            &settings_eur(),
+            &[account_with_price(Some(140.0))],
+        )
+        .expect("a valuer");
+
+        let value = valuer.value("atlas", &synthetic);
+        assert_eq!(value.api, Some(0.0), "no tokens cost nothing");
+        assert_eq!(value.api_missing, None);
+        assert_eq!(value.subscription, Some(0.0));
+
+        let opus_value = valuer.value("atlas", &opus);
+        assert_eq!(
+            opus_value.subscription_missing, None,
+            "a record without tokens does not make the week unknown"
+        );
+        let week = 80.0 * percent_value(140.0);
+        assert!((opus_value.subscription.expect("a value") - 0.75 * week).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_own_rate_belongs_to_its_currency() {
+        let settings = Settings {
+            currency: Some("CHF".to_string()),
+            usd_rate: Some(OwnRate {
+                currency: "EUR".to_string(),
+                value: 0.95,
+            }),
+            ..Settings::default()
+        };
+        let mut fx = Fx {
+            version: 1,
+            currency: "CHF".to_string(),
+            points: Vec::new(),
+        };
+        fx.take(date("2026-11-13"), 0.90);
+        assert_eq!(
+            usd_rate(&settings, &fx, date("2026-11-14")),
+            Some(Rate {
+                value: 0.90,
+                date: Some(date("2026-11-13")),
+                own: false,
+            }),
+            "the own rate for EUR is not used for CHF"
+        );
+        assert_eq!(
+            usd_rate(&settings, &empty_fx(), date("2026-11-14")),
+            None,
+            "without a CHF rate there is no CHF rate, not the EUR one"
+        );
+    }
+
+    #[test]
+    fn a_rate_of_another_currency_is_not_used() {
+        let settings = Settings {
+            currency: Some("CHF".to_string()),
+            ..Settings::default()
+        };
+        let mut fx = Fx {
+            version: 1,
+            currency: "EUR".to_string(),
+            points: Vec::new(),
+        };
+        fx.take(date("2026-11-13"), 0.95);
+        assert_eq!(
+            usd_rate(&settings, &fx, date("2026-11-14")),
+            None,
+            "an EUR point is not a CHF rate"
+        );
+    }
+
+    #[test]
+    fn a_price_without_a_currency_does_not_count() {
+        let value_for = |with_change: bool| {
+            let (history, _dir, opus, _haiku, prices) = two_records();
+            if with_change {
+                history
+                    .append(&price_changed(
+                        utc("2026-11-06T00:00:00Z"),
+                        Some(140.0),
+                        None,
+                    ))
+                    .expect("a price change before a currency was set");
+            }
+            history
+                .append(&weekly_window(
+                    utc("2026-11-07T00:00:00Z"),
+                    utc("2026-11-14T00:00:00Z"),
+                    80.0,
+                ))
+                .expect("a finished window");
+            Valuer::build(
+                &history,
+                &range("2026-11-10T00:00:00Z", "2026-11-11T00:00:00Z"),
+                &prices,
+                &empty_fx(),
+                &settings_eur(),
+                &[account_with_price(Some(140.0))],
+            )
+            .expect("a valuer")
+            .value("atlas", &opus)
+        };
+
+        let change = value_for(true);
+        assert_eq!(change.subscription, None);
+        assert_eq!(
+            change.subscription_missing,
+            Some(Missing::PriceWithoutCurrency)
+        );
+
+        let stored = value_for(false);
+        assert_eq!(stored.subscription, None);
+        assert_eq!(
+            stored.subscription_missing,
+            Some(Missing::PriceWithoutCurrency),
+            "a stored price names no currency"
+        );
+    }
+
+    #[test]
+    fn a_week_without_a_reading_says_so() {
+        let (history, _dir, opus, _haiku, prices) = two_records();
+        history
+            .append(&price_changed(
+                utc("2026-11-06T00:00:00Z"),
+                Some(140.0),
+                Some("EUR"),
+            ))
+            .expect("the account's price");
+        let valuer = Valuer::build(
+            &history,
+            &range("2026-11-10T00:00:00Z", "2026-11-11T00:00:00Z"),
+            &prices,
+            &empty_fx(),
+            &settings_eur(),
+            &[account_with_price(Some(140.0))],
+        )
+        .expect("a valuer");
+
+        let value = valuer.value("atlas", &opus);
+        assert_eq!(value.subscription, None);
+        assert_eq!(value.subscription_missing, Some(Missing::NoReading));
+    }
+
+    #[test]
+    fn every_missing_value_has_the_text_a_page_shows() {
+        assert_eq!(
+            Missing::NoCurrency.to_string(),
+            "set a currency in Settings → General"
+        );
+        assert_eq!(
+            Missing::NoPrice {
+                model: "claude-unknown".to_string()
+            }
+            .to_string(),
+            "no price for claude-unknown"
+        );
+        assert_eq!(
+            Missing::NoAccount.to_string(),
+            "no account was in use at that time"
+        );
+        assert_eq!(
+            Missing::NoAccountPrice.to_string(),
+            "the account has no monthly price"
+        );
+        assert_eq!(
+            Missing::PriceInOtherCurrency {
+                currency: "USD".to_string()
+            }
+            .to_string(),
+            "the account's price is in USD; enter it again in the current currency"
+        );
+        assert_eq!(
+            Missing::PriceWithoutCurrency.to_string(),
+            "the account's price was entered before a currency was set; enter it again"
+        );
+        assert_eq!(
+            Missing::NoReading.to_string(),
+            "no reading of that week's usage"
+        );
+        assert_eq!(
+            Missing::UnpricedInWeek {
+                model: "claude-unknown".to_string()
+            }
+            .to_string(),
+            "that week also has tokens of claude-unknown, which has no price"
         );
     }
 
@@ -1763,16 +2306,57 @@ mod tests {
         };
 
         let no_currency = value_of(&Settings::default());
-        assert_eq!(no_currency.api, None, "without a rate there is no amount");
-        assert!(no_currency.missing_rate, "a missing rate is named");
         assert_eq!(
-            no_currency.missing_price_for, None,
-            "the model has a price; the rate is what is missing"
+            no_currency.api, None,
+            "without a currency there is no amount"
+        );
+        assert_eq!(
+            no_currency.api_missing,
+            Some(Missing::NoCurrency),
+            "a missing currency is named"
+        );
+        assert_eq!(
+            no_currency.api_currency, None,
+            "a missing amount has no currency"
         );
 
         let with_rate = value_of(&settings_eur());
         assert_eq!(with_rate.api, Some(4.0));
-        assert!(!with_rate.missing_rate);
+        assert_eq!(with_rate.api_missing, None);
+        assert_eq!(with_rate.api_currency.as_deref(), Some("EUR"));
+    }
+
+    #[test]
+    fn without_a_rate_the_api_value_is_in_usd() {
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let prices = priced_prices(utc("2026-11-01T00:00:00Z"));
+        let opus = token(
+            utc("2026-11-10T10:00:00Z"),
+            "claude-opus-5-5",
+            1_000_000,
+            0,
+            0,
+            0,
+        );
+        let settings = Settings {
+            currency: Some("CHF".to_string()),
+            ..Settings::default()
+        };
+        let value = Valuer::build(
+            &history,
+            &range("2026-11-10T00:00:00Z", "2026-11-11T00:00:00Z"),
+            &prices,
+            &empty_fx(),
+            &settings,
+            &[],
+        )
+        .expect("a valuer")
+        .value("atlas", &opus);
+
+        assert_eq!(value.api, Some(4.0), "the USD value is shown");
+        assert_eq!(value.api_currency.as_deref(), Some("USD"));
+        assert_eq!(value.api_missing, None);
     }
 
     // -----------------------------------------------------------------------
@@ -1898,7 +2482,13 @@ mod tests {
             start_server(Reply::ok(MODELS_DEV).header("ETag", "W/\"new\""));
 
         let looked = look_up_prices(&lookup_api(&base), &app, now).expect("the look-up");
-        assert!(matches!(looked, Looked::Taken(Some(_))));
+        assert!(matches!(
+            looked,
+            Looked::Taken {
+                change: Some(_),
+                ..
+            }
+        ));
         let request = captured(&receiver, handle);
         assert_eq!(request.path, "/api.json");
         assert_eq!(request.header("If-None-Match"), None);

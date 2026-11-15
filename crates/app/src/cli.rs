@@ -1297,9 +1297,19 @@ fn prices(context: Context, refresh: bool) -> Result<(), CliError> {
                     .to_string(),
             ));
         }
-        money::look_up_prices(&Api::new(), &app, Utc::now()).map_err(|error| {
-            CliError::Message(format!("cannot refresh the API prices: {error}"))
-        })?;
+        match money::look_up_prices(&Api::new(), &app, Utc::now()) {
+            Ok(money::Looked::Taken { left_out, .. }) => {
+                for entry in &left_out {
+                    println!("left out of models.dev's list: {entry}");
+                }
+            }
+            Ok(money::Looked::NotModified) => {}
+            Err(error) => {
+                return Err(CliError::Message(format!(
+                    "cannot refresh the API prices: {error}"
+                )))
+            }
+        }
     }
     let stored = Prices::load(&app)
         .map_err(|error| CliError::Message(format!("cannot read prices.json: {error}")))?;

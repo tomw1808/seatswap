@@ -36,6 +36,9 @@ pub(crate) struct MoneyView {
     pub models_with_price: u32,
     pub prices_checked_at: Option<DateTime<Utc>>,
     pub last_change: Option<PriceChange>,
+    /// The models of the last look-up's list that were left out, each
+    /// `"<key>: <reason>"`; kept until a later list names others.
+    pub left_out: Vec<String>,
     pub last_error: Option<String>,
 }
 
@@ -243,10 +246,15 @@ impl LookupRuntime {
     /// what is stored.
     pub(crate) fn round(&mut self, settings: &Settings, now: DateTime<Utc>) -> MoneyView {
         let mut error: Option<String> = None;
+        let mut left_out: Option<Vec<String>> = None;
         let today = local_day(now);
         if settings.look_up_prices {
-            if let Err(failure) = money::look_up_prices(&self.api, &self.app, now) {
-                error = combine(error, format!("API prices: {failure}"));
+            match money::look_up_prices(&self.api, &self.app, now) {
+                Ok(money::Looked::Taken {
+                    left_out: names, ..
+                }) => left_out = Some(names),
+                Ok(money::Looked::NotModified) => {}
+                Err(failure) => error = combine(error, format!("API prices: {failure}")),
             }
             if let Some(currency) = settings.currency.clone() {
                 if currency != "USD" {
@@ -285,7 +293,7 @@ impl LookupRuntime {
             }
         }
         self.settings = Some(settings.clone());
-        self.build_view(settings, error, today)
+        self.build_view(settings, error, today, left_out)
     }
 
     /// accounts.json could not be read: remember that and send no request.
@@ -298,7 +306,7 @@ impl LookupRuntime {
 
     fn set_override(&mut self, key: String, price: Option<ModelPrice>) -> Result<(), String> {
         if let Some(price) = &price {
-            validate_price(price)?;
+            price.validate()?;
         }
         // The same app lock the look-up takes: an own price written while a
         // look-up runs is never lost, and a look-up never overwrites this save.
@@ -315,7 +323,7 @@ impl LookupRuntime {
         }
         prices.save(&self.app).map_err(|error| error.to_string())?;
         if let Some(settings) = self.settings.clone() {
-            self.build_view(&settings, None, local_day(Utc::now()));
+            self.build_view(&settings, None, local_day(Utc::now()), None);
         }
         Ok(())
     }
@@ -325,6 +333,7 @@ impl LookupRuntime {
         settings: &Settings,
         error: Option<String>,
         today: NaiveDate,
+        left_out: Option<Vec<String>>,
     ) -> MoneyView {
         let mut error = error;
         let prices = match Prices::load(&self.app) {
@@ -342,12 +351,9 @@ impl LookupRuntime {
             }
         };
         let currency = settings.currency.clone();
-        let fx_for = match &currency {
-            Some(code) if *code == fx.currency => fx,
-            _ => Fx::default(),
-        };
-        let rate = money::usd_rate(settings, &fx_for, today);
+        let rate = money::usd_rate(settings, &fx, today);
         let models_with_price = prices.current().len() as u32;
+        let left_out = left_out.unwrap_or_else(|| self.view().left_out);
         let view = MoneyView {
             currency,
             rate,
@@ -355,6 +361,7 @@ impl LookupRuntime {
             models_with_price,
             prices_checked_at: prices.checked_at,
             last_change: prices.last_change,
+            left_out,
             last_error: error,
         };
         self.store(view)
@@ -398,6 +405,7 @@ fn stored_view(app: &AppPaths) -> MoneyView {
         models_with_price: prices.current().len() as u32,
         prices_checked_at: prices.checked_at,
         last_change: prices.last_change,
+        left_out: Vec::new(),
         last_error: error,
     }
 }
@@ -411,22 +419,6 @@ fn combine(first: Option<String>, second: String) -> Option<String> {
         Some(first) => format!("{first}; {second}"),
         None => second,
     })
-}
-
-fn validate_price(price: &ModelPrice) -> Result<(), String> {
-    for (name, value) in [
-        ("input", price.input),
-        ("output", price.output),
-        ("cache write", price.cache_write),
-        ("cache read", price.cache_read),
-    ] {
-        if !value.is_finite() || value < 0.0 {
-            return Err(format!(
-                "the {name} price must be a number of 0 or more, got {value}"
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// Every model with a price: the looked-up one or the one entered by hand.
@@ -641,6 +633,39 @@ mod tests {
     }
 
     #[test]
+    fn a_body_of_another_shape_keeps_the_stored_prices() {
+        let dir = tempdir().expect("tempdir");
+        let app = AppPaths::at(&dir.path().join("data"));
+        let stored_at = utc("2026-11-13T09:00:00Z");
+        let prices = stored_prices(stored_at);
+        prices.save(&app).expect("the stored prices");
+        let before = std::fs::read(app.prices_file()).expect("prices.json");
+
+        let (base, receiver, handle) = start_server(200, Vec::new(), r#"{"x": 1}"#);
+        let mut runtime = runtime(app.clone(), lookup_api(&base));
+        let view = runtime.round(&no_rate_settings(), utc("2026-11-14T09:00:00Z"));
+        let request = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the fake server received no request");
+        handle.join().expect("the server thread");
+
+        assert_eq!(request.path, "/api.json");
+        assert!(
+            view.last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("models.dev")),
+            "the view names models.dev, got {:?}",
+            view.last_error
+        );
+        let after = std::fs::read(app.prices_file()).expect("prices.json");
+        assert_eq!(
+            after, before,
+            "a body of another shape leaves prices.json byte-for-byte the same"
+        );
+        assert_eq!(view.models_with_price, 2);
+    }
+
+    #[test]
     fn not_modified_only_moves_checked_at() {
         let dir = tempdir().expect("tempdir");
         let app = AppPaths::at(&dir.path().join("data"));
@@ -735,6 +760,7 @@ mod tests {
                 changed: Vec::new(),
                 removed: Vec::new(),
             }),
+            left_out: vec!["anthropic/claude-x: the input cost is not a number".to_string()],
             last_error: None,
         };
         let json = serde_json::to_value(view).expect("the event's JSON");
@@ -742,6 +768,43 @@ mod tests {
         assert_eq!(json["rate"]["value"], json!(0.9048));
         assert_eq!(json["rate"]["date"], json!("2026-11-13"));
         assert_eq!(json["pricesCheckedAt"], json!("2026-11-14T09:00:00Z"));
+        assert_eq!(
+            json["leftOut"],
+            json!(["anthropic/claude-x: the input cost is not a number"])
+        );
+    }
+
+    #[test]
+    fn left_out_is_kept_until_a_later_list_names_others() {
+        let dir = tempdir().expect("tempdir");
+        let app = AppPaths::at(&dir.path().join("data"));
+        stored_prices(utc("2026-11-13T09:00:00Z"))
+            .save(&app)
+            .expect("the stored prices");
+        let mut runtime = runtime(app, lookup_api("http://127.0.0.1:1"));
+        let settings = no_rate_settings();
+        let today = NaiveDate::from_ymd_opt(2026, 11, 14).expect("a test date");
+        let names = vec!["anthropic/claude-x: the input price is negative".to_string()];
+
+        let taken = runtime.build_view(&settings, None, today, Some(names.clone()));
+        assert_eq!(taken.left_out, names);
+
+        let not_modified = runtime.build_view(&settings, None, today, None);
+        assert_eq!(not_modified.left_out, names, "NotModified keeps the names");
+
+        let error = runtime.build_view(
+            &settings,
+            Some("API prices: models.dev's answer failed".to_string()),
+            today,
+            None,
+        );
+        assert_eq!(error.left_out, names, "an error keeps the names");
+
+        let cleared = runtime.build_view(&settings, None, today, Some(Vec::new()));
+        assert!(
+            cleared.left_out.is_empty(),
+            "a later list without left-out models clears them"
+        );
     }
 
     const MODELS_DEV_BODY: &str = r#"{
