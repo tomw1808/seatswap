@@ -17,6 +17,7 @@ use crate::projects::{Projects, ProjectsLogRecord};
 use crate::store::{Account, Settings};
 
 pub mod overview;
+pub mod weeks;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StatsError {
@@ -67,8 +68,9 @@ pub struct Ctx<'a> {
 }
 
 /// ThisWeek: Monday 00:00 local of this week .. now. LastWeek: the week before. Days30 / Days90 / Months12: from the
-/// Monday 00:00 of the week that holds now - 30 d / 90 d / 365 d .. now. All: from the first record .. now, or from
-/// this week's Monday 00:00 when the history holds no record.
+/// Monday 00:00 of the week that holds now - 30 d / 90 d / 365 d .. now. All: from the Monday 00:00 local of the
+/// week that holds the first record .. now, so every page's first calendar week holds all its windows; when the
+/// history holds no record, from this week's Monday 00:00.
 pub fn range_of(key: RangeKey, ctx: &Ctx) -> Result<Range, StatsError> {
     let this_week = week_start(ctx.now, ctx.offset);
     let (from, to) = match key {
@@ -86,7 +88,12 @@ pub fn range_of(key: RangeKey, ctx: &Ctx) -> Result<Range, StatsError> {
             week_start(ctx.now - Duration::days(365), ctx.offset),
             ctx.now,
         ),
-        RangeKey::All => (first_record(ctx)?.unwrap_or(this_week), ctx.now),
+        RangeKey::All => (
+            first_record(ctx)?
+                .map(|first| week_start(first, ctx.offset))
+                .unwrap_or(this_week),
+            ctx.now,
+        ),
     };
     Range::between(Some(from), Some(to)).map_err(StatsError::from)
 }
@@ -118,7 +125,9 @@ pub struct AccountWeek {
 }
 
 /// Every finished weekly_all window whose midpoint lies in the range, of the chosen accounts, any host; if several
-/// hosts recorded the same window (same account and end), the one with the latest lastSample.
+/// hosts recorded the same window (same account and end), the one with the latest lastSample. One window per account
+/// and calendar week: when an account has two windows whose midpoints fall in one week (its reset moved), only the
+/// one with the later end is kept.
 pub fn account_weeks(ctx: &Ctx, range: &Range, q: &Query) -> Result<Vec<AccountWeek>, StatsError> {
     let valuer = Valuer::build(
         ctx.history,
@@ -132,14 +141,17 @@ pub fn account_weeks(ctx: &Ctx, range: &Range, q: &Query) -> Result<Vec<AccountW
 }
 
 /// [`account_weeks`] with a [`Valuer`] the caller already built for the same
-/// range, so a page that values token records too builds only one.
+/// range, so a page that values token records too builds only one. One window
+/// per account and calendar week: when an account has two windows whose
+/// midpoints fall in one week (its reset moved), only the one with the later
+/// end is kept.
 pub(crate) fn account_weeks_valued(
     ctx: &Ctx,
     range: &Range,
     q: &Query,
     valuer: &Valuer,
 ) -> Result<Vec<AccountWeek>, StatsError> {
-    let mut weeks = Vec::new();
+    let mut weeks: Vec<AccountWeek> = Vec::new();
     for hosted in ctx.history.finished_windows(&Range::ALL, &Hosts::All)? {
         let window = hosted.record;
         if window.k != LimitKind::WeeklyAll {
@@ -164,13 +176,24 @@ pub(crate) fn account_weeks_valued(
             Ok(price) => (Some(price), None),
             Err(missing) => (None, Some(missing)),
         };
-        weeks.push(AccountWeek {
+        let account_week = AccountWeek {
             week: week_start(midpoint, ctx.offset),
             account: window.account.clone(),
             price,
             price_missing,
             window,
-        });
+        };
+        let same = weeks
+            .iter_mut()
+            .find(|kept| kept.account == account_week.account && kept.week == account_week.week);
+        match same {
+            Some(kept) => {
+                if account_week.window.end > kept.window.end {
+                    *kept = account_week;
+                }
+            }
+            None => weeks.push(account_week),
+        }
     }
     Ok(weeks)
 }
@@ -303,6 +326,36 @@ pub(crate) fn account_id(ctx: &Ctx, reference: &AccountRef) -> String {
     stored_account(ctx, reference)
         .map(|account| account.id.clone())
         .unwrap_or_else(|| reference.acc.clone())
+}
+
+/// The abbreviation a page writes for `reference`: the stored account's, or the
+/// reference's account id when it is no longer stored.
+pub(crate) fn account_abbr(ctx: &Ctx, reference: &AccountRef) -> String {
+    stored_account(ctx, reference)
+        .map(|account| account.abbr.clone())
+        .unwrap_or_else(|| reference.acc.clone())
+}
+
+/// Where an account id stands in the stored accounts' order; an id that is no
+/// longer stored sorts after all of them.
+pub(crate) fn account_position(ctx: &Ctx, id: &str) -> usize {
+    ctx.accounts
+        .iter()
+        .position(|account| account.id == id)
+        .unwrap_or(usize::MAX)
+}
+
+/// The three largest of `items`, then `("other", rest)` only when a rest is
+/// left; ties by name.
+pub(crate) fn top_three(mut items: Vec<(String, f64)>) -> Vec<(String, f64)> {
+    items.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    if items.len() <= 3 {
+        return items;
+    }
+    let rest = items.split_off(3);
+    let other = rest.into_iter().fold(0.0, |sum, (_, value)| sum + value);
+    items.push(("other".to_string(), other));
+    items
 }
 
 /// Money as the page writes it (`crates/app/ui/common.js`'s `money`): two

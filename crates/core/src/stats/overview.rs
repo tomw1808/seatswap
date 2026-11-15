@@ -18,10 +18,10 @@ use crate::money::Valuer;
 use crate::projects::ProjectId;
 
 use super::{
-    account_id, account_weeks_valued, blocked_by_week, blocked_spans, date_text, hours_text,
-    lost_percent, money_of, money_text, percent_text, range_of, stored_account, switch_counts,
-    week_columns, week_of_record, working_rhythm, AccountWeek, Ctx, Query, StatsError,
-    SwitchCounts, WindowMoney,
+    account_abbr, account_id, account_position, account_weeks_valued, blocked_by_week,
+    blocked_spans, date_text, hours_text, lost_percent, money_of, money_text, percent_text,
+    range_of, switch_counts, top_three, week_columns, week_of_record, working_rhythm, AccountWeek,
+    Ctx, Query, StatsError, SwitchCounts, WindowMoney,
 };
 
 /// The Overview page's numbers for one range (spec §3.1).
@@ -251,7 +251,7 @@ pub(crate) fn overview_in(ctx: &Ctx, range: &Range, q: &Query) -> Result<Overvie
         weeks_by_start
             .entry(start)
             .or_insert_with(|| empty_week(start))
-            .projects = top_projects(sums);
+            .projects = top_three(sums.into_iter().collect());
     }
 
     let mut marks = Vec::new();
@@ -262,9 +262,7 @@ pub(crate) fn overview_in(ctx: &Ctx, range: &Range, q: &Query) -> Result<Overvie
         }
         match &hosted.record.kind {
             EventKind::AccountAdded { account, .. } => {
-                let label = stored_account(ctx, account)
-                    .map(|stored| stored.abbr.clone())
-                    .unwrap_or_else(|| account.acc.clone());
+                let label = account_abbr(ctx, account);
                 marks.push(Mark {
                     at,
                     label: format!("{label} added"),
@@ -365,27 +363,6 @@ fn switch_cost_percent(
     let active = timelines.get(ctx.history.host())?.at(range.to)?;
     let window = learned.get(active)?.s?;
     Some(cost.wu * window)
-}
-
-/// The three largest projects by subscription value, then `("other", rest)`
-/// only when a rest is left.
-fn top_projects(sums: BTreeMap<String, f64>) -> Vec<(String, f64)> {
-    let mut projects: Vec<(String, f64)> = sums.into_iter().collect();
-    projects.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    if projects.len() <= 3 {
-        return projects;
-    }
-    let rest = projects.split_off(3);
-    let other = rest.into_iter().map(|(_, value)| value).sum();
-    projects.push(("other".to_string(), other));
-    projects
-}
-
-fn account_position(ctx: &Ctx, id: &str) -> usize {
-    ctx.accounts
-        .iter()
-        .position(|account| account.id == id)
-        .unwrap_or(usize::MAX)
 }
 
 /// The first finding: the account with the most expired money, if above zero;
