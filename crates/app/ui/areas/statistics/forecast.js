@@ -46,13 +46,14 @@ function spanText(from, to) {
   return `${weekdayTimeText(from)} to ${weekdayTimeText(to)}`;
 }
 
-// A struct percent as a CSS position: a value outside 0..100 is an error, never
-// silently clamped.
+// A struct percent as a CSS position. A value below 0 is an error. A value
+// above 100 is a real window (C3-2: a window can expire nothing): its bar is
+// drawn full and the number beside it is written as it is, never changed here.
 function position(value, what) {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 100) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
     throw new Error(`${what} ${String(value)} is not a percent`);
   }
-  return `${value}%`;
+  return `${Math.min(value, 100)}%`;
 }
 
 // Why an expected percent is missing: the account is still learning its rates,

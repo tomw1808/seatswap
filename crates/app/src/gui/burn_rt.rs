@@ -107,6 +107,10 @@ pub(crate) struct BurnTick<'a> {
     pub thinking: &'a [(DateTime<Utc>, u32)],
 }
 
+/// The plan inputs, its regime and the oldest reading they were built from;
+/// the tray keeps the latest for the Forecast page.
+pub(crate) type KeptForecast = (Inputs, Regime, DateTime<Utc>);
+
 /// What one tick produced. The worker adds `error` to the snapshot's error,
 /// prints `warnings` once, and sends `notification` after the switch landed.
 #[derive(Debug, Default)]
@@ -115,9 +119,10 @@ pub(crate) struct BurnReport {
     pub error: Option<String>,
     pub warnings: Vec<String>,
     pub notification: Option<String>,
-    /// The plan inputs and regime this tick computed; `None` while there is no
-    /// situation. The Forecast page reads the latest one.
-    pub forecast: Option<(Inputs, Regime)>,
+    /// The plan inputs, regime and oldest reading this tick computed; `None`
+    /// while there is no situation. The Forecast page reads the latest one and
+    /// refuses it by the reading's age.
+    pub forecast: Option<KeptForecast>,
 }
 
 /// A switch that was sent and whose reply has not been read yet.
@@ -331,7 +336,11 @@ impl BurnRuntime {
             plan,
             next,
         } = assessment;
-        report.forecast = Some((situation.inputs.clone(), regime.clone()));
+        report.forecast = Some((
+            situation.inputs.clone(),
+            regime.clone(),
+            situation.oldest_reading,
+        ));
         if let Some(error) = self.publish_next(tick, &situation, &decision, &plan, next.as_deref())
         {
             append_error(&mut report, error);

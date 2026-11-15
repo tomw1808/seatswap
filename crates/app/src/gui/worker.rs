@@ -23,7 +23,9 @@ use serde::Serialize;
 use seatswap_core::api::Api;
 #[cfg(test)]
 use seatswap_core::api::ApiError;
+#[cfg(test)]
 use seatswap_core::burn::decide::Regime;
+#[cfg(test)]
 use seatswap_core::burn::plan::Inputs;
 #[cfg(test)]
 use seatswap_core::engine::Remote;
@@ -43,7 +45,7 @@ use seatswap_core::switcher::{self, LiveState, SwitchError, Synced, UnsavedPolic
 use seatswap_core::types::Login;
 
 use super::autostart;
-use super::burn_rt::{BurnRuntime, BurnTick};
+use super::burn_rt::{BurnRuntime, BurnTick, KeptForecast};
 use super::lookup_rt::{self, LookupHandle, MoneyView};
 use super::notify;
 use super::sessions_rt::{self, SessionsHandle};
@@ -369,9 +371,9 @@ pub(crate) struct Worker {
     /// The history folder the recorder opened at startup. Every reader uses
     /// this one; a changed setting takes effect after a restart.
     pub history: Result<seatswap_core::history::HistoryDir, String>,
-    /// The plan inputs and regime of the last auto-burn decision; the Forecast
-    /// page reads them through `GuiState`.
-    pub forecast: Arc<Mutex<Option<(Inputs, Regime)>>>,
+    /// The plan inputs, regime and oldest reading of the last auto-burn
+    /// decision; the Forecast page reads them through `GuiState`.
+    pub forecast: Arc<Mutex<Option<KeptForecast>>>,
 }
 
 pub(crate) fn spawn(
@@ -623,9 +625,9 @@ struct EngineRuntime {
     snapshot: Snapshot,
     baseline: ClockBaseline,
     burn: BurnRuntime,
-    /// The last auto-burn plan inputs and regime, shared with `GuiState` for
-    /// the Forecast page.
-    forecast: Arc<Mutex<Option<(Inputs, Regime)>>>,
+    /// The last auto-burn plan inputs, regime and oldest reading, shared with
+    /// `GuiState` for the Forecast page.
+    forecast: Arc<Mutex<Option<KeptForecast>>>,
     /// The sessions thread's busy sessions on a thinking-tied model. It is 0
     /// when the sessions thread cannot tell (with `readSessions` off): nothing
     /// is held back then (spec §2.12).
@@ -660,7 +662,7 @@ impl EngineRuntime {
         action: Sender<ActionCommand>,
         engine: Sender<EngineCommand>,
         history: Result<HistoryDir, String>,
-        forecast: Arc<Mutex<Option<(Inputs, Regime)>>>,
+        forecast: Arc<Mutex<Option<KeptForecast>>>,
     ) -> EngineRuntime {
         let mut runtime = EngineRuntime {
             app,
@@ -3027,6 +3029,7 @@ mod tests {
                 extra_switches: 0,
                 cost_h: None,
             },
+            Utc::now(),
         ))));
         let (ui, _rx) = mpsc::channel();
         let (action, engine_commands) = burn_channels();

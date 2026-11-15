@@ -15,9 +15,9 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "gui")]
 use seatswap_core::api::Usage;
-#[cfg(feature = "gui")]
+#[cfg(all(feature = "gui", test))]
 use seatswap_core::burn::decide::Regime;
-#[cfg(feature = "gui")]
+#[cfg(all(feature = "gui", test))]
 use seatswap_core::burn::plan::Inputs;
 #[cfg(feature = "gui")]
 use seatswap_core::feed::Feed;
@@ -54,6 +54,9 @@ use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder
 use crate::statusline::render::AccountFacts;
 #[cfg(feature = "gui")]
 use crate::statusline::{self, FactsSource, PreviewLine, Scenario};
+
+#[cfg(feature = "gui")]
+use super::burn_rt::KeptForecast;
 
 /// Window label used by `tauri.conf.json`'s capability and by every command.
 #[cfg(feature = "gui")]
@@ -746,19 +749,21 @@ pub(crate) fn stats_what_if_at(
 
 /// The forecast has no empty marker: it either has a plan or the error that no
 /// reading of every account exists yet. A reading older than the burn runtime's
-/// freshness is the same as no reading.
+/// freshness is the same as no reading; the age is the oldest reading the
+/// situation kept, not the tick time its plan was built for.
 #[cfg(feature = "gui")]
 pub(crate) fn stats_forecast_at(
     parts: &StatsParts,
     history: &HistoryDir,
     now: DateTime<Utc>,
     offset: FixedOffset,
-    inputs: Option<(Inputs, Regime)>,
+    kept: Option<KeptForecast>,
 ) -> Result<Page<forecast::Forecast>, String> {
-    let Some((inputs, regime)) = inputs else {
+    let Some((inputs, regime, oldest_reading)) = kept else {
         return Err("the forecast needs a reading of every account first".to_string());
     };
-    if now.signed_duration_since(inputs.now) > Duration::minutes(seatswap_core::burn::FRESH_MIN) {
+    if now.signed_duration_since(oldest_reading) > Duration::minutes(seatswap_core::burn::FRESH_MIN)
+    {
         return Err("the forecast needs a reading of every account first".to_string());
     }
     let ctx = parts.ctx(history, now, offset);
@@ -2102,9 +2107,14 @@ mod tests {
             extra_switches: 0,
             cost_h: None,
         };
-        let forecast =
-            stats_forecast_at(&parts, &tiny.history, now, offset, Some((inputs, regime)))
-                .expect("the forecast");
+        let forecast = stats_forecast_at(
+            &parts,
+            &tiny.history,
+            now,
+            offset,
+            Some((inputs, regime, now)),
+        )
+        .expect("the forecast");
         assert!(matches!(forecast, Page::Data(_)), "{forecast:?}");
 
         let error = stats_forecast_at(&parts, &tiny.history, now, offset, None)
@@ -2221,7 +2231,7 @@ mod tests {
             &tiny.history,
             now,
             offset,
-            Some((inputs(now), regime.clone())),
+            Some((inputs(now), regime.clone(), now)),
         )
         .expect("the forecast of a fresh reading");
         assert!(matches!(fresh, Page::Data(_)), "{fresh:?}");
@@ -2234,12 +2244,166 @@ mod tests {
             &tiny.history,
             now,
             offset,
-            Some((inputs(old), regime.clone())),
+            Some((inputs(old), regime.clone(), old)),
         )
         .expect_err("a reading that is too old is no plan");
         assert_eq!(
             error, "the forecast needs a reading of every account first",
             "{error}"
+        );
+    }
+
+    /// The plan's own tick time is not the age of its readings: a tick one
+    /// minute ago can still be built on readings two hours old when the usage
+    /// fetch failed and only a cached regime kept the plan alive.
+    #[cfg(feature = "gui")]
+    #[test]
+    fn the_forecast_refuses_readings_that_are_too_old() {
+        let dir = tempfile::tempdir().expect("a temp folder");
+        let tiny = fixture::write(dir.path()).expect("the tiny fixture");
+        let app = AppPaths::at(dir.path());
+        let parts = stats_ctx_parts(&app, &tiny.history).expect("the statistics parts");
+        let now = tiny.now;
+        let offset = tiny.offset;
+        let regime = Regime {
+            early: false,
+            why: RegimeWhy::NoCostYet,
+            lazy_blocked_h: 0.0,
+            eager_blocked_h: 0.0,
+            extra_switches: 0,
+            cost_h: None,
+        };
+        let inputs = Inputs {
+            now: now - Duration::minutes(1),
+            offset,
+            accounts: vec![AccountState {
+                id: tiny.accounts[0].id.clone(),
+                may_use: true,
+                login_ok: true,
+                week_percent: 30.0,
+                week_resets_at: "2026-11-23T17:00:00Z".parse().expect("a reset"),
+                session: Some(SessionState {
+                    percent: 0.0,
+                    resets_at: None,
+                }),
+                model_blocked: false,
+                rates: Some(Rates {
+                    c: 4.0,
+                    s: Some(80.0),
+                }),
+                thinking_held: 0,
+            }],
+            active: Some(tiny.accounts[0].id.clone()),
+            rhythm: Rhythm { wu: [1.0; 168] },
+        };
+
+        let oldest = now - Duration::hours(2);
+        let error = stats_forecast_at(
+            &parts,
+            &tiny.history,
+            now,
+            offset,
+            Some((inputs, regime, oldest)),
+        )
+        .expect_err("readings two hours old are no plan");
+        assert_eq!(
+            error, "the forecast needs a reading of every account first",
+            "{error}"
+        );
+    }
+
+    /// A range with no record says "nothing recorded yet" on every page, not
+    /// only in the core: every command that takes a query builds its range and
+    /// asks `stats::empty` before it computes.
+    #[cfg(feature = "gui")]
+    #[test]
+    fn every_page_but_the_forecast_says_nothing_recorded_for_an_empty_range() {
+        fn assert_empty<T: std::fmt::Debug>(page: Page<T>) {
+            match page {
+                Page::Empty(_) => {}
+                Page::Data(data) => panic!("the empty range has data: {data:?}"),
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("a temp folder");
+        let tiny = fixture::write(dir.path()).expect("the tiny fixture");
+        let app = AppPaths::at(dir.path());
+        let parts = stats_ctx_parts(&app, &tiny.history).expect("the statistics parts");
+        let now = "2026-12-10T10:00:00Z".parse().expect("a later month");
+        let offset = tiny.offset;
+        let query = Query {
+            range: RangeKey::ThisWeek,
+            accounts: Vec::new(),
+            host: None,
+        };
+
+        assert_empty(
+            stats_overview_at(&parts, &tiny.history, now, offset, &query)
+                .expect("the overview command"),
+        );
+        assert_empty(
+            stats_weeks_at(&parts, &tiny.history, now, offset, &query).expect("the weeks command"),
+        );
+        assert_empty(
+            stats_week_summary_at(
+                &parts,
+                &tiny.history,
+                now,
+                offset,
+                &query,
+                "2026-12-07T00:00:00Z".parse().expect("this week"),
+            )
+            .expect("the week summary command"),
+        );
+        assert_empty(
+            stats_window_detail_at(
+                &parts,
+                &tiny.history,
+                now,
+                offset,
+                &query,
+                &tiny.accounts[0].id,
+                "2026-11-09T17:00:00Z".parse().expect("a window end"),
+            )
+            .expect("the window detail command"),
+        );
+        assert_empty(
+            stats_projects_at(&parts, &tiny.history, now, offset, &query)
+                .expect("the projects command"),
+        );
+        assert_empty(
+            stats_project_detail_at(
+                &parts,
+                &tiny.history,
+                now,
+                offset,
+                &query,
+                &ProjectKey::Repo("github.com/sam/atlas".to_string()),
+            )
+            .expect("the project detail command"),
+        );
+        assert_empty(
+            stats_subscriptions_at(&parts, &tiny.history, now, offset, &query)
+                .expect("the subscriptions command"),
+        );
+        assert_empty(
+            stats_what_if_at(
+                &parts,
+                &tiny.history,
+                now,
+                offset,
+                &query,
+                &tiny.accounts[1].id,
+            )
+            .expect("the what-if command"),
+        );
+        assert_empty(
+            stats_rhythm_at(&parts, &tiny.history, now, offset, &query)
+                .expect("the rhythm command"),
+        );
+        assert_empty(
+            stats_activity_at(&parts, &tiny.history, now, offset, &query)
+                .expect("the activity command"),
         );
     }
 

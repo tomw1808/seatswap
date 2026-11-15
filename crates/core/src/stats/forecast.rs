@@ -8,8 +8,10 @@ use serde::Serialize;
 
 use crate::api::LimitKind;
 use crate::burn::decide::Regime;
-use crate::burn::plan::{follow, next_reset, rates_known, AccountState, Inputs, Plan, Policy};
-use crate::burn::HORIZON_H;
+use crate::burn::plan::{
+    follow, next_reset, rates_known, week_percent_at, AccountState, Inputs, Plan, Policy,
+};
+use crate::burn::{wu_hours, HORIZON_H};
 use crate::history::{same_reset, AccountRef, Hosts, Range, Sample, WindowRecord};
 use crate::money::{window_money, Valuer};
 
@@ -69,7 +71,8 @@ pub struct ForecastKpis {
 #[serde(rename_all = "camelCase")]
 pub struct ForecastAccount {
     pub id: String,
-    /// The account's weekly percent now.
+    /// The account's weekly percent now, as the plan plays it: 0 when its
+    /// weekly reset has passed.
     pub now: f64,
     /// The percent the plan expects to have used at the account's reset:
     /// 100 − the plan's unused percent. `None` while the rates are unknown or
@@ -256,7 +259,7 @@ pub fn forecast(ctx: &Ctx, inputs: &Inputs, regime: &Regime) -> Result<Forecast,
             };
             ForecastAccount {
                 id: state.id.clone(),
-                now: state.week_percent,
+                now: week_percent_at(state, inputs.now),
                 expected,
                 low: lows[index],
                 full_at: planned.full_at.get(&state.id).copied(),
@@ -272,11 +275,11 @@ pub fn forecast(ctx: &Ctx, inputs: &Inputs, regime: &Regime) -> Result<Forecast,
     let kpis = ForecastKpis {
         expire_planned: planned_money,
         expire_only_when_full: lazy_money,
-        blocked_hours: if regime.early {
-            regime.eager_blocked_h
-        } else {
-            regime.lazy_blocked_h
-        },
+        // The plan on the page: its blocked work in the hours the rhythm makes
+        // of it, with the one work-units-to-hours function. A typical hour of
+        // 0.0 means no hours can be computed; the regime's rule then says 0.0
+        // (see `burn::decide::regime`).
+        blocked_hours: wu_hours(planned.blocked_wu, inputs.rhythm.typical_hour()).unwrap_or(0.0),
         switches: planned.switches,
         switches_only_when_full: lazy.switches,
     };
@@ -365,8 +368,9 @@ fn expire_money(
 /// percent of the newest `weekly_all` sample at or before `end - d` that names
 /// the window's reset, where `d` is the time from now to the reset the plan
 /// plays the account to. A window without such a sample is left out; with
-/// fewer than four gains there is no low. The value is this week's percent now
-/// plus the second-lowest gain, at most 100 (the plan's rule of spec §3.4).
+/// fewer than four gains there is no low. The value is the percent the plan
+/// plays this week (0 after a passed reset) plus the second-lowest gain, at most
+/// 100 (the plan's rule of spec §3.4).
 fn low_of(
     state: &AccountState,
     reset: DateTime<Utc>,
@@ -405,7 +409,7 @@ fn low_of(
         return None;
     }
     gains.sort_by(f64::total_cmp);
-    Some((state.week_percent + gains[1]).min(100.0))
+    Some((week_percent_at(state, now) + gains[1]).min(100.0))
 }
 
 /// The account's weekly resets inside `[from, to)`: the reset the plan plays it
@@ -516,7 +520,7 @@ mod tests {
 
     use crate::burn::decide::RegimeWhy;
     use crate::burn::plan::testkit::inputs;
-    use crate::burn::{Rates, HORIZON_H};
+    use crate::burn::{wu_hours, Rates, HORIZON_H};
     use crate::history::{LimitSample, Source};
     use crate::store::Account;
 
@@ -656,7 +660,9 @@ mod tests {
         assert_eq!(forecast.blocked, blocked);
         assert_eq!(forecast.from, inputs.now);
         assert_eq!(forecast.to, inputs.now + Duration::hours(HORIZON_H));
-        assert_eq!(forecast.kpis.blocked_hours, 1.25);
+        let blocked_hours = wu_hours(planned.blocked_wu, inputs.rhythm.typical_hour())
+            .expect("the test rhythm has working hours");
+        assert_eq!(forecast.kpis.blocked_hours, blocked_hours);
         assert_eq!(forecast.kpis.switches, planned.switches);
         assert_eq!(forecast.kpis.switches_only_when_full, lazy.switches);
     }
@@ -847,6 +853,71 @@ mod tests {
 
     // ---- proof tests of the review ----
 
+    /// The KPI "Blocked" is the page's own plan, not the cached regime's:
+    /// the plan's blocked work in the hours the rhythm makes of it.
+    #[test]
+    fn blocked_hours_come_from_the_planned_work() {
+        let tiny = tiny();
+        let accounts = stored_accounts(&tiny);
+        let ctx = context(&tiny, &accounts);
+        let inputs = inputs();
+        let planned = follow(&inputs, Policy::Lazy);
+        let expected = wu_hours(planned.blocked_wu, inputs.rhythm.typical_hour())
+            .expect("the test rhythm has working hours");
+        assert!(planned.blocked_wu > 0.0, "the plan must have blocked work");
+
+        let page = forecast(&ctx, &inputs, &regime(false)).expect("the forecast");
+        assert!(
+            close(page.kpis.blocked_hours, expected),
+            "the page says {} blocked hours, the plan {}",
+            page.kpis.blocked_hours,
+            expected
+        );
+    }
+
+    /// An account whose weekly reset has passed is played from 0 %: the page's
+    /// `now` and the base of its low are 0, not the old week's percent.
+    #[test]
+    fn a_passed_reset_is_played_from_zero() {
+        let tiny = tiny();
+        let accounts = stored_accounts(&tiny);
+        let pr = AccountRef::of(&accounts[0]);
+        let ctx = context(&tiny, &accounts);
+
+        let ends = [
+            utc("2026-11-14T19:00:00Z"),
+            utc("2026-11-07T19:00:00Z"),
+            utc("2026-10-31T19:00:00Z"),
+            utc("2026-10-24T19:00:00Z"),
+        ];
+        let gains = [10.0, 12.0, 15.0, 20.0];
+        let (windows, samples): (Vec<WindowRecord>, Vec<Sample>) = ends
+            .iter()
+            .zip(gains)
+            .map(|(end, gain)| low_records(&pr, *end, gain))
+            .unzip();
+        tiny.history.append_many(&windows).expect("four windows");
+        tiny.history.append_many(&samples).expect("the samples");
+
+        let mut inputs = inputs();
+        inputs.accounts[0].week_percent = 40.0;
+        // PR's weekly reset of 14 November has passed, so the plan plays it
+        // from 0 % to its next reset on 21 November.
+        inputs.accounts[0].week_resets_at = utc("2026-11-14T19:00:00Z");
+        let page = forecast(&ctx, &inputs, &regime(false)).expect("the forecast");
+        let row = page
+            .accounts
+            .iter()
+            .find(|account| account.id == "PR")
+            .expect("PR's row");
+        assert_eq!(row.now, 0.0, "the old week's percent is played");
+        assert_eq!(
+            row.low,
+            Some(12.0),
+            "the low starts at the percent the plan plays, not the old week's"
+        );
+    }
+
     /// The plan plays an account whose weekly reset has passed to its *next*
     /// reset (spec §2.4: "a weekly reset at or before `Inputs::now` means that
     /// week is over: the account is played from 0 % with its next reset"). The
@@ -885,7 +956,9 @@ mod tests {
         tiny.history.append_many(&samples).expect("the samples");
 
         let mut inputs = inputs();
-        inputs.accounts[0].week_percent = 40.0;
+        // The base is 0 in both cases, so the comparison is about the stretch
+        // the low measures, not about a passed week's percent.
+        inputs.accounts[0].week_percent = 0.0;
         // PR's weekly reset: Saturday 21 November 19:00, 131 hours from now.
         inputs.accounts[0].week_resets_at = utc("2026-11-21T19:00:00Z");
         let page = forecast(&ctx, &inputs, &regime(false)).expect("the forecast");
@@ -907,7 +980,7 @@ mod tests {
             .expect("PR's row")
             .low;
 
-        assert_eq!(future, Some(52.0), "the reset of 21 November");
+        assert_eq!(future, Some(12.0), "the reset of 21 November");
         assert_eq!(
             passed, future,
             "a reset that has passed measures another stretch"
@@ -1005,6 +1078,8 @@ mod tests {
         let page = forecast(&ctx, &inputs, &early).expect("the forecast");
         assert_eq!(page.kpis.switches, eager.switches);
         assert_eq!(page.kpis.switches_only_when_full, lazy.switches);
-        assert_eq!(page.kpis.blocked_hours, early.eager_blocked_h);
+        let blocked_hours = wu_hours(eager.blocked_wu, inputs.rhythm.typical_hour())
+            .expect("the test rhythm has working hours");
+        assert_eq!(page.kpis.blocked_hours, blocked_hours);
     }
 }

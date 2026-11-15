@@ -49,10 +49,6 @@ use std::thread;
 use chrono::{DateTime, Local, Utc};
 
 #[cfg(feature = "gui")]
-use seatswap_core::burn::decide::Regime;
-#[cfg(feature = "gui")]
-use seatswap_core::burn::plan::Inputs;
-#[cfg(feature = "gui")]
 use seatswap_core::history::By;
 #[cfg(feature = "gui")]
 use seatswap_core::paths::AppPaths;
@@ -67,6 +63,8 @@ use notify::Notification;
 #[cfg(feature = "gui")]
 use tauri::{AppHandle, Emitter, Manager};
 
+#[cfg(feature = "gui")]
+use burn_rt::KeptForecast;
 #[cfg(feature = "gui")]
 use lookup_rt::{LookupClient, LookupHandle};
 #[cfg(feature = "gui")]
@@ -96,9 +94,10 @@ pub(crate) struct GuiState {
     /// The history folder the recorder opened at startup, or why it could not
     /// be opened. A changed setting takes effect after a restart.
     pub(crate) history: Result<seatswap_core::history::HistoryDir, String>,
-    /// The plan inputs and regime of the last snapshot's auto-burn decision;
-    /// the Forecast page reads them. `None` until a situation exists.
-    pub(crate) forecast: Arc<Mutex<Option<(Inputs, Regime)>>>,
+    /// The plan inputs, regime and oldest reading of the last snapshot's
+    /// auto-burn decision; the Forecast page reads them. `None` until a
+    /// situation exists.
+    pub(crate) forecast: Arc<Mutex<Option<KeptForecast>>>,
     /// The latest sessions summary; every snapshot is emitted with it.
     sessions: Mutex<Option<SessionsSummary>>,
     /// The sessions thread's commands; `None` while `readSessions` is off.

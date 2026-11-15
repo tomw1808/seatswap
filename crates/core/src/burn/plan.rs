@@ -218,6 +218,18 @@ pub fn rates_known(account: &AccountState) -> bool {
     }
 }
 
+/// The weekly percent the plan plays an account from at `at`: 0 when the
+/// account's weekly reset is at or before `at`, because that week is over; else
+/// the reading's percent. This is the one copy of the rule [`View::of`] and the
+/// Forecast page use.
+pub(crate) fn week_percent_at(account: &AccountState, at: DateTime<Utc>) -> f64 {
+    if account.week_resets_at <= at {
+        0.0
+    } else {
+        account.week_percent
+    }
+}
+
 /// The work units this account can still take before its weekly reset, minus
 /// the work units needed to empty it (spec §2.3). The walk runs in [`STEP_MIN`]
 /// steps from [`Inputs::now`]; a capped account takes at most
@@ -531,11 +543,7 @@ impl<'a> View<'a> {
         };
         View {
             account,
-            week: if account.week_resets_at <= at {
-                0.0
-            } else {
-                account.week_percent
-            },
+            week: week_percent_at(account, at),
             session,
             window_end,
             reset: next_reset(account.week_resets_at, at),
