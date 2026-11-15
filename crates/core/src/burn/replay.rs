@@ -102,6 +102,7 @@ pub fn replay(
             session,
             model_blocked: false,
             rates: rates.get(account).copied(),
+            thinking_held: 0,
         });
         refs.insert(id, account.clone());
     }

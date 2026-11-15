@@ -18,7 +18,7 @@ use crate::store::{Account, LoginState};
 use super::cost::switch_cost;
 use super::decide::{decide, regime, Decision, Regime, Situation};
 use super::plan::{blocked, follow, AccountState, Inputs, Plan, PlanError, Policy, SessionState};
-use super::rates::{rates, rhythm};
+use super::rates::{rates, rhythm, Timeline};
 use super::{Rates, Rhythm, MANUAL_HOLD_H, RATES_DAYS, RHYTHM_WEEKS};
 
 /// Everything a decision is built from, read once: the rhythm, the accounts'
@@ -117,6 +117,29 @@ pub fn learn(
     })
 }
 
+/// The answers with thinking the running sessions hold, per account that
+/// produced them (spec §2.12): each minute's count goes to the account that was
+/// live on `host` at the minute's start ([`Timeline::of`]). A minute without a
+/// known live account is left out; the map has no entry for an account without
+/// thinking.
+pub fn thinking_held(
+    thinking: &[(DateTime<Utc>, u32)],
+    events: &[Hosted<Event>],
+    host: &str,
+) -> BTreeMap<AccountRef, u32> {
+    let timeline = Timeline::of(events, host);
+    let mut held: BTreeMap<AccountRef, u32> = BTreeMap::new();
+    for (minute, count) in thinking {
+        let Some(account) = timeline.at(*minute) else {
+            continue;
+        };
+        held.entry(account.clone())
+            .and_modify(|sum| *sum = sum.saturating_add(*count))
+            .or_insert(*count);
+    }
+    held
+}
+
 /// Turn the views into [`Inputs`], check them, and derive the two hold times
 /// from the learned events (spec §2.5, §2.12).
 ///
@@ -125,6 +148,10 @@ pub fn learn(
 /// no reading makes the whole situation [`Readiness::Unread`]; a logged-out
 /// account without a reading is left out. When no account at all can go into
 /// the inputs, the situation is [`Readiness::NoAccounts`].
+///
+/// `thinking` is every running tied session's answers with thinking since its
+/// user turn; each account's [`AccountState::thinking_held`] is what it produced
+/// of them, 0 when it produced none.
 #[allow(clippy::too_many_arguments)]
 pub fn situation(
     learned: &Learned,
@@ -134,10 +161,12 @@ pub fn situation(
     now: DateTime<Utc>,
     offset: FixedOffset,
     tied_busy: u32,
+    thinking: &[(DateTime<Utc>, u32)],
 ) -> Result<Readiness, PlanError> {
     let mut unread = Vec::new();
     let mut states = Vec::new();
     let mut oldest_reading: Option<DateTime<Utc>> = None;
+    let held = thinking_held(thinking, &learned.events, &learned.host);
 
     for account in accounts {
         let view = views.iter().find(|view| view.id == account.id);
@@ -154,6 +183,7 @@ pub fn situation(
                     session,
                     model_blocked: view.is_some_and(model_blocked),
                     rates: learned.rates.get(&AccountRef::of(account)).copied(),
+                    thinking_held: held.get(&AccountRef::of(account)).copied().unwrap_or(0),
                 });
                 if login_ok && (account.auto_burn || active == Some(account.id.as_str())) {
                     oldest_reading = Some(match oldest_reading {
@@ -374,6 +404,7 @@ mod tests {
     const ORG: &str = "e92d7b31-5c8e-4f2a-9d6b-1e3c5a7f9b20";
     const PR_ACC: &str = "4b7e2f91-3c5a-4d8e-9f1b-6a2c8e4d7b30";
     const AC_ACC: &str = "8e1d5b7a-6c3f-4a2b-9d8e-1f2a3b4c5d6e";
+    const LB_ACC: &str = "1c4a8e2f-7b3d-4a6c-8e0f-2b4d6a8c0e1f";
     const RESET: &str = "2026-11-16T02:00:00Z";
 
     fn utc(text: &str) -> DateTime<Utc> {
@@ -509,13 +540,123 @@ mod tests {
         active: Option<&str>,
         now: DateTime<Utc>,
     ) -> Situation {
-        match situation(learned, views, accounts, active, now, offset(), 0)
+        match situation(learned, views, accounts, active, now, offset(), 0, &[])
             .expect("the views are valid")
         {
             Readiness::Ready(situation) => situation,
             Readiness::Unread { accounts } => panic!("unread accounts: {accounts:?}"),
             Readiness::NoAccounts => panic!("no account can go into the inputs"),
         }
+    }
+
+    #[test]
+    fn thinking_goes_to_the_account_live_in_its_minute() {
+        let lb = account("lb", "LB", LB_ACC, true);
+        let ac = account("ac", "AC", AC_ACC, true);
+        let events = vec![
+            switch_event(
+                "atlas",
+                utc("2026-11-10T09:00:00Z"),
+                AccountRef::of(&lb),
+                By::Auto,
+            ),
+            switch_event(
+                "atlas",
+                utc("2026-11-10T10:03:40Z"),
+                AccountRef::of(&ac),
+                By::Auto,
+            ),
+        ];
+        let thinking = vec![
+            (utc("2026-11-10T09:50:00Z"), 4),
+            (utc("2026-11-10T10:03:00Z"), 2),
+            (utc("2026-11-10T10:04:00Z"), 3),
+        ];
+
+        let held = thinking_held(&thinking, &events, "atlas");
+
+        assert_eq!(held.get(&AccountRef::of(&lb)), Some(&6));
+        assert_eq!(held.get(&AccountRef::of(&ac)), Some(&3));
+    }
+
+    #[test]
+    fn thinking_without_a_known_account_is_left_out() {
+        let lb = account("lb", "LB", LB_ACC, true);
+        let events = vec![switch_event(
+            "atlas",
+            utc("2026-11-10T09:00:00Z"),
+            AccountRef::of(&lb),
+            By::Auto,
+        )];
+
+        // 08:00 lies before the first event of the host.
+        let before = thinking_held(&[(utc("2026-11-10T08:00:00Z"), 4)], &events, "atlas");
+        assert!(before.is_empty(), "{before:?}");
+
+        // The same switches, but reported by another host.
+        let thinking = vec![(utc("2026-11-10T09:50:00Z"), 4)];
+        let other_host = thinking_held(&thinking, &events, "vega");
+        assert!(other_host.is_empty(), "{other_host:?}");
+    }
+
+    #[test]
+    fn situation_fills_thinking_held() {
+        let now = utc("2026-11-10T12:00:00Z");
+        let pr = account("pr", "PR", PR_ACC, true);
+        let lb = account("lb", "LB", LB_ACC, true);
+        let ac = account("ac", "AC", AC_ACC, true);
+        let events = vec![
+            switch_event(
+                "atlas",
+                utc("2026-11-10T09:00:00Z"),
+                AccountRef::of(&lb),
+                By::Auto,
+            ),
+            switch_event(
+                "atlas",
+                utc("2026-11-10T10:03:40Z"),
+                AccountRef::of(&ac),
+                By::Auto,
+            ),
+        ];
+        let learned = learned("atlas", events);
+        let views = vec![
+            view("pr", "PR", 10.0, None, now - Duration::minutes(1)),
+            view("lb", "LB", 10.0, None, now - Duration::minutes(1)),
+            view("ac", "AC", 10.0, None, now - Duration::minutes(1)),
+        ];
+        let thinking = vec![
+            (utc("2026-11-10T09:50:00Z"), 4),
+            (utc("2026-11-10T10:03:00Z"), 2),
+            (utc("2026-11-10T10:04:00Z"), 3),
+        ];
+
+        let readiness = situation(
+            &learned,
+            &views,
+            &[pr, lb, ac],
+            Some("pr"),
+            now,
+            offset(),
+            0,
+            &thinking,
+        )
+        .expect("the views are valid");
+        let Readiness::Ready(situation) = readiness else {
+            panic!("the accounts have readings");
+        };
+        let held = |id: &str| {
+            situation
+                .inputs
+                .accounts
+                .iter()
+                .find(|state| state.id == id)
+                .map(|state| state.thinking_held)
+                .expect("the account is in the inputs")
+        };
+        assert_eq!(held("lb"), 6);
+        assert_eq!(held("ac"), 3);
+        assert_eq!(held("pr"), 0);
     }
 
     #[test]
@@ -671,8 +812,17 @@ mod tests {
             view("pr", "PR", 10.0, None, now - Duration::minutes(1)),
             no_reading,
         ];
-        let readiness = situation(&learned, &views, &[pr, ac], Some("pr"), now, offset(), 0)
-            .expect("the accounts are valid");
+        let readiness = situation(
+            &learned,
+            &views,
+            &[pr, ac],
+            Some("pr"),
+            now,
+            offset(),
+            0,
+            &[],
+        )
+        .expect("the accounts are valid");
         match readiness {
             Readiness::Unread { accounts } => assert_eq!(accounts, vec!["ac".to_string()]),
             Readiness::Ready(_) => panic!("AC has no reading"),
@@ -783,8 +933,17 @@ mod tests {
         no_ac.usage = None;
         no_ac.fetched_at = None;
         let learned = learned("atlas", Vec::new());
-        let readiness = situation(&learned, &[no_pr, no_ac], &[pr, ac], None, now, offset(), 0)
-            .expect("the accounts are valid");
+        let readiness = situation(
+            &learned,
+            &[no_pr, no_ac],
+            &[pr, ac],
+            None,
+            now,
+            offset(),
+            0,
+            &[],
+        )
+        .expect("the accounts are valid");
         match readiness {
             Readiness::NoAccounts => {}
             Readiness::Ready(_) => panic!("no account can go into the inputs"),

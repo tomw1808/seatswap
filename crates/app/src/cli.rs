@@ -1527,7 +1527,7 @@ fn burn_status(
         }
     };
     let active = active.filter(|id| accounts.iter().any(|account| account.id == *id));
-    let readiness = match live::situation(&learned, views, accounts, active, now, offset, 0) {
+    let readiness = match live::situation(&learned, views, accounts, active, now, offset, 0, &[]) {
         Ok(readiness) => readiness,
         Err(error) => {
             status.error = Some(error.to_string());
@@ -1635,7 +1635,7 @@ fn burn_plan(context: Context, json: bool) -> Result<String, CliError> {
         context.settings.read_sessions,
     )
     .map_err(|error| CliError::Message(format!("cannot read the history: {error}")))?;
-    let readiness = live::situation(&learned, &views, &accounts, active, now, offset, 0)
+    let readiness = live::situation(&learned, &views, &accounts, active, now, offset, 0, &[])
         .map_err(|error| CliError::Message(error.to_string()))?;
     let situation = match readiness {
         Readiness::Ready(situation) => situation,

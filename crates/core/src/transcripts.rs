@@ -143,7 +143,11 @@ pub struct SessionSeen {
     pub last: DateTime<Utc>,
     pub last_model: Option<String>,
     pub last_user_turn: Option<DateTime<Utc>>,
-    pub thinking_since_user: u32,
+    /// The answers with thinking since the last user turn: per minute (its
+    /// start in UTC) and oldest first. A user turn empties the list, so every
+    /// reader of [`Self::thinking_since_user`] sees the current task's count.
+    #[serde(default)]
+    pub thinking: Vec<(DateTime<Utc>, u32)>,
     /// The tokens of the session's answers and of its agents'. A state file
     /// written before this field loads with zero: the sums then start at the
     /// answers read from that point on, and the old transcripts are not read
@@ -168,6 +172,16 @@ pub struct SessionSeen {
     /// write the same record again. Absent in an old state file means none.
     #[serde(default)]
     pub recorded: Option<RecordedSession>,
+}
+
+impl SessionSeen {
+    /// The answers with thinking since the session's last user turn: the sum of
+    /// [`Self::thinking`], the one count every reader uses.
+    pub fn thinking_since_user(&self) -> u32 {
+        self.thinking
+            .iter()
+            .fold(0u32, |sum, (_, count)| sum.saturating_add(*count))
+    }
 }
 
 /// What one agent of a session did.
@@ -1222,7 +1236,7 @@ impl ScanRun<'_> {
                 last: at,
                 last_model: model.map(str::to_string),
                 last_user_turn: None,
-                thinking_since_user: 0,
+                thinking: Vec::new(),
                 totals: Tokens::default(),
                 by_model: BTreeMap::new(),
                 agents: BTreeMap::new(),
@@ -1257,13 +1271,26 @@ impl ScanRun<'_> {
         for event in events {
             match event {
                 Event::Answer(index) => {
-                    if answers.get(index).is_some_and(|answer| answer.thinking) {
-                        seen.thinking_since_user = seen.thinking_since_user.saturating_add(1);
+                    let Some(answer) = answers.get(index) else {
+                        continue;
+                    };
+                    if !answer.thinking {
+                        continue;
+                    }
+                    let minute = minute_start(answer.at);
+                    match seen
+                        .thinking
+                        .binary_search_by_key(&minute, |(start, _)| *start)
+                    {
+                        Ok(found) => {
+                            seen.thinking[found].1 = seen.thinking[found].1.saturating_add(1)
+                        }
+                        Err(found) => seen.thinking.insert(found, (minute, 1)),
                     }
                 }
                 Event::User(at) => {
                     seen.last_user_turn = Some(seen.last_user_turn.map_or(at, |last| last.max(at)));
-                    seen.thinking_since_user = 0;
+                    seen.thinking.clear();
                 }
             }
         }
@@ -2185,13 +2212,77 @@ mod tests {
 
         assert_eq!(scan.user_turns.len(), 2, "{:?}", scan.user_turns);
         let seen = &state.sessions[SESSION];
-        assert_eq!(seen.thinking_since_user, 1);
+        assert_eq!(seen.thinking_since_user(), 1);
         assert_eq!(seen.last_user_turn, Some(at("2026-11-12T09:42:00.000Z")));
         assert_eq!(seen.folder, FOLDER);
         assert_eq!(seen.cwd, ENGINE);
         assert_eq!(seen.last_model.as_deref(), Some(OPUS));
         assert_eq!(seen.first, at("2026-11-12T09:40:58.101Z"));
         assert_eq!(seen.last, at("2026-11-12T09:42:30.000Z"));
+    }
+
+    #[test]
+    fn thinking_is_kept_per_minute() {
+        let (_tmp, claude, _app) = fixture();
+        let dir = folder(&claude, FOLDER);
+        write_lines(
+            &dir,
+            &format!("{SESSION}.jsonl"),
+            &[
+                user_string("fix the failing tests", "2026-11-12T09:40:57.000Z"),
+                assistant_line(
+                    "msg_a",
+                    "2026-11-12T09:41:07.412Z",
+                    ENGINE,
+                    OPUS,
+                    &["thinking"],
+                    USAGE,
+                ),
+                assistant_line(
+                    "msg_b",
+                    "2026-11-12T09:41:40.000Z",
+                    ENGINE,
+                    OPUS,
+                    &["thinking"],
+                    USAGE,
+                ),
+                assistant_line(
+                    "msg_c",
+                    "2026-11-12T09:42:00.000Z",
+                    ENGINE,
+                    OPUS,
+                    &["text"],
+                    USAGE,
+                ),
+                assistant_line(
+                    "msg_d",
+                    "2026-11-12T09:43:02.000Z",
+                    ENGINE,
+                    OPUS,
+                    &["thinking"],
+                    USAGE,
+                ),
+            ],
+        );
+
+        let (mut state, _scan) = scan_run(&claude);
+        let seen = &state.sessions[SESSION];
+        assert_eq!(
+            seen.thinking,
+            vec![
+                (at("2026-11-12T09:41:00.000Z"), 2),
+                (at("2026-11-12T09:43:00.000Z"), 1),
+            ]
+        );
+        assert_eq!(seen.thinking_since_user(), 3);
+
+        append(
+            &dir.join(format!("{SESSION}.jsonl")),
+            &user_string("and the linter", "2026-11-12T09:44:00.000Z"),
+        );
+        scan_commit(&claude, &mut state, BUDGET);
+        assert!(state.sessions[SESSION].thinking.is_empty());
+        assert_eq!(state.sessions[SESSION].thinking_since_user(), 0);
     }
 
     #[test]
@@ -2361,7 +2452,10 @@ mod tests {
         assert!(seen["folder"].is_string());
         assert!(seen["lastModel"].is_string());
         assert!(seen["lastUserTurn"].is_null());
-        assert_eq!(seen["thinkingSinceUser"], 1);
+        assert_eq!(
+            seen["thinking"],
+            serde_json::json!([["2026-11-12T09:41:00Z", 1]])
+        );
 
         append(
             &atlas_path,
@@ -3399,6 +3493,34 @@ mod tests {
         assert!(seen.agents.is_empty());
         assert!(seen.spawns.is_empty());
         assert!(seen.recent.is_empty());
+    }
+
+    #[test]
+    fn a_state_file_without_thinking_holds_none() {
+        let (_tmp, _claude, app) = fixture();
+        let dir = app.transcripts_state_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let saved = serde_json::json!({
+            "version": 1,
+            "files": {},
+            "sessions": {
+                SESSION: {
+                    "folder": FOLDER,
+                    "cwd": ENGINE,
+                    "first": "2026-11-12T09:41:07.412Z",
+                    "last": "2026-11-12T09:41:07.412Z",
+                    "lastModel": OPUS,
+                    "lastUserTurn": null
+                }
+            }
+        });
+        fs::write(dir.join(format!("{FOLDER}.json")), saved.to_string()).unwrap();
+
+        let state = ScanState::load(&app).unwrap();
+
+        let seen = &state.sessions[SESSION];
+        assert!(seen.thinking.is_empty());
+        assert_eq!(seen.thinking_since_user(), 0);
     }
 
     #[test]

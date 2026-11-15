@@ -270,11 +270,13 @@ pub(crate) enum EngineCommand {
     /// The status line wrote `feed.json`; read it and merge it into the cache.
     Feed,
     /// The sessions thread saw these models in use (lower-case ids), or `None`
-    /// when it cannot tell, and how many sessions are on a model whose thinking
-    /// is tied to the account (spec §2.11).
+    /// when it cannot tell, how many sessions are on a model whose thinking is
+    /// tied to the account, and those sessions' answers with thinking minute by
+    /// minute (spec §2.11, §2.12).
     ModelsInUse {
         models: Option<BTreeSet<String>>,
         tied_busy: u32,
+        thinking: Vec<(DateTime<Utc>, u32)>,
     },
     /// A pause or resume was written to the history; learn it before deciding.
     HistoryChanged,
@@ -616,6 +618,9 @@ struct EngineRuntime {
     /// when the sessions thread cannot tell (with `readSessions` off): nothing
     /// is held back then (spec §2.12).
     tied_busy: u32,
+    /// The running tied sessions' answers with thinking, minute by minute. It is
+    /// emptied together with `tied_busy`.
+    thinking: Vec<(DateTime<Utc>, u32)>,
 }
 
 /// The wall and monotonic clocks at one moment. Wake detection compares two of
@@ -659,6 +664,7 @@ impl EngineRuntime {
             baseline: ClockBaseline::now(),
             burn: BurnRuntime::new(action, engine),
             tied_busy: 0,
+            thinking: Vec::new(),
         };
         runtime.open();
         // Show the real settings even when the engine could not open.
@@ -701,9 +707,16 @@ impl EngineRuntime {
                         EngineCommand::Publish => self.publish(),
                         EngineCommand::Feed => self.apply_feed(),
                         EngineCommand::ModelsInUse {
-                            models, tied_busy, ..
+                            models,
+                            tied_busy,
+                            thinking,
                         } => {
                             self.tied_busy = if models.is_some() { tied_busy } else { 0 };
+                            self.thinking = if models.is_some() {
+                                thinking
+                            } else {
+                                Vec::new()
+                            };
                             let now = Utc::now();
                             let views = match self.engine.as_mut() {
                                 Some(engine) => {
@@ -984,6 +997,7 @@ impl EngineRuntime {
             now,
             offset: *Local::now().offset(),
             tied_busy: self.tied_busy,
+            thinking: &self.thinking,
         };
         let report = self.burn.after_snapshot(&tick);
         self.snapshot.burn = report.view;
@@ -2888,6 +2902,7 @@ mod tests {
             baseline: ClockBaseline::now(),
             burn: BurnRuntime::new(action, engine_commands),
             tied_busy: 0,
+            thinking: Vec::new(),
         };
 
         runtime.write_live_once();
@@ -2944,6 +2959,7 @@ mod tests {
             baseline: ClockBaseline::now(),
             burn: BurnRuntime::new(action, engine_commands),
             tied_busy: 0,
+            thinking: Vec::new(),
         };
 
         runtime.heartbeat(Utc::now());

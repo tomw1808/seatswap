@@ -70,6 +70,9 @@ pub(crate) struct PassOutcome {
     pub summary: SessionsSummary,
     pub models: Option<BTreeSet<String>>,
     pub tied_busy: u32,
+    /// The running tied sessions' answers with thinking, each session's list one
+    /// after the other.
+    pub thinking: Vec<(DateTime<Utc>, u32)>,
     pub wake_soon: bool,
 }
 
@@ -725,6 +728,7 @@ fn run(
             .send(EngineCommand::ModelsInUse {
                 models: outcome.models,
                 tied_busy: outcome.tied_busy,
+                thinking: outcome.thinking,
             })
             .is_err()
         {
@@ -917,6 +921,7 @@ pub(crate) fn run_pass(
                 summary,
                 models: None,
                 tied_busy: 0,
+                thinking: Vec::new(),
                 wake_soon: false,
             };
         }
@@ -934,6 +939,7 @@ pub(crate) fn run_pass(
                 summary,
                 models: None,
                 tied_busy: 0,
+                thinking: Vec::new(),
                 wake_soon: false,
             };
         }
@@ -1341,7 +1347,7 @@ pub(crate) fn run_pass(
             state
                 .sessions
                 .get(&session.session_id)
-                .map(|seen| (session.session_id.clone(), seen.thinking_since_user))
+                .map(|seen| (session.session_id.clone(), seen.thinking_since_user()))
         })
         .collect();
     refresh_closed_rows(app, recorder, memory, now, closed_now, &mut summary);
@@ -1354,11 +1360,12 @@ pub(crate) fn run_pass(
     publish_view(memory, now);
 
     let models = models_in_use(&running.sessions, state);
-    let (_, tied_busy) = tied_sessions(&running.sessions, state);
+    let (_, tied_busy, thinking) = tied_sessions(&running.sessions, state);
     PassOutcome {
         summary,
         models,
         tied_busy,
+        thinking,
         wake_soon: !scan_complete,
     }
 }
@@ -1457,6 +1464,7 @@ fn pass_without_running(
         summary,
         models: None,
         tied_busy: 0,
+        thinking: Vec::new(),
         wake_soon: false,
     }
 }
@@ -1824,10 +1832,15 @@ fn models_in_use(running: &[SessionFile], state: &ScanState) -> Option<BTreeSet<
 }
 
 /// The sessions whose model ties its thinking to the account, and of those the
-/// ones busy now (spec §2.11).
-fn tied_sessions(running: &[SessionFile], state: &ScanState) -> (u32, u32) {
+/// ones busy now (spec §2.11), and every tied session's answers with thinking
+/// since its user turn, one session's list after the other (spec §2.12).
+fn tied_sessions(
+    running: &[SessionFile],
+    state: &ScanState,
+) -> (u32, u32, Vec<(DateTime<Utc>, u32)>) {
     let mut tied = 0u32;
     let mut busy = 0u32;
+    let mut thinking = Vec::new();
     for session in running {
         let Some(seen) = state.sessions.get(&session.session_id) else {
             continue;
@@ -1840,11 +1853,12 @@ fn tied_sessions(running: &[SessionFile], state: &ScanState) -> (u32, u32) {
             continue;
         }
         tied += 1;
-        if session.status == SessionStatus::Busy && seen.thinking_since_user > 0 {
+        thinking.extend(seen.thinking.iter().copied());
+        if session.status == SessionStatus::Busy && seen.thinking_since_user() > 0 {
             busy += 1;
         }
     }
-    (tied, busy)
+    (tied, busy, thinking)
 }
 
 /// Write this host's report when the rows changed and the last one is at least
@@ -2241,7 +2255,7 @@ mod tests {
                 last: first,
                 last_model: Some("claude-opus-5-5".to_string()),
                 last_user_turn: None,
-                thinking_since_user: 0,
+                thinking: Vec::new(),
                 totals: Default::default(),
                 by_model: Default::default(),
                 agents: Default::default(),
@@ -2402,7 +2416,7 @@ mod tests {
                 last: first,
                 last_model: Some("claude-opus-5-5".to_string()),
                 last_user_turn: None,
-                thinking_since_user: 0,
+                thinking: Vec::new(),
                 totals: Default::default(),
                 by_model: Default::default(),
                 agents: Default::default(),
@@ -3040,7 +3054,7 @@ mod tests {
                 last: at,
                 last_model: Some("claude-opus-5-5".to_string()),
                 last_user_turn: None,
-                thinking_since_user: 0,
+                thinking: Vec::new(),
                 totals: Default::default(),
                 by_model: Default::default(),
                 agents: Default::default(),
@@ -3065,6 +3079,92 @@ mod tests {
             Some(BTreeSet::from(["claude-opus-5-5".to_string()])),
             "the session without an answer adds nothing and does not clear the set"
         );
+    }
+
+    #[test]
+    fn the_pass_hands_over_the_thinking_of_tied_sessions_only() {
+        const OTHER: &str = "2b7d9c1e-5a4f-4c3b-9e8d-7f6a5b4c3d2e";
+        let (_tmp, claude, app) = fixture();
+        let at = time("2026-11-14T10:00:00Z");
+        write_session(
+            &claude,
+            800,
+            &session_json(
+                800,
+                SESSION,
+                "/home/sam/projects/atlas",
+                None,
+                "busy",
+                at.timestamp_millis(),
+            ),
+        );
+        write_session(
+            &claude,
+            801,
+            &session_json(
+                801,
+                OTHER,
+                "/home/sam/projects/ledger",
+                None,
+                "idle",
+                at.timestamp_millis(),
+            ),
+        );
+        let thinking = vec![
+            (time("2026-11-14T09:58:00Z"), 2),
+            (time("2026-11-14T09:59:00Z"), 1),
+        ];
+        let mut state = ScanState::default();
+        state.sessions.insert(
+            SESSION.to_string(),
+            SessionSeen {
+                folder: "-home-sam-projects-atlas".to_string(),
+                cwd: "/home/sam/projects/atlas".to_string(),
+                first: at,
+                last: at,
+                last_model: Some("claude-fable-5-2".to_string()),
+                last_user_turn: None,
+                thinking: thinking.clone(),
+                totals: Default::default(),
+                by_model: Default::default(),
+                agents: Default::default(),
+                spawns: Default::default(),
+                recent: Default::default(),
+                recorded: None,
+            },
+        );
+        state.sessions.insert(
+            OTHER.to_string(),
+            SessionSeen {
+                folder: "-home-sam-projects-ledger".to_string(),
+                cwd: "/home/sam/projects/ledger".to_string(),
+                first: at,
+                last: at,
+                last_model: Some("claude-opus-5-5".to_string()),
+                last_user_turn: None,
+                thinking: vec![(time("2026-11-14T09:57:00Z"), 3)],
+                totals: Default::default(),
+                by_model: Default::default(),
+                agents: Default::default(),
+                spawns: Default::default(),
+                recent: Default::default(),
+                recorded: None,
+            },
+        );
+        let mut memory = SessionMemory::new(claude.home().to_path_buf());
+
+        let outcome = run_pass(
+            &app,
+            &claude,
+            &probe(&[800, 801]),
+            None,
+            &mut state,
+            &mut memory,
+            at,
+            None,
+        );
+
+        assert_eq!(outcome.thinking, thinking);
     }
 
     /// A closed session that answers again gets one new closed record; an
@@ -3370,7 +3470,7 @@ mod tests {
                 last: first,
                 last_model: Some("claude-opus-5-5".to_string()),
                 last_user_turn: None,
-                thinking_since_user: 0,
+                thinking: Vec::new(),
                 totals: Default::default(),
                 by_model: Default::default(),
                 agents: Default::default(),

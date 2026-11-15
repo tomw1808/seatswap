@@ -819,7 +819,10 @@ pub struct FileState { pub offset: u64, pub grew: DateTime<Utc>, pub recent: Vec
     pub last_answer: Option<DateTime<Utc>> }
 pub struct SessionSeen { pub folder: String, pub cwd: String, pub first: DateTime<Utc>,
     pub last: DateTime<Utc>, pub last_model: Option<String>, pub last_user_turn: Option<DateTime<Utc>>,
-    pub thinking_since_user: u32, pub recorded: Option<RecordedSession> }
+    pub thinking: Vec<(DateTime<Utc>, u32)>, pub recorded: Option<RecordedSession> }
+impl SessionSeen { pub fn thinking_since_user(&self) -> u32; }  // the sum of `thinking`
+// `thinking` is the answers with thinking since the last user turn: one entry per minute (its start
+// in UTC) and oldest first. A user turn empties it; every reader of the old number calls the sum.
 pub struct RecordedSession { pub last: DateTime<Utc>, pub closed: bool }
 // `recorded` is the last session record written from this session: the answer time it covers and
 // whether it was the closing one. It keeps a restart from writing the same record again; absent in
@@ -1031,6 +1034,7 @@ parts of their transcripts, writes token and session lines to the history, then 
 
 ```rust
 pub(crate) struct PassOutcome { pub summary: SessionsSummary, pub models: Option<BTreeSet<String>>,
+                                pub tied_busy: u32, pub thinking: Vec<(DateTime<Utc>, u32)>,
                                 pub wake_soon: bool }
 pub(crate) struct SessionMemory { /* home, project per cwd, waits, last session record, closed */ }
 impl SessionMemory { pub(crate) fn new(home: PathBuf) -> SessionMemory; }
@@ -1088,7 +1092,8 @@ pub(crate) struct Waiting { pub session: String, pub label: String, pub project:
     pub since: DateTime<Utc>, pub host: Option<String> /* None = this host */ }
 pub(crate) struct Snapshot { … pub burn: Option<BurnView>, pub sessions: Option<SessionsSummary> /* None = readSessions off */ … }
 pub(crate) enum EngineCommand { Poll(PollReason), Publish,
-    ModelsInUse { models: Option<BTreeSet<String>>, tied_busy: u32 }, Feed, HistoryChanged, Shutdown }
+    ModelsInUse { models: Option<BTreeSet<String>>, tied_busy: u32,
+                  thinking: Vec<(DateTime<Utc>, u32)> }, Feed, HistoryChanged, Shutdown }
 pub(crate) enum UiEvent { Snapshot(Snapshot), Sessions(SessionsSummary) }
 
 /// The timer poll as a fixed deadline: a command never moves it; `advance` jumps over `now`.
@@ -1299,7 +1304,7 @@ earlier sample is at 100 % is left out; a rate at or below 0 is unknown (`None`)
 #[derive(Debug, Clone, PartialEq)] pub struct SessionState { pub percent: f64, pub resets_at: Option<DateTime<Utc>> }
 #[derive(Clone)] pub struct AccountState { pub id: String, pub may_use: bool, pub login_ok: bool,
     pub week_percent: f64, pub week_resets_at: DateTime<Utc>, pub session: Option<SessionState>,
-    pub model_blocked: bool, pub rates: Option<Rates> }
+    pub model_blocked: bool, pub rates: Option<Rates>, pub thinking_held: u32 }
 #[derive(Clone)] pub struct Inputs { pub now: DateTime<Utc>, pub offset: FixedOffset,
     pub accounts: Vec<AccountState>, pub active: Option<String>, pub rhythm: Rhythm }
 impl Inputs { pub fn check(&self) -> Result<(), PlanError>; }
@@ -1329,7 +1334,10 @@ least `SLACK_MARGIN_H` × the typical hour below the current one's and the last 
 and never causes an eager move. An active account with `may_use` false stays until it is blocked.
 `choose` is the usable account with the least slack, ties by the earlier weekly reset and then id;
 when any usable account has no rates it uses the fixed order instead (capped accounts with an open
-window first, then the rest, each by earlier reset and id).
+window first, then the rest, each by earlier reset and id). When every usable account has a slack,
+the candidates are the accounts within `SLACK_MARGIN_H` × the typical hour of the least slack; among
+them the highest `thinking_held` wins, and equal counts (including all 0) fall back to the slack,
+reset and id order. So with no thinking held `choose` names exactly the least-slack account as before.
 
 ## burn/decide.rs — the regime and the decision (step B)
 
@@ -1422,7 +1430,12 @@ pub fn learn(history: &HistoryDir, now: DateTime<Utc>, offset: FixedOffset,
              accounts: &[Account], read_sessions: bool) -> Result<Learned, HistoryError>;
 pub fn situation(learned: &Learned, views: &[AccountView], accounts: &[Account],
                  active: Option<&str>, now: DateTime<Utc>, offset: FixedOffset,
-                 tied_busy: u32) -> Result<Readiness, PlanError>;
+                 tied_busy: u32, thinking: &[(DateTime<Utc>, u32)])
+    -> Result<Readiness, PlanError>;
+/// `thinking` is the running tied sessions' answers with thinking, minute by minute; every
+/// `AccountState.thinking_held` is what the account produced of them (`thinking_held`).
+pub fn thinking_held(thinking: &[(DateTime<Utc>, u32)], events: &[Hosted<Event>], host: &str)
+    -> BTreeMap<AccountRef, u32>;
 pub fn next_account(situation: &Situation, decision: &Decision, plan: &Plan) -> Option<String>;
 pub struct Assessment { pub situation: Situation, pub regime: Regime, pub decision: Decision,
                         pub plan: Plan, pub next: Option<String> }
@@ -1555,7 +1568,7 @@ pub(crate) struct BurnView { pub on: bool, pub paused_until: Option<DateTime<Utc
 pub(crate) struct BurnTick<'a> { pub app: &'a AppPaths, pub history: Option<&'a HistoryDir>,
     pub views: &'a [AccountView], pub accounts: &'a [Account], pub settings: &'a Settings,
     pub active: Option<&'a str>, pub now: DateTime<Utc>, pub offset: FixedOffset,
-    pub tied_busy: u32 }
+    pub tied_busy: u32, pub thinking: &'a [(DateTime<Utc>, u32)] }
 #[derive(Debug, Default)] pub(crate) struct BurnReport { pub view: Option<BurnView>,
     pub error: Option<String>, pub warnings: Vec<String>, pub notification: Option<String> }
 pub(crate) struct BurnRuntime { /* learned, last learn/regime, last sent switch, view */ }
@@ -1593,8 +1606,9 @@ backend, takes no lock and writes no history. The other additions:
 - `seatswap status --json` reads the history once through `live::learn` and `live::situation` and
   assembles through `live::assess`; a history or planner error becomes `burnError`, never a failed
   command. The plain, waybar and i3blocks forms do not read the history.
-- `seatswap burn plan [--json]` uses the same read and `live::assess` with `tied_busy = 0` (the CLI
-  has no session count). Blocked hours come from `wu_hours` on the lazy and eager `blocked_wu`. An
+- `seatswap burn plan [--json]` uses the same read and `live::assess` with `tied_busy = 0` and no
+  thinking (the CLI has no session count and does not know the running sessions). Blocked hours come
+  from `wu_hours` on the lazy and eager `blocked_wu`. An
   account auto-burn may use (or the active one) with a login and no reading is an error
   `no reading for …`; no account at all is `no account has a login with a reading`.
 - `seatswap burn simulate --from D --to D [--without ABBR]…` maps the two local days to a range
@@ -2385,8 +2399,9 @@ When `readSessions` is off no thread runs, `GuiState.sessions_client` is `None`,
 takes effect after restarting seatswap, because the thread starts only with the app.
 
 After every pass `SessionMemory` keeps this host's `Rows`, each running session's
-`thinking_since_user`, the last `OtherHosts` read, the summary's `unavailable` text, the settings'
-currency, the last pass time and the history's host (`None` without a history). It keeps the
+`thinking_since_user()` (the sum of its minutes), the last `OtherHosts` read, the summary's
+`unavailable` text, the settings' currency, the last pass time and the history's host (`None`
+without a history). It keeps the
 subscription's options (`Option<SessionsOptions>`, `None` while nothing is subscribed) apart from a
 command's; `publish_view` always uses the subscription's. A `View` command is answered from those
 facts over `window::view_of`, without a pass, for the options it sends; another closed choice reads

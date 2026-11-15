@@ -103,6 +103,8 @@ pub(crate) struct BurnTick<'a> {
     pub now: DateTime<Utc>,
     pub offset: FixedOffset,
     pub tied_busy: u32,
+    /// The running tied sessions' answers with thinking, minute by minute.
+    pub thinking: &'a [(DateTime<Utc>, u32)],
 }
 
 /// What one tick produced. The worker adds `error` to the snapshot's error,
@@ -259,6 +261,7 @@ impl BurnRuntime {
             tick.now,
             tick.offset,
             tick.tied_busy,
+            tick.thinking,
         ) {
             Ok(readiness) => readiness,
             Err(error) => {
@@ -909,6 +912,7 @@ mod tests {
             } else {
                 Some(Rates { c: 2.0, s: None })
             },
+            thinking_held: 0,
         }
     }
 
@@ -1028,6 +1032,7 @@ mod tests {
             now,
             offset: offset(),
             tied_busy: 0,
+            thinking: &[],
         };
         let report = runtime.after_snapshot(&tick);
         assert!(report.view.is_some(), "the first snapshot has a view");
@@ -1285,6 +1290,7 @@ mod tests {
             now,
             offset: offset(),
             tied_busy: 0,
+            thinking: &[],
         };
         runtime.after_snapshot(&tick);
         match action.try_recv().expect("one switch") {
@@ -1326,6 +1332,7 @@ mod tests {
             now: at,
             offset: offset(),
             tied_busy: 0,
+            thinking: &[],
         };
         runtime.after_snapshot(&tick(now));
         assert!(matches!(
@@ -1376,6 +1383,7 @@ mod tests {
             now,
             offset: offset(),
             tied_busy: 0,
+            thinking: &[],
         };
         let first_report = runtime.after_snapshot(&first_tick);
         let burn_view = first_report.view.expect("unread keeps the strip");
@@ -1404,6 +1412,7 @@ mod tests {
             now: now + Duration::minutes(1),
             offset: offset(),
             tied_busy: 0,
+            thinking: &[],
         };
         let second_report = runtime.after_snapshot(&second_tick);
         assert!(second_report.view.is_some(), "the regime is computed now");
@@ -1447,6 +1456,7 @@ mod tests {
             now: at,
             offset: offset(),
             tied_busy: 0,
+            thinking: &[],
         };
         let first = runtime.after_snapshot(&tick(now));
         let error = first.error.expect("the learn error");
@@ -1495,6 +1505,7 @@ mod tests {
             now: at,
             offset: offset(),
             tied_busy: 0,
+            thinking: &[],
         };
         runtime.after_snapshot(&tick(now));
         let reply = match action.try_recv().expect("the first switch") {
@@ -1551,6 +1562,7 @@ mod tests {
             now: at,
             offset: offset(),
             tied_busy: 0,
+            thinking: &[],
         };
         runtime.after_snapshot(&tick(now));
         let reply = match action.try_recv().expect("the switch") {
@@ -1622,8 +1634,17 @@ mod tests {
             view("pr", "PR", 10.0, true, now - Duration::minutes(1)),
             view("ac", "AC", 10.0, false, now - Duration::minutes(1)),
         ];
-        let readiness = live::situation(&learned, &views, &accounts, Some("ac"), now, offset(), 0)
-            .expect("the views are valid");
+        let readiness = live::situation(
+            &learned,
+            &views,
+            &accounts,
+            Some("ac"),
+            now,
+            offset(),
+            0,
+            &[],
+        )
+        .expect("the views are valid");
         let Readiness::Ready(situation) = readiness else {
             panic!("every account has a reading");
         };
@@ -1761,6 +1782,7 @@ mod tests {
             now: at,
             offset: offset(),
             tied_busy: 0,
+            thinking: &[],
         };
 
         runtime.after_snapshot(&tick(now, "pr"));
@@ -1855,6 +1877,7 @@ mod tests {
             now,
             offset: offset(),
             tied_busy: 0,
+            thinking: &[],
         };
         runtime.after_snapshot(&tick);
         assert!(runtime.regime.is_none(), "a stale situation has no regime");
@@ -1894,6 +1917,7 @@ mod tests {
             now,
             offset: offset(),
             tied_busy: 0,
+            thinking: &[],
         };
         runtime.after_snapshot(&first);
         assert_eq!(runtime.regime_at, Some(now));
@@ -1909,6 +1933,7 @@ mod tests {
             now: now + Duration::minutes(1),
             offset: offset(),
             tied_busy: 0,
+            thinking: &[],
         };
         runtime.after_snapshot(&second);
         assert_eq!(
@@ -1962,6 +1987,7 @@ mod tests {
             now: at,
             offset: offset(),
             tied_busy: 0,
+            thinking: &[],
         };
 
         let mut runtime = runtime().0;
@@ -2024,6 +2050,7 @@ mod tests {
             now,
             offset: offset(),
             tied_busy: 0,
+            thinking: &[],
         };
 
         let report = runtime.after_snapshot(&tick);
@@ -2065,6 +2092,7 @@ mod tests {
             now,
             offset: offset(),
             tied_busy: 0,
+            thinking: &[],
         };
 
         runtime.after_snapshot(&tick);

@@ -936,7 +936,7 @@ mod tests {
             last: utc("2026-11-14T18:30:00Z"),
             last_model: Some(model.to_string()),
             last_user_turn: None,
-            thinking_since_user: 0,
+            thinking: Vec::new(),
             totals: tokens,
             by_model,
             agents: BTreeMap::new(),

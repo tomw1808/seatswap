@@ -42,6 +42,9 @@ pub struct AccountState {
     pub session: Option<SessionState>,
     pub model_blocked: bool,
     pub rates: Option<Rates>,
+    /// The answers with thinking that the running sessions hold and this
+    /// account produced (spec §2.12): the sum of the minutes it was live for.
+    pub thinking_held: u32,
 }
 
 /// Everything a plan is computed from. It is pure: no clock, no files, no
@@ -335,7 +338,12 @@ pub fn choose(inputs: &Inputs, at: DateTime<Utc>) -> Option<String> {
         .iter()
         .map(|account| View::of(account, at))
         .collect();
-    let index = pick(&views, at, &rhythm_walk(inputs))?;
+    let index = pick(
+        &views,
+        at,
+        &rhythm_walk(inputs),
+        inputs.rhythm.typical_hour(),
+    )?;
     inputs.accounts.get(index).map(|account| account.id.clone())
 }
 
@@ -423,7 +431,7 @@ pub(super) fn play(inputs: &Inputs, policy: Policy, walk: &Walk<'_>, typical: f6
                     Some(index)
                 }
             }
-            _ => pick(&views, t, walk),
+            _ => pick(&views, t, walk, typical),
         };
 
         match choice {
@@ -696,7 +704,13 @@ impl<'a> View<'a> {
 
 /// The index of the account [`choose`] would name: the usable account with the
 /// least slack, or the fixed order when any usable account has no rates.
-fn pick(views: &[View<'_>], at: DateTime<Utc>, walk: &Walk<'_>) -> Option<usize> {
+///
+/// Only in the branch where every usable account has a slack: the candidates
+/// are the accounts whose slack is at most `SLACK_MARGIN_H × typical` above the
+/// least one (two slacks within [`SLACK_TIE`] count as equal). Among them the
+/// highest [`AccountState::thinking_held`] wins; equal counts, which includes
+/// all 0, fall back to the order of the least slack: slack, reset, id.
+fn pick(views: &[View<'_>], at: DateTime<Utc>, walk: &Walk<'_>, typical: f64) -> Option<usize> {
     let mut usable: Vec<usize> = (0..views.len())
         .filter(|&index| views[index].usable(at))
         .collect();
@@ -719,31 +733,46 @@ fn pick(views: &[View<'_>], at: DateTime<Utc>, walk: &Walk<'_>) -> Option<usize>
         });
         return usable.first().copied();
     }
-    let mut best: Option<(f64, DateTime<Utc>, usize)> = None;
-    for &index in &usable {
-        let Some(slack) = views[index].slack(at, walk) else {
+    let slacks: Vec<(usize, f64)> = usable
+        .iter()
+        .filter_map(|&index| views[index].slack(at, walk).map(|slack| (index, slack)))
+        .collect();
+    let least = slacks
+        .iter()
+        .map(|(_, slack)| *slack)
+        .fold(f64::INFINITY, f64::min);
+    let margin = SLACK_MARGIN_H * typical;
+    let mut best: Option<(u32, f64, DateTime<Utc>, usize)> = None;
+    for (index, slack) in slacks {
+        // A slack beyond the margin is not a candidate; the tie is the same
+        // rounding noise the order below treats as equal.
+        if slack - least > margin + SLACK_TIE {
             continue;
-        };
+        }
         let reset = next_reset(views[index].account.week_resets_at, at);
+        let thinking = views[index].account.thinking_held;
         let better = match best {
             None => true,
-            Some((best_slack, best_reset, best_index)) => {
+            Some((best_thinking, best_slack, best_reset, best_index)) => {
                 let slack_order = if (slack - best_slack).abs() <= SLACK_TIE {
                     Ordering::Equal
                 } else {
                     slack.total_cmp(&best_slack)
                 };
-                slack_order
+                thinking
+                    .cmp(&best_thinking)
+                    .reverse()
+                    .then(slack_order)
                     .then_with(|| reset.cmp(&best_reset))
                     .then_with(|| views[index].account.id.cmp(&views[best_index].account.id))
                     == Ordering::Less
             }
         };
         if better {
-            best = Some((slack, reset, index));
+            best = Some((thinking, slack, reset, index));
         }
     }
-    best.map(|(_, _, index)| index)
+    best.map(|(_, _, _, index)| index)
 }
 
 /// The early move of the eager plan (spec §2.5, S2): the account [`choose`]
@@ -761,7 +790,7 @@ fn eager_move(
     if last_switch.is_some_and(|last| at - last < Duration::minutes(MIN_DWELL_MIN)) {
         return None;
     }
-    let target = pick(views, at, walk)?;
+    let target = pick(views, at, walk, typical)?;
     if target == current {
         return None;
     }
@@ -870,6 +899,7 @@ pub(crate) mod testkit {
             }),
             model_blocked: false,
             rates: Some(Rates { c, s }),
+            thinking_held: 0,
         }
     }
 
@@ -971,6 +1001,111 @@ mod tests {
             resets_at: Some(now() + Duration::hours(1)),
         });
         assert_eq!(choose(&inputs, now()), Some("PR".to_string()));
+    }
+
+    #[test]
+    fn choose_takes_the_account_that_holds_the_thinking_within_the_margin() {
+        let reset = "2026-11-21T19:00:00Z";
+        let x1 = account("X1", 2.0, None, false, reset);
+        let mut x2 = account("X2", 2.0, None, false, reset);
+        x2.week_percent = 2.0;
+        let mut inputs = Inputs {
+            now: now(),
+            offset: offset(),
+            accounts: vec![x1, x2],
+            active: None,
+            rhythm: week(15),
+        };
+        let x1_slack = slack(&inputs.accounts[0], &inputs).expect("X1 has rates");
+        let x2_slack = slack(&inputs.accounts[1], &inputs).expect("X2 has rates");
+        assert!((x1_slack - 42.0).abs() < EPS, "{x1_slack}");
+        assert!((x2_slack - 43.0).abs() < EPS, "{x2_slack}");
+        let margin = SLACK_MARGIN_H * inputs.rhythm.typical_hour();
+        assert!((margin - 2.0).abs() < EPS, "{margin}");
+
+        assert_eq!(choose(&inputs, now()), Some("X1".to_string()));
+        inputs.accounts[1].thinking_held = 5;
+        assert_eq!(choose(&inputs, now()), Some("X2".to_string()));
+        inputs.accounts[0].thinking_held = 7;
+        assert_eq!(choose(&inputs, now()), Some("X1".to_string()));
+    }
+
+    #[test]
+    fn thinking_does_not_decide_outside_the_margin() {
+        let reset = "2026-11-21T19:00:00Z";
+        let x1 = account("X1", 2.0, None, false, reset);
+        let mut x2 = account("X2", 2.0, None, false, reset);
+        x2.week_percent = 6.0;
+        x2.thinking_held = 5;
+        let inputs = Inputs {
+            now: now(),
+            offset: offset(),
+            accounts: vec![x1, x2],
+            active: None,
+            rhythm: week(15),
+        };
+        let x1_slack = slack(&inputs.accounts[0], &inputs).expect("X1 has rates");
+        let x2_slack = slack(&inputs.accounts[1], &inputs).expect("X2 has rates");
+        assert!((x1_slack - 42.0).abs() < EPS, "{x1_slack}");
+        assert!((x2_slack - 45.0).abs() < EPS, "{x2_slack}");
+        let margin = SLACK_MARGIN_H * inputs.rhythm.typical_hour();
+        assert!((margin - 2.0).abs() < EPS, "{margin}");
+
+        assert_eq!(choose(&inputs, now()), Some("X1".to_string()));
+    }
+
+    #[test]
+    fn thinking_does_not_decide_without_rates() {
+        let reset = "2026-11-21T19:00:00Z";
+        let mut x1 = account("X1", 2.0, None, false, reset);
+        x1.rates = None;
+        let mut x2 = account("X2", 2.0, None, false, reset);
+        x2.thinking_held = 5;
+        let mut inputs = Inputs {
+            now: now(),
+            offset: offset(),
+            accounts: vec![x1, x2],
+            active: None,
+            rhythm: week(15),
+        };
+
+        let with_thinking = choose(&inputs, now());
+        inputs.accounts[1].thinking_held = 0;
+        let without_thinking = choose(&inputs, now());
+        assert_eq!(with_thinking, without_thinking);
+        assert_eq!(with_thinking, Some("X1".to_string()));
+    }
+
+    #[test]
+    fn the_plan_goes_back_to_the_account_with_the_thinking() {
+        let reset = "2026-11-21T19:00:00Z";
+        let mut z = account("Z", 2.0, None, false, reset);
+        z.week_percent = 100.0;
+        let x1 = account("X1", 2.0, None, false, reset);
+        let mut x2 = account("X2", 2.0, None, false, reset);
+        x2.week_percent = 2.0;
+        x2.thinking_held = 5;
+        let inputs = Inputs {
+            now: now(),
+            offset: offset(),
+            accounts: vec![z, x1, x2],
+            active: Some("Z".to_string()),
+            rhythm: week(15),
+        };
+        let x1_slack = slack(&inputs.accounts[1], &inputs).expect("X1 has rates");
+        let x2_slack = slack(&inputs.accounts[2], &inputs).expect("X2 has rates");
+        assert!((x1_slack - 42.0).abs() < EPS, "{x1_slack}");
+        assert!((x2_slack - 43.0).abs() < EPS, "{x2_slack}");
+        let margin = SLACK_MARGIN_H * inputs.rhythm.typical_hour();
+        assert!((margin - 2.0).abs() < EPS, "{margin}");
+
+        let plan = follow(&inputs, Policy::Lazy);
+        let first = plan
+            .segments
+            .iter()
+            .find(|segment| segment.account.as_deref() != Some("Z"))
+            .expect("the plan uses the usable accounts");
+        assert_eq!(first.account.as_deref(), Some("X2"));
     }
 
     #[test]

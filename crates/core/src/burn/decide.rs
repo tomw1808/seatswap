@@ -871,4 +871,111 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn a_full_active_account_goes_back_to_the_account_with_the_thinking() {
+        let reset = "2026-11-21T19:00:00Z";
+        let mut z = account("Z", 2.0, None, false, reset);
+        z.week_percent = 100.0;
+        let x1 = account("X1", 2.0, None, false, reset);
+        let mut x2 = account("X2", 2.0, None, false, reset);
+        x2.week_percent = 2.0;
+        x2.thinking_held = 5;
+        let inputs = Inputs {
+            now: now(),
+            offset: crate::burn::plan::testkit::offset(),
+            accounts: vec![z, x1, x2],
+            active: Some("Z".to_string()),
+            rhythm: week(15),
+        };
+        let situation = situation(inputs);
+        let state = regime(&situation);
+
+        match decide(&situation, &state) {
+            Decision::Switch {
+                to,
+                reason: Reason::ActiveFull { .. },
+            } => assert_eq!(to, "X2"),
+            other => panic!("{other:?}"),
+        }
+        // The pop-up's plan plays through the same `pick`: it names the account
+        // the decision switches to.
+        let plan = follow(&situation.inputs, Policy::Lazy);
+        let planned = plan
+            .segments
+            .iter()
+            .find(|segment| segment.account.as_deref() != Some("Z"))
+            .and_then(|segment| segment.account.as_deref());
+        assert_eq!(planned, Some("X2"));
+    }
+
+    /// Review Focus 6, the other half: the account with the thinking is outside
+    /// the margin (slack 45.0 against 42.0, margin 2.0), so the clearly more
+    /// urgent third account is taken, by the decision and by the plan.
+    #[test]
+    fn a_full_active_account_goes_to_the_clearly_more_urgent_third_one() {
+        let reset = "2026-11-21T19:00:00Z";
+        let mut z = account("Z", 2.0, None, false, reset);
+        z.week_percent = 100.0;
+        let x1 = account("X1", 2.0, None, false, reset);
+        let mut x2 = account("X2", 2.0, None, false, reset);
+        x2.week_percent = 6.0;
+        x2.thinking_held = 5;
+        let inputs = Inputs {
+            now: now(),
+            offset: crate::burn::plan::testkit::offset(),
+            accounts: vec![z, x1, x2],
+            active: Some("Z".to_string()),
+            rhythm: week(15),
+        };
+        let situation = situation(inputs);
+        let state = regime(&situation);
+
+        match decide(&situation, &state) {
+            Decision::Switch { to, .. } => assert_eq!(to, "X1"),
+            other => panic!("{other:?}"),
+        }
+        let plan = follow(&situation.inputs, Policy::Lazy);
+        let planned = plan
+            .segments
+            .iter()
+            .find(|segment| segment.account.as_deref() != Some("Z"))
+            .and_then(|segment| segment.account.as_deref());
+        assert_eq!(planned, Some("X1"));
+    }
+
+    #[test]
+    fn an_early_switch_waits_for_the_account_with_the_thinking() {
+        let reset = "2026-11-21T19:00:00Z";
+        let mut z = account("Z", 2.0, None, false, reset);
+        z.week_percent = 7.0;
+        let x1 = account("X1", 2.0, None, false, reset);
+        let mut x2 = account("X2", 2.0, None, false, reset);
+        x2.week_percent = 3.5;
+        x2.thinking_held = 5;
+        let inputs = Inputs {
+            now: now(),
+            offset: crate::burn::plan::testkit::offset(),
+            accounts: vec![z, x1, x2],
+            active: Some("Z".to_string()),
+            rhythm: week(15),
+        };
+        let z_slack = slack(&inputs.accounts[0], &inputs).expect("Z has rates");
+        let x1_slack = slack(&inputs.accounts[1], &inputs).expect("X1 has rates");
+        let x2_slack = slack(&inputs.accounts[2], &inputs).expect("X2 has rates");
+        assert!((z_slack - 45.5).abs() < EPS, "{z_slack}");
+        assert!((x1_slack - 42.0).abs() < EPS, "{x1_slack}");
+        assert!((x2_slack - 43.75).abs() < EPS, "{x2_slack}");
+        let margin = SLACK_MARGIN_H * inputs.rhythm.typical_hour();
+        assert!((margin - 2.0).abs() < EPS, "{margin}");
+
+        let mut situation = situation(inputs);
+        assert_eq!(decide(&situation, &pays()), Decision::Stay);
+
+        situation.inputs.accounts[2].thinking_held = 0;
+        assert!(matches!(
+            decide(&situation, &pays()),
+            Decision::Switch { ref to, .. } if to == "X1"
+        ));
+    }
 }
