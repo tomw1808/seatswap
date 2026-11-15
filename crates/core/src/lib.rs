@@ -7,6 +7,7 @@
 //!   and the only module that knows file modes and private files and folders
 //! - `history`  the history folder: record types, appending, reading a range, merging hosts
 //! - `project`  from a folder to the project's identity
+//! - `sessions` Claude Code's session files and which are alive
 //! - `locks`    Claude Code's six lock folders + seatswap's own switch.lock
 //! - `live`     read/write the live login (.credentials.json) and identity (.claude.json)
 //! - `store`    accounts.json (no secrets) + secrets (OS keyring, or 0600 files)
@@ -23,6 +24,7 @@ pub mod live;
 pub mod locks;
 pub mod paths;
 pub mod project;
+pub mod sessions;
 pub mod store;
 pub mod switcher;
 pub mod types;
