@@ -2658,3 +2658,489 @@ client call on `tauri::async_runtime::spawn_blocking`. The large window's `Destr
 - The history files keep the shapes step A gave them. The sessions thread writes the same
   `tokens-YYYY-MM.jsonl`, `sessions-YYYY-MM.jsonl` and wait event lines; step C2 adds no file kind
   there.
+
+## `stats` (step C3)
+
+`crates/core/src/stats/` holds everything the statistics pages show (spec §3.1–§3.6, §3.9),
+computed from the history, the prices and the project log. **Statistics only read:** no function of
+this module opens a file for writing. `stats` is public from `lib.rs`; `fixture` is compiled only
+for tests or the core feature `fixtures`.
+
+```rust
+pub enum StatsError { History(HistoryError), Money(MoneyError), Message(String) }
+pub enum RangeKey { ThisWeek, LastWeek, Days30, Days90, Months12, All }
+pub struct Query { pub range: RangeKey, pub accounts: Vec<String>, pub host: Option<String> }
+pub struct Ctx<'a> { pub history: &'a HistoryDir, pub accounts: &'a [Account],
+    pub settings: &'a Settings, pub prices: &'a Prices, pub fx: &'a Fx,
+    pub projects: &'a Projects, pub now: DateTime<Utc>, pub offset: FixedOffset }
+
+/// ThisWeek: this week's Monday .. now. LastWeek: the Monday before .. this Monday.
+/// Days30/Days90/Months12: the Monday of the week holding now − 30/90/365 days .. now.
+/// All: the Monday of the week holding the first record .. now; this week's Monday when
+/// the history is empty.
+pub fn range_of(key: RangeKey, ctx: &Ctx) -> Result<Range, StatsError>;
+pub fn week_start(t: DateTime<Utc>, offset: FixedOffset) -> DateTime<Utc>;
+pub(crate) fn local_hour_start(t: DateTime<Utc>, offset: FixedOffset) -> DateTime<Utc>;
+pub(crate) fn local_day_start(t: DateTime<Utc>, offset: FixedOffset) -> DateTime<Utc>;
+
+pub struct AccountWeek { pub week: DateTime<Utc>, pub account: AccountRef,
+    pub window: WindowRecord, pub price: Option<f64>, pub price_missing: Option<Missing> }
+pub fn account_weeks(ctx: &Ctx, range: &Range, q: &Query)
+    -> Result<Vec<AccountWeek>, StatsError>;
+pub(crate) fn account_weeks_valued(ctx: &Ctx, range: &Range, q: &Query, valuer: &Valuer)
+    -> Result<Vec<AccountWeek>, StatsError>;
+
+pub struct BlockedSpan { pub host: String, pub account: AccountRef,
+    pub from: DateTime<Utc>, pub to: DateTime<Utc>, pub hours: f64, pub avoidable_hours: f64 }
+pub fn blocked_spans(ctx: &Ctx, range: &Range, q: &Query)
+    -> Result<Vec<BlockedSpan>, StatsError>;
+pub struct Empty { pub recording_since: Option<DateTime<Utc>> }
+pub fn empty(ctx: &Ctx, range: &Range) -> Result<Option<Empty>, StatsError>;
+```
+
+- `range_of` starts every range at a local Monday (spec §3.1's ranges); `All` uses the week of the
+  first record, not the record's instant. A range whose start and end coincide is `Range::between`'s
+  error, not an empty page.
+- `account_weeks` reads every finished `weekly_all` window, puts it in the calendar week of its
+  midpoint (`end − 84 h`), keeps the window whose midpoint lies in `range`, filters with
+  `account_chosen`, and prices it at that midpoint with `Valuer::price_at`. One window survives per
+  account and calendar week: the one with the later end. The cross-host rule (same account and end:
+  the latest `lastSample`) is `HistoryDir::finished_windows`'s.
+- `blocked_spans` reads all events, builds each host's blocked intervals for every limit kind and
+  each host's account timeline (the last `Live` or `Switch`), and cuts every interval at the range,
+  at every change of the account in use and at an `Unblocked`. Only a piece with
+  `timeline.at(from) == account` becomes a span. `hours` counts only the rhythm's working hours;
+  `avoidable_hours` is the part in which an account with `auto_burn` other than the blocked one is
+  not blocked on that host and has a finished weekly window running (`start ≤ t < end`) whose final
+  percent left something unused.
+- `empty` asks whether any of the seven record kinds (sample, window, event, token, session, up,
+  project log) has a record in the range. `recording_since` is the earliest record of any kind in
+  the whole history, or `None` for a history with nothing.
+- `working_rhythm(ctx, range)` is `burn::rates::rhythm` over this host's token records of the four
+  weeks before `range.to`: the weighted work of each clock hour of the week. `working_hours` counts
+  the seconds of an interval in hours whose rhythm value is above 0.
+
+The shared helpers, used by more than one page:
+
+| Helper | Job |
+|---|---|
+| `accounts_without_price` | the account ids with at least one account week that has no price: stored accounts in `Ctx::accounts` order, then removed accounts by id |
+| `WindowMoney`, `money_of`, `lost_percent` | `paid = 100 × pv(price)`, `expired = lost × pv`, `used = paid − expired`; a window without `lost` is an error because the history always writes it |
+| `SwitchCounts`, `switch_counts` | `Switch` events of a range and host by `By::{User, Cli, Auto, Agent, External}` |
+| `week_columns` | Monday 00:00 local of the week holding `range.from`, then every seven days while the start is before `range.to` |
+| `blocked_by_week`, `blocked_by_weekday` | spans split at every week start or local midnight; each part counts its working hours |
+| `week_of_record`, `output_by_account_week` | the account week whose window holds an instant; output tokens per `(account, calendar week)` for the records inside those windows |
+| `account_chosen` | empty `q.accounts` = every account; otherwise only a named account; a record without a known account is never chosen by a filter |
+| `stored_account`, `account_id`, `account_abbr`, `account_position` | the stored account behind a reference or its id/abbr when it is no longer stored; the store's order, removed accounts last |
+| `top_three` | the three largest `(name, value)` by value, ties by name, then `("other", rest)` only when a rest is left |
+| `money_text`, `hours_text`, `percent_text`, `thousands`, `join_names`, `date_text` | the pages' exact formats; `money_text` matches `ui/common.js`'s `money` |
+
+Every page module has a public entry point taking the `Query` (the forecast takes the burn inputs
+and regime; `window_detail` takes the account and end) and most also have a `pub(crate) ..._in`
+taking a `Range` for their tests; each produces one serde camelCase struct:
+
+```rust
+// overview.rs
+pub struct Overview { pub currency: Option<String>, pub without_price: Vec<String>,
+    pub kpis: Kpis, pub weeks: Vec<OverviewWeek>, pub marks: Vec<Mark>, pub findings: Vec<String> }
+pub struct Kpis { pub used: f64, pub paid: f64, pub expired: f64,
+    pub expired_by_account: Vec<(String, f64)>, pub blocked_hours: f64,
+    pub avoidable_hours: f64, pub switches: SwitchCounts,
+    pub switch_cost_percent_of_window: Option<f64> }
+pub struct OverviewWeek { pub week: DateTime<Utc>, pub accounts: Vec<WeekAccount>,
+    pub projects: Vec<(String, f64)>, pub blocked_hours: f64, pub expired_share: Option<f64> }
+pub struct WeekAccount { pub id: String, pub used_percent: f64, pub used: Option<f64>,
+    pub expired_percent: f64, pub expired: Option<f64>, pub uncertain: bool }
+pub struct Mark { pub at: DateTime<Utc>, pub label: String }
+pub fn overview(ctx: &Ctx, q: &Query) -> Result<Overview, StatsError>;
+
+// weeks.rs
+pub struct WeeksPage { pub week_starts: Vec<DateTime<Utc>>, pub rows: Vec<WeeksRow>,
+    pub blocked: Vec<f64>, pub recent: Vec<Curve> }
+pub struct WeeksRow { pub id: String, pub plan: Option<String>, pub cells: Vec<Option<WeekCell>>,
+    pub now_percent: Option<f64> }
+pub struct WeekCell { pub end: DateTime<Utc>, pub used: f64, pub expired: f64,
+    pub expired_money: Option<f64>, pub full: bool, pub uncertain: bool }
+pub struct Curve { pub id: String, pub points: Vec<(DateTime<Utc>, f64)> }
+pub struct WeekSummary { pub week: DateTime<Utc>, pub used_percent_of_paid: f64,
+    pub used: f64, pub expired: f64, pub blocked_hours: f64, pub switches: SwitchCounts,
+    pub per_account: Vec<(String, f64)>, pub top_projects: Vec<(String, f64)>,
+    pub tokens: Tokens, pub api_value: Option<f64>, pub used_change_percent: Option<f64>,
+    pub conclusion: Vec<String> }
+pub struct WindowDetail { pub id: String, pub end: DateTime<Utc>, pub used: f64,
+    pub used_money: Option<f64>, pub expired: f64, pub expired_money: Option<f64>,
+    pub reached_100_at: Option<DateTime<Utc>>, pub blocked_hours_after: f64,
+    pub session_windows_used: Option<u32>, pub switches_in_out: u32, pub switches_auto: u32,
+    pub last_sample_before_end_secs: i64, pub uncertain: bool,
+    pub curve: Vec<(DateTime<Utc>, f64)> }
+pub fn weeks(ctx: &Ctx, q: &Query) -> Result<WeeksPage, StatsError>;
+pub fn week_summary(ctx: &Ctx, q: &Query, week: DateTime<Utc>)
+    -> Result<WeekSummary, StatsError>;
+pub fn window_detail(ctx: &Ctx, account_id: &str, end: DateTime<Utc>)
+    -> Result<WindowDetail, StatsError>;
+
+// projects.rs
+pub enum NodeKind { Org, Project, Folder }
+pub struct Node { pub kind: NodeKind, pub level: u8, pub name: String,
+    pub key: Option<ProjectKey>, pub org_accounts: Vec<String>, pub tokens: Tokens,
+    pub share: f64, pub subscription: Option<f64>, pub api: Option<f64>,
+    pub by_account: Vec<(Option<String>, f64)>, pub sessions: u32 }
+pub struct ProjectsPage { pub nodes: Vec<Node>, pub matrix: Matrix,
+    pub tokens_per_percent: Vec<(String, f64)>, pub unknown_account_tokens: Tokens,
+    pub without_price: Vec<String>, pub notes: Vec<String> }
+pub struct Matrix { pub orgs: Vec<String>, pub accounts: Vec<String>,
+    pub cells: Vec<Vec<f64>>, pub sentences: Vec<String> }
+pub struct ProjectDetail { pub name: String, pub tokens: Tokens, pub agent_share: f64,
+    pub hosts: Vec<(String, f64)>, pub subscription: Option<f64>, pub api: Option<f64>,
+    pub weekly_by_model: Vec<(DateTime<Utc>, Vec<(String, u64)>)>, pub sessions: u32 }
+pub fn projects_page(ctx: &Ctx, q: &Query) -> Result<ProjectsPage, StatsError>;
+pub fn project_detail(ctx: &Ctx, q: &Query, key: &ProjectKey)
+    -> Result<ProjectDetail, StatsError>;
+
+// subscriptions.rs
+pub struct Period { pub id: String, pub plan: Option<String>, pub price: Option<f64>,
+    pub from: DateTime<Utc>, pub to: Option<DateTime<Utc>> }
+pub enum Verdict { MostlyUnused, RegularlyFull, WellUsed, TooEarly }
+pub struct SubRow { pub id: String, pub plan: Option<String>, pub price: Option<f64>,
+    pub since: DateTime<Utc>, pub weeks: u32, pub avg_used: Option<f64>,
+    pub expired_percent: Option<f64>, pub expired: Option<f64>, pub full_weeks: u32,
+    pub blocked_hours_on_it: f64, pub api_value: Option<f64>, pub times_paid: Option<f64>,
+    pub verdict: Verdict, pub tokens_per_percent: Vec<(DateTime<Utc>, f64)> }
+pub struct SubscriptionsPage { pub periods: Vec<Period>, pub rows: Vec<SubRow>,
+    pub without_price: Vec<String> }
+pub struct WhatIf { pub without: String, pub blocked_hours: Option<f64>,
+    pub blocked_hours_was: f64, pub expired: Option<f64>, pub expired_was: Option<f64>,
+    pub saved_price: Option<f64>, pub sentence: String,
+    pub weekly: Vec<(DateTime<Utc>, f64, f64)> }
+pub fn subscriptions(ctx: &Ctx, q: &Query) -> Result<SubscriptionsPage, StatsError>;
+pub fn what_if(ctx: &Ctx, q: &Query, without: &str) -> Result<WhatIf, StatsError>;
+
+// forecast.rs
+pub struct Forecast { pub basis_weeks: u32, pub learning: Vec<String>,
+    pub kpis: ForecastKpis, pub accounts: Vec<ForecastAccount>, pub lanes: Vec<Lane>,
+    pub blocked: Vec<(DateTime<Utc>, DateTime<Utc>)>, pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>, pub sentence: String }
+pub struct ForecastKpis { pub expire_planned: Option<f64>,
+    pub expire_only_when_full: Option<f64>, pub blocked_hours: f64, pub switches: u32,
+    pub switches_only_when_full: u32 }
+pub struct ForecastAccount { pub id: String, pub now: f64, pub expected: Option<f64>,
+    pub low: Option<f64>, pub full_at: Option<DateTime<Utc>>, pub resets_at: DateTime<Utc>,
+    pub only_when_full_expected: Option<f64>, pub only_when_full_expires: Option<f64> }
+pub struct Lane { pub id: String, pub blocks: Vec<(DateTime<Utc>, DateTime<Utc>)>,
+    pub resets: Vec<DateTime<Utc>> }
+pub fn forecast(ctx: &Ctx, inputs: &Inputs, regime: &Regime) -> Result<Forecast, StatsError>;
+
+// activity.rs
+pub struct RhythmPage { pub heat: Vec<f64>, pub per_day: Vec<DayRow> }
+pub struct DayRow { pub weekday: u8, pub working_hours: f64, pub blocked_hours: f64 }
+pub enum HourState { Off, Idle, Work, Unknown }
+pub struct HourCell { pub t: DateTime<Utc>, pub state: HourState,
+    pub by_model: Vec<(String, u64)>, pub sessions: u32, pub top_project: Option<String>,
+    pub values: Values }
+pub struct HostLane { pub host: String, pub hours: Vec<HourCell>, pub working: u32,
+    pub idle: u32, pub off: u32, pub unknown: u32, pub tokens: Tokens, pub values: Values }
+pub struct DayTokens { pub date: NaiveDate, pub out: Vec<(String, u64)> }
+pub struct ActivityWeek { pub week: DateTime<Utc>, pub working_hours: Vec<(String, u32)>,
+    pub tokens: Tokens, pub values: Values, pub sessions: u32,
+    pub top: Option<(String, String)> }
+pub struct BigSession { pub label: String, pub project: String, pub host: String,
+    pub model: Option<String>, pub worked_hours: u32, pub tokens: Tokens,
+    pub values: Values, pub agents: u32 }
+pub struct ActivityPage { pub lanes: Vec<HostLane>, pub days: Vec<DayTokens>,
+    pub weeks: Vec<ActivityWeek>, pub largest: Vec<BigSession>,
+    pub waited: Vec<(NaiveDate, f64)>, pub peak_hour: Tokens }
+pub fn rhythm(ctx: &Ctx, q: &Query) -> Result<RhythmPage, StatsError>;
+pub fn activity(ctx: &Ctx, q: &Query) -> Result<ActivityPage, StatsError>;
+```
+
+Page details that are easy to miss:
+
+- `Overview::expired_share` is `Option` (a week without a priced account week has none); the four
+  findings are the only sentences and are built in the fixed order above, each `None` when its data
+  is missing.
+- `WeeksRow.cells` is one entry per `week_starts`; `None` means no finished window that week.
+  `now_percent` is the newest weekly sample of an account whose window is still running.
+  `recent` covers the last 14 days. `session_windows_used` counts finished `session` windows with
+  `final > 0` that ended inside the weekly window. `blocked_hours_after` uses the rhythm of the four
+  weeks before `Ctx::now`, because a single window has no range of its own.
+- `projects_page` only adds folder rows when a project has more than one folder (`total_folders >
+  1`); its `by_account` shares are shares of the node's API value, and `share` is the node's API
+  value over the page's. `tokens_per_percent` sums an account's output tokens over all its finished
+  weeks and divides by the sum of those weeks' final percents; an account without a week, or whose
+  weeks total 0 %, is left out. `notes` always carries the "use that leaves no transcript" text and
+  adds the unknown-account and no-subscription-value sentences when they have counts.
+  `project_detail` filters by `q.host`, so a folder key's detail counts every host's folder of that
+  name only with all hosts chosen.
+- `subscriptions`' `since` is the first period of the whole history, not of the range; `plan` and
+  `price` are the latest visible period's. `WhatIf` replays each calendar week with `Policy::Lazy`;
+  the week's extra blocked work is converted with `wu_hours` and the recorded hours are the floor.
+  `expired = expired_was + replay_without − replay_with`, each replay's expired money priced at the
+  range's end; an account with a reading in the range but no learned rate returns the
+  "Not enough history" sentence with `blocked_hours`, `expired` and `weekly` empty/`None`, and a
+  reading from an account no longer stored returns `{abbr} is no longer stored, so this range
+  cannot be replayed.`
+- `forecast` uses `regime.early` to choose the planned policy (`Eager`/`Lazy`), always computes the
+  lazy plan, takes `HORIZON_H = 168` hours from `inputs.now`, reads the last eight finished windows
+  and the samples that name their resets, and returns an error if a plan account is not stored.
+  `low` is `state.week_percent + gains[1]` capped at 100, with fewer than four gains → `None`.
+- `rhythm` divides the heat map and both per-day numbers by the range's calendar weeks (a partial
+  week counts as one). `activity` lanes are the 168 hours ending with the hour holding `range.to`,
+  the day chart the 14 local dates ending with the date holding `range.to`, and the largest sessions
+  are the 20 with the most output tokens.
+
+## `stats_*` commands in `gui/window.rs` (step C3)
+
+```rust
+pub(crate) enum Page<T> { Empty(Empty), Data(T) }        // serde: {"empty":{…}} | {"data":{…}}
+pub(crate) struct StatsParts { accounts: Vec<Account>, settings: Settings, prices: Prices,
+    fx: Fx, projects: projects::Projects }
+impl StatsParts {
+    pub(crate) fn ctx<'a>(&'a self, history: &'a HistoryDir, now: DateTime<Utc>,
+        offset: FixedOffset) -> Ctx<'a>;
+}
+pub(crate) fn load_prices_and_fx(app: &AppPaths) -> Result<(Prices, Fx), String>;
+pub(crate) fn stats_ctx_parts(app: &AppPaths, history: &HistoryDir)
+    -> Result<StatsParts, String>;
+fn stats_page<T>(parts: &StatsParts, history: &HistoryDir, now: DateTime<Utc>,
+    offset: FixedOffset, query: &Query,
+    compute: impl FnOnce(&Ctx<'_>) -> Result<T, stats::StatsError>) -> Result<Page<T>, String>;
+```
+
+`stats_ctx_parts` loads `accounts.json`, the prices and the dollar rate through the one
+`load_prices_and_fx` that `sessions_rt::build_pricing` also uses, and the project log; the projects'
+warnings are printed as `seatswap: warning: {warning}`. The error texts are `the accounts cannot be
+read: …`, `the prices cannot be read: …`, `the dollar rate cannot be read: …` and `the projects
+cannot be read: …`. `stats_page` is the one place a page becomes a `Page`: it computes
+`range_of(query.range)` and `stats::empty`; an empty range is `Page::Empty` with the recording date,
+otherwise it calls the page function and wraps `Page::Data`.
+
+Each page has a plain testable function and one async command. Every page command but
+`stats_forecast` takes `query: Query`; the detail commands take the item they open, and
+`stats_hosts` is the separate host list:
+
+```rust
+pub(crate) fn stats_overview_at(parts, history, now, offset, query)
+    -> Result<Page<overview::Overview>, String>;
+pub(crate) fn stats_weeks_at(parts, history, now, offset, query)
+    -> Result<Page<weeks::WeeksPage>, String>;
+pub(crate) fn stats_week_summary_at(parts, history, now, offset, query, week: DateTime<Utc>)
+    -> Result<Page<weeks::WeekSummary>, String>;
+pub(crate) fn stats_window_detail_at(parts, history, now, offset, query,
+    account_id: &str, end: DateTime<Utc>) -> Result<Page<weeks::WindowDetail>, String>;
+pub(crate) fn stats_projects_at(parts, history, now, offset, query)
+    -> Result<Page<stats_projects::ProjectsPage>, String>;
+pub(crate) fn stats_project_detail_at(parts, history, now, offset, query,
+    key: &ProjectKey) -> Result<Page<stats_projects::ProjectDetail>, String>;
+pub(crate) fn stats_subscriptions_at(parts, history, now, offset, query)
+    -> Result<Page<subscriptions::SubscriptionsPage>, String>;
+pub(crate) fn stats_what_if_at(parts, history, now, offset, query, without: &str)
+    -> Result<Page<subscriptions::WhatIf>, String>;
+pub(crate) fn stats_forecast_at(parts, history, now, offset,
+    inputs: Option<(Inputs, Regime)>) -> Result<Page<forecast::Forecast>, String>;
+pub(crate) fn stats_rhythm_at(parts, history, now, offset, query)
+    -> Result<Page<activity::RhythmPage>, String>;
+pub(crate) fn stats_activity_at(parts, history, now, offset, query)
+    -> Result<Page<activity::ActivityPage>, String>;
+pub(crate) fn stats_hosts_at(history: &HistoryDir) -> Result<Vec<String>, String>;
+```
+
+`stats_forecast_at` takes no `Query`: the forecast is the latest plan kept from the auto-burn
+runtime, for every account and host (spec §3.4), and `stats_forecast` asks only the state. It
+returns the one error `the forecast needs a reading of every account first` both when the kept
+inputs are `None` and when their `now` is more than `burn::FRESH_MIN` (20 min) before the command's
+`now`. `stats_hosts_at` is `HistoryDir::hosts()`, so a broken prices file cannot hide the host
+list.
+
+One private helper is the body of every page command (`stats_hosts` reads only the host list):
+
+```rust
+async fn stats_command<T, F>(state: State<'_, super::GuiState>, run: F) -> Result<T, String>
+where T: Send + 'static,
+      F: FnOnce(&StatsParts, &HistoryDir, DateTime<Utc>, FixedOffset) -> Result<T, String>
+          + Send + 'static;
+```
+
+It clones the app paths and the history handle, and inside `spawn_blocking` loads `StatsParts`,
+takes `Utc::now()` and `*Local::now().offset()`, and runs the page's function. The files are thus
+read on the blocking thread, not on the async one. The async commands `stats_overview`,
+`stats_weeks`, `stats_week_summary`, `stats_window_detail`, `stats_projects`,
+`stats_project_detail`, `stats_subscriptions`, `stats_what_if`, `stats_forecast`, `stats_rhythm`,
+`stats_activity` and `stats_hosts` are registered in `gui/mod.rs`'s handler list; `stats_forecast`
+reads the kept `(Inputs, Regime)` from `GuiState` before it enters the helper.
+
+## The forecast's inputs kept from the burn runtime (step C3)
+
+```rust
+// gui/burn_rt.rs
+pub(crate) struct BurnReport { …, pub forecast: Option<(Inputs, Regime)> }
+
+// gui/worker.rs and gui/mod.rs
+pub(crate) forecast: Arc<Mutex<Option<(Inputs, Regime)>>>
+```
+
+`BurnRuntime::tick`, after `live::assess` produced the situation, the regime and the plan, does
+`report.forecast = Some((situation.inputs.clone(), regime.clone()))`. A tick that has no situation
+(sessions off, no account, an unread account, or no learned rates) leaves it `None`; the worker
+stores `report.forecast` on every report, `None` included, through `gui::lock`, so a tick without a
+situation clears the kept forecast. `stats_forecast` reads that one field and hands it to
+`stats_forecast_at`; it never recomputes a situation. The values are the plan's own `Inputs`
+(each account's id, weekly percent and reset, session state and rates, `may_use` from the account's
+`auto_burn`) and `Regime` (the early-switching verdict and the lazy/eager blocked hours), so the
+Forecast page and auto-burn are computed from the same values; an `Inputs` older than `FRESH_MIN`
+is refused like none.
+
+## The statistics fixture and `export_tiny` (step C3)
+
+`crates/core/Cargo.toml` declares the empty feature `fixtures = []` and an example that requires it:
+
+```toml
+[[example]]
+name = "export_tiny"
+required-features = ["fixtures"]
+```
+
+Under `#[cfg(any(test, feature = "fixtures"))]`, `stats/fixture.rs` writes the fixture every
+statistics test uses, as seatswap's own files:
+
+```rust
+pub struct TinyDir { /* path, optional guard */ }
+impl TinyDir { pub fn path(&self) -> &Path; #[cfg(test)] pub(crate) fn keep(&mut self,
+    guard: Box<dyn Any + Send>); }
+pub struct Tiny { pub dir: TinyDir, pub history: HistoryDir, pub accounts: Vec<Account>,
+    pub settings: Settings, pub prices: Prices, pub fx: Fx, pub projects: Projects,
+    pub now: DateTime<Utc>, pub offset: FixedOffset, pub windows: Vec<WindowRecord> }
+pub fn write(root: &Path) -> Result<Tiny, String>;
+```
+
+`write` refuses a root that exists and is not empty (`{root} is not empty`). It writes the history
+under `AppPaths::at(root)`'s history folder for host `atlas`, `accounts.json`, `prices.json` and
+`fx.json`, each through the module that owns that file (`history`, `store`, `money`; never a second
+writer). The fixture is the plan's: host `atlas`, local offset +00:00, "now" Thu 19 Nov 2026 10:00,
+accounts LB (Max, 180 EUR) and AC (Team 5x, 140 EUR), their four finished windows and the events,
+token and session records of `step-c3.md`. `Tiny.dir` is the history root. The test helper
+`stats::tests::tiny()` writes the fixture into a `tempfile::tempdir()` and keeps the `TempDir` in
+`TinyDir`'s optional guard, so the folder is removed with the fixture; `fixture.rs` itself does not
+depend on `tempfile`.
+
+`crates/core/examples/export_tiny.rs` is a thin wrapper: `export_tiny <empty folder>` writes the
+same fixture there and prints the folder; a missing folder, a second argument or a folder that
+cannot be written is an error with its text. The tray bench starts the app on a throw-away data
+folder (`--data-dir`); `export_tiny` fills such a folder with the fixture's history, accounts,
+prices and dollar rate, so the Statistics pages open on a real history without touching any of the
+person's files. The browser page bench does not need it: the pages fall back to
+`crates/app/ui/fixture-stats.js`, whose answers have the same JSON shape as the Rust structs.
+
+## `app: ui/charts.js` (step C3)
+
+The statistics pages' charts are plain elements and SVG, no chart library, in
+`crates/app/ui/charts.js`. Every colour is a CSS token or the colour the caller hands in (an
+account's colour is its snapshot view's colour), so the charts follow the theme. One tooltip lives
+here; a mark with a `tip` shows it on hover and on keyboard focus.
+
+```js
+export function stackedColumns({ columns, marks } = {});
+export function lines({ series, yMax, marks, ySuffix, yDecimals, yFormat } = {});
+export function bars({ categories, series, labelEvery } = {});
+export function grid({ rows, headers } = {});
+export function heat({ rows = 7, cols = 24, values, tip } = {});
+export function lanes({ lanes, from, to, ticks } = {});
+export function hours({ lanes, days } = {});
+export { attachTip, hideTip, showTip };
+```
+
+- `stackedColumns`: `columns: [{ label, sub?, at?, stacks: [[{ value, color, hatch?, tip? }]] }]`.
+  Every stack is scaled to the largest stack total; a segment with `hatch` is drawn as a hatched
+  fill. `marks: [{ at, label }]` are placed at the left edge of the first column that starts after
+  the mark (a mark on a week's Monday sits at the next column); without `at` on the columns a mark
+  is left out, never guessed.
+- `lines`: `series: [{ name, color?, area?, points: [[time, value]], tip(time, value)? }]`,
+  `yMax` (else the largest value), `ySuffix`, `yDecimals`, `yFormat(value)`. A point is the pair
+  `[time, value]` the Rust structs serialise; points become focusable buttons, a `null` value
+  breaks the line, and the x axis is the first, middle and last valid time.
+- `bars`: `categories: [label]`, `series: [{ name, color, values: [number],
+  unit?, tip(category, value)? }]`, `labelEvery` for a sparse category axis.
+- `grid`: `rows: [{ label, cells: [{ fill?, hatch?, full?, uncertain?, current?, color?,
+  textColor?, text?, tip?, onClick? }] }]`, `headers: [label | { label, tip?, onClick?, selected?,
+  current? }]`. A cell without `fill` is plain; the fill is its height in percent.
+- `heat`: `values` is row-major, 7 rows of 24 columns, Monday first; the colour strength is the
+  value over the largest; `tip(row, col, value)` names the weekday and hour.
+- `lanes`: `lanes: [{ label, color?, className?, blocks: [[from, to]], blockTips?, marks: [time],
+  markTips? }]`, `from`, `to`, `ticks: [{ at, label } | time]`; a block shorter than the axis still
+  gets a sliver.
+- `hours`: `lanes: [{ label, cells: [{ state: "work"|"idle"|"off"|"unknown", stack:
+  [{ value, color }], strip?, tip? }] }]`, `days: [{ label, span }]`. The stack is scaled to the
+  tallest hour, the strip to the most sessions.
+- Every builder throws on a missing required list; unreadable points are skipped by the builder
+  that takes them (except `lanes`' `from`/`to`, which is an error). Nothing is clamped silently
+  except a percent into 0..100 for a CSS position.
+
+## `app: the Statistics area (step C3)`
+
+```text
+crates/app/ui/areas/statistics.js          the area: frame, range, chips, host, tabs, calls
+crates/app/ui/areas/statistics/overview.js
+crates/app/ui/areas/statistics/weeks.js
+crates/app/ui/areas/statistics/projects.js
+crates/app/ui/areas/statistics/subscriptions.js
+crates/app/ui/areas/statistics/forecast.js
+crates/app/ui/areas/statistics/rhythm.js
+crates/app/ui/areas/statistics/activity.js
+crates/app/ui/charts.js                    the seven chart builders above
+crates/app/ui/fixture-stats.js             the browser fixture, the Rust structs' JSON shape
+```
+
+`statistics.js` exports `render(container, context)`, `update(snapshot)` and `unmount()`. `render`
+reads the area's sub-page from the address, builds the frame and loads one page module at a time
+(`import("./statistics/<page>.js")`), each with `show(container, env)`. `update(snapshot)` redraws
+the frame and chips and reloads the page when the stored account set changes, not on every
+snapshot. `env` is:
+
+```js
+{ query, call, accounts, open, currency }
+```
+
+`query` is `{ range, accounts, host }`; the account list is empty while no chip is excluded, else
+the remaining stored ids; `host` is `null` for all hosts. `call(command, extra?)` invokes a
+`stats_*` command, throws an `EmptyRange` error for a `{"empty": …}` reply (carrying `recordingSince`)
+and returns `reply.data` otherwise. `accounts` are the chosen snapshot views, `open(page)` asks
+the area to switch page, `currency` is the snapshot's settings currency. A page draws into its own
+stage and is swapped in only when its load still wins, so a slow page cannot overwrite a newer one.
+An `EmptyRange` becomes the plain "Nothing recorded yet…" line; any other error becomes the area's
+banner.
+
+The frame has the range tabs, the account chips (at least one stays chosen; clicking one off writes
+the exclusion list), the host `<select>` only when `stats_hosts` answered more than one host, and the
+seven page tabs. The range, excluded accounts, host and page are kept in
+`localStorage` under `seatswap.stats.range`, `seatswap.stats.accounts`, `seatswap.stats.host` and
+`seatswap.stats.tab`; the host choice falls back to all hosts when its remembered host is gone. A
+page tab writes `statistics/<page>` to the address (`open(page)` does the same). `stats_forecast`
+takes no query parameter (the area's generic call still adds the frame's query to the request, which
+the command does not read): that page follows neither the range nor the chips nor the host.
+
+The seven page modules only format and draw the struct; they add no sum, share, verdict or sentence
+of their own:
+
+- **Overview** draws the five numbers, the two stacks per week with the project legend, the
+  blocked hours, the marks, "What the numbers say" and the expired-share line. Project colours are
+  taken from a five-token cycle, *other* in the muted token.
+- **Weeks** draws the grid (a date opens the week summary, a cell the window detail), the last-14-days
+  curves and the detail card; it opens the newest finished week's summary.
+- **Projects** draws the tree (By organization · Plain folder tree, rows open and close), the
+  organization × account matrix and its sentences, the project detail and the notes; it opens the
+  first project's detail.
+- **Subscriptions** draws the period bars, the row table and, for the chosen row, "What if without
+  it" with the blocked hours per week and the tokens-per-percent line; it opens the first row.
+- **Forecast** draws the four numbers, the sentence, the per-account rows and the seven-day lanes.
+  It shows `the forecast needs a reading of every account first` as a plain line, every other
+  failure as the area's banner.
+- **Rhythm** draws the 7 × 24 heat map and the working and blocked hours per weekday.
+- **Activity** draws the per-host numbers, the 168-hour lanes with the unit switch (Tokens ·
+  Subscription value · API value), the 14-day token bars, the per-week table and the largest
+  sessions.
+
+Kept choices: the Forecast page is the latest kept plan of every account and host (no range or
+chip), up to 20 minutes old; the Activity waits follow the host but no account chip, because a
+`Waited` event names no account; the account chips are the stored accounts of the snapshot, while
+an empty query still lets core count the history of accounts no longer stored; page detail is
+always fetched by its own command, never computed in the page; and the browser opens on
+`fixture-stats.js` with no tray app, which is for pictures only and is not the app's data.

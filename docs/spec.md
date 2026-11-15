@@ -908,10 +908,11 @@ already open one is shown, un-minimized, focused and sent `open-area`. The pop-u
 `navigate` event, because an event reaches every window.
 
 **The areas.** Four tabs at the top left, in this order: Sessions · Statistics · Status line ·
-Settings. An empty address opens Sessions. Sessions and Settings have a page; Statistics and Status
-line say "Comes with a later version." The area's title and its subtitle stand above the card, and
-the snapshot's error is a banner above both. The theme follows the `theme` setting and the system,
-as in the pop-up.
+Settings. An empty address opens Sessions. Sessions, Statistics and Settings have a page; Status
+line says "Comes with a later version." Under `statistics` the sub-area is one of the seven page
+names (`statistics/forecast`); without one the area keeps the page last chosen. The area's title and
+its subtitle stand above the card, and the snapshot's error is a banner above both. The theme
+follows the `theme` setting and the system, as in the pop-up.
 
 **Settings.** Seven groups on the left, the chosen group's card on the right:
 General · Accounts · Auto-burn · Notifications · Projects · Agents · History and hosts. The address
@@ -1050,6 +1051,243 @@ running session leaves the list, and as a heartbeat every 5 minutes when nothing
 host is not taken for a stale one; an empty list is a report too. A report more than 15 minutes
 before now is stale, and its sessions say "no report"; a time in the future is fresh. The import
 never copies the file and a host folder's size leaves it out (§5).
+
+### The Statistics area
+
+The second area: seven pages over the history. Every number is computed from what the history
+holds — usage readings, finished weekly windows, switches and blocks, token and session records,
+waits — together with the accounts and settings, the prices and dollar rate of §11.5 and the
+project log of §11.6. **The statistics only read:** no function of `core::stats` writes a file. The
+history records they count hold only time, folder, model, block kinds, token counts and ids; no
+message text is read or kept for them.
+
+**The frame.** Seven tabs at the top of the page, in this order: Overview · Weeks · Projects ·
+Subscriptions · Forecast · Rhythm · Activity. Above them stand:
+
+- **The range**: This week · Last week · 30 d · 90 d · 12 mo · All. Every range starts at Monday
+  00:00 local time. *This week* runs from this week's Monday to now, *Last week* is the week before,
+  and *30 d* / *90 d* / *12 mo* start at the Monday of the week that holds now − 30 / 90 / 365 days.
+  *All* starts at the Monday of the week that holds the first record, so every page's first
+  calendar week holds all its windows; a history with no record uses this week's Monday.
+- **The accounts**, as chips in their colours. A click takes an account out of every page; at least
+  one stays chosen. While no chip is taken out the query names no account, which means every
+  account the history knows, including one no longer stored. As soon as a chip is taken out the
+  query names the remaining stored accounts, so accounts no longer stored fall out too.
+- **The host**, when the history holds more than one: All hosts, or one. Every page except Forecast
+  follows it. A missing host list is a banner, and the pages still show every host.
+
+The range, the excluded chips, the host and the tab are remembered. The address names a page
+(`statistics/forecast`); without a page name the area keeps the last one chosen.
+
+**An empty range.** A page whose range holds no record at all shows no chart of zeros. It says
+`Nothing recorded yet.` or, when the history has any record, `Nothing recorded yet. seatswap has
+been recording since {date}.` with the date as `Mon 9 Nov`. This is one marker from `stats::empty`,
+the same on every page except Forecast. The Forecast is a plan for every account and host, not a
+range; without a reading of every account it says `the forecast needs a reading of every account
+first` instead.
+
+**Definitions every page uses.**
+
+- **Local time.** Every clock hour, day, week, weekday and curve point is in this computer's local
+  time zone, also for records from another host. The Activity lanes and the Rhythm heat map take
+  the hours of the week in this host's local time for every host.
+- **A calendar week** is Monday 00:00 local to the next Monday 00:00 local. A page shows every
+  calendar week its range touches; a partial week counts as one.
+- **One window per account and calendar week.** A finished `weekly_all` window belongs to the
+  calendar week of its midpoint, its end minus 3.5 days, and a range chooses the windows whose
+  midpoints fall inside it. If several hosts recorded the same window (same account, same end), the
+  history keeps the one with the latest last reading. If one account has two windows whose
+  midpoints fall in one week because its reset moved, only the window with the later end is kept.
+- **The price of a window** is the account's monthly price at the window's midpoint: the last
+  `PriceChanged` at or before it, or the first change when the midpoint lies before all of them, or
+  the stored price when there is no change. It counts only in the currency it was entered in, as in
+  §11.5.
+- **Used, paid and expired money.** One percent of a week is worth `pv(price) = price × 12 / 52 /
+  100` in the display currency. The money paid for a week is `100 × pv`, one week's share of the
+  monthly price. What expired is `max(0, 100 − final percent) × pv`, the history's `lost`; what was
+  used is the rest, `paid − expired`. A window above 100 % therefore expired nothing. A week
+  without a price is left out of every money sum — the account's other, priced weeks still count —
+  and the Overview and Subscriptions pages name that account under "No price for …".
+- **Blocked hours.** A block is counted only while its account was the account in use on that host,
+  and only in the working hours of the rhythm of the four weeks before the range's end: an hour of
+  the week whose learned work is above zero. A block that is still open at the range's end counts
+  up to it. Blocks of every limit kind count (weekly, session and per-model). Two hosts blocked at
+  the same time each have their own span, so each machine's blocked time is shown.
+- **Avoidable hours.** The part of the blocked hours in which another stored account with its
+  auto-burn switch on was not blocked on that host and had a finished weekly window running that
+  ended with something expired. The rest of the blocked hours is not avoidable: no other
+  auto-burn account had expired quota running then, or it was blocked on that host too.
+- **Switches** are the `Switch` events of the range and host, by who made them: *you* (the tray or
+  the pop-up), *cli* (`seatswap use`), *auto* (auto-burn), *agent* (a call by an agent), and
+  *external* (a change seatswap noticed but did not make).
+
+**Overview.** Five numbers for the range:
+
+- **Used**: the money used of the priced account weeks, with the money paid for them below it.
+- **Expired unused**: the money that expired, split per account, largest first.
+- **Blocked**: the working hours in which the account in use was blocked.
+- **Avoidable**: the part of those hours in which another account's quota expired.
+- **Switches**: by you, cli, auto, agents and external, and what one switch costs this host's
+  account in use at the range's end as a percent of its 5 h window (the measured cost of §2.13);
+  `—` when the cost or the rates are missing.
+
+Below them, every calendar week of the range carries two stacked bars in money: one stacked in the
+accounts' colours with the expired part hatched on top, and one splitting the projects'
+subscription value among the projects (the three largest, the rest as *other*). The hours blocked
+stand under each week, and the marks say when an account was added and when auto-burn was switched
+on or off. Beside them, "Share that expired, per week" is one line: the expired money over the paid
+money of that week's priced weeks; a week without a priced week has no point. "What the numbers say"
+holds at most four sentences, in this order, each only when it has data:
+
+1. `{abbr} is where most money expired: {amount} in {n} weeks.` — the account with the largest
+   expired money, if above zero; only with a currency.
+2. `You were blocked {h} in {n} weeks; {a} of them while other quota expired.`
+3. `Since auto-burn ({date}): {h} blocked a week, {e} expired. Before: {h0}, {e0}.` — from the latest
+   `AutoBurnSet { on: true }` in the range that stayed on, with a full week before and after it.
+4. `{abbr} was full in {n} of {m} weeks.` — the account with the most weeks at 100 %.
+
+**Weeks.** Every window as a grid: one row per account, one column per calendar week. A cell is
+filled up to its final percent, the rest is hatched; a week before the account existed is empty, not
+zero. Next to the rows stands the account's percent now from its newest reading, and a row below
+the grid holds the hours blocked per week. One curve per stored account shows its weekly percent
+over the last 14 days; a reset is a drop to 0 at the earlier window's reset when that lies between
+two readings, else at the later reading. The page opens on the summary of the newest finished week
+of the range when it has one.
+
+- **The summary of a week** (a click on a week's date): used as a percent of what was paid and in
+  money, expired in money, the hours blocked, the switches by who made them, the money used per
+  account, the three projects with the largest share of the week's API value (then *other*), the
+  week's tokens and API value, and the change of the used money against the week before (`—` when
+  either week has no priced account week). Its conclusion has at most three sentences:
+  `No hour blocked.` or `{h} blocked.`; then the account week with the largest expired share — `{abbr}
+  came closest to expiring unused: {n} left at its reset.` under 10 %, else `{n} of {abbr}'s week
+  expired, {money}.` when a currency is set; then `Auto-burn held back {n} planned
+  {switch|switches}, {m} {minute|minutes} in total.` when switches of the week carry a waited time.
+- **The detail of a window** (a click on a cell): used and expired in percent and money; the first
+  weekly block of that account inside the window (`reached 100 %`) and the working hours blocked
+  after it; how many finished session windows of the account ended inside it with some use; how
+  many switches went into or out of the account and how many of them were auto-burn's; the age of
+  the last reading before the reset; whether the window is marked uncertain (seatswap was off at the
+  reset); and the week's curve, built from the account's weekly readings inside the window that name
+  its reset.
+
+**Projects and organizations.** A tree table with three levels: organization → project → folder.
+An organization's row comes first; its projects follow by API value, and a project's folders appear
+under it when it has more than one. A folder is the first path part below the project's root on
+that host (the common parent of the project's folders), or the top folder. The second view is the
+plain folder tree without organization rows; either view opens and closes its rows. Every row shows
+its tokens, its share of the page's API value, its subscription value and API value, a bar split by
+account, and its distinct sessions.
+
+- **Organization × account** is the subscription value per organization and account, in the stored
+  accounts' order. For an organization linked to its own subscription it carries the sentence
+  `{abbr} is {org}'s subscription. It covered {n} of the work for {org}.`; below 100 % it adds
+  ` The rest ran on {others}: {amount} of their value.` when another account carried some, and, when
+  that account's subscription also carried work for other organizations,
+  `The other way round: {abbr} carried {amount} of work for {orgs}.`
+- **A project's detail** (a click on a project row): its tokens, the share of answers that came from
+  agents, each host's share of its API value, its subscription and API values, its output tokens per
+  calendar week and model, and its distinct sessions. A folder key belongs to one host: with All
+  hosts chosen, the detail of that key counts every host's folder of that name; with one host chosen,
+  only that host's.
+- **Tokens per percent** of each account is its output tokens of its finished weeks over the sum of
+  those weeks' final percents. A fall means use that left no transcript, such as claude.ai, the
+  phone, Claude Desktop or a host without the shared history. The page says that such use is in the
+  percent but in no project, and how many tokens have no known account at all.
+- The page also names the models whose API value is missing because they have no price, and the
+  tokens that have no subscription value with the reasons. It does not merge two projects with the
+  same name: their keys differ.
+
+**Subscriptions.** One bar per subscription period that overlaps the range: from the account's
+`AccountAdded` (or its first record) to its `AccountRemoved`, split at every plan and price change.
+A period that still runs has no end; its price is the price at the period's start. The rows follow,
+one per account, stored accounts first and accounts no longer stored after them:
+
+| Column | What it is |
+|---|---|
+| Plan, price | the plan and monthly price of the account's latest period that overlaps the range; without one, the stored account's plan and price, or for an account no longer stored its latest window record's plan and the price at the range's end |
+| Since | the start of its first period in the whole history, or its `addedAt` without one |
+| Weeks | its finished account weeks in the range |
+| Average used | the mean final percent of those weeks (`—` without a week) |
+| Expired | the mean expired percent and the expired money (`—` without a week or a price) |
+| Full | the weeks at 100 % out of all its weeks |
+| Blocked on it | the working hours blocked while it was the account in use |
+| At API prices · × paid | the API value of its records of the range, and that over the paid money of its weeks; `—` when a record has no value or a week has no price |
+| Verdict | *Too early* under 4 weeks; *Mostly unused* when the average is under 40 %; *Regularly full* when at least half its weeks were full; else *Well used* |
+
+- **What if without it** (a click on a row): each calendar week of the range is replayed twice, with
+  every account and without that one. The replay is the simulator of §2.8 with the recorded work and
+  the **lazy** rule — auto-burn switches only when the account in use is full. The switching rule
+  that was set in a week is not in the history, so it cannot be replayed per week. The extra blocked
+  work of a week is turned into hours with the replay's typical working hour, and the page never
+  reports fewer hours than were recorded. It shows the hours blocked instead of the recorded number,
+  the money expired instead of the recorded expired money, the money paid for that account's weeks
+  of the range ("saved on the price"), one sentence, and the blocked hours per week as it was and
+  without the account. Expired money is `recorded + (replay without − replay with)`; a week with no
+  price is left out. Without enough history — no learned rate for an account with a reading in the
+  range — it says `Not enough history yet to replay this.`, gives no replayed number, and keeps the
+  recorded numbers beside the sentence. A reading from an account the store no longer holds refuses
+  the replay too: `{abbr} is no longer stored, so this range cannot be replayed.`
+
+**Forecast.** The latest plan of every account and every host, so it follows neither the range, the
+account chips nor the host choice. Each time the page loads it uses the plan reading kept from the
+auto-burn runtime, which is at most 20 minutes old; it says how many weeks of history that plan
+reads. Below it:
+
+- **Four numbers**: the money expected to expire this week with auto-burn's plan as it is set now
+  (eager when early switching pays, else lazy), the same when switching only when an account is full
+  (the lazy plan), the working hours the plan has no usable account, and the switches planned with
+  each of the two rules.
+- **Per account**: the weekly percent now; the percent the plan expects at its reset (`100 − the
+  plan's unused percent`); the low of its last 8 finished windows; when the plan first has it full;
+  its next reset; and what switching only when full would leave unused, in percent and money.
+- **The low** is this week's percent now plus the second-lowest gain of its last 8 finished windows,
+  at most 100. A window's gain is its final percent minus the percent of the newest weekly reading
+  at or before `end − d` that names the window's reset, where `d` is the time from now to the reset
+  the plan plays the account to. A window without such a reading is left out; with fewer than four
+  gains there is no low.
+- **The sentence**: while an account auto-burn may use has no rates it starts
+  `Still learning how fast {abbrs} is used. ` Then either `Enough for the week.`, or
+  `All accounts full from {weekday HH:MM} to the end of the forecast.`, or
+  `All accounts full from {weekday HH:MM} until {abbr} resets {weekday HH:MM}.` when the gap ends at
+  that account's reset, else `All accounts full from {weekday HH:MM} until {abbr} is usable again
+  {weekday HH:MM}.` A reopened 5 h window is not a reset.
+- **The lanes** are the next 7 days, one row per account: the stretches the plan plays it, its
+  weekly reset as a mark, and the stretches where no account is usable. Times are local.
+
+**Rhythm.** A heat map of 7 weekdays × 24 clock hours: the output tokens of each hour of the week,
+averaged over the range's calendar weeks (a partial week counts as one), all chosen hosts together.
+Below it, per weekday: the distinct local hours with tokens divided by the number of calendar weeks
+("working hours per week"), and the blocked working hours of that weekday divided by the same
+number. Auto-burn and the Forecast plan with this picture; an hour that usually has work counts as
+a working hour.
+
+**Activity.** Every chosen host gets a lane over the last 168 local hours, ending with the hour that
+holds the range's end. Each hour is one of four states, decided in this order:
+
+| State | Rule |
+|---|---|
+| Work | the hour holds token records of that host |
+| Idle | no tokens, but an `up` record in that hour |
+| Off | no tokens and no `up`, but the hour lies at or after the host's first `up` record: seatswap was not running, the machine was off or asleep |
+| Unknown | before the host's first `up` record, or without one |
+
+An hour's tooltip holds its output tokens per model, its sessions and the project that used most;
+the strip below each lane shows how many sessions worked in that hour. On top, per host: hours
+working, on but idle, off and not known, the tokens of the whole range and their two values, and
+the whole range's output tokens over the working hours of the last 7 days; the highest hour of the
+range is all chosen hosts together. A switch picks what the hour bars measure: tokens (per model) ·
+subscription value · API value (the two values exist per hour only). Below the lanes: output tokens
+per day for the last 14 days, one bar per host; one row per calendar week with its working hours per
+host, tokens and their two values, sessions, and the project and folder that used most; and the
+largest sessions of the range, at most 20, by output tokens, with project, host, model, hours worked,
+tokens and their two values, and agents. The minutes sessions waited for you per local day come from
+the `Waited` events; they follow the host choice but no account chip, because a wait names no
+account.
+
+**What is not built here.** Of the proposals of §3.10, "Tokens per percent, over time" and "Time
+sessions waited for you" are on these pages (Subscriptions and Activity). "What auto-burn did" and
+"Where tokens are lost" are not built and stay proposals.
 
 ---
 

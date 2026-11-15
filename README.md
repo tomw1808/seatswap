@@ -34,10 +34,10 @@ read or write that yet.
 
 - **One-click switch** from the tray menu or the pop-up, or `seatswap use AC`. Running Claude
   Code sessions pick up the new login on their next request.
-- **A large window with Sessions and Settings.** The gear in the pop-up (or `,`) opens a full
-  window: Sessions, Statistics, Status line and Settings. Sessions and Settings are there now —
-  every setting, plus the account editor that used to sit in the pop-up; Statistics and Status line
-  come with a later version. `seatswap window [AREA]` opens it from a terminal, and so do the
+- **A large window with Sessions, Statistics and Settings.** The gear in the pop-up (or `,`) opens
+  a full window: Sessions, Statistics, Status line and Settings. Sessions, Statistics and Settings
+  are there now — every setting, plus the account editor that used to sit in the pop-up; Status line
+  comes with a later version. `seatswap window [AREA]` opens it from a terminal, and so do the
   tray's *Settings…* and *Open seatswap…*. Every control saves at once.
 - **The Sessions area.** It shows every running Claude Code session on this host and, through the
   shared history folder, on your other hosts: live, with its agents to any depth, its tokens and
@@ -45,6 +45,12 @@ read or write that yet.
   top, two groupings and a card for what a switch would cost the running sessions. It updates by
   itself (at most twice a second) and needs *Read Claude Code's session files* (on by default);
   turning it on takes effect after a restart.
+- **The Statistics area.** Seven pages over the recorded history, for a range from this week to
+  all of it, with account chips and a host choice: Overview (what was used, expired, blocked and
+  switched), Weeks (a grid of every account's week, with a summary per week and the detail of one
+  window), Projects and organizations (where the subscriptions went), Subscriptions with "what if"
+  (what dropping an account would have changed), Forecast (the latest plan for the next 7 days),
+  Rhythm (when your week is worked) and Activity (when each host worked, idled or was off).
 - **Money.** seatswap shows what tokens and subscriptions are worth: API prices from
   [models.dev](https://models.dev) and the dollar rate from
   [Frankfurter](https://frankfurter.dev), each kept with its dates, so past days keep the price of

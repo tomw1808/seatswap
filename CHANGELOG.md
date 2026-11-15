@@ -27,6 +27,8 @@ All notable changes to this project are documented here. The format follows
   level.
 - A large window with the Settings area: every setting, the account editor (abbreviation, colour,
   label, price, auto-burn) and the History and hosts view, with each control saving at once.
+- Statistics (Overview, Weeks with a summary per week, Projects and organizations, Subscriptions
+  with "what if", Forecast, Rhythm, Activity).
 - Money: a currency, each account's monthly price, API prices from models.dev and the dollar rate
   from Frankfurter, both kept with their dates; *Look up prices and the dollar rate* switches both
   look-ups off.
