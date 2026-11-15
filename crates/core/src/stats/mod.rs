@@ -9,12 +9,14 @@ use serde::{Deserialize, Serialize};
 use crate::api::LimitKind;
 use crate::burn::{rates, Rhythm, RHYTHM_WEEKS};
 use crate::history::{
-    AccountRef, Event, EventKind, HistoryDir, HistoryError, Hosted, Hosts, Range, Record, Sample,
-    SessionRecord, TokenRecord, UpRecord, WindowRecord,
+    AccountRef, By, Event, EventKind, HistoryDir, HistoryError, Hosted, Hosts, Range, Record,
+    Sample, SessionRecord, TokenRecord, UpRecord, WindowRecord,
 };
-use crate::money::{Fx, Missing, MoneyError, Prices, Valuer};
+use crate::money::{percent_value, Fx, Missing, MoneyError, Prices, Valuer};
 use crate::projects::{Projects, ProjectsLogRecord};
 use crate::store::{Account, Settings};
+
+pub mod overview;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StatsError {
@@ -126,6 +128,17 @@ pub fn account_weeks(ctx: &Ctx, range: &Range, q: &Query) -> Result<Vec<AccountW
         ctx.settings,
         ctx.accounts,
     )?;
+    account_weeks_valued(ctx, range, q, &valuer)
+}
+
+/// [`account_weeks`] with a [`Valuer`] the caller already built for the same
+/// range, so a page that values token records too builds only one.
+pub(crate) fn account_weeks_valued(
+    ctx: &Ctx,
+    range: &Range,
+    q: &Query,
+    valuer: &Valuer,
+) -> Result<Vec<AccountWeek>, StatsError> {
     let mut weeks = Vec::new();
     for hosted in ctx.history.finished_windows(&Range::ALL, &Hosts::All)? {
         let window = hosted.record;
@@ -160,6 +173,185 @@ pub fn account_weeks(ctx: &Ctx, range: &Range, q: &Query) -> Result<Vec<AccountW
         });
     }
     Ok(weeks)
+}
+
+/// The switches of the range by who made them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SwitchCounts {
+    pub user: u32,
+    pub cli: u32,
+    pub auto: u32,
+    pub agent: u32,
+    pub external: u32,
+}
+
+/// The `Switch` events of `range`, only of `host` when it is set, by their
+/// `by`.
+pub(crate) fn switch_counts(
+    events: &[Hosted<Event>],
+    range: &Range,
+    host: Option<&str>,
+) -> SwitchCounts {
+    let mut counts = SwitchCounts::default();
+    for hosted in events {
+        let at = hosted.record.t;
+        if at < range.from || at >= range.to {
+            continue;
+        }
+        if host.is_some_and(|host| host != hosted.host) {
+            continue;
+        }
+        let EventKind::Switch { by, .. } = &hosted.record.kind else {
+            continue;
+        };
+        match by {
+            By::User => counts.user += 1,
+            By::Cli => counts.cli += 1,
+            By::Auto => counts.auto += 1,
+            By::Agent => counts.agent += 1,
+            By::External => counts.external += 1,
+        }
+    }
+    counts
+}
+
+/// The calendar weeks of `range`: Monday 00:00 local of the week that holds
+/// `range.from`, then every seven days while the start is before `range.to`.
+pub(crate) fn week_columns(range: &Range, offset: FixedOffset) -> Vec<DateTime<Utc>> {
+    let mut columns = Vec::new();
+    let mut week = week_start(range.from, offset);
+    while week < range.to {
+        columns.push(week);
+        week += Duration::weeks(1);
+    }
+    columns
+}
+
+/// The blocked hours of `spans` per calendar week: a span is split at every
+/// week start it crosses and each part counts the working hours it has.
+pub(crate) fn blocked_by_week(
+    spans: &[BlockedSpan],
+    rhythm: &Rhythm,
+    offset: FixedOffset,
+) -> BTreeMap<DateTime<Utc>, f64> {
+    let mut by_week = BTreeMap::new();
+    for span in spans {
+        let mut cursor = span.from;
+        while cursor < span.to {
+            let week = week_start(cursor, offset);
+            let end = (week + Duration::weeks(1)).min(span.to);
+            *by_week.entry(week).or_insert(0.0) += working_hours(cursor, end, rhythm, offset);
+            cursor = end;
+        }
+    }
+    by_week
+}
+
+/// The money of one account week: a full window is `paid`, the share that
+/// expired is `expired` and the rest is `used`. `None` without a price; a
+/// weekly window without `lost` is an error (the history always writes it).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct WindowMoney {
+    pub(crate) used: f64,
+    pub(crate) paid: f64,
+    pub(crate) expired: f64,
+}
+
+/// The money of a weekly window, from its `lost` percent and its price:
+/// `expired = lost × pv`, `paid = 100 × pv`, `used = paid − expired`.
+pub(crate) fn money_of(week: &AccountWeek) -> Result<Option<WindowMoney>, StatsError> {
+    let lost = lost_percent(&week.window)?;
+    let Some(price) = week.price else {
+        return Ok(None);
+    };
+    let pv = percent_value(price);
+    let paid = 100.0 * pv;
+    let expired = lost * pv;
+    Ok(Some(WindowMoney {
+        used: paid - expired,
+        paid,
+        expired,
+    }))
+}
+
+/// The `lost` percent of a weekly window; a window without it is an error,
+/// because seatswap always writes it.
+pub(crate) fn lost_percent(window: &WindowRecord) -> Result<f64, StatsError> {
+    window.lost.ok_or_else(|| {
+        StatsError::Message(format!(
+            "the weekly window of {} ending {} has no lost percent; seatswap always writes it",
+            window.account.acc, window.end
+        ))
+    })
+}
+
+/// The account week of `account` whose window holds `t`.
+pub(crate) fn week_of_record<'a>(
+    weeks: &'a [AccountWeek],
+    account: &AccountRef,
+    t: DateTime<Utc>,
+) -> Option<&'a AccountWeek> {
+    weeks.iter().find(|week| {
+        &week.account == account && week.window.weekly_start() <= t && t < week.window.end
+    })
+}
+
+/// The id a page writes for `reference`: the stored account's id, or the
+/// reference's account id when it is no longer stored.
+pub(crate) fn account_id(ctx: &Ctx, reference: &AccountRef) -> String {
+    stored_account(ctx, reference)
+        .map(|account| account.id.clone())
+        .unwrap_or_else(|| reference.acc.clone())
+}
+
+/// Money as the page writes it (`crates/app/ui/common.js`'s `money`): two
+/// decimals below 10 (`8.31 EUR`), else whole units with thousands commas
+/// (`19 EUR`, `1,204 EUR`).
+pub(crate) fn money_text(amount: f64, currency: &str) -> String {
+    let value = (amount * 100.0).round() / 100.0;
+    if value < 10.0 {
+        format!("{value:.2} {currency}")
+    } else {
+        format!("{} {currency}", thousands(value.round() as i64))
+    }
+}
+
+/// A whole number with a comma every three digits: `1204` → `1,204`.
+fn thousands(whole: i64) -> String {
+    let digits = whole.unsigned_abs().to_string();
+    let mut text = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            text.push(',');
+        }
+        text.push(digit);
+    }
+    if whole < 0 {
+        format!("-{text}")
+    } else {
+        text
+    }
+}
+
+/// Hours with at most one decimal and no `.0`: `2 h`, `0.5 h`.
+pub(crate) fn hours_text(hours: f64) -> String {
+    if (hours * 10.0).round() % 10.0 == 0.0 {
+        format!("{} h", hours.round() as i64)
+    } else {
+        format!("{hours:.1} h")
+    }
+}
+
+/// A percent, whole: `27 %`.
+pub(crate) fn percent_text(percent: f64) -> String {
+    format!("{} %", percent.round() as i64)
+}
+
+/// A date in local time: `12 Nov`.
+pub(crate) fn date_text(t: DateTime<Utc>, offset: FixedOffset) -> String {
+    let local = t.with_timezone(&offset);
+    format!("{} {}", local.day(), local.format("%b"))
 }
 
 /// A stretch in which the account in use on a host was blocked, cut at every

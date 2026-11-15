@@ -866,7 +866,7 @@ impl Valuer {
             return;
         }
         let end = record.end;
-        let start = record.start.unwrap_or(end - Duration::days(7));
+        let start = record.weekly_start();
         let index = self.window_index(&record.account, start, end);
         let window = &mut self.windows[index];
         window.used = Some(record.final_percent);

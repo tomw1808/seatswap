@@ -199,6 +199,15 @@ pub struct WindowRecord {
     pub uncertain: bool,
 }
 
+impl WindowRecord {
+    /// A weekly window's start: the recorded `start`, or seven days before its
+    /// `end` when the record has none. This is the rule the value of a token
+    /// record and the pages use to find the window that holds it.
+    pub fn weekly_start(&self) -> DateTime<Utc> {
+        self.start.unwrap_or(self.end - chrono::Duration::days(7))
+    }
+}
+
 impl Record for WindowRecord {
     const KIND: Kind = Kind::Windows;
 
