@@ -112,11 +112,18 @@ function finite(value) {
   return typeof value === "number" && Number.isFinite(value);
 }
 
+// A time as milliseconds. An unreadable time is an error that names the value,
+// never a point, block or mark quietly left out.
 function timeOf(value) {
   if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (value instanceof Date) return value.getTime();
-  const time = Date.parse(String(value));
-  return Number.isNaN(time) ? null : time;
+  if (value instanceof Date) {
+    const time = value.getTime();
+    if (!Number.isNaN(time)) return time;
+  } else {
+    const time = Date.parse(String(value));
+    if (!Number.isNaN(time)) return time;
+  }
+  throw new Error(`invalid time ${value instanceof Date ? String(value) : JSON.stringify(value)}`);
 }
 
 function clampPercent(value) {
@@ -132,7 +139,6 @@ function timeBounds(series) {
       if (!Array.isArray(point) || point.length < 2) continue;
       if (point[1] === null || point[1] === undefined) continue;
       const time = timeOf(point[0]);
-      if (time === null) continue;
       if (min === null || time < min) min = time;
       if (max === null || time > max) max = time;
     }
@@ -145,7 +151,7 @@ function timeBounds(series) {
 // out rather than guessed.
 function markPosition(at, columnTimes) {
   const time = timeOf(at);
-  if (time === null || columnTimes.length === 0) return null;
+  if (columnTimes.length === 0) return null;
   let index = columnTimes.findIndex((value) => value > time);
   if (index < 0) index = columnTimes.length;
   return `${(index / columnTimes.length) * 100}%`;
@@ -155,9 +161,13 @@ function markLayer(marks, leftOf, className) {
   if (!Array.isArray(marks) || marks.length === 0) return null;
   const layer = h("div", { class: className || "chart-marks" });
   for (const mark of marks) {
-    if (!mark || mark.at === undefined) continue;
+    if (!mark || mark.at === undefined) {
+      throw new Error(`a mark needs its time, not ${JSON.stringify(mark)}`);
+    }
     const left = leftOf(mark.at);
-    if (left === null) continue;
+    if (left === null) {
+      throw new Error(`cannot place the mark ${JSON.stringify(mark.label)}: the chart has no time axis`);
+    }
     const line = h("div", { class: "chart-mark", style: { left } });
     // A label at the chart's edge is aligned inwards so it stays inside its box.
     const percent = Number.parseFloat(left);
@@ -227,9 +237,7 @@ export function stackedColumns({ columns, marks } = {}) {
     body.appendChild(col);
   }
 
-  const columnTimes = columns
-    .map((column) => timeOf(column.at))
-    .filter((time) => time !== null);
+  const columnTimes = columns.map((column) => timeOf(column.at));
   const layer = markLayer(marks, (at) => markPosition(at, columnTimes), "chart-marks chart-marks-cols");
   // The marks come after the columns so their labels lie above them, as in the
   // mock-up (Task 8, part 3, item 7).
@@ -295,7 +303,6 @@ export function lines({ series, yMax, marks, ySuffix, yDecimals, yFormat } = {})
     const points = (Array.isArray(entry.points) ? entry.points : [])
       .filter((point) => Array.isArray(point) && point.length >= 2)
       .map((point) => ({ time: timeOf(point[0]), value: point[1] }))
-      .filter((point) => point.time !== null)
       .sort((a, b) => a.time - b.time);
 
     let segment = [];
@@ -586,7 +593,7 @@ export function lanes({ lanes, from, to, ticks } = {}) {
   if (!Array.isArray(lanes)) throw new Error("lanes needs a list of lanes");
   const start = timeOf(from);
   const end = timeOf(to);
-  if (start === null || end === null || end <= start) {
+  if (end <= start) {
     throw new Error("lanes needs a from before its to");
   }
   const xOf = (time) => clampPercent(((time - start) / (end - start)) * 100);
@@ -597,7 +604,7 @@ export function lanes({ lanes, from, to, ticks } = {}) {
   const axisTrack = h("div", { class: "chart-lanes-track" });
   for (const tick of Array.isArray(ticks) ? ticks : []) {
     const at = timeOf(tick && tick.at !== undefined ? tick.at : tick);
-    if (at === null || at < start || at > end) continue;
+    if (at < start || at > end) continue;
     const mark = h("span", {
       class: "chart-lanes-tick",
       style: { left: `${xOf(at)}%` },
@@ -622,10 +629,14 @@ export function lanes({ lanes, from, to, ticks } = {}) {
     const track = h("div", { class: "chart-lanes-track" });
     const blocks = Array.isArray(lane.blocks) ? lane.blocks : [];
     for (const [index, block] of blocks.entries()) {
-      if (!Array.isArray(block) || block.length < 2) continue;
+      if (!Array.isArray(block) || block.length < 2) {
+        throw new Error(`a lane block is a from and a to, not ${JSON.stringify(block)}`);
+      }
       const blockStart = timeOf(block[0]);
       const blockEnd = timeOf(block[1]);
-      if (blockStart === null || blockEnd === null || blockEnd <= blockStart) continue;
+      if (blockEnd <= blockStart) {
+        throw new Error(`a lane block ends before it starts: ${JSON.stringify(block)}`);
+      }
       // A block shorter than the axis's width still gets a visible sliver.
       const left = xOf(Math.max(start, blockStart));
       const width = Math.max(0.35, xOf(Math.min(end, blockEnd)) - left);
@@ -639,7 +650,7 @@ export function lanes({ lanes, from, to, ticks } = {}) {
     const marks = Array.isArray(lane.marks) ? lane.marks : [];
     for (const [index, mark] of marks.entries()) {
       const at = timeOf(mark);
-      if (at === null || at < start || at > end) continue;
+      if (at < start || at > end) continue;
       const line = h("u", { style: { left: `${xOf(at)}%` } });
       const tip = Array.isArray(lane.markTips) ? lane.markTips[index] : undefined;
       attachTip(line, tip);
@@ -707,7 +718,20 @@ export function hours({ lanes, days } = {}) {
     const strip = h("div", { class: "chart-hours-strip" });
     for (let index = 0; index < count; index += 1) {
       const cell = Array.isArray(lane.cells) ? lane.cells[index] : undefined;
-      const state = cell && typeof cell.state === "string" ? cell.state : "unknown";
+      const state = cell && cell.state;
+      if (typeof state !== "string" || state === "") {
+        const laneName =
+          lane.label !== undefined && lane.label !== null
+            ? typeof lane.label === "string"
+              ? lane.label
+              : lane.label.textContent
+            : "?";
+        throw new Error(
+          `an hour cell has no state: ${JSON.stringify(state)} (lane ${JSON.stringify(
+            laneName
+          )}, hour ${index})`
+        );
+      }
       const node = h("div", { class: `chart-hours-cell chart-hours-${state}` });
       const stack = h("div", { class: "chart-hours-stack" });
       for (const segment of Array.isArray(cell && cell.stack) ? cell.stack : []) {

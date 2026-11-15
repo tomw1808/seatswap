@@ -976,7 +976,7 @@ const SESSION_PROJECTS = {
   atlas: "github.com/sam/atlas",
   "acme-kb": "github.com/acme/acme-kb",
   ledger: "github.com/sam/ledger",
-  seatswap: "github.com/sam/seatswap",
+  notes: "github.com/sam/notes",
 };
 
 function fixtureTokenCounts(million) {
@@ -1211,7 +1211,7 @@ function fixtureSessionRows() {
   staleSonnetAgents[0].running = true;
   staleSonnetAgents[0].last = null;
   const ledgerAgents = fixtureFinishedAgents("ledger-02", "vega", 1, () => 0.05);
-  const s47Agents = fixtureFinishedAgents("seatswap-47", "atlas", 2, (index) =>
+  const s47Agents = fixtureFinishedAgents("notes-47", "atlas", 2, (index) =>
     index === 0 ? 0.6 : 0.5
   );
   s47Agents[0].task = "research a usage endpoint";
@@ -1255,8 +1255,8 @@ function fixtureSessionRows() {
     make("ledger-c1", "ledger", "atlas", "idle", "gpt-6-astra", isoIn(-35 * 60000), 0.4, 0, 0, 0, [], {
       provider: "Codex",
     }),
-    make("seatswap-47", "seatswap", "atlas", "busy", "claude-fable-5-2", isoIn(-6 * 60000), 5.3, 1.2, 0, 2, s47Agents, { tied: true }),
-    make("seatswap-b9", "seatswap", "atlas", "idle", null, isoIn(-19 * 3600000), 0, 0, 0, 0, []),
+    make("notes-47", "notes", "atlas", "busy", "claude-fable-5-2", isoIn(-6 * 60000), 5.3, 1.2, 0, 2, s47Agents, { tied: true }),
+    make("notes-b9", "notes", "atlas", "idle", null, isoIn(-19 * 3600000), 0, 0, 0, 0, []),
   ];
   if (fixtureWantsAgents400()) {
     rows.push(

@@ -140,7 +140,7 @@ export async function show(container, env) {
   side.appendChild(
     h("p", {
       class: "stats-note",
-      text: "Auto-burn and the forecast plan with this picture: an hour that is usually coloured counts as a working hour.",
+      text: "Auto-burn and the Forecast use the last 4 weeks before now, of every host: an hour that is usually coloured counts as a working hour.",
     })
   );
 }

@@ -1317,6 +1317,9 @@ button.link:hover {
   width: 24px;
   height: 24px;
   border-radius: 7px;
+  /* The tray's grey for an unknown or invalid account colour (common.js TRAY_GREY). */
+  background: #555b66;
+  color: #fff;
   font-size: 10px;
   font-weight: 700;
   vertical-align: -5px;
@@ -2201,6 +2204,8 @@ details[open] > summary .sess-car {
   height: 18px;
   padding: 0 5px;
   border-radius: 5px;
+  background: var(--button-bg);
+  color: var(--text);
   font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.02em;

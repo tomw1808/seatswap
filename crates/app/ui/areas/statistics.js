@@ -56,6 +56,7 @@ const state = {
   accounts: [],
   hosts: null,
   hostError: null,
+  choiceError: null,
   range: "thisWeek",
   excluded: new Set(),
   host: "*",
@@ -124,6 +125,7 @@ function writeExcluded() {
 }
 
 function reconcileExcluded(excluded, accounts, keepAtLeastOne) {
+  state.choiceError = null;
   const known = new Set(accounts.map((view) => view.id));
   const next = new Set();
   for (const id of excluded) {
@@ -131,7 +133,10 @@ function reconcileExcluded(excluded, accounts, keepAtLeastOne) {
     else console.warn(`[statistics] dropped the kept account ${JSON.stringify(id)}: it is no longer stored`);
   }
   if (keepAtLeastOne && accounts.length > 0 && next.size >= accounts.length) {
-    console.warn("[statistics] the kept account choice leaves no account; using all accounts");
+    // The stored choice would leave no account at all. It is reset, and the
+    // area shows that in its error banner: never a silent fallback.
+    state.choiceError =
+      "the kept account choice leaves no account; every account is shown again";
     next.clear();
   }
   return next;
@@ -299,6 +304,7 @@ function selectRange(id) {
 
 function toggleAccount(id) {
   if (!state.accounts.some((view) => view.id === id)) return;
+  state.choiceError = null;
   const chosen = chosenIds();
   if (chosen.includes(id) && chosen.length === 1) return;
   if (state.excluded.has(id)) state.excluded.delete(id);
@@ -376,6 +382,11 @@ function showHostError() {
   state.errorHost.appendChild(banner("error", "⚠", state.hostError));
 }
 
+function showChoiceError() {
+  if (state.choiceError === null) return;
+  state.errorHost.appendChild(banner("error", "⚠", state.choiceError));
+}
+
 async function loadPage() {
   if (!state.active || !state.pageHost) return;
   hideTip();
@@ -383,6 +394,7 @@ async function loadPage() {
   clear(state.errorHost);
   state.query = buildQuery();
   showHostError();
+  showChoiceError();
 
   let module;
   try {
@@ -536,6 +548,7 @@ export function unmount() {
   state.accounts = [];
   state.hosts = null;
   state.hostError = null;
+  state.choiceError = null;
   state.excluded = new Set();
   state.query = null;
   state.accountKey = "";

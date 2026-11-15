@@ -217,10 +217,14 @@ export async function show(container, env) {
     const average = h("span", { class: "stats-sub-cell-wide" });
     const bar = h("span", { class: "stats-ubar" });
     if (typeof row.avgUsed === "number") {
-      if (row.avgUsed < 0 || row.avgUsed > 100) {
-        throw new Error(`the average used ${row.avgUsed} is not a percent`);
+      if (!Number.isFinite(row.avgUsed) || row.avgUsed < 0) {
+        throw new Error(`the average used ${String(row.avgUsed)} is not a percent`);
       }
-      bar.appendChild(h("i", { style: { width: `${row.avgUsed}%`, background: color } }));
+      // A window above 100 % exists (C3-2): the bar is full, the number beside
+      // it is written as it is.
+      bar.appendChild(
+        h("i", { style: { width: `${Math.min(100, row.avgUsed)}%`, background: color } })
+      );
     }
     average.appendChild(bar);
     node.appendChild(average);
@@ -298,7 +302,7 @@ export async function show(container, env) {
     whatHead.appendChild(
       h("span", {
         class: "x11 mf",
-        text: "replayed with the same working hours and the switching rule of each week",
+        text: "replayed with the same working hours, switching only at 100 %",
       })
     );
   }

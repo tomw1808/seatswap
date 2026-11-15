@@ -193,16 +193,52 @@ function pad(number) {
   return String(number).padStart(2, "0");
 }
 
-// One of the pages' KPI boxes: the label, the value (text or a node such as an
-// amount), an optional sub-line, the whole card's tip and an optional class on
-// the value. The statistics pages share this one box.
-function kpi(label, value, sub, tip, valueClass) {
-  const node = h("div", { class: "stats-kpi" }, [
-    h("span", { class: "stats-kpi-label", text: label }),
-    h("span", { class: `stats-kpi-value${valueClass ? ` ${valueClass}` : ""}` }, value),
-    sub ? h("span", { class: "stats-kpi-sub" }, sub) : null,
-  ]);
-  node.title = tip;
+// One KPI box of the large window: the label, the value (text or a node such as
+// an amount), an optional sub-line, the whole box's tip and optional classes.
+// The areas differ only in their CSS prefix (`stats` or `sess`); everything
+// else is this one helper. A box kept across an update is changed with its
+// `update`, never rebuilt.
+function kpi(label, value, sub, tip, valueClass, options) {
+  const config = isObject(options) ? options : {};
+  const prefix = typeof config.prefix === "string" ? config.prefix : "stats";
+  const labelNode = h("span", { class: `${prefix}-kpi-label` });
+  const valueNode = h("span", { class: `${prefix}-kpi-value` });
+  const subNode = h("span", { class: `${prefix}-kpi-sub`, hidden: true });
+  const node = h("div", { class: `${prefix}-kpi` }, [labelNode, valueNode, subNode]);
+
+  function setContent(container, content) {
+    if (content instanceof Node) {
+      if (container.firstChild !== content || container.childNodes.length !== 1) {
+        clear(container);
+        container.appendChild(content);
+      }
+      return;
+    }
+    if (Array.isArray(content)) {
+      clear(container);
+      appendChildren(container, content);
+      return;
+    }
+    const text = content === null || content === undefined ? "" : String(content);
+    if (container.textContent !== text) container.textContent = text;
+  }
+
+  function update(nextLabel, nextValue, nextSub, nextTip, nextValueClass, nextSubClass) {
+    labelNode.textContent = String(nextLabel);
+    valueNode.className = `${prefix}-kpi-value${nextValueClass ? ` ${nextValueClass}` : ""}`;
+    setContent(valueNode, nextValue);
+    subNode.className = `${prefix}-kpi-sub${nextSubClass ? ` ${nextSubClass}` : ""}`;
+    setContent(subNode, nextSub);
+    subNode.hidden =
+      nextSub === null ||
+      nextSub === undefined ||
+      nextSub === "" ||
+      (Array.isArray(nextSub) && nextSub.filter(Boolean).length === 0);
+    node.title = nextTip === null || nextTip === undefined ? "" : String(nextTip);
+  }
+
+  node.update = update;
+  update(label, value, sub, tip, valueClass, config.subClass);
   return node;
 }
 
@@ -632,22 +668,73 @@ function amountTip(value, currency) {
   return text;
 }
 
-// The tip of one `Values` half (spec §1.4, §3.6). `scope` names the span the
-// number covers ("in the range", "in this hour"), so two numbers of different
-// spans never look alike. A missing half carries the struct's own reason; a
-// missing currency carries the settings' reason. The pages draw the number
-// itself with `amountNode(values.api, values.apiCurrency)` and the other half
-// with `values.currency`.
+// The two halves of a `Values` struct (spec §1.4, §3.6): the amount, its
+// currency and the struct's own reason when the amount is missing.
+function valuePart(values, unit) {
+  if (unit !== "api" && unit !== "subscription") {
+    throw new Error(`unknown value unit ${JSON.stringify(unit)}`);
+  }
+  const api = unit === "api";
+  return {
+    amount: api ? values.api : values.subscription,
+    currency: api ? values.apiCurrency : values.currency,
+    missing: api ? values.apiMissing : values.subscriptionMissing,
+  };
+}
+
+// One `Values` half as text: the money in its own currency, or "—" with the
+// reason as the title. `viewCurrency` is the currency the page's column header
+// names: an amount in it leaves the currency to the header, another currency
+// is written beside the amount.
+function valueText(values, unit, viewCurrency) {
+  if (!isObject(values)) {
+    return { text: "—", title: "the view has no value for this row" };
+  }
+  const part = valuePart(values, unit);
+  if (part.missing !== null && part.missing !== undefined) {
+    return { text: "—", title: String(part.missing) };
+  }
+  if (part.amount === null || part.amount === undefined) {
+    return { text: "—", title: "the value is missing without a reason" };
+  }
+  const text = amountText(part.amount, part.currency);
+  if (text === "—") {
+    return { text, title: "no currency set in Settings" };
+  }
+  if (
+    typeof viewCurrency === "string" &&
+    part.currency === viewCurrency &&
+    text.endsWith(` ${part.currency}`)
+  ) {
+    return { text: text.slice(0, -(part.currency.length + 1)), title: "" };
+  }
+  return { text, title: "" };
+}
+
+// Both halves of `Values` as one line for a KPI's sub-line: "1.23 EUR
+// subscription · 4.56 USD at API prices"; a missing half carries its reason.
+function valueSummary(values) {
+  if (!isObject(values)) return "no values in the view";
+  const parts = [];
+  for (const [unit, label] of [
+    ["subscription", "subscription"],
+    ["api", "at API prices"],
+  ]) {
+    const value = valueText(values, unit, null);
+    parts.push(`${value.text}${value.title ? ` (${value.title})` : ""} ${label}`);
+  }
+  return parts.join(" · ");
+}
+
+// The tip of one `Values` half. `scope` names the span the number covers ("in
+// the range", "in this hour"), so two numbers of different spans never look
+// alike. A missing half carries the struct's own reason; a missing currency
+// carries the settings' reason.
 function valueTip(values, unit, scope) {
   const span = scope ? ` ${scope}` : "";
+  const value = valueText(values, unit, null);
   const label = unit === "api" ? "API value" : "Subscription value";
-  const missing = unit === "api" ? values.apiMissing : values.subscriptionMissing;
-  if (missing !== null && missing !== undefined) {
-    return `${label}${span}: — (${missing})`;
-  }
-  const amount = unit === "api" ? values.api : values.subscription;
-  const currency = unit === "api" ? values.apiCurrency : values.currency;
-  return `${label}${span}: ${amountTip(amount, currency)}`;
+  return `${label}${span}: ${value.text}${value.title ? ` (${value.title})` : ""}`;
 }
 
 // The snapshot's account view for an id, or null when the snapshot has none.
@@ -656,10 +743,11 @@ function accountView(views, id) {
   return views.find((view) => isObject(view) && view.id === id) || null;
 }
 
-// The name of an account on the statistics pages, as data: its abbreviation in
-// the account's colour, its label as the title; an id the snapshot does not know
-// (an account no longer stored) is its first eight characters, titled with the
-// full id.
+// The name of an account, as data: its abbreviation in the account's colour,
+// its label as the title; an id the snapshot does not know (an account no
+// longer stored) is its first eight characters, titled with the full id. A
+// missing or invalid colour leaves the background to the area's class, as
+// `.sess-acc` and `.stats-acc` name it.
 function accountLabel(views, id) {
   if (typeof id !== "string" || id === "") {
     throw new Error(`an account name needs an account id, not ${JSON.stringify(id)}`);
@@ -672,9 +760,7 @@ function accountLabel(views, id) {
   return {
     text: abbr || id.slice(0, 8),
     title: known ? [abbr, label].filter(Boolean).join(" · ") || id : id,
-    style: color
-      ? { background: color, color: contrastText(color) }
-      : { background: "var(--button-bg)", color: "var(--text)" },
+    style: color ? { background: color, color: contrastText(color) } : null,
   };
 }
 
@@ -684,10 +770,12 @@ function accountNameText(views, id) {
   return accountLabel(views, id).text;
 }
 
-function accountName(views, id) {
+// The one account tag of the window. `className` lets an area keep its own
+// class where the CSS differs (Sessions' `sess-acc`, Statistics' `stats-acc`).
+function accountName(views, id, className) {
   const spec = accountLabel(views, id);
   return h("span", {
-    class: "stats-acc",
+    class: className || "stats-acc",
     text: spec.text,
     title: spec.title,
     style: spec.style,
@@ -934,6 +1022,8 @@ export {
   amountText,
   amountNode,
   amountTip,
+  valueText,
+  valueSummary,
   valueTip,
   accountView,
   accountLabel,

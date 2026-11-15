@@ -7,17 +7,18 @@
 // `time_texts` command; durations are counted here from the view's times.
 
 import {
-  MODEL_NAMES,
-  TRAY_GREY,
+  accountName,
   clear,
-  contrastText,
   errorMessage,
   h,
   isActiveView,
   isObject,
-  money,
+  kpi,
+  modelName,
   readChoice,
   tokens,
+  valueSummary,
+  valueText,
   writeChoice,
 } from "../common.js";
 
@@ -133,14 +134,6 @@ function options() {
 
 function plural(count, one, many) {
   return `${count} ${count === 1 ? one : many}`;
-}
-
-function modelName(model) {
-  if (!model) return "no answers yet";
-  if (MODEL_NAMES[model]) return MODEL_NAMES[model];
-  const match = /^claude-([a-z]+)-(\d+)-(\d+)$/.exec(model);
-  if (!match) return model;
-  return `${match[1].charAt(0).toUpperCase()}${match[1].slice(1)} ${match[2]}.${match[3]}`;
 }
 
 // "A and B"; three or more: "A, B and C".
@@ -273,34 +266,6 @@ function otherHostStale(row) {
   return view.hosts.find((host) => host.host === row.host) || null;
 }
 
-function amountText(amount, currency) {
-  if (typeof currency !== "string" || !/^[A-Z]{3}$/.test(currency)) {
-    return typeof amount === "number" && Number.isFinite(amount) ? String(amount) : "";
-  }
-  const text = money(amount, currency);
-  const space = text.lastIndexOf(" ");
-  return space < 0 ? text : text.slice(0, space);
-}
-
-function valueText(values, kind, viewCurrency) {
-  if (!isObject(values)) {
-    return { text: "—", title: "the view has no value for this row" };
-  }
-  const api = kind === "api";
-  const amount = api ? values.api : values.subscription;
-  const missing = api ? values.apiMissing : values.subscriptionMissing;
-  const currency = api ? values.apiCurrency : values.currency;
-  if (amount === null || amount === undefined) {
-    return {
-      text: "—",
-      title: missing || "the value is missing without a reason",
-    };
-  }
-  let text = amountText(amount, currency || viewCurrency);
-  if (currency && currency !== viewCurrency) text += ` ${currency}`;
-  return { text, title: typeof missing === "string" ? missing : "" };
-}
-
 function valueNode(values, kind, viewCurrency, className) {
   const value = valueText(values, kind, viewCurrency);
   return h(
@@ -308,24 +273,6 @@ function valueNode(values, kind, viewCurrency, className) {
     { class: className || "n", title: value.title || null },
     value.text
   );
-}
-
-function valueSummary(values, viewCurrency) {
-  if (!isObject(values)) return "no values in the view";
-  const parts = [];
-  if (values.subscription !== null && values.subscription !== undefined) {
-    const currency = values.currency || viewCurrency || "";
-    parts.push(`${amountText(values.subscription, currency)} ${currency} subscription`);
-  } else {
-    parts.push(`subscription: ${values.subscriptionMissing || "missing without a reason"}`);
-  }
-  if (values.api !== null && values.api !== undefined) {
-    const currency = values.apiCurrency || viewCurrency || "";
-    parts.push(`${amountText(values.api, currency)} ${currency} at API prices`);
-  } else {
-    parts.push(`API: ${values.apiMissing || "missing without a reason"}`);
-  }
-  return parts.join(" · ");
 }
 
 function tokenNode(count, className) {
@@ -985,7 +932,9 @@ function accountInUse() {
   return snapshot.views.find((view) => isActiveView(view, snapshot)) || null;
 }
 
-function accountNode() {
+// The KPI's "In use" value: the shared account tag, the account's label and
+// its weekly percent. The tag itself is common.js's `accountName`.
+function inUseNode() {
   const account = accountInUse();
   if (!account) {
     if (state.accountKey === "none" && state.accountValue) return state.accountValue;
@@ -996,17 +945,12 @@ function accountNode() {
   const key = JSON.stringify(account);
   if (state.accountKey === key && state.accountValue) return state.accountValue;
   state.accountKey = key;
-  const inUse = typeof account.id === "string" ? account.id : "";
-  const color = typeof account.color === "string" ? account.color : TRAY_GREY;
-  const chip = h(
-    "span",
-    {
-      class: "sess-acc",
-      style: { background: color, color: contrastText(color) },
-    },
-    account.abbr || account.label || inUse
-  );
-  const label = account.label || account.abbr || inUse;
+  const views =
+    isObject(state.snapshot) && Array.isArray(state.snapshot.views)
+      ? state.snapshot.views
+      : [account];
+  const chip = accountName(views, account.id, "sess-acc");
+  const label = account.label || account.abbr || account.id || "";
   const limits =
     account.usage && Array.isArray(account.usage.limits) ? account.usage.limits : [];
   const weekly = limits.find((limit) => isObject(limit) && limit.kind === "weekly_all");
@@ -1016,33 +960,6 @@ function accountNode() {
       : "";
   state.accountValue = h("span", { class: "sess-inuse" }, [chip, ` ${label}${percent}`]);
   return state.accountValue;
-}
-
-// One KPI cell, built once and updated with its texts; an event does not
-// rebuild the band.
-function kpiEntry() {
-  const label = h("span", { class: "sess-kpi-label" });
-  const value = h("span", { class: "sess-kpi-value" });
-  const sub = h("span", { class: "sess-kpi-sub", hidden: true });
-  const node = h("div", { class: "sess-kpi" }, [label, value, sub]);
-  return { node, label, value, sub };
-}
-
-function updateKpi(entry, label, value, sub, valueClass, subClass) {
-  if (entry.label.textContent !== label) entry.label.textContent = label;
-  entry.value.className = `sess-kpi-value${valueClass ? ` ${valueClass}` : ""}`;
-  if (value instanceof Node) {
-    if (entry.value.firstChild !== value || entry.value.childNodes.length !== 1) {
-      clear(entry.value);
-      entry.value.appendChild(value);
-    }
-  } else if (entry.value.textContent !== value) {
-    entry.value.textContent = value;
-  }
-  const text = sub === null || sub === undefined ? "" : String(sub);
-  entry.sub.className = `sess-kpi-sub${subClass ? ` ${subClass}` : ""}`;
-  entry.sub.hidden = text === "";
-  if (entry.sub.textContent !== text) entry.sub.textContent = text;
 }
 
 function renderKpis() {
@@ -1079,40 +996,40 @@ function renderKpis() {
   const closedCount = view.sessions.filter((row) => isClosed(row)).length;
 
   if (!state.kpis) {
-    state.kpis = Array.from({ length: 7 }, () => kpiEntry());
-    for (const entry of state.kpis) state.kpiHost.appendChild(entry.node);
+    state.kpis = Array.from({ length: 7 }, () =>
+      kpi("", "", null, null, null, { prefix: "sess" })
+    );
+    for (const entry of state.kpis) state.kpiHost.appendChild(entry);
   }
   const kpis = state.kpis;
-  updateKpi(
-    kpis[0],
+  kpis[0].update(
     "Running",
     String(running.length),
     hosts.size === 1 ? "on 1 host" : `on ${hosts.size} hosts`
   );
-  updateKpi(
-    kpis[1],
+  kpis[1].update(
     "Busy",
     String(busy.length),
     waiting.length ? `${waiting.length} waiting for you` : "",
+    "",
     "pri",
     waiting.length ? "warn" : ""
   );
-  updateKpi(kpis[2], "Agents", `${agentsRunning} running`, `${completedToday} completed today`);
-  updateKpi(
-    kpis[3],
+  kpis[2].update("Agents", `${agentsRunning} running`, `${completedToday} completed today`);
+  kpis[3].update(
     `${view.sessions.length === 1 ? "Total of the 1 session" : `Total of the ${view.sessions.length} sessions`}${closedCount ? ` · ${closedCount} closed` : ""}`,
     all ? `${tokens(all.tokens.out)} tokens` : "no sum in the view",
-    all ? valueSummary(all.values, view.currency) : ""
+    all ? valueSummary(all.values) : ""
   );
-  updateKpi(kpis[4], "Last hour", all ? tokens(all.lastHour.out) : "no sum in the view", "");
-  updateKpi(
-    kpis[5],
+  kpis[4].update("Last hour", all ? tokens(all.lastHour.out) : "no sum in the view", "");
+  kpis[5].update(
     "Thinking tied to the account",
     String(tied.length),
     tiedSubText,
+    "",
     tied.length ? "warn" : ""
   );
-  updateKpi(kpis[6], "In use", accountNode(), "");
+  kpis[6].update("In use", inUseNode(), "");
 }
 
 // ---------------------------------------------------------------------------
