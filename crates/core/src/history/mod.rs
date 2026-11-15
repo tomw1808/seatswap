@@ -20,7 +20,9 @@ use crate::store::{Account, Settings};
 mod read;
 mod write;
 
-pub use read::{export_csv, export_json, HostInfo, Hosted, Hosts, Range, Read};
+pub use read::{
+    export_csv, export_json, HostConflict, HostInfo, Hosted, Hosts, Imported, Range, Read,
+};
 pub use write::{closed_windows, sample_of, Recorder};
 
 #[derive(Debug, thiserror::Error)]
@@ -51,10 +53,6 @@ pub enum HistoryError {
     Paths(#[from] PathsError),
     #[error("{} does not exist", path.display())]
     NoFolder { path: PathBuf },
-    #[error(
-        "two machines use the host name {host}; give one of them another name under History and hosts"
-    )]
-    HostConflict { host: String },
     #[error("a {kind:?} record is too long: its line with the newline is more than 4096 bytes")]
     LineTooLong { kind: Kind },
     #[error("a {kind:?} record holds a number that is not finite")]
@@ -449,10 +447,11 @@ impl HistoryDir {
         &self.root
     }
 
-    /// The subfolders that hold a `host.json`, sorted. A name that is not a
+    /// Every subfolder of the root whose name follows `paths::host_name`'s rule,
+    /// sorted, whether or not it holds a `host.json`. A name that is not a
     /// valid, already-lower-case host name (a sync service's conflict copy) is
-    /// not a host.
-    pub fn hosts(&self) -> Result<Vec<String>, HistoryError> {
+    /// not a host folder.
+    fn host_folders(&self) -> Result<Vec<String>, HistoryError> {
         let entries = match fs::read_dir(&self.root) {
             Ok(entries) => entries,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -483,20 +482,6 @@ impl HistoryDir {
             if !is_dir {
                 continue;
             }
-            let marker = path.join("host.json");
-            let has_marker = match fs::metadata(&marker) {
-                Ok(metadata) => metadata.is_file(),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(source) => {
-                    return Err(HistoryError::Io {
-                        path: marker,
-                        source,
-                    })
-                }
-            };
-            if !has_marker {
-                continue;
-            }
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
@@ -508,6 +493,28 @@ impl HistoryDir {
             }
         }
         hosts.sort();
+        Ok(hosts)
+    }
+
+    /// The subfolders that hold a `host.json`, sorted. A name that is not a
+    /// valid, already-lower-case host name (a sync service's conflict copy) is
+    /// not a host.
+    pub fn hosts(&self) -> Result<Vec<String>, HistoryError> {
+        let mut hosts = Vec::new();
+        for host in self.host_folders()? {
+            let marker = self.root.join(&host).join("host.json");
+            match fs::metadata(&marker) {
+                Ok(metadata) if metadata.is_file() => hosts.push(host),
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(HistoryError::Io {
+                        path: marker,
+                        source,
+                    })
+                }
+            }
+        }
         Ok(hosts)
     }
 
@@ -550,31 +557,16 @@ impl HistoryDir {
         machine_id: &str,
         machine_id_file: &Path,
     ) -> Result<(), HistoryError> {
-        let text = match fs::read_to_string(marker) {
-            Ok(text) => text,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                let text = format!("{{\"machineId\":\"{machine_id}\"}}");
-                return atomic::write_atomic(marker, text.as_bytes(), Access::Private).map_err(
-                    |source| HistoryError::Io {
-                        path: marker.to_path_buf(),
-                        source,
-                    },
-                );
-            }
-            Err(source) => {
-                return Err(HistoryError::Io {
+        let Some(held) = read_marker(marker)? else {
+            let text = format!("{{\"machineId\":\"{machine_id}\"}}");
+            return atomic::write_atomic(marker, text.as_bytes(), Access::Private).map_err(
+                |source| HistoryError::Io {
                     path: marker.to_path_buf(),
                     source,
-                })
-            }
+                },
+            );
         };
-        let held: HostMarker =
-            serde_json::from_str(&text).map_err(|source| HistoryError::Json {
-                path: marker.to_path_buf(),
-                line: source.line(),
-                source,
-            })?;
-        if held.machine_id.trim() != machine_id {
+        if held.machine_id != machine_id {
             return Err(HistoryError::HostTaken {
                 host: self.host.clone(),
                 folder: self.root.join(&self.host),
@@ -589,6 +581,29 @@ impl HistoryDir {
 struct HostMarker {
     #[serde(rename = "machineId")]
     machine_id: String,
+}
+
+/// The marker of a host folder, or `None` when its `host.json` is not there.
+/// The id is trimmed; a file that does not parse is an error naming it.
+fn read_marker(path: &Path) -> Result<Option<HostMarker>, HistoryError> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(HistoryError::Io {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
+    };
+    let mut marker: HostMarker =
+        serde_json::from_str(&text).map_err(|source| HistoryError::Json {
+            path: path.to_path_buf(),
+            line: source.line(),
+            source,
+        })?;
+    marker.machine_id = marker.machine_id.trim().to_string();
+    Ok(Some(marker))
 }
 
 fn read_or_create_machine_id(app: &AppPaths) -> Result<String, HistoryError> {
@@ -1528,8 +1543,9 @@ mod tests {
         vega.append(&an_up(utc("2026-11-14T07:00:00Z"))).unwrap();
         mark_host(there.path(), "vega");
 
-        let copied = own.import(there.path()).unwrap();
-        assert_eq!(copied, vec!["vega"]);
+        let imported = own.import(there.path()).unwrap();
+        assert_eq!(imported.copied, vec!["vega"]);
+        assert!(imported.conflicts.is_empty());
         assert_eq!(
             folder_files(&here.path().join("atlas")),
             before,
@@ -1547,7 +1563,7 @@ mod tests {
         );
 
         // A second run copies nothing more.
-        assert!(own.import(there.path()).unwrap().is_empty());
+        assert!(own.import(there.path()).unwrap().copied.is_empty());
     }
 
     #[test]
@@ -1562,11 +1578,14 @@ mod tests {
                     {\"t\":\"2026-11-14T09:00:00Z\"}\n{\"t\":\"2026-11-14T10:00:00Z\"}\n\
                     {\"t\":\"2026-11-14T11:00:00Z\"}\n";
         fs::create_dir_all(here.path().join("vega")).unwrap();
+        // Both sides say this is this machine, so the longer file may replace
+        // the shorter one; a folder without a marker would be a conflict.
+        mark_host(here.path(), "vega");
         fs::create_dir_all(there.path().join("vega")).unwrap();
         fs::write(here.path().join("vega/up-2026-11.jsonl"), two).unwrap();
         fs::write(there.path().join("vega/up-2026-11.jsonl"), five).unwrap();
 
-        assert_eq!(own.import(there.path()).unwrap(), vec!["vega"]);
+        assert_eq!(own.import(there.path()).unwrap().copied, vec!["vega"]);
         assert_eq!(
             fs::read_to_string(here.path().join("vega/up-2026-11.jsonl")).unwrap(),
             five
@@ -1574,7 +1593,7 @@ mod tests {
 
         // The other way round: the longer file here stays.
         fs::write(there.path().join("vega/up-2026-11.jsonl"), two).unwrap();
-        assert!(own.import(there.path()).unwrap().is_empty());
+        assert!(own.import(there.path()).unwrap().copied.is_empty());
         assert_eq!(
             fs::read_to_string(here.path().join("vega/up-2026-11.jsonl")).unwrap(),
             five
@@ -1627,9 +1646,14 @@ mod tests {
         ledger.append(&an_up(utc("2026-11-14T06:00:00Z"))).unwrap();
         mark_host(there.path(), "ledger");
 
-        let error = own.import(there.path()).expect_err("two machines use vega");
+        let imported = own
+            .import(there.path())
+            .expect("a conflict is reported, not an error");
+        assert_eq!(imported.copied, vec!["ledger"]);
+        assert_eq!(imported.conflicts.len(), 1);
+        assert_eq!(imported.conflicts[0].host, "vega");
         assert_eq!(
-            error.to_string(),
+            imported.conflicts[0].reason,
             "two machines use the host name vega; give one of them another name under History and hosts"
         );
         assert_eq!(
@@ -1641,6 +1665,84 @@ mod tests {
             here.path().join("ledger/up-2026-11.jsonl").is_file(),
             "the other hosts are still copied"
         );
+    }
+
+    #[test]
+    fn import_does_not_merge_a_host_without_a_marker() {
+        let here = tempdir().unwrap();
+        let there = tempdir().unwrap();
+        let own = HistoryDir::at(here.path(), "atlas");
+
+        // The `vega` folder is here already, with a line of this machine, but
+        // without a marker: nothing says that the source's vega is the same one.
+        fs::create_dir_all(here.path().join("vega")).unwrap();
+        let mine = "{\"t\":\"2026-11-14T06:00:00Z\"}\n";
+        fs::write(here.path().join("vega/up-2026-11.jsonl"), mine).unwrap();
+        let vega = HistoryDir::at(there.path(), "vega");
+        vega.append(&an_up(utc("2026-11-14T07:00:00Z"))).unwrap();
+        mark_host(there.path(), "vega");
+
+        let imported = own.import(there.path()).unwrap();
+        assert!(imported.copied.is_empty());
+        assert_eq!(imported.conflicts.len(), 1);
+        assert_eq!(imported.conflicts[0].host, "vega");
+        assert_eq!(
+            imported.conflicts[0].reason,
+            format!(
+                "cannot tell whether vega here and in {} are the same machine: {} has no host.json",
+                there.path().display(),
+                here.path().join("vega").display()
+            )
+        );
+        assert_eq!(
+            fs::read_to_string(here.path().join("vega/up-2026-11.jsonl")).unwrap(),
+            mine,
+            "the other machine's vega is never merged in"
+        );
+
+        // The other way round: this side has the marker and the source has none.
+        fs::write(
+            here.path().join("vega/host.json"),
+            "{\"machineId\":\"0b4e7c22-6a1d-4e3f-8c59-2d7a9e1b4f60\"}",
+        )
+        .unwrap();
+        fs::remove_file(there.path().join("vega/host.json")).unwrap();
+        let imported = own.import(there.path()).unwrap();
+        assert!(imported.copied.is_empty());
+        assert_eq!(imported.conflicts.len(), 1);
+        assert_eq!(
+            imported.conflicts[0].reason,
+            format!(
+                "cannot tell whether vega here and in {} are the same machine: {} has no host.json",
+                there.path().display(),
+                there.path().join("vega").display()
+            )
+        );
+    }
+
+    #[test]
+    fn import_matches_a_marker_with_a_trailing_newline() {
+        let here = tempdir().unwrap();
+        let there = tempdir().unwrap();
+        let own = HistoryDir::at(here.path(), "atlas");
+        let id = "0b4e7c22-6a1d-4e3f-8c59-2d7a9e1b4f60";
+        mark_host_with(here.path(), "vega", id);
+        let vega = HistoryDir::at(there.path(), "vega");
+        vega.append(&an_up(utc("2026-11-14T07:00:00Z"))).unwrap();
+        // The source's marker holds the same id with a newline at its end.
+        fs::create_dir_all(there.path().join("vega")).unwrap();
+        fs::write(
+            there.path().join("vega/host.json"),
+            format!("{{\"machineId\":\"{id}\\n\"}}"),
+        )
+        .unwrap();
+
+        let imported = own
+            .import(there.path())
+            .expect("the same machine id, with whitespace");
+        assert_eq!(imported.copied, vec!["vega"]);
+        assert!(imported.conflicts.is_empty());
+        assert!(here.path().join("vega/up-2026-11.jsonl").is_file());
     }
 
     #[test]
@@ -1656,6 +1758,78 @@ mod tests {
             error.to_string(),
             format!("{} does not exist", missing.display())
         );
+    }
+
+    #[test]
+    fn a_window_of_two_hosts_is_read_once_with_the_latest_last_sample() {
+        let dir = tempdir().unwrap();
+        let end = utc("2026-11-16T16:00:00Z");
+        let atlas = HistoryDir::at(dir.path(), "atlas");
+        let mut from_atlas = a_window(end, 61.0);
+        from_atlas.last_sample = utc("2026-11-16T09:58:00Z");
+        atlas.append(&from_atlas).unwrap();
+        let vega = HistoryDir::at(dir.path(), "vega");
+        let mut from_vega = a_window(end, 63.0);
+        from_vega.last_sample = utc("2026-11-16T10:02:00Z");
+        vega.append(&from_vega).unwrap();
+        mark_host(dir.path(), "vega");
+
+        let windows = atlas.finished_windows(&wide_range(), &Hosts::All).unwrap();
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].host, "vega");
+        assert_eq!(windows[0].record.final_percent, 63.0);
+    }
+
+    #[test]
+    fn a_window_of_two_hosts_on_a_tie_uses_the_first_host_name() {
+        let dir = tempdir().unwrap();
+        let end = utc("2026-11-16T16:00:00Z");
+        let atlas = HistoryDir::at(dir.path(), "atlas");
+        let mut from_atlas = a_window(end, 61.0);
+        from_atlas.last_sample = utc("2026-11-16T10:00:00Z");
+        atlas.append(&from_atlas).unwrap();
+        let vega = HistoryDir::at(dir.path(), "vega");
+        let mut from_vega = a_window(end, 63.0);
+        from_vega.last_sample = utc("2026-11-16T10:00:00Z");
+        vega.append(&from_vega).unwrap();
+        mark_host(dir.path(), "vega");
+
+        let windows = atlas.finished_windows(&wide_range(), &Hosts::All).unwrap();
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].host, "atlas");
+        assert_eq!(windows[0].record.final_percent, 61.0);
+    }
+
+    #[test]
+    fn export_writes_a_window_of_two_hosts_once() {
+        let dir = tempdir().unwrap();
+        let end = utc("2026-11-16T16:00:00Z");
+        let atlas = HistoryDir::at(dir.path(), "atlas");
+        let mut from_atlas = a_window(end, 61.0);
+        from_atlas.last_sample = utc("2026-11-16T09:58:00Z");
+        atlas.append(&from_atlas).unwrap();
+        let vega = HistoryDir::at(dir.path(), "vega");
+        let mut from_vega = a_window(end, 63.0);
+        from_vega.last_sample = utc("2026-11-16T10:02:00Z");
+        vega.append(&from_vega).unwrap();
+        mark_host(dir.path(), "vega");
+
+        let mut csv = Vec::new();
+        export_csv(&atlas, &wide_range(), &mut csv).unwrap();
+        let csv = String::from_utf8(csv).unwrap();
+        let windows: Vec<&str> = csv
+            .lines()
+            .filter(|line| line.starts_with("window,"))
+            .collect();
+        assert_eq!(windows.len(), 1, "{csv}");
+        assert!(windows[0].contains(",63,"), "{csv}");
+
+        let mut json = Vec::new();
+        export_json(&atlas, &wide_range(), &mut json).unwrap();
+        let json: Value = serde_json::from_slice(&json).unwrap();
+        let windows = json["windows"].as_array().unwrap();
+        assert_eq!(windows.len(), 1, "{json}");
+        assert_eq!(windows[0]["percent"], 63.0);
     }
 
     #[test]

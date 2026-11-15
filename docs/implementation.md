@@ -2030,24 +2030,37 @@ without a row.
 ```rust
 pub struct HostInfo { pub host: String, pub this_host: bool, pub first_record: Option<DateTime<Utc>>,
     pub last_record: Option<DateTime<Utc>>, pub bytes: u64 }
+pub struct Imported { pub copied: Vec<String>, pub conflicts: Vec<HostConflict> }
+pub struct HostConflict { pub host: String, pub reason: String }
 impl HistoryDir {
     /// One entry per host folder under the root, this host's own included when it is still
     /// empty, sorted by host. `first_record` is the first record of the oldest file of any kind;
     /// `last_record` the newest `up` or `samples` line; `bytes` the folder's size.
     pub fn host_infos(&self) -> Result<Vec<HostInfo>, HistoryError>;
+    /// The window records of the range, one per (account, kind, end within `same_reset`): the
+    /// record with the latest `lastSample` counts (spec §1.5), a tie goes to the host name that
+    /// sorts first, so read order does not decide. Sorted by end, then account.
+    pub fn finished_windows(&self, range: &Range, hosts: &Hosts)
+        -> Result<Vec<Hosted<WindowRecord>>, HistoryError>;
     /// Copy every file of `from`'s host folders that is missing here or longer there; keep a
     /// longer file; never read or write this host's folder; refuse this folder and a folder
-    /// without a host folder; a host whose `host.json` names another machine is HostConflict.
-    /// Returns the hosts at least one file was copied for, sorted.
-    pub fn import(&self, from: &Path) -> Result<Vec<String>, HistoryError>;
+    /// without a host folder. A host folder that is not here yet is copied as it is. One that
+    /// is here is copied only when both sides' `host.json` name this machine; another machine
+    /// id, or no `host.json` on either side, is a conflict ("cannot tell whether …"), and
+    /// nothing of that folder is copied. A read or write error stops the whole import; a
+    /// conflict does not. Returns what was copied and the conflicts, both sorted by host.
+    pub fn import(&self, from: &Path) -> Result<Imported, HistoryError>;
 }
 pub fn export_csv(history: &HistoryDir, range: &Range, out: &mut dyn Write) -> Result<(), HistoryError>;
 pub fn export_json(history: &HistoryDir, range: &Range, out: &mut dyn Write) -> Result<(), HistoryError>;
 ```
 
-The export has one row per `WindowRecord` (`kind: "window"`, account, org, limit, model, start, end,
-percent) and one per UTC day and project key (`kind: "tokens"`, `dayUtc`, `project` as
-`repo:<id>`/`folder:<id>`, input, output, cacheWrite, cacheRead). CSV writes the header
+The export has one row per window — windows that several hosts recorded are one row, the
+record with the latest `lastSample` winning (from `finished_windows`) — and one per UTC day and
+project key (`kind: "tokens"`, `dayUtc`, `project` as `repo:<id>`/`folder:<id>`, input, output,
+cacheWrite, cacheRead). Both formats make their rows once through the same function: every
+window first, then the token rows month by month, so memory holds one month of token records
+plus the rows. CSV writes the header
 `kind,account,org,limit,model,start,end,percent,day_utc,project,input,output,cache_write,cache_read`
 and then the rows, quoting per RFC 4180; JSON writes `{"windows":[…],"dailyTokens":[…]}` with
 camelCase fields. A project's shown name is never exported; a name changes, the key does not.
@@ -2077,7 +2090,7 @@ async fn skill_install(state, force: bool) -> Result<SkillRow, String>;
 // history
 struct HistoryView { host: String, dir: String, hosts: Vec<HostInfo>, bytes: u64,
     saved_host: Option<String>, saved_dir: Option<String> }
-struct ImportResult { copied: Vec<String>, view: HistoryView }
+struct ImportResult { copied: Vec<String>, conflicts: Vec<HostConflict>, view: HistoryView }
 async fn history_view(state) -> Result<HistoryView, String>;
 async fn history_import(state, from: String) -> Result<ImportResult, String>;
 async fn history_export(state, format: String, to: String,
@@ -2132,7 +2145,9 @@ pub(crate) enum ExportFormat { Csv, Json }
   standard output; the days are UTC days, `--to` inclusive (the range ends at the next midnight),
   either end open when absent, `--from` after `--to` is a usage error.
 - `seatswap history import <folder>`: `~` is expanded, the folder must be absolute; prints
-  `copied <host>` per host at least one file was copied for, or `nothing new`.
+  `copied <host>` per host at least one file was copied for, or `nothing new`, then
+  `conflict <host>: <reason>` per conflict, and exits with an error when there was one (after
+  printing what was copied).
 
 The gate for an agent: `window` is refused like `panel` (`AGENTS_MAY_NOT_CHANGE`); `prices` follows
 `agentsRead`, and `--refresh` is refused even with it on (it writes `prices.json`); `history export`

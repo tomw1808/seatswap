@@ -20,8 +20,8 @@ use tauri::{
 use seatswap_core::atomic::{self, Access};
 use seatswap_core::engine::PollReason;
 use seatswap_core::history::{
-    export_csv, export_json, By, Event, EventKind, HistoryDir, HostInfo, Hosts, Range,
-    SessionRecord,
+    export_csv, export_json, By, Event, EventKind, HistoryDir, HostConflict, HostInfo, Hosts,
+    Range, SessionRecord,
 };
 use seatswap_core::money::ModelPrice;
 use seatswap_core::projects::{ProjectEdit, Projects, ProjectsLogRecord};
@@ -958,11 +958,12 @@ pub(crate) struct HistoryView {
     saved_dir: Option<String>,
 }
 
-/// What an import copied and the folder afterwards.
+/// What an import copied, the hosts it refused, and the folder afterwards.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ImportResult {
     copied: Vec<String>,
+    conflicts: Vec<HostConflict>,
     view: HistoryView,
 }
 
@@ -1037,9 +1038,13 @@ pub(crate) async fn history_import(
             from.display()
         ));
     }
-    let copied = history.import(&from).map_err(|error| error.to_string())?;
+    let imported = history.import(&from).map_err(|error| error.to_string())?;
     let view = history_view_for(&state, &history)?;
-    Ok(ImportResult { copied, view })
+    Ok(ImportResult {
+        copied: imported.copied,
+        conflicts: imported.conflicts,
+        view,
+    })
 }
 
 /// The range an export covers: `from` inclusive, `until` exclusive, either end

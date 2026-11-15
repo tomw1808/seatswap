@@ -110,6 +110,7 @@ const state = {
   exportResult: "",
   importFolder: "",
   importResult: "",
+  importConflicts: [],
 };
 
 // A snapshot read before a save landed must not undo it: while saves are
@@ -2602,11 +2603,20 @@ function importRow() {
   input.addEventListener("input", () => {
     state.importFolder = input.value;
   });
-  const result = h("span", { class: "mf", text: state.importResult });
+  const noteLines = [];
+  if (state.importResult !== "") noteLines.push(state.importResult);
+  noteLines.push(...state.importConflicts);
+  const noteChildren = [];
+  for (const line of noteLines) {
+    if (noteChildren.length > 0) noteChildren.push(h("br"));
+    noteChildren.push(line);
+  }
+  const result = h("span", { class: "mf" }, noteChildren);
   const run = async () => {
     const from = String(state.importFolder || "").trim();
     if (from === "") {
       state.importResult = "";
+      state.importConflicts = [];
       result.textContent = "";
       fieldError("historyImport", "enter a folder path");
       return;
@@ -2617,15 +2627,29 @@ function importRow() {
       if (
         !isObject(reply) ||
         !Array.isArray(reply.copied) ||
+        !Array.isArray(reply.conflicts) ||
         !isObject(reply.view)
       ) {
         throw new Error("history_import returned an unexpected reply");
       }
+      for (const conflict of reply.conflicts) {
+        if (
+          !isObject(conflict) ||
+          typeof conflict.host !== "string" ||
+          typeof conflict.reason !== "string"
+        ) {
+          throw new Error("history_import returned an unexpected reply");
+        }
+      }
       state.history = reply.view;
       state.importResult =
         reply.copied.length === 0 ? "nothing new" : `copied: ${reply.copied.join(", ")}`;
+      state.importConflicts = reply.conflicts.map(
+        (conflict) => `conflict ${conflict.host}: ${conflict.reason}`
+      );
     } catch (error) {
       state.importResult = "";
+      state.importConflicts = [];
       result.textContent = "";
       fieldError("historyImport", errorMessage(error));
       return;

@@ -17,8 +17,8 @@ use chrono::{DateTime, NaiveDate, SecondsFormat, TimeZone, Utc};
 use serde::Serialize;
 
 use super::{
-    Event, HistoryDir, HistoryError, HostMarker, Kind, Record, Sample, SessionRecord, TokenRecord,
-    UpRecord, WindowRecord,
+    read_marker, same_reset, Event, HistoryDir, HistoryError, Kind, Record, Sample, SessionRecord,
+    TokenRecord, UpRecord, WindowRecord,
 };
 use crate::atomic::{self, Access};
 use crate::paths;
@@ -46,6 +46,23 @@ pub struct Hosted<R> {
     pub record: R,
 }
 
+/// What an import did: the hosts at least one file was copied for, and the
+/// hosts it refused, each with the reason. Both are sorted by host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Imported {
+    pub copied: Vec<String>,
+    pub conflicts: Vec<HostConflict>,
+}
+
+/// A host folder the import did not copy, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostConflict {
+    pub host: String,
+    pub reason: String,
+}
+
 /// What a range read found, sorted by [`Record::at`] and then by host.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Read<R> {
@@ -71,6 +88,44 @@ impl HistoryDir {
                 .then_with(|| a.host.cmp(&b.host))
         });
         Ok(Read { records, warnings })
+    }
+
+    /// The window records of the range, one per (account, kind, end within
+    /// `same_reset`): the one with the latest `last_sample` counts (spec §1.5).
+    /// On a tie the host name that sorts first wins, so the result does not
+    /// depend on read order. Sorted by end, then account.
+    pub fn finished_windows(
+        &self,
+        range: &Range,
+        hosts: &Hosts,
+    ) -> Result<Vec<Hosted<WindowRecord>>, HistoryError> {
+        let read = self.read::<WindowRecord>(range, hosts)?;
+        let mut windows: Vec<Hosted<WindowRecord>> = Vec::new();
+        for hosted in read.records {
+            let same = windows.iter().position(|kept| {
+                kept.record.account == hosted.record.account
+                    && kept.record.k == hosted.record.k
+                    && same_reset(kept.record.end, hosted.record.end)
+            });
+            let Some(index) = same else {
+                windows.push(hosted);
+                continue;
+            };
+            let kept = &windows[index];
+            let later = hosted.record.last_sample > kept.record.last_sample
+                || (hosted.record.last_sample == kept.record.last_sample
+                    && hosted.host < kept.host);
+            if later {
+                windows[index] = hosted;
+            }
+        }
+        windows.sort_by(|a, b| {
+            a.record
+                .end
+                .cmp(&b.record.end)
+                .then_with(|| a.record.account.cmp(&b.record.account))
+        });
+        Ok(windows)
     }
 
     /// `Hosts::All` is every folder with a `host.json` plus this dir's own host
@@ -346,10 +401,7 @@ impl HistoryDir {
     /// One entry per host folder under the root, this host's own folder
     /// included even when it is still empty, sorted by host name.
     pub fn host_infos(&self) -> Result<Vec<HostInfo>, HistoryError> {
-        let mut hosts = self.hosts()?;
-        if !hosts.iter().any(|host| host == self.host()) {
-            hosts.push(self.host().to_string());
-        }
+        let mut hosts = self.hosts_to_read(&Hosts::All)?;
         hosts.sort();
         let mut infos = Vec::with_capacity(hosts.len());
         for host in hosts {
@@ -436,8 +488,11 @@ impl HistoryDir {
     /// Copy every file of another history folder's host folders that is missing
     /// here or longer there; a file that is longer here is kept. This host's own
     /// folder is never read or written: a host only ever writes its own folder.
-    /// Returns the hosts at least one file was copied for, sorted.
-    pub fn import(&self, from: &Path) -> Result<Vec<String>, HistoryError> {
+    /// A host folder that is not here yet is copied as it is; one that is here
+    /// only when both folders' `host.json` name this machine (otherwise it is a
+    /// conflict, never a merge). A read or write error stops the whole import;
+    /// a conflict does not.
+    pub fn import(&self, from: &Path) -> Result<Imported, HistoryError> {
         match fs::metadata(from) {
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -460,7 +515,7 @@ impl HistoryDir {
             ));
         }
         let source = HistoryDir::at(from, self.host());
-        let hosts = source.hosts()?;
+        let hosts = source.host_folders()?;
         if hosts.is_empty() {
             return Err(failed(
                 from,
@@ -468,44 +523,59 @@ impl HistoryDir {
                 format!("no host folder found in {}", from.display()),
             ));
         }
-        let mut copied = Vec::new();
-        let mut conflict = None;
+        let mut imported = Imported {
+            copied: Vec::new(),
+            conflicts: Vec::new(),
+        };
         for host in hosts {
             if host == self.host() {
                 continue;
             }
-            match self.copy_host(from, &host) {
-                Ok(true) => copied.push(host),
-                Ok(false) => {}
-                Err(HistoryError::HostConflict { host }) => {
-                    // The other hosts are still copied; this one is reported
-                    // after them, never merged with another machine's files.
-                    conflict.get_or_insert(HistoryError::HostConflict { host });
-                }
-                Err(error) => return Err(error),
+            match self.copy_host(from, &host)? {
+                HostImport::Copied => imported.copied.push(host),
+                HostImport::Unchanged => {}
+                HostImport::Conflict(conflict) => imported.conflicts.push(conflict),
             }
         }
-        if let Some(error) = conflict {
-            return Err(error);
-        }
-        copied.sort();
-        Ok(copied)
+        imported.copied.sort();
+        imported.conflicts.sort_by(|a, b| a.host.cmp(&b.host));
+        Ok(imported)
     }
 
-    /// Copy the files of one other host's folder in; `true` when one was copied.
-    fn copy_host(&self, from: &Path, host: &str) -> Result<bool, HistoryError> {
+    /// Copy the files of one other host's folder in.
+    fn copy_host(&self, from: &Path, host: &str) -> Result<HostImport, HistoryError> {
         let from_dir = from.join(host);
         let to_dir = self.root().join(host);
         // A folder here that belongs to another machine is never touched: two
         // machines with the same host name would otherwise merge their files.
-        if let (Some(here), Some(there)) = (
-            host_machine_id(&to_dir.join("host.json"))?,
-            host_machine_id(&from_dir.join("host.json"))?,
-        ) {
-            if here != there {
-                return Err(HistoryError::HostConflict {
-                    host: host.to_string(),
-                });
+        // A folder that is not here yet is copied without asking (an old host
+        // may have no marker).
+        if folder_exists(&to_dir)? {
+            let here = read_marker(&to_dir.join("host.json"))?;
+            let there = read_marker(&from_dir.join("host.json"))?;
+            match (here, there) {
+                (Some(here), Some(there)) if here.machine_id == there.machine_id => {}
+                (Some(_), Some(_)) => {
+                    return Ok(HostImport::Conflict(HostConflict {
+                        host: host.to_string(),
+                        reason: format!(
+                            "two machines use the host name {host}; give one of them another name \
+                             under History and hosts"
+                        ),
+                    }))
+                }
+                (None, _) => {
+                    return Ok(HostImport::Conflict(HostConflict {
+                        host: host.to_string(),
+                        reason: cannot_tell(host, from, &to_dir),
+                    }))
+                }
+                (_, None) => {
+                    return Ok(HostImport::Conflict(HostConflict {
+                        host: host.to_string(),
+                        reason: cannot_tell(host, from, &from_dir),
+                    }))
+                }
             }
         }
         let entries = fs::read_dir(&from_dir).map_err(|source| HistoryError::Io {
@@ -580,8 +650,47 @@ impl HistoryDir {
             })?;
             copied = true;
         }
-        Ok(copied)
+        Ok(if copied {
+            HostImport::Copied
+        } else {
+            HostImport::Unchanged
+        })
     }
+}
+
+/// What copying one host's folder did.
+enum HostImport {
+    Copied,
+    Unchanged,
+    Conflict(HostConflict),
+}
+
+/// Whether a host folder is there, as a folder. A path that is there but is not
+/// a folder cannot hold a host's files.
+fn folder_exists(dir: &Path) -> Result<bool, HistoryError> {
+    match fs::metadata(dir) {
+        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(_) => Err(failed(
+            dir,
+            io::ErrorKind::AlreadyExists,
+            "exists but is not a folder",
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(HistoryError::Io {
+            path: dir.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// The import's conflict reason when one side of a host folder has no
+/// `host.json`: nothing proves the two folders are the same machine.
+fn cannot_tell(host: &str, from: &Path, folder: &Path) -> String {
+    format!(
+        "cannot tell whether {host} here and in {} are the same machine: {} has no host.json",
+        from.display(),
+        folder.display()
+    )
 }
 
 /// The sum of the sizes of the files directly in one host folder; a folder that
@@ -643,24 +752,6 @@ fn failed(path: &Path, kind: io::ErrorKind, text: impl Into<String>) -> HistoryE
         path: path.to_path_buf(),
         source: io::Error::new(kind, text.into()),
     }
-}
-
-/// The machine id in a host folder's `host.json`, or `None` when the file is
-/// not there.
-fn host_machine_id(path: &Path) -> Result<Option<String>, HistoryError> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(HistoryError::Io {
-                path: path.to_path_buf(),
-                source,
-            })
-        }
-    };
-    let marker: HostMarker = serde_json::from_str(&text)
-        .map_err(|source| failed(path, io::ErrorKind::InvalidData, source.to_string()))?;
-    Ok(Some(marker.machine_id))
 }
 
 // ---------------------------------------------------------------------------
@@ -848,10 +939,36 @@ fn token_rows_of_month(
         .collect())
 }
 
-/// The export as CSV: one header line, one `window` line per window record of
-/// the range, one `tokens` line per UTC day and project key, every host. Fields
-/// are quoted RFC 4180 style; a field that does not apply to a line is empty.
-/// Each month is read as it is written, so memory holds one month plus one row.
+/// One row of the export, in the order both formats write them: every window
+/// first, then the token rows.
+enum ExportRow {
+    Window(WindowRow),
+    Tokens(TokenDayRow),
+}
+
+/// The export's rows, made once for both writers: the windows of the range
+/// (one per window, the latest `last_sample` winning; spec §1.5), then the
+/// token rows month by month, so memory holds one month of token records plus
+/// the rows. `emit` writes each row as it arrives.
+fn export_rows(
+    history: &HistoryDir,
+    range: &Range,
+    mut emit: impl FnMut(ExportRow) -> Result<(), HistoryError>,
+) -> Result<(), HistoryError> {
+    for hosted in history.finished_windows(range, &Hosts::All)? {
+        emit(ExportRow::Window(WindowRow::of(hosted.record)))?;
+    }
+    for month in months_in(history, Kind::Tokens, range)? {
+        for row in token_rows_of_month(history, &month)? {
+            emit(ExportRow::Tokens(row))?;
+        }
+    }
+    Ok(())
+}
+
+/// The export as CSV: one header line, one `window` line per window of the
+/// range, one `tokens` line per UTC day and project key, every host. Fields are
+/// quoted RFC 4180 style; a field that does not apply to a line is empty.
 pub fn export_csv(
     history: &HistoryDir,
     range: &Range,
@@ -861,20 +978,14 @@ pub fn export_csv(
         .map_err(|source| export_io(history, source))?;
     out.write_all(b"\n")
         .map_err(|source| export_io(history, source))?;
-    for month in months_in(history, Kind::Windows, range)? {
-        for hosted in history.read::<WindowRecord>(&month, &Hosts::All)?.records {
-            let row = WindowRow::of(hosted.record);
-            out.write_all(csv_line(&row.fields()).as_bytes())
-                .map_err(|source| export_io(history, source))?;
-        }
-    }
-    for month in months_in(history, Kind::Tokens, range)? {
-        for row in token_rows_of_month(history, &month)? {
-            out.write_all(csv_line(&row.fields()).as_bytes())
-                .map_err(|source| export_io(history, source))?;
-        }
-    }
-    Ok(())
+    export_rows(history, range, |row| {
+        let line = match row {
+            ExportRow::Window(row) => csv_line(&row.fields()),
+            ExportRow::Tokens(row) => csv_line(&row.fields()),
+        };
+        out.write_all(line.as_bytes())
+            .map_err(|source| export_io(history, source))
+    })
 }
 
 /// The same rows as [`export_csv`], as one JSON object
@@ -894,29 +1005,34 @@ pub fn export_json(
     out.write_all(b"{\"windows\":[")
         .map_err(|source| export_io(history, source))?;
     let mut first = true;
-    for month in months_in(history, Kind::Windows, range)? {
-        for hosted in history.read::<WindowRecord>(&month, &Hosts::All)?.records {
+    let mut in_tokens = false;
+    export_rows(history, range, |row| match row {
+        ExportRow::Window(row) => {
             if !first {
                 out.write_all(b",")
                     .map_err(|source| export_io(history, source))?;
             }
             first = false;
-            let row = WindowRow::of(hosted.record);
-            serde_json::to_writer(&mut *out, &row).map_err(encode)?;
+            serde_json::to_writer(&mut *out, &row).map_err(encode)
         }
-    }
-    out.write_all(b"],\"dailyTokens\":[")
-        .map_err(|source| export_io(history, source))?;
-    first = true;
-    for month in months_in(history, Kind::Tokens, range)? {
-        for row in token_rows_of_month(history, &month)? {
+        ExportRow::Tokens(row) => {
+            if !in_tokens {
+                out.write_all(b"],\"dailyTokens\":[")
+                    .map_err(|source| export_io(history, source))?;
+                in_tokens = true;
+                first = true;
+            }
             if !first {
                 out.write_all(b",")
                     .map_err(|source| export_io(history, source))?;
             }
             first = false;
-            serde_json::to_writer(&mut *out, &row).map_err(encode)?;
+            serde_json::to_writer(&mut *out, &row).map_err(encode)
         }
+    })?;
+    if !in_tokens {
+        out.write_all(b"],\"dailyTokens\":[")
+            .map_err(|source| export_io(history, source))?;
     }
     out.write_all(b"]}\n")
         .map_err(|source| export_io(history, source))

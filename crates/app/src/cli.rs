@@ -20,7 +20,7 @@ use seatswap_core::burn::replay::replay;
 use seatswap_core::burn::wu_hours;
 use seatswap_core::engine::{AccountView, Engine, PollReason, UsageCache};
 use seatswap_core::history::{
-    export_csv, export_json, AccountRef, By, EventKind, HistoryDir, Range, Recorder,
+    export_csv, export_json, AccountRef, By, EventKind, HistoryDir, Imported, Range, Recorder,
 };
 use seatswap_core::money::{self, Prices};
 use seatswap_core::paths::{self, AppPaths, ClaudePaths, PathsError};
@@ -1440,22 +1440,31 @@ fn utc_midnight(date: NaiveDate) -> Result<DateTime<Utc>, CliError> {
 }
 
 /// `seatswap history import <folder>`: one line per host at least one file was
-/// copied for, or "nothing new".
+/// copied for (or "nothing new") and one per conflict; a conflict leaves an
+/// error after everything that was copied.
 fn history_import(context: &Context, folder: &str) -> Result<(), CliError> {
-    let copied = import_history(context, folder)?;
-    if copied.is_empty() {
+    let imported = import_history(context, folder)?;
+    if imported.copied.is_empty() {
         println!("nothing new");
     } else {
-        for host in copied {
+        for host in &imported.copied {
             println!("copied {host}");
         }
     }
-    Ok(())
+    if imported.conflicts.is_empty() {
+        return Ok(());
+    }
+    for conflict in &imported.conflicts {
+        println!("conflict {}: {}", conflict.host, conflict.reason);
+    }
+    Err(CliError::Message(format!(
+        "{} host folder(s) were not imported",
+        imported.conflicts.len()
+    )))
 }
 
-/// Copy another history folder's host folders in; returns the hosts a file was
-/// copied for, sorted.
-fn import_history(context: &Context, folder: &str) -> Result<Vec<String>, CliError> {
+/// Copy another history folder's host folders in.
+fn import_history(context: &Context, folder: &str) -> Result<Imported, CliError> {
     let path = crate::format::expand_tilde(folder, &context.claude.home);
     if !path.is_absolute() {
         return Err(CliError::Usage(format!("{folder} is not an absolute path")));
@@ -3091,9 +3100,10 @@ pub(crate) mod tests {
         let line = "{\"t\":\"2026-11-14T07:00:00Z\"}\n";
         fs::write(there.path().join("vega/up-2026-11.jsonl"), line).expect("an up line");
 
-        let copied = import_history(&context, &there.path().display().to_string())
+        let imported = import_history(&context, &there.path().display().to_string())
             .expect("the folder is imported");
-        assert_eq!(copied, vec!["vega"]);
+        assert_eq!(imported.copied, vec!["vega"]);
+        assert!(imported.conflicts.is_empty());
         assert_eq!(
             fs::read_to_string(fixture.data_dir.join("history/vega/up-2026-11.jsonl"))
                 .expect("the copied line"),
@@ -3102,6 +3112,7 @@ pub(crate) mod tests {
         assert!(
             import_history(&context, &there.path().display().to_string())
                 .expect("a second import")
+                .copied
                 .is_empty()
         );
 

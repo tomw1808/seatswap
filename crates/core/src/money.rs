@@ -760,7 +760,7 @@ impl Valuer {
             from: range.from - Duration::days(7),
             to: range.to + Duration::days(7),
         };
-        let windows = history.read::<WindowRecord>(&widened, &Hosts::All)?;
+        let windows = history.finished_windows(&widened, &Hosts::All)?;
         let samples = history.read::<Sample>(&widened, &Hosts::All)?;
         let events = history.read::<Event>(
             &Range {
@@ -783,7 +783,7 @@ impl Valuer {
             fx: fx.clone(),
             settings: settings.clone(),
         };
-        for hosted in &windows.records {
+        for hosted in &windows {
             valuer.finished_window(&hosted.record);
         }
         for hosted in &samples.records {
@@ -1592,6 +1592,50 @@ mod tests {
             (one.subscription.expect("a value") + two.subscription.expect("a value") - week).abs()
                 < 1e-9
         );
+    }
+
+    #[test]
+    fn a_window_of_two_hosts_uses_the_latest_last_sample() {
+        let (history, dir, opus, haiku, prices) = two_records();
+        history
+            .append(&price_changed(
+                utc("2026-11-06T00:00:00Z"),
+                Some(140.0),
+                Some("EUR"),
+            ))
+            .expect("the account's price");
+        let end = utc("2026-11-14T16:00:00Z");
+        let start = end - Duration::days(7);
+        let mut from_atlas = weekly_window(start, end, 61.0);
+        from_atlas.last_sample = utc("2026-11-14T09:58:00Z");
+        history.append(&from_atlas).expect("atlas's window");
+        let vega = HistoryDir::at(dir.path(), "vega");
+        let mut from_vega = weekly_window(start, end, 63.0);
+        from_vega.last_sample = utc("2026-11-14T10:02:00Z");
+        vega.append(&from_vega).expect("vega's window");
+        fs::write(
+            dir.path().join("vega/host.json"),
+            "{\"machineId\":\"0b4e7c22-6a1d-4e3f-8c59-2d7a9e1b4f60\"}",
+        )
+        .expect("the other host's marker");
+        let account = account_with_price(Some(140.0));
+        let valuer = Valuer::build(
+            &history,
+            &range("2026-11-10T00:00:00Z", "2026-11-11T00:00:00Z"),
+            &prices,
+            &empty_fx(),
+            &settings_eur(),
+            &[account],
+        )
+        .expect("a valuer");
+
+        // The week's value uses vega's 63 %, not atlas's 61 %: the record with
+        // the latest lastSample counts (spec §1.5).
+        let week = 63.0 * percent_value(140.0);
+        let one = valuer.value("atlas", &opus);
+        let two = valuer.value("atlas", &haiku);
+        assert!((one.subscription.expect("a value") - 0.75 * week).abs() < 1e-9);
+        assert!((two.subscription.expect("a value") - 0.25 * week).abs() < 1e-9);
     }
 
     #[test]
