@@ -4,6 +4,7 @@
 
 use chrono::{DateTime, Datelike, FixedOffset, Timelike, Utc};
 
+pub mod plan;
 pub mod rates;
 
 /// An account's rates are known from this much work on it (spec §2.3, "while
@@ -13,6 +14,14 @@ pub const LEARN_MIN_WU: f64 = 20.0;
 pub const RHYTHM_WEEKS: i64 = 4;
 /// Rates are learned from the samples of this many days.
 pub const RATES_DAYS: i64 = 14;
+/// The plan's step (spec §2.4).
+pub const STEP_MIN: i64 = 15;
+/// The plan's horizon (spec §2.4).
+pub const HORIZON_H: i64 = 168;
+/// The shortest time between two switches (spec §2.5).
+pub const MIN_DWELL_MIN: i64 = 30;
+/// The margin of S2, in typical working hours (spec §2.5).
+pub const SLACK_MARGIN_H: f64 = 2.0;
 
 /// One output token against one input token (spec §2.3).
 const OUTPUT_WEIGHT: f64 = 5.0;
