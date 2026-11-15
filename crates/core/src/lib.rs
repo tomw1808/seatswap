@@ -13,6 +13,7 @@
 //! - `transcripts` Claude Code's transcripts: answers, user turns, token records
 //! - `locks`    Claude Code's six lock folders + seatswap's own switch.lock
 //! - `live`     read/write the live login (.credentials.json) and identity (.claude.json)
+//! - `live_sessions` the rows of the Sessions area: running and closed sessions, their agents and values
 //! - `money`    API prices with their dates, the dollar rate, the value of tokens
 //! - `projects` projects and organizations: names, joins, the shared log (spec §3.6)
 //! - `store`    accounts.json (no secrets) + secrets (OS keyring, or 0600 files)
@@ -28,6 +29,7 @@ pub mod engine;
 pub mod feed;
 pub mod history;
 pub mod live;
+pub mod live_sessions;
 pub mod locks;
 pub mod money;
 pub mod paths;
