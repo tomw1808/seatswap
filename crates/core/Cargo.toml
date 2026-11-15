@@ -8,6 +8,13 @@ rust-version.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+fixtures = []
+
+[[example]]
+name = "export_tiny"
+required-features = ["fixtures"]
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true

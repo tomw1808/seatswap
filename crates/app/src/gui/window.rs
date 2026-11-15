@@ -9,16 +9,35 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(feature = "gui")]
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, FixedOffset, Local, Utc};
 #[cfg(feature = "gui")]
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "gui")]
+use seatswap_core::burn::decide::Regime;
+#[cfg(feature = "gui")]
+use seatswap_core::burn::plan::Inputs;
+#[cfg(feature = "gui")]
+use seatswap_core::history::HistoryDir;
 #[cfg(feature = "gui")]
 use seatswap_core::live_sessions::{
     switch_kind, LiveSession, LiveStatus, OtherHost, SwitchKind, Values,
 };
 #[cfg(feature = "gui")]
-use seatswap_core::projects::ProjectId;
+use seatswap_core::money::{Fx, Prices};
+#[cfg(feature = "gui")]
+use seatswap_core::paths::AppPaths;
+#[cfg(feature = "gui")]
+use seatswap_core::project::ProjectKey;
+#[cfg(feature = "gui")]
+use seatswap_core::projects::{self, ProjectId};
+#[cfg(feature = "gui")]
+use seatswap_core::stats::{
+    self, activity, forecast, overview, projects as stats_projects, subscriptions, weeks, Ctx,
+    Empty, Query,
+};
+#[cfg(feature = "gui")]
+use seatswap_core::store::{self, Account, Settings};
 #[cfg(feature = "gui")]
 use seatswap_core::transcripts::Tokens;
 
@@ -508,6 +527,441 @@ fn sums_of(sessions: &[LiveSession]) -> Vec<Sum> {
             values: Values::sum(&values),
         })
         .collect()
+}
+
+// ---- the Statistics area's commands (step-c3.md, Task 8) ----
+
+/// A statistics page: the data, or the "nothing recorded" marker.
+#[cfg(feature = "gui")]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum Page<T> {
+    Empty(Empty),
+    Data(T),
+}
+
+/// Everything a page reads besides the history, loaded once per command.
+#[cfg(feature = "gui")]
+#[derive(Debug)]
+pub(crate) struct StatsParts {
+    accounts: Vec<Account>,
+    settings: Settings,
+    prices: Prices,
+    fx: Fx,
+    projects: projects::Projects,
+}
+
+#[cfg(feature = "gui")]
+impl StatsParts {
+    pub(crate) fn ctx<'a>(
+        &'a self,
+        history: &'a HistoryDir,
+        now: DateTime<Utc>,
+        offset: FixedOffset,
+    ) -> Ctx<'a> {
+        Ctx {
+            history,
+            accounts: &self.accounts,
+            settings: &self.settings,
+            prices: &self.prices,
+            fx: &self.fx,
+            projects: &self.projects,
+            now,
+            offset,
+        }
+    }
+}
+
+/// Read the prices and the dollar rate the app shows money with. Any failure
+/// is the text the page shows.
+#[cfg(feature = "gui")]
+pub(crate) fn load_prices_and_fx(app: &AppPaths) -> Result<(Prices, Fx), String> {
+    let prices =
+        Prices::load(app).map_err(|error| format!("the prices cannot be read: {error}"))?;
+    let fx = Fx::load(app).map_err(|error| format!("the dollar rate cannot be read: {error}"))?;
+    Ok((prices, fx))
+}
+
+/// Load the accounts file, the prices, the dollar rate and the projects for
+/// one statistics command. Any failure is the text the page shows.
+#[cfg(feature = "gui")]
+pub(crate) fn stats_ctx_parts(app: &AppPaths, history: &HistoryDir) -> Result<StatsParts, String> {
+    let file = store::load_accounts(app)
+        .map_err(|error| format!("the accounts cannot be read: {error}"))?;
+    let (prices, fx) = load_prices_and_fx(app)?;
+    let (projects, warnings) = projects::load(history, &file.accounts)
+        .map_err(|error| format!("the projects cannot be read: {error}"))?;
+    for warning in warnings {
+        eprintln!("seatswap: warning: {warning}");
+    }
+    Ok(StatsParts {
+        accounts: file.accounts,
+        settings: file.settings,
+        prices,
+        fx,
+        projects,
+    })
+}
+
+/// The one way a page becomes [`Page`]: "nothing recorded" first, else the
+/// page's own numbers.
+#[cfg(feature = "gui")]
+fn stats_page<T>(
+    parts: &StatsParts,
+    history: &HistoryDir,
+    now: DateTime<Utc>,
+    offset: FixedOffset,
+    query: &Query,
+    compute: impl FnOnce(&Ctx<'_>) -> Result<T, stats::StatsError>,
+) -> Result<Page<T>, String> {
+    let ctx = parts.ctx(history, now, offset);
+    let range = stats::range_of(query.range, &ctx).map_err(|error| error.to_string())?;
+    match stats::empty(&ctx, &range).map_err(|error| error.to_string())? {
+        Some(empty) => Ok(Page::Empty(empty)),
+        None => compute(&ctx)
+            .map(Page::Data)
+            .map_err(|error| error.to_string()),
+    }
+}
+
+#[cfg(feature = "gui")]
+pub(crate) fn stats_overview_at(
+    parts: &StatsParts,
+    history: &HistoryDir,
+    now: DateTime<Utc>,
+    offset: FixedOffset,
+    query: &Query,
+) -> Result<Page<overview::Overview>, String> {
+    stats_page(parts, history, now, offset, query, |ctx| {
+        overview::overview(ctx, query)
+    })
+}
+
+#[cfg(feature = "gui")]
+pub(crate) fn stats_weeks_at(
+    parts: &StatsParts,
+    history: &HistoryDir,
+    now: DateTime<Utc>,
+    offset: FixedOffset,
+    query: &Query,
+) -> Result<Page<weeks::WeeksPage>, String> {
+    stats_page(parts, history, now, offset, query, |ctx| {
+        weeks::weeks(ctx, query)
+    })
+}
+
+#[cfg(feature = "gui")]
+pub(crate) fn stats_week_summary_at(
+    parts: &StatsParts,
+    history: &HistoryDir,
+    now: DateTime<Utc>,
+    offset: FixedOffset,
+    query: &Query,
+    week: DateTime<Utc>,
+) -> Result<Page<weeks::WeekSummary>, String> {
+    stats_page(parts, history, now, offset, query, |ctx| {
+        weeks::week_summary(ctx, query, week)
+    })
+}
+
+#[cfg(feature = "gui")]
+pub(crate) fn stats_window_detail_at(
+    parts: &StatsParts,
+    history: &HistoryDir,
+    now: DateTime<Utc>,
+    offset: FixedOffset,
+    query: &Query,
+    account_id: &str,
+    end: DateTime<Utc>,
+) -> Result<Page<weeks::WindowDetail>, String> {
+    stats_page(parts, history, now, offset, query, |ctx| {
+        weeks::window_detail(ctx, account_id, end)
+    })
+}
+
+#[cfg(feature = "gui")]
+pub(crate) fn stats_projects_at(
+    parts: &StatsParts,
+    history: &HistoryDir,
+    now: DateTime<Utc>,
+    offset: FixedOffset,
+    query: &Query,
+) -> Result<Page<stats_projects::ProjectsPage>, String> {
+    stats_page(parts, history, now, offset, query, |ctx| {
+        stats_projects::projects_page(ctx, query)
+    })
+}
+
+#[cfg(feature = "gui")]
+pub(crate) fn stats_project_detail_at(
+    parts: &StatsParts,
+    history: &HistoryDir,
+    now: DateTime<Utc>,
+    offset: FixedOffset,
+    query: &Query,
+    key: &ProjectKey,
+) -> Result<Page<stats_projects::ProjectDetail>, String> {
+    stats_page(parts, history, now, offset, query, |ctx| {
+        stats_projects::project_detail(ctx, query, key)
+    })
+}
+
+#[cfg(feature = "gui")]
+pub(crate) fn stats_subscriptions_at(
+    parts: &StatsParts,
+    history: &HistoryDir,
+    now: DateTime<Utc>,
+    offset: FixedOffset,
+    query: &Query,
+) -> Result<Page<subscriptions::SubscriptionsPage>, String> {
+    stats_page(parts, history, now, offset, query, |ctx| {
+        subscriptions::subscriptions(ctx, query)
+    })
+}
+
+#[cfg(feature = "gui")]
+pub(crate) fn stats_what_if_at(
+    parts: &StatsParts,
+    history: &HistoryDir,
+    now: DateTime<Utc>,
+    offset: FixedOffset,
+    query: &Query,
+    without: &str,
+) -> Result<Page<subscriptions::WhatIf>, String> {
+    stats_page(parts, history, now, offset, query, |ctx| {
+        subscriptions::what_if(ctx, query, without)
+    })
+}
+
+/// The forecast has no empty marker: it either has a plan or the error that no
+/// reading of every account exists yet. A reading older than the burn runtime's
+/// freshness is the same as no reading.
+#[cfg(feature = "gui")]
+pub(crate) fn stats_forecast_at(
+    parts: &StatsParts,
+    history: &HistoryDir,
+    now: DateTime<Utc>,
+    offset: FixedOffset,
+    inputs: Option<(Inputs, Regime)>,
+) -> Result<Page<forecast::Forecast>, String> {
+    let Some((inputs, regime)) = inputs else {
+        return Err("the forecast needs a reading of every account first".to_string());
+    };
+    if now.signed_duration_since(inputs.now) > Duration::minutes(seatswap_core::burn::FRESH_MIN) {
+        return Err("the forecast needs a reading of every account first".to_string());
+    }
+    let ctx = parts.ctx(history, now, offset);
+    forecast::forecast(&ctx, &inputs, &regime)
+        .map(Page::Data)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "gui")]
+pub(crate) fn stats_rhythm_at(
+    parts: &StatsParts,
+    history: &HistoryDir,
+    now: DateTime<Utc>,
+    offset: FixedOffset,
+    query: &Query,
+) -> Result<Page<activity::RhythmPage>, String> {
+    stats_page(parts, history, now, offset, query, |ctx| {
+        activity::rhythm(ctx, query)
+    })
+}
+
+#[cfg(feature = "gui")]
+pub(crate) fn stats_activity_at(
+    parts: &StatsParts,
+    history: &HistoryDir,
+    now: DateTime<Utc>,
+    offset: FixedOffset,
+    query: &Query,
+) -> Result<Page<activity::ActivityPage>, String> {
+    stats_page(parts, history, now, offset, query, |ctx| {
+        activity::activity(ctx, query)
+    })
+}
+
+#[cfg(feature = "gui")]
+pub(crate) fn stats_hosts_at(history: &HistoryDir) -> Result<Vec<String>, String> {
+    history.hosts().map_err(|error| error.to_string())
+}
+
+/// The one body of a statistics command: on the blocking thread it reads the
+/// files the page needs, then runs the page's own function with the moment and
+/// the local offset it read there.
+#[cfg(feature = "gui")]
+async fn stats_command<T, F>(state: State<'_, super::GuiState>, run: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(&StatsParts, &HistoryDir, DateTime<Utc>, FixedOffset) -> Result<T, String>
+        + Send
+        + 'static,
+{
+    let app = state.app.clone();
+    let history = state
+        .history
+        .as_ref()
+        .map_err(|error| error.clone())?
+        .clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let parts = stats_ctx_parts(&app, &history)?;
+        run(&parts, &history, Utc::now(), *Local::now().offset())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub(crate) async fn stats_overview(
+    state: State<'_, super::GuiState>,
+    query: Query,
+) -> Result<Page<overview::Overview>, String> {
+    stats_command(state, move |parts, history, now, offset| {
+        stats_overview_at(parts, history, now, offset, &query)
+    })
+    .await
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub(crate) async fn stats_weeks(
+    state: State<'_, super::GuiState>,
+    query: Query,
+) -> Result<Page<weeks::WeeksPage>, String> {
+    stats_command(state, move |parts, history, now, offset| {
+        stats_weeks_at(parts, history, now, offset, &query)
+    })
+    .await
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub(crate) async fn stats_week_summary(
+    state: State<'_, super::GuiState>,
+    query: Query,
+    week: DateTime<Utc>,
+) -> Result<Page<weeks::WeekSummary>, String> {
+    stats_command(state, move |parts, history, now, offset| {
+        stats_week_summary_at(parts, history, now, offset, &query, week)
+    })
+    .await
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub(crate) async fn stats_window_detail(
+    state: State<'_, super::GuiState>,
+    query: Query,
+    account_id: String,
+    end: DateTime<Utc>,
+) -> Result<Page<weeks::WindowDetail>, String> {
+    stats_command(state, move |parts, history, now, offset| {
+        stats_window_detail_at(parts, history, now, offset, &query, &account_id, end)
+    })
+    .await
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub(crate) async fn stats_projects(
+    state: State<'_, super::GuiState>,
+    query: Query,
+) -> Result<Page<stats_projects::ProjectsPage>, String> {
+    stats_command(state, move |parts, history, now, offset| {
+        stats_projects_at(parts, history, now, offset, &query)
+    })
+    .await
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub(crate) async fn stats_project_detail(
+    state: State<'_, super::GuiState>,
+    query: Query,
+    key: ProjectKey,
+) -> Result<Page<stats_projects::ProjectDetail>, String> {
+    stats_command(state, move |parts, history, now, offset| {
+        stats_project_detail_at(parts, history, now, offset, &query, &key)
+    })
+    .await
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub(crate) async fn stats_subscriptions(
+    state: State<'_, super::GuiState>,
+    query: Query,
+) -> Result<Page<subscriptions::SubscriptionsPage>, String> {
+    stats_command(state, move |parts, history, now, offset| {
+        stats_subscriptions_at(parts, history, now, offset, &query)
+    })
+    .await
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub(crate) async fn stats_what_if(
+    state: State<'_, super::GuiState>,
+    query: Query,
+    without: String,
+) -> Result<Page<subscriptions::WhatIf>, String> {
+    stats_command(state, move |parts, history, now, offset| {
+        stats_what_if_at(parts, history, now, offset, &query, &without)
+    })
+    .await
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub(crate) async fn stats_forecast(
+    state: State<'_, super::GuiState>,
+) -> Result<Page<forecast::Forecast>, String> {
+    let inputs = super::lock(&state.forecast).clone();
+    stats_command(state, move |parts, history, now, offset| {
+        stats_forecast_at(parts, history, now, offset, inputs)
+    })
+    .await
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub(crate) async fn stats_rhythm(
+    state: State<'_, super::GuiState>,
+    query: Query,
+) -> Result<Page<activity::RhythmPage>, String> {
+    stats_command(state, move |parts, history, now, offset| {
+        stats_rhythm_at(parts, history, now, offset, &query)
+    })
+    .await
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub(crate) async fn stats_activity(
+    state: State<'_, super::GuiState>,
+    query: Query,
+) -> Result<Page<activity::ActivityPage>, String> {
+    stats_command(state, move |parts, history, now, offset| {
+        stats_activity_at(parts, history, now, offset, &query)
+    })
+    .await
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub(crate) async fn stats_hosts(state: State<'_, super::GuiState>) -> Result<Vec<String>, String> {
+    // The host list needs only the history, not the parts a page reads: a
+    // broken prices file must not hide the hosts.
+    let history = state
+        .history
+        .as_ref()
+        .map_err(|error| error.clone())?
+        .clone();
+    tauri::async_runtime::spawn_blocking(move || stats_hosts_at(&history))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[cfg(test)]
@@ -1354,5 +1808,295 @@ mod tests {
         assert_eq!(all.sessions, 4);
         assert_eq!(all.tokens.out, 6_500_000);
         assert_eq!(all.last_hour.out, 650_000);
+    }
+
+    #[cfg(feature = "gui")]
+    use seatswap_core::burn::decide::RegimeWhy;
+    #[cfg(feature = "gui")]
+    use seatswap_core::burn::plan::{AccountState, SessionState};
+    #[cfg(feature = "gui")]
+    use seatswap_core::burn::{Rates, Rhythm};
+    #[cfg(feature = "gui")]
+    use seatswap_core::stats::fixture;
+    #[cfg(feature = "gui")]
+    use seatswap_core::stats::RangeKey;
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn an_empty_range_serialises_as_empty() {
+        let page = Page::<()>::Empty(Empty {
+            recording_since: None,
+        });
+        assert_eq!(
+            serde_json::to_string(&page).expect("the page as JSON"),
+            r#"{"empty":{"recordingSince":null}}"#
+        );
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn each_command_answers_for_the_tiny_history() {
+        let dir = tempfile::tempdir().expect("a temp folder");
+        let tiny = fixture::write(dir.path()).expect("the tiny fixture");
+        let app = AppPaths::at(dir.path());
+        let parts = stats_ctx_parts(&app, &tiny.history).expect("the statistics parts");
+        let query = Query {
+            range: RangeKey::All,
+            accounts: Vec::new(),
+            host: None,
+        };
+        let now = tiny.now;
+        let offset = tiny.offset;
+
+        assert_eq!(
+            stats_hosts_at(&tiny.history).expect("the hosts"),
+            vec!["atlas".to_string()]
+        );
+
+        let overview =
+            stats_overview_at(&parts, &tiny.history, now, offset, &query).expect("the overview");
+        match overview {
+            Page::Data(overview) => {
+                assert!(
+                    (overview.kpis.used - 120.0).abs() < 0.001,
+                    "used {}",
+                    overview.kpis.used
+                );
+            }
+            Page::Empty(empty) => panic!("the tiny history is not empty: {empty:?}"),
+        }
+
+        assert!(stats_weeks_at(&parts, &tiny.history, now, offset, &query).is_ok());
+        assert!(stats_week_summary_at(
+            &parts,
+            &tiny.history,
+            now,
+            offset,
+            &query,
+            "2026-11-09T00:00:00Z".parse().expect("a week")
+        )
+        .is_ok());
+        assert!(stats_window_detail_at(
+            &parts,
+            &tiny.history,
+            now,
+            offset,
+            &query,
+            &tiny.accounts[0].id,
+            "2026-11-09T17:00:00Z".parse().expect("a window end")
+        )
+        .is_ok());
+        assert!(stats_projects_at(&parts, &tiny.history, now, offset, &query).is_ok());
+        assert!(stats_project_detail_at(
+            &parts,
+            &tiny.history,
+            now,
+            offset,
+            &query,
+            &ProjectKey::Repo("github.com/sam/atlas".to_string())
+        )
+        .is_ok());
+        assert!(stats_subscriptions_at(&parts, &tiny.history, now, offset, &query).is_ok());
+        assert!(stats_what_if_at(
+            &parts,
+            &tiny.history,
+            now,
+            offset,
+            &query,
+            &tiny.accounts[1].id
+        )
+        .is_ok());
+        assert!(stats_rhythm_at(&parts, &tiny.history, now, offset, &query).is_ok());
+        assert!(stats_activity_at(&parts, &tiny.history, now, offset, &query).is_ok());
+
+        let inputs = Inputs {
+            now,
+            offset,
+            accounts: vec![
+                AccountState {
+                    id: tiny.accounts[0].id.clone(),
+                    may_use: true,
+                    login_ok: true,
+                    week_percent: 30.0,
+                    week_resets_at: "2026-11-23T17:00:00Z".parse().expect("a reset"),
+                    session: Some(SessionState {
+                        percent: 0.0,
+                        resets_at: None,
+                    }),
+                    model_blocked: false,
+                    rates: Some(Rates {
+                        c: 4.0,
+                        s: Some(80.0),
+                    }),
+                    thinking_held: 0,
+                },
+                AccountState {
+                    id: tiny.accounts[1].id.clone(),
+                    may_use: true,
+                    login_ok: true,
+                    week_percent: 40.0,
+                    week_resets_at: "2026-11-23T02:00:00Z".parse().expect("a reset"),
+                    session: Some(SessionState {
+                        percent: 0.0,
+                        resets_at: None,
+                    }),
+                    model_blocked: false,
+                    rates: Some(Rates {
+                        c: 4.0,
+                        s: Some(100.0),
+                    }),
+                    thinking_held: 0,
+                },
+            ],
+            active: Some(tiny.accounts[0].id.clone()),
+            rhythm: Rhythm { wu: [1.0; 168] },
+        };
+        let regime = Regime {
+            early: false,
+            why: RegimeWhy::NoCostYet,
+            lazy_blocked_h: 0.0,
+            eager_blocked_h: 0.0,
+            extra_switches: 0,
+            cost_h: None,
+        };
+        let forecast =
+            stats_forecast_at(&parts, &tiny.history, now, offset, Some((inputs, regime)))
+                .expect("the forecast");
+        assert!(matches!(forecast, Page::Data(_)), "{forecast:?}");
+
+        let error = stats_forecast_at(&parts, &tiny.history, now, offset, None)
+            .expect_err("no reading, no forecast");
+        assert_eq!(error, "the forecast needs a reading of every account first");
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn the_ctx_names_a_broken_prices_file() {
+        let dir = tempfile::tempdir().expect("a temp folder");
+        let tiny = fixture::write(dir.path()).expect("the tiny fixture");
+        let app = AppPaths::at(dir.path());
+        std::fs::write(app.prices_file(), "{not json").expect("the broken prices");
+
+        let error = stats_ctx_parts(&app, &tiny.history).expect_err("the prices cannot be read");
+        assert!(error.starts_with("the prices cannot be read"), "{error}");
+    }
+
+    // ---- proof tests of the review ----
+
+    /// The fixture must stay the fixture: a second `fixture::write` into the
+    /// same folder is refused, because the first write is already there. The
+    /// pages then count the history once.
+    #[cfg(feature = "gui")]
+    #[test]
+    fn the_fixture_written_twice_counts_the_history_once() {
+        let dir = tempfile::tempdir().expect("a temp folder");
+        let tiny = fixture::write(dir.path()).expect("the tiny fixture");
+        let app = AppPaths::at(dir.path());
+        let parts = stats_ctx_parts(&app, &tiny.history).expect("the statistics parts");
+        let query = Query {
+            range: RangeKey::All,
+            accounts: Vec::new(),
+            host: None,
+        };
+
+        // The second write into the same folder must not add a second copy of
+        // every record: it is refused.
+        let error = fixture::write(dir.path())
+            .err()
+            .expect("the second fixture is refused");
+        assert!(error.ends_with("is not empty"), "{error}");
+
+        let overview = stats_overview_at(&parts, &tiny.history, tiny.now, tiny.offset, &query)
+            .expect("the overview");
+        let Page::Data(overview) = overview else {
+            panic!("the tiny history is not empty");
+        };
+        assert_eq!(
+            overview.kpis.switches.user, 1,
+            "the switches are counted twice"
+        );
+    }
+
+    /// The forecast is the plan of the reading it was built from. A reading
+    /// older than the freshness the burn runtime itself uses (`FRESH_MIN`) is
+    /// refused like no reading at all: its seven days would lie in the past.
+    #[cfg(feature = "gui")]
+    #[test]
+    fn the_forecast_refuses_a_reading_that_is_too_old() {
+        let dir = tempfile::tempdir().expect("a temp folder");
+        let tiny = fixture::write(dir.path()).expect("the tiny fixture");
+        let app = AppPaths::at(dir.path());
+        let parts = stats_ctx_parts(&app, &tiny.history).expect("the statistics parts");
+        let now = tiny.now;
+        let offset = tiny.offset;
+        let regime = Regime {
+            early: false,
+            why: RegimeWhy::NoCostYet,
+            lazy_blocked_h: 0.0,
+            eager_blocked_h: 0.0,
+            extra_switches: 0,
+            cost_h: None,
+        };
+        let state = |id: String, percent: f64, resets_at: &str, s: f64| AccountState {
+            id,
+            may_use: true,
+            login_ok: true,
+            week_percent: percent,
+            week_resets_at: resets_at.parse().expect("a reset"),
+            session: Some(SessionState {
+                percent: 0.0,
+                resets_at: None,
+            }),
+            model_blocked: false,
+            rates: Some(Rates { c: 4.0, s: Some(s) }),
+            thinking_held: 0,
+        };
+        let inputs = |at: DateTime<Utc>| Inputs {
+            now: at,
+            offset,
+            accounts: vec![
+                state(
+                    tiny.accounts[0].id.clone(),
+                    30.0,
+                    "2026-11-23T17:00:00Z",
+                    80.0,
+                ),
+                state(
+                    tiny.accounts[1].id.clone(),
+                    40.0,
+                    "2026-11-23T02:00:00Z",
+                    100.0,
+                ),
+            ],
+            active: Some(tiny.accounts[0].id.clone()),
+            rhythm: Rhythm { wu: [1.0; 168] },
+        };
+
+        // A reading of this moment is a plan.
+        let fresh = stats_forecast_at(
+            &parts,
+            &tiny.history,
+            now,
+            offset,
+            Some((inputs(now), regime.clone())),
+        )
+        .expect("the forecast of a fresh reading");
+        assert!(matches!(fresh, Page::Data(_)), "{fresh:?}");
+
+        // A reading of half an hour ago is not: it is older than the
+        // freshness the burn runtime itself uses.
+        let old = now - Duration::minutes(seatswap_core::burn::FRESH_MIN + 10);
+        let error = stats_forecast_at(
+            &parts,
+            &tiny.history,
+            now,
+            offset,
+            Some((inputs(old), regime.clone())),
+        )
+        .expect_err("a reading that is too old is no plan");
+        assert_eq!(
+            error, "the forecast needs a reading of every account first",
+            "{error}"
+        );
     }
 }

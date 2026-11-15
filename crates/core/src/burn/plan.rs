@@ -29,7 +29,7 @@ pub struct SessionState {
 }
 
 /// One account as the plan needs it (spec §2.3).
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct AccountState {
     pub id: String,
     pub may_use: bool,
@@ -49,7 +49,7 @@ pub struct AccountState {
 
 /// Everything a plan is computed from. It is pure: no clock, no files, no
 /// network (spec §2.4).
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Inputs {
     pub now: DateTime<Utc>,
     pub offset: FixedOffset,

@@ -19,7 +19,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 
 use seatswap_core::history::{EventKind, HistoryDir, Range, Recorder, SessionRecord};
 use seatswap_core::live_sessions::{self, LiveSession, LiveStatus, OtherHost, Rows};
-use seatswap_core::money::{Fx, Prices, Valuer};
+use seatswap_core::money::Valuer;
 use seatswap_core::paths::{AppPaths, ClaudePaths};
 use seatswap_core::project::{self, ProjectKey};
 use seatswap_core::projects;
@@ -518,9 +518,7 @@ fn build_pricing(
     range: &Range,
     file: &store::AccountsFile,
 ) -> Result<(Valuer, Settings), String> {
-    let prices =
-        Prices::load(app).map_err(|error| format!("the prices cannot be read: {error}"))?;
-    let fx = Fx::load(app).map_err(|error| format!("the dollar rate cannot be read: {error}"))?;
+    let (prices, fx) = super::window::load_prices_and_fx(app)?;
     let valuer = Valuer::build(history, range, &prices, &fx, &file.settings, &file.accounts)
         .map_err(|error| format!("the values cannot be read: {error}"))?;
     Ok((valuer, file.settings.clone()))

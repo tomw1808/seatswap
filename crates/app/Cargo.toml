@@ -77,3 +77,4 @@ tauri-build = { version = "2", features = [], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+seatswap-core = { path = "../core", features = ["fixtures"] }

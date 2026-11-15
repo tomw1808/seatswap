@@ -49,6 +49,10 @@ use std::thread;
 use chrono::{DateTime, Local, Utc};
 
 #[cfg(feature = "gui")]
+use seatswap_core::burn::decide::Regime;
+#[cfg(feature = "gui")]
+use seatswap_core::burn::plan::Inputs;
+#[cfg(feature = "gui")]
 use seatswap_core::history::By;
 #[cfg(feature = "gui")]
 use seatswap_core::paths::AppPaths;
@@ -92,6 +96,9 @@ pub(crate) struct GuiState {
     /// The history folder the recorder opened at startup, or why it could not
     /// be opened. A changed setting takes effect after a restart.
     pub(crate) history: Result<seatswap_core::history::HistoryDir, String>,
+    /// The plan inputs and regime of the last snapshot's auto-burn decision;
+    /// the Forecast page reads them. `None` until a situation exists.
+    pub(crate) forecast: Arc<Mutex<Option<(Inputs, Regime)>>>,
     /// The latest sessions summary; every snapshot is emitted with it.
     sessions: Mutex<Option<SessionsSummary>>,
     /// The sessions thread's commands; `None` while `readSessions` is off.
@@ -231,6 +238,18 @@ pub(crate) fn run(
             window::sessions_view,
             window::sessions_subscribe,
             window::sessions_unsubscribe,
+            window::stats_overview,
+            window::stats_weeks,
+            window::stats_week_summary,
+            window::stats_window_detail,
+            window::stats_projects,
+            window::stats_project_detail,
+            window::stats_subscriptions,
+            window::stats_what_if,
+            window::stats_forecast,
+            window::stats_rhythm,
+            window::stats_activity,
+            window::stats_hosts,
         ])
         .build(tauri::generate_context!());
     match result {
@@ -394,12 +413,14 @@ fn setup(
         .ok_or_else(|| "the look-up thread did not start".to_string())?;
     let lookup = lookup_handle.client();
     let history = worker.history.clone();
+    let forecast = worker.forecast.clone();
 
     tauri_app.manage(GuiState {
         snapshot: Mutex::new(initial.clone()),
         app: app.clone(),
         claude: claude.clone(),
         history,
+        forecast,
         sessions: Mutex::new(None),
         sessions_client: sessions.as_ref().map(SessionsHandle::client),
         engine: worker.engine.clone(),

@@ -12,7 +12,7 @@ use serde::Serialize;
 use seatswap_core::burn::burn_next::{self, BurnNext};
 use seatswap_core::burn::decide::{Decision, Regime, RegimeWhy, Situation};
 use seatswap_core::burn::live::{self, Learned, Readiness};
-use seatswap_core::burn::plan::{follow, rates_known, Plan, Policy};
+use seatswap_core::burn::plan::{follow, rates_known, Inputs, Plan, Policy};
 use seatswap_core::burn::{
     FRESH_MIN, HORIZON_H, LEARN_RETRY_MIN, MANUAL_HOLD_H, STALE_ASK_SECS, SWITCH_RELEARN_MIN,
     SWITCH_RETRY_MIN,
@@ -115,6 +115,9 @@ pub(crate) struct BurnReport {
     pub error: Option<String>,
     pub warnings: Vec<String>,
     pub notification: Option<String>,
+    /// The plan inputs and regime this tick computed; `None` while there is no
+    /// situation. The Forecast page reads the latest one.
+    pub forecast: Option<(Inputs, Regime)>,
 }
 
 /// A switch that was sent and whose reply has not been read yet.
@@ -328,6 +331,7 @@ impl BurnRuntime {
             plan,
             next,
         } = assessment;
+        report.forecast = Some((situation.inputs.clone(), regime.clone()));
         if let Some(error) = self.publish_next(tick, &situation, &decision, &plan, next.as_deref())
         {
             append_error(&mut report, error);

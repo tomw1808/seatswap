@@ -23,6 +23,8 @@ use serde::Serialize;
 use seatswap_core::api::Api;
 #[cfg(test)]
 use seatswap_core::api::ApiError;
+use seatswap_core::burn::decide::Regime;
+use seatswap_core::burn::plan::Inputs;
 #[cfg(test)]
 use seatswap_core::engine::Remote;
 use seatswap_core::engine::{
@@ -367,6 +369,9 @@ pub(crate) struct Worker {
     /// The history folder the recorder opened at startup. Every reader uses
     /// this one; a changed setting takes effect after a restart.
     pub history: Result<seatswap_core::history::HistoryDir, String>,
+    /// The plan inputs and regime of the last auto-burn decision; the Forecast
+    /// page reads them through `GuiState`.
+    pub forecast: Arc<Mutex<Option<(Inputs, Regime)>>>,
 }
 
 pub(crate) fn spawn(
@@ -386,6 +391,7 @@ pub(crate) fn spawn(
         Some(settings) => ops::open_history(&app, settings).map(|recorder| recorder.dir().clone()),
         None => Err(ops::history_unwritable(&"the settings are not loaded")),
     };
+    let forecast = Arc::new(Mutex::new(None));
 
     let action_engine = engine_tx.clone();
     let engine_action = action_tx.clone();
@@ -394,6 +400,7 @@ pub(crate) fn spawn(
     let engine_claude = claude.clone();
     let engine_ui = ui.clone();
     let engine_history = history.clone();
+    let engine_forecast = Arc::clone(&forecast);
     thread::Builder::new()
         .name("seatswap-engine".to_string())
         .spawn(move || {
@@ -404,6 +411,7 @@ pub(crate) fn spawn(
                 engine_action,
                 engine_commands,
                 engine_history,
+                engine_forecast,
             )
             .run(engine_rx)
         })
@@ -449,6 +457,7 @@ pub(crate) fn spawn(
         sessions,
         lookup,
         history,
+        forecast,
     })
 }
 
@@ -614,6 +623,9 @@ struct EngineRuntime {
     snapshot: Snapshot,
     baseline: ClockBaseline,
     burn: BurnRuntime,
+    /// The last auto-burn plan inputs and regime, shared with `GuiState` for
+    /// the Forecast page.
+    forecast: Arc<Mutex<Option<(Inputs, Regime)>>>,
     /// The sessions thread's busy sessions on a thinking-tied model. It is 0
     /// when the sessions thread cannot tell (with `readSessions` off): nothing
     /// is held back then (spec §2.12).
@@ -648,6 +660,7 @@ impl EngineRuntime {
         action: Sender<ActionCommand>,
         engine: Sender<EngineCommand>,
         history: Result<HistoryDir, String>,
+        forecast: Arc<Mutex<Option<(Inputs, Regime)>>>,
     ) -> EngineRuntime {
         let mut runtime = EngineRuntime {
             app,
@@ -663,6 +676,7 @@ impl EngineRuntime {
             snapshot: Snapshot::empty(None, None, None),
             baseline: ClockBaseline::now(),
             burn: BurnRuntime::new(action, engine),
+            forecast,
             tied_busy: 0,
             thinking: Vec::new(),
         };
@@ -1000,6 +1014,7 @@ impl EngineRuntime {
             thinking: &self.thinking,
         };
         let report = self.burn.after_snapshot(&tick);
+        *super::lock(&self.forecast) = report.forecast;
         self.snapshot.burn = report.view;
         if let Some(error) = report.error {
             self.snapshot.error = combine(self.snapshot.error.take(), error);
@@ -2577,6 +2592,7 @@ mod tests {
             action,
             engine_commands,
             history,
+            Arc::new(Mutex::new(None)),
         );
         let error = runtime
             .snapshot
@@ -2630,6 +2646,7 @@ mod tests {
             action,
             engine_commands,
             history,
+            Arc::new(Mutex::new(None)),
         );
         assert!(runtime.engine.is_some(), "the engine reopened");
         let error = runtime
@@ -2664,6 +2681,7 @@ mod tests {
             action,
             engine_commands,
             history,
+            Arc::new(Mutex::new(None)),
         );
         assert!(runtime.engine.is_none(), "the engine could not open");
         assert_eq!(
@@ -2695,6 +2713,7 @@ mod tests {
             action,
             engine_commands,
             history,
+            Arc::new(Mutex::new(None)),
         );
         assert!(runtime.snapshot.settings.is_none());
         let error = runtime.snapshot.error.expect("an error is shown");
@@ -2901,6 +2920,7 @@ mod tests {
             snapshot: Snapshot::empty(None, None, None),
             baseline: ClockBaseline::now(),
             burn: BurnRuntime::new(action, engine_commands),
+            forecast: Arc::new(Mutex::new(None)),
             tied_busy: 0,
             thinking: Vec::new(),
         };
@@ -2958,6 +2978,7 @@ mod tests {
             snapshot: Snapshot::empty(None, None, None),
             baseline: ClockBaseline::now(),
             burn: BurnRuntime::new(action, engine_commands),
+            forecast: Arc::new(Mutex::new(None)),
             tied_busy: 0,
             thinking: Vec::new(),
         };
@@ -2981,6 +3002,59 @@ mod tests {
         assert!(
             error.contains("the history cannot be written:"),
             "publish() must not clear the history error: {error}"
+        );
+    }
+
+    /// A tick that computes no situation clears the kept forecast: the Forecast
+    /// page must not show the plan of an older reading as if it were current.
+    #[test]
+    fn a_tick_without_a_situation_clears_the_forecast() {
+        let fixture = Fixture::new();
+        let file = store::load_accounts(&fixture.app).expect("accounts");
+        let forecast = Arc::new(Mutex::new(Some((
+            Inputs {
+                now: Utc::now(),
+                offset: chrono::FixedOffset::east_opt(0).expect("UTC"),
+                accounts: Vec::new(),
+                active: None,
+                rhythm: seatswap_core::burn::Rhythm { wu: [0.0; 168] },
+            },
+            Regime {
+                early: false,
+                why: seatswap_core::burn::decide::RegimeWhy::NoCostYet,
+                lazy_blocked_h: 0.0,
+                eager_blocked_h: 0.0,
+                extra_switches: 0,
+                cost_h: None,
+            },
+        ))));
+        let (ui, _rx) = mpsc::channel();
+        let (action, engine_commands) = burn_channels();
+        let mut runtime = EngineRuntime {
+            app: fixture.app.clone(),
+            claude: fixture.claude.clone(),
+            ui,
+            engine: None,
+            history: fixture.history(),
+            secrets_warning: None,
+            open_error: None,
+            history_error: None,
+            live_written: false,
+            notice: None,
+            snapshot: Snapshot::empty(None, None, Some(file.settings)),
+            baseline: ClockBaseline::now(),
+            burn: BurnRuntime::new(action, engine_commands),
+            forecast: Arc::clone(&forecast),
+            tied_busy: 0,
+            thinking: Vec::new(),
+        };
+
+        // No account: the burn runtime has no situation to compute a plan from.
+        runtime.update_burn(Some(Vec::new()));
+
+        assert!(
+            super::super::lock(&forecast).is_none(),
+            "a tick without a situation must clear the forecast"
         );
     }
 }
