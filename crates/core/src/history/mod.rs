@@ -150,6 +150,13 @@ pub struct Sample {
     pub l: Vec<LimitSample>,
 }
 
+impl Sample {
+    /// The sample's limit of `kind`: the one way to find a limit in a sample.
+    pub fn limit(&self, kind: &LimitKind) -> Option<&LimitSample> {
+        self.l.iter().find(|limit| &limit.k == kind)
+    }
+}
+
 impl Record for Sample {
     const KIND: Kind = Kind::Samples;
 
@@ -1298,5 +1305,13 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(root.path().join("atlas/host.json")).unwrap())
                 .unwrap();
         assert_eq!(marker["machineId"], Value::String(id.to_string()));
+    }
+
+    #[test]
+    fn sample_limit_finds_the_limit_of_a_kind() {
+        let sample = a_sample(utc("2026-11-14T10:00:00Z"), 12.0);
+        let session = sample.limit(&LimitKind::Session).expect("a session limit");
+        assert!((session.p - 12.0).abs() < 1e-9);
+        assert!(sample.limit(&LimitKind::WeeklyAll).is_none());
     }
 }

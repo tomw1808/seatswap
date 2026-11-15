@@ -1266,7 +1266,7 @@ fn last_whole_line_end(file: &mut File, path: &Path) -> Result<u64, TranscriptEr
 }
 
 /// The start of the hour `at` falls in, in UTC.
-fn hour_start(at: DateTime<Utc>) -> DateTime<Utc> {
+pub(crate) fn hour_start(at: DateTime<Utc>) -> DateTime<Utc> {
     at - Duration::minutes(i64::from(at.minute()))
         - Duration::seconds(i64::from(at.second()))
         - Duration::nanoseconds(i64::from(at.nanosecond()))

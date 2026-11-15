@@ -5,7 +5,8 @@
 use chrono::{DateTime, Duration, Utc};
 
 use super::plan::{
-    blocked, choose, follow, rates_known, slack, step_walk, usable_again, Inputs, PlanError, Policy,
+    blocked, choose, follow, rates_known, slack, usable_again, Inputs, PlanError, Policy, Walk,
+    Work,
 };
 use super::{
     FRESH_MIN, GAIN_FACTOR, HORIZON_H, MIN_COST_SAMPLES, MIN_DWELL_MIN, MIN_GAIN_H, SLACK_MARGIN_H,
@@ -306,8 +307,15 @@ fn next_free(inputs: &Inputs) -> Option<(String, DateTime<Utc>)> {
 /// (the decision is taken again at every reading).
 fn latest_reaching(inputs: &Inputs, target_wu: f64) -> DateTime<Utc> {
     let step = Duration::minutes(STEP_MIN);
+    let walk = Walk::new(
+        Work::Rhythm {
+            rhythm: &inputs.rhythm,
+            offset: inputs.offset,
+        },
+        inputs.now + Duration::hours(HORIZON_H),
+    );
     let mut sum = 0.0;
-    for (at, work) in step_walk(inputs, inputs.now) {
+    for (at, work) in walk.steps_from(inputs.now) {
         sum += work;
         if sum >= target_wu {
             return at + step;

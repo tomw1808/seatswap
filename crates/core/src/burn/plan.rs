@@ -8,6 +8,8 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Duration, FixedOffset, Utc};
 
+use crate::transcripts::hour_start;
+
 use super::{Rates, Rhythm, HORIZON_H, MIN_DWELL_MIN, SLACK_MARGIN_H, STEP_MIN};
 
 /// A 5 h window lasts this many hours (spec §2.1).
@@ -214,7 +216,97 @@ pub(crate) fn rates_known(account: &AccountState) -> bool {
 /// account without `s`. Task 4 returns no rate of 0 or below (it returns
 /// `None`), so neither division here can be by zero from a rate.
 pub fn slack(account: &AccountState, inputs: &Inputs) -> Option<f64> {
-    View::of(account, inputs.now).slack(inputs, inputs.now)
+    let walk = rhythm_walk(inputs);
+    View::of(account, inputs.now).slack(inputs.now, &walk)
+}
+
+/// The walk of the learned rhythm: every step carries a quarter of the work of
+/// the clock hour that holds its start, over the plan's [`HORIZON_H`] hours.
+fn rhythm_walk(inputs: &Inputs) -> Walk<'_> {
+    Walk::new(
+        Work::Rhythm {
+            rhythm: &inputs.rhythm,
+            offset: inputs.offset,
+        },
+        inputs.now + Duration::hours(HORIZON_H),
+    )
+}
+
+/// Where the work of a walk's steps comes from.
+#[derive(Clone, Copy)]
+pub(super) enum Work<'a> {
+    /// The learned rhythm: the hour that holds the step's start, a quarter of it.
+    Rhythm {
+        rhythm: &'a Rhythm,
+        offset: FixedOffset,
+    },
+    /// Work recorded in the history, by the UTC hour that holds it; each hour is
+    /// spread evenly over the four steps of that hour.
+    Recorded(&'a BTreeMap<DateTime<Utc>, f64>),
+}
+
+impl Work<'_> {
+    fn at(&self, t: DateTime<Utc>) -> f64 {
+        match self {
+            Work::Rhythm { rhythm, offset } => rhythm.at(t, *offset) * STEP_FRACTION,
+            Work::Recorded(hours) => {
+                hours.get(&hour_start(t)).copied().unwrap_or(0.0) / STEPS_PER_HOUR as f64
+            }
+        }
+    }
+}
+
+/// The steps of an hour: the four a recorded hour is spread over.
+const STEPS_PER_HOUR: i64 = 60 / STEP_MIN;
+
+/// A walk of [`STEP_MIN`] steps: every step from a start up to the exclusive
+/// `end`, with the work `work` gives that step. The plan's one step walk:
+/// [`follow`] and [`slack`] give it the rhythm, a replay the recorded work.
+pub(super) struct Walk<'a> {
+    work: Work<'a>,
+    end: DateTime<Utc>,
+}
+
+impl<'a> Walk<'a> {
+    pub(super) fn new(work: Work<'a>, end: DateTime<Utc>) -> Walk<'a> {
+        Walk { work, end }
+    }
+
+    pub(super) fn steps_from(
+        &self,
+        from: DateTime<Utc>,
+    ) -> impl Iterator<Item = (DateTime<Utc>, f64)> + '_ {
+        self.steps(from, self.end)
+    }
+
+    /// The walk from `from` over [`HORIZON_H`] hours, whatever this walk's own
+    /// end is: a slack always looks a full horizon ahead from the moment of the
+    /// decision, as it did before the recorded walk had an end of its own.
+    fn horizon_from(&self, from: DateTime<Utc>) -> impl Iterator<Item = (DateTime<Utc>, f64)> + '_ {
+        self.steps(from, from + Duration::hours(HORIZON_H))
+    }
+
+    fn steps(
+        &self,
+        from: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> impl Iterator<Item = (DateTime<Utc>, f64)> + '_ {
+        let count = if end <= from {
+            0
+        } else {
+            let span = end.signed_duration_since(from);
+            let minutes = span.num_minutes() + if span.subsec_nanos() > 0 { 1 } else { 0 };
+            (minutes + STEP_MIN - 1) / STEP_MIN
+        };
+        (0..count).map(move |index| {
+            let at = from + Duration::minutes(STEP_MIN * index);
+            (at, self.work.at(at))
+        })
+    }
+
+    fn end(&self) -> DateTime<Utc> {
+        self.end
+    }
 }
 
 /// The usable account with the least slack (spec §2.3), ties broken by the
@@ -232,7 +324,7 @@ pub fn choose(inputs: &Inputs, at: DateTime<Utc>) -> Option<String> {
         .iter()
         .map(|account| View::of(account, at))
         .collect();
-    let index = pick(&views, inputs, at)?;
+    let index = pick(&views, at, &rhythm_walk(inputs))?;
     inputs.accounts.get(index).map(|account| account.id.clone())
 }
 
@@ -259,16 +351,38 @@ pub fn choose(inputs: &Inputs, at: DateTime<Utc>) -> Option<String> {
 /// because [`choose`] only takes usable accounts (spec §2.6: S1 still leaves it
 /// when it gets blocked).
 pub fn follow(inputs: &Inputs, policy: Policy) -> Plan {
+    play(
+        inputs,
+        policy,
+        &rhythm_walk(inputs),
+        inputs.rhythm.typical_hour(),
+    )
+    .plan
+}
+
+/// One played walk: the plan, the work that was done on an account, and the
+/// week-% unused at every weekly reset the walk passed, per account.
+pub(super) struct Played {
+    pub(super) plan: Plan,
+    pub(super) worked_wu: f64,
+    pub(super) expired: BTreeMap<String, f64>,
+}
+
+/// Play `inputs` over `walk` in [`STEP_MIN`] steps. This is the plan's one step
+/// loop: [`follow`] gives it the rhythm over [`HORIZON_H`] hours, a replay the
+/// recorded work up to the range's end and the recorded hours' typical hour.
+/// `worked_wu` is the work of the steps with an account, `plan.blocked_wu` the
+/// work of those without one, so they add up to the work of the walk.
+pub(super) fn play(inputs: &Inputs, policy: Policy, walk: &Walk<'_>, typical: f64) -> Played {
     let step = Duration::minutes(STEP_MIN);
-    let horizon_end = inputs.now + Duration::hours(HORIZON_H);
-    let typical = inputs.rhythm.typical_hour();
+    let end = walk.end();
     let mut views: Vec<View<'_>> = inputs
         .accounts
         .iter()
         .map(|account| View::of(account, inputs.now))
         .collect();
     for view in &mut views {
-        view.clear_resets(inputs.now, horizon_end);
+        view.clear_resets(inputs.now, end);
         if view.is_full(inputs.now) {
             view.full_at = Some(inputs.now);
         }
@@ -279,24 +393,25 @@ pub fn follow(inputs: &Inputs, policy: Policy) -> Plan {
         .and_then(|id| views.iter().position(|view| &view.account.id == id))
         .filter(|&index| !views[index].blocked(inputs.now));
     let mut last_switch: Option<DateTime<Utc>> = None;
+    let mut worked_wu = 0.0;
     let mut blocked_wu = 0.0;
     let mut switches = 0u32;
     let mut segments: Vec<Segment> = Vec::new();
 
-    for (t, work) in step_walk(inputs, inputs.now) {
+    for (t, work) in walk.steps_from(inputs.now) {
         for view in &mut views {
-            view.clear_resets(t, horizon_end);
+            view.clear_resets(t, end);
         }
 
         let choice = match current {
             Some(index) if !views[index].blocked(t) => {
                 if policy == Policy::Eager && typical > 0.0 && views[index].usable(t) {
-                    eager_move(&views, inputs, t, index, typical, last_switch).or(Some(index))
+                    eager_move(&views, t, index, typical, last_switch, walk).or(Some(index))
                 } else {
                     Some(index)
                 }
             }
-            _ => pick(&views, inputs, t),
+            _ => pick(&views, t, walk),
         };
 
         match choice {
@@ -309,6 +424,7 @@ pub fn follow(inputs: &Inputs, policy: Policy) -> Plan {
                 }
                 current = Some(index);
                 if work > 0.0 {
+                    worked_wu += work;
                     views[index].apply(t, work);
                     if views[index].full_at.is_none() && views[index].is_full(t) {
                         views[index].full_at = Some(t);
@@ -334,23 +450,31 @@ pub fn follow(inputs: &Inputs, policy: Policy) -> Plan {
     }
 
     for view in &mut views {
-        view.clear_resets(horizon_end, horizon_end);
+        view.clear_resets(end, end);
     }
 
-    Plan {
-        segments,
-        blocked_wu,
-        switches,
-        left_at_reset: views
+    Played {
+        plan: Plan {
+            segments,
+            blocked_wu,
+            switches,
+            left_at_reset: views
+                .iter()
+                .filter_map(|view| {
+                    view.left_at_reset
+                        .map(|left| (view.account.id.clone(), left))
+                })
+                .collect(),
+            full_at: views
+                .iter()
+                .filter_map(|view| view.full_at.map(|at| (view.account.id.clone(), at)))
+                .collect(),
+        },
+        worked_wu,
+        expired: views
             .iter()
-            .filter_map(|view| {
-                view.left_at_reset
-                    .map(|left| (view.account.id.clone(), left))
-            })
-            .collect(),
-        full_at: views
-            .iter()
-            .filter_map(|view| view.full_at.map(|at| (view.account.id.clone(), at)))
+            .filter(|view| view.resets_passed > 0)
+            .map(|view| (view.account.id.clone(), view.expired))
             .collect(),
     }
 }
@@ -366,6 +490,10 @@ struct View<'a> {
     reset: DateTime<Utc>,
     full_at: Option<DateTime<Utc>>,
     left_at_reset: Option<f64>,
+    /// The week-% unused at every weekly reset this view passed.
+    expired: f64,
+    /// How many weekly resets this view passed.
+    resets_passed: u32,
 }
 
 impl<'a> View<'a> {
@@ -386,6 +514,8 @@ impl<'a> View<'a> {
             reset: next_reset(account.week_resets_at, at),
             full_at: None,
             left_at_reset: None,
+            expired: 0.0,
+            resets_passed: 0,
         }
     }
 
@@ -414,11 +544,16 @@ impl<'a> View<'a> {
 
     /// Clear what has ended at `at`: a weekly reset that has passed (the week
     /// is over and starts again at 0 %, its unused percent recorded if the
-    /// reset is inside the horizon) and a 5 h window whose end has passed.
-    fn clear_resets(&mut self, at: DateTime<Utc>, horizon_end: DateTime<Utc>) {
+    /// reset is inside the walk) and a 5 h window whose end has passed.
+    fn clear_resets(&mut self, at: DateTime<Utc>, end: DateTime<Utc>) {
         while self.reset <= at {
-            if self.left_at_reset.is_none() && self.reset < horizon_end {
-                self.left_at_reset = Some(100.0 - self.week);
+            if self.reset < end {
+                let unused = 100.0 - self.week;
+                if self.left_at_reset.is_none() {
+                    self.left_at_reset = Some(unused);
+                }
+                self.expired += unused;
+                self.resets_passed += 1;
             }
             self.week = 0.0;
             self.reset += Duration::weeks(1);
@@ -481,17 +616,16 @@ impl<'a> View<'a> {
         self.account.may_use && !self.blocked(at)
     }
 
-    fn slack(&self, inputs: &Inputs, at: DateTime<Utc>) -> Option<f64> {
+    fn slack(&self, at: DateTime<Utc>, walk: &Walk<'_>) -> Option<f64> {
         let rates = self.rates()?;
         let week = self.week;
         let mut view = *self;
-        let horizon_end = inputs.now + Duration::hours(HORIZON_H);
         let mut usable_wu = 0.0;
-        for (cursor, work) in step_walk(inputs, at) {
+        for (cursor, work) in walk.horizon_from(at) {
             if cursor >= view.reset {
                 break;
             }
-            view.clear_resets(cursor, horizon_end);
+            view.clear_resets(cursor, walk.end());
             if work > 0.0 {
                 usable_wu += view.apply(cursor, work);
             }
@@ -523,7 +657,7 @@ impl<'a> View<'a> {
 
 /// The index of the account [`choose`] would name: the usable account with the
 /// least slack, or the fixed order when any usable account has no rates.
-fn pick(views: &[View<'_>], inputs: &Inputs, at: DateTime<Utc>) -> Option<usize> {
+fn pick(views: &[View<'_>], at: DateTime<Utc>, walk: &Walk<'_>) -> Option<usize> {
     let mut usable: Vec<usize> = (0..views.len())
         .filter(|&index| views[index].usable(at))
         .collect();
@@ -532,7 +666,7 @@ fn pick(views: &[View<'_>], inputs: &Inputs, at: DateTime<Utc>) -> Option<usize>
     }
     if usable
         .iter()
-        .any(|&index| views[index].slack(inputs, at).is_none())
+        .any(|&index| views[index].slack(at, walk).is_none())
     {
         let group = |index: usize| u8::from(!views[index].capped());
         usable.sort_by(|&a, &b| {
@@ -548,7 +682,7 @@ fn pick(views: &[View<'_>], inputs: &Inputs, at: DateTime<Utc>) -> Option<usize>
     }
     let mut best: Option<(f64, DateTime<Utc>, usize)> = None;
     for &index in &usable {
-        let Some(slack) = views[index].slack(inputs, at) else {
+        let Some(slack) = views[index].slack(at, walk) else {
             continue;
         };
         let reset = next_reset(views[index].account.week_resets_at, at);
@@ -579,21 +713,21 @@ fn pick(views: &[View<'_>], inputs: &Inputs, at: DateTime<Utc>) -> Option<usize>
 /// A target without known rates is never a reason to move.
 fn eager_move(
     views: &[View<'_>],
-    inputs: &Inputs,
     at: DateTime<Utc>,
     current: usize,
     typical: f64,
     last_switch: Option<DateTime<Utc>>,
+    walk: &Walk<'_>,
 ) -> Option<usize> {
     if last_switch.is_some_and(|last| at - last < Duration::minutes(MIN_DWELL_MIN)) {
         return None;
     }
-    let target = pick(views, inputs, at)?;
+    let target = pick(views, at, walk)?;
     if target == current {
         return None;
     }
-    let target_slack = views[target].slack(inputs, at)?;
-    let current_slack = views[current].slack(inputs, at)?;
+    let target_slack = views[target].slack(at, walk)?;
+    let current_slack = views[current].slack(at, walk)?;
     if target_slack <= current_slack - SLACK_MARGIN_H * typical {
         Some(target)
     } else {
@@ -609,24 +743,6 @@ fn next_reset(reset: DateTime<Utc>, at: DateTime<Utc>) -> DateTime<Utc> {
         next += Duration::weeks(1);
     }
     next
-}
-
-fn step_work(inputs: &Inputs, at: DateTime<Utc>) -> f64 {
-    inputs.rhythm.at(at, inputs.offset) * STEP_FRACTION
-}
-
-/// The plan's step walk from `from` over [`HORIZON_H`]: every [`STEP_MIN`] step
-/// with the work of the rhythm hour that holds its start, a quarter of
-/// [`Rhythm::at`]. [`follow`] plays every step, [`slack`] stops at the weekly
-/// reset, and the decision's wait walks the same steps; there is no second loop.
-pub(crate) fn step_walk(
-    inputs: &Inputs,
-    from: DateTime<Utc>,
-) -> impl Iterator<Item = (DateTime<Utc>, f64)> + '_ {
-    (0..HORIZON_H * 60 / STEP_MIN).map(move |index| {
-        let at = from + Duration::minutes(STEP_MIN * index);
-        (at, step_work(inputs, at))
-    })
 }
 
 /// The setup the plan's tests share with the later auto-burn tests (Tasks 6
@@ -837,6 +953,18 @@ mod tests {
         assert!(lazy.blocked_wu > 15.0, "{}", lazy.blocked_wu);
     }
 
+    #[test]
+    fn follow_is_unchanged_by_the_split() {
+        // The values of Task 5's setup before the one player replaced the loop.
+        let inputs = inputs();
+        let lazy = follow(&inputs, Policy::Lazy);
+        let eager = follow(&inputs, Policy::Eager);
+        assert!((lazy.blocked_wu - 21.75).abs() < EPS, "{}", lazy.blocked_wu);
+        assert_eq!(lazy.switches, 19);
+        assert!((eager.blocked_wu - 0.0).abs() < EPS, "{}", eager.blocked_wu);
+        assert_eq!(eager.switches, 58);
+    }
+
     /// The eager move of `inputs()` away from PR, `minutes` after a switch.
     fn eager_target_after(minutes: i64) -> Option<usize> {
         let inputs = inputs();
@@ -847,11 +975,11 @@ mod tests {
             .collect();
         eager_move(
             &views,
-            &inputs,
             now(),
             0, // PR
             inputs.rhythm.typical_hour(),
             Some(now() - Duration::minutes(minutes)),
+            &rhythm_walk(&inputs),
         )
     }
 
@@ -1138,5 +1266,17 @@ mod tests {
         );
         // The raw slacks prefer PR; within 1e-9 the id rule prefers LB.
         assert_eq!(choose(&inputs, now()), Some("LB".to_string()));
+    }
+
+    #[test]
+    fn recorded_work_uses_the_transcripts_hour_start() {
+        let at = utc("2026-11-16T10:45:30Z");
+        let hour = hour_start(at);
+        assert_eq!(hour, utc("2026-11-16T10:00:00Z"));
+        let hours = BTreeMap::from([(hour, 8.0)]);
+        let work = Work::Recorded(&hours);
+        assert!((work.at(hour) - 2.0).abs() < EPS);
+        assert!((work.at(at) - 2.0).abs() < EPS);
+        assert!((work.at(utc("2026-11-16T11:00:00Z")) - 0.0).abs() < EPS);
     }
 }

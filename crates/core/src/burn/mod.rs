@@ -4,9 +4,11 @@
 
 use chrono::{DateTime, Datelike, FixedOffset, Timelike, Utc};
 
+pub mod cost;
 pub mod decide;
 pub mod plan;
 pub mod rates;
+pub mod replay;
 pub mod tied;
 
 /// An account's rates are known from this much work on it (spec §2.3, "while
@@ -83,19 +85,26 @@ impl Rhythm {
     /// The mean over the hours that have work, 0.0 when there is none: the
     /// "work of a typical working hour" of spec §2.3.
     pub fn typical_hour(&self) -> f64 {
-        let mut sum = 0.0;
-        let mut hours = 0usize;
-        for wu in &self.wu {
-            if *wu > 0.0 {
-                sum += *wu;
-                hours += 1;
-            }
+        mean_over_hours(self.wu.iter().copied())
+    }
+}
+
+/// The mean over the values that have work, 0.0 when there is none: the "work
+/// of a typical working hour" of spec §2.3. The one function behind the learned
+/// rhythm's [`Rhythm::typical_hour`] and the recorded hours of a replay.
+pub(crate) fn mean_over_hours(hours: impl IntoIterator<Item = f64>) -> f64 {
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    for wu in hours {
+        if wu > 0.0 {
+            sum += wu;
+            count += 1;
         }
-        if hours == 0 {
-            0.0
-        } else {
-            sum / hours as f64
-        }
+    }
+    if count == 0 {
+        0.0
+    } else {
+        sum / count as f64
     }
 }
 

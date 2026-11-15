@@ -6,9 +6,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Duration, FixedOffset, Timelike, Utc};
 
 use crate::api::LimitKind;
-use crate::history::{
-    same_reset, AccountRef, Event, EventKind, Hosted, LimitSample, Sample, TokenRecord,
-};
+use crate::history::{same_reset, AccountRef, Event, EventKind, Hosted, Sample, TokenRecord};
 
 use super::{
     hour_of_week, week_weight, work_units, Rates, Rhythm, LEARN_MIN_WU, RATES_DAYS, RHYTHM_WEEKS,
@@ -89,12 +87,7 @@ pub fn rates(
 ) -> Option<Rates> {
     let pairs = pairs(account, samples, now);
 
-    let mut timelines: HashMap<String, Timeline> = HashMap::new();
-    for hosted in events {
-        if !timelines.contains_key(&hosted.host) {
-            timelines.insert(hosted.host.clone(), Timeline::of(events, &hosted.host));
-        }
-    }
+    let timelines = timelines(events);
 
     let week_spans: Vec<(DateTime<Utc>, DateTime<Utc>)> =
         pairs.iter().map(|pair| (pair.from, pair.to)).collect();
@@ -126,6 +119,17 @@ pub fn rates(
     };
 
     Some(Rates { c, s })
+}
+
+/// The timeline of every host that has an event.
+pub(super) fn timelines(events: &[Hosted<Event>]) -> HashMap<String, Timeline> {
+    let mut timelines: HashMap<String, Timeline> = HashMap::new();
+    for hosted in events {
+        if !timelines.contains_key(&hosted.host) {
+            timelines.insert(hosted.host.clone(), Timeline::of(events, &hosted.host));
+        }
+    }
+    timelines
 }
 
 /// Two consecutive samples of one account that lie in one weekly window.
@@ -165,8 +169,8 @@ fn pairs(account: &AccountRef, samples: &[Hosted<Sample>], now: DateTime<Utc>) -
             continue;
         }
         let (Some(week_before), Some(week_after)) = (
-            limit(&before.record, &LimitKind::WeeklyAll),
-            limit(&after.record, &LimitKind::WeeklyAll),
+            before.record.limit(&LimitKind::WeeklyAll),
+            after.record.limit(&LimitKind::WeeklyAll),
         ) else {
             continue;
         };
@@ -186,16 +190,12 @@ fn pairs(account: &AccountRef, samples: &[Hosted<Sample>], now: DateTime<Utc>) -
     pairs
 }
 
-fn limit<'a>(sample: &'a Sample, kind: &LimitKind) -> Option<&'a LimitSample> {
-    sample.l.iter().find(|limit| &limit.k == kind)
-}
-
 /// The session percent a pair gained, when both samples carry a session limit in
 /// one 5 h window (the same reset, [`same_reset`]) and the earlier one is below
 /// 100 %; otherwise no session pair.
 fn session_gain(before: &Sample, after: &Sample) -> Option<f64> {
-    let limit_before = limit(before, &LimitKind::Session)?;
-    let limit_after = limit(after, &LimitKind::Session)?;
+    let limit_before = before.limit(&LimitKind::Session)?;
+    let limit_after = after.limit(&LimitKind::Session)?;
     let (reset_before, reset_after) = (limit_before.r?, limit_after.r?);
     if !same_reset(reset_before, reset_after) || limit_before.p >= 100.0 {
         return None;
@@ -205,12 +205,12 @@ fn session_gain(before: &Sample, after: &Sample) -> Option<f64> {
 
 /// When an account was live on one host. Every `live` and `switch` event changes
 /// it, so the account between two changes is the one of the earlier change.
-struct Timeline {
+pub(super) struct Timeline {
     changes: Vec<(DateTime<Utc>, Option<AccountRef>)>,
 }
 
 impl Timeline {
-    fn of(events: &[Hosted<Event>], host: &str) -> Timeline {
+    pub(super) fn of(events: &[Hosted<Event>], host: &str) -> Timeline {
         let mut changes: Vec<(DateTime<Utc>, Option<AccountRef>)> = events
             .iter()
             .filter(|hosted| hosted.host == host)
@@ -265,7 +265,7 @@ fn seconds_between(from: DateTime<Utc>, to: DateTime<Utc>) -> f64 {
 /// counting each record only while `account` was live on the record's host and
 /// spreading a record evenly over its hour: the hour starts at the record's time,
 /// as `transcripts::token_records` groups the answers of one hour.
-fn work_in(
+pub(super) fn work_in(
     timelines: &HashMap<String, Timeline>,
     tokens: &[Hosted<TokenRecord>],
     account: &AccountRef,
@@ -303,7 +303,7 @@ fn work_in(
 mod tests {
     use super::*;
 
-    use crate::history::{By, Source};
+    use crate::history::{By, LimitSample, Source};
     use crate::project::ProjectKey;
 
     const EPS: f64 = 1e-9;
