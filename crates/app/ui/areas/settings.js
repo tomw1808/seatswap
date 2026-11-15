@@ -19,7 +19,6 @@ import {
   isObject,
   selectInput,
   shortPercent,
-  switchButton,
   textInput,
 } from "../common.js";
 
@@ -419,6 +418,14 @@ function savedValue(field) {
   return state.settings ? state.settings[field] : undefined;
 }
 
+// The mock-up gives every select the same 170 px width; the two organization
+// selects and "For sessions on" are 130 px, and the currency is 110 px.
+function selectWidth(select, width = 170) {
+  select.style.width = `${width}px`;
+  select.style.flex = "0 0 auto";
+  return select;
+}
+
 function themeControl(value) {
   const select = selectInput(
     [
@@ -437,10 +444,10 @@ function themeControl(value) {
     }
   );
   select.setAttribute("aria-label", "Theme");
-  return select;
+  return selectWidth(select);
 }
 
-function selectSetting(field, options, label) {
+function selectSetting(field, options, label, width) {
   const select = selectInput(options, savedValue(field), async (next) => {
     select.disabled = true;
     await saveField(field, next);
@@ -448,19 +455,57 @@ function selectSetting(field, options, label) {
     select.disabled = false;
   });
   if (label) select.setAttribute("aria-label", label);
-  return select;
+  return selectWidth(select, width);
 }
 
-function toggle(field, label) {
-  const control = switchButton(Boolean(savedValue(field)), label, async (next) => {
-    control.disabled = true;
-    const ok = await saveField(field, next);
-    if (!ok) {
-      control.setAttribute("aria-checked", savedValue(field) ? "true" : "false");
-    }
-    control.disabled = false;
+// The mock-up's `.sws` switch: a blue track with a knob, and its On/Off word
+// beside it where the mock-up has one (`settings()` uses `words=False` only
+// in the Accounts row). The caller gets the button so it can disable it while
+// a save runs, and `set` to put the switch back when the save is refused.
+function switchControl(checked, label, onchange, options) {
+  const words = !options || options.words !== false;
+  let state = Boolean(checked);
+  const button = h("button", {
+    type: "button",
+    class: `sws${state ? " ison" : ""}`,
+    role: "switch",
+    "aria-checked": state ? "true" : "false",
+    "aria-label": label,
   });
-  return control;
+  const word = words
+    ? h("span", { class: "sws-word", text: state ? "On" : "Off" })
+    : null;
+  const set = (next) => {
+    state = Boolean(next);
+    button.setAttribute("aria-checked", state ? "true" : "false");
+    button.classList.toggle("ison", state);
+    if (word) word.textContent = state ? "On" : "Off";
+  };
+  button.addEventListener("click", () => {
+    const next = !state;
+    set(next);
+    onchange(next);
+  });
+  return {
+    button,
+    set,
+    node: word ? h("span", { class: "sws-line" }, [button, word]) : button,
+  };
+}
+
+function toggle(field, label, words = true) {
+  const control = switchControl(
+    Boolean(savedValue(field)),
+    label,
+    async (next) => {
+      control.button.disabled = true;
+      const ok = await saveField(field, next);
+      if (!ok) control.set(Boolean(savedValue(field)));
+      control.button.disabled = false;
+    },
+    { words }
+  );
+  return control.node;
 }
 
 function numberField(field, label, options) {
@@ -635,8 +680,14 @@ async function fillTimeNodes(requests) {
   }
 }
 
+// The note rows lay their parts out as flex items; a bare " · " text node loses
+// its outer spaces there. A span with `white-space: pre` keeps them.
+function middotSeparator() {
+  return h("span", { class: "middot-sep", text: " · " });
+}
+
 function addNotePart(host, node) {
-  if (host.childNodes.length > 0) host.appendChild(document.createTextNode(" · "));
+  if (host.childNodes.length > 0) host.appendChild(middotSeparator());
   host.appendChild(node);
 }
 
@@ -686,6 +737,7 @@ function currencyRow() {
     }
   );
   select.setAttribute("aria-label", "Currency");
+  selectWidth(select, 110);
 
   custom = textInput({
     value: code && !known ? code : "",
@@ -714,27 +766,24 @@ function currencyRow() {
 }
 
 function lookUpRow() {
-  const control = switchButton(
+  const control = switchControl(
     Boolean(savedValue("lookUpPrices")),
     "Look up prices and the dollar rate",
     async (next) => {
-      control.disabled = true;
+      control.button.disabled = true;
       const ok = await saveField("lookUpPrices", next);
       if (!ok) {
-        control.setAttribute(
-          "aria-checked",
-          savedValue("lookUpPrices") ? "true" : "false"
-        );
-        control.disabled = false;
+        control.set(Boolean(savedValue("lookUpPrices")));
+        control.button.disabled = false;
         return;
       }
       await refreshMoney();
-      control.disabled = false;
+      control.button.disabled = false;
     }
   );
   return setting(
     "Look up prices and the dollar rate",
-    control,
+    control.node,
     "prices hourly from models.dev · rate daily from the European Central Bank · nothing about you is sent",
     "lookUpPrices"
   );
@@ -865,7 +914,7 @@ function apiPricesRow(times) {
       : `${count} models with a price`;
   const show = h("button", {
     type: "button",
-    class: "hbtn xs ghost",
+    class: "hbtn xs",
     text: state.moneyOpen ? "Hide" : "Show…",
     "aria-expanded": state.moneyOpen ? "true" : "false",
   });
@@ -1136,6 +1185,7 @@ function addModelRow() {
     () => {}
   );
   provider.setAttribute("aria-label", "Model provider");
+  selectWidth(provider);
   const model = textInput({
     class: "inp tall price-add-model",
     placeholder: "claude-opus-5-5",
@@ -1426,14 +1476,15 @@ function accountRow(row) {
     currencyMark,
   ]);
 
-  const auto = switchButton(
+  const auto = switchControl(
     row.autoBurn === true,
     `Auto-burn may use ${abbr}`,
     async (next) => {
       const ok = await saveAccount(row, { autoBurn: next }, field);
       if (ok) row.autoBurn = next;
-      else auto.setAttribute("aria-checked", row.autoBurn ? "true" : "false");
-    }
+      else auto.set(row.autoBurn === true);
+    },
+    { words: false }
   );
 
   wrap.appendChild(
@@ -1443,7 +1494,7 @@ function accountRow(row) {
       h("span", { class: "acc-text", title: accountEmail(row), text: accountEmail(row) }),
       h("span", { class: "acc-text", title: accountPlan(row), text: accountPlan(row) }),
       priceCell,
-      h("div", { class: "acc-switch" }, [auto]),
+      h("div", { class: "acc-switch" }, [auto.node]),
       accountOrgCell(row, field),
       h("span", { class: "acc-text", text: loginEndsText(row) }),
     ])
@@ -1717,7 +1768,7 @@ function accountOrgCell(row, field) {
     select.value = back ? back.id : "";
   });
   select.setAttribute("aria-label", `Organization of ${row.abbr || "the account"}`);
-  return select;
+  return selectWidth(select, 130);
 }
 
 function saveAccountOrg(row, orgId, field) {
@@ -1888,6 +1939,7 @@ function projectOrgCell(project, projects, field) {
     }
   );
   select.setAttribute("aria-label", `Organization of ${project.name || "the project"}`);
+  selectWidth(select, 130);
 
   const newInput = textInput({
     class: "inp tall proj-new-input",
@@ -1929,7 +1981,7 @@ function projectOrgCell(project, projects, field) {
 function joinedLine(project, field) {
   const line = h("div", { class: "proj-joined" }, [h("span", { class: "mf", text: "joined: " })]);
   project.joined.forEach((joined, index) => {
-    if (index > 0) line.appendChild(document.createTextNode(" · "));
+    if (index > 0) line.appendChild(middotSeparator());
     line.appendChild(h("span", { class: "mono x11", text: joined.name }));
     const undo = h("button", {
       type: "button",
@@ -1956,6 +2008,8 @@ function joinRow(projects) {
   const second = selectInput(options, rows.length > 1 ? "1" : "0", () => {});
   first.setAttribute("aria-label", "Join this project");
   second.setAttribute("aria-label", "Into this project");
+  selectWidth(first);
+  selectWidth(second);
   const join = h("button", { type: "button", class: "hbtn", text: "Join projects" });
   join.disabled = rows.length < 2;
   join.addEventListener("click", async () => {
@@ -2028,6 +2082,17 @@ function orgRow(org, projects) {
     `from the owner of the repositories · ${counts}`,
     field
   );
+}
+
+// The mock-up shows the folder in effect as the empty field's placeholder. The
+// snapshot fills it from the ClaudePaths the app runs with; when the snapshot
+// has no folder, the field says so instead of inventing one.
+function configFolderPlaceholder() {
+  const folder =
+    state.snapshot && typeof state.snapshot.claudeConfigDir === "string"
+      ? state.snapshot.claudeConfigDir
+      : "";
+  return folder !== "" ? folder : "the config folder in effect is not known";
 }
 
 function generalCard() {
@@ -2114,7 +2179,11 @@ function generalCard() {
   body.appendChild(
     setting(
       "Claude Code's config folder",
-      textField("claudeConfigDir", "Claude Code's config folder", "/home/you/.claude"),
+      textField(
+        "claudeConfigDir",
+        "Claude Code's config folder",
+        configFolderPlaceholder()
+      ),
       "empty: $CLAUDE_CONFIG_DIR or Claude Code's default folder · takes effect after restarting seatswap",
       "claudeConfigDir"
     )
@@ -2186,12 +2255,6 @@ function measuredText(measured) {
   return parts.join(" · ");
 }
 
-function switchesText(view) {
-  if (!view) return MISSING;
-  if (!view.early) return "switching only when full";
-  return "switching before 100 % pays";
-}
-
 function switchesNote(view) {
   if (!view) return "";
   if (!view.early) return "early switching is off";
@@ -2222,13 +2285,16 @@ function autoBurnCard() {
       section("What it decides by itself"),
       setting(
         "How early it switches",
-        h("span", { text: view && view.why ? view.why : MISSING }),
+        h("span", { text: "from what it has measured" }),
         "the size of your 5 h windows and what a switch costs"
       ),
       setting("Measured so far", h("span", { text: measuredText(view && view.measured) })),
       setting(
         "So right now",
-        h("span", { class: "ok", text: switchesText(view) }),
+        h("span", {
+          class: view && view.early ? "ok" : "",
+          text: view && typeof view.why === "string" ? view.why : MISSING,
+        }),
         switchesNote(view)
       ),
       setting(
@@ -2253,6 +2319,13 @@ function autoBurnCard() {
 // ---------------------------------------------------------------------------
 
 function notificationsCard() {
+  // The mock-up draws "All accounts are full" as a switch, but the settings
+  // description says it is always on: there is no setting to save. The switch
+  // shows that state and says so, instead of offering a click that would do
+  // nothing.
+  const allFull = switchControl(true, "All accounts are full", () => {});
+  allFull.button.disabled = true;
+  allFull.button.title = "always on: it is sent whenever every account is full";
   return panel(
     "Notifications",
     "",
@@ -2272,7 +2345,8 @@ function notificationsCard() {
             ["thisHost", "this host"],
             ["allHosts", "all hosts"],
           ],
-          "For sessions on"
+          "For sessions on",
+          130
         ),
         "other hosts report with the delay of the sync",
         "notifyWaitingHosts"
@@ -2286,7 +2360,7 @@ function notificationsCard() {
       ),
       setting(
         "All accounts are full",
-        h("span", { class: "mf", text: "always" }),
+        allFull.node,
         "with the time the next one is free"
       ),
       setting(
@@ -2295,10 +2369,7 @@ function notificationsCard() {
         "",
         "notifyOnSwitch"
       ),
-      setting(
-        "A switch by an agent",
-        h("span", { class: "mf", text: "always" })
-      ),
+      setting("A switch by an agent", h("span", { class: "mf", text: "always" })),
       setting(
         "Suggested switches",
         h(
@@ -2374,26 +2445,23 @@ function agentsCard() {
         "agentsSwitch"
       ),
       note([
-        "These two switches work through a marker that Claude Code puts on every command it runs. An agent runs as you. It can remove the marker, or change seatswap's files directly. The switches stop agents that follow the rules. They are not a lock. To block the command itself, add a deny rule for ",
-        h("code", { text: "seatswap" }),
+        h("b", { text: "These switches are not a lock." }),
+        " They work through a marker that Claude Code puts on every command it runs. An agent runs as you: it can remove the marker, or change seatswap's files directly. The switches stop agents that follow the rules. To block the command itself, add a deny rule for ",
+        h("span", { class: "mono", text: "seatswap" }),
         " to Claude Code's permissions.",
       ]),
       section("Telling agents about seatswap"),
       skillRow,
       section("Last calls by agents"),
       calls,
-      note([
-        "A call counts as an agent's when ",
-        h("code", { text: "CLAUDECODE=1" }),
-        " or ",
-        h("code", { text: "AI_AGENT" }),
-        " is set.",
-      ]),
     ],
-    h("span", {
-      class: "mf",
-      text: "The skill goes to <claude config folder>/skills/seatswap/SKILL.md.",
-    })
+    h("span", { class: "mf" }, [
+      "A call counts as an agent's when ",
+      h("span", { class: "mono", text: "CLAUDECODE=1" }),
+      " or ",
+      h("span", { class: "mono", text: "AI_AGENT" }),
+      " is set.",
+    ])
   );
 
   // Draw the two rows that need the app from the stored views.
@@ -2468,7 +2536,7 @@ async function loadCallsView() {
     let whens = rows.map(() => "?");
     try {
       whens = await state.context.invoke("time_texts", {
-        times: rows.map((row) => ({ at: row.at, style: "clock" })),
+        times: rows.map((row) => ({ at: row.at, style: "dayClock" })),
       });
       if (!Array.isArray(whens) || whens.length !== rows.length) {
         throw new Error("time_texts returned an unexpected reply");
@@ -2556,7 +2624,8 @@ function historyCard() {
       "History folder",
       view && typeof view.dir === "string" ? view.dir : "",
       "a synced folder shares it with your other hosts",
-      Boolean(view && typeof view.savedDir === "string")
+      Boolean(view && typeof view.savedDir === "string"),
+      280
     )
   );
 
@@ -2583,7 +2652,7 @@ function historyCard() {
 // A field whose new value only reaches the tray app when it restarts. The
 // restart note shows exactly when the saved value differs from the one in
 // effect, as the view says.
-function restartField(field, label, placeholder, baseNote, differs) {
+function restartField(field, label, placeholder, baseNote, differs, width) {
   const value = savedValue(field);
   const input = textInput({
     value: value === null || value === undefined ? "" : String(value),
@@ -2591,6 +2660,7 @@ function restartField(field, label, placeholder, baseNote, differs) {
     "aria-label": label,
   });
   input.className = "inp tall";
+  if (width) input.style.width = `${width}px`;
   const noteNode = h("span", { class: "mf" });
   const showNote = () => {
     noteNode.textContent = differs ? RESTART_NOTE : baseNote;

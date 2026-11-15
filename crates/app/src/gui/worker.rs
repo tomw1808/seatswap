@@ -106,6 +106,9 @@ pub(crate) struct Snapshot {
     /// `None` when accounts.json cannot be read: the panel shows the error and
     /// disables Save instead of offering defaults that would overwrite it.
     pub settings: Option<Settings>,
+    /// Claude Code's config folder as the app runs with it, with `~` for the
+    /// home folder. The General group shows it as the empty field's placeholder.
+    pub claude_config_dir: String,
 }
 
 /// One stored account as the Accounts group shows it. `loginDaysLeft` comes
@@ -195,6 +198,7 @@ impl Snapshot {
             error,
             sessions: None,
             settings,
+            claude_config_dir: String::new(),
         }
     }
 
@@ -464,6 +468,8 @@ pub(crate) struct SnapshotParts {
     pub pending: Option<PendingSwitch>,
     /// A one-shot message (the moved usage cache) for this snapshot only.
     pub notice: Option<String>,
+    /// The config folder in effect, already written with `~` for the home folder.
+    pub claude_config_dir: String,
 }
 
 /// The one place that turns the engine's data into a [`Snapshot`]. The engine
@@ -529,6 +535,7 @@ pub(crate) fn build_snapshot(parts: SnapshotParts) -> Snapshot {
         error,
         sessions: None,
         settings,
+        claude_config_dir: parts.claude_config_dir,
     }
 }
 
@@ -931,6 +938,10 @@ impl EngineRuntime {
             engine_error = combine(engine_error, history_error.clone());
         }
         let accounts_for_burn = accounts.as_ref().ok().map(|file| file.accounts.clone());
+        let claude_config_dir = with_tilde(
+            &self.claude.config_dir.to_string_lossy(),
+            self.claude.home(),
+        );
         self.snapshot = build_snapshot(SnapshotParts {
             views,
             accounts,
@@ -940,6 +951,7 @@ impl EngineRuntime {
             last_poll_at,
             pending: None,
             notice: self.notice.take(),
+            claude_config_dir,
         });
         self.update_burn(accounts_for_burn);
     }
@@ -1783,6 +1795,10 @@ fn snapshot_from_engine<R: Remote>(
         last_poll_at,
         pending: None,
         notice: None,
+        claude_config_dir: with_tilde(
+            &engine.claude_paths().config_dir.to_string_lossy(),
+            engine.claude_paths().home(),
+        ),
     })
 }
 
@@ -2068,6 +2084,7 @@ mod tests {
                 "accounts",
                 "activeId",
                 "burn",
+                "claudeConfigDir",
                 "error",
                 "lastPollAt",
                 "live",
@@ -2079,6 +2096,7 @@ mod tests {
                 "warnings",
             ]
         );
+        assert_eq!(object["claudeConfigDir"], "~/claude");
         assert_eq!(object["live"]["kind"], "known");
         assert_eq!(object["live"]["accountId"], fixture.account.id.as_str());
         assert_eq!(object["views"][0]["isActive"], true);

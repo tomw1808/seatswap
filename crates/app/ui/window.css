@@ -491,7 +491,7 @@ code,
 /* ---------- the Accounts group ---------- */
 
 .acc-grid {
-  grid-template-columns: 62px 128px minmax(0, 1fr) 60px 232px 132px 84px 70px;
+  grid-template-columns: 62px 128px minmax(0, 1fr) 60px 178px 132px 138px 70px;
 }
 
 .acc-wrap {
@@ -872,44 +872,66 @@ select.inp {
   font-variant-numeric: tabular-nums;
 }
 
-/* The mock-up's switch (panel.css has the same shape for the pop-up). */
-.switch {
+/* The Settings groups use the mock-up's `.sws`: a 28×16 track, a knob and the
+   On/Off word beside it. The pop-up keeps its own `.switch` in panel.css. */
+.sws {
   position: relative;
   flex: 0 0 auto;
-  width: 30px;
-  height: 17px;
+  width: 28px;
+  height: 16px;
   padding: 0;
-  border: 1px solid var(--border-strong);
+  border: 0;
   border-radius: 999px;
   background: var(--track);
-  transition: background 120ms ease, border-color 120ms ease;
+  cursor: pointer;
+  transition: background 120ms ease;
 }
 
-.switch::after {
+.sws::after {
   content: "";
   position: absolute;
-  top: 1px;
-  left: 1px;
-  width: 13px;
-  height: 13px;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
   border-radius: 50%;
-  background: var(--muted);
-  transition: transform 120ms ease, background 120ms ease;
+  background: var(--surface);
+  transition: left 120ms ease;
 }
 
-.switch[aria-checked="true"] {
-  border-color: transparent;
-  background: var(--pill-bg);
+.sws.ison {
+  background: var(--focus);
 }
 
-.switch[aria-checked="true"]::after {
-  transform: translateX(13px);
-  background: var(--pill-text);
+.sws.ison::after {
+  left: 14px;
 }
 
-.switch:focus-visible {
+.sws:focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 1px;
+}
+
+.sws:disabled {
+  cursor: default;
+}
+
+.sws-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sws-word {
+  width: 22px;
+  font-size: 13px;
+  line-height: 18px;
+}
+
+/* The note rows are flex containers; the separator keeps the spaces the
+   mock-up writes around its "·" (`checked 09:00 · last change 9 Nov`). */
+.middot-sep {
+  white-space: pre;
 }
 
 button.link {

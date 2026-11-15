@@ -657,6 +657,7 @@ mod tests {
             error: error.map(str::to_string),
             sessions: None,
             settings: Some(Settings::default()),
+            claude_config_dir: String::new(),
         }
     }
 }

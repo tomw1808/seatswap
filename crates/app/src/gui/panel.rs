@@ -1136,9 +1136,11 @@ pub(crate) fn icon_preview(abbr: String, color: String) -> Result<Vec<IconPx>, S
 
 /// How the panel writes a time: `countdown` to a reset as in the cards
 /// (`format_reset_at`), `clock` as in the switch suggestion
-/// (`format_reset_clock`), `age` of a poll or a usage fetch (`format_age`),
-/// `day` for a looked-up value's time in local time, and `date` for a calendar
-/// date without a time zone conversion (`13 Nov`).
+/// (`format_reset_clock`), `dayClock` for a call today as `09:41`, within the
+/// last six days as `Thu 09:41`, and older as `13 Nov 09:41`, `age` of a poll
+/// or a usage fetch (`format_age`), `day` for a looked-up value's time in local
+/// time, and `date` for a calendar date without a time zone conversion
+/// (`13 Nov`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum TimeStyle {
@@ -1147,6 +1149,7 @@ pub(crate) enum TimeStyle {
     Age,
     Day,
     Date,
+    DayClock,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -1181,6 +1184,23 @@ where
                 // time zone of the machine.
                 let date = time.at.date_naive();
                 format!("{} {}", date.day(), date.format("%b"))
+            }
+            TimeStyle::DayClock => {
+                let local = time.at.with_timezone(tz);
+                let today = now.with_timezone(tz).date_naive();
+                let days = (today - local.date_naive()).num_days();
+                if days == 0 {
+                    local.format("%H:%M").to_string()
+                } else if (1..=6).contains(&days) {
+                    local.format("%a %H:%M").to_string()
+                } else {
+                    format!(
+                        "{} {} {}",
+                        local.day(),
+                        local.format("%b"),
+                        local.format("%H:%M")
+                    )
+                }
             }
         })
         .collect()
@@ -1650,6 +1670,26 @@ mod tests {
                 "12 s ago",
                 "5 min ago"
             ]
+        );
+    }
+
+    /// Last calls keep the clock today, name the weekday within the last six
+    /// days, and keep the day and month for anything older.
+    #[test]
+    fn day_clock_names_the_day_unless_today() {
+        let times: Vec<TimeRequest> = serde_json::from_value(serde_json::json!([
+            { "at": "2026-11-20T09:41:00Z", "style": "dayClock" },
+            { "at": "2026-11-19T09:41:00Z", "style": "dayClock" },
+            { "at": "2026-11-14T09:41:00Z", "style": "dayClock" },
+            { "at": "2026-11-13T09:41:00Z", "style": "dayClock" },
+        ]))
+        .expect("the panel's request");
+        let now = DateTime::parse_from_rfc3339("2026-11-20T13:35:00Z")
+            .expect("now")
+            .with_timezone(&Utc);
+        assert_eq!(
+            time_texts_at(&times, now, &Utc),
+            vec!["09:41", "Thu 09:41", "Sat 09:41", "13 Nov 09:41"]
         );
     }
 

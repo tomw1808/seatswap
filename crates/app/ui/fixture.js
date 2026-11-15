@@ -153,6 +153,9 @@ function makeFixture() {
   const labId = "8b4e7f20-6a1d-4d33-b8c5-2f9a0e6d7c81";
   const privateId = "c0a1b2d3-e4f5-4a6b-8c7d-9e0f1a2b3c4d";
   return {
+    // The folder the app runs with (the Snapshot's field); the General group
+    // shows it as the empty config-folder field's placeholder.
+    claudeConfigDir: "~/.claude",
     views: [
       {
         id: privateId,
@@ -318,19 +321,19 @@ function makeFixture() {
     },
     agentCalls: [
       {
-        at: isoIn(-3 * hour),
+        at: isoIn(-30 * 60000),
         command: "status --json",
         cwd: "~/projects/ledger",
         allowed: true,
       },
       {
-        at: isoIn(-2 * hour),
+        at: isoIn(-26 * hour),
         command: "use PR",
         cwd: "~/projects/ledger",
         allowed: false,
       },
       {
-        at: isoIn(-1 * hour),
+        at: isoIn(-50 * hour),
         command: "status --json --refresh",
         cwd: "~/projects/acme-kb",
         allowed: true,
@@ -1274,25 +1277,28 @@ export async function fixtureInvoke(command, args) {
 
     // Only a stand-in so the page can be looked at in a browser: the real
     // texts come from `format.rs`, which a browser cannot run.
-    case "time_texts":
+    case "time_texts": {
+      const months = [
+        "Jan",
+        "Feb",
+        "Mar",
+        "Apr",
+        "May",
+        "Jun",
+        "Jul",
+        "Aug",
+        "Sep",
+        "Oct",
+        "Nov",
+        "Dec",
+      ];
+      const weekdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+      const clock = (date) =>
+        `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
       return (args.times || []).map((time) => {
         if (time.style === "age") return "a moment ago";
         const date = new Date(time.at);
         if (time.style === "day" || time.style === "date") {
-          const months = [
-            "Jan",
-            "Feb",
-            "Mar",
-            "Apr",
-            "May",
-            "Jun",
-            "Jul",
-            "Aug",
-            "Sep",
-            "Oct",
-            "Nov",
-            "Dec",
-          ];
           // `date` is a calendar date: the day as written, without moving it
           // into the browser's time zone. `day` is a moment in local time.
           if (time.style === "date") {
@@ -1300,8 +1306,20 @@ export async function fixtureInvoke(command, args) {
           }
           return `${date.getDate()} ${months[date.getMonth()]}`;
         }
-        return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+        if (time.style === "dayClock") {
+          const now = new Date();
+          const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+          const day = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+          const days = Math.round((today - day) / 86400000);
+          // Today keeps the clock; the last six days name the weekday; older
+          // calls keep the day and month in front, as `TimeStyle::DayClock`.
+          if (days === 0) return clock(date);
+          if (days > 0 && days <= 6) return `${weekdays[date.getDay()]} ${clock(date)}`;
+          return `${date.getDate()} ${months[date.getMonth()]} ${clock(date)}`;
+        }
+        return clock(date);
       });
+    }
 
     case "projects_view":
       return clone(fixtureProjectView(fixture));

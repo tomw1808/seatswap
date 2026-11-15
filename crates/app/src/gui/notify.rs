@@ -714,6 +714,7 @@ mod tests {
             error: None,
             sessions: None,
             settings: Some(Settings::default()),
+            claude_config_dir: String::new(),
         }
     }
 
@@ -791,6 +792,7 @@ mod tests {
             error: None,
             sessions,
             settings,
+            claude_config_dir: String::new(),
         }
     }
 
