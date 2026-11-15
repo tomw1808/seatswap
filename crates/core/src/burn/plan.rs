@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Duration, FixedOffset, Utc};
 
+use crate::api::{Limit, LimitKind, Severity};
 use crate::transcripts::hour_start;
 
 use super::{Rates, Rhythm, HORIZON_H, MIN_DWELL_MIN, SLACK_MARGIN_H, STEP_MIN};
@@ -582,12 +583,21 @@ impl<'a> View<'a> {
         }
     }
 
-    fn window_over(&self, at: DateTime<Utc>) -> bool {
-        self.window_end.is_some_and(|end| at >= end)
-    }
-
     fn window_blocked(&self, at: DateTime<Utc>) -> bool {
-        self.capped() && self.session >= 100.0 && !self.window_over(at)
+        if !self.capped() {
+            return false;
+        }
+        // The same rule `engine::blocking_limit` uses: a session limit at 100 %
+        // whose reset is not at or before `at`.
+        Limit {
+            kind: LimitKind::Session,
+            percent: self.session,
+            severity: Severity::Normal,
+            resets_at: self.window_end,
+            model: None,
+            is_active: false,
+        }
+        .is_full_at(at)
     }
 
     /// An account is full when its week is at 100 % or its 5 h window is at

@@ -9,11 +9,12 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use chrono::{DateTime, Duration, FixedOffset, Utc};
 use serde::Serialize;
 
-use seatswap_core::burn::decide::{decide, regime, Decision, Reason, Regime, Situation};
+use seatswap_core::burn::decide::{decide, regime, Decision, Regime, Situation};
 use seatswap_core::burn::live::{self, Learned, Readiness};
 use seatswap_core::burn::plan::{follow, rates_known, Plan, Policy};
+use seatswap_core::burn::{FRESH_MIN, SWITCH_RELEARN_MIN};
 use seatswap_core::engine::{AccountView, PollReason};
-use seatswap_core::history::{By, HistoryDir};
+use seatswap_core::history::{AccountRef, By, EventKind, HistoryDir};
 use seatswap_core::store::{Account, Settings};
 use seatswap_core::switcher::UnsavedPolicy;
 
@@ -71,7 +72,6 @@ pub(crate) struct BurnReport {
 /// A switch that was sent and whose reply has not been read yet.
 struct SentSwitch {
     to: String,
-    reason: Reason,
     /// The active account when the switch was sent; a refusal leaves it.
     from: Option<String>,
     sent_at: DateTime<Utc>,
@@ -98,7 +98,13 @@ pub(crate) struct BurnRuntime {
     learn_error: Option<String>,
     regime: Option<Regime>,
     regime_at: Option<DateTime<Utc>>,
+    /// The accounts auto-burn may use and whether each has rates, when the
+    /// regime was computed: a change means the regime is computed again.
+    regime_basis: Option<BTreeMap<String, bool>>,
     last_active: Option<String>,
+    /// The last learn attempt, for the re-learn after a switch event that
+    /// landed after the files it names.
+    switch_learn_at: Option<DateTime<Utc>>,
     /// The last switch decision sent, its reply, and when it was sent.
     last_sent: Option<SentSwitch>,
     /// The time of the last stale poll ask (at most one per [`STALE_ASK_SECS`]).
@@ -120,7 +126,9 @@ impl BurnRuntime {
             learn_error: None,
             regime: None,
             regime_at: None,
+            regime_basis: None,
             last_active: None,
+            switch_learn_at: None,
             last_sent: None,
             last_stale_ask: None,
             view: None,
@@ -157,12 +165,20 @@ impl BurnRuntime {
                     .learn_attempted_at
                     .is_some_and(|at| tick.now - at >= Duration::hours(1)))
             || failed_due
-            || tick.active != self.last_active.as_deref();
+            || tick.active != self.last_active.as_deref()
+            || self.switch_relearn_due(tick);
         if due {
             self.force_learn = false;
             self.learn_attempted_at = Some(tick.now);
+            self.switch_learn_at = Some(tick.now);
             match tick.history {
-                Some(history) => match live::learn(history, tick.now, tick.offset, tick.accounts) {
+                Some(history) => match live::learn(
+                    history,
+                    tick.now,
+                    tick.offset,
+                    tick.accounts,
+                    tick.settings.read_sessions,
+                ) {
                     Ok(learned) => {
                         for warning in &learned.warnings {
                             if self.warned.insert(warning.clone()) {
@@ -221,15 +237,24 @@ impl BurnRuntime {
                 return report;
             }
         };
-        let regime_due = self.regime.is_none()
-            || self
-                .regime_at
-                .is_none_or(|at| tick.now - at >= Duration::hours(1));
+        let fresh = tick.now.signed_duration_since(situation.oldest_reading)
+            <= Duration::minutes(FRESH_MIN);
+        let basis = regime_basis(&situation);
+        let regime_due = fresh
+            && (self.regime.is_none()
+                || self
+                    .regime_at
+                    .is_none_or(|at| tick.now - at >= Duration::hours(1))
+                || self.regime_basis.as_ref() != Some(&basis));
         if regime_due {
             self.regime = Some(regime(&situation));
             self.regime_at = Some(tick.now);
+            self.regime_basis = Some(basis);
         }
         let Some(regime) = self.regime.clone() else {
+            if !fresh {
+                self.ask_stale(tick.now);
+            }
             return report;
         };
         let decision = decide(&situation, &regime);
@@ -289,6 +314,28 @@ impl BurnRuntime {
                 sent.error = Some("auto-burn: the switch action is not connected".to_string());
             }
         }
+    }
+
+    /// Whether the learned history still names another account than the one in
+    /// use: the files can change before the switch event is written (the CLI
+    /// writes Claude Code's files first), so learn again, at most once per
+    /// [`SWITCH_RELEARN_MIN`] minutes.
+    fn switch_relearn_due(&self, tick: &BurnTick<'_>) -> bool {
+        let Some(learned) = &self.learned else {
+            return false;
+        };
+        let Some(target) = newest_switch_target(learned, tick.now) else {
+            return false;
+        };
+        let target_id = tick
+            .accounts
+            .iter()
+            .find(|account| AccountRef::of(account) == *target)
+            .map(|account| account.id.as_str());
+        target_id != tick.active
+            && self
+                .switch_learn_at
+                .is_none_or(|at| tick.now - at >= Duration::minutes(SWITCH_RELEARN_MIN))
     }
 
     /// Ask for a poll of the old readings, at most once per [`STALE_ASK_SECS`].
@@ -357,7 +404,11 @@ impl BurnRuntime {
             on: settings.auto_burn,
             paused_until: situation.manual_hold_until.filter(|until| *until > now),
             early: regime.early,
-            why: burn_text::why(regime.why).to_string(),
+            why: if settings.read_sessions {
+                burn_text::why(regime.why).to_string()
+            } else {
+                "reading sessions is off: no rates are learned".to_string()
+            },
             learning: learning.clone(),
             line,
             planned: burn_text::planned(plan, active),
@@ -369,8 +420,9 @@ impl BurnRuntime {
             Decision::Switch { to, reason } => {
                 if settings.auto_burn {
                     let retry_due = match &self.last_sent {
-                        Some(sent) if sent.to == *to && sent.reason == *reason => {
-                            now - sent.sent_at >= Duration::minutes(SWITCH_RETRY_MIN)
+                        Some(sent) if sent.to == *to => {
+                            sent.reply.is_none()
+                                && now - sent.sent_at >= Duration::minutes(SWITCH_RETRY_MIN)
                         }
                         _ => true,
                     };
@@ -395,7 +447,6 @@ impl BurnRuntime {
                                 if sent {
                                     self.last_sent = Some(SentSwitch {
                                         to: to.clone(),
-                                        reason: reason.clone(),
                                         from: active.map(str::to_string),
                                         sent_at: now,
                                         notification,
@@ -448,13 +499,36 @@ impl BurnRuntime {
             Decision::Stay | Decision::AllFull { .. } => {}
         }
 
-        if !settings.auto_burn || !matches!(decision, Decision::Switch { .. }) {
-            self.last_sent = None;
-        }
         self.view = Some(view.clone());
         report.view = Some(view);
         report
     }
+}
+
+/// The accounts auto-burn may use and whether each has rates: the value the
+/// regime was computed from, so a change computes it again.
+fn regime_basis(situation: &Situation) -> BTreeMap<String, bool> {
+    situation
+        .inputs
+        .accounts
+        .iter()
+        .filter(|account| account.may_use)
+        .map(|account| (account.id.clone(), rates_known(account)))
+        .collect()
+}
+
+/// The target of the newest switch event of this host in the learned history.
+fn newest_switch_target(learned: &Learned, now: DateTime<Utc>) -> Option<&AccountRef> {
+    learned
+        .events
+        .iter()
+        .filter(|hosted| hosted.host == learned.host && hosted.record.t <= now)
+        .filter_map(|hosted| match &hosted.record.kind {
+            EventKind::Switch { to, .. } => Some((hosted.record.t, to)),
+            _ => None,
+        })
+        .max_by_key(|(at, _)| *at)
+        .map(|(_, to)| to)
 }
 
 fn text_error(error: burn_text::TextError) -> String {
@@ -485,10 +559,10 @@ mod tests {
     use chrono::FixedOffset;
 
     use seatswap_core::api::{Limit, LimitKind, Severity, Usage};
-    use seatswap_core::burn::decide::{RegimeWhy, Situation, SwitchCost};
+    use seatswap_core::burn::decide::{Reason, RegimeWhy, Situation, SwitchCost};
     use seatswap_core::burn::plan::{AccountState, Inputs, Plan, Segment, SessionState};
     use seatswap_core::burn::{Rates, Rhythm};
-    use seatswap_core::history::{AccountRef, Event, EventKind, Hosted};
+    use seatswap_core::history::{AccountRef, Event, EventKind, Hosted, Recorder};
     use seatswap_core::store::LoginState;
     use seatswap_core::types::OAuthAccount;
 
@@ -1327,5 +1401,256 @@ mod tests {
         assert_eq!(planned.get("ac"), Some(&(now + Duration::hours(1))));
         assert_eq!(planned.get("lb"), Some(&(now + Duration::hours(2))));
         assert!(!planned.contains_key("pr"));
+    }
+
+    #[test]
+    fn the_reply_is_read_after_the_account_changed() {
+        let now = utc("2026-11-10T12:00:00Z");
+        let tmp = tempfile::tempdir().expect("a temp folder");
+        let history = HistoryDir::at(tmp.path(), "atlas");
+        let (mut runtime, action, _engine) = runtime();
+        let accounts = vec![
+            account("pr", "PR", PR_ACC, true),
+            account("ac", "AC", AC_ACC, true),
+        ];
+        let views = vec![
+            view("pr", "PR", 100.0, false, now - Duration::minutes(1)),
+            view("ac", "AC", 10.0, true, now - Duration::minutes(1)),
+        ];
+        let settings = Settings {
+            auto_burn: true,
+            ..Settings::default()
+        };
+        let tick = |at: DateTime<Utc>, active: &'static str| BurnTick {
+            history: Some(&history),
+            views: &views,
+            accounts: &accounts,
+            settings: &settings,
+            active: Some(active),
+            now: at,
+            offset: offset(),
+            tied_busy: 0,
+        };
+
+        runtime.after_snapshot(&tick(now, "pr"));
+        let reply = match action.try_recv().expect("the switch") {
+            ActionCommand::Switch { reply, .. } => reply,
+            _ => panic!("not a switch"),
+        };
+        // Claude Code's files already name AC, but the action thread has not
+        // answered the switch yet: the tick decides Stay and must keep waiting.
+        let changed = runtime.after_snapshot(&tick(now + Duration::seconds(30), "ac"));
+        assert_eq!(changed.notification, None, "the switch has not landed yet");
+
+        reply
+            .send(ActionReply::Switched("ac".to_string()))
+            .expect("the runtime listens");
+        let answered = runtime.after_snapshot(&tick(now + Duration::minutes(1), "ac"));
+        let notification = answered.notification.expect("the landed switch notifies");
+        assert!(notification.contains("now on AC"), "{notification}");
+        let again = runtime.after_snapshot(&tick(now + Duration::minutes(2), "ac"));
+        assert_eq!(again.notification, None, "the notification is sent once");
+    }
+
+    #[test]
+    fn a_moved_until_does_not_send_the_switch_again() {
+        let now = utc("2026-11-10T12:00:00Z");
+        let (mut runtime, action, _engine) = runtime();
+        let views = vec![
+            view("pr", "PR", 100.0, false, now - Duration::minutes(1)),
+            view("ac", "AC", 10.0, true, now - Duration::minutes(1)),
+        ];
+        let settings = Settings {
+            auto_burn: true,
+            ..Settings::default()
+        };
+        let situation = situation(now, Some("pr"));
+        let plan = plan(now);
+        let regime = regime(true);
+        let send = |runtime: &mut BurnRuntime, until: DateTime<Utc>, at: DateTime<Utc>| {
+            runtime.apply_decision(
+                Decision::Switch {
+                    to: "ac".to_string(),
+                    reason: Reason::ActiveFull { until: Some(until) },
+                },
+                &situation,
+                &plan,
+                &regime,
+                &views,
+                &settings,
+                at,
+                offset(),
+            );
+        };
+        send(&mut runtime, now + Duration::hours(1), now);
+        send(
+            &mut runtime,
+            now + Duration::hours(1) + Duration::seconds(10),
+            now + Duration::seconds(10),
+        );
+        assert!(action.try_recv().is_ok(), "the first decision switches");
+        assert!(
+            action.try_recv().is_err(),
+            "a target whose reset moved by ten seconds is the same target"
+        );
+    }
+
+    #[test]
+    fn a_stale_situation_computes_no_regime() {
+        let now = utc("2026-11-10T12:00:00Z");
+        let tmp = tempfile::tempdir().expect("a temp folder");
+        let history = HistoryDir::at(tmp.path(), "atlas");
+        let (mut runtime, _action, engine) = runtime();
+        let accounts = vec![
+            account("pr", "PR", PR_ACC, true),
+            account("ac", "AC", AC_ACC, true),
+        ];
+        let views = vec![
+            view("pr", "PR", 20.0, false, now - Duration::minutes(25)),
+            view("ac", "AC", 80.0, true, now - Duration::minutes(25)),
+        ];
+        let settings = Settings {
+            auto_burn: true,
+            ..Settings::default()
+        };
+        let tick = BurnTick {
+            history: Some(&history),
+            views: &views,
+            accounts: &accounts,
+            settings: &settings,
+            active: Some("pr"),
+            now,
+            offset: offset(),
+            tied_busy: 0,
+        };
+        runtime.after_snapshot(&tick);
+        assert!(runtime.regime.is_none(), "a stale situation has no regime");
+        assert!(runtime.regime_at.is_none());
+        assert!(matches!(
+            engine.try_recv().expect("a stale poll"),
+            EngineCommand::Poll(PollReason::Stale)
+        ));
+    }
+
+    #[test]
+    fn an_account_turned_on_computes_the_regime_again() {
+        let now = utc("2026-11-10T12:00:00Z");
+        let tmp = tempfile::tempdir().expect("a temp folder");
+        let history = HistoryDir::at(tmp.path(), "atlas");
+        let (mut runtime, _action, _engine) = runtime();
+        let mut accounts = vec![
+            account("pr", "PR", PR_ACC, true),
+            account("ac", "AC", AC_ACC, false),
+        ];
+        let views = vec![
+            view("pr", "PR", 20.0, false, now - Duration::minutes(1)),
+            view("ac", "AC", 80.0, true, now - Duration::minutes(1)),
+        ];
+        let settings = Settings {
+            auto_burn: true,
+            ..Settings::default()
+        };
+        let first = BurnTick {
+            history: Some(&history),
+            views: &views,
+            accounts: &accounts,
+            settings: &settings,
+            active: Some("pr"),
+            now,
+            offset: offset(),
+            tied_busy: 0,
+        };
+        runtime.after_snapshot(&first);
+        assert_eq!(runtime.regime_at, Some(now));
+
+        accounts[1].auto_burn = true;
+        let second = BurnTick {
+            history: Some(&history),
+            views: &views,
+            accounts: &accounts,
+            settings: &settings,
+            active: Some("pr"),
+            now: now + Duration::minutes(1),
+            offset: offset(),
+            tied_busy: 0,
+        };
+        runtime.after_snapshot(&second);
+        assert_eq!(
+            runtime.regime_at,
+            Some(now + Duration::minutes(1)),
+            "a newly usable account computes the regime again"
+        );
+    }
+
+    #[test]
+    fn a_switch_event_that_lands_late_is_learned() {
+        let now = utc("2026-11-10T12:00:00Z");
+        let tmp = tempfile::tempdir().expect("a temp folder");
+        let history = HistoryDir::at(tmp.path(), "atlas");
+        let recorder = Recorder::new(HistoryDir::at(history.root(), history.host()));
+        let accounts = vec![
+            account("pr", "PR", PR_ACC, true),
+            account("ac", "AC", AC_ACC, true),
+        ];
+        let switch = |to: AccountRef| EventKind::Switch {
+            from: None,
+            to,
+            by: By::Cli,
+            reason: None,
+            cwd: None,
+            sessions: None,
+            waited_secs: None,
+        };
+        recorder
+            .event(
+                now - Duration::minutes(10),
+                switch(AccountRef::of(&accounts[0])),
+            )
+            .expect("the old switch event");
+        let views = vec![
+            view("pr", "PR", 20.0, false, now - Duration::minutes(1)),
+            view("ac", "AC", 80.0, true, now - Duration::minutes(1)),
+        ];
+        let settings = Settings {
+            auto_burn: true,
+            ..Settings::default()
+        };
+        let tick = |at: DateTime<Utc>| BurnTick {
+            history: Some(&history),
+            views: &views,
+            accounts: &accounts,
+            settings: &settings,
+            active: Some("ac"),
+            now: at,
+            offset: offset(),
+            tied_busy: 0,
+        };
+
+        let mut runtime = runtime().0;
+        runtime.after_snapshot(&tick(now));
+        assert_eq!(
+            newest_switch_target(
+                runtime.learned.as_ref().expect("the first learn"),
+                now + Duration::seconds(30)
+            ),
+            Some(&AccountRef::of(&accounts[0])),
+            "the learned history is still on PR"
+        );
+
+        recorder
+            .event(
+                now + Duration::seconds(30),
+                switch(AccountRef::of(&accounts[1])),
+            )
+            .expect("the late switch event");
+        runtime.after_snapshot(&tick(now + Duration::minutes(1)));
+        assert_eq!(
+            newest_switch_target(
+                runtime.learned.as_ref().expect("the second learn"),
+                now + Duration::minutes(1)
+            ),
+            Some(&AccountRef::of(&accounts[1])),
+            "the event that landed late is learned at the next tick"
+        );
     }
 }

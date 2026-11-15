@@ -1254,7 +1254,7 @@ fn burn_status(
             return status;
         }
     };
-    let learned = match live::learn(&history, now, offset, accounts) {
+    let learned = match live::learn(&history, now, offset, accounts, settings.read_sessions) {
         Ok(learned) => learned,
         Err(error) => {
             status.error = Some(format!("cannot read the history: {error}"));
@@ -1356,8 +1356,14 @@ fn burn_plan(context: Context, json: bool) -> Result<String, CliError> {
         .iter()
         .find(|view| view.is_active)
         .map(|view| view.id.as_str());
-    let learned = live::learn(&history, now, offset, &accounts)
-        .map_err(|error| CliError::Message(format!("cannot read the history: {error}")))?;
+    let learned = live::learn(
+        &history,
+        now,
+        offset,
+        &accounts,
+        context.settings.read_sessions,
+    )
+    .map_err(|error| CliError::Message(format!("cannot read the history: {error}")))?;
     let readiness = live::situation(&learned, &views, &accounts, active, now, offset, 0)
         .map_err(|error| CliError::Message(error.to_string()))?;
     let situation = match readiness {
@@ -1453,8 +1459,14 @@ fn burn_simulate(
         excluded.push(AccountRef::of(account));
     }
     let accounts = file.accounts;
-    let learned = live::learn(&history, now, offset, &accounts)
-        .map_err(|error| CliError::Message(format!("cannot read the history: {error}")))?;
+    let learned = live::learn(
+        &history,
+        now,
+        offset,
+        &accounts,
+        context.settings.read_sessions,
+    )
+    .map_err(|error| CliError::Message(format!("cannot read the history: {error}")))?;
     let mut lines = Vec::new();
     let mut printed = BTreeSet::new();
     for policy in [Policy::Lazy, Policy::Eager] {

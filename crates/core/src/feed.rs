@@ -123,9 +123,10 @@ pub fn account_for(feed: &Feed, cache: &UsageCache, accounts: &[Account]) -> Opt
 /// - **Session:** taken when the cache has no reset, when the feed's reset is
 ///   later than the cached one (a new window), or when the two name the same
 ///   window ([`same_reset`]) and the feed's percent is at least the cached
-///   percent. A feed reset earlier than the cached one is an ended window and
-///   is ignored; a lower percent in the same window is an older reading and is
-///   ignored.
+///   percent. A feed `five_hour` whose reset is at or before the feed's `at` is
+///   an ended window and is ignored; a feed reset earlier than the cached one is
+///   an ended window and is ignored; a lower percent in the same window is an
+///   older reading and is ignored.
 /// - **Week:** the percent is taken only when it is at least the cached one;
 ///   `account_for` has already made it the same weekly window. The reset stays
 ///   the cached one.
@@ -137,6 +138,12 @@ pub fn merged(usage: &Usage, feed: &Feed) -> Usage {
                 let Some(five_hour) = &feed.five_hour else {
                     continue;
                 };
+                // A window whose reset is at or before the reading's own time
+                // has already ended: its numbers must not come back after a
+                // poll replaced them with the new window.
+                if five_hour.resets_at <= feed.at {
+                    continue;
+                }
                 let take = match limit.resets_at {
                     None => true,
                     Some(cached_reset) => {
@@ -433,6 +440,49 @@ mod tests {
         let session = merged.session().expect("the session limit");
         assert_eq!(session.percent, 5.0);
         assert_eq!(session.resets_at, Some(new_reset));
+    }
+
+    #[test]
+    fn a_window_that_is_over_is_not_taken() {
+        let usage = Usage {
+            limits: vec![
+                Limit {
+                    kind: LimitKind::Session,
+                    percent: 0.0,
+                    severity: Severity::Normal,
+                    resets_at: None,
+                    model: None,
+                    is_active: true,
+                },
+                Limit {
+                    kind: LimitKind::WeeklyAll,
+                    percent: 40.0,
+                    severity: Severity::Normal,
+                    resets_at: Some(weekday(16, 2, 0)),
+                    model: None,
+                    is_active: false,
+                },
+            ],
+            extra_usage_enabled: false,
+        };
+        let numbers = Feed {
+            at: at("2026-11-14T14:41:00Z"),
+            five_hour: Some(FeedLimit {
+                percent: 100.0,
+                resets_at: at("2026-11-14T14:40:00Z"),
+            }),
+            seven_day: None,
+            model: None,
+        };
+
+        let merged = merged(&usage, &numbers);
+
+        let session = merged.session().expect("the session limit");
+        assert_eq!(
+            session.percent, 0.0,
+            "the past window's 100 % must not come back"
+        );
+        assert_eq!(session.resets_at, None, "nor its past reset");
     }
 
     #[test]

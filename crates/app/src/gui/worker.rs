@@ -51,6 +51,35 @@ use crate::ops;
 /// How often the engine thread polls even without a command.
 const TICK: Duration = Duration::from_secs(30);
 
+/// The next timer poll as a fixed deadline. A command may arrive first, but it
+/// never moves the deadline: the timer poll runs as soon as it has passed.
+struct TickDeadline {
+    next: Instant,
+}
+
+impl TickDeadline {
+    fn new(now: Instant) -> TickDeadline {
+        TickDeadline { next: now + TICK }
+    }
+
+    /// How long to wait for a command before the timer poll is due.
+    fn wait(&self, now: Instant) -> Duration {
+        self.next.saturating_duration_since(now)
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        now >= self.next
+    }
+
+    /// Move past `now`: the next deadline is the first one that has not passed.
+    fn advance(&mut self, now: Instant) {
+        self.next += TICK;
+        while self.next <= now {
+            self.next += TICK;
+        }
+    }
+}
+
 /// More wall-clock time than this beyond the monotonic clock between two ticks
 /// means the machine slept.
 const WAKE_THRESHOLD: Duration = Duration::from_secs(90);
@@ -542,15 +571,26 @@ impl EngineRuntime {
         // The first snapshot is the one built above; it carries a one-shot
         // notice (the moved usage cache) and the settings read at startup.
         self.send();
+        let mut deadline = TickDeadline::new(Instant::now());
         loop {
-            match commands.recv_timeout(TICK) {
+            let wait = deadline.wait(Instant::now());
+            match commands.recv_timeout(wait) {
                 Ok(command) => {
                     // A command can arrive after any gap, including one that
                     // hid a suspend; check and update the baseline every time.
                     let (baseline, wake) = wake_step(self.baseline, ClockBaseline::now());
                     self.baseline = baseline;
-                    if wake && !matches!(&command, EngineCommand::Shutdown) {
-                        self.poll(PollReason::Wake);
+                    let now = Instant::now();
+                    let due = deadline.due(now);
+                    if !matches!(&command, EngineCommand::Shutdown) && (wake || due) {
+                        self.poll(if wake {
+                            PollReason::Wake
+                        } else {
+                            PollReason::Timer
+                        });
+                    }
+                    if due {
+                        deadline.advance(now);
                     }
                     match command {
                         EngineCommand::Poll(reason) => self.poll(reason),
@@ -593,6 +633,7 @@ impl EngineRuntime {
                     } else {
                         PollReason::Timer
                     });
+                    deadline.advance(Instant::now());
                 }
                 Err(RecvTimeoutError::Disconnected) => return,
             }
@@ -2163,6 +2204,25 @@ mod tests {
         assert!(runtime.snapshot.settings.is_none());
         let error = runtime.snapshot.error.expect("an error is shown");
         assert!(error.contains("accounts.json"), "{error}");
+    }
+
+    #[test]
+    fn commands_do_not_delay_the_timer_tick() {
+        let start = Instant::now();
+        let mut deadline = TickDeadline::new(start);
+        assert_eq!(deadline.wait(start), TICK, "the first wait is one tick");
+
+        let mut ticks = 0;
+        // A command every two seconds: each one is handled, but none moves the
+        // deadline, so the timer still runs at 30 s and 60 s.
+        for seconds in (2..=70).step_by(2) {
+            let now = start + Duration::from_secs(seconds);
+            if deadline.due(now) {
+                ticks += 1;
+                deadline.advance(now);
+            }
+        }
+        assert_eq!(ticks, 2, "two timer polls in seventy seconds");
     }
 
     #[test]

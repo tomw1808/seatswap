@@ -479,7 +479,7 @@ impl<R: Remote> Engine<R> {
         let usage = entry.and_then(|entry| entry.usage.clone());
         let blocking = usage
             .as_ref()
-            .and_then(|usage| blocking_limit(usage, self.models_in_use.as_ref()));
+            .and_then(|usage| blocking_limit(usage, self.models_in_use.as_ref(), now));
         let usable = account.login_state == LoginState::Ok && usage.is_some() && blocking.is_none();
         let blocked_until = blocking.as_ref().and_then(|(limit, _)| limit.resets_at);
         let blocker = blocking.map(|(_, blocker)| blocker);
@@ -550,10 +550,16 @@ impl<R: Remote> Engine<R> {
         };
         // A blocked account is polled 30 s after its reset, whatever the
         // interval; only a reading or an attempt before that moment is old
-        // enough. An attempt at or after the reset used the rule up.
+        // enough. An attempt at or after the reset used the rule up. The
+        // reading is asked about its own time: a 5 h window whose reset has
+        // since passed is over now, but its last reading still said it was
+        // blocked, and the poll after that reset is what finds the new window.
         if let Some(entry) = entry {
             if let Some(usage) = &entry.usage {
-                if let Some((limit, _)) = blocking_limit(usage, self.models_in_use.as_ref()) {
+                let reading_at = last_activity(entry).unwrap_or(now);
+                if let Some((limit, _)) =
+                    blocking_limit(usage, self.models_in_use.as_ref(), reading_at)
+                {
                     if let Some(blocked_until) = limit.resets_at {
                         let retry_at = blocked_until + chrono::Duration::seconds(30);
                         if now >= retry_at
@@ -1066,8 +1072,12 @@ impl<R: Remote> Engine<R> {
 /// Why this usage answer blocks the account, or `None` (spec §2.7). `Week` and
 /// `Session` block at 100 %; a `Model` limit blocks while a running session uses
 /// that model, or, when the models are unknown, while the server calls it active.
-pub fn blocker(usage: &Usage, models_in_use: Option<&BTreeSet<String>>) -> Option<Blocker> {
-    blocking_limit(usage, models_in_use).map(|(_, blocker)| blocker)
+pub fn blocker(
+    usage: &Usage,
+    models_in_use: Option<&BTreeSet<String>>,
+    now: DateTime<Utc>,
+) -> Option<Blocker> {
+    blocking_limit(usage, models_in_use, now).map(|(_, blocker)| blocker)
 }
 
 /// True when at least one view has a working login and every view with a
@@ -1088,10 +1098,11 @@ pub fn all_blocked(views: &[AccountView]) -> bool {
 fn blocking_limit<'a>(
     usage: &'a Usage,
     models_in_use: Option<&BTreeSet<String>>,
+    now: DateTime<Utc>,
 ) -> Option<(&'a Limit, Blocker)> {
     let mut winner: Option<(&Limit, Blocker)> = None;
     for limit in &usage.limits {
-        if limit.percent < 100.0 {
+        if !limit.is_full_at(now) {
             continue;
         }
         let blocker = match &limit.kind {
@@ -2964,6 +2975,24 @@ mod tests {
     }
 
     #[test]
+    fn a_full_window_whose_reset_has_passed_does_not_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = Fixture::new(&tmp);
+        let (_app, _fake, mut engine) = fixture.into_engine();
+        let usage = usage_of(vec![
+            limit_of(LimitKind::WeeklyAll, 60.0, Some(at(7200)), None, false),
+            limit_of(LimitKind::Session, 100.0, Some(at(-60)), None, true),
+        ]);
+        cache_usage(&mut engine, A_ID, usage.clone(), at(0));
+
+        assert_eq!(blocker(&usage, None, t0()), None);
+        let view = view_by_id(&engine, A_ID, t0());
+        assert!(view.usable, "the window is over at 100 %");
+        assert_eq!(view.blocked_until, None);
+        assert_eq!(view.blocker, None);
+    }
+
+    #[test]
     fn a_full_fable_limit_blocks_only_with_a_fable_session() {
         let tmp = tempfile::tempdir().unwrap();
         let fixture = Fixture::new(&tmp);
@@ -2982,14 +3011,14 @@ mod tests {
         ]);
 
         let opus: BTreeSet<String> = ["claude-opus-5-5".to_string()].into_iter().collect();
-        assert_eq!(blocker(&usage, Some(&opus)), None);
+        assert_eq!(blocker(&usage, Some(&opus), t0()), None);
         cache_usage(&mut engine, A_ID, usage.clone(), t0());
         engine.set_models_in_use(Some(opus));
         assert!(view_by_id(&engine, A_ID, t0()).usable);
 
         let fable: BTreeSet<String> = ["claude-fable-5-2".to_string()].into_iter().collect();
         assert_eq!(
-            blocker(&usage, Some(&fable)),
+            blocker(&usage, Some(&fable), t0()),
             Some(Blocker::Model("Fable".to_string()))
         );
         engine.set_models_in_use(Some(fable));
@@ -2997,14 +3026,14 @@ mod tests {
         assert!(!view.usable);
         assert_eq!(view.blocked_until, Some(scoped_reset));
 
-        assert_eq!(blocker(&usage, None), None);
+        assert_eq!(blocker(&usage, None, t0()), None);
         engine.set_models_in_use(None);
         assert!(view_by_id(&engine, A_ID, t0()).usable);
 
         let mut active_scoped = usage;
         active_scoped.limits[1].is_active = true;
         assert_eq!(
-            blocker(&active_scoped, None),
+            blocker(&active_scoped, None, t0()),
             Some(Blocker::Model("Fable".to_string()))
         );
         cache_usage(&mut engine, A_ID, active_scoped, t0());
@@ -3063,7 +3092,7 @@ mod tests {
                 false,
             )]);
             assert_eq!(
-                blocker(&usage, Some(&fable)),
+                blocker(&usage, Some(&fable), t0()),
                 None,
                 "model {missing:?} is inactive"
             );
@@ -3071,7 +3100,7 @@ mod tests {
             let mut active = usage;
             active.limits[0].is_active = true;
             assert_eq!(
-                blocker(&active, Some(&opus)),
+                blocker(&active, Some(&opus), t0()),
                 Some(Blocker::Model("unknown model".to_string())),
                 "model {missing:?} is active"
             );

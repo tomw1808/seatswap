@@ -40,6 +40,9 @@ pub const MIN_COST_SAMPLES: u32 = 3;
 /// A decision needs readings at most this many minutes old for every account
 /// auto-burn may use (spec §2.5).
 pub const FRESH_MIN: i64 = 20;
+/// A switch event that lands after the files it names is learned again after at
+/// most this many minutes (spec §5.3: the CLI writes the files before the event).
+pub const SWITCH_RELEARN_MIN: i64 = 1;
 
 /// One output token against one input token (spec §2.3).
 const OUTPUT_WEIGHT: f64 = 5.0;
