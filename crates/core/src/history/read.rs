@@ -9,7 +9,7 @@ use std::path::Path;
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 
-use super::{HistoryDir, HistoryError, Record};
+use super::{HistoryDir, HistoryError, Kind, Record};
 use crate::paths;
 
 /// A time range: `from` inclusive, `to` exclusive.
@@ -125,6 +125,29 @@ fn month_files(dir: &Path, stem: &str, range: &Range) -> Result<Vec<String>, His
     Ok(files)
 }
 
+/// The months of `kind`'s files in one host folder, newest first, each as the
+/// half-open range of its UTC month. The files that exist bound the list; a
+/// name that is not exactly `<stem>-YYYY-MM.jsonl` is not a month file.
+pub(super) fn months_of_kind(dir: &Path, kind: Kind) -> Result<Vec<Range>, HistoryError> {
+    let every_month = Range {
+        from: DateTime::<Utc>::MIN_UTC,
+        to: DateTime::<Utc>::MAX_UTC,
+    };
+    let mut months = Vec::new();
+    for file in month_files(dir, kind.stem(), &every_month)? {
+        let Some((year, month)) = month_of_name(&file, kind.stem()) else {
+            continue;
+        };
+        let (Some(from), Some(to)) = (month_start(year, month), next_month_start(year, month))
+        else {
+            continue;
+        };
+        months.push(Range { from, to });
+    }
+    months.sort_by_key(|range| std::cmp::Reverse(range.from));
+    Ok(months)
+}
+
 /// `(year, month)` of a file named `<stem>-YYYY-MM.jsonl`, or `None` for any
 /// other shape (including a month outside 1..=12).
 fn month_of_name(name: &str, stem: &str) -> Option<(i32, u32)> {
@@ -170,7 +193,7 @@ fn next_month_start(year: i32, month: u32) -> Option<DateTime<Utc>> {
     }
 }
 
-fn month_start(year: i32, month: u32) -> Option<DateTime<Utc>> {
+pub(super) fn month_start(year: i32, month: u32) -> Option<DateTime<Utc>> {
     NaiveDate::from_ymd_opt(year, month, 1)
         .and_then(|date| date.and_hms_opt(0, 0, 0))
         .map(|naive| Utc.from_utc_datetime(&naive))

@@ -17,8 +17,10 @@ use crate::project::ProjectKey;
 use crate::store::Settings;
 
 mod read;
+mod write;
 
 pub use read::{Hosted, Hosts, Range, Read};
+pub use write::{closed_windows, sample_of, Recorder};
 
 #[derive(Debug, thiserror::Error)]
 pub enum HistoryError {
