@@ -5,6 +5,8 @@
 //! - `paths`    where Claude Code's files and seatswap's own files live
 //! - `atomic`   the one way to write a file (temp file + fsync + rename, mode kept)
 //!   and the only module that knows file modes and private files and folders
+//! - `history`  the history folder: record types, appending, reading a range, merging hosts
+//! - `project`  from a folder to the project's identity
 //! - `locks`    Claude Code's six lock folders + seatswap's own switch.lock
 //! - `live`     read/write the live login (.credentials.json) and identity (.claude.json)
 //! - `store`    accounts.json (no secrets) + secrets (OS keyring, or 0600 files)
@@ -16,9 +18,11 @@
 pub mod api;
 pub mod atomic;
 pub mod engine;
+pub mod history;
 pub mod live;
 pub mod locks;
 pub mod paths;
+pub mod project;
 pub mod store;
 pub mod switcher;
 pub mod types;

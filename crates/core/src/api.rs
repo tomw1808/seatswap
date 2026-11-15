@@ -336,7 +336,7 @@ pub struct Limit {
     pub is_active: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LimitKind {
     Session,
@@ -346,12 +346,22 @@ pub enum LimitKind {
 }
 
 impl LimitKind {
-    fn from_api(text: &str) -> LimitKind {
+    pub fn from_api(text: &str) -> LimitKind {
         match text {
             "session" => LimitKind::Session,
             "weekly_all" => LimitKind::WeeklyAll,
             "weekly_scoped" => LimitKind::WeeklyScoped,
             other => LimitKind::Other(other.to_string()),
+        }
+    }
+
+    /// The text the server uses for this kind, the inverse of [`from_api`](Self::from_api).
+    pub fn as_api(&self) -> &str {
+        match self {
+            LimitKind::Session => "session",
+            LimitKind::WeeklyAll => "weekly_all",
+            LimitKind::WeeklyScoped => "weekly_scoped",
+            LimitKind::Other(other) => other,
         }
     }
 }

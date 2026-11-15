@@ -38,19 +38,6 @@ pub(crate) fn format_age(fetched_at: DateTime<Utc>, now: DateTime<Utc>) -> Strin
     format!("{} d ago", hours / 24)
 }
 
-/// A reset time as shown: rounded up to the full minute. The server sends a
-/// moment just before the boundary (`00:59:59.59`), which would read `00:59`
-/// instead of `01:00`.
-fn reset_minute(resets_at: DateTime<Utc>) -> DateTime<Utc> {
-    let into_minute = resets_at.timestamp().rem_euclid(60) * 1_000_000_000
-        + i64::from(resets_at.timestamp_subsec_nanos());
-    if into_minute == 0 {
-        resets_at
-    } else {
-        resets_at + chrono::Duration::nanoseconds(60_000_000_000 - into_minute)
-    }
-}
-
 /// Time to a reset (spec §11), the one rule for the panel, tray and CLI:
 /// under 24 h hours and minutes (`35m`, `1h05m`), up to 48 h days and hours
 /// (`1d18h`), beyond 48 h the local weekday and clock time (`Sun 02:00`).
@@ -64,7 +51,7 @@ pub(crate) fn format_reset_at<Tz: TimeZone>(
 where
     Tz::Offset: std::fmt::Display,
 {
-    let resets_at = reset_minute(resets_at);
+    let resets_at = seatswap_core::history::reset_minute(resets_at);
     let seconds = resets_at.signed_duration_since(now).num_seconds();
     if seconds <= 0 {
         return "0m".to_string();
@@ -92,7 +79,7 @@ pub(crate) fn format_reset_clock<Tz: TimeZone>(
 where
     Tz::Offset: std::fmt::Display,
 {
-    let resets_at = reset_minute(resets_at);
+    let resets_at = seatswap_core::history::reset_minute(resets_at);
     let seconds = resets_at.signed_duration_since(now).num_seconds();
     if seconds > 24 * 60 * 60 {
         resets_at.with_timezone(tz).format("%a %H:%M").to_string()

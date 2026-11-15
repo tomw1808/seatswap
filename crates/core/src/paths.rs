@@ -219,11 +219,12 @@ impl AppPaths {
 
 /// The name this host writes its history under: `explicit` if set, else the
 /// machine's host name (Linux: /proc/sys/kernel/hostname; Windows: %COMPUTERNAME%).
-/// 1..=63 characters of [A-Za-z0-9._-]; anything else is
-/// [`PathsError::HostName`] with the text "set hostName in the settings". The
-/// result is always in lower case: Windows has the same name in upper case in
-/// %COMPUTERNAME% and in lower case in Claude Code's files (checked 15 November
-/// 2026).
+/// 1..=63 characters of [A-Za-z0-9._-] whose first character is a letter or a
+/// digit; anything else is [`PathsError::HostName`] with the text "set hostName
+/// in the settings". The first character rules out `.` and `..`, which would
+/// name another folder. The result is always in lower case: Windows has the
+/// same name in upper case in %COMPUTERNAME% and in lower case in Claude Code's
+/// files (checked 15 November 2026).
 pub fn host_name(explicit: Option<&str>) -> Result<String, PathsError> {
     let name = match explicit {
         Some(name) => name.to_string(),
@@ -233,9 +234,14 @@ pub fn host_name(explicit: Option<&str>) -> Result<String, PathsError> {
         || !name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+        || !name
+            .as_bytes()
+            .first()
+            .is_some_and(|b| b.is_ascii_alphanumeric())
     {
         return Err(PathsError::HostName(format!(
-            "host name {name:?} must be 1 to 63 characters of A-Z, a-z, 0-9, '.', '_' or '-'"
+            "host name {name:?} must be 1 to 63 characters of A-Z, a-z, 0-9, '.', '_' or '-' \
+             and must start with a letter or a digit"
         )));
     }
     Ok(name.to_ascii_lowercase())
@@ -326,6 +332,22 @@ mod tests {
             host_name(Some("a/b")),
             Err(PathsError::HostName(_))
         ));
+    }
+
+    #[test]
+    fn a_host_name_must_start_with_a_letter_or_digit() {
+        for name in [".", "..", ".atlas", "-atlas", "_atlas"] {
+            match host_name(Some(name)) {
+                Err(PathsError::HostName(text)) => assert!(
+                    text.contains("must start with a letter or a digit"),
+                    "{name:?}: {text}"
+                ),
+                other => panic!("{name:?} must be refused, got {other:?}"),
+            }
+        }
+        for name in ["atlas", "9vega", "vega-2.lan", "a"] {
+            assert_eq!(host_name(Some(name)).unwrap(), name);
+        }
     }
 
     #[test]
