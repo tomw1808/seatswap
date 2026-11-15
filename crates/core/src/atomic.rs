@@ -1,14 +1,17 @@
 //! The one way seatswap writes a file, and the one module that knows about file
-//! modes and how to make private files and folders.
+//! modes and how to make private files and folders. `append_line` is also the
+//! one way seatswap appends a line to a file.
 //!
 //! A write goes to a temp file in the same folder, is fsynced, renamed over the
 //! target, and (Unix) the folder is fsynced. On Unix an existing file keeps its
 //! mode and a new one gets the mode of `access_if_new`; on Windows a file gets
 //! the permissions of its folder, and the rename is retried briefly while
-//! another program holds the target open.
+//! another program holds the target open. An append is one write of the line
+//! and its newline, then fsynced; a new file gets the mode of `access_if_new`,
+//! an existing one keeps its mode.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -82,6 +85,74 @@ pub fn write_atomic(path: &Path, bytes: &[u8], access_if_new: Access) -> io::Res
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+/// The longest line, with its newline, that `append_line` accepts.
+pub const MAX_LINE_BYTES: usize = 4096;
+
+/// Append `line` plus '\n' as one write to `path` (created with `access_if_new`
+/// when missing), then fsync. `line` must not contain '\n' and, with the
+/// newline, must fit in `MAX_LINE_BYTES`: otherwise `InvalidInput` with a text
+/// that says what is wrong. The line is checked before the file is opened, so a
+/// rejected line leaves no file and changes no existing one. When the file is
+/// not empty and its last byte is not '\n' (a crash left a torn last line), the
+/// write starts with a '\n', so the torn part stays a line of its own and the
+/// new record is a whole line; that leading newline does not count toward
+/// `MAX_LINE_BYTES`. An existing file keeps its mode (Unix); a new one gets the
+/// mode of `access_if_new`.
+pub fn append_line(path: &Path, line: &str, access_if_new: Access) -> io::Result<()> {
+    if line.contains('\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the line contains a newline",
+        ));
+    }
+    let len = line.len() + 1;
+    if len > MAX_LINE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("the line is {len} bytes with its newline, more than {MAX_LINE_BYTES}"),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(len + 1);
+    bytes.extend_from_slice(line.as_bytes());
+    bytes.push(b'\n');
+
+    let mut options = OpenOptions::new();
+    options.read(true).append(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(access_if_new.mode());
+    #[cfg(windows)]
+    let _ = access_if_new;
+    let (mut file, created) = match options.open(path) {
+        Ok(file) => (file, true),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            // The file is already there: append to it and keep its mode.
+            (
+                OpenOptions::new().read(true).append(true).open(path)?,
+                false,
+            )
+        }
+        Err(e) => return Err(e),
+    };
+    #[cfg(unix)]
+    if created {
+        // create_new honours the umask; set the mode explicitly.
+        file.set_permissions(fs::Permissions::from_mode(access_if_new.mode()))?;
+    }
+    if !created {
+        let end = file.seek(SeekFrom::End(0))?;
+        if end > 0 {
+            file.seek(SeekFrom::Start(end - 1))?;
+            let mut last = [0u8; 1];
+            file.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                bytes.insert(0, b'\n');
+            }
+        }
+    }
+    file.write_all(&bytes)?;
+    file.sync_all()
 }
 
 /// `fs::rename`, retried while it fails with access denied (OS error 5) or a
@@ -338,6 +409,78 @@ mod tests {
         fs::write(&p, b"kept").unwrap();
         drop(open_private(&p).unwrap());
         assert_eq!(fs::read(&p).unwrap(), b"kept");
+    }
+
+    #[test]
+    fn append_line_creates_the_file_private() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("events.jsonl");
+        append_line(&p, "a", Access::Private).unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"a\n");
+        #[cfg(unix)]
+        assert_eq!(mode(&p), 0o600);
+    }
+
+    #[test]
+    fn append_line_adds_after_existing_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("events.jsonl");
+        fs::write(&p, b"a\n").unwrap();
+        append_line(&p, "b", Access::Private).unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"a\nb\n");
+    }
+
+    #[test]
+    fn append_line_starts_a_new_line_after_a_torn_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("events.jsonl");
+        // A crash while appending left half a line behind.
+        fs::write(&p, b"{\"t\":\"2026-11-14T1").unwrap();
+        append_line(&p, "{\"t\":\"2026-11-15T10:00:00Z\"}", Access::Private).unwrap();
+        assert_eq!(
+            fs::read(&p).unwrap(),
+            b"{\"t\":\"2026-11-14T1\n{\"t\":\"2026-11-15T10:00:00Z\"}\n"
+        );
+    }
+
+    #[test]
+    fn append_line_rejects_a_newline_inside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("events.jsonl");
+        fs::write(&p, b"a\n").unwrap();
+        let err = append_line(&p, "a\nb", Access::Private).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(fs::read(&p).unwrap(), b"a\n");
+        let missing = tmp.path().join("missing.jsonl");
+        let err = append_line(&missing, "a\nb", Access::Private).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn append_line_rejects_a_line_over_4096_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("events.jsonl");
+        let too_long = "x".repeat(MAX_LINE_BYTES);
+        let err = append_line(&p, &too_long, Access::Private).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(!p.exists());
+        let fits = "x".repeat(MAX_LINE_BYTES - 1);
+        append_line(&p, &fits, Access::Private).unwrap();
+        assert_eq!(fs::read(&p).unwrap().len(), MAX_LINE_BYTES);
+    }
+
+    #[test]
+    fn append_line_measures_the_limit_in_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("events.jsonl");
+        // 2047 × 'ä' = 4094 bytes, with the newline 4095: fits.
+        append_line(&p, &"ä".repeat(2047), Access::Private).unwrap();
+        assert_eq!(fs::read(&p).unwrap().len(), 4095);
+        // 2048 × 'ä' = 4096 bytes, with the newline 4097: refused.
+        let err = append_line(&p, &"ä".repeat(2048), Access::Private).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(fs::read(&p).unwrap().len(), 4095);
     }
 
     #[cfg(windows)]
