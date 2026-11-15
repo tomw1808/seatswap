@@ -142,6 +142,192 @@ pub enum WaitingHosts {
     AllHosts,
 }
 
+/// The status line's layout (spec §5.4): two zones, the gap to the terminal's
+/// right edge in columns, and the margin a renderer keeps free.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatuslineConfig {
+    #[serde(default = "default_statusline_left")]
+    pub left: Vec<Segment>,
+    #[serde(default = "default_statusline_right")]
+    pub right: Vec<Segment>,
+    #[serde(default = "default_statusline_margin")]
+    pub margin: u16,
+}
+
+/// One segment of a status line zone. `prefix` and `suffix` are printed only
+/// when the segment has a value; `drop` is the drop order (1 is dropped first,
+/// `None` is never dropped); `time_format` is used by the reset segments and
+/// `text` by the `Text` segment.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Segment {
+    pub kind: SegmentKind,
+    #[serde(default = "default_color_rule")]
+    pub color: ColorRule,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prefix: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub suffix: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drop: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_format: Option<TimeFormat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+/// What a status line segment shows (spec §5.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SegmentKind {
+    Account,
+    Plan,
+    FiveHourPercent,
+    FiveHourReset,
+    WeekPercent,
+    WeekReset,
+    ModelPercent,
+    AutoBurn,
+    Model,
+    Effort,
+    Folder,
+    GitBranch,
+    UserHost,
+    Clock,
+    Text,
+    Separator,
+}
+
+/// How a segment is coloured (spec §5.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "rule", rename_all = "camelCase")]
+pub enum ColorRule {
+    None,
+    Fixed { color: String },
+    ByLoad { warn: u32, bad: u32 },
+    ByModelFamily,
+    ByEffort,
+    Account,
+}
+
+/// How a reset segment shows its time (spec §5.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TimeFormat {
+    CompactLeft,
+    Seatswap,
+    Clock,
+}
+
+impl StatuslineConfig {
+    /// The preset "My current line": what the status line script prints today
+    /// (spec §5.1), so turning the builder on is a start, not a loss.
+    pub fn current_line() -> StatuslineConfig {
+        StatuslineConfig {
+            left: vec![
+                Segment {
+                    kind: SegmentKind::UserHost,
+                    color: ColorRule::Fixed {
+                        color: "#22c55e".to_string(),
+                    },
+                    prefix: String::new(),
+                    suffix: String::new(),
+                    drop: None,
+                    time_format: None,
+                    text: None,
+                },
+                Segment {
+                    kind: SegmentKind::Text,
+                    color: ColorRule::None,
+                    prefix: String::new(),
+                    suffix: String::new(),
+                    drop: None,
+                    time_format: None,
+                    text: Some(":".to_string()),
+                },
+                Segment {
+                    kind: SegmentKind::Folder,
+                    color: ColorRule::Fixed {
+                        color: "#3b82f6".to_string(),
+                    },
+                    prefix: String::new(),
+                    suffix: String::new(),
+                    drop: None,
+                    time_format: None,
+                    text: None,
+                },
+                Segment {
+                    kind: SegmentKind::Model,
+                    color: ColorRule::ByModelFamily,
+                    prefix: " ".to_string(),
+                    suffix: String::new(),
+                    drop: None,
+                    time_format: None,
+                    text: None,
+                },
+                Segment {
+                    kind: SegmentKind::Effort,
+                    color: ColorRule::ByEffort,
+                    prefix: " ".to_string(),
+                    suffix: String::new(),
+                    drop: None,
+                    time_format: None,
+                    text: None,
+                },
+            ],
+            right: vec![
+                Segment {
+                    kind: SegmentKind::Account,
+                    color: ColorRule::Account,
+                    prefix: String::new(),
+                    suffix: " ".to_string(),
+                    drop: None,
+                    time_format: None,
+                    text: None,
+                },
+                Segment {
+                    kind: SegmentKind::FiveHourPercent,
+                    color: ColorRule::ByLoad { warn: 50, bad: 80 },
+                    prefix: String::new(),
+                    suffix: "%".to_string(),
+                    drop: Some(2),
+                    time_format: None,
+                    text: None,
+                },
+                Segment {
+                    kind: SegmentKind::FiveHourReset,
+                    color: ColorRule::None,
+                    prefix: " ".to_string(),
+                    suffix: String::new(),
+                    drop: Some(1),
+                    time_format: Some(TimeFormat::CompactLeft),
+                    text: None,
+                },
+                Segment {
+                    kind: SegmentKind::WeekPercent,
+                    color: ColorRule::ByLoad { warn: 50, bad: 80 },
+                    prefix: "  ".to_string(),
+                    suffix: "%".to_string(),
+                    drop: None,
+                    time_format: None,
+                    text: None,
+                },
+                Segment {
+                    kind: SegmentKind::WeekReset,
+                    color: ColorRule::None,
+                    prefix: " ".to_string(),
+                    suffix: String::new(),
+                    drop: Some(1),
+                    time_format: Some(TimeFormat::CompactLeft),
+                    text: None,
+                },
+            ],
+            margin: 4,
+        }
+    }
+}
+
 const DEFAULT_POLL_ACTIVE_SECS: u64 = 120;
 const DEFAULT_POLL_INACTIVE_SECS: u64 = 900;
 const DEFAULT_SUGGEST_AT: u32 = 90;
@@ -220,6 +406,25 @@ fn default_agents_switch() -> bool {
     false
 }
 
+/// A missing status line field takes the preset's value for that field, read
+/// from [`StatuslineConfig::current_line`] so the preset is written once.
+fn default_statusline_left() -> Vec<Segment> {
+    StatuslineConfig::current_line().left
+}
+
+fn default_statusline_right() -> Vec<Segment> {
+    StatuslineConfig::current_line().right
+}
+
+fn default_statusline_margin() -> u16 {
+    StatuslineConfig::current_line().margin
+}
+
+/// A segment without a colour rule is printed uncoloured.
+fn default_color_rule() -> ColorRule {
+    ColorRule::None
+}
+
 /// Settings (spec §10). Each field has a serde default, so a file written by an
 /// older build still loads with that setting's default; a present but invalid
 /// value is rejected by [`Settings::validate`], never silently replaced.
@@ -273,6 +478,9 @@ pub struct Settings {
     pub agents_read: bool,
     #[serde(default = "default_agents_switch")]
     pub agents_switch: bool,
+    /// The status line's layout; absent in an older file, so the preset loads.
+    #[serde(default = "StatuslineConfig::current_line")]
+    pub statusline: StatuslineConfig,
 }
 
 impl Default for Settings {
@@ -299,6 +507,7 @@ impl Default for Settings {
             notify_waiting_hosts: default_notify_waiting_hosts(),
             agents_read: default_agents_read(),
             agents_switch: default_agents_switch(),
+            statusline: StatuslineConfig::current_line(),
         }
     }
 }
@@ -336,8 +545,54 @@ impl Settings {
             crate::paths::host_name(Some(name))
                 .map_err(|e| StoreError::InvalidSetting(e.to_string()))?;
         }
+        validate_statusline(&self.statusline)?;
         Ok(())
     }
+}
+
+/// The status line's four rules (spec §5.4): a `Fixed` colour is `#rrggbb`, a
+/// `ByLoad` pair is ordered and inside 0..=100, `drop` is never 0, and a `Text`
+/// segment has its text. The first bad value wins, named by side and position.
+fn validate_statusline(config: &StatuslineConfig) -> Result<(), StoreError> {
+    for (side, segments) in [("left", &config.left), ("right", &config.right)] {
+        for (index, segment) in segments.iter().enumerate() {
+            let at = format!("statusline.{side}[{index}]");
+            match &segment.color {
+                ColorRule::Fixed { color } => {
+                    validate_color(color).map_err(|error| {
+                        StoreError::InvalidSetting(format!("{at}.color: {error}"))
+                    })?;
+                }
+                ColorRule::ByLoad { warn, bad } => {
+                    if warn >= bad {
+                        return Err(StoreError::InvalidSetting(format!(
+                            "{at}.color: warn ({warn}) must be below bad ({bad})"
+                        )));
+                    }
+                    if *bad > 100 {
+                        return Err(StoreError::InvalidSetting(format!(
+                            "{at}.color: bad ({bad}) must be at most 100"
+                        )));
+                    }
+                }
+                ColorRule::None
+                | ColorRule::ByModelFamily
+                | ColorRule::ByEffort
+                | ColorRule::Account => {}
+            }
+            if segment.drop == Some(0) {
+                return Err(StoreError::InvalidSetting(format!(
+                    "{at}.drop: must be at least 1, got 0"
+                )));
+            }
+            if segment.kind == SegmentKind::Text && segment.text.is_none() {
+                return Err(StoreError::InvalidSetting(format!(
+                    "{at}.text: a Text segment needs text"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn percent(name: &str, value: u32) -> Result<(), StoreError> {
@@ -1139,6 +1394,313 @@ mod tests {
     }
 
     #[test]
+    fn settings_without_a_statusline_get_the_current_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(&tmp.path().join("app"));
+        fs::create_dir_all(store.app_paths().data_dir.clone()).unwrap();
+        fs::write(
+            store.app_paths().accounts_file(),
+            br#"{"version":1,"accounts":[],"settings":{}}"#,
+        )
+        .unwrap();
+        let file = store.load().unwrap();
+        assert_eq!(file.settings.statusline, StatuslineConfig::current_line());
+        assert_eq!(file.settings.statusline.right.len(), 5);
+        assert_eq!(file.settings.statusline.margin, 4);
+    }
+
+    #[test]
+    fn the_current_line_round_trips_through_json() {
+        let preset = StatuslineConfig::current_line();
+        let text = serde_json::to_string(&preset).unwrap();
+        let loaded: StatuslineConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(loaded, preset);
+        // The short file: empty prefix/suffix and absent options are left out.
+        for omitted in ["\"prefix\":\"\"", "\"suffix\":\"\"", "\"drop\":null"] {
+            assert!(!text.contains(omitted), "unexpected {omitted} in {text}");
+        }
+        // The names on disk are camelCase, and a colour rule is tagged by "rule".
+        for expected in [
+            "\"kind\":\"fiveHourPercent\"",
+            "\"timeFormat\":\"compactLeft\"",
+            "\"rule\":\"byLoad\"",
+            "\"rule\":\"fixed\"",
+        ] {
+            assert!(text.contains(expected), "missing {expected} in {text}");
+        }
+    }
+
+    /// A file written before `statusline` gained a field must still load with
+    /// that field's default, like every other setting (see `Settings`).
+    #[test]
+    fn a_statusline_without_a_margin_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(&tmp.path().join("app"));
+        fs::create_dir_all(store.app_paths().data_dir.clone()).unwrap();
+        fs::write(
+            store.app_paths().accounts_file(),
+            br#"{"version":1,"accounts":[],"settings":{"statusline":{"left":[],"right":[]}}}"#,
+        )
+        .unwrap();
+        let file = store
+            .load()
+            .expect("a statusline without a margin must still load");
+        assert_eq!(file.settings.statusline.margin, 4);
+    }
+
+    /// A segment written before `color` had a default still loads: a segment
+    /// without a colour rule is printed uncoloured (`ColorRule::None`).
+    #[test]
+    fn a_segment_without_a_colour_rule_loads_uncoloured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(&tmp.path().join("app"));
+        fs::create_dir_all(store.app_paths().data_dir.clone()).unwrap();
+        fs::write(
+            store.app_paths().accounts_file(),
+            br#"{"version":1,"accounts":[],"settings":{"statusline":{"left":[{"kind":"userHost"}],"right":[],"margin":4}}}"#,
+        )
+        .unwrap();
+        let file = store
+            .load()
+            .expect("a segment without a colour rule must still load");
+        assert_eq!(file.settings.statusline.left[0].color, ColorRule::None);
+    }
+
+    /// The preset as the page fixture carries it, in the JSON form serde gives
+    /// it (camelCase keys, `rule` tags, empty prefix/suffix and absent options
+    /// left out), so `panel.js` and the code cannot drift apart.
+    #[test]
+    fn the_preset_is_the_page_fixture() {
+        let expected = serde_json::json!({
+            "left": [
+                { "kind": "userHost", "color": { "rule": "fixed", "color": "#22c55e" } },
+                { "kind": "text", "color": { "rule": "none" }, "text": ":" },
+                { "kind": "folder", "color": { "rule": "fixed", "color": "#3b82f6" } },
+                { "kind": "model", "color": { "rule": "byModelFamily" }, "prefix": " " },
+                { "kind": "effort", "color": { "rule": "byEffort" }, "prefix": " " }
+            ],
+            "right": [
+                { "kind": "account", "color": { "rule": "account" }, "suffix": " " },
+                { "kind": "fiveHourPercent", "color": { "rule": "byLoad", "warn": 50, "bad": 80 }, "suffix": "%", "drop": 2 },
+                { "kind": "fiveHourReset", "color": { "rule": "none" }, "prefix": " ", "drop": 1, "timeFormat": "compactLeft" },
+                { "kind": "weekPercent", "color": { "rule": "byLoad", "warn": 50, "bad": 80 }, "prefix": "  ", "suffix": "%" },
+                { "kind": "weekReset", "color": { "rule": "none" }, "prefix": " ", "drop": 1, "timeFormat": "compactLeft" }
+            ],
+            "margin": 4
+        });
+        assert_eq!(
+            serde_json::to_value(StatuslineConfig::current_line()).unwrap(),
+            expected
+        );
+    }
+
+    /// The preset of the task, segment by segment: kind, colour rule, prefix,
+    /// suffix, drop order, time format and text.
+    #[test]
+    fn the_current_line_is_the_preset_the_task_names() {
+        type Parts = (
+            SegmentKind,
+            ColorRule,
+            String,
+            String,
+            Option<u8>,
+            Option<TimeFormat>,
+            Option<String>,
+        );
+        fn parts(segment: &Segment) -> Parts {
+            (
+                segment.kind,
+                segment.color.clone(),
+                segment.prefix.clone(),
+                segment.suffix.clone(),
+                segment.drop,
+                segment.time_format,
+                segment.text.clone(),
+            )
+        }
+
+        let config = StatuslineConfig::current_line();
+        assert_eq!(config.margin, 4);
+        let left: Vec<Parts> = config.left.iter().map(parts).collect();
+        assert_eq!(
+            left,
+            vec![
+                (
+                    SegmentKind::UserHost,
+                    ColorRule::Fixed {
+                        color: "#22c55e".to_string()
+                    },
+                    String::new(),
+                    String::new(),
+                    None,
+                    None,
+                    None,
+                ),
+                (
+                    SegmentKind::Text,
+                    ColorRule::None,
+                    String::new(),
+                    String::new(),
+                    None,
+                    None,
+                    Some(":".to_string()),
+                ),
+                (
+                    SegmentKind::Folder,
+                    ColorRule::Fixed {
+                        color: "#3b82f6".to_string()
+                    },
+                    String::new(),
+                    String::new(),
+                    None,
+                    None,
+                    None,
+                ),
+                (
+                    SegmentKind::Model,
+                    ColorRule::ByModelFamily,
+                    " ".to_string(),
+                    String::new(),
+                    None,
+                    None,
+                    None,
+                ),
+                (
+                    SegmentKind::Effort,
+                    ColorRule::ByEffort,
+                    " ".to_string(),
+                    String::new(),
+                    None,
+                    None,
+                    None,
+                ),
+            ]
+        );
+        let right: Vec<Parts> = config.right.iter().map(parts).collect();
+        assert_eq!(
+            right,
+            vec![
+                (
+                    SegmentKind::Account,
+                    ColorRule::Account,
+                    String::new(),
+                    " ".to_string(),
+                    None,
+                    None,
+                    None,
+                ),
+                (
+                    SegmentKind::FiveHourPercent,
+                    ColorRule::ByLoad { warn: 50, bad: 80 },
+                    String::new(),
+                    "%".to_string(),
+                    Some(2),
+                    None,
+                    None,
+                ),
+                (
+                    SegmentKind::FiveHourReset,
+                    ColorRule::None,
+                    " ".to_string(),
+                    String::new(),
+                    Some(1),
+                    Some(TimeFormat::CompactLeft),
+                    None,
+                ),
+                (
+                    SegmentKind::WeekPercent,
+                    ColorRule::ByLoad { warn: 50, bad: 80 },
+                    "  ".to_string(),
+                    "%".to_string(),
+                    None,
+                    None,
+                    None,
+                ),
+                (
+                    SegmentKind::WeekReset,
+                    ColorRule::None,
+                    " ".to_string(),
+                    String::new(),
+                    Some(1),
+                    Some(TimeFormat::CompactLeft),
+                    None,
+                ),
+            ]
+        );
+    }
+
+    /// The edges of the four rules: `warn == bad` is out of order, `bad == 100`
+    /// is the last value inside the range, `drop == 1` is the first drop
+    /// order, `#ABCDEF` is a `#rrggbb` and `#abc` is not, and a `Text` segment
+    /// needs its text (an empty text is a text).
+    #[test]
+    fn the_edges_of_the_statusline_rules() {
+        let mut config = StatuslineConfig::current_line();
+        config.right[1].color = ColorRule::ByLoad { warn: 50, bad: 50 };
+        assert!(statusline_error(config).contains("statusline.right[1].color"));
+
+        let mut config = StatuslineConfig::current_line();
+        config.right[1].color = ColorRule::ByLoad { warn: 99, bad: 100 };
+        assert!(settings_with_statusline(config).validate().is_ok());
+
+        let mut config = StatuslineConfig::current_line();
+        config.right[2].drop = Some(1);
+        assert!(settings_with_statusline(config).validate().is_ok());
+
+        let mut config = StatuslineConfig::current_line();
+        config.left[0].color = ColorRule::Fixed {
+            color: "#ABCDEF".to_string(),
+        };
+        assert!(settings_with_statusline(config).validate().is_ok());
+
+        let mut config = StatuslineConfig::current_line();
+        config.left[0].color = ColorRule::Fixed {
+            color: "#abc".to_string(),
+        };
+        assert!(statusline_error(config).contains("statusline.left[0].color"));
+
+        let mut config = StatuslineConfig::current_line();
+        config.left[1].text = Some(String::new());
+        assert!(settings_with_statusline(config).validate().is_ok());
+
+        let mut config = StatuslineConfig::current_line();
+        config.left[1].text = None;
+        assert!(statusline_error(config).contains("statusline.left[1].text"));
+    }
+
+    /// `Settings` has no `deny_unknown_fields`, so an unknown key is ignored
+    /// everywhere; inside `statusline` it is ignored too.
+    #[test]
+    fn unknown_keys_in_the_statusline_are_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(&tmp.path().join("app"));
+        fs::create_dir_all(store.app_paths().data_dir.clone()).unwrap();
+        fs::write(
+            store.app_paths().accounts_file(),
+            br#"{"version":1,"accounts":[],"settings":{"statusline":{"left":[],"right":[],"margin":4,"futureKey":true}}}"#,
+        )
+        .unwrap();
+        let file = store.load().unwrap();
+        assert_eq!(file.settings.statusline.margin, 4);
+    }
+
+    /// A value the code does not know is an error, not an ignored key: the
+    /// whole file cannot be read any more (like every other enum in
+    /// `Settings`).
+    #[test]
+    fn an_unknown_colour_rule_makes_the_file_unreadable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(&tmp.path().join("app"));
+        fs::create_dir_all(store.app_paths().data_dir.clone()).unwrap();
+        fs::write(
+            store.app_paths().accounts_file(),
+            br#"{"version":1,"accounts":[],"settings":{"statusline":{"left":[{"kind":"userHost","color":{"rule":"byLoad2","warn":50,"bad":80}}],"right":[],"margin":4}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(store.load(), Err(StoreError::Corrupt { .. })));
+    }
+
+    #[test]
     fn version_two_is_unsupported() {
         let tmp = tempfile::tempdir().unwrap();
         let store = store_at(&tmp.path().join("app"));
@@ -1218,6 +1780,90 @@ mod tests {
         assert!(settings.validate().is_err());
         settings.suggest_target_below = 101;
         assert!(settings.validate().is_err());
+    }
+
+    fn settings_with_statusline(config: StatuslineConfig) -> Settings {
+        Settings {
+            statusline: config,
+            ..Settings::default()
+        }
+    }
+
+    fn statusline_error(config: StatuslineConfig) -> String {
+        settings_with_statusline(config)
+            .validate()
+            .expect_err("this statusline must be rejected")
+            .to_string()
+    }
+
+    #[test]
+    fn validate_rejects_bad_statusline_values() {
+        let mut config = StatuslineConfig::current_line();
+        config.left[0].color = ColorRule::Fixed {
+            color: "#22c5".to_string(),
+        };
+        assert!(statusline_error(config).contains("statusline.left[0].color"));
+
+        let mut config = StatuslineConfig::current_line();
+        config.right[1].color = ColorRule::ByLoad { warn: 80, bad: 50 };
+        assert!(statusline_error(config).contains("statusline.right[1].color"));
+
+        let mut config = StatuslineConfig::current_line();
+        config.right[1].drop = Some(0);
+        assert!(statusline_error(config).contains("statusline.right[1].drop"));
+
+        let mut config = StatuslineConfig::current_line();
+        config.left[1].text = None;
+        assert!(statusline_error(config).contains("statusline.left[1].text"));
+    }
+
+    #[test]
+    fn validate_rejects_a_statusline_fixed_colour_that_is_not_rrggbb() {
+        let mut config = StatuslineConfig::current_line();
+        config.left[0].color = ColorRule::Fixed {
+            color: "#22c5".to_string(),
+        };
+        assert_eq!(
+            statusline_error(config),
+            "invalid setting: statusline.left[0].color: invalid colour \"#22c5\": use #rrggbb"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_a_statusline_load_rule_out_of_order_or_above_100() {
+        let mut config = StatuslineConfig::current_line();
+        config.right[1].color = ColorRule::ByLoad { warn: 80, bad: 50 };
+        assert_eq!(
+            statusline_error(config),
+            "invalid setting: statusline.right[1].color: warn (80) must be below bad (50)"
+        );
+
+        let mut config = StatuslineConfig::current_line();
+        config.right[1].color = ColorRule::ByLoad { warn: 50, bad: 101 };
+        assert_eq!(
+            statusline_error(config),
+            "invalid setting: statusline.right[1].color: bad (101) must be at most 100"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_a_statusline_drop_order_of_zero() {
+        let mut config = StatuslineConfig::current_line();
+        config.left[0].drop = Some(0);
+        assert_eq!(
+            statusline_error(config),
+            "invalid setting: statusline.left[0].drop: must be at least 1, got 0"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_a_statusline_text_segment_without_text() {
+        let mut config = StatuslineConfig::current_line();
+        config.left[1].text = None;
+        assert_eq!(
+            statusline_error(config),
+            "invalid setting: statusline.left[1].text: a Text segment needs text"
+        );
     }
 
     #[test]

@@ -36,6 +36,45 @@ const DEFAULT_SETTINGS = {
   notifyWaitingHosts: "thisHost",
   agentsRead: true,
   agentsSwitch: false,
+  statusline: {
+    left: [
+      { kind: "userHost", color: { rule: "fixed", color: "#22c55e" } },
+      { kind: "text", color: { rule: "none" }, text: ":" },
+      { kind: "folder", color: { rule: "fixed", color: "#3b82f6" } },
+      { kind: "model", color: { rule: "byModelFamily" }, prefix: " " },
+      { kind: "effort", color: { rule: "byEffort" }, prefix: " " },
+    ],
+    right: [
+      { kind: "account", color: { rule: "account" }, suffix: " " },
+      {
+        kind: "fiveHourPercent",
+        color: { rule: "byLoad", warn: 50, bad: 80 },
+        suffix: "%",
+        drop: 2,
+      },
+      {
+        kind: "fiveHourReset",
+        color: { rule: "none" },
+        prefix: " ",
+        drop: 1,
+        timeFormat: "compactLeft",
+      },
+      {
+        kind: "weekPercent",
+        color: { rule: "byLoad", warn: 50, bad: 80 },
+        prefix: "  ",
+        suffix: "%",
+      },
+      {
+        kind: "weekReset",
+        color: { rule: "none" },
+        prefix: " ",
+        drop: 1,
+        timeFormat: "compactLeft",
+      },
+    ],
+    margin: 4,
+  },
 };
 
 const LEVEL_COLORS = {
