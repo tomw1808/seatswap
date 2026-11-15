@@ -60,6 +60,9 @@ All notable changes to this project are documented here. The format follows
 ### Fixed
 - `seatswap status --help` names the fields of the JSON output as they are: `views`, `active`
   and `suggestion`. It said "the active id", which is not a field.
+- The pop-up, `burn-next.json` and the status line name the same next account as the Forecast
+  while early switching is on. The pop-up's line says `Then AC, before PR is full.` when that
+  plan leaves PR before its week fills.
 
 ## [1.0.6] - 2026-11-14
 

@@ -554,7 +554,8 @@ pub struct AccountView {
 }
 
 // Step B's suggestion is `burn_text::SwitchSuggestion { to, text }`, built from the decision and the
-// lazy plan. It replaces the fixed `Suggestion` struct and `engine::suggestion`, which are gone.
+// lazy plan it computes itself (`follow(inputs, Policy::Lazy)`). It replaces the fixed `Suggestion`
+// struct and `engine::suggestion`, which are gone.
 
 /// §6.3: accounts whose login ends within 5 days (days_left 5..=2 → Soon, ≤ 1 → Tomorrow, < 0 → Ended).
 pub enum LoginWarning { Soon { id: String, days_left: i64 }, Tomorrow { id: String }, Ended { id: String } }
@@ -976,7 +977,7 @@ of one event kind never clears the other kind's failure.
 | `agent-skill install\|uninstall [--force]` | `agent_skill`: `<claude config dir>/skills/seatswap/SKILL.md` from the bundled text, through `atomic::ensure_private_dir` and `atomic::write_atomic` (0600). Install prints "already installed: <path>" when the file is identical, refuses a differing file without `--force`, else prints the path. Uninstall prints "not installed: <path>" when absent, refuses a differing file without `--force`, else prints "removed <path>" and removes the folder when it is empty. |
 | `status` | The live account in one line: `AC 97% · 1h12m` (binding limit, time to its reset; format §11: `35m`, `1h05m`, `1d18h`, beyond 48 h `Sun 02:00` — `format::format_reset_at`; reset times are rounded up to the full minute first, `format::reset_minute`). `--json` prints `views` + `active` + `suggestion` + `autoBurn` + `next` + `burnError` (§7.8 of the spec); each view carries `usable`, the one definition of §7.2, and `slackHours` when known. `--waybar` prints one JSON line `{"text":"AC 97%","tooltip":"…","class":"fine|close|critical|locked|none","percentage":97}`; `--i3blocks` prints three lines (full text, short text, colour). `--refresh` polls first (PollReason::Timer). Only `--json` reads the history. |
 | `statusline` | Claude Code's status line: reads its JSON from stdin, prints the one line and exits 0 (even when it prints `seatswap: <reason>`). Never gated, never recorded, no lock, no network. |
-| `burn plan [--json]` | The regime and the lazy plan (§7.7 of the spec). |
+| `burn plan [--json]` | The regime and the plan auto-burn follows (eager while early switching is on; §7.7 of the spec). |
 | `burn simulate --from D --to D [--without KEY]…` | Replays the two local days for `Lazy` and `Eager`. |
 
 ### Agent gate and skill (step A)
@@ -1373,6 +1374,7 @@ pub fn choose(inputs: &Inputs, at: DateTime<Utc>) -> Option<String>;
     pub blocked_wu: f64, pub switches: u32, pub left_at_reset: BTreeMap<String, f64>,
     pub full_at: BTreeMap<String, DateTime<Utc>>, pub full_by: BTreeMap<String, Fill> }
 pub fn follow(inputs: &Inputs, policy: Policy) -> Plan;
+pub fn followed(inputs: &Inputs, regime: &Regime) -> Plan; // eager while `regime.early`, else lazy
 pub(super) fn rhythm_walk(inputs: &Inputs) -> Walk<'_>; // the plan and `decide::latest_reaching`
 ```
 
@@ -1387,6 +1389,9 @@ window first, then the rest, each by earlier reset and id). When every usable ac
 the candidates are the accounts within `SLACK_MARGIN_H` × the typical hour of the least slack; among
 them the highest `thinking_held` wins, and equal counts (including all 0) fall back to the slack,
 reset and id order. So with no thinking held `choose` names exactly the least-slack account as before.
+`followed` is the one place the rule "eager while early switching is on, else lazy" lives: it returns
+`follow(inputs, Policy::Eager)` when `regime.early`, else `follow(inputs, Policy::Lazy)`. The
+Forecast's planned plan, `live::assess` and everything that reads its plan take it from there.
 
 ## burn/decide.rs — the regime and the decision (step B)
 
@@ -1488,7 +1493,7 @@ pub fn thinking_held(thinking: &[(DateTime<Utc>, u32)], events: &[Hosted<Event>]
 pub fn next_account(situation: &Situation, decision: &Decision, plan: &Plan) -> Option<String>;
 pub struct Assessment { pub situation: Situation, pub regime: Regime, pub decision: Decision,
                         pub plan: Plan, pub next: Option<String> }
-/// regime → decide → follow(Lazy) → next. `cached_regime` is an earlier regime; None computes one.
+/// regime → decide → followed → next. `cached_regime` is an earlier regime; None computes one.
 pub fn assess(situation: Situation, cached_regime: Option<&Regime>) -> Assessment;
 ```
 
@@ -1500,8 +1505,10 @@ into `Inputs` (`may_use` = the account's `auto_burn`, `login_ok` = `loginState =
 out. The manual hold
 is the latest of any non-auto switch's `MANUAL_HOLD_H` and an `autoBurn` pause; a resume clears the
 manual hold; a manual hold ends at the first block of the account switched to, from the history or
-the state now, and stays ended. `next_account` is the target of a
-`Switch`/`Wait`, otherwise the first account of the lazy plan other than the active one.
+the state now, and stays ended. `assess` takes its plan from `plan::followed`, so the pop-up,
+`burn-next.json`, the status line and `status --json` follow the same plan the Forecast shows.
+`next_account` is the target of a
+`Switch`/`Wait`, otherwise the first account of the plan other than the active one.
 
 ## burn changes — going back restores (step C2)
 
@@ -1628,7 +1635,7 @@ pub fn line(plan: &Plan, active: Option<&str>, views: &[AccountView], learning: 
 pub fn planned(plan: &Plan, active: Option<&str>) -> BTreeMap<String, DateTime<Utc>>; // feature "gui"
 pub fn switch_notification(decision: &Decision, active: Option<&str>, views: &[AccountView],
     now: DateTime<Utc>, offset: FixedOffset) -> Result<Option<String>, TextError>; // feature "gui"
-pub fn suggestion(decision: &Decision, plan: &Plan, active: Option<&str>, views: &[AccountView],
+pub fn suggestion(decision: &Decision, inputs: &Inputs, active: Option<&str>, views: &[AccountView],
     now: DateTime<Utc>, offset: FixedOffset) -> Result<Option<SwitchSuggestion>, TextError>;
 ```
 
@@ -1637,8 +1644,10 @@ Every text is here; the tray app and the CLI do not keep a second copy. Missing 
 `Waiting for a first reading of AC, LB.` in account order; `no_accounts_line` is the fixed
 `No account auto-burn may use has a working login.` `why(SessionsOff)` is
 `reading sessions is off: no rates are learned`. `suggestion` returns `Some` only for `Switch`
-and `Wait`, and adds the "Staying on … is expected to let … expire" sentence only when the lazy
-plan leaves more than 1 % of the target's week at its reset.
+and `Wait`, and chooses the plan for its "Staying on … is expected to let … expire" sentence
+itself: `follow(inputs, Policy::Lazy)`, the plan that switches only at 100 %, never the plan
+auto-burn follows (which is eager while early switching is on). It adds that sentence only when
+that plan leaves more than 1 % of the target's week at its reset.
 
 ## app: auto-burn in the tray app (`gui/burn_rt.rs`, step B)
 
@@ -1677,8 +1686,9 @@ keeps the strip with `burn_text::unread_line` as its line and still asks the sta
 `suggest_switches` on, `Switch` and `Wait` fill `view.suggestion`. The switch is retried after
 `SWITCH_RETRY_MIN` minutes; the notification is shown only after the reply says the switch landed.
 `publish_next` writes `<data>/burn-next.json` (`Switch`: `to` and now; `Wait`: `to` and `latest`;
-otherwise the lazy plan's next account and its first use), removes it when auto-burn is off,
-paused or nothing is planned, and rewrites at least every `burn_next::REWRITE_AFTER_MIN` minutes.
+otherwise the next account of the plan auto-burn follows and its first use), removes it when
+auto-burn is off, paused or nothing is planned, and rewrites at least every
+`burn_next::REWRITE_AFTER_MIN` minutes.
 The runtime remembers the warnings it printed with `worker::PrintedWarnings`, shared rather than a
 second `BTreeSet`. `BurnView` is part of `Snapshot.burn`; the
 settings toggle calls `worker::save_setting` and writes `EventKind::AutoBurnSet`, the pause calls

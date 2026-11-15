@@ -17,7 +17,7 @@ use crate::store::{Account, LoginState};
 
 use super::cost::switch_cost;
 use super::decide::{decide, regime, Decision, Regime, Situation};
-use super::plan::{blocked, follow, AccountState, Inputs, Plan, PlanError, Policy, SessionState};
+use super::plan::{blocked, followed, AccountState, Inputs, Plan, PlanError, SessionState};
 use super::rates::{rates, rhythm, Timeline};
 use super::{Rates, Rhythm, MANUAL_HOLD_H, RATES_DAYS, RHYTHM_WEEKS};
 
@@ -232,7 +232,7 @@ pub fn situation(
 
 /// The account auto-burn would switch to at this reading: the target of a
 /// [`Decision::Switch`] or [`Decision::Wait`], otherwise the first account of
-/// the lazy plan other than the active one, otherwise `None`. It is the one
+/// the plan other than the active one, otherwise `None`. It is the one
 /// rule `BurnView` and `status --json`'s `next` use.
 pub fn next_account(situation: &Situation, decision: &Decision, plan: &Plan) -> Option<String> {
     match decision {
@@ -251,8 +251,8 @@ pub fn next_account(situation: &Situation, decision: &Decision, plan: &Plan) -> 
 }
 
 /// The whole shared assembly after [`situation`]: the regime, the decision, the
-/// lazy plan and the account the plan names next. The tray app and both CLI
-/// commands use it, so they cannot take the steps in a different order.
+/// plan auto-burn follows and the account the plan names next. The tray app and
+/// both CLI commands use it, so they cannot take the steps in a different order.
 pub struct Assessment {
     pub situation: Situation,
     pub regime: Regime,
@@ -262,7 +262,7 @@ pub struct Assessment {
 }
 
 /// Assemble one decision from a checked situation: regime → decide →
-/// follow(Lazy) → next. `cached_regime` is a regime an earlier call computed;
+/// [`followed`] → next. `cached_regime` is a regime an earlier call computed;
 /// `None` computes a new one. Keeping that cache is the tray app's own job.
 pub fn assess(situation: Situation, cached_regime: Option<&Regime>) -> Assessment {
     let regime = match cached_regime {
@@ -270,7 +270,7 @@ pub fn assess(situation: Situation, cached_regime: Option<&Regime>) -> Assessmen
         None => regime(&situation),
     };
     let decision = decide(&situation, &regime);
-    let plan = follow(&situation.inputs, Policy::Lazy);
+    let plan = followed(&situation.inputs, &regime);
     let next = next_account(&situation, &decision, &plan);
     Assessment {
         situation,
@@ -395,8 +395,8 @@ mod tests {
     use chrono::FixedOffset;
 
     use crate::api::{Limit, LimitKind, Severity, Usage};
-    use crate::burn::decide::Reason;
-    use crate::burn::plan::{follow, Policy};
+    use crate::burn::decide::{Reason, RegimeWhy};
+    use crate::burn::plan::{follow, followed, Policy};
     use crate::history::{Recorder, Source, TokenRecord};
     use crate::project::ProjectKey;
     use crate::types::OAuthAccount;
@@ -1122,6 +1122,149 @@ mod tests {
             situation.manual_hold_until,
             Some(now + Duration::hours(3)),
             "a CLI switch one hour ago holds for four hours"
+        );
+    }
+
+    fn early_regime(early: bool) -> Regime {
+        Regime {
+            early,
+            why: if early {
+                RegimeWhy::Pays
+            } else {
+                RegimeWhy::NoCostYet
+            },
+            lazy_blocked_h: 0.0,
+            eager_blocked_h: 0.0,
+            extra_switches: 0,
+            cost_h: None,
+        }
+    }
+
+    fn assess_situation(inputs: Inputs) -> Situation {
+        Situation {
+            oldest_reading: inputs.now - Duration::minutes(1),
+            inputs,
+            cost: None,
+            last_switch_at: None,
+            manual_hold_until: None,
+            tied_busy: 0,
+            sessions_off: false,
+        }
+    }
+
+    /// The stored accounts the plan's ids name: PR, AC and LB, as the
+    /// Forecast's own tests build them.
+    fn stored_plan_accounts(tiny: &crate::stats::tests::Tiny) -> Vec<Account> {
+        let mut pr = tiny.lb().clone();
+        pr.id = "PR".to_string();
+        pr.label = "PR".to_string();
+        pr.abbr = "PR".to_string();
+        pr.account_uuid = "0a1b2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c5d".to_string();
+        pr.organization_uuid = "1b2c3d4e-5f6a-4b7c-9d0e-1f2a3b4c5d6e".to_string();
+        pr.price = Some(100.0);
+        pr.price_currency = Some("EUR".to_string());
+
+        let mut ac = tiny.ac().clone();
+        ac.id = "AC".to_string();
+        ac.label = "AC".to_string();
+        ac.abbr = "AC".to_string();
+
+        let mut lb = tiny.lb().clone();
+        lb.id = "LB".to_string();
+        lb.label = "LB".to_string();
+        lb.abbr = "LB".to_string();
+
+        vec![pr, ac, lb]
+    }
+
+    /// The plan's next account and the start of its first switch away from the
+    /// active account.
+    fn next_and_first_switch(
+        plan: &Plan,
+        active: Option<&str>,
+    ) -> (Option<String>, Option<DateTime<Utc>>) {
+        let next = plan.segments.iter().find_map(|segment| {
+            let id = segment.account.as_deref()?;
+            (Some(id) != active).then(|| id.to_string())
+        });
+        let first = plan
+            .segments
+            .iter()
+            .find(|segment| segment.account.as_deref() != active)
+            .map(|segment| segment.from);
+        (next, first)
+    }
+
+    #[test]
+    fn with_early_switching_assess_follows_the_forecasts_plan() {
+        let tiny = crate::stats::tests::tiny();
+        let accounts = stored_plan_accounts(&tiny);
+        let ctx = crate::stats::Ctx {
+            accounts: &accounts,
+            ..tiny.ctx()
+        };
+        let inputs = crate::burn::plan::testkit::inputs();
+        let early = early_regime(true);
+        let active = inputs.active.as_deref();
+        let lazy = follow(&inputs, Policy::Lazy);
+        let eager = follow(&inputs, Policy::Eager);
+        assert_ne!(
+            next_and_first_switch(&lazy, active),
+            next_and_first_switch(&eager, active),
+            "the lazy and eager plans name a different next account or first switch time"
+        );
+
+        let assessment = assess(assess_situation(inputs.clone()), Some(&early));
+        assert_eq!(
+            assessment.plan,
+            followed(&assessment.situation.inputs, &early)
+        );
+        assert_eq!(assessment.plan, eager);
+        assert_eq!(assessment.next, next_and_first_switch(&eager, active).0);
+
+        let forecast =
+            crate::stats::forecast::forecast(&ctx, &inputs, &early).expect("the forecast is built");
+        let mut blocks: Vec<(Option<String>, DateTime<Utc>, DateTime<Utc>)> = forecast
+            .lanes
+            .iter()
+            .flat_map(|lane| {
+                lane.blocks
+                    .iter()
+                    .map(move |(from, to)| (Some(lane.id.clone()), *from, *to))
+            })
+            .collect();
+        let mut segments: Vec<(Option<String>, DateTime<Utc>, DateTime<Utc>)> = assessment
+            .plan
+            .segments
+            .iter()
+            .filter(|segment| segment.account.is_some())
+            .map(|segment| (segment.account.clone(), segment.from, segment.to))
+            .collect();
+        blocks.sort();
+        segments.sort();
+        assert_eq!(
+            blocks, segments,
+            "the Forecast's lanes follow the assessed plan"
+        );
+        assert_eq!(forecast.kpis.switches, assessment.plan.switches);
+        let blocked: Vec<(DateTime<Utc>, DateTime<Utc>)> = assessment
+            .plan
+            .segments
+            .iter()
+            .filter(|segment| segment.account.is_none())
+            .map(|segment| (segment.from, segment.to))
+            .collect();
+        assert_eq!(forecast.blocked, blocked);
+    }
+
+    #[test]
+    fn without_early_switching_assess_follows_the_lazy_plan() {
+        let inputs = crate::burn::plan::testkit::inputs();
+        let late = early_regime(false);
+        let assessment = assess(assess_situation(inputs.clone()), Some(&late));
+        assert_eq!(
+            assessment.plan,
+            follow(&assessment.situation.inputs, Policy::Lazy)
         );
     }
 }

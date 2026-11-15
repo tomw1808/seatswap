@@ -9,7 +9,7 @@ use serde::Serialize;
 use crate::api::LimitKind;
 use crate::burn::decide::Regime;
 use crate::burn::plan::{
-    follow, next_reset, rates_known, week_percent_at, AccountState, Inputs, Plan, Policy,
+    follow, followed, next_reset, rates_known, week_percent_at, AccountState, Inputs, Plan, Policy,
 };
 use crate::burn::{wu_hours, HORIZON_H};
 use crate::history::{same_reset, AccountRef, Hosts, Range, Sample, WindowRecord};
@@ -114,12 +114,7 @@ pub fn forecast<Tz: TimeZone + Copy>(
     inputs: &Inputs,
     regime: &Regime,
 ) -> Result<Forecast, StatsError> {
-    let policy = if regime.early {
-        Policy::Eager
-    } else {
-        Policy::Lazy
-    };
-    let planned = follow(inputs, policy);
+    let planned = followed(inputs, regime);
     let lazy = follow(inputs, Policy::Lazy);
     let from = inputs.now;
     let to = inputs.now + Duration::hours(HORIZON_H);

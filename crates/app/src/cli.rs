@@ -14,8 +14,9 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use seatswap_core::api::{Api, Usage};
+use seatswap_core::burn::decide::Regime;
 use seatswap_core::burn::live::{self, Readiness};
-use seatswap_core::burn::plan::{follow, slack, Policy};
+use seatswap_core::burn::plan::{follow, slack, Inputs, Policy};
 use seatswap_core::burn::replay::replay;
 use seatswap_core::burn::wu_hours;
 use seatswap_core::engine::{AccountView, Engine, PollReason, UsageCache};
@@ -289,7 +290,8 @@ impl ExportFormat {
 /// What `seatswap burn` does (spec §2.4, §2.8).
 #[derive(Debug, Subcommand)]
 pub(crate) enum BurnAction {
-    /// Print the early-switching regime and the lazy plan's segments.
+    /// Print the early-switching regime and the plan auto-burn follows (eager while early
+    /// switching is on).
     Plan {
         /// Print one JSON object instead of the lines.
         #[arg(long)]
@@ -1559,7 +1561,7 @@ fn burn_status(
     if !settings.auto_burn && settings.suggest_switches {
         match burn_text::suggestion(
             &assessment.decision,
-            &assessment.plan,
+            &assessment.situation.inputs,
             active,
             views,
             now,
@@ -1616,9 +1618,27 @@ struct BurnSegmentJson {
     to: DateTime<Utc>,
 }
 
-/// `seatswap burn plan [--json]`: the early-switching regime and the lazy plan,
-/// read exactly as the tray app reads them (`tied_busy` is 0: the CLI has no
-/// session count).
+/// The regime's numbers as `burn plan --json` prints them. Both blocked-hours
+/// fields name a policy on purpose, so both plans are computed explicitly: the
+/// command's segments are the plan auto-burn follows, which is eager while
+/// early switching is on, and it cannot answer for the lazy plan.
+fn burn_regime_json(inputs: &Inputs, regime: &Regime) -> BurnRegimeJson {
+    let typical = inputs.rhythm.typical_hour();
+    let lazy = follow(inputs, Policy::Lazy);
+    let eager = follow(inputs, Policy::Eager);
+    BurnRegimeJson {
+        early: regime.early,
+        why: burn_text::why(regime.why).to_string(),
+        blocked_lazy_h: wu_hours(lazy.blocked_wu, typical),
+        blocked_eager_h: wu_hours(eager.blocked_wu, typical),
+        extra_switches: regime.extra_switches,
+        cost_h: regime.cost_h,
+    }
+}
+
+/// `seatswap burn plan [--json]`: the early-switching regime and the plan
+/// auto-burn follows (eager while early switching is on), read exactly as the
+/// tray app reads them (`tied_busy` is 0: the CLI has no session count).
 fn burn_plan(context: Context, json: bool) -> Result<String, CliError> {
     let now = Utc::now();
     let offset = *Local::now().offset();
@@ -1660,17 +1680,8 @@ fn burn_plan(context: Context, json: bool) -> Result<String, CliError> {
     let regime = &assessment.regime;
     let plan = &assessment.plan;
     if json {
-        let typical = assessment.situation.inputs.rhythm.typical_hour();
-        let eager = follow(&assessment.situation.inputs, Policy::Eager);
         let output = BurnPlanJson {
-            regime: BurnRegimeJson {
-                early: regime.early,
-                why: burn_text::why(regime.why).to_string(),
-                blocked_lazy_h: wu_hours(plan.blocked_wu, typical),
-                blocked_eager_h: wu_hours(eager.blocked_wu, typical),
-                extra_switches: regime.extra_switches,
-                cost_h: regime.cost_h,
-            },
+            regime: burn_regime_json(&assessment.situation.inputs, regime),
             segments: plan
                 .segments
                 .iter()
@@ -2049,6 +2060,9 @@ pub(crate) mod tests {
 
     use chrono::FixedOffset;
     use seatswap_core::api::{Limit, LimitKind, Severity, Usage};
+    use seatswap_core::burn::decide::RegimeWhy;
+    use seatswap_core::burn::plan::{AccountState, Inputs};
+    use seatswap_core::burn::{Rates, Rhythm};
     use seatswap_core::engine::{AccountView, CacheEntry};
     use seatswap_core::history::{LimitSample, Sample, Source, TokenRecord};
     use seatswap_core::paths::ClaudePaths;
@@ -3608,6 +3622,70 @@ pub(crate) mod tests {
             fetched_at: Some(fetched_at),
             last_error: None,
         }
+    }
+
+    /// PR and AC as the planner needs them: PR fills after 50 h, AC's weekly
+    /// reset comes after 24 h, so the lazy plan blocks more work than the eager
+    /// one (the eager plan uses AC at once, until its reset).
+    fn burn_plan_inputs() -> Inputs {
+        let now = DateTime::parse_from_rfc3339("2026-11-10T12:00:00Z")
+            .expect("a test time")
+            .with_timezone(&Utc);
+        let state = |id: &str, c: f64, reset: &str| AccountState {
+            id: id.to_string(),
+            may_use: true,
+            login_ok: true,
+            week_percent: 0.0,
+            week_resets_at: DateTime::parse_from_rfc3339(reset)
+                .expect("a test time")
+                .with_timezone(&Utc),
+            session: None,
+            model_blocked: false,
+            rates: Some(Rates { c, s: None }),
+            thinking_held: 0,
+        };
+        Inputs {
+            now,
+            offset: FixedOffset::east_opt(0).expect("UTC"),
+            accounts: vec![
+                state("pr", 2.0, "2026-11-18T12:00:00Z"),
+                state("ac", 5.0, "2026-11-11T12:00:00Z"),
+            ],
+            active: Some("pr".to_string()),
+            rhythm: Rhythm { wu: [1.0; 168] },
+        }
+    }
+
+    #[test]
+    fn burn_plan_json_names_the_lazy_and_eager_hours() {
+        let inputs = burn_plan_inputs();
+        let lazy = follow(&inputs, Policy::Lazy);
+        let eager = follow(&inputs, Policy::Eager);
+        assert_ne!(
+            lazy.blocked_wu, eager.blocked_wu,
+            "the two policies block different work"
+        );
+        let regime = Regime {
+            early: true,
+            why: RegimeWhy::Pays,
+            lazy_blocked_h: 1.0,
+            eager_blocked_h: 0.0,
+            extra_switches: 1,
+            cost_h: Some(0.1),
+        };
+        let json = burn_regime_json(&inputs, &regime);
+        let typical = inputs.rhythm.typical_hour();
+        assert_eq!(
+            json.blocked_lazy_h,
+            wu_hours(lazy.blocked_wu, typical),
+            "blockedLazyH is the lazy plan's hours, even while early switching is on"
+        );
+        assert_eq!(
+            json.blocked_eager_h,
+            wu_hours(eager.blocked_wu, typical),
+            "blockedEagerH is the eager plan's hours"
+        );
+        assert_ne!(json.blocked_lazy_h, json.blocked_eager_h);
     }
 
     /// The printed forms of `status` show nothing of auto-burn, so they must

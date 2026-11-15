@@ -12,7 +12,9 @@ use seatswap_core::burn::decide::RegimeWhy;
 use seatswap_core::burn::decide::{Decision, Reason};
 #[cfg(feature = "gui")]
 use seatswap_core::burn::plan::Fill;
-use seatswap_core::burn::plan::{Plan, Policy};
+#[cfg(feature = "gui")]
+use seatswap_core::burn::plan::Plan;
+use seatswap_core::burn::plan::{follow, Inputs, Policy};
 use seatswap_core::burn::replay::ReplayResult;
 use seatswap_core::engine::AccountView;
 use seatswap_core::history::AccountRef;
@@ -207,7 +209,9 @@ pub fn reason(
 
 #[cfg(feature = "gui")]
 /// The line under the auto-burn switch: the account in use, when it fills and
-/// which account follows. While learning, the accounts whose rates are missing.
+/// which account follows. A plan that leaves the account before it fills (an
+/// eager plan can) says `Then AC, before PR is full.` instead. While learning,
+/// the accounts whose rates are missing.
 pub fn line(
     plan: &Plan,
     active: Option<&str>,
@@ -249,6 +253,22 @@ pub fn line(
                 return Ok(None);
             };
             let seconds = next.from.signed_duration_since(now).num_seconds();
+            // A plan that fills the current account only after the next one is
+            // due leaves it before it is full (an eager plan can do that): the
+            // line then says so instead of claiming it stays until full.
+            let fills_before_switch = plan
+                .full_at
+                .get(current)
+                .is_some_and(|full_at| *full_at <= next.from);
+            if !fills_before_switch {
+                return Ok(Some(format!(
+                    "On {} for about {}. Then {}, before {} is full.",
+                    abbr(views, current)?,
+                    format::compact_left(seconds, seconds >= 24 * 60 * 60),
+                    abbr(views, next_id)?,
+                    abbr(views, current)?
+                )));
+            }
             let fill = plan
                 .full_by
                 .get(current)
@@ -316,10 +336,15 @@ pub fn switch_notification(
 }
 
 /// The suggestion when auto-burn is off: "Switch to … now: …", plus what the
-/// lazy plan expects to leave unused on the target's week.
+/// plan that switches only at 100 % expects to leave unused on the target's
+/// week. The "Staying on …" sentence is about staying on the active account
+/// until the target is full, which only the lazy plan models, so this is the
+/// one place that plan is chosen: the plan auto-burn follows may be eager while
+/// early switching is on, and its `left_at_reset` would not answer that
+/// sentence.
 pub fn suggestion(
     decision: &Decision,
-    plan: &Plan,
+    inputs: &Inputs,
     active: Option<&str>,
     views: &[AccountView],
     now: DateTime<Utc>,
@@ -335,6 +360,7 @@ pub fn suggestion(
         "Switch to {to_name} now: {}.",
         reason(why, to, active, views, now, offset)?
     );
+    let plan = follow(inputs, Policy::Lazy);
     if let (Some(left), Some(active_name)) = (
         plan.left_at_reset.get(to),
         active.map(|id| abbr(views, id)).transpose()?,
@@ -357,11 +383,16 @@ mod tests {
     use super::*;
 
     use chrono::Duration;
+    #[cfg(feature = "gui")]
     use std::collections::BTreeMap;
 
     use seatswap_core::api::{Limit, LimitKind, Severity, Usage};
-    use seatswap_core::burn::decide::Decision;
+    use seatswap_core::burn::decide::{Decision, Regime, RegimeWhy, Situation};
+    use seatswap_core::burn::live::assess;
+    use seatswap_core::burn::plan::AccountState;
+    #[cfg(feature = "gui")]
     use seatswap_core::burn::plan::{Fill, Plan, Segment};
+    use seatswap_core::burn::{Rates, Rhythm};
     use seatswap_core::store::LoginState;
 
     const RESET: &str = "2026-11-16T02:00:00Z";
@@ -419,6 +450,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "gui")]
     fn plan() -> Plan {
         let now = utc("2026-11-10T12:00:00Z");
         Plan {
@@ -437,11 +469,83 @@ mod tests {
             blocked_wu: 0.0,
             switches: 1,
             left_at_reset: BTreeMap::new(),
-            full_at: BTreeMap::new(),
+            // The lazy plan's shape: PR fills when its segment ends, so the
+            // switch comes at the same time, not before.
+            full_at: BTreeMap::from([("pr".to_string(), now + Duration::hours(2))]),
             full_by: BTreeMap::from([
                 ("pr".to_string(), Fill::Week),
                 ("ac".to_string(), Fill::Window),
             ]),
+        }
+    }
+
+    /// An uncapped account as the plan needs it for the suggestion's own lazy
+    /// plan.
+    fn state(id: &str, c: f64, week: f64, reset: &str) -> AccountState {
+        AccountState {
+            id: id.to_string(),
+            may_use: true,
+            login_ok: true,
+            week_percent: week,
+            week_resets_at: utc(reset),
+            session: None,
+            model_blocked: false,
+            rates: Some(Rates { c, s: None }),
+            thinking_held: 0,
+        }
+    }
+
+    /// Two accounts whose weekly resets lie beyond the plan's horizon: no reset
+    /// is recorded, so the suggestion adds no "Staying" sentence.
+    fn inputs_without_a_reset() -> Inputs {
+        Inputs {
+            now: utc("2026-11-10T12:00:00Z"),
+            offset: offset(),
+            accounts: vec![
+                state("pr", 2.0, 20.0, "2026-11-18T12:00:00Z"),
+                state("ac", 1.0, 10.0, "2026-11-18T12:00:00Z"),
+            ],
+            active: Some("pr".to_string()),
+            rhythm: Rhythm { wu: [1.0; 168] },
+        }
+    }
+
+    /// The lazy plan stays on PR for 50 h, after AC's weekly reset at 24 h, so
+    /// AC is left untouched (100 % unused); the eager plan uses AC at once and
+    /// leaves nothing at that reset.
+    fn inputs_that_leave_the_target_unused() -> Inputs {
+        Inputs {
+            now: utc("2026-11-10T12:00:00Z"),
+            offset: offset(),
+            accounts: vec![
+                state("pr", 2.0, 0.0, "2026-11-18T12:00:00Z"),
+                state("ac", 5.0, 0.0, "2026-11-11T12:00:00Z"),
+            ],
+            active: Some("pr".to_string()),
+            rhythm: Rhythm { wu: [1.0; 168] },
+        }
+    }
+
+    fn early_regime() -> Regime {
+        Regime {
+            early: true,
+            why: RegimeWhy::Pays,
+            lazy_blocked_h: 1.0,
+            eager_blocked_h: 0.0,
+            extra_switches: 1,
+            cost_h: Some(0.1),
+        }
+    }
+
+    fn situation(inputs: Inputs) -> Situation {
+        Situation {
+            oldest_reading: inputs.now - Duration::minutes(1),
+            inputs,
+            cost: None,
+            last_switch_at: None,
+            manual_hold_until: None,
+            tied_busy: 0,
+            sessions_off: false,
         }
     }
 
@@ -480,6 +584,23 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "gui")]
+    #[test]
+    fn the_line_says_so_when_the_plan_leaves_before_the_account_is_full() {
+        let views = vec![view("pr", "PR", 20.0, false), view("ac", "AC", 10.0, true)];
+        let now = utc("2026-11-10T12:00:00Z");
+        let mut plan = plan();
+        plan.full_at
+            .insert("pr".to_string(), now + Duration::hours(3));
+        let line = line(&plan, Some("pr"), &views, &[], now)
+            .expect("a line")
+            .expect("the plan has a next account");
+        assert_eq!(
+            line, "On PR for about 2h. Then AC, before PR is full.",
+            "the eager plan leaves PR before its week fills"
+        );
+    }
+
     #[test]
     fn a_suggestion_has_the_exact_reason() {
         let views = vec![view("pr", "PR", 20.0, false), view("ac", "AC", 10.0, true)];
@@ -489,7 +610,7 @@ mod tests {
         };
         let suggestion = suggestion(
             &decision,
-            &plan(),
+            &inputs_without_a_reset(),
             Some("pr"),
             &views,
             utc("2026-11-10T12:00:00Z"),
@@ -515,7 +636,7 @@ mod tests {
         };
         let suggestion = suggestion(
             &decision,
-            &plan(),
+            &inputs_without_a_reset(),
             Some("pr"),
             &views,
             utc("2026-11-10T12:00:00Z"),
@@ -610,7 +731,7 @@ mod tests {
         };
         let error = suggestion(
             &decision,
-            &plan(),
+            &inputs_without_a_reset(),
             Some("pr"),
             &views,
             utc("2026-11-10T12:00:00Z"),
@@ -626,26 +747,62 @@ mod tests {
     #[test]
     fn an_expiring_target_adds_the_lazy_plans_percent() {
         let views = vec![view("pr", "PR", 20.0, false), view("ac", "AC", 10.0, true)];
-        let mut plan = plan();
-        plan.left_at_reset.insert("ac".to_string(), 12.4);
+        let inputs = inputs_that_leave_the_target_unused();
+        assert_eq!(
+            follow(&inputs, Policy::Lazy)
+                .left_at_reset
+                .get("ac")
+                .copied(),
+            Some(100.0),
+            "the lazy plan never uses AC before its reset"
+        );
         let decision = Decision::Switch {
             to: "ac".to_string(),
             reason: Reason::WindowOpen,
         };
-        let suggestion = suggestion(
-            &decision,
-            &plan,
-            Some("pr"),
-            &views,
-            utc("2026-11-10T12:00:00Z"),
-            offset(),
-        )
-        .expect("the text is writable")
-        .expect("a switch suggests");
+        let suggestion = suggestion(&decision, &inputs, Some("pr"), &views, inputs.now, offset())
+            .expect("the text is writable")
+            .expect("a switch suggests");
         assert!(
             suggestion
                 .text
-                .ends_with(" Staying on PR is expected to let 12 % of AC expire."),
+                .ends_with(" Staying on PR is expected to let 100 % of AC expire."),
+            "{}",
+            suggestion.text
+        );
+    }
+
+    #[test]
+    fn the_suggestion_uses_the_lazy_plan_even_when_the_assessment_is_eager() {
+        let views = vec![view("pr", "PR", 20.0, false), view("ac", "AC", 10.0, true)];
+        let inputs = inputs_that_leave_the_target_unused();
+        let early = early_regime();
+        let assessment = assess(situation(inputs.clone()), Some(&early));
+        assert_eq!(
+            assessment.plan,
+            follow(&inputs, Policy::Eager),
+            "early switching makes the assessment follow the eager plan"
+        );
+        assert_ne!(
+            assessment.plan.left_at_reset.get("ac"),
+            follow(&inputs, Policy::Lazy).left_at_reset.get("ac"),
+            "the eager plan leaves AC used, the lazy plan leaves it untouched"
+        );
+
+        let suggestion = suggestion(
+            &assessment.decision,
+            &assessment.situation.inputs,
+            Some("pr"),
+            &views,
+            inputs.now,
+            offset(),
+        )
+        .expect("the text is writable")
+        .expect("the decision switches");
+        assert!(
+            suggestion
+                .text
+                .ends_with(" Staying on PR is expected to let 100 % of AC expire."),
             "{}",
             suggestion.text
         );

@@ -629,7 +629,14 @@ impl BurnRuntime {
                         report.error = Some(error.clone());
                     }
                 } else if settings.suggest_switches {
-                    match burn_text::suggestion(&decision, plan, active, views, now, offset) {
+                    match burn_text::suggestion(
+                        &decision,
+                        &situation.inputs,
+                        active,
+                        views,
+                        now,
+                        offset,
+                    ) {
                         Ok(suggestion) => view.suggestion = suggestion,
                         Err(error) => report.error = Some(text_error(error)),
                     }
@@ -648,7 +655,14 @@ impl BurnRuntime {
                         tied_busy: *tied_busy,
                     });
                 } else if settings.suggest_switches {
-                    match burn_text::suggestion(&decision, plan, active, views, now, offset) {
+                    match burn_text::suggestion(
+                        &decision,
+                        &situation.inputs,
+                        active,
+                        views,
+                        now,
+                        offset,
+                    ) {
                         Ok(suggestion) => view.suggestion = suggestion,
                         Err(error) => report.error = Some(text_error(error)),
                     }
@@ -985,7 +999,8 @@ mod tests {
             blocked_wu: 0.0,
             switches: 1,
             left_at_reset: BTreeMap::new(),
-            full_at: BTreeMap::new(),
+            // The lazy plan's shape: PR fills when its segment ends.
+            full_at: BTreeMap::from([("pr".to_string(), now + Duration::hours(2))]),
             full_by: BTreeMap::from([
                 ("pr".to_string(), seatswap_core::burn::plan::Fill::Week),
                 ("ac".to_string(), seatswap_core::burn::plan::Fill::Window),
@@ -1160,7 +1175,9 @@ mod tests {
             .expect("a suggestion");
         assert_eq!(
             suggestion.text,
-            "Switch to AC now: its 5 h window is open and its week resets on Mon 02:00."
+            "Switch to AC now: its 5 h window is open and its week resets on Mon 02:00. \
+             Staying on PR is expected to let 16 % of AC expire.",
+            "the suggestion's staying sentence is the lazy plan's, not the followed plan's"
         );
     }
 

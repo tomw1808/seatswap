@@ -11,6 +11,7 @@ use chrono::{DateTime, Duration, FixedOffset, Utc};
 use crate::api::{Limit, LimitKind, Severity};
 use crate::transcripts::hour_start;
 
+use super::decide::Regime;
 use super::{Rates, Rhythm, HORIZON_H, MIN_DWELL_MIN, SLACK_MARGIN_H, STEP_MIN};
 
 /// A 5 h window lasts this many hours (spec §2.1).
@@ -389,6 +390,19 @@ pub fn follow(inputs: &Inputs, policy: Policy) -> Plan {
         inputs.rhythm.typical_hour(),
     )
     .plan
+}
+
+/// The plan auto-burn follows (spec §7.4): eager while early switching is on,
+/// else lazy. This is the one place the rule lives; the Forecast, the pop-up,
+/// `burn-next.json`, the status line's auto-burn segment and `status --json`'s
+/// `next` all take their plan from here.
+pub fn followed(inputs: &Inputs, regime: &Regime) -> Plan {
+    let policy = if regime.early {
+        Policy::Eager
+    } else {
+        Policy::Lazy
+    };
+    follow(inputs, policy)
 }
 
 /// One played walk: the plan, the work that was done on an account, and the
@@ -1145,6 +1159,28 @@ mod tests {
         assert_eq!(lazy.switches, 19);
         assert!((eager.blocked_wu - 0.0).abs() < EPS, "{}", eager.blocked_wu);
         assert_eq!(eager.switches, 58);
+    }
+
+    fn regime(early: bool) -> Regime {
+        Regime {
+            early,
+            why: crate::burn::decide::RegimeWhy::Pays,
+            lazy_blocked_h: 0.0,
+            eager_blocked_h: 0.0,
+            extra_switches: 0,
+            cost_h: None,
+        }
+    }
+
+    #[test]
+    fn followed_is_eager_only_when_early() {
+        let inputs = inputs();
+        let lazy = follow(&inputs, Policy::Lazy);
+        let eager = follow(&inputs, Policy::Eager);
+        assert_ne!(eager.segments, lazy.segments, "the two policies differ");
+
+        assert_eq!(followed(&inputs, &regime(true)), eager);
+        assert_eq!(followed(&inputs, &regime(false)), lazy);
     }
 
     /// The eager move of `inputs()` away from PR, `minutes` after a switch.

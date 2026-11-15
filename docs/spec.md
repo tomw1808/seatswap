@@ -477,6 +477,12 @@ no modes and no tuning settings: every threshold is a constant in the code (see 
   more urgent. The "wait for a quiet moment" rule of §2.12 applies as before. With `readSessions`
   off nothing is held back.
 
+While early switching is on, the pop-up's next line, `burn-next.json`, the status line's
+auto-burn segment and `status --json`'s `next` follow the plan auto-burn follows — the eager plan —
+and otherwise the lazy plan that switches only at 100 %. That is the same plan the Forecast shows.
+The suggestion's "Staying on …" sentence is the lazy plan's — the plan that switches only at
+100 % — not the followed plan.
+
 #### 7.4.1 The regime
 
 Once an hour seatswap plans the next 7 days twice: the **lazy** plan stays on an account until it
@@ -531,15 +537,16 @@ Times are local `HH:MM`, or `Mon HH:MM` when not today; durations are `35m`, `2h
 `1d3h`.
 
 - **The line under the switch:** `On PR until its week is full, about 2h. Then AC.`, `On AC until
-  its 5 h window is full, about 1h30m. Then LB.`, `On PR. No switch planned this week.` While
-  rates are missing: `Learning how fast AC, LB are used. Until then: switch only when full.`
+  its 5 h window is full, about 1h30m. Then LB.`, `On PR for about 2h. Then AC, before PR is full.`
+  (the plan leaves PR before it fills), `On PR. No switch planned this week.` While rates are
+  missing: `Learning how fast AC, LB are used. Until then: switch only when full.`
 - **An automatic switch** (when `notifyOnSwitch` is on): `Auto-burn: now on PR. AC is full until
   14:40.` or `Auto-burn: now on PR: its week resets on Mon 02:00.`
 - **A suggestion** (auto-burn off): `Switch to AC now: its 5 h window is open and its week resets
-  on Mon 02:00.` When the lazy plan expects more than 1 % of the target's week to be left unused
-  at its reset, it adds ` Staying on PR is expected to let 12 % of AC expire.` The pop-up shows
-  the same sentence and a [Switch] button; the desktop notification is sent once per target and
-  hour.
+  on Mon 02:00.` When the plan that switches only at 100 % — the lazy plan, not the plan auto-burn
+  follows — expects more than 1 % of the target's week to be left unused at its reset, it adds
+  ` Staying on PR is expected to let 12 % of AC expire.` The pop-up shows the same sentence and a
+  [Switch] button; the desktop notification is sent once per target and hour.
 - **The reason of a switch:** `AC is full until 14:40`, `its 5 h window is open and its week
   resets on Mon 02:00`, `its week resets on Mon 02:00`, or `no account was in use`.
 - While auto-burn is on, no suggestions are sent: it would ask for what auto-burn does anyway.
@@ -642,8 +649,9 @@ whatever this file says.
 
 Both commands only read; for an agent they follow `agentsRead` like `status` and `list`.
 
-- **`seatswap burn plan [--json]`** prints the early-switching regime and the lazy plan, read the
-  same way the tray app reads them (with no session count, so `tied_busy` is 0). The text form is
+- **`seatswap burn plan [--json]`** prints the early-switching regime and the plan auto-burn
+  follows (eager while early switching is on), read the same way the tray app reads them (with no
+  session count, so `tied_busy` is 0). The text form is
   the regime's words, then one line per segment: `Mon 08:00–Mon 10:00  AC`, or `… nothing usable`.
   `--json` prints one object with the regime (`early`, `why`, `blockedLazyH`, `blockedEagerH`,
   `extraSwitches`, `costH`), the segments (`account`, `from`, `to`; `account` is null when nothing
@@ -673,7 +681,7 @@ Both commands only read; for an agent they follow `agentsRead` like `status` and
 - `autoBurn`: `{on, pausedUntil}`, where `pausedUntil` is null when there is no pause or manual
   hold.
 - `next`: the id auto-burn would switch to (the target of a switch or a waiting switch, otherwise
-  the first account of the lazy plan other than the active one), or null.
+  the first account of the plan auto-burn follows other than the active one), or null.
 - `burnError`: a history or planner error as text, or null. When it is set, `next` is null and the
   views have no `slackHours`; the command still answers.
 
