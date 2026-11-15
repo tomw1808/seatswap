@@ -22,6 +22,9 @@ pub const FRANKFURTER_URL: &str = "https://api.frankfurter.dev/v1/latest";
 /// The server rejects a library default User-Agent with 403 "error code: 1010".
 const USER_AGENT: &str = concat!("seatswap/", env!("CARGO_PKG_VERSION"));
 const TIMEOUT: Duration = Duration::from_secs(20);
+/// models.dev's list is about 6.5 MB: the one request that may take longer than
+/// [`TIMEOUT`] on a slow line.
+const MODELS_DEV_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_ERROR_BODY_CHARS: usize = 300;
 /// The most of models.dev's list this build reads (the file is about 6.5 MB).
 const MAX_MODELS_DEV_BYTES: usize = 32 * 1024 * 1024;
@@ -69,6 +72,8 @@ impl ApiError {
 
 pub struct Api {
     agent: ureq::Agent,
+    /// models.dev and Frankfurter: redirects are not followed.
+    lookup_agent: ureq::Agent,
     usage_url: String,
     token_url: String,
     models_dev_url: String,
@@ -79,6 +84,7 @@ impl Api {
     pub fn new() -> Api {
         Api {
             agent: build_agent(),
+            lookup_agent: build_lookup_agent(),
             usage_url: USAGE_URL.to_string(),
             token_url: TOKEN_URL.to_string(),
             models_dev_url: MODELS_DEV_URL.to_string(),
@@ -90,6 +96,7 @@ impl Api {
     pub fn with_urls(usage_url: &str, token_url: &str) -> Api {
         Api {
             agent: build_agent(),
+            lookup_agent: build_lookup_agent(),
             usage_url: usage_url.to_string(),
             token_url: token_url.to_string(),
             models_dev_url: MODELS_DEV_URL.to_string(),
@@ -167,15 +174,16 @@ impl Api {
     /// [`Fetched::NotModified`]; a body over [`MAX_MODELS_DEV_BYTES`] is an error.
     pub fn models_dev(&self, etag: Option<&str>) -> Result<Fetched<Value>, ApiError> {
         let mut request = self
-            .agent
+            .lookup_agent
             .get(&self.models_dev_url)
+            .timeout(MODELS_DEV_TIMEOUT)
             .set("User-Agent", USER_AGENT);
         if let Some(etag) = etag {
             request = request.set("If-None-Match", etag);
         }
         let response = match request.call() {
             Ok(response) if response.status() == 304 => return Ok(Fetched::NotModified),
-            Ok(response) => response,
+            Ok(response) => no_redirect(response)?,
             Err(ureq::Error::Status(304, _)) => return Ok(Fetched::NotModified),
             Err(ureq::Error::Status(status, response)) => {
                 return Err(status_error(status, response))
@@ -213,8 +221,13 @@ impl Api {
             )));
         }
         let url = format!("{}?base=USD&symbols={}", self.frankfurter_url, currency);
-        let response = match self.agent.get(&url).set("User-Agent", USER_AGENT).call() {
-            Ok(response) => response,
+        let response = match self
+            .lookup_agent
+            .get(&url)
+            .set("User-Agent", USER_AGENT)
+            .call()
+        {
+            Ok(response) => no_redirect(response)?,
             Err(ureq::Error::Status(status, response)) => {
                 return Err(status_error(status, response))
             }
@@ -256,6 +269,32 @@ impl Default for Api {
 
 fn build_agent() -> ureq::Agent {
     ureq::AgentBuilder::new().timeout(TIMEOUT).build()
+}
+
+/// The agent of the two look-ups: no redirect is followed, so each request goes
+/// to the host its URL names and to no other (spec §1.4.1, "no other host is
+/// contacted"). A redirect answer is an error ([`no_redirect`]).
+fn build_lookup_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(TIMEOUT)
+        .redirects(0)
+        .build()
+}
+
+/// A look-up's answer, unless it is a redirect: that is an error naming where it
+/// pointed, and nothing is asked there.
+fn no_redirect(response: ureq::Response) -> Result<ureq::Response, ApiError> {
+    let status = response.status();
+    if (300..400).contains(&status) {
+        let location = response.header("Location").unwrap_or("nowhere").to_string();
+        return Err(ApiError::Http {
+            status,
+            body: cut_body(&format!(
+                "redirected to {location}; seatswap asks no other host"
+            )),
+        });
+    }
+    Ok(response)
 }
 
 fn read_body(response: ureq::Response) -> Result<String, ApiError> {
@@ -1488,6 +1527,39 @@ mod tests {
             let _ = sender.send(captured);
         });
         (base, receiver, handle)
+    }
+
+    #[test]
+    fn a_look_up_never_follows_a_redirect() {
+        // The redirect names another host; it must not be asked. The fake
+        // server answers once, so a followed redirect would also fail, but
+        // with a network error, not with this one.
+        let (base, receiver, handle) =
+            start_server(Reply::status(302, "").header("Location", "http://127.0.0.2:9/api.json"));
+        let error = lookup_api(&base)
+            .models_dev(None)
+            .expect_err("a redirect is an error");
+        let request = captured(&receiver, handle);
+        assert_eq!(request.path, "/api.json");
+        match error {
+            ApiError::Http { status, body } => {
+                assert_eq!(status, 302);
+                assert!(body.contains("http://127.0.0.2:9/api.json"), "{body}");
+                assert!(body.contains("asks no other host"), "{body}");
+            }
+            other => panic!("expected the redirect as an HTTP error, got {other:?}"),
+        }
+
+        let (base, receiver, handle) =
+            start_server(Reply::status(301, "").header("Location", "http://127.0.0.2:9/v1/latest"));
+        let error = lookup_api(&base)
+            .usd_rate("EUR")
+            .expect_err("a redirect is an error");
+        let _ = captured(&receiver, handle);
+        assert!(
+            matches!(error, ApiError::Http { status: 301, .. }),
+            "{error:?}"
+        );
     }
 
     #[test]
