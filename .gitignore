@@ -7,3 +7,4 @@ phase0/.tripwire.json
 *.seatswap-backup
 .flash-agents.json
 /specs
+/.claude
