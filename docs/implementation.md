@@ -87,6 +87,12 @@ pub enum Access { Private /* Unix 0600 */, Shared /* Unix 0644 */ }
 /// 200 ms, for at most 2 s, then the last OS error. Any error removes the temp file.
 pub fn write_atomic(path: &Path, bytes: &[u8], access_if_new: Access) -> io::Result<()>;
 
+/// Append `line` plus '\n' as one write to `path` (created with `access_if_new` when
+/// missing), then fsync. `line` must not contain '\n' and, with the newline, must fit
+/// in MAX_LINE_BYTES: otherwise io::ErrorKind::InvalidInput.
+pub const MAX_LINE_BYTES: usize = 4096;
+pub fn append_line(path: &Path, line: &str, access_if_new: Access) -> io::Result<()>;
+
 /// Copy `path` to `<path>.seatswap-backup` (Access::Private) unless that backup exists.
 pub fn backup_once(path: &Path) -> io::Result<bool>;
 
@@ -218,13 +224,26 @@ pub enum LoginState { Ok, LoggedOut }
 /// Settings §10 (no clearOrgCaches). Defaults: tray_text Percent, icon_limit Binding,
 /// poll_active_secs 120, poll_inactive_secs 900, suggest_at 90, suggest_target_below 50,
 /// notify_on_switch true, mirror_live true, refresh_inactive true, hotkey "Ctrl+Alt+C",
-/// start_at_login true, theme System, claude_config_dir None.
+/// start_at_login true, theme System, claude_config_dir None, history_dir None,
+/// host_name None, read_sessions true, notify_usable_again true, notify_waiting true,
+/// notify_waiting_hosts ThisHost, agents_read true, agents_switch false.
 /// `#[serde(default)]` per field so an older file without a new setting still loads.
 pub struct Settings { … }  // camelCase in the file
+// step A's fields:
+pub history_dir: Option<PathBuf>,       // None = <data>/history; a relative path is refused
+pub host_name: Option<String>,          // None = the machine's host name; validated by paths::host_name
+pub read_sessions: bool,
+pub notify_usable_again: bool,
+pub notify_waiting: bool,
+pub notify_waiting_hosts: WaitingHosts,
+pub agents_read: bool,
+pub agents_switch: bool,
+#[serde(rename_all = "camelCase")] pub enum WaitingHosts { ThisHost, AllHosts }
 pub enum TrayText { Percent, PercentReset, Off }
 pub enum IconLimit { Binding, Session, Week }
 pub enum Theme { System, Light, Dark }
-impl Settings { pub fn validate(&self) -> Result<(), StoreError>; } // percents 1..=100, polls >= 30 s
+impl Settings { pub fn validate(&self) -> Result<(), StoreError>; } // percents 1..=100, polls >= 30 s,
+// an absolute claudeConfigDir, an absolute historyDir, and a hostName that passes paths::host_name
 
 pub struct AccountsFile { pub version: u32, pub accounts: Vec<Account>, pub settings: Settings,
                           #[serde(default)] pub secrets_backend: Option<SecretsBackend> }
@@ -570,9 +589,242 @@ pub fn load_accounts(app: &AppPaths) -> Result<AccountsFile, StoreError>;
 //   "live" (NoLogin, Ended, Unknown → no active account).
 ```
 
+## paths.rs additions — step A
+
+```rust
+impl ClaudePaths {
+    pub fn sessions_dir(&self) -> PathBuf;    // <config_dir>/sessions
+    pub fn projects_dir(&self) -> PathBuf;    // <config_dir>/projects
+}
+impl AppPaths {
+    pub fn history_dir(&self) -> PathBuf;          // <data_dir>/history
+    pub fn machine_id_file(&self) -> PathBuf;      // <data_dir>/machine-id
+    pub fn transcripts_state_dir(&self) -> PathBuf; // <data_dir>/transcripts-state
+}
+/// A `historyDir` must be absolute; a relative one is PathsError::HistoryDir, never resolved
+/// against the current folder.
+pub fn check_history_dir(path: &Path) -> Result<(), PathsError>;
+/// The explicit absolute historyDir, else app.history_dir().
+pub fn history_root(explicit: Option<&Path>, app: &AppPaths) -> Result<PathBuf, PathsError>;
+/// The name this host writes its history under: `explicit` if set, else the machine's host name
+/// (Linux: /proc/sys/kernel/hostname; Windows: %COMPUTERNAME%). 1..=63 characters of
+/// [A-Za-z0-9._-], starting with a letter or a digit; anything else is PathsError::HostName.
+/// The result is always in lower case.
+pub fn host_name(explicit: Option<&str>) -> Result<String, PathsError>;
+```
+
+## history — records, folder, append, read (step A)
+
+One subfolder per host, one JSON Lines file per kind and month; nothing else opens these files.
+
+```rust
+pub enum HistoryError { Io { path, source }, Json { path, line, source }, HostTaken { host, folder, machine_id },
+                        Paths(PathsError), LineTooLong { kind }, NotFinite { kind } }
+pub enum Kind { Samples, Windows, Events, Tokens, Sessions, Up }   // stems samples windows events tokens sessions up
+pub trait Record: Serialize + DeserializeOwned { const KIND: Kind; fn at(&self) -> DateTime<Utc>; }
+
+pub struct AccountRef { pub acc: String, pub org: String }        // accountUuid and organizationUuid
+impl AccountRef { pub fn of(account: &Account) -> AccountRef; }
+pub enum Source { Poll, Statusline }
+pub struct LimitSample { pub k: LimitKind, pub m: Option<String>, pub p: f64, pub r: Option<DateTime<Utc>>, pub b: bool }
+pub struct Sample { pub t: DateTime<Utc>, #[serde(flatten)] pub account: AccountRef, pub src: Source, pub l: Vec<LimitSample> }
+pub struct WindowRecord { #[serde(flatten)] pub account: AccountRef, pub k: LimitKind, pub m: Option<String>,
+    pub start: Option<DateTime<Utc>>, pub end: DateTime<Utc>, #[serde(rename = "final")] pub final_percent: f64,
+    pub lost: Option<f64>, #[serde(rename = "lastSample")] pub last_sample: DateTime<Utc>,
+    pub plan: Option<String>, pub uncertain: bool }
+pub enum By { User, Cli, Auto, Agent, External }
+pub struct SessionCounts { pub running: u32, pub busy: u32, pub tied: u32 }
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum EventKind {
+    Switch { from, to, by, reason, cwd, sessions, waited_secs },
+    Blocked { account, k, m }, Unblocked { account, k, m }, AllBlocked, AnyUsable,
+    AccountAdded { account, plan }, AccountRemoved { account }, PlanChanged { account, from, to },
+    LoginEnded { account }, LoginRenewed { account }, Live { account },
+    AgentCall { command, cwd, allowed },
+    Waited { session, project, secs },
+}
+pub struct Event { pub t: DateTime<Utc>, #[serde(flatten)] pub kind: EventKind }
+#[serde(rename_all = "camelCase")]
+pub struct TokenRecord { pub t: DateTime<Utc>, pub session: String, pub cwd: String, pub project: ProjectKey,
+    pub model: String, #[serde(rename = "in")] pub input: u64, pub out: u64, pub cw: u64, pub cr: u64,
+    pub answers: u32, pub agent_answers: u32 }                // agentAnswers in the file
+#[serde(rename_all = "camelCase")]
+pub struct SessionRecord { pub t: DateTime<Utc>, pub session: String, pub cwd: String, pub project: ProjectKey,
+    pub entrypoint: Option<String>, pub first: DateTime<Utc>, pub last: DateTime<Utc>,
+    pub agents_started: u32, pub agents_finished: u32, pub closed: bool }  // agentsStarted, agentsFinished
+pub struct UpRecord { pub t: DateTime<Utc> }
+
+pub struct HistoryDir { /* root, host */ }
+impl HistoryDir {
+    /// Root = settings.history_dir or app.history_dir(); host = paths::host_name(settings.host_name).
+    /// Creates <root>/<host>/ and its host.json {"machineId": "<uuid>"} (the id of app.machine_id_file(),
+    /// created on first use); a host.json naming another machine is HostTaken.
+    pub fn open(app: &AppPaths, settings: &Settings) -> Result<HistoryDir, HistoryError>;
+    pub fn at(root: &Path, host: &str) -> HistoryDir;            // tests: no marker check
+    pub fn host(&self) -> &str;
+    pub fn root(&self) -> &Path;
+    pub fn hosts(&self) -> Result<Vec<String>, HistoryError>;    // subfolders holding host.json, sorted
+    pub fn append<R: Record>(&self, record: &R) -> Result<(), HistoryError>;
+    pub fn read<R: Record>(&self, range: &Range, hosts: &Hosts) -> Result<Read<R>, HistoryError>;
+}
+pub struct Range { pub from: DateTime<Utc>, pub to: DateTime<Utc> }   // from inclusive, to exclusive
+pub enum Hosts { All, One(String) }
+pub struct Hosted<R> { pub host: String, pub record: R }
+pub struct Read<R> { pub records: Vec<Hosted<R>>, pub warnings: Vec<String> }
+pub fn reset_minute(resets_at: DateTime<Utc>) -> DateTime<Utc>;       // round up to the full minute
+```
+
+Rules: a record goes to `<root>/<own host>/<stem>-YYYY-MM.jsonl` by its `at()` in UTC. A line,
+with its newline, over `atomic::MAX_LINE_BYTES` is `LineTooLong` before the folder or file is made;
+a record holding a non-finite number is `NotFinite`. Optional fields are omitted, never `null`.
+`read` opens only the month files that overlap the range, skips a torn line or a line of a shape
+this version does not know with a warning, and makes other broken lines an error only when they are
+more than 1 % of a file's lines. `Hosts::All` is every folder with a `host.json` plus this dir's own
+host, merged by `at()` and then host.
+
+```rust
+pub struct Recorder { /* dir, per-account last line and remembered limits, written windows, last up */ }
+impl Recorder {
+    pub fn new(dir: HistoryDir) -> Recorder;
+    pub fn dir(&self) -> &HistoryDir;
+    /// One usage answer: appends a Sample when a limit or a reset time differs from the account's
+    /// last written line, or that line is at least 1 h old. Before it, writes every window that
+    /// ended and every Blocked / Unblocked crossing; returns the events written. The account's
+    /// state is read from this host's files on first use.
+    pub fn reading(&mut self, account: &AccountRef, plan: Option<&str>, usage: &Usage,
+                   at: DateTime<Utc>, src: Source) -> Result<Vec<EventKind>, HistoryError>;
+    pub fn event(&self, at: DateTime<Utc>, kind: EventKind) -> Result<(), HistoryError>;
+    pub fn up(&mut self, at: DateTime<Utc>) -> Result<(), HistoryError>;   // at most once per 5 min
+    pub fn tokens(&self, records: &[TokenRecord]) -> Result<(), HistoryError>;
+    pub fn session(&self, record: &SessionRecord) -> Result<(), HistoryError>;
+}
+pub fn sample_of(account: &AccountRef, usage: &Usage, at: DateTime<Utc>, src: Source) -> Sample;
+/// A limit (matched by k and m) has ended when prev.r is Some(end) and next.t >= end, or next has
+/// the limit with next.r > end + 60 s. A limit missing from next, or with r None, ends nothing.
+/// end = prev.r, final = prev.p, lastSample = prev.t, uncertain = end - prev.t > 1 h;
+/// start = end - 7 d for weekly kinds, end - 5 h for session, None otherwise;
+/// lost = max(0, 100 - final) for weekly kinds, None otherwise.
+pub fn closed_windows(prev: &Sample, next: &Sample, plan: Option<&str>) -> Vec<WindowRecord>;
+```
+
+## project.rs — from a folder to the project's identity (step A)
+
+```rust
+#[serde(tag = "kind", content = "id", rename_all = "camelCase")]
+pub enum ProjectKey {
+    Repo(String),     // "github.com/acme/acme-kb": host/path of remote origin, lower-case host, no protocol/user/.git
+    Folder(String),   // no remote: the repository folder name; outside a repository: first folder under home, or "~"
+}
+/// Walk up from cwd to the first ancestor with .git (a folder, or a file "gitdir: <path>" as in
+/// worktrees and submodules: follow it to the config). Read [remote "origin"] url. Nothing is run.
+pub fn identify(cwd: &Path, home: &Path) -> ProjectKey;
+/// The same project for https, ssh:// and scp-like remotes; credentials before @ are dropped;
+/// file:// or a plain path gives None.
+pub fn normalize_remote(url: &str) -> Option<String>;
+/// A Windows path starting with a lower-case drive letter gets it in upper case; everything else
+/// comes back unchanged. sessions and transcripts pass every cwd they read through this.
+pub fn canonical_cwd(cwd: &str) -> String;
+```
+
+## sessions.rs — Claude Code's session files (step A)
+
+```rust
+pub enum SessionsError { Io { path, source } }
+pub enum SessionStatus { Busy, Idle, Waiting, Other(String) }
+#[serde(rename_all = "camelCase")]
+pub struct SessionFile { pub pid: u32, pub session_id: String, pub cwd: String, pub started_at: i64,
+    pub proc_start: String, pub version: Option<String>, pub kind: Option<String>,
+    pub entrypoint: Option<String>, pub name: Option<String>,
+    pub messaging_socket_path: Option<String>, pub status: SessionStatus, pub status_updated_at: i64 }
+pub trait Liveness { fn alive(&self, file: &SessionFile) -> bool; }
+/// Linux: pid exists and field 22 of /proc/<pid>/stat equals proc_start. Windows: the messaging
+/// pipe named by messaging_socket_path is in the \\.\pipe\ listing read once by new(); nothing is
+/// opened or connected to.
+pub struct SystemProbe { /* Windows: the pipe names */ }
+impl SystemProbe { pub fn new() -> std::io::Result<SystemProbe>; }
+pub fn pipe_name(messaging_socket_path: &str) -> Option<&str>;
+pub const TESTED_CLAUDE_CODE: &str = "2.1.322";
+/// Every session file whose process is alive, sorted by started_at then pid. A missing folder is
+/// an empty list. Only <digits>.json is read; an empty file and a file without status are ignored
+/// quietly; any other file that does not parse is named in skipped.
+pub fn running(claude: &ClaudePaths, probe: &dyn Liveness) -> Result<Running, SessionsError>;
+pub struct Running { pub sessions: Vec<SessionFile>, pub skipped: Vec<String> }
+pub fn newer_than_tested(version: &str) -> bool;
+```
+
+## transcripts.rs — incremental reading, answers, token records (step A)
+
+```rust
+pub enum TranscriptError { Io { path, source }, State { path, source }, Version { path, found } }
+pub struct Answer { pub session: String, pub agent: Option<String>, pub message_id: String,
+    pub at: DateTime<Utc>, pub cwd: String, pub model: String, pub input: u64, pub output: u64,
+    pub cache_write: u64, pub cache_read: u64, pub thinking: bool }
+pub struct UserTurn { pub session: String, pub at: DateTime<Utc> }
+pub struct AgentMeta { pub session: String, pub agent: String, pub agent_type: Option<String>,
+    pub description: Option<String>, pub finished: bool, pub spawn_depth: u32 }
+#[derive(Default, Serialize, Deserialize)] #[serde(rename_all = "camelCase")]
+pub struct ScanState { pub version: u32, pub files: BTreeMap<String, FileState>,
+    pub sessions: BTreeMap<String, SessionSeen> /* private: changed folders */ }
+pub struct FileState { pub offset: u64, pub grew: DateTime<Utc>, pub recent: Vec<String>,
+    pub last_answer: Option<DateTime<Utc>> }
+pub struct SessionSeen { pub folder: String, pub cwd: String, pub first: DateTime<Utc>,
+    pub last: DateTime<Utc>, pub last_model: Option<String>, pub last_user_turn: Option<DateTime<Utc>>,
+    pub thinking_since_user: u32 }
+impl ScanState {
+    pub fn load(app: &AppPaths) -> Result<ScanState, TranscriptError>;  // missing folder = default
+    /// Writes only the project folders that changed, as <folder>.json; before writing, drops the
+    /// recent ids of a file that has not grown for 24 h, and removes entries whose transcript is gone.
+    pub fn save(&mut self, claude: &ClaudePaths, app: &AppPaths, now: DateTime<Utc>)
+        -> Result<u32, TranscriptError>;
+}
+pub struct Scan { pub answers: Vec<Answer>, pub user_turns: Vec<UserTurn>, pub complete: bool,
+    pub warnings: Vec<String> }
+/// Reads what is new in <folder>/<session>.jsonl and <folder>/<session>/subagents/agent-<id>.jsonl,
+/// at most budget_bytes; only whole lines, and the offset stops after the last '\n'. A shorter file
+/// is read again from 0 (warning); its recent ids keep answers from counting twice. A file that had
+/// stopped growing and was replaced is not counted again, and the warning says so. Other line
+/// types are skipped quietly. A user line counts only as a real user message whose origin is
+/// absent or "human". An answer counts once per file by message id; "<synthetic>" is skipped.
+pub fn scan(claude: &ClaudePaths, state: &mut ScanState, budget_bytes: u64)
+    -> Result<Scan, TranscriptError>;
+pub fn agents_of(claude: &ClaudePaths, session: &str) -> Vec<AgentMeta>;
+/// One TokenRecord per (session, hour, model); an agent's answers go to its parent session and use
+/// the parent's folder when known. The group's cwd is that of its earliest answer.
+pub fn token_records(answers: &[Answer], state: &ScanState, home: &Path) -> Vec<TokenRecord>;
+```
+
+Only numbers and names leave the parser: time, folder, model, block kinds, token counts, session
+and agent ids. Message text is never stored, logged, put into a warning or sent anywhere.
+
+## engine.rs additions — usable, models in use, due at a reset (step A)
+
+```rust
+impl<R: Remote> Engine<R> {
+    pub fn with_recorder(self, recorder: Recorder) -> Self;   // every record_success also calls recorder.reading
+    pub fn recorder(&mut self) -> Option<&mut Recorder>;
+    /// The models of the running sessions (lower-case ids), or None when they are not known
+    /// (readSessions off, or the CLI).
+    pub fn set_models_in_use(&mut self, models: Option<BTreeSet<String>>);
+}
+pub enum Blocker { Week, Session, Model(String) }
+/// Why this usage blocks the account, or None. Week: weekly_all >= 100. Session: session >= 100.
+/// Model(m): a weekly_scoped limit of m >= 100 and a model in use contains m lower-cased; with
+/// models_in_use None, only while the server marks that limit active.
+pub fn blocker(usage: &Usage, models_in_use: Option<&BTreeSet<String>>) -> Option<Blocker>;
+// AccountView gains:  pub usable: bool, pub blocked_until: Option<DateTime<Utc>>
+```
+
+When several limits are at 100 %, the blocking one is chosen by the latest reset time (a limit with
+no reset wins over one with a time); on a tie Week comes before Model, Model before Session.
+`blocked_until` is that limit's reset time. `record_success` passes the account's `AccountRef` and
+plan to the recorder; a history error becomes the account's `last_error`, never a failed poll. An
+account blocked by a limit is due once 30 s after that reset whatever the interval, if its last
+success and last attempt are both before that moment. After a poll the engine writes `AllBlocked` or
+`AnyUsable` when "some account is usable" changed since the previous poll.
+
 ## app: CLI (§4)
 
-`crates/app/src/cli.rs`, clap derive. `main.rs` parses; no subcommand → tray app when built with `gui`, else help. Global options: `--claude-config-dir <DIR>` (else the `claudeConfigDir` setting, else `$CLAUDE_CONFIG_DIR`, else `~/.claude`), `--data-dir <DIR>` (else the platform folder). Every command prints errors as `seatswap: <message>` to stderr and exits 1; success exits 0.
+`crates/app/src/cli.rs`, clap derive. `main.rs` parses; no subcommand → tray app when built with `gui`, else help; from an agent (§6.6 of the spec) it is refused instead (`no_subcommand(caller)`). Global options: `--claude-config-dir <DIR>` (else the `claudeConfigDir` setting, else `$CLAUDE_CONFIG_DIR`, else `~/.claude`), `--data-dir <DIR>` (else the platform folder). Every command prints errors as `seatswap: <message>` to stderr and exits 1 (2: an unsaved current login; 3: refused for an agent); success exits 0.
 
 | Command | Does |
 |---|---|
@@ -583,7 +835,40 @@ pub fn load_accounts(app: &AppPaths) -> Result<AccountsFile, StoreError>;
 | `rm <KEY> [--yes]` | `remove_account`; without `--yes` asks "Remove AC — Acme? [y/N]" on a terminal, refuses when stdin is not a terminal. |
 | `edit <KEY> [--label L] [--abbr A] [--color #rrggbb]` | `edit_account`. |
 | `panel [main\|add\|settings]` | Asks the running tray app to open its pop-up (§ app: GUI, single instance). Not running → exit 1 "seatswap is not running". This is the hotkey on Linux v1: the person binds it in the desktop's keyboard settings (no global-shortcut crate is available). |
-| `status` | The live account in one line: `AC 97% · 1h12m` (binding limit, time to its reset; format §11: `35m`, `1h05m`, `1d18h`, beyond 48 h `Sun 02:00` — `format::format_reset_at`; reset times are rounded up to the full minute first, `format::reset_minute`). `--json` prints the views as JSON (`views` array + `active` id + `suggestion`); `--waybar` prints one JSON line `{"text":"AC 97%","tooltip":"…","class":"fine|close|critical|locked|none","percentage":97}`; `--i3blocks` prints three lines (full text, short text, colour). `--refresh` polls first (PollReason::Timer). |
+| `agent-skill install\|uninstall [--force]` | `agent_skill`: `<claude config dir>/skills/seatswap/SKILL.md` from the bundled text, through `atomic::ensure_private_dir` and `atomic::write_atomic` (0600). Install prints "already installed: <path>" when the file is identical, refuses a differing file without `--force`, else prints the path. Uninstall prints "not installed: <path>" when absent, refuses a differing file without `--force`, else prints "removed <path>" and removes the folder when it is empty. |
+| `status` | The live account in one line: `AC 97% · 1h12m` (binding limit, time to its reset; format §11: `35m`, `1h05m`, `1d18h`, beyond 48 h `Sun 02:00` — `format::format_reset_at`; reset times are rounded up to the full minute first, `format::reset_minute`). `--json` prints the views as JSON (`views` array + `active` id + `suggestion`); each view carries `usable`, the one definition of §7.2. `--waybar` prints one JSON line `{"text":"AC 97%","tooltip":"…","class":"fine|close|critical|locked|none","percentage":97}`; `--i3blocks` prints three lines (full text, short text, colour). `--refresh` polls first (PollReason::Timer). |
+
+### Agent gate and skill (step A)
+
+```rust
+pub enum Caller { Person, Agent }
+/// Agent when `CLAUDECODE` is exactly "1", or `AI_AGENT` is set and not empty. `env` is passed in,
+/// never the process's own environment.
+pub fn caller(env: &dyn Fn(&str) -> Option<String>) -> Caller;
+pub enum Gate { Allowed, Refused(&'static str) }
+pub fn gate(command: &Command, caller: Caller, settings: &Settings) -> Gate;
+pub enum SkillAction { Install { force: bool }, Uninstall { force: bool } }
+pub enum CliError { … , AgentRefused(&'static str) }   // exit code 3
+```
+
+Gate, when `caller` is `Person`: everything is `Allowed`. When `Agent`: `list` and `status` need
+`agents_read`; `use` and `next` need `agents_switch`, and never with `--save-current` or
+`--discard-current`; `add`, `rm`, `edit`, `agent-skill` and `panel` are always refused. The three
+texts are `agents may not read usage (seatswap settings → Agents)`, `agents may not switch accounts
+(seatswap settings → Agents)` and `agents may not change seatswap's accounts or settings`; a
+refusal prints `seatswap: <text>` and exits 3. The store is opened first, so the call can be
+recorded: a refused call changes no account, setting or login, and writes only its `agentCall`
+event.
+
+`command_text` names the subcommand and its positional values and flags, never free text
+(`--label`, `--abbr`, `--color`, `--save-current`'s value); every call by an agent writes
+`EventKind::AgentCall { command, cwd, allowed }`. `current_cwd` records the folder only when
+`std::env::current_dir()` and its UTF-8 name can be read; otherwise it prints a warning and records
+None, never a replaced name. A switch made by a caller `Agent` is recorded with `By::Agent` and the
+same folder; the tray always announces it with `An agent switched to {abbr} (from {cwd with ~}).` or
+`An agent switched to {abbr}.` when the folder is unknown, whatever `notifyOnSwitch` says. The
+CLI tests' `command()` removes `CLAUDECODE` and `AI_AGENT` so a developer's terminal cannot change
+a test's result.
 
 ## app: icon.rs (§8.1, §8.2) — wave 1, `gui` feature
 
@@ -643,4 +928,99 @@ Event `navigate` (payload `"main"|"add"|"settings"`) when the panel is shown for
 
 **Autostart** (`autostart.rs`, one entry point `apply_autostart(enabled, arguments)`): at start and on `save_settings`. The entry is text: a program path or folder argument that is not valid Unicode is `AutostartError::NotUnicode` on both platforms (the one `path_text`), never a path with replaced characters. Linux: `startAtLogin` on → write `autostart_file($XDG_CONFIG_HOME or ~/.config)` with `Exec=<current_exe>` via `write_atomic` (`Access::Shared`); off → remove it if present. Windows: on → the string value `seatswap` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` = `"<folder of current_exe>\seatswap-tray.exe" "<arg>" …` (each part in double quotes, `"` written `\"`, a run of backslashes before a `"` or at the end doubled); a missing `seatswap-tray.exe` (`NoTrayProgram`), a path that is not valid Unicode (`NotUnicode`) or a command over 260 UTF-16 units (`CommandTooLong`) is an error, never shortened; off → delete the value (missing is fine). `gui/registry.rs` (Windows only) is the one module that names `winreg`: `set_string`, `get_string` (tests only), `delete_value`, all under `HKEY_CURRENT_USER`.
 
-**Panel UI** (`ui/`, plain HTML/CSS/JS, no build step, `window.__TAURI__` with `app.withGlobalTauri: true`): §11.1–11.3. Views `main`, `add` (the §6.1 steps; shows the unknown live login with a label field and "Save" when there is one), `settings` (every §10 setting). Every time on the page (reset countdowns, the suggestion's clock time, the header's poll age, a card's "usage 5 min ago") is an element with `data-time` + `data-time-style` whose text comes from the command `time_texts([{at, style}]) → [text]` (`countdown` → `format_reset_at`, `clock` → `format_reset_clock`, `age` → `format_age`), asked after each render and every second, so the page has no copy of these rules. Without `window.__TAURI__` it runs on a built-in fixture snapshot so it can be opened in a browser; there `time_texts` answers with stand-ins (the plain clock time, "a moment ago").
+**Panel UI** (`ui/`, plain HTML/CSS/JS, no build step, `window.__TAURI__` with `app.withGlobalTauri: true`): §11.1–11.4. Views `main`, `add` (the §6.1 steps; shows the unknown live login with a label field and "Save" when there is one), `settings` (every §10 setting, in the groups of §11.4). The main view's footer carries the sessions line of §11.1 from `snapshot.sessions`. Every time on the page (reset countdowns, the suggestion's clock time, the header's poll age, a card's "usage 5 min ago") is an element with `data-time` + `data-time-style` whose text comes from the command `time_texts([{at, style}]) → [text]` (`countdown` → `format_reset_at`, `clock` → `format_reset_clock`, `age` → `format_age`), asked after each render and every second, so the page has no copy of these rules. Without `window.__TAURI__` it runs on a built-in fixture snapshot so it can be opened in a browser; there `time_texts` answers with stand-ins (the plain clock time, "a moment ago").
+
+## app: sessions thread (`gui/sessions_rt.rs`) — step A
+
+It runs only when `readSessions` is on: every wake asks which sessions are alive, reads the new
+parts of their transcripts, writes token and session lines to the history, then hands a
+`SessionsSummary` to the main thread and the models in use to the engine thread.
+
+```rust
+pub(crate) struct PassOutcome { pub summary: SessionsSummary, pub models: Option<BTreeSet<String>>,
+                                pub wake_soon: bool }
+pub(crate) struct SessionMemory { /* home, project per cwd, waits, last session record, closed */ }
+impl SessionMemory { pub(crate) fn new(home: PathBuf) -> SessionMemory; }
+pub(crate) struct SessionsHandle { /* stop flag, wake sender, join handle, latest summary */ }
+impl SessionsHandle {
+    pub(crate) fn latest(&self) -> Arc<Mutex<Option<SessionsSummary>>>;
+    pub(crate) fn stop(&mut self);           // also joins the thread; Drop stops it
+}
+pub(crate) fn spawn(app: AppPaths, claude: ClaudePaths, settings: Settings,
+                    ui: Sender<UiEvent>, engine: Sender<EngineCommand>) -> Result<SessionsHandle, String>;
+
+/// One wake, without the thread: the sessions, new transcript answers, token lines, session lines
+/// and waits. `state_error` is the load error that keeps this pass from saving the state; it is
+/// shown in the summary. A pass that did not finish asks for a wake in one second.
+pub(crate) fn run_pass(claude: &ClaudePaths, probe: &dyn Liveness, recorder: Option<&Recorder>,
+                       state: &mut ScanState, memory: &mut SessionMemory, now: DateTime<Utc>,
+                       state_error: Option<&str>) -> PassOutcome;
+/// run_pass, then state.save; a save failure is a warning on the summary. The thread's start is
+/// load_state(app) + SessionMemory::new(home) + one_pass, which is what the backfill test does.
+fn one_pass(app: &AppPaths, claude: &ClaudePaths, probe: &dyn Liveness, recorder: Option<&Recorder>,
+            state: &mut ScanState, memory: &mut SessionMemory, now: DateTime<Utc>,
+            state_error: Option<&str>) -> PassOutcome;
+```
+
+`WAKE` = 60 s, `AFTER_INCOMPLETE` = 1 s, `SCAN_BUDGET` = 64 MiB per pass, `RECORD_EVERY_SECS` =
+10 min: a running session's record is written when its summary changes and at most that often, and
+one closing record when it is gone. Token records are written on every pass from the answers that
+pass read (`transcripts::token_records`), so one answer is counted once even when it arrives over
+two passes. Waits are kept in memory: a wait that ended writes `EventKind::Waited { session,
+project, secs }` with the whole seconds (never 0 from a backwards clock). A session file that
+cannot be read, a count that does not fit u32, or a transcript state error is shown in
+`SessionsSummary.unavailable` / `warning`; the thread keeps running.
+
+## app: worker, ops and notifications additions — step A
+
+```rust
+// worker.rs
+pub(crate) struct SessionsSummary { pub running: u32, pub busy: u32, pub waiting: Vec<Waiting>,
+    pub unavailable: Option<String>, pub warning: Option<String> }
+pub(crate) struct Waiting { pub session: String, pub label: String, pub project: String,
+    pub since: DateTime<Utc> }
+pub(crate) struct Snapshot { … pub sessions: Option<SessionsSummary> /* None = readSessions off */ … }
+pub(crate) enum EngineCommand { Poll(PollReason), Publish, ModelsInUse(Option<BTreeSet<String>>), Shutdown }
+pub(crate) enum UiEvent { Snapshot(Snapshot), Sessions(SessionsSummary) }
+
+// ops.rs
+pub(crate) fn open_history(app: &AppPaths, settings: &Settings) -> Result<Recorder, String>;
+pub(crate) fn history_unwritable(error: &dyn std::fmt::Display) -> String;
+pub(crate) fn record_switch(recorder: &Recorder, from: Option<AccountRef>, to: AccountRef, by: By,
+    reason: Option<String>, cwd: Option<String>, sessions: Option<SessionCounts>,
+    at: DateTime<Utc>) -> Result<(), HistoryError>;
+
+// notify.rs
+pub(crate) enum Notification { Suggestion(..), LoginWarning(..), UnknownLogin { .. },
+    UsableAgain { id: String, reason: String }, AllFull { next: Option<(String, DateTime<Utc>)> },
+    Waiting(Waiting), WaitingOver { session: String } }
+impl Deduper {
+    /// All notifications that are due now: suggestions and warnings as before, plus usable again,
+    /// all full, and waits.
+    pub(crate) fn due(&mut self, snapshot: &Snapshot, now: DateTime<Utc>) -> Vec<Notification>;
+    /// When the next waiting session becomes 15 s old; `None` when none is still waiting.
+    pub(crate) fn recheck_at(&self, snapshot: &Snapshot, now: DateTime<Utc>)
+        -> Option<DateTime<Utc>>;
+}
+pub(crate) fn send_usable_again(account: &str, reason: &str, on_switch: impl FnOnce() + Send + 'static,
+    on_open: impl FnOnce() + Send + 'static);
+pub(crate) fn send_all_full(next: Option<(&str, &str)>);
+pub(crate) fn send_waiting(waiting: &Waiting, host: Option<&str>,
+    on_open: impl FnOnce() + Send + 'static) -> WaitingHandle;
+impl WaitingHandle { pub(crate) fn withdraw(self); }
+```
+
+`Notification::UsableAgain` needs `notifyUsableAgain` on, the account now usable, not active, and
+the previous snapshot naming a blocker; it is remembered by (account id, previous reset minute), so
+one per account and reset. `AllFull` only when the previous snapshot had a usable account and every
+account whose login still works is now blocked; the next is the earliest `blocked_until`. `Waiting`
+only after 15 s (`waiting.since` to `now`), once per session and wait; turning `notifyWaiting` off
+withdraws the shown ones and sends nothing new; a session that stops waiting gets `WaitingOver`,
+which withdraws its notification. The texts come from one place each: `usable_again_text` =
+`{abbr} is usable again: {reason}.`, with reason `its 5 h window reset`, `its week reset` or
+`its {model} week reset`; `all_full_text` = `All accounts are full. Next: {abbr} at {time}.` or
+`All accounts are full.`; `waiting_text` = `{label} is waiting for you ({project}, on {host}).` or,
+without a host name, `{label} is waiting for you ({project}).`. On Linux a waiting notification
+never times out and can be withdrawn; on Windows it follows the system's rules and the pop-up keeps
+the count.
+

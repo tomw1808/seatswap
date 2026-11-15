@@ -167,16 +167,7 @@ fn run(
         Ok(recorder) => (Some(recorder), None),
         Err(error) => (None, Some(error)),
     };
-    let (mut state, state_error) = match ScanState::load(&app) {
-        Ok(state) => (state, None),
-        Err(error) => (
-            ScanState::default(),
-            Some(format!(
-                "the transcript state cannot be read: {error}; delete {} to read the transcripts again",
-                app.transcripts_state_dir().display()
-            )),
-        ),
-    };
+    let (mut state, state_error) = load_state(&app);
     let mut memory = SessionMemory::new(claude.home().to_path_buf());
     let mut watch: Option<FolderWatch> = None;
     let mut last_watch_error: Option<String> = None;
@@ -206,8 +197,9 @@ fn run(
         }
 
         let now = Utc::now();
-        let mut outcome = match SystemProbe::new() {
-            Ok(probe) => run_pass(
+        let outcome = match SystemProbe::new() {
+            Ok(probe) => one_pass(
+                &app,
                 &claude,
                 &probe,
                 recorder.as_ref(),
@@ -215,6 +207,7 @@ fn run(
                 &mut memory,
                 now,
                 state_error.as_deref(),
+                history_error.as_deref(),
             ),
             Err(error) => {
                 let mut summary = SessionsSummary {
@@ -228,6 +221,17 @@ fn run(
                     &mut summary,
                     format!("running sessions cannot be read: {error}"),
                 );
+                if let Some(error) = &history_error {
+                    add_unavailable(&mut summary, error.clone());
+                }
+                save_state(
+                    &app,
+                    &claude,
+                    &mut state,
+                    now,
+                    state_error.as_deref(),
+                    &mut summary,
+                );
                 PassOutcome {
                     summary,
                     models: None,
@@ -235,17 +239,6 @@ fn run(
                 }
             }
         };
-        if let Some(error) = &history_error {
-            add_unavailable(&mut outcome.summary, error.clone());
-        }
-        if state_error.is_none() {
-            if let Err(error) = state.save(&claude, &app, now) {
-                add_unavailable(
-                    &mut outcome.summary,
-                    format!("the transcript state cannot be written: {error}"),
-                );
-            }
-        }
 
         {
             let mut shared = match latest.lock() {
@@ -274,6 +267,65 @@ fn run(
             Err(RecvTimeoutError::Disconnected) => return,
         }
     }
+}
+
+/// The transcript state at start: the files saved by the last run, or the
+/// default with the error that keeps this pass from writing it back.
+fn load_state(app: &AppPaths) -> (ScanState, Option<String>) {
+    match ScanState::load(app) {
+        Ok(state) => (state, None),
+        Err(error) => (
+            ScanState::default(),
+            Some(format!(
+                "the transcript state cannot be read: {error}; delete {} to read the transcripts again",
+                app.transcripts_state_dir().display()
+            )),
+        ),
+    }
+}
+
+/// Write what changed; a failure is a warning on the summary, never a pass
+/// that stops.
+fn save_state(
+    app: &AppPaths,
+    claude: &ClaudePaths,
+    state: &mut ScanState,
+    now: DateTime<Utc>,
+    state_error: Option<&str>,
+    summary: &mut SessionsSummary,
+) {
+    if state_error.is_some() {
+        return;
+    }
+    if let Err(error) = state.save(claude, app, now) {
+        add_unavailable(
+            summary,
+            format!("the transcript state cannot be written: {error}"),
+        );
+    }
+}
+
+/// One wake of the sessions thread: read what is new, write the history, save
+/// the state. The thread calls it with [`SystemProbe`]; the tests with a fake
+/// probe.
+#[allow(clippy::too_many_arguments)]
+fn one_pass(
+    app: &AppPaths,
+    claude: &ClaudePaths,
+    probe: &dyn Liveness,
+    recorder: Option<&Recorder>,
+    state: &mut ScanState,
+    memory: &mut SessionMemory,
+    now: DateTime<Utc>,
+    state_error: Option<&str>,
+    history_error: Option<&str>,
+) -> PassOutcome {
+    let mut outcome = run_pass(claude, probe, recorder, state, memory, now, state_error);
+    if let Some(error) = history_error {
+        add_unavailable(&mut outcome.summary, error.to_string());
+    }
+    save_state(app, claude, state, now, state_error, &mut outcome.summary);
+    outcome
 }
 
 /// One pass: running sessions, transcripts, tokens, session records, waits.
@@ -695,6 +747,44 @@ mod tests {
         value.to_string()
     }
 
+    fn transcript_line(
+        session: &str,
+        id: &str,
+        at: DateTime<Utc>,
+        cwd: &str,
+        model: &str,
+        usage: (u64, u64, u64, u64),
+    ) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "uuid": "0b6f4c1a-2d3e-4f50-8a9b-0c1d2e3f4a5b",
+            "parentUuid": "91c2a7b3-4c5d-4e6f-8a90-1b2c3d4e5f60",
+            "sessionId": session,
+            "timestamp": at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            "cwd": cwd,
+            "gitBranch": "main",
+            "isSidechain": false,
+            "requestId": format!("req_{id}"),
+            "version": "2.1.322",
+            "message": {
+                "id": id,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [{"type": "text", "text": "fix the failing tests"}],
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": usage.0,
+                    "output_tokens": usage.1,
+                    "cache_creation_input_tokens": usage.2,
+                    "cache_read_input_tokens": usage.3,
+                    "service_tier": "standard",
+                }
+            }
+        })
+        .to_string()
+    }
+
     fn write_session(claude: &ClaudePaths, pid: u32, text: &str) {
         fs::write(claude.sessions_dir().join(format!("{pid}.json")), text).unwrap();
     }
@@ -716,7 +806,7 @@ mod tests {
         fs::create_dir_all(root.join(".git")).unwrap();
         fs::write(
             root.join(".git").join("config"),
-            "[remote \"origin\"]\n\turl = https://github.com/sam/atlas.git\n",
+            format!("[remote \"origin\"]\n\turl = https://github.com/sam/{name}.git\n"),
         )
         .unwrap();
         root
@@ -1121,5 +1211,313 @@ mod tests {
         assert_eq!(lines.len(), 2, "{text}");
         let last: SessionRecord = serde_json::from_str(lines[1]).unwrap();
         assert!(last.closed);
+    }
+
+    /// The order of the pop-up's messages: the history error comes before the
+    /// state that cannot be written.
+    #[test]
+    fn a_history_error_comes_before_a_state_that_cannot_be_written() {
+        let (tmp, claude, app) = fixture();
+        let folder = claude.projects_dir().join("-home-sam-projects-atlas");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(
+            folder.join(format!("{SESSION}.jsonl")),
+            format!(
+                "{}\n",
+                transcript_line(
+                    SESSION,
+                    "msg_01QmB7xT",
+                    time("2026-11-14T09:56:00Z"),
+                    "/home/sam/projects/atlas",
+                    "claude-opus-5-5",
+                    (2_400, 260, 17_000, 31_000),
+                )
+            ),
+        )
+        .unwrap();
+        // The state loads while its folder is still a folder. The transcript
+        // above changes the state, so the save tries to write that folder.
+        let (mut state, state_error) = load_state(&app);
+        assert_eq!(state_error, None);
+        fs::write(app.transcripts_state_dir(), "not a folder").unwrap();
+
+        // A history folder that is a file cannot be opened.
+        let history_file = tmp.path().join("history-is-a-file");
+        fs::write(&history_file, "").unwrap();
+        let settings = Settings {
+            host_name: Some("atlas".to_string()),
+            history_dir: Some(history_file),
+            ..Settings::default()
+        };
+        let (recorder, history_error) = match ops::open_history(&app, &settings) {
+            Ok(recorder) => (Some(recorder), None),
+            Err(error) => (None, Some(error)),
+        };
+        assert!(recorder.is_none(), "the history folder is a file");
+        let history_error = history_error.expect("a history folder that is a file is an error");
+
+        let mut memory = SessionMemory::new(claude.home().to_path_buf());
+        let outcome = one_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            recorder.as_ref(),
+            &mut state,
+            &mut memory,
+            time("2026-11-14T10:00:00Z"),
+            state_error.as_deref(),
+            Some(history_error.as_str()),
+        );
+        let unavailable = outcome
+            .summary
+            .unavailable
+            .expect("both errors are reported");
+        assert!(
+            unavailable.starts_with(&format!(
+                "{history_error}; the transcript state cannot be written: "
+            )),
+            "{unavailable}"
+        );
+    }
+
+    /// The first start reads a projects folder it has never seen and writes one
+    /// token line per session, hour and model; a second start, from the saved
+    /// state, adds none. The data is made here: three sessions, two days, about
+    /// forty answers, two models, several answers in one hour.
+    #[test]
+    fn a_backfill_writes_each_hour_once() {
+        use chrono::Timelike;
+        use std::collections::BTreeMap;
+
+        const LEDGER: &str = "2b7d9c1e-5a4f-4c3b-9e8d-7f6a5b4c3d2e";
+        const ACME_KB: &str = "4f8a1c3e-6b2d-4a5c-9e7f-1a3b5c7d9e20";
+        const OPUS: &str = "claude-opus-5-5";
+        const SONNET: &str = "claude-sonnet-5-5";
+
+        #[derive(Debug, Default, Clone, PartialEq, Eq)]
+        struct Totals {
+            input: u64,
+            output: u64,
+            cache_write: u64,
+            cache_read: u64,
+            answers: u32,
+        }
+
+        impl Totals {
+            fn add(&mut self, usage: (u64, u64, u64, u64)) {
+                self.input += usage.0;
+                self.output += usage.1;
+                self.cache_write += usage.2;
+                self.cache_read += usage.3;
+                self.answers += 1;
+            }
+        }
+
+        fn start_of_hour(at: DateTime<Utc>) -> DateTime<Utc> {
+            at - chrono::Duration::minutes(i64::from(at.minute()))
+                - chrono::Duration::seconds(i64::from(at.second()))
+                - chrono::Duration::nanoseconds(i64::from(at.nanosecond()))
+        }
+
+        fn project_folder(cwd: &Path) -> String {
+            cwd.to_string_lossy()
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect()
+        }
+
+        fn files_under(root: &Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
+            let mut files = BTreeMap::new();
+            let mut folders = vec![root.to_path_buf()];
+            while let Some(folder) = folders.pop() {
+                let entries = match fs::read_dir(&folder) {
+                    Ok(entries) => entries,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => panic!("{}: {error}", folder.display()),
+                };
+                for entry in entries {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        folders.push(path);
+                    } else {
+                        files.insert(path.clone(), fs::read(&path).unwrap());
+                    }
+                }
+            }
+            files
+        }
+
+        fn token_lines(root: &Path) -> usize {
+            files_under(root)
+                .iter()
+                .filter(|(path, _)| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("tokens-") && name.ends_with(".jsonl"))
+                })
+                .map(|(_, bytes)| bytes.iter().filter(|byte| **byte == b'\n').count())
+                .sum()
+        }
+
+        let (tmp, claude, app) = fixture();
+        let mut cwds = HashMap::new();
+        for name in ["atlas", "ledger", "acme-kb"] {
+            cwds.insert(name, repo(tmp.path(), name));
+        }
+
+        // (project, session, first answer, model, answers in that hour)
+        let groups: [(&str, &str, &str, &str, u32); 15] = [
+            ("atlas", SESSION, "2026-11-12T09:10:00Z", OPUS, 3),
+            ("atlas", SESSION, "2026-11-12T09:30:00Z", SONNET, 2),
+            ("atlas", SESSION, "2026-11-12T10:05:00Z", OPUS, 2),
+            ("atlas", SESSION, "2026-11-12T14:20:00Z", SONNET, 3),
+            ("atlas", SESSION, "2026-11-13T08:10:00Z", OPUS, 4),
+            ("atlas", SESSION, "2026-11-13T09:15:00Z", SONNET, 3),
+            ("atlas", SESSION, "2026-11-13T12:30:00Z", OPUS, 3),
+            ("ledger", LEDGER, "2026-11-12T11:05:00Z", OPUS, 4),
+            ("ledger", LEDGER, "2026-11-12T13:20:00Z", SONNET, 3),
+            ("ledger", LEDGER, "2026-11-13T10:10:00Z", SONNET, 3),
+            ("ledger", LEDGER, "2026-11-13T11:40:00Z", OPUS, 4),
+            ("acme-kb", ACME_KB, "2026-11-12T09:05:00Z", SONNET, 2),
+            ("acme-kb", ACME_KB, "2026-11-12T16:20:00Z", OPUS, 3),
+            ("acme-kb", ACME_KB, "2026-11-13T08:40:00Z", OPUS, 4),
+            ("acme-kb", ACME_KB, "2026-11-13T09:50:00Z", SONNET, 3),
+        ];
+
+        let mut lines: HashMap<&str, Vec<String>> = HashMap::new();
+        let mut expected: BTreeMap<(String, DateTime<Utc>, String), Totals> = BTreeMap::new();
+        let mut per_session: BTreeMap<String, Totals> = BTreeMap::new();
+        let mut sequence = 0u32;
+        for (project, session, start, model, count) in groups {
+            let cwd = cwds[project].to_str().unwrap().to_string();
+            for answer in 0..count {
+                let at = time(start) + chrono::Duration::minutes(i64::from(answer) * 3);
+                // Input in the thousands, cache reads in the tens of thousands,
+                // output in the hundreds.
+                let usage = (
+                    2_400 + u64::from(sequence) * 91,
+                    260 + u64::from(sequence) * 7,
+                    17_000 + u64::from(sequence) * 173,
+                    31_000 + u64::from(sequence) * 257,
+                );
+                expected
+                    .entry((session.to_string(), start_of_hour(at), model.to_string()))
+                    .or_default()
+                    .add(usage);
+                per_session
+                    .entry(session.to_string())
+                    .or_default()
+                    .add(usage);
+                lines.entry(session).or_default().push(transcript_line(
+                    session,
+                    &format!("msg_{sequence:04}"),
+                    at,
+                    &cwd,
+                    model,
+                    usage,
+                ));
+                sequence += 1;
+            }
+        }
+        assert_eq!(sequence, 46, "the backfill has about forty answers");
+
+        for (session, session_lines) in &lines {
+            let cwd = groups
+                .iter()
+                .find(|group| group.1 == *session)
+                .map(|group| &cwds[group.0])
+                .unwrap();
+            let folder = claude.projects_dir().join(project_folder(cwd));
+            fs::create_dir_all(&folder).unwrap();
+            fs::write(
+                folder.join(format!("{session}.jsonl")),
+                format!("{}\n", session_lines.join("\n")),
+            )
+            .unwrap();
+        }
+
+        let history_root = tmp.path().join("history");
+        let history_dir = history(&history_root);
+        let first_now = time("2026-11-13T13:00:00Z");
+        let (mut state, state_error) = load_state(&app);
+        let mut memory = SessionMemory::new(claude.home().to_path_buf());
+        let recorder = Recorder::new(history(&history_root));
+        let outcome = one_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            first_now,
+            state_error.as_deref(),
+            None,
+        );
+        assert_eq!(outcome.summary.unavailable, None);
+        assert_eq!(outcome.summary.warning, None);
+        assert_eq!(outcome.summary.running, 0);
+        assert_eq!(
+            token_lines(&history_root),
+            expected.len(),
+            "one token line per session, hour and model"
+        );
+
+        let read = history_dir
+            .read::<seatswap_core::history::TokenRecord>(
+                &Range {
+                    from: time("2026-11-01T00:00:00Z"),
+                    to: time("2026-12-01T00:00:00Z"),
+                },
+                &Hosts::One("atlas".to_string()),
+            )
+            .unwrap();
+        assert_eq!(read.warnings, Vec::<String>::new());
+        assert_eq!(read.records.len(), expected.len());
+        let mut seen = HashSet::new();
+        let mut got_per_session: BTreeMap<String, Totals> = BTreeMap::new();
+        for hosted in &read.records {
+            let record = &hosted.record;
+            let key = (record.session.clone(), record.t, record.model.clone());
+            let want = expected
+                .get(&key)
+                .unwrap_or_else(|| panic!("a token line for {key:?} that has no answers"));
+            assert!(seen.insert(key.clone()), "two token lines for {key:?}");
+            assert_eq!(record.input, want.input, "{key:?} input");
+            assert_eq!(record.out, want.output, "{key:?} output");
+            assert_eq!(record.cw, want.cache_write, "{key:?} cache write");
+            assert_eq!(record.cr, want.cache_read, "{key:?} cache read");
+            assert_eq!(record.answers, want.answers, "{key:?} answers");
+            assert_eq!(record.agent_answers, 0);
+            let total = got_per_session.entry(record.session.clone()).or_default();
+            total.input += record.input;
+            total.output += record.out;
+            total.cache_write += record.cw;
+            total.cache_read += record.cr;
+            total.answers += record.answers;
+        }
+        assert_eq!(seen.len(), expected.len());
+        assert_eq!(got_per_session, per_session);
+
+        let before = files_under(&history_root);
+        let (mut state, state_error) = load_state(&app);
+        let mut memory = SessionMemory::new(claude.home().to_path_buf());
+        let recorder = Recorder::new(history(&history_root));
+        let outcome = one_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            time("2026-11-13T14:00:00Z"),
+            state_error.as_deref(),
+            None,
+        );
+        assert_eq!(outcome.summary.unavailable, None);
+        assert_eq!(
+            files_under(&history_root),
+            before,
+            "a second start adds no line to any history file"
+        );
     }
 }

@@ -241,6 +241,14 @@ They use the `keyring` crate, with service `seatswap` and the account `id` as th
 
 **Usage cache.** `usage-cache.json` holds the last response per account and when it was fetched. The pop-up opens at once from the cache and refreshes in the background.
 
+**History.** seatswap keeps what it saw and did in a folder of its own: `<data folder>/history` (`historyDir` names another one). Every host writes only into its own subfolder `<host>/`, and only appends, so several hosts can share one synced folder without producing a conflict. `<host>/host.json` holds the id of the machine that writes there; when it names another machine, seatswap refuses to write into that subfolder and says why.
+
+The history has six kinds of file, one JSON object per line, one file per month and kind: `samples-YYYY-MM.jsonl` (one usage answer per account, when a number or a reset time changed, and at least once an hour while the app runs), `windows-YYYY-MM.jsonl` (a window that ended), `events-YYYY-MM.jsonl` (a switch; a limit crossing 100 %, as `blocked`, `unblocked`, `allBlocked` or `anyUsable`; `live`; an `agentCall`; a wait), `tokens-YYYY-MM.jsonl` (what the sessions used, one line per session, hour and model), `sessions-YYYY-MM.jsonl` (a session's summary when it changes and when it closes), and `up-YYYY-MM.jsonl` (at most one line per 5 minutes while seatswap runs on this host). The account and login events (`accountAdded`, `accountRemoved`, `planChanged`, `loginEnded`, `loginRenewed`) are defined but nothing writes them yet.
+
+A line is at most 4096 bytes; a longer record is an error, never cut. Times are UTC, RFC 3339; a reset time is rounded up to the full minute before it is stored. An account is named by `acc` (its `accountUuid`) and `org` (its `organizationUuid`), never by seatswap's local account id. A token line carries the project's identity as it was found at that moment, so it stays right after a folder is moved or its transcript is deleted.
+
+Appending is one write of the whole line plus an fsync (`atomic::append_line`). Reading opens only the month files that overlap the asked range and merges the hosts in time order. A torn last line, or a line of a shape this version does not know, is skipped and named in a warning, never guessed.
+
 ---
 
 ## 6. Behaviour
@@ -354,6 +362,26 @@ Not tried yet *(Phase 0)*:
 
 There is no special handling for an "old account written back" event. If the live login ever changes to another known account, whatever the cause, the rule in §6.4 covers it: the tray follows.
 
+### 6.6 Agents
+
+Every command Claude Code runs carries `CLAUDECODE=1` in its environment; an agent call also carries `AI_AGENT` (for example `claude-code_2-1-322_agent`). seatswap treats a call as an agent call when `CLAUDECODE` is exactly `1`, or `AI_AGENT` is set and not empty. A person's terminal has neither.
+
+Two settings decide what an agent may do. `agentsRead` (on by default) lets agents run `list` and `status`, also with `--json`, `--refresh`, `--waybar` or `--i3blocks`. `agentsSwitch` (off by default) lets agents run `use <account>` and `next` without `--save-current` or `--discard-current`. `add`, `rm`, `edit`, `agent-skill`, `panel`, `use` or `next` with one of those two flags, and `seatswap` without a subcommand (which starts the tray app) can never be run by an agent, whatever the settings.
+
+| Command | Agent may run it when |
+|---|---|
+| `list`, `status` | `agentsRead` is on; otherwise refused with `agents may not read usage (seatswap settings → Agents)` |
+| `use`, `next` without `--save-current` / `--discard-current` | `agentsSwitch` is on; otherwise refused with `agents may not switch accounts (seatswap settings → Agents)` |
+| `use` or `next` with one of those flags; `add`, `rm`, `edit`, `agent-skill`, `panel`; no subcommand | never; refused with `agents may not change seatswap's accounts or settings` (no subcommand is recorded as `(no subcommand)`) |
+
+A refused call prints `seatswap: <text>` to stderr and exits with code 3; nothing is half done. Every call by an agent writes an `agentCall` event with the subcommand and its flags (without free-text values, e.g. `use PR` or `status --json --refresh`), the folder it was called from, and whether it was allowed. A switch by an agent is written with `by: agent` and the folder, and the tray always announces it: `An agent switched to PR (from ~/projects/atlas).` — or `An agent switched to PR.` when the folder is not known — whatever `notifyOnSwitch` says.
+
+`seatswap agent-skill install` writes `<Claude config folder>/skills/seatswap/SKILL.md` from the bundled text; it refuses to overwrite a file that differs from it unless `--force`, and prints the path. `seatswap agent-skill uninstall` removes that file (with `--force` if it differs) and the `seatswap` folder when it is empty. Nothing else writes into Claude Code's config folder.
+
+What the settings page says about the two switches:
+
+> These two switches work through a marker that Claude Code puts on every command it runs. An agent runs as you. It can remove the marker, or change seatswap's files directly. The switches stop agents that follow the rules. They are not a lock. To block the command itself, add a deny rule for `seatswap` to Claude Code's permissions.
+
 ---
 
 ## 7. Usage
@@ -367,6 +395,7 @@ There is no special handling for an "old account written back" event. If the liv
 
 - On an HTTP 429 or 5xx, back off exponentially up to 30 min and show the time of the last fetch.
 - On a 401: for the active account, read the live file again (Claude Code may have renewed it). For an inactive account, refresh (§6.3).
+- An account that a limit blocks is polled once 30 s after that limit's reset time, whatever its interval, so a notification does not wait for the 15-minute poll of inactive accounts.
 - No polling while the machine sleeps. Poll once on wake.
 
 ### 7.2 What the app derives from the response
@@ -377,6 +406,8 @@ For each account it shows:
 - One rule for every reset shown (pop-up, tray menu, CLI): under 24 h hours and minutes, 24–48 h days and hours, beyond 48 h weekday and clock time. Minutes round up, and a reset time is shown rounded up to the full minute: the server sends a moment just before the boundary (`00:59:59.59`), which is meant as `01:00`.
 - **Week, scoped:** one row per scoped weekly limit (e.g. Fable), percentage only.
 - **Binding limit:** the one with `is_active: true`, or else the highest percentage. This drives the tray icon.
+- **Usable:** the login works, the usage is known, and no limit blocks the account. The week is below 100 %, the 5 h session below 100 %, and a per-model weekly limit below 100 % while a running session uses that model. A per-model limit at 100 % blocks the account only while a session on that model is open (busy or idle); with `readSessions` off, it blocks only while the server marks it as the binding one.
+- **Which limit blocks:** when several limits are at 100 %, the one with the latest reset time is named; one without a reset time comes before one with a time. On a tie the week comes before a model, and a model before the 5 h session.
 - **Extra usage / spend:** only if enabled.
 
 ### 7.3 Colours by load
@@ -394,6 +425,13 @@ For each account it shows:
 - If the platform's notifications don't support actions, clicking the notification opens the pop-up.
 - A click on the notification's text opens the pop-up. A notification that times out or is dismissed does nothing.
 - One notification per account per reset window.
+
+### 7.5 Notifications about limits and waiting
+
+- **Usable again.** When an account that a limit blocked is usable again and is not the active account, seatswap sends `PR is usable again: its 5 h window reset.` The reason is `its 5 h window reset`, `its week reset` or `its {model} week reset`. It is sent at most once per account and reset minute, and only while `notifyUsableAgain` is on. The poll 30 s after the reset time (§7.1) is what makes it timely.
+- **All accounts are full.** When the last usable account fills up, seatswap sends `All accounts are full. Next: AC at 14:40.` once; without a next reset time it is `All accounts are full.` Only accounts whose login still works count.
+- **Waiting for you.** A session that is still waiting 15 s after it entered `waiting` sends `acme-kb-dd is waiting for you (acme-kb, on atlas).` The label is the session's name, or `<project>-<first two hex digits of the session id>` when the session has no name. The host part is left out when this host's name cannot be read: `acme-kb-dd is waiting for you (acme-kb).` It is sent once per session and wait, and only while `notifyWaiting` is on. When the session stops waiting, its notification is withdrawn.
+- A waiting notification does not time out where the desktop allows that (Linux). On Windows it follows the system's rules; the pop-up keeps the count either way. A click opens the pop-up.
 
 ---
 
@@ -510,6 +548,14 @@ They give real click handling and exact placement on those desktops. They're not
 | `startAtLogin` | on | Linux: `~/.config/autostart/seatswap.desktop`; Windows: the `Run` key value `seatswap` → `seatswap-tray.exe` (§9.4) |
 | `theme` | system | system · light · dark |
 | `claudeConfigDir` | `$CLAUDE_CONFIG_DIR` or `~/.claude` | |
+| `historyDir` | `null` (`<data folder>/history`) | text, an absolute folder; point it at a synced folder to share the history with other hosts |
+| `hostName` | `null` (the machine's host name) | text, 1–63 characters of `A–Z a–z 0–9 . _ -` that must start with a letter or a digit, stored in lower case; the name this host writes its history under |
+| `readSessions` | on | read Claude Code's session files and transcripts: model, busy or idle, waits and tokens per folder. Message text is never stored |
+| `notifyUsableAgain` | on | the "usable again" notification (§7.5) |
+| `notifyWaiting` | on | the "waiting for you" notification (§7.5) |
+| `notifyWaitingHosts` | `thisHost` | `thisHost` · `allHosts`: whose waiting sessions notify; only this host's are known yet |
+| `agentsRead` | on | agents may run `list` and `status` (§6.6) |
+| `agentsSwitch` | off | agents may run `use` and `next` (§6.6) |
 
 ---
 
@@ -536,6 +582,8 @@ The target is somewhere between the macOS Control Centre and Raycast: one floati
 - **Motion:** after a switch, the cards trade places with a 250 ms spring animation. The ticking reset countdowns ("1h12m") update every minute without flicker. All animation is off when the system asks for reduced motion.
 - **Keyboard:** ↑/↓ moves between accounts, Enter switches, 1–9 switch directly, `,` opens settings, Esc closes. The cursor (a blue ring) appears only with the first ↑/↓, starting from the account in use, and is gone again each time the pop-up opens; until then Enter does nothing. Clicking a card does not move it.
 
+**Sessions line.** In the footer next to "+ Add account" the pop-up reads `9 sessions · 2 busy` (the mock-up shows it without a waiting session), and while someone waits ` · 1 waiting for you` in the warning colour. With `readSessions` off there is no line. When the session files cannot be read, their reason stands there muted instead; a newer Claude Code adds a small ⚠ whose tooltip is the warning text. The numbers do not depend on the pop-up being open.
+
 ### 11.2 Mock-up
 
 ```
@@ -555,7 +603,7 @@ The target is somewhere between the macOS Control Centre and Raycast: one floati
 │                                                      │
 │  ⚠ AC is almost out. P has room — switch?   [Switch] │
 │                                                      │
-│  + Add account                       3 sessions open │
+│  + Add account                   3 sessions · 1 busy │
 ╰──────────────────────────────────────────────────────╯
 ```
 
@@ -567,6 +615,15 @@ The ✎ shows while the pointer is on the card or the card has the keyboard focu
 - Abbreviation: two boxes, live preview of the tray icon at 16, 22 and 32 px.
 - Colour: 10 preset swatches plus a custom hex value.
 - "Remove account", which asks first. It deletes the account from the keyring and list. The live login is never touched.
+
+### 11.4 Settings view
+
+The gear opens the settings in the same card, in the same style, with the existing setting rows:
+
+- **History.** "Name of this host" (text; empty = the machine's name), "History folder" (text; empty = seatswap's own folder), "Read Claude Code's session files" (switch; sub-text "model, busy or idle, tokens per folder · never message text").
+  - Note under the group: "Takes effect after restarting seatswap."
+- **Notifications.** "An account is usable again" (switch), "A session is waiting for you" (switch).
+- **Agents.** "Agents may read usage" (switch), "Agents may switch accounts" (switch), and under them the text of §6.6.
 
 ---
 

@@ -6,6 +6,19 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- A history of every usage reading, finished window, switch and agent call, plus the tokens each
+  session used per project and hour, in an append-only folder that several hosts can share.
+- The pop-up shows the running Claude Code sessions: how many run, how many are busy, and how
+  many are waiting for you.
+- Notifications "usable again", "all accounts are full" and "waiting for you".
+- Settings for agents ("Agents may read usage", "Agents may switch accounts") and
+  `seatswap agent-skill install|uninstall`.
+- `usable` in `seatswap status --json`: whether an account can be used right now.
+
+### Changed
+- A per-model limit blocks an account only while a session on that model is open.
+
 ### Fixed
 - `seatswap status --help` names the fields of the JSON output as they are: `views`, `active`
   and `suggestion`. It said "the active id", which is not a field.

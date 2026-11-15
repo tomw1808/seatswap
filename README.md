@@ -39,6 +39,17 @@ read or write that yet.
   until each one resets.
 - **Switch suggestion.** When the active account passes 90 % and another one is under 50 %, the
   pop-up (and a desktop notification) offers the switch.
+- **History.** Every usage reading, finished window, switch and agent call is kept in an
+  append-only history folder, one JSON Lines file per month and kind, with tokens per project and
+  hour. Several hosts can share it through a synced folder; each writes only its own subfolder.
+- **Running sessions in the pop-up.** seatswap reads Claude Code's session files and transcripts
+  and shows how many sessions run, how many are busy, and how many are waiting for you. Only
+  numbers and names leave the transcripts: model, token counts, folder, session id; never message
+  text.
+- **Notifications that matter.** When a blocked account is usable again, when the last usable
+  account fills up, or when a session has waited for you for 15 s.
+- **Agent settings.** Two switches decide whether agents may read usage and may switch accounts;
+  `seatswap agent-skill install` adds a skill that tells them how.
 - **Logins kept fresh.** Stored logins of inactive accounts are refreshed before they expire, and
   the app warns a few days before an account needs a new `/login`.
 - **Safe with running sessions.** It takes the same lock files Claude Code uses, so a switch never
@@ -137,6 +148,7 @@ seatswap edit <account> [--label TEXT] [--abbr XY] [--color '#rrggbb']
 seatswap rm <account>           remove an account and its stored login
 seatswap status [--json | --waybar | --i3blocks] [--refresh]
 seatswap panel [main|add|settings]   open the running app's pop-up
+seatswap agent-skill install|uninstall [--force]   add or remove the skill for agents
 ```
 
 Every command takes `--claude-config-dir DIR` (default: the setting, then `$CLAUDE_CONFIG_DIR`,
