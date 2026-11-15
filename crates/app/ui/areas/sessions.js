@@ -12,6 +12,7 @@ import {
   contrastText,
   errorMessage,
   h,
+  isActiveView,
   isObject,
   money,
   tokens,
@@ -172,6 +173,14 @@ function modelName(model) {
   return `${match[1].charAt(0).toUpperCase()}${match[1].slice(1)} ${match[2]}.${match[3]}`;
 }
 
+// "A and B"; three or more: "A, B and C".
+function nameList(names) {
+  if (names.length === 0) return "";
+  if (names.length === 1) return names[0];
+  if (names.length === 2) return `${names[0]} and ${names[1]}`;
+  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+}
+
 function projectKey(id) {
   if (!isObject(id)) return "";
   return `${id.kind || ""}\u0000${id.id || ""}\u0000${id.host || ""}`;
@@ -222,7 +231,9 @@ function validEffect(effect) {
     isObject(effect) &&
     ["losesThinking", "losesThinkingBusy", "resend", "free"].every((key) =>
       Number.isFinite(effect[key])
-    )
+    ) &&
+    Array.isArray(effect.losesThinkingModels) &&
+    effect.losesThinkingModels.every((model) => typeof model === "string")
   );
 }
 
@@ -273,6 +284,18 @@ function isClosed(row) {
   return statusName(row) === "closed";
 }
 
+// A row whose status the view knows is not a live one: a stale host's report
+// says `{other: "no report"}`. The page reads that status; it never judges the
+// report's age itself.
+function isReported(row) {
+  return statusName(row) !== "other";
+}
+
+// A session that counts as running: listed, not closed, and with a live status.
+function isRunning(row) {
+  return !isClosed(row) && isReported(row);
+}
+
 function otherHostStale(row) {
   const view = state.view;
   if (!view || !Array.isArray(view.hosts)) return null;
@@ -290,16 +313,21 @@ function amountText(amount, currency) {
 }
 
 function valueText(values, kind, viewCurrency) {
-  if (!isObject(values)) return { text: "", title: "the view has no value for this row" };
+  if (!isObject(values)) {
+    return { text: "—", title: "the view has no value for this row" };
+  }
   const api = kind === "api";
   const amount = api ? values.api : values.subscription;
   const missing = api ? values.apiMissing : values.subscriptionMissing;
   const currency = api ? values.apiCurrency : values.currency;
   if (amount === null || amount === undefined) {
-    return { text: "", title: missing || "the value is missing without a reason" };
+    return {
+      text: "—",
+      title: missing || "the value is missing without a reason",
+    };
   }
   let text = amountText(amount, currency || viewCurrency);
-  if (api && currency && currency !== viewCurrency) text += ` ${currency}`;
+  if (currency && currency !== viewCurrency) text += ` ${currency}`;
   return { text, title: typeof missing === "string" ? missing : "" };
 }
 
@@ -954,6 +982,11 @@ function renderHeadLines() {
       }
       for (const host of view.hosts) {
         if (host.this) continue;
+        if (host.stale) {
+          appendText(state.liveHost, ` · ${host.host}: no report since `);
+          state.liveHost.appendChild(timeNode(host.at, "dayClock"));
+          continue;
+        }
         appendText(state.liveHost, ` · ${host.host}: as of `);
         state.liveHost.appendChild(timeNode(host.at, "age"));
       }
@@ -975,28 +1008,25 @@ function renderHeadLines() {
   state.linkHost.textContent = state.linkMessage || "";
 }
 
+// The account in use comes from the snapshot, by the pop-up's rule.
+function accountInUse() {
+  const snapshot = state.snapshot;
+  if (!isObject(snapshot) || !Array.isArray(snapshot.views)) return null;
+  return snapshot.views.find((view) => isActiveView(view, snapshot)) || null;
+}
+
 function accountNode() {
-  const inUse = state.view.inUse;
-  if (!inUse) {
+  const account = accountInUse();
+  if (!account) {
     if (state.accountKey === "none" && state.accountValue) return state.accountValue;
     state.accountKey = "none";
     state.accountValue = h("span", { class: "mf" }, "no account in use");
     return state.accountValue;
   }
-  const snapshot = state.snapshot || {};
-  const rows = Array.isArray(snapshot.accounts)
-    ? snapshot.accounts
-    : Array.isArray(snapshot.views)
-      ? snapshot.views
-      : [];
-  const account = rows.find((row) => isObject(row) && row.id === inUse) || null;
-  const key = JSON.stringify([inUse, account]);
+  const key = JSON.stringify(account);
   if (state.accountKey === key && state.accountValue) return state.accountValue;
   state.accountKey = key;
-  if (!account) {
-    state.accountValue = h("span", { class: "mf" }, inUse);
-    return state.accountValue;
-  }
+  const inUse = typeof account.id === "string" ? account.id : "";
   const color = typeof account.color === "string" ? account.color : TRAY_GREY;
   const chip = h(
     "span",
@@ -1049,7 +1079,7 @@ function renderKpis() {
   if (!state.kpiHost || !state.view) return;
   const view = state.view;
   const all = sumFor("all");
-  const running = view.sessions.filter((row) => !isClosed(row));
+  const running = view.sessions.filter(isRunning);
   const busy = running.filter((row) => statusName(row) === "busy");
   const waiting = running.filter((row) => statusName(row) === "waiting");
   const hosts = new Set(running.map((row) => row.host).filter(Boolean));
@@ -1120,8 +1150,9 @@ function renderKpis() {
 // ---------------------------------------------------------------------------
 
 function groupSubText(rows) {
-  const running = rows.filter((row) => !isClosed(row));
-  const closed = rows.length - running.length;
+  const running = rows.filter(isRunning);
+  const closed = rows.filter(isClosed).length;
+  const unreported = rows.filter((row) => !isReported(row)).length;
   const busy = running.filter((row) => statusName(row) === "busy").length;
   const waiting = running.filter((row) => statusName(row) === "waiting").length;
   const agents = running.reduce(
@@ -1131,7 +1162,8 @@ function groupSubText(rows) {
   const parts = [];
   if (running.length) parts.push(plural(running.length, "session", "sessions"));
   if (closed) parts.push(`${closed} closed`);
-  if (!running.length && !closed) parts.push("0 sessions");
+  if (unreported) parts.push(`${unreported} without a report`);
+  if (!running.length && !closed && !unreported) parts.push("0 sessions");
   if (busy) parts.push(`${busy} busy`);
   if (waiting) parts.push(`${waiting} waiting for you`);
   if (agents) parts.push(`${plural(agents, "agent", "agents")} running`);
@@ -1147,14 +1179,14 @@ function modelSubText(rows, model, sampleRows) {
   if (rowsForText.length === 0) {
     throw new Error(`the model group ${String(model)} has no row`);
   }
-  const running = rows.filter((row) => !isClosed(row));
+  const running = rows.filter(isRunning);
   const provider = rowsForText[0].provider;
   const parts =
     model === null
       ? ["no answers yet", plural(running.length, "session", "sessions")]
       : [provider, modelName(model), plural(running.length, "session", "sessions")];
   if (model !== null) {
-    const tied = rowsForText.some((row) => !isClosed(row) && row.tied);
+    const tied = rowsForText.some((row) => isReported(row) && row.tied === true);
     parts.push(tied ? "thinking tied to the account" : "thinking survives a switch");
   }
   return parts.join(" · ");
@@ -1982,11 +2014,11 @@ function modelCard() {
   );
   for (const group of groups) {
     const model = group[0].model;
-    const running = group.filter((row) => !isClosed(row));
+    const running = group.filter(isRunning);
     const busy = running.filter((row) => statusName(row) === "busy").length;
     const sum = sumFor("model", model);
     const last = sum ? sum.lastHour.out : null;
-    const dot = group.some((row) => row.tied)
+    const dot = group.some((row) => isReported(row) && row.tied === true)
       ? h("span", {
           class: "sess-tied-dot",
           title: "Thinking tied to the account",
@@ -2003,7 +2035,7 @@ function modelCard() {
       ])
     );
   }
-  if (rows.some((row) => row.tied)) {
+  if (rows.some((row) => isReported(row) && row.tied === true)) {
     body.appendChild(
       h("p", { class: "sess-card-note mf" }, [
         h("span", { class: "sess-tied-dot" }),
@@ -2029,7 +2061,13 @@ function switchCard() {
     list.appendChild(item);
   };
   if (loses > 0) {
-    let rest = " on Fable 5.2 and Sonnet 5.5 would work without their earlier thinking.";
+    const models = effect.losesThinkingModels;
+    if (models.length === 0) {
+      throw new Error(
+        "switchEffect.losesThinkingModels is empty while losesThinking is not"
+      );
+    }
+    let rest = ` on ${nameList(models.map(modelName))} would work without their earlier thinking.`;
     if (busy > 0) rest += ` ${busy} of them ${busy === 1 ? "is" : "are"} busy.`;
     line(plural(loses, "session", "sessions"), rest);
   }
@@ -2040,7 +2078,10 @@ function switchCard() {
     );
   }
   if (free > 0) {
-    line(plural(free, "session", "sessions"), " pay nothing: idle for hours.");
+    line(
+      plural(free, "session", "sessions"),
+      " pay nothing: idle for an hour or longer, or without an answer yet."
+    );
   }
   if (list.childNodes.length === 0) {
     const item = h("li", {});
@@ -2146,19 +2187,19 @@ function renderSide() {
   const rows = state.view.sessions;
   const models = groupsOf(rows, (row) => modelKey(row.model)).map((group) => {
     const model = group[0].model;
-    const running = group.filter((row) => !isClosed(row));
+    const running = group.filter(isRunning);
     const sum = sumFor("model", model);
     return [
       model,
       running.length,
       running.filter((row) => statusName(row) === "busy").length,
       sum ? sum.lastHour.out : null,
-      group.some((row) => row.tied),
+      group.some((row) => isReported(row) && row.tied === true),
     ];
   });
   setSideCard(
     "model",
-    JSON.stringify([models, rows.some((row) => row.tied)]),
+    JSON.stringify([models, rows.some((row) => isReported(row) && row.tied === true)]),
     modelCard
   );
   setSideCard("switch", JSON.stringify(state.view.switchEffect), switchCard);

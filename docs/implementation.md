@@ -568,6 +568,9 @@ callback calls `switcher::sync_live` (mirrorLive on) or `switcher::live_state` (
 
 ```rust
 pub const DEBOUNCE: Duration = Duration::from_millis(500);
+/// A burst in a `watch_folder` folder fires at the latest this long after its first change, even
+/// while changes keep arriving; `watch` has no such bound (a login written many times is one change).
+pub const DEBOUNCE_MAX: Duration = Duration::from_secs(1);
 pub const BUSY_RECHECK: Duration = Duration::from_millis(200);
 
 #[derive(Debug, thiserror::Error)]
@@ -582,6 +585,11 @@ pub enum WatchError { Notify(#[from] notify::Error), Io { path: PathBuf, source:
 /// is an error (no create). Drop stops the watching and joins the thread.
 pub struct Watcher { /* … */ }
 pub fn watch(claude: &ClaudePaths, on_change: impl Fn() + Send + 'static) -> Result<Watcher, WatchError>;
+/// One folder, non-recursive, read access ignored: `on_change` after DEBOUNCE quiet, or at the
+/// latest DEBOUNCE_MAX after a burst's first change (a transcript folder written every 200 ms
+/// still wakes the sessions thread). No lock wait.
+pub struct FolderWatch { /* … */ }
+pub fn watch_folder(folder: &Path, on_change: impl Fn() + Send + 'static) -> Result<FolderWatch, WatchError>;
 ```
 
 ## locks.rs / paths.rs additions — wave 3
@@ -811,7 +819,7 @@ pub struct Answer { pub session: String, pub agent: Option<String>, pub message_
     pub cache_write: u64, pub cache_read: u64, pub thinking: bool }
 pub struct UserTurn { pub session: String, pub at: DateTime<Utc> }
 pub struct AgentMeta { pub session: String, pub agent: String, pub agent_type: Option<String>,
-    pub description: Option<String>, pub finished: bool, pub spawn_depth: u32 }
+    pub description: Option<String>, pub finished: bool, pub spawn_depth: Option<u32> }
 #[derive(Default, Serialize, Deserialize)] #[serde(rename_all = "camelCase")]
 pub struct ScanState { pub version: u32, pub files: BTreeMap<String, FileState>,
     pub sessions: BTreeMap<String, SessionSeen> /* private: changed folders */ }
@@ -863,8 +871,9 @@ impl Scan {
 /// The caller's state is not changed; the result carries the state to `commit`.
 pub fn scan(claude: &ClaudePaths, state: &ScanState, budget_bytes: u64)
     -> Result<Scan, TranscriptError>;
+pub struct Agents { pub metas: Vec<AgentMeta>, pub warnings: Vec<String> }
 pub fn agents_of(claude: &ClaudePaths, session: &str,
-    spawns: &BTreeMap<String, Option<String>>) -> Vec<AgentMeta>;
+    spawns: &BTreeMap<String, Option<String>>) -> Agents;
 /// One TokenRecord per (session, hour, model); an agent's answers go to its parent session and use
 /// the parent's folder when known. The group's cwd is that of its earliest answer.
 pub fn token_records(answers: &[Answer], state: &ScanState, home: &Path) -> Vec<TokenRecord>;
@@ -892,7 +901,7 @@ pub recent: Vec<(DateTime<Utc>, Tokens)>,            // one entry per minute, th
 pub tool_use_id: Option<String>, pub parent: Option<String>   // the agent that started it; None: the session
 pub fn last_hour(seen: &SessionSeen, now: DateTime<Utc>) -> Tokens;
 pub fn agents_of(claude: &ClaudePaths, session: &str, spawns: &BTreeMap<String, Option<String>>)
-    -> Vec<AgentMeta>;
+    -> Agents;
 impl ScanState { pub fn forget_closed(&mut self, running: &BTreeSet<String>, now: DateTime<Utc>) -> usize; }
 ```
 
@@ -901,7 +910,10 @@ answer) `agents`; the same message id rule keeps an answer read twice from being
 answer only goes to a session whose main transcript has made one: an agent transcript alone has
 nowhere to put it. A `tool_use` block named `Agent` or `Task` adds its id and the agent that made the
 call to `spawns` (only the id and the name are read from the block); `agents_of` looks each meta's
-`toolUseId` up there and sets `parent`. `recent` is one entry per minute; it is pruned to the
+`toolUseId` up there and sets `parent`. A meta file that cannot be read or parsed is a warning
+naming the file and the reason, and its agent is still listed as running with `spawn_depth: None`
+(a meta without `finished` is a running agent, and an unreadable one cannot say it finished).
+`recent` is one entry per minute; it is pruned to the
 60 minutes before the newest answer, and `last_hour` adds the entries whose minute starts after
 `now - 60 min`. `forget_closed` drops a session that is not running and whose latest answer — its own
 or one of its agents', whichever is newer — is more than an hour old; its files' offsets stay, so the
@@ -2432,8 +2444,11 @@ missing. `switch_kind` answers what a switch costs a row in the "If you switched
 for a closed one, one without a model, or an idle or waiting one older than `CACHE_LIFE_MIN`; else
 `LosesThinking` when the row is tied and `thinking_since_user > 0`; else `Resend`. `closed` reads
 the last `SessionRecord` of each session and keeps the closed ones whose `last` is in `[since, now)`,
-sums every `TokenRecord` of the session (several lines for one hour and model) and gives the row the
-label `<project>-<first two characters of the session id>` and no agents.
+sums every `TokenRecord` of the session (several lines for one hour and model) from the hour start
+of the earliest `first` — a record's `t` is its hour's start — and gives the row the
+label `<project>-<first two characters of the session id>` and no agents. A closed row's last hour
+sums the records whose hour `[t, t + 1 h)` overlaps `[now - 60 min, now)`, because the history is
+hourly, so a record from the hour before the window still counts.
 
 `live_sessions::Values::sum(parts: &[&Values]) -> Values` is the one sum rule: each half is added
 only when every part has it, a missing part makes the sum unknown with the first part's reason, parts
@@ -2502,7 +2517,11 @@ writes this host's report and reads the other hosts. A session record is rewritt
 record. The thread's regular wake is `WAKE = 60 s`, and `AFTER_INCOMPLETE = 1 s` follows a scan that
 did not finish; the session folder is watched all the time, the transcript folders only while the
 window is subscribed. `PassOutcome.thinking` is the running tied sessions' answers with thinking,
-minute by minute, and `tied_busy` of them the busy ones; both go to the burn tick (below).
+minute by minute, and `tied_busy` of them the busy ones; both go to the burn tick (below). The same
+counts fill `SessionsSummary.tied` and `.tied_busy`, the one source for the pop-up's sentence and the
+switch event's history line. `agents_of` runs once per running session per pass; the session record
+and the rows both use that one list, so the meta files are read once whether or not the window is
+open, and the list's warnings go to `SessionsSummary.warning`.
 
 ### window.rs: the sessions view, its sums and the commands (step C2, Task 4)
 
@@ -2545,6 +2564,7 @@ impl ClosedSince { pub(crate) fn since(self, now: DateTime<Utc>) -> Option<DateT
 pub(crate) struct SessionsOptions { pub closed: ClosedSince, pub host: Option<String> }
 pub(crate) struct HostState { pub host: String, pub at: DateTime<Utc>, pub stale: bool, pub this: bool }
 pub(crate) struct SwitchEffect { pub loses_thinking: u32, pub loses_thinking_busy: u32,
+                                 pub loses_thinking_models: Vec<String>,
                                  pub resend: u32, pub free: u32 }
 pub(crate) enum SumOf { All, Provider(String), Project(ProjectId),
     ProjectModel(ProjectId, Option<String>), Model(Option<String>) }
@@ -2552,7 +2572,7 @@ pub(crate) struct Sum { pub of: SumOf, pub sessions: u32, pub tokens: Tokens,
     pub last_hour: Tokens, pub values: Values }
 pub(crate) struct SessionsView { pub at: DateTime<Utc>, pub this_host: Option<String>,
     pub hosts: Vec<HostState>, pub sessions: Vec<LiveSession>, pub sums: Vec<Sum>,
-    pub switch_effect: SwitchEffect, pub in_use: Option<String>,
+    pub switch_effect: SwitchEffect,
     pub currency: Option<String>, pub unavailable: Option<String> }
 pub(crate) fn view_of(at: DateTime<Utc>, this_host: Option<String>, running: &[LiveSession],
     closed: &[LiveSession], other_hosts: &[OtherHost], thinking: &BTreeMap<String, u32>,
@@ -2560,12 +2580,15 @@ pub(crate) fn view_of(at: DateTime<Utc>, this_host: Option<String>, running: &[L
 ```
 
 `view_of` is pure. This host's running rows come first in their order, then the other hosts' by
-name, then the closed rows newest first; `options.host` keeps one host and a host that is not in
+name, then the closed rows newest first; a closed row whose `(host, session)` is already listed as
+running is dropped, because the running row is the newer fact. `options.host` keeps one host and a
+host that is not in
 `hosts` gives an empty list. `hosts` starts with this host (`this: true`, `at` the pass time, never
 stale) when there is a history, then the other hosts by name. `switch_effect` counts this host's
 running rows only, whatever `options.host` and `closed` say; `loses_thinking_busy` is the busy part
-of `loses_thinking`. `in_use` is set by the one function `gui::fill_in_use(&mut view, &snapshot)`,
-for the command's answer and every pushed view.
+of `loses_thinking`, and `loses_thinking_models` holds the distinct model ids of those sessions in
+the order their first session is listed. The account in use is not part of the view: the page reads
+it from the snapshot, like the pop-up does.
 
 `sums` is built over exactly the sessions the view lists, by `sums_of`, so a group's total and the
 rows agree and the page never adds values. It has `All` (even for an empty list) and one key for
@@ -2612,7 +2635,7 @@ at once.
 
 The three commands are registered with the others and are `async`, like `money_view`; each runs its
 client call on `tauri::async_runtime::spawn_blocking`. The large window's `Destroyed` event sends
-`Unsubscribe`. `gui::handle_ui_event` fills `view.in_use` and emits `sessions-view` with
+`Unsubscribe`. `gui::handle_ui_event` emits `sessions-view` with
 `emit_to(WINDOW_LABEL, …)`, so only the large window receives it.
 
 ## Files step C2 writes

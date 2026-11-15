@@ -505,10 +505,13 @@ pub fn running(
 /// The sessions of every host that closed in `[since, now)` (spec §3.8). A row
 /// is a session whose last `SessionRecord` has `closed: true` and whose `last`
 /// is in the range; its tokens are the sum of every `TokenRecord` of the
-/// session from the earliest `first` of the rows, because one hour and model
-/// can have several lines, and its last hour the sum of those after an hour
-/// before `now`. Its agents list is empty; the counts come from the
-/// record. `label` is `<project>-<first 2 characters of the session id>`.
+/// session from the hour start of the earliest `first` of the rows (a record's
+/// `t` is the start of its hour), because one hour and model can have several
+/// lines. Its last hour sums the records whose hour `[t, t + 1 h)` overlaps
+/// `[now - 60 min, now)`: the history's records are hourly, so a record from
+/// the hour before the window still counts. Its agents list is empty; the
+/// counts come from the record. `label` is `<project>-<first 2 characters of
+/// the session id>`.
 ///
 /// The history read's warnings are passed on in [`Rows::warnings`]. `projects`
 /// and `pricing` mean what they do in [`running`].
@@ -538,7 +541,7 @@ pub fn closed(
             warnings,
         });
     };
-    let token_range = Range::between(Some(earliest), Some(now))?;
+    let token_range = Range::between(Some(transcripts::hour_start(earliest)), Some(now))?;
     let token_read = history.read::<TokenRecord>(&token_range, &Hosts::All)?;
     let token_records = token_read.records;
     warnings.extend(token_read.warnings);
@@ -570,8 +573,9 @@ pub fn closed(
                 cr: token.cr,
             };
             tokens += of_record;
-            // The same window as `transcripts::last_hour`: after an hour ago.
-            if token.t > hour_ago {
+            // The history is hourly: a record whose hour overlaps the window
+            // counts, even when its start is before the window.
+            if token.t < now && transcripts::hour_start(token.t) + Duration::hours(1) > hour_ago {
                 last_hour += of_record;
             }
             *out_by_model.entry(token.model.clone()).or_insert(0) += token.out;
@@ -1091,7 +1095,7 @@ mod tests {
                 agent_type: Some("general-purpose".to_string()),
                 description: Some("fix the failing tests".to_string()),
                 finished: i >= 3,
-                spawn_depth: 1,
+                spawn_depth: Some(1),
                 tool_use_id: Some(format!("toolu_{i:02}")),
                 parent: None,
             })
@@ -1285,6 +1289,96 @@ mod tests {
     }
 
     #[test]
+    fn a_closed_row_keeps_the_hour_of_its_first_answer() {
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        history
+            .append(&session_record(
+                SESSION_11,
+                utc("2026-11-14T09:40:00Z"),
+                utc("2026-11-14T08:12:00Z"),
+                utc("2026-11-14T09:40:00Z"),
+                true,
+                0,
+            ))
+            .expect("a session record");
+        // `token_records` writes the start of the hour, so the first answer at
+        // 08:12 has its record at 08:00.
+        history
+            .append(&token(
+                SESSION_11,
+                utc("2026-11-14T08:00:00Z"),
+                "claude-opus-5-5",
+                0,
+                4_000_000,
+            ))
+            .expect("a token record");
+        history
+            .append(&token(
+                SESSION_11,
+                utc("2026-11-14T09:00:00Z"),
+                "claude-opus-5-5",
+                0,
+                3_000_000,
+            ))
+            .expect("a token record");
+        let settings = settings_eur();
+        let valuer = valuer(&history, &settings, &[]);
+        let rows = closed(
+            &history,
+            utc("2026-11-14T07:00:00Z"),
+            utc("2026-11-14T10:10:00Z"),
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
+        )
+        .expect("rows");
+
+        assert_eq!(rows.sessions.len(), 1);
+        assert_eq!(rows.sessions[0].tokens.out, 7_000_000);
+    }
+
+    #[test]
+    fn a_closed_rows_last_hour_counts_the_hour_that_overlaps() {
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        history
+            .append(&session_record(
+                SESSION_11,
+                utc("2026-11-14T09:58:00Z"),
+                utc("2026-11-14T09:50:00Z"),
+                utc("2026-11-14T09:58:00Z"),
+                true,
+                0,
+            ))
+            .expect("a session record");
+        history
+            .append(&token(
+                SESSION_11,
+                utc("2026-11-14T09:00:00Z"),
+                "claude-opus-5-5",
+                0,
+                3_000_000,
+            ))
+            .expect("a token record");
+        let settings = settings_eur();
+        let valuer = valuer(&history, &settings, &[]);
+        let rows = closed(
+            &history,
+            utc("2026-11-14T09:00:00Z"),
+            utc("2026-11-14T10:20:00Z"),
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
+        )
+        .expect("rows");
+
+        assert_eq!(rows.sessions.len(), 1);
+        assert_eq!(
+            rows.sessions[0].last_hour.out, 3_000_000,
+            "the 09:00 hour overlaps [09:20, 10:20)"
+        );
+    }
+
+    #[test]
     fn a_session_closed_before_since_is_left_out() {
         let dir = tempdir().expect("tempdir");
         let history = HistoryDir::at(dir.path(), "atlas");
@@ -1320,7 +1414,7 @@ mod tests {
             agent_type: Some("general-purpose".to_string()),
             description: Some("fix the failing tests".to_string()),
             finished: false,
-            spawn_depth: 1,
+            spawn_depth: Some(1),
             tool_use_id: Some("toolu_01Nkn4".to_string()),
             parent: None,
         };
@@ -1687,7 +1781,7 @@ mod tests {
             agent_type: Some("general-purpose".to_string()),
             description: Some("fix the failing tests".to_string()),
             finished: true,
-            spawn_depth: 2,
+            spawn_depth: Some(2),
             tool_use_id: Some("toolu_01Nkn4".to_string()),
             parent: Some("a8751b20660a1de6b".to_string()),
         };
@@ -1908,7 +2002,7 @@ mod tests {
                 agent_type: Some("general-purpose".to_string()),
                 description: Some("fix the failing tests".to_string()),
                 finished: i >= 3,
-                spawn_depth: 1,
+                spawn_depth: Some(1),
                 tool_use_id: Some(format!("toolu_{i:04}")),
                 parent: None,
             })

@@ -68,8 +68,6 @@ use lookup_rt::{LookupClient, LookupHandle};
 #[cfg(feature = "gui")]
 use sessions_rt::{SessionsClient, SessionsHandle};
 #[cfg(feature = "gui")]
-use window::SessionsView;
-#[cfg(feature = "gui")]
 use worker::SessionsSummary;
 #[cfg(feature = "gui")]
 use worker::{ActionCommand, ActionReply, EngineCommand, PendingSwitch, Snapshot, UiEvent};
@@ -145,17 +143,6 @@ impl GuiState {
             .clone()
             .ok_or_else(|| sessions_rt::SESSIONS_OFF.to_string())
     }
-}
-
-/// The one way a view learns the account in use: the snapshot's active view.
-/// Used for the command's answer and for every pushed view.
-#[cfg(feature = "gui")]
-pub(crate) fn fill_in_use(view: &mut SessionsView, snapshot: &Snapshot) {
-    view.in_use = snapshot
-        .views
-        .iter()
-        .find(|account| account.is_active)
-        .map(|account| account.id.clone());
 }
 
 #[cfg(feature = "gui")]
@@ -517,10 +504,7 @@ fn handle_ui_event(app: &AppHandle, event: UiEvent) {
         UiEvent::Money(view) => {
             let _ = app.emit("money", &view);
         }
-        UiEvent::SessionsView(mut view) => {
-            let state = app.state::<GuiState>();
-            let snapshot = lock(&state.snapshot).clone();
-            fill_in_use(&mut view, &snapshot);
+        UiEvent::SessionsView(view) => {
             let _ = app.emit_to(window::WINDOW_LABEL, "sessions-view", &view);
         }
     }

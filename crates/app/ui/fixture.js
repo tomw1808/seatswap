@@ -982,23 +982,23 @@ function fixtureTokenCounts(million) {
   return { input: 0, out: Math.round(million * 1000000), cw: 0, cr: 0 };
 }
 
-function fixtureSessionValues(million) {
+function fixtureSessionValues(million, currency = "EUR") {
   if (!(million > 0)) {
     return {
       api: null,
       apiCurrency: null,
       apiMissing: "no tokens yet",
       subscription: null,
-      currency: "EUR",
+      currency,
       subscriptionMissing: "no tokens yet",
     };
   }
   return {
     api: Number((million * SESSION_APIV).toFixed(2)),
-    apiCurrency: "EUR",
+    apiCurrency: currency,
     apiMissing: null,
     subscription: Number((million * SESSION_SUBV).toFixed(2)),
-    currency: "EUR",
+    currency,
     subscriptionMissing: null,
   };
 }
@@ -1201,6 +1201,14 @@ function fixtureSessionRows() {
 
   const b3Agents = fixtureFinishedAgents("atlas-b3", "vega", 4, () => 0.1);
   b3Agents[0].task = null;
+  const staleFableAgents = fixtureFinishedAgents("acme-kb-91", "ledger", 5, () => 0.1);
+  for (const agent of staleFableAgents.slice(0, 2)) {
+    agent.running = true;
+    agent.last = null;
+  }
+  const staleSonnetAgents = fixtureFinishedAgents("acme-kb-a2", "ledger", 3, () => 0.08);
+  staleSonnetAgents[0].running = true;
+  staleSonnetAgents[0].last = null;
   const ledgerAgents = fixtureFinishedAgents("ledger-02", "vega", 1, () => 0.05);
   const s47Agents = fixtureFinishedAgents("seatswap-47", "atlas", 2, (index) =>
     index === 0 ? 0.6 : 0.5
@@ -1227,17 +1235,20 @@ function fixtureSessionRows() {
     agents,
     tokens: fixtureTokenCounts(million),
     lastHour: fixtureTokenCounts(lastHour),
-    values: fixtureSessionValues(million),
+    values: fixtureSessionValues(million, options.currency || "EUR"),
   });
 
   const rows = [
     make("atlas-a6", "atlas", "atlas", "busy", "claude-opus-5-5", isoIn(-(2 * 60 + 31) * 60000), 12.4, 1.9, 3, 38, a6Agents),
     make("atlas-56", "atlas", "atlas", "idle", "claude-opus-5-5", isoIn(-6 * 3600000), 8.1, 0, 0, 12, s56Agents),
     make("atlas-11", "atlas", "atlas", "closed", "claude-opus-5-5", fixtureTodayAt(9, 12), 7.9, 0, 0, 17, []),
-    make("atlas-b3", "atlas", "vega", "idle", "claude-fable-5-2", isoIn(-100 * 60000), 3.9, 0.5, 0, 4, b3Agents, { tied: true }),
+    make("atlas-b3", "atlas", "vega", "idle", "claude-fable-5-2", isoIn(-100 * 60000), 3.9, 0.5, 0, 4, b3Agents, { tied: true, currency: "USD" }),
     make("acme-kb-dd", "acme-kb", "atlas", "waiting", "claude-opus-5-5", isoIn(-4 * 60000), 2.2, 0.8, 1, 6, ddAgents),
     make("acme-kb-3c", "acme-kb", "atlas", "closed", "claude-opus-5-5", fixtureTodayAt(8, 40), 4.4, 0, 0, 9, []),
+    make("atlas-c4", "atlas", "atlas", "closed", "claude-mythos-5-2", fixtureTodayAt(7, 30), 1.1, 0, 0, 5, [], { tied: true }),
     make("acme-kb-74", "acme-kb", "atlas", "idle", "claude-sonnet-5-5", isoIn(-10 * 3600000), 0.3, 0, 0, 0, [], { tied: true }),
+    make("acme-kb-91", "acme-kb", "ledger", { other: "no report" }, "claude-fable-5-2", isoIn(-3 * 3600000), 1.2, 0, 2, 3, staleFableAgents, { tied: true }),
+    make("acme-kb-a2", "acme-kb", "ledger", { other: "no report" }, "claude-sonnet-5-5", isoIn(-3 * 3600000), 0.9, 0, 1, 2, staleSonnetAgents),
     make("ledger-02", "ledger", "vega", "idle", "claude-opus-5-5", isoIn(-17 * 3600000), 0.1, 0, 0, 1, ledgerAgents),
     make("ledger-9e", "ledger", "vega", "closed", "claude-opus-5-5", fixtureDaysAgoAt(3, 22, 5), 1.6, 0, 0, 3, []),
     make("ledger-c1", "ledger", "atlas", "idle", "gpt-6-astra", isoIn(-35 * 60000), 0.4, 0, 0, 0, [], {
@@ -1335,16 +1346,22 @@ function fixtureSessionsView(args) {
     hosts: [
       { host: "atlas", at: new Date(now).toISOString(), stale: false, this: true },
       { host: "vega", at: new Date(now - 2 * 60000).toISOString(), stale: false, this: false },
+      {
+        host: "ledger",
+        at: new Date(now - 3 * 3600000).toISOString(),
+        stale: true,
+        this: false,
+      },
     ],
     sessions: rows,
     sums: fixtureSums(rows),
     switchEffect: {
       losesThinking: 3,
       losesThinkingBusy: 1,
+      losesThinkingModels: ["claude-fable-5-2", "claude-sonnet-5-5"],
       resend: 2,
       free: 4,
     },
-    inUse: fixture.activeId,
     currency: "EUR",
     unavailable: null,
   };

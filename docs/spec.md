@@ -1023,15 +1023,16 @@ that started agents opens the same way, to any depth. Completed agents are folde
 - **Hosts**: all, or one. Each host writes what is running on it into its own report in the shared
   history folder (`<host>/sessions-now.json`, below). Another host's row carries the age of its
   report ("vega · 2 min ago"); a host whose report is older than 15 minutes says "no report since …"
-  instead of running. Without a shared history folder only this host is shown and no report is
-  written.
+  instead of running. Without a shared history folder only this host is shown; the report is still
+  written whenever this host has a history folder, shared or not.
 
 **How it updates.** While the area is open, the sessions thread watches the session files and the
 running sessions' transcripts and pushes its view: a change is on screen within about a second, at
 most two redraws a second, with a trailing one so the last numbers always arrive, and once a minute
 for the durations and "last hour". Rows keep their place and open rows stay open; a new session or
 agent appears in its group. A session that left turns grey for 60 seconds and is then removed, or,
-with closed sessions shown, it is already there as a closed row. Other hosts' rows change when their
+with closed sessions shown, a session that has a closing record is already there as a closed row.
+Other hosts' rows change when their
 report arrives. The thread reads the session files and transcripts whether or not the window is
 open; the transcript folder watches and the pushes exist only while the area is subscribed.
 

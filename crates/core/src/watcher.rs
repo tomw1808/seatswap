@@ -23,6 +23,12 @@ use crate::paths::ClaudePaths;
 /// How long the event stream has to stay quiet before `on_change` is considered.
 pub const DEBOUNCE: Duration = Duration::from_millis(500);
 
+/// A burst in a watched folder ([`watch_folder`]) fires at the latest this long
+/// after its first change, even while changes keep arriving more often than
+/// [`DEBOUNCE`]. The login watch ([`watch`]) has no such bound: a login written
+/// many times while Claude Code starts is one change.
+pub const DEBOUNCE_MAX: Duration = Duration::from_secs(1);
+
 /// How often a busy Claude Code lock is re-checked.
 pub const BUSY_RECHECK: Duration = Duration::from_millis(200);
 
@@ -174,8 +180,13 @@ fn is_read_access(kind: &EventKind) -> bool {
 enum Phase {
     /// No relevant event seen yet.
     Idle,
-    /// A relevant event was seen; wait until it has been quiet for [`DEBOUNCE`].
-    Quiet { until: Instant },
+    /// A relevant event was seen; wait until it has been quiet for [`DEBOUNCE`],
+    /// but never past `deadline` (the burst's first change plus the loop's
+    /// maximum wait, when it has one).
+    Quiet {
+        until: Instant,
+        deadline: Option<Instant>,
+    },
     /// Quiet period over; wait for Claude Code's locks to be free.
     WaitingForLocks,
 }
@@ -185,10 +196,18 @@ enum Phase {
 /// the channel and wakes it).
 fn wait_timeout(phase: Phase) -> Option<Duration> {
     match phase {
-        Phase::Quiet { until } => Some(until.saturating_duration_since(Instant::now())),
+        Phase::Quiet { until, deadline } => {
+            Some(fires_at(until, deadline).saturating_duration_since(Instant::now()))
+        }
         Phase::WaitingForLocks => Some(BUSY_RECHECK),
         Phase::Idle => None,
     }
+}
+
+/// The moment a quiet phase ends: after the quiet time, or at the deadline if
+/// that comes first.
+fn fires_at(until: Instant, deadline: Option<Instant>) -> Instant {
+    deadline.map_or(until, |deadline| until.min(deadline))
 }
 
 fn run(
@@ -203,6 +222,7 @@ fn run(
         stop,
         |event| names.is_change(event),
         || !locks::claude_locks_busy(&claude),
+        None,
         on_change,
     );
 }
@@ -226,7 +246,8 @@ impl Drop for FolderWatch {
 }
 
 /// Watch one folder non-recursively and call `on_change` on its own thread after
-/// the event stream has been quiet for [`DEBOUNCE`]. Read access is ignored: the
+/// the event stream has been quiet for [`DEBOUNCE`], or at the latest
+/// [`DEBOUNCE_MAX`] after the first change of a burst. Read access is ignored: the
 /// callback reads the folder, which would otherwise make it trigger itself.
 pub fn watch_folder(
     folder: &Path,
@@ -246,6 +267,7 @@ pub fn watch_folder(
                 thread_stop,
                 |event| !is_read_access(&event.kind),
                 || true,
+                Some(DEBOUNCE_MAX),
                 on_change,
             );
         });
@@ -266,13 +288,15 @@ pub fn watch_folder(
 }
 
 /// The debounce loop shared by [`watch`] and [`watch_folder`]: wait for an event
-/// that `is_change` accepts, then after [`DEBOUNCE`] quiet and while `ready`
+/// that `is_change` accepts, then after [`DEBOUNCE`] quiet (and at the latest
+/// `max_wait` after the burst's first change, when given) and while `ready`
 /// holds, call `on_change` once.
 fn run_debounced(
     events: Receiver<notify::Result<Event>>,
     stop: Arc<AtomicBool>,
     is_change: impl Fn(&Event) -> bool,
     ready: impl Fn() -> bool,
+    max_wait: Option<Duration>,
     on_change: impl Fn(),
 ) {
     let mut phase = Phase::Idle;
@@ -295,16 +319,24 @@ fn run_debounced(
         match received {
             Ok(Ok(event)) => {
                 if is_change(&event) {
+                    let now = Instant::now();
+                    let deadline = match phase {
+                        Phase::Quiet { deadline, .. } => deadline,
+                        Phase::Idle | Phase::WaitingForLocks => {
+                            max_wait.map(|max_wait| now + max_wait)
+                        }
+                    };
                     phase = Phase::Quiet {
-                        until: Instant::now() + DEBOUNCE,
+                        until: now + DEBOUNCE,
+                        deadline,
                     };
                 }
             }
             // An error inside the stream is not fatal: the next event still works.
             Ok(Err(_)) => {}
             Err(RecvTimeoutError::Timeout) => {
-                if let Phase::Quiet { until } = phase {
-                    if Instant::now() >= until {
+                if let Phase::Quiet { until, deadline } = phase {
+                    if Instant::now() >= fires_at(until, deadline) {
                         phase = Phase::WaitingForLocks;
                     }
                 }
@@ -318,6 +350,7 @@ fn run_debounced(
 mod tests {
     use super::*;
     use crate::atomic;
+    use std::io::Write;
     use std::sync::atomic::AtomicUsize;
     use tempfile::TempDir;
 
@@ -380,6 +413,44 @@ mod tests {
         }
         expect_one(&received, &count);
         drop(watcher);
+    }
+
+    #[test]
+    fn a_burst_longer_than_the_quiet_time_still_wakes() {
+        let tmp = TempDir::new().unwrap();
+        let folder = tmp.path().join("subagents");
+        fs::create_dir(&folder).unwrap();
+        let (calls, received) = mpsc::channel();
+        let watch = watch_folder(&folder, move || {
+            let _ = calls.send(());
+        })
+        .unwrap();
+
+        // An agent's transcript grows more often than DEBOUNCE, so a pure
+        // trailing debounce would never fire while it writes.
+        let transcript = folder.join("agent-a875.jsonl");
+        let mut wakes = 0;
+        let started = Instant::now();
+        let mut line = 0;
+        while started.elapsed() < Duration::from_secs(3) {
+            line += 1;
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&transcript)
+                .unwrap();
+            writeln!(file, "{{\"line\":{line}}}").unwrap();
+            drop(file);
+            thread::sleep(Duration::from_millis(200));
+            while received.try_recv().is_ok() {
+                wakes += 1;
+            }
+        }
+        assert!(
+            wakes >= 2,
+            "a 3 s burst every 200 ms woke on_change {wakes} times before it stopped"
+        );
+        drop(watch);
     }
 
     #[test]

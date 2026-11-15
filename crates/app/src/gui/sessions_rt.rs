@@ -1108,14 +1108,33 @@ pub(crate) fn run_pass(
         .map(|session| session.session_id.clone())
         .collect();
 
+    // One `agents_of` per running session per pass: the session record and the
+    // rows use the same list, so the meta files are read once. Its warnings are
+    // the pass's, whether or not the window is open.
+    let mut agents_by_session: HashMap<String, Vec<transcripts::AgentMeta>> = HashMap::new();
+    for session in &running.sessions {
+        let Some(seen) = state.sessions.get(&session.session_id) else {
+            continue;
+        };
+        let agents = transcripts::agents_of(claude, &session.session_id, &seen.spawns);
+        for warning in agents.warnings {
+            add_warning(&mut summary, warning);
+        }
+        agents_by_session.insert(session.session_id.clone(), agents.metas);
+    }
+
     // One record per running session whose summary changed and whose last
     // record is old enough (or which has none yet).
     for session in &running.sessions {
         let Some(seen) = state.sessions.get(&session.session_id) else {
             continue;
         };
+        let agents = agents_by_session
+            .get(&session.session_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         let record = match session_record(
-            claude,
+            agents,
             &session.session_id,
             seen,
             session.entrypoint.clone(),
@@ -1180,8 +1199,19 @@ pub(crate) fn run_pass(
                 .records
                 .get(&session)
                 .and_then(|record| record.entrypoint.clone());
-            let record = match session_record(claude, &session, seen, entrypoint, true, memory, now)
-            {
+            let agents = transcripts::agents_of(claude, &session, &seen.spawns);
+            for warning in agents.warnings {
+                add_warning(&mut summary, warning);
+            }
+            let record = match session_record(
+                &agents.metas,
+                &session,
+                seen,
+                entrypoint,
+                true,
+                memory,
+                now,
+            ) {
                 Ok(record) => record,
                 Err(error) => {
                     add_warning(&mut summary, error);
@@ -1268,8 +1298,8 @@ pub(crate) fn run_pass(
                 live_rows(
                     &running.sessions,
                     state,
-                    claude,
                     memory,
+                    &agents_by_session,
                     projects,
                     &pricing,
                     recorder.dir().host(),
@@ -1288,8 +1318,8 @@ pub(crate) fn run_pass(
             Some(live_rows(
                 &running.sessions,
                 state,
-                claude,
                 memory,
+                &agents_by_session,
                 None,
                 &pricing,
                 "",
@@ -1360,7 +1390,9 @@ pub(crate) fn run_pass(
     publish_view(memory, now);
 
     let models = models_in_use(&running.sessions, state);
-    let (_, tied_busy, thinking) = tied_sessions(&running.sessions, state);
+    let (tied, tied_busy, thinking) = tied_sessions(&running.sessions, state);
+    summary.tied = tied;
+    summary.tied_busy = tied_busy;
     PassOutcome {
         summary,
         models,
@@ -1705,7 +1737,6 @@ fn same_pushed(first: &SessionsView, second: &SessionsView) -> bool {
         && first.switch_effect == second.switch_effect
         && first.currency == second.currency
         && first.unavailable == second.unavailable
-        && first.in_use == second.in_use
         && first.hosts.len() == second.hosts.len()
         && first
             .hosts
@@ -1720,20 +1751,14 @@ fn same_pushed(first: &SessionsView, second: &SessionsView) -> bool {
 fn live_rows(
     files: &[SessionFile],
     state: &ScanState,
-    claude: &ClaudePaths,
     memory: &mut SessionMemory,
+    agents: &HashMap<String, Vec<transcripts::AgentMeta>>,
     projects: Option<&projects::Projects>,
     pricing: &live_sessions::Pricing,
     host: &str,
     now: DateTime<Utc>,
 ) -> live_sessions::Rows {
-    let metas = |session: &str| {
-        state
-            .sessions
-            .get(session)
-            .map(|seen| transcripts::agents_of(claude, session, &seen.spawns))
-            .unwrap_or_default()
-    };
+    let metas = |session: &str| agents.get(session).cloned().unwrap_or_default();
     let project_of = {
         let memory = RefCell::new(memory);
         move |cwd: &str| memory.borrow_mut().project_for(cwd)
@@ -1751,7 +1776,7 @@ fn live_rows(
 }
 
 fn session_record(
-    claude: &ClaudePaths,
+    agents: &[transcripts::AgentMeta],
     session: &str,
     seen: &SessionSeen,
     entrypoint: Option<String>,
@@ -1759,7 +1784,6 @@ fn session_record(
     memory: &mut SessionMemory,
     now: DateTime<Utc>,
 ) -> Result<SessionRecord, String> {
-    let agents = transcripts::agents_of(claude, session, &seen.spawns);
     let started = count_u32(
         agents.len(),
         &format!("the number of agents started in session {session}"),
@@ -3165,6 +3189,154 @@ mod tests {
         );
 
         assert_eq!(outcome.thinking, thinking);
+    }
+
+    #[test]
+    fn the_agents_are_read_once_per_session_per_pass() {
+        let (_tmp, claude, app) = fixture();
+        let at = time("2026-11-14T10:00:00Z");
+        write_session(
+            &claude,
+            900,
+            &session_json(
+                900,
+                SESSION,
+                "/home/sam/projects/atlas",
+                None,
+                "busy",
+                at.timestamp_millis(),
+            ),
+        );
+        // The unreadable meta is a warning from `agents_of`; the session record
+        // and the rows must share one read, so it is said once.
+        let subagents = claude
+            .projects_dir()
+            .join("-home-sam-projects-atlas")
+            .join(SESSION)
+            .join("subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        fs::write(subagents.join("agent-a875.meta.json"), "{\"agentType\": ").unwrap();
+        let mut state = ScanState::default();
+        state.sessions.insert(
+            SESSION.to_string(),
+            SessionSeen {
+                folder: "-home-sam-projects-atlas".to_string(),
+                cwd: "/home/sam/projects/atlas".to_string(),
+                first: at,
+                last: at,
+                last_model: Some("claude-opus-5-5".to_string()),
+                last_user_turn: None,
+                thinking: Vec::new(),
+                totals: Default::default(),
+                by_model: Default::default(),
+                agents: Default::default(),
+                spawns: Default::default(),
+                recent: Default::default(),
+                recorded: None,
+            },
+        );
+
+        let mut memory = SessionMemory::new(claude.home().to_path_buf());
+        let outcome = run_pass(
+            &app,
+            &claude,
+            &probe(&[900]),
+            None,
+            &mut state,
+            &mut memory,
+            at,
+            None,
+        );
+
+        let warning = outcome.summary.warning.unwrap_or_default();
+        assert_eq!(
+            warning.matches("agent meta").count(),
+            1,
+            "the meta file is read once per pass: {warning:?}"
+        );
+    }
+
+    #[test]
+    fn the_summary_counts_tied_sessions_and_the_busy_ones() {
+        const OTHER: &str = "2b7d9c1e-5a4f-4c3b-9e8d-7f6a5b4c3d2e";
+        let (_tmp, claude, app) = fixture();
+        let at = time("2026-11-14T10:00:00Z");
+        write_session(
+            &claude,
+            910,
+            &session_json(
+                910,
+                SESSION,
+                "/home/sam/projects/atlas",
+                None,
+                "busy",
+                at.timestamp_millis(),
+            ),
+        );
+        write_session(
+            &claude,
+            911,
+            &session_json(
+                911,
+                OTHER,
+                "/home/sam/projects/ledger",
+                None,
+                "idle",
+                at.timestamp_millis(),
+            ),
+        );
+        let mut state = ScanState::default();
+        state.sessions.insert(
+            SESSION.to_string(),
+            SessionSeen {
+                folder: "-home-sam-projects-atlas".to_string(),
+                cwd: "/home/sam/projects/atlas".to_string(),
+                first: at,
+                last: at,
+                last_model: Some("claude-fable-5-2".to_string()),
+                last_user_turn: None,
+                thinking: vec![(time("2026-11-14T09:58:00Z"), 2)],
+                totals: Default::default(),
+                by_model: Default::default(),
+                agents: Default::default(),
+                spawns: Default::default(),
+                recent: Default::default(),
+                recorded: None,
+            },
+        );
+        state.sessions.insert(
+            OTHER.to_string(),
+            SessionSeen {
+                folder: "-home-sam-projects-ledger".to_string(),
+                cwd: "/home/sam/projects/ledger".to_string(),
+                first: at,
+                last: at,
+                last_model: Some("claude-fable-5-2".to_string()),
+                last_user_turn: None,
+                thinking: Vec::new(),
+                totals: Default::default(),
+                by_model: Default::default(),
+                agents: Default::default(),
+                spawns: Default::default(),
+                recent: Default::default(),
+                recorded: None,
+            },
+        );
+
+        let mut memory = SessionMemory::new(claude.home().to_path_buf());
+        let outcome = run_pass(
+            &app,
+            &claude,
+            &probe(&[910, 911]),
+            None,
+            &mut state,
+            &mut memory,
+            at,
+            None,
+        );
+
+        assert_eq!(outcome.summary.tied, 2);
+        assert_eq!(outcome.summary.tied_busy, 1);
     }
 
     /// A closed session that answers again gets one new closed record; an

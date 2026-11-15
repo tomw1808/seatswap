@@ -35,6 +35,19 @@ function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+// Whether an account view of a snapshot is the account in use: its own
+// `isActive` flag, or the snapshot's `activeId`. The pop-up and the window
+// both ask this one rule.
+function isActiveView(view, snapshot) {
+  if (!isObject(view)) return false;
+  if (view.isActive === true) return true;
+  return Boolean(
+    isObject(snapshot) &&
+      typeof snapshot.activeId === "string" &&
+      view.id === snapshot.activeId
+  );
+}
+
 function clamp(value, low, high) {
   return Math.min(high, Math.max(low, value));
 }
@@ -590,6 +603,7 @@ export {
   TAURI_GLOBAL,
   HAS_TAURI,
   isObject,
+  isActiveView,
   clamp,
   clone,
   errorMessage,

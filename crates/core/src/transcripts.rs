@@ -110,7 +110,8 @@ pub struct AgentMeta {
     pub agent_type: Option<String>,
     pub description: Option<String>,
     pub finished: bool,
-    pub spawn_depth: u32,
+    /// The nesting the meta names; `None` when the meta file could not be read.
+    pub spawn_depth: Option<u32>,
     /// The `toolUseId` of the call that started the agent.
     pub tool_use_id: Option<String>,
     /// The agent that made the call; `None` when the session made it.
@@ -667,16 +668,30 @@ pub fn last_hour(seen: &SessionSeen, now: DateTime<Utc>) -> Tokens {
     tokens
 }
 
+/// The agents a session started, and the meta files that could not be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Agents {
+    pub metas: Vec<AgentMeta>,
+    pub warnings: Vec<String>,
+}
+
 /// The agents a session started, from their `*.meta.json` files. `spawns` maps
 /// the `tool_use` id of an `Agent` or `Task` call to the agent that made it
-/// (`None`: the main transcript), and gives each agent its parent. Unreadable
-/// files are left out.
+/// (`None`: the main transcript), and gives each agent its parent.
+///
+/// A meta file that cannot be read or parsed is a warning naming the file and
+/// the reason, and its agent is still listed, as running: a meta without
+/// `finished` means a running agent, and an unreadable meta cannot say it
+/// finished.
 pub fn agents_of(
     claude: &ClaudePaths,
     session: &str,
     spawns: &BTreeMap<String, Option<String>>,
-) -> Vec<AgentMeta> {
-    let mut out = Vec::new();
+) -> Agents {
+    let mut out = Agents {
+        metas: Vec::new(),
+        warnings: Vec::new(),
+    };
     let dir = claude.projects_dir();
     let Ok(entries) = fs::read_dir(&dir) else {
         return out;
@@ -704,11 +719,29 @@ pub fn agents_of(
             let Some(agent) = file_name.to_str().and_then(agent_meta_id) else {
                 continue;
             };
-            let Ok(bytes) = fs::read(entry.path()) else {
-                continue;
+            let path = entry.path();
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(source) => {
+                    out.warnings
+                        .push(format!("agent meta {}: {source}", path.display()));
+                    out.metas.push(unread_agent(session, agent));
+                    continue;
+                }
             };
-            let Ok(meta) = serde_json::from_slice::<AgentMetaFile>(&bytes) else {
-                continue;
+            let meta = match serde_json::from_slice::<AgentMetaFile>(&bytes) {
+                Ok(meta) => meta,
+                Err(error) => {
+                    // Never the parser's message: it can quote the file's text.
+                    out.warnings.push(format!(
+                        "agent meta {}: not valid JSON at line {} column {}",
+                        path.display(),
+                        error.line(),
+                        error.column()
+                    ));
+                    out.metas.push(unread_agent(session, agent));
+                    continue;
+                }
             };
             let parent = meta
                 .tool_use_id
@@ -716,20 +749,35 @@ pub fn agents_of(
                 .and_then(|id| spawns.get(id))
                 .cloned()
                 .flatten();
-            out.push(AgentMeta {
+            out.metas.push(AgentMeta {
                 session: session.to_string(),
                 agent: agent.to_string(),
                 agent_type: meta.agent_type,
                 description: meta.description,
                 finished: meta.finished.unwrap_or(false),
-                spawn_depth: meta.spawn_depth,
+                spawn_depth: Some(meta.spawn_depth),
                 tool_use_id: meta.tool_use_id,
                 parent,
             });
         }
     }
-    out.sort_by(|a, b| a.agent.cmp(&b.agent));
+    out.metas.sort_by(|a, b| a.agent.cmp(&b.agent));
     out
+}
+
+/// The agent entry of a meta file that could not be read: still running (a
+/// meta without `finished` is a running agent), with everything else unknown.
+fn unread_agent(session: &str, agent: &str) -> AgentMeta {
+    AgentMeta {
+        session: session.to_string(),
+        agent: agent.to_string(),
+        agent_type: None,
+        description: None,
+        finished: false,
+        spawn_depth: None,
+        tool_use_id: None,
+        parent: None,
+    }
 }
 
 /// One [`TokenRecord`] per (session, hour, model).
@@ -2336,20 +2384,44 @@ mod tests {
         .unwrap();
 
         // No scan state here, so no call is known: no agent has a parent.
-        let metas = agents_of(&claude, SESSION, &BTreeMap::new());
+        let agents = agents_of(&claude, SESSION, &BTreeMap::new());
 
+        assert!(agents.warnings.is_empty(), "{:?}", agents.warnings);
         assert_eq!(
-            metas,
+            agents.metas,
             vec![AgentMeta {
                 session: SESSION.to_string(),
                 agent: "a875".to_string(),
                 agent_type: Some("general-purpose".to_string()),
                 description: Some("fix the failing tests".to_string()),
                 finished: true,
-                spawn_depth: 1,
+                spawn_depth: Some(1),
                 tool_use_id: Some("toolu_01Nkn4".to_string()),
                 parent: None,
             }]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_meta_file_is_a_warning_and_the_agent_is_running() {
+        let (_tmp, claude, _app) = fixture();
+        let dir = folder(&claude, FOLDER).join(SESSION).join("subagents");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("agent-a875.meta.json"), "{\"agentType\": ").unwrap();
+
+        let agents = agents_of(&claude, SESSION, &BTreeMap::new());
+
+        assert_eq!(agents.metas.len(), 1, "{:?}", agents.warnings);
+        assert!(
+            !agents.metas[0].finished,
+            "an unreadable meta cannot say the agent finished"
+        );
+        assert_eq!(agents.metas[0].spawn_depth, None);
+        assert_eq!(agents.warnings.len(), 1);
+        assert!(
+            agents.warnings[0].contains("agent-a875.meta.json"),
+            "the warning names the file: {:?}",
+            agents.warnings
         );
     }
 
@@ -2365,10 +2437,10 @@ mod tests {
         .unwrap();
 
         // No scan state here, so no call is known: no agent has a parent.
-        let metas = agents_of(&claude, SESSION, &BTreeMap::new());
+        let agents = agents_of(&claude, SESSION, &BTreeMap::new());
 
-        assert_eq!(metas.len(), 1);
-        assert!(!metas[0].finished);
+        assert_eq!(agents.metas.len(), 1);
+        assert!(!agents.metas[0].finished);
     }
 
     #[test]
@@ -3344,7 +3416,8 @@ mod tests {
         .unwrap();
 
         let (state, _scan) = scan_run(&claude);
-        let metas = agents_of(&claude, SESSION, &state.sessions[SESSION].spawns);
+        let agents = agents_of(&claude, SESSION, &state.sessions[SESSION].spawns);
+        let metas = agents.metas;
 
         let started_by_agent = metas
             .iter()

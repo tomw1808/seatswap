@@ -15,6 +15,7 @@ import {
   followTheme,
   h,
   isColor,
+  isActiveView,
   isObject,
   invoke,
   limitLevel,
@@ -90,11 +91,7 @@ function allViews() {
 }
 
 function viewIsActive(view) {
-  if (!view) return false;
-  if (view.isActive) return true;
-  return Boolean(
-    state.snapshot && state.snapshot.activeId && view.id === state.snapshot.activeId
-  );
+  return isActiveView(view, state.snapshot);
 }
 
 // The active account is the bottom card; the others keep the list order.

@@ -6,7 +6,7 @@
 //! time, and a `snapshot` event reaches each of them.
 
 #[cfg(feature = "gui")]
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(feature = "gui")]
 use chrono::{DateTime, Duration, Utc};
@@ -192,11 +192,9 @@ pub(crate) async fn sessions_view(
     options: SessionsOptions,
 ) -> Result<SessionsView, String> {
     let client = state.sessions_commands()?;
-    let snapshot = state.snapshot()?;
-    let mut view = tauri::async_runtime::spawn_blocking(move || client.view(options))
+    let view = tauri::async_runtime::spawn_blocking(move || client.view(options))
         .await
         .map_err(|error| error.to_string())??;
-    super::fill_in_use(&mut view, &snapshot);
     Ok(view)
 }
 
@@ -275,11 +273,14 @@ pub(crate) struct HostState {
 
 /// What a switch now costs this host's running sessions (spec §2.11).
 #[cfg(feature = "gui")]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SwitchEffect {
     pub loses_thinking: u32,
     pub loses_thinking_busy: u32,
+    /// The distinct model ids of the sessions counted in `loses_thinking`, in
+    /// the order their first session is listed.
+    pub loses_thinking_models: Vec<String>,
     pub resend: u32,
     pub free: u32,
 }
@@ -359,8 +360,6 @@ pub(crate) struct SessionsView {
     pub sums: Vec<Sum>,
     /// This host's running sessions only, whatever the host filter says.
     pub switch_effect: SwitchEffect,
-    /// The id of the account in use; filled in by `gui::fill_in_use`.
-    pub in_use: Option<String>,
     pub currency: Option<String>,
     pub unavailable: Option<String>,
 }
@@ -422,7 +421,18 @@ pub(crate) fn view_of(
                 .filter(|row| filter.is_none() || filter == Some(row.host.as_str()))
                 .collect();
             closed_rows.sort_by_key(|row| std::cmp::Reverse(row.since));
-            sessions.extend(closed_rows.into_iter().cloned());
+            // A session listed as running already is the newer fact: its closed
+            // row from the history is not listed a second time.
+            let listed: BTreeSet<(String, String)> = sessions
+                .iter()
+                .map(|row| (row.host.clone(), row.session.clone()))
+                .collect();
+            sessions.extend(
+                closed_rows
+                    .into_iter()
+                    .filter(|row| !listed.contains(&(row.host.clone(), row.session.clone())))
+                    .cloned(),
+            );
         }
     }
 
@@ -431,6 +441,11 @@ pub(crate) fn view_of(
         match switch_kind(row, thinking.get(&row.session).copied().unwrap_or(0), at) {
             SwitchKind::LosesThinking => {
                 switch_effect.loses_thinking += 1;
+                if let Some(model) = &row.model {
+                    if !switch_effect.loses_thinking_models.contains(model) {
+                        switch_effect.loses_thinking_models.push(model.clone());
+                    }
+                }
                 if row.status == LiveStatus::Busy {
                     switch_effect.loses_thinking_busy += 1;
                 }
@@ -448,7 +463,6 @@ pub(crate) fn view_of(
         sessions,
         sums,
         switch_effect,
-        in_use: None,
         currency: currency.map(str::to_string),
         unavailable: unavailable.map(str::to_string),
     }
@@ -764,6 +778,56 @@ mod tests {
 
     #[cfg(feature = "gui")]
     #[test]
+    fn a_session_running_on_another_host_is_not_listed_closed_too() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let now = time("2026-11-14T10:00:00Z");
+        let mut running = row(
+            VEGA,
+            "vega",
+            LiveStatus::Busy,
+            Some("claude-opus-5-5"),
+            now - Duration::minutes(2),
+        );
+        running.tokens.out = 1_000_000;
+        let other = vega_report(tmp.path(), now, vec![running]);
+        let mut closed = row(
+            VEGA,
+            "vega",
+            LiveStatus::Closed,
+            Some("claude-opus-5-5"),
+            now - Duration::hours(3),
+        );
+        closed.tokens.out = 9_000_000;
+
+        let view = view_of(
+            now,
+            Some("atlas".to_string()),
+            &[],
+            &[closed],
+            &other,
+            &BTreeMap::new(),
+            None,
+            None,
+            &options(ClosedSince::Day, None),
+        );
+
+        assert_eq!(view.sessions.len(), 1, "{:?}", view.sessions);
+        assert_eq!(view.sessions[0].session, VEGA);
+        assert_eq!(view.sessions[0].status, LiveStatus::Busy);
+        let all = view
+            .sums
+            .iter()
+            .find(|sum| sum.of == SumOf::All)
+            .expect("the total");
+        assert_eq!(all.sessions, 1);
+        assert_eq!(
+            all.tokens.out, 1_000_000,
+            "the closed row's tokens are not counted a second time"
+        );
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
     fn a_host_filter_keeps_only_that_host() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let now = time("2026-11-14T10:00:00Z");
@@ -876,9 +940,62 @@ mod tests {
             SwitchEffect {
                 loses_thinking: 3,
                 loses_thinking_busy: 1,
+                loses_thinking_models: vec!["claude-fable-5-2".to_string()],
                 resend: 2,
                 free: 4,
             }
+        );
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn the_switch_effect_names_the_models_that_lose_thinking() {
+        let now = time("2026-11-14T10:00:00Z");
+        let running = vec![
+            row(
+                &id(0),
+                "atlas",
+                LiveStatus::Busy,
+                Some("claude-fable-5-2"),
+                now,
+            ),
+            row(
+                &id(1),
+                "atlas",
+                LiveStatus::Idle,
+                Some("claude-sonnet-5-5"),
+                now - Duration::minutes(10),
+            ),
+            row(
+                &id(2),
+                "atlas",
+                LiveStatus::Idle,
+                Some("claude-fable-5-2"),
+                now - Duration::minutes(10),
+            ),
+        ];
+        let thinking: BTreeMap<String, u32> =
+            running.iter().map(|row| (row.session.clone(), 1)).collect();
+        let view = view_of(
+            now,
+            Some("atlas".to_string()),
+            &running,
+            &[],
+            &[],
+            &thinking,
+            None,
+            None,
+            &SessionsOptions::default(),
+        );
+
+        assert_eq!(view.switch_effect.loses_thinking, 3);
+        assert_eq!(
+            view.switch_effect.loses_thinking_models,
+            vec![
+                "claude-fable-5-2".to_string(),
+                "claude-sonnet-5-5".to_string()
+            ],
+            "each model once, in the order its first session is listed"
         );
     }
 
@@ -929,6 +1046,7 @@ mod tests {
             SwitchEffect {
                 loses_thinking: 1,
                 loses_thinking_busy: 1,
+                loses_thinking_models: vec!["claude-fable-5-2".to_string()],
                 resend: 0,
                 free: 0,
             },
@@ -1236,65 +1354,5 @@ mod tests {
         assert_eq!(all.sessions, 4);
         assert_eq!(all.tokens.out, 6_500_000);
         assert_eq!(all.last_hour.out, 650_000);
-    }
-
-    #[cfg(feature = "gui")]
-    #[test]
-    fn in_use_is_the_active_account() {
-        use seatswap_core::engine::AccountView;
-        use seatswap_core::store::LoginState;
-
-        fn account_view(id: &str, is_active: bool) -> AccountView {
-            AccountView {
-                id: id.to_string(),
-                label: id.to_string(),
-                abbr: "AC".to_string(),
-                color: "#3b82f6".to_string(),
-                email: None,
-                plan: None,
-                auto_burn: true,
-                is_active,
-                login_state: LoginState::Ok,
-                login_ends_at_ms: None,
-                login_days_left: None,
-                usage: None,
-                usable: true,
-                blocked_until: None,
-                blocker: None,
-                fetched_at: None,
-                last_error: None,
-            }
-        }
-
-        let now = time("2026-11-14T10:00:00Z");
-        let mut view = view_of(
-            now,
-            Some("atlas".to_string()),
-            &[],
-            &[],
-            &[],
-            &BTreeMap::new(),
-            None,
-            None,
-            &SessionsOptions::default(),
-        );
-        assert_eq!(view.in_use, None);
-        let snapshot = super::super::worker::Snapshot {
-            views: vec![account_view("id-ac", false), account_view("id-lb", true)],
-            accounts: Vec::new(),
-            active_id: Some("id-lb".to_string()),
-            live: super::super::worker::LiveView::NoLogin,
-            burn: None,
-            warnings: Vec::new(),
-            pending: None,
-            secrets_warning: None,
-            last_poll_at: None,
-            error: None,
-            sessions: None,
-            settings: None,
-            claude_config_dir: String::new(),
-        };
-        super::super::fill_in_use(&mut view, &snapshot);
-        assert_eq!(view.in_use.as_deref(), Some("id-lb"));
     }
 }
