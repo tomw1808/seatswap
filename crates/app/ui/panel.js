@@ -78,6 +78,8 @@ const state = {
     add: null,
     settings: null,
     settingsConfigDir: null,
+    settingsHostName: null,
+    settingsHistoryDir: null,
     settingsSaved: false,
   },
   fixture: null,
@@ -469,6 +471,7 @@ function renderMain() {
   state.lastCardOrder = nextOrder;
   if (reordered) animateCardMoves(cards, previousPositions);
 
+  renderFooter();
   updateAge();
   fitPanel();
 
@@ -484,6 +487,47 @@ function renderMain() {
         }
       }
     }
+  }
+}
+
+// The footer line beside "+ Add account": the running sessions, and a warning
+// mark whose tooltip is the sessions thread's warning (spec §1.6).
+function renderFooter() {
+  const footer = document.querySelector(".footer");
+  if (!footer) return;
+  for (const old of footer.querySelectorAll(".footer-sessions, .footer-warning")) {
+    old.remove();
+  }
+  const snapshot = state.snapshot;
+  if (!snapshot || snapshot.sessions == null) return;
+  const sessions = snapshot.sessions;
+  if (sessions.unavailable != null) {
+    footer.appendChild(
+      h("span", {
+        class: "footer-sessions",
+        text: String(sessions.unavailable),
+      })
+    );
+  } else {
+    const waiting = Array.isArray(sessions.waiting) ? sessions.waiting.length : 0;
+    const line = h("span", { class: "footer-sessions" }, [
+      `${sessions.running} sessions · ${sessions.busy} busy`,
+    ]);
+    if (waiting > 0) {
+      line.appendChild(
+        h("span", { class: "footer-waiting", text: ` · ${waiting} waiting for you` })
+      );
+    }
+    footer.appendChild(line);
+  }
+  if (sessions.warning != null) {
+    footer.appendChild(
+      h("span", {
+        class: "footer-warning",
+        title: String(sessions.warning),
+        text: "⚠",
+      })
+    );
   }
 }
 
@@ -1794,7 +1838,7 @@ function renderSettings() {
   });
   configInput.addEventListener("input", () => {
     draft.claudeConfigDir = configInput.value;
-    settingsConfigDirError(null);
+    settingsFieldError("claudeConfigDir", null);
   });
   const configField = h("div", { class: "field" }, [
     configInput,
@@ -1817,6 +1861,95 @@ function renderSettings() {
       class: "setting-note",
       text: "Takes effect after restarting seatswap.",
     })
+  );
+
+  settings.appendChild(settingGroup("History"));
+
+  const hostInput = textInput({
+    value: draft.hostName || "",
+    placeholder: "the machine's name",
+    "aria-label": "Name of this host",
+  });
+  hostInput.addEventListener("input", () => {
+    draft.hostName = hostInput.value;
+    settingsFieldError("hostName", null);
+  });
+  settings.appendChild(
+    settingRow(
+      "Name of this host",
+      h("div", { class: "field" }, [
+        hostInput,
+        h("div", {
+          class: "inline-error",
+          id: "host-name-error",
+          hidden: !state.errors.settingsHostName,
+          text: state.errors.settingsHostName || "",
+        }),
+      ]),
+      "Empty: the machine's name."
+    )
+  );
+
+  const historyInput = textInput({
+    value: draft.historyDir || "",
+    placeholder: "seatswap's own folder",
+    "aria-label": "History folder",
+  });
+  historyInput.addEventListener("input", () => {
+    draft.historyDir = historyInput.value;
+    settingsFieldError("historyDir", null);
+  });
+  settings.appendChild(
+    settingRow(
+      "History folder",
+      h("div", { class: "field" }, [
+        historyInput,
+        h("div", {
+          class: "inline-error",
+          id: "history-dir-error",
+          hidden: !state.errors.settingsHistoryDir,
+          text: state.errors.settingsHistoryDir || "",
+        }),
+      ]),
+      "Empty: seatswap's own folder."
+    )
+  );
+
+  settings.appendChild(
+    settingRow(
+      "Read Claude Code's session files",
+      checkboxControl(draft, "readSessions"),
+      "model, busy or idle, tokens per folder · never message text"
+    )
+  );
+  settings.appendChild(
+    h("div", {
+      class: "setting-note",
+      text: "Takes effect after restarting seatswap.",
+    })
+  );
+
+  settings.appendChild(settingGroup("Notifications"));
+  settings.appendChild(
+    settingRow("An account is usable again", checkboxControl(draft, "notifyUsableAgain"))
+  );
+  settings.appendChild(
+    settingRow("A session is waiting for you", checkboxControl(draft, "notifyWaiting"))
+  );
+
+  settings.appendChild(settingGroup("Agents"));
+  settings.appendChild(
+    settingRow("Agents may read usage", checkboxControl(draft, "agentsRead"))
+  );
+  settings.appendChild(
+    settingRow("Agents may switch accounts", checkboxControl(draft, "agentsSwitch"))
+  );
+  settings.appendChild(
+    h("div", { class: "setting-note" }, [
+      "These two switches work through a marker that Claude Code puts on every command it runs. An agent runs as you. It can remove the marker, or change seatswap's files directly. The switches stop agents that follow the rules. They are not a lock. To block the command itself, add a deny rule for ",
+      h("code", { text: "seatswap" }),
+      " to Claude Code's permissions.",
+    ])
   );
 
   root.appendChild(settings);
@@ -1844,6 +1977,15 @@ function renderSettings() {
   );
 
   fitPanel();
+}
+
+function settingGroup(title) {
+  return h("div", {
+    class: "setting-group",
+    role: "heading",
+    "aria-level": "3",
+    text: title,
+  });
 }
 
 function settingRow(labelText, control, subText) {
@@ -1906,14 +2048,49 @@ function settingsError(text) {
   fitPanel();
 }
 
-function settingsConfigDirError(text) {
-  state.errors.settingsConfigDir = text || null;
-  const node = document.getElementById("claude-config-error");
+const SETTINGS_FIELD_ERRORS = {
+  claudeConfigDir: ["settingsConfigDir", "claude-config-error"],
+  hostName: ["settingsHostName", "host-name-error"],
+  historyDir: ["settingsHistoryDir", "history-dir-error"],
+};
+
+function settingsFieldError(field, text) {
+  const target = SETTINGS_FIELD_ERRORS[field];
+  if (!target) return;
+  state.errors[target[0]] = text || null;
+  const node = document.getElementById(target[1]);
   if (node) {
     node.textContent = text || "";
     node.hidden = !text;
   }
   fitPanel();
+}
+
+// Which row an error from the core belongs to. A relative path is not always
+// claudeConfigDir's fault: historyDir and hostName have their own rules.
+function settingsErrorField(message) {
+  if (message.includes("historyDir")) return "historyDir";
+  if (
+    message.includes("hostName") ||
+    /host name .*must be 1 to 63 characters/i.test(message)
+  ) {
+    return "hostName";
+  }
+  if (message.includes("claudeConfigDir")) return "claudeConfigDir";
+  return null;
+}
+
+function routeSettingsError(message) {
+  settingsFieldError("hostName", null);
+  settingsFieldError("historyDir", null);
+  settingsFieldError("claudeConfigDir", null);
+  const field = settingsErrorField(message);
+  if (field) {
+    settingsFieldError(field, message);
+    settingsError(null);
+  } else {
+    settingsError(message);
+  }
 }
 
 async function saveSettings() {
@@ -1946,8 +2123,10 @@ async function saveSettings() {
   }
 
   const configDir = String(draft.claudeConfigDir || "").trim();
-  // Keep every field the pop-up does not edit (history, sessions, notifications,
-  // agents), so saving here never resets one of them to its default.
+  const hostName = String(draft.hostName || "").trim();
+  const historyDir = String(draft.historyDir || "").trim();
+  // Keep every field the pop-up does not edit, so saving here never resets one
+  // of them to its default.
   const payload = Object.assign({}, draft);
   Object.assign(payload, {
     trayText: draft.trayText,
@@ -1963,18 +2142,29 @@ async function saveSettings() {
     startAtLogin: Boolean(draft.startAtLogin),
     theme: draft.theme,
     claudeConfigDir: configDir === "" ? null : configDir,
+    hostName: hostName === "" ? null : hostName,
+    historyDir: historyDir === "" ? null : historyDir,
+    readSessions: Boolean(draft.readSessions),
+    notifyUsableAgain: Boolean(draft.notifyUsableAgain),
+    notifyWaiting: Boolean(draft.notifyWaiting),
+    agentsRead: Boolean(draft.agentsRead),
+    agentsSwitch: Boolean(draft.agentsSwitch),
   });
 
   try {
     await invoke("save_settings", { settings: payload });
     state.errors.settings = null;
     state.errors.settingsConfigDir = null;
+    state.errors.settingsHostName = null;
+    state.errors.settingsHistoryDir = null;
     state.errors.settingsSaved = true;
     Object.assign(draft, payload);
     state.settingsDraft = draft;
     if (state.snapshot) state.snapshot.settings = Object.assign({}, payload);
     applyTheme(payload.theme);
-    settingsConfigDirError(null);
+    settingsFieldError("hostName", null);
+    settingsFieldError("historyDir", null);
+    settingsFieldError("claudeConfigDir", null);
     settingsError(null);
     afterCommand();
   } catch (error) {
@@ -1987,17 +2177,7 @@ async function saveSettings() {
       state.settingsDraft = null;
       renderSettings();
     }
-    // A relative claudeConfigDir comes back from the core; keep it at the
-    // field that caused it instead of in the panel-wide error at the bottom.
-    const configProblem =
-      message.includes("claudeConfigDir") || /absolute path/i.test(message);
-    if (configProblem) {
-      settingsConfigDirError(message);
-      settingsError(null);
-    } else {
-      settingsConfigDirError(null);
-      settingsError(message);
-    }
+    routeSettingsError(message);
   }
 }
 
@@ -2207,6 +2387,8 @@ function setView(view, options) {
     state.settingsDraft = null;
     state.errors.settings = null;
     state.errors.settingsConfigDir = null;
+    state.errors.settingsHostName = null;
+    state.errors.settingsHistoryDir = null;
     state.errors.settingsSaved = false;
     renderSettings();
   }
@@ -2498,13 +2680,13 @@ function makeFixture() {
     lastPollAt: isoIn(-12000),
     error: null,
     sessions: {
-      running: 2,
-      busy: 1,
+      running: 9,
+      busy: 2,
       waiting: [
         {
           session: "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34",
-          label: "atlas-7c",
-          project: "atlas",
+          label: "acme-kb-dd",
+          project: "acme-kb",
           since: isoIn(-4 * 60000),
         },
       ],
@@ -2679,6 +2861,21 @@ function validateFixtureSettings(settings) {
     throw new Error(
       `claudeConfigDir must be an absolute path, got ${merged.claudeConfigDir}`
     );
+  }
+  if (
+    merged.historyDir !== null &&
+    merged.historyDir !== undefined &&
+    !String(merged.historyDir).startsWith("/")
+  ) {
+    throw new Error(`historyDir must be an absolute path, got ${merged.historyDir}`);
+  }
+  if (merged.hostName !== null && merged.hostName !== undefined) {
+    const name = String(merged.hostName);
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/.test(name)) {
+      throw new Error(
+        `host name ${JSON.stringify(name)} must be 1 to 63 characters of A-Z, a-z, 0-9, '.', '_' or '-' and must start with a letter or a digit; set hostName in the settings`
+      );
+    }
   }
   return merged;
 }
