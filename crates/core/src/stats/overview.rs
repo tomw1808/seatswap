@@ -18,10 +18,10 @@ use crate::money::Valuer;
 use crate::projects::ProjectId;
 
 use super::{
-    account_abbr, account_id, account_position, account_weeks_valued, blocked_by_week,
-    blocked_spans, date_text, hours_text, lost_percent, money_of, money_text, percent_text,
-    range_of, switch_counts, top_three, week_columns, week_of_record, working_rhythm, AccountWeek,
-    Ctx, Query, StatsError, SwitchCounts, WindowMoney,
+    account_abbr, account_id, account_position, account_weeks_valued, accounts_without_price,
+    blocked_by_week, blocked_spans, date_text, hours_text, lost_percent, money_of, money_text,
+    percent_text, range_of, switch_counts, top_three, week_columns, week_of_record, working_rhythm,
+    AccountWeek, Ctx, Query, StatsError, SwitchCounts, WindowMoney,
 };
 
 /// The Overview page's numbers for one range (spec §3.1).
@@ -32,7 +32,8 @@ pub struct Overview {
     pub currency: Option<String>,
     /// The accounts with at least one week left out of the money sums, in the
     /// order of [`Ctx::accounts`]: a week without a price is left out, while
-    /// the account's priced weeks still count.
+    /// the account's priced weeks still count. An account no longer stored is
+    /// named by its id after the stored ones.
     pub without_price: Vec<String>,
     pub kpis: Kpis,
     pub weeks: Vec<OverviewWeek>,
@@ -126,16 +127,7 @@ pub(crate) fn overview_in(ctx: &Ctx, range: &Range, q: &Query) -> Result<Overvie
     let samples = ctx.history.read::<Sample>(&reading, &Hosts::All)?;
     let tokens = ctx.history.read::<TokenRecord>(&reading, &Hosts::All)?;
 
-    let mut without_price = Vec::new();
-    for account in ctx.accounts {
-        let reference = AccountRef::of(account);
-        if finished
-            .iter()
-            .any(|week| week.account == reference && week.price.is_none())
-        {
-            without_price.push(account.id.clone());
-        }
-    }
+    let without_price = accounts_without_price(ctx, &finished);
 
     // The page shows every calendar week of the range, with or without an
     // account week; the blocked hours of all of them add up to the KPI.

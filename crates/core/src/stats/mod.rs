@@ -18,6 +18,7 @@ use crate::store::{Account, Settings};
 
 pub mod overview;
 pub mod projects;
+pub mod subscriptions;
 pub mod weeks;
 
 #[derive(Debug, thiserror::Error)]
@@ -191,6 +192,33 @@ pub(crate) fn account_weeks_valued(
         }
     }
     Ok(weeks)
+}
+
+/// The ids of the accounts with at least one account week without a price:
+/// stored accounts in [`Ctx::accounts`] order, then accounts no longer stored
+/// by id. These are the accounts left out of a money sum; a priced week of the
+/// same account still counts.
+pub(crate) fn accounts_without_price(ctx: &Ctx, weeks: &[AccountWeek]) -> Vec<String> {
+    let mut ids: Vec<String> = ctx
+        .accounts
+        .iter()
+        .filter(|account| {
+            let reference = AccountRef::of(account);
+            weeks
+                .iter()
+                .any(|week| week.account == reference && week.price.is_none())
+        })
+        .map(|account| account.id.clone())
+        .collect();
+    let mut removed: Vec<String> = weeks
+        .iter()
+        .filter(|week| week.price.is_none() && stored_account(ctx, &week.account).is_none())
+        .map(|week| account_id(ctx, &week.account))
+        .collect();
+    removed.sort();
+    removed.dedup();
+    ids.extend(removed);
+    ids
 }
 
 /// The switches of the range by who made them.
@@ -574,7 +602,7 @@ fn has_record(ctx: &Ctx, range: &Range) -> Result<bool, StatsError> {
         || any_record::<ProjectsLogRecord>(ctx.history, range)?)
 }
 
-fn stored_account<'a>(ctx: &Ctx<'a>, reference: &AccountRef) -> Option<&'a Account> {
+pub(crate) fn stored_account<'a>(ctx: &Ctx<'a>, reference: &AccountRef) -> Option<&'a Account> {
     ctx.accounts.iter().find(|account| {
         account.account_uuid == reference.acc && account.organization_uuid == reference.org
     })
