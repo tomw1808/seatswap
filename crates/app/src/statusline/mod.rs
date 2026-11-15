@@ -3,17 +3,18 @@
 //!
 //! `parse` is the one place a malformed payload is tolerated: Claude Code may
 //! send anything, and the status line must still print. `facts` gathers what
-//! the line shows besides the payload; `render` fits it to the terminal.
+//! the line shows besides the payload; `render_spans` fits it to the terminal
+//! and `ansi` turns the spans into the command's one line.
 
-use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use chrono::{DateTime, TimeZone, Utc};
+use serde::{Deserialize, Serialize};
 
 use seatswap_core::api::Usage;
 use seatswap_core::burn::burn_next;
 use seatswap_core::engine::UsageCache;
 use seatswap_core::feed::{self, Feed, FeedLimit};
 use seatswap_core::paths::{self, AppPaths};
-use seatswap_core::store::{Account, AccountsFile, Settings};
+use seatswap_core::store::{Account, AccountsFile, SegmentKind, Settings, StatuslineConfig};
 use seatswap_core::switcher::LiveState;
 
 use crate::gui::ipc;
@@ -21,7 +22,12 @@ use crate::gui::ipc;
 pub(crate) mod render;
 pub(crate) mod width;
 
-use render::{git_branch, AccountFacts, Facts, Limit2};
+use render::{git_branch, AccountFacts, Facts, Limit2, Span};
+
+/// The status line payload of `specs/plan/README.md` §5, whole. The preview
+/// uses this one payload for every scenario.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const README_PAYLOAD: &str = r#"{"workspace":{"current_dir":"/home/sam/projects/atlas"},"model":{"id":"claude-fable-5-2","display_name":"Fable 5.2"},"effort":{"level":"high"},"rate_limits":{"five_hour":{"used_percentage":12,"resets_at":1794490200},"seven_day":{"used_percentage":48,"resets_at":1794790800}}}"#;
 
 /// The parts of the payload seatswap reads. Unknown keys are ignored: Claude
 /// Code adds keys with new versions. A key that is missing or `null` is `None`.
@@ -29,6 +35,10 @@ use render::{git_branch, AccountFacts, Facts, Limit2};
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Deserialize, Default)]
 pub(crate) struct Payload {
+    /// The whole payload as Claude Code sent it, for the fields that are not
+    /// typed above. `Null` when standard input was not JSON.
+    #[serde(skip)]
+    pub raw: serde_json::Value,
     pub workspace: Option<Workspace>,
     pub model: Option<Model>,
     pub effort: Option<Effort>,
@@ -79,13 +89,17 @@ pub(crate) struct RateLimit {
 }
 
 /// Claude Code's JSON to a [`Payload`]. Anything that is not a JSON object of
-/// this shape gives [`Payload::default()`]: the line must print whatever the
-/// input was. A present key of the wrong type is an error for the whole
-/// payload (the `RateLimit` fields are not optional), so it is defaulted too.
+/// this shape gives the default typed fields: the line must print whatever the
+/// input was. `raw` keeps what was parsed, or `null` when it was not JSON. A
+/// present key of the wrong type is an error for the whole typed payload (the
+/// `RateLimit` fields are not optional), so it is defaulted too.
 // used by the statusline command (step B, Task 2)
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn parse(stdin: &[u8]) -> Payload {
-    serde_json::from_slice(stdin).unwrap_or_default()
+    let raw: serde_json::Value = serde_json::from_slice(stdin).unwrap_or_default();
+    let mut payload: Payload = serde_json::from_value(raw.clone()).unwrap_or_default();
+    payload.raw = raw;
+    payload
 }
 
 /// The feed a payload carries: its 5 h and weekly numbers and its model, at
@@ -144,6 +158,111 @@ fn cached_limit(limit: &seatswap_core::api::Limit) -> Limit2 {
     }
 }
 
+/// The next account the tray app wrote to `burn-next.json`, named through the
+/// caller's lookup: the command looks in its accounts file, the preview in the
+/// snapshot's views. The tray app writes the file only while auto-burn is on
+/// and unpaused; a missing or stale file is no value. An id the lookup does not
+/// know is no value either, never a guessed abbreviation.
+pub(crate) fn burn_next_account(
+    app: &AppPaths,
+    now: DateTime<Utc>,
+    abbr_of: impl Fn(&str) -> Option<String>,
+) -> Result<Option<(String, DateTime<Utc>)>, String> {
+    match burn_next::read(app, now) {
+        Ok(Some(next)) => Ok(abbr_of(&next.account).map(|abbr| (abbr, next.at))),
+        Ok(None) => Ok(None),
+        Err(error) => Err(format!(
+            "cannot read {}: {error}",
+            app.burn_next_file().display()
+        )),
+    }
+}
+
+/// Where the numbers besides the payload come from: the status line command
+/// reads `accounts.json` and `usage-cache.json`; the window preview reads the
+/// current snapshot. Both go through [`facts_from_source`].
+pub(crate) trait FactsSource {
+    fn host_name(&self) -> Option<&str>;
+    fn account(&self, account_id: &str) -> Option<AccountFacts>;
+    fn usage(&self, account_id: &str, feed: Option<&Feed>) -> Option<Usage>;
+    fn model_limits(&self, account_id: &str) -> Vec<(String, f64)>;
+    fn burn_next(&self, now: DateTime<Utc>) -> Result<Option<(String, DateTime<Utc>)>, String>;
+}
+
+/// The command's source: the files it read without a lock.
+struct AccountsFacts<'a> {
+    app: &'a AppPaths,
+    file: &'a AccountsFile,
+    cache: &'a UsageCache,
+}
+
+impl FactsSource for AccountsFacts<'_> {
+    fn host_name(&self) -> Option<&str> {
+        self.file.settings.host_name.as_deref()
+    }
+
+    fn account(&self, account_id: &str) -> Option<AccountFacts> {
+        let account: &Account = self.file.find(account_id)?;
+        Some(AccountFacts {
+            abbr: account.abbr.clone(),
+            color: account.color.clone(),
+            plan: account.plan.clone(),
+        })
+    }
+
+    fn usage(&self, account_id: &str, feed: Option<&Feed>) -> Option<Usage> {
+        let cached = self
+            .cache
+            .entries
+            .get(account_id)
+            .and_then(|entry| entry.usage.as_ref())?;
+        // The payload's numbers are shown only when they belong to the live
+        // account. A fresh session that has not sent a request since a switch
+        // carries the old account's numbers; they are never printed under the
+        // new account's letters. Without a cache entry there is nothing to
+        // compare.
+        let belongs_to_live = feed.is_some_and(|feed| {
+            feed::account_for(feed, self.cache, &self.file.accounts).as_deref() == Some(account_id)
+        });
+        Some(match (feed, belongs_to_live) {
+            (Some(feed), true) => feed::merged(cached, feed),
+            _ => cached.clone(),
+        })
+    }
+
+    fn model_limits(&self, account_id: &str) -> Vec<(String, f64)> {
+        self.cache
+            .entries
+            .get(account_id)
+            .and_then(|entry| entry.usage.as_ref())
+            .map(|usage| {
+                usage
+                    .weekly_scoped()
+                    .filter_map(|limit| {
+                        limit
+                            .model
+                            .as_ref()
+                            .map(|model| (model.clone(), limit.percent))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn burn_next(&self, now: DateTime<Utc>) -> Result<Option<(String, DateTime<Utc>)>, String> {
+        // A file the tray app wrote names an account in this same accounts.json;
+        // an id that is no longer there is no value, never a guessed
+        // abbreviation.
+        burn_next_account(self.app, now, |account_id| {
+            self.file
+                .accounts
+                .iter()
+                .find(|account| account.id == account_id)
+                .map(|account| account.abbr.clone())
+        })
+    }
+}
+
 /// What the line shows besides the payload: who and where, the live account,
 /// its limits, and the branch of the session's folder. A live login that
 /// matches no stored account shows no account (and no limits from the cache);
@@ -159,86 +278,47 @@ pub(crate) fn facts(
     user: String,
     now: DateTime<Utc>,
 ) -> Result<Facts, String> {
-    let host =
-        paths::host_name(file.settings.host_name.as_deref()).map_err(|error| error.to_string())?;
-    let (account, cached, live_id) = match live {
+    let source = AccountsFacts { app, file, cache };
+    facts_from_source(&source, payload, live, home, user, now)
+}
+
+/// The one builder of [`Facts`]. The command and the preview differ only in
+/// their [`FactsSource`].
+pub(crate) fn facts_from_source<S: FactsSource>(
+    source: &S,
+    payload: &Payload,
+    live: &LiveState,
+    home: &std::path::Path,
+    user: String,
+    now: DateTime<Utc>,
+) -> Result<Facts, String> {
+    let host = paths::host_name(source.host_name()).map_err(|error| error.to_string())?;
+    let feed = feed_from_payload(payload, now);
+    let (account, shown, live_id) = match live {
         LiveState::Known { account_id } => {
-            let account: &Account = file
-                .find(account_id)
+            let account = source
+                .account(account_id)
                 .ok_or_else(|| format!("the live account {account_id} is not in accounts.json"))?;
-            let cached = cache
-                .entries
-                .get(account_id)
-                .and_then(|entry| entry.usage.as_ref());
-            (
-                Some(AccountFacts {
-                    abbr: account.abbr.clone(),
-                    color: account.color.clone(),
-                    plan: account.plan.clone(),
-                }),
-                cached,
-                Some(account_id.as_str()),
-            )
+            let shown = source.usage(account_id, feed.as_ref());
+            (Some(account), shown, Some(account_id.as_str()))
         }
         LiveState::Unknown { .. } => (None, None, None),
         LiveState::NoLogin => return Err("no live login; run seatswap add".to_string()),
         LiveState::Ended { .. } => return Err("the live login has ended; log in again".to_string()),
     };
-    // The payload's numbers are shown only when they belong to the live
-    // account. A fresh session that has not sent a request since a switch
-    // carries the old account's numbers; they are never printed under the new
-    // account's letters. Without a cache entry there is nothing to compare.
-    let feed = feed_from_payload(payload, now);
-    let shown: Option<Usage> = match cached {
-        Some(cached) => {
-            let belongs_to_live = feed.as_ref().is_some_and(|feed| {
-                feed::account_for(feed, cache, &file.accounts).as_deref() == live_id
-            });
-            Some(match (&feed, belongs_to_live) {
-                (Some(feed), true) => feed::merged(cached, feed),
-                _ => cached.clone(),
-            })
-        }
-        None => None,
-    };
     let five_hour = shown.as_ref().and_then(Usage::session).map(cached_limit);
     let week = shown.as_ref().and_then(Usage::weekly_all).map(cached_limit);
     // The per-model limits only exist in the cache.
-    let model_limits = cached
-        .map(|usage| {
-            usage
-                .weekly_scoped()
-                .filter_map(|limit| {
-                    limit
-                        .model
-                        .as_ref()
-                        .map(|model| (model.clone(), limit.percent))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let model_limits = match live_id {
+        Some(account_id) => source.model_limits(account_id),
+        None => Vec::new(),
+    };
     let git_branch = payload
         .workspace
         .as_ref()
         .and_then(|workspace| workspace.current_dir.as_deref())
         .and_then(|folder| git_branch(std::path::Path::new(folder)));
-    // The tray app's next account. A file it wrote names an account in this
-    // same accounts.json; an id that is no longer there is no value, never a
-    // guessed abbreviation.
-    let burn_next = match burn_next::read(app, now) {
-        Ok(Some(next)) => file
-            .accounts
-            .iter()
-            .find(|account| account.id == next.account)
-            .map(|account| (account.abbr.clone(), next.at)),
-        Ok(None) => None,
-        Err(error) => {
-            return Err(format!(
-                "cannot read {}: {error}",
-                app.burn_next_file().display()
-            ))
-        }
-    };
+    let burn_next = source.burn_next(now)?;
     Ok(Facts {
         user,
         host,
@@ -253,12 +333,145 @@ pub(crate) fn facts(
     })
 }
 
+/// One test case of the preview: the live data, or one number changed.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum Scenario {
+    Live,
+    NearFull,
+    Blocked,
+    NoSessionLimit,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl Scenario {
+    /// This scenario's numbers. Each case changes only the one value it names.
+    fn facts(self, mut facts: Facts) -> Facts {
+        match self {
+            Scenario::Live => facts,
+            Scenario::NearFull => {
+                let resets_at = facts.week.as_ref().and_then(|week| week.resets_at);
+                facts.week = Some(Limit2 {
+                    percent: 97.0,
+                    resets_at,
+                });
+                facts
+            }
+            Scenario::Blocked => {
+                let resets_at = facts.week.as_ref().and_then(|week| week.resets_at);
+                facts.week = Some(Limit2 {
+                    percent: 100.0,
+                    resets_at,
+                });
+                facts
+            }
+            Scenario::NoSessionLimit => {
+                facts.five_hour = None;
+                facts
+            }
+        }
+    }
+}
+
+/// One width of the preview: the fitted spans, the drop numbers removed, and
+/// the sentence about them.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PreviewLine {
+    pub width: u16,
+    pub spans: Vec<Span>,
+    pub dropped: Vec<u8>,
+    pub note: String,
+}
+
+/// Render `config` (never the stored one) once per width. A width of 0 or an
+/// empty list is an error: the preview must show a line, not silently skip it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn preview_lines<Tz: TimeZone>(
+    config: &StatuslineConfig,
+    payload: &Payload,
+    facts: &Facts,
+    widths: &[u16],
+    scenario: Scenario,
+    tz: &Tz,
+) -> Result<Vec<PreviewLine>, String>
+where
+    Tz::Offset: std::fmt::Display,
+{
+    if widths.is_empty() {
+        return Err("the preview needs at least one width".to_string());
+    }
+    if widths.contains(&0) {
+        return Err("a preview width must be at least 1 column; 0 cannot show a line".to_string());
+    }
+    let facts = scenario.facts(facts.clone());
+    let mut lines = Vec::with_capacity(widths.len());
+    for &width in widths {
+        let fitted = render::fitted_line(config, payload, &facts, Some(width), tz);
+        lines.push(PreviewLine {
+            width,
+            note: dropped_note(&fitted.dropped_kinds),
+            spans: fitted.spans,
+            dropped: fitted.dropped,
+        });
+    }
+    Ok(lines)
+}
+
+/// What a preview says about the segments the fitting dropped, one name per
+/// kind.
+#[cfg_attr(not(test), allow(dead_code))]
+fn dropped_note(dropped: &[SegmentKind]) -> String {
+    let mut names: Vec<&'static str> = Vec::new();
+    for kind in dropped {
+        let name = kind_name(*kind);
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    let Some((last, rest)) = names.split_last() else {
+        return "everything fits".to_string();
+    };
+    let list = if rest.is_empty() {
+        (*last).to_string()
+    } else {
+        format!("{} and {last}", rest.join(", "))
+    };
+    let is = if names.len() == 1 { "is" } else { "are" };
+    format!("{list} {is} dropped")
+}
+
+/// The name a dropped segment is called in the preview's note.
+#[cfg_attr(not(test), allow(dead_code))]
+fn kind_name(kind: SegmentKind) -> &'static str {
+    match kind {
+        SegmentKind::Account => "account",
+        SegmentKind::Plan => "plan",
+        SegmentKind::FiveHourPercent => "5 h percent",
+        SegmentKind::FiveHourReset => "5 h reset",
+        SegmentKind::WeekPercent => "week percent",
+        SegmentKind::WeekReset => "week reset",
+        SegmentKind::ModelPercent => "per-model percent",
+        SegmentKind::AutoBurn => "auto-burn",
+        SegmentKind::Model => "model",
+        SegmentKind::Effort => "effort",
+        SegmentKind::Folder => "folder",
+        SegmentKind::GitBranch => "branch",
+        SegmentKind::UserHost => "user@host",
+        SegmentKind::Clock => "clock",
+        SegmentKind::Text => "text",
+        SegmentKind::Separator => "separator",
+        SegmentKind::ContextUsed => "context used",
+        SegmentKind::SessionCost => "session cost",
+        SegmentKind::LinesChanged => "lines changed",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The status line payload of `specs/plan/README.md` §5, whole.
-    const README_PAYLOAD: &str = r#"{"workspace":{"current_dir":"/home/sam/projects/atlas"},"model":{"id":"claude-fable-5-2","display_name":"Fable 5.2"},"effort":{"level":"high"},"rate_limits":{"five_hour":{"used_percentage":12,"resets_at":1794490200},"seven_day":{"used_percentage":48,"resets_at":1794790800}}}"#;
 
     #[test]
     fn the_payload_of_the_readme_parses() {
@@ -494,12 +707,15 @@ mod tests {
         .expect("the facts of the live account");
 
         assert_eq!(facts.week.as_ref().expect("AC's week").percent, 48.0);
-        let line = render::render(
-            &StatuslineConfig::current_line(),
-            &payload,
-            &facts,
-            None,
-            &Utc,
+        let line = render::ansi(
+            &render::render_spans(
+                &StatuslineConfig::current_line(),
+                &payload,
+                &facts,
+                None,
+                &Utc,
+            )
+            .0,
         );
         assert!(line.contains("AC"), "{line}");
         assert!(
@@ -558,7 +774,7 @@ mod tests {
             margin: 0,
         };
         assert_eq!(
-            render::render(&config, &payload, &facts, None, &Utc),
+            render::ansi(&render::render_spans(&config, &payload, &facts, None, &Utc).0),
             "AC 2h05m"
         );
     }

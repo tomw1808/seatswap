@@ -669,18 +669,21 @@ fn statusline_line(cli: &Cli, stdin: &[u8], now: DateTime<Utc>) -> Result<String
         user_name()?,
         now,
     )?;
-    Ok(statusline::render::render(
-        &file.settings.statusline,
-        &payload,
-        &facts,
-        statusline::width::terminal_width(),
-        &Local,
+    Ok(statusline::render::ansi(
+        &statusline::render::render_spans(
+            &file.settings.statusline,
+            &payload,
+            &facts,
+            statusline::width::terminal_width(),
+            &Local,
+        )
+        .0,
     ))
 }
 
 /// The user name of the line's `user@host`: `$USER` on Unix, `%USERNAME%` on
 /// Windows. Not set is an error the line shows, never a made-up name.
-fn user_name() -> Result<String, String> {
+pub(crate) fn user_name() -> Result<String, String> {
     #[cfg(windows)]
     let variable = "USERNAME";
     #[cfg(not(windows))]

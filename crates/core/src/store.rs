@@ -213,6 +213,9 @@ pub enum SegmentKind {
     Clock,
     Text,
     Separator,
+    ContextUsed,
+    SessionCost,
+    LinesChanged,
 }
 
 /// How a segment is coloured (spec §5.4).
@@ -340,6 +343,93 @@ impl StatuslineConfig {
                 },
             ],
             margin: 4,
+        }
+    }
+
+    /// The three presets the builder offers, in the page's order.
+    pub fn presets() -> Vec<(String, StatuslineConfig)> {
+        vec![
+            (
+                "My current line".to_string(),
+                StatuslineConfig::current_line(),
+            ),
+            ("Limits only".to_string(), StatuslineConfig::limits_only()),
+            ("Everything".to_string(), StatuslineConfig::everything()),
+        ]
+    }
+
+    /// The preset "Limits only": the account and its two limits, without the
+    /// folder, model or effort.
+    pub fn limits_only() -> StatuslineConfig {
+        let line = StatuslineConfig::current_line();
+        StatuslineConfig {
+            left: Vec::new(),
+            right: line.right,
+            margin: line.margin,
+        }
+    }
+
+    /// The preset "Everything": every kind once. The drop numbers are the
+    /// mock-up's: the two reset times go first, then the 5 h percent, then the
+    /// branch.
+    pub fn everything() -> StatuslineConfig {
+        fn part(kind: SegmentKind, prefix: &str, suffix: &str, drop: Option<u8>) -> Segment {
+            Segment {
+                kind,
+                color: ColorRule::None,
+                prefix: prefix.to_string(),
+                suffix: suffix.to_string(),
+                drop,
+                time_format: None,
+                text: None,
+            }
+        }
+
+        let mut left = vec![
+            part(SegmentKind::UserHost, "", "", None),
+            part(SegmentKind::Text, "", "", None),
+            part(SegmentKind::Folder, "", "", None),
+            part(SegmentKind::GitBranch, " ", "", Some(3)),
+            part(SegmentKind::Model, " ", "", None),
+            part(SegmentKind::Effort, " ", "", None),
+            part(SegmentKind::Plan, " ", "", None),
+            part(SegmentKind::ModelPercent, " ", "", None),
+            part(SegmentKind::AutoBurn, " ", "", None),
+            part(SegmentKind::ContextUsed, " ", "", None),
+            part(SegmentKind::SessionCost, " ", "", None),
+            part(SegmentKind::LinesChanged, " ", "", None),
+            part(SegmentKind::Clock, " ", "", None),
+            part(SegmentKind::Separator, " ", " ", None),
+        ];
+        if let Some(segment) = left.first_mut() {
+            segment.color = ColorRule::Fixed {
+                color: "#22c55e".to_string(),
+            };
+        }
+        if let Some(segment) = left.get_mut(1) {
+            segment.text = Some(":".to_string());
+        }
+        if let Some(segment) = left.get_mut(2) {
+            segment.color = ColorRule::Fixed {
+                color: "#3b82f6".to_string(),
+            };
+        }
+        if let Some(segment) = left.get_mut(3) {
+            segment.color = ColorRule::Fixed {
+                color: "#22c55e".to_string(),
+            };
+        }
+        if let Some(segment) = left.get_mut(4) {
+            segment.color = ColorRule::ByModelFamily;
+        }
+        if let Some(segment) = left.get_mut(5) {
+            segment.color = ColorRule::ByEffort;
+        }
+        let line = StatuslineConfig::current_line();
+        StatuslineConfig {
+            left,
+            right: line.right,
+            margin: line.margin,
         }
     }
 }

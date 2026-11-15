@@ -8,6 +8,7 @@
 use std::path::Path;
 
 use chrono::{DateTime, TimeZone, Utc};
+use serde::{Serialize, Serializer};
 
 use seatswap_core::store::{ColorRule, Segment, SegmentKind, StatuslineConfig, TimeFormat};
 
@@ -17,17 +18,126 @@ use crate::format::{
     with_tilde,
 };
 
-/// The green / yellow / red (and bright) SGR prefixes of the colour rules.
-const GREEN: &str = "\x1b[32m";
-const YELLOW: &str = "\x1b[33m";
-const RED: &str = "\x1b[31m";
-const MAGENTA: &str = "\x1b[35m";
-const CYAN: &str = "\x1b[36m";
-const BRIGHT_YELLOW: &str = "\x1b[93m";
-const BRIGHT_RED: &str = "\x1b[91m";
+/// The named terminal colours, one table: the name the preview uses, the SGR
+/// code `ansi` writes as a foreground, the code it writes as a background, and
+/// the xterm default `#rrggbb` the page paints.
+const NAMED_COLORS: [(&str, &str, &str, &str); 7] = [
+    ("green", "\x1b[32m", "\x1b[42m", "#00cd00"),
+    ("yellow", "\x1b[33m", "\x1b[43m", "#cdcd00"),
+    ("red", "\x1b[31m", "\x1b[41m", "#cd0000"),
+    ("magenta", "\x1b[35m", "\x1b[45m", "#cd00cd"),
+    ("cyan", "\x1b[36m", "\x1b[46m", "#00cdcd"),
+    ("bright yellow", "\x1b[93m", "\x1b[103m", "#ffff00"),
+    ("bright red", "\x1b[91m", "\x1b[101m", "#ff0000"),
+];
+
+const GREEN: NamedColor = NamedColor::Green;
+const YELLOW: NamedColor = NamedColor::Yellow;
+const RED: NamedColor = NamedColor::Red;
+const MAGENTA: NamedColor = NamedColor::Magenta;
+const CYAN: NamedColor = NamedColor::Cyan;
+const BRIGHT_YELLOW: NamedColor = NamedColor::BrightYellow;
+const BRIGHT_RED: NamedColor = NamedColor::BrightRed;
+
 const RESET: &str = "\x1b[0m";
 
+/// One of the named colours of the table [`NAMED_COLORS`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum NamedColor {
+    Green,
+    Yellow,
+    Red,
+    Magenta,
+    Cyan,
+    BrightYellow,
+    BrightRed,
+}
+
+impl NamedColor {
+    /// The row of this colour in the one table.
+    fn row(self) -> (&'static str, &'static str, &'static str, &'static str) {
+        NAMED_COLORS[match self {
+            NamedColor::Green => 0,
+            NamedColor::Yellow => 1,
+            NamedColor::Red => 2,
+            NamedColor::Magenta => 3,
+            NamedColor::Cyan => 4,
+            NamedColor::BrightYellow => 5,
+            NamedColor::BrightRed => 6,
+        }]
+    }
+}
+
+/// A span's colour: a named terminal colour, or an RGB colour from the store.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Color {
+    Named(NamedColor),
+    Rgb([u8; 3]),
+}
+
+impl Color {
+    /// The SGR sequence `ansi` writes for this colour.
+    fn sgr(self, background: bool) -> String {
+        match self {
+            Color::Named(named) => {
+                let (_, foreground, background_sgr, _) = named.row();
+                if background {
+                    background_sgr.to_string()
+                } else {
+                    foreground.to_string()
+                }
+            }
+            Color::Rgb([red, green, blue]) => {
+                let layer = if background { 48 } else { 38 };
+                format!("\x1b[{layer};2;{red};{green};{blue}m")
+            }
+        }
+    }
+
+    /// The `#rrggbb` the page paints for this colour.
+    fn hex(self) -> String {
+        match self {
+            Color::Named(named) => named.row().3.to_string(),
+            Color::Rgb([red, green, blue]) => format!("#{red:02x}{green:02x}{blue:02x}"),
+        }
+    }
+}
+
+impl Serialize for Color {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.hex())
+    }
+}
+
+/// One piece of a fitted line. `fg` and `bg` serialise as `#rrggbb`, while
+/// [`ansi`] keeps writing the old SGR bytes.
+#[derive(Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Span {
+    pub text: String,
+    pub fg: Option<Color>,
+    pub bg: Option<Color>,
+    pub bold: bool,
+}
+
+/// The status line payload's fields that have no typed field in [`Payload`].
+pub(crate) const PATH_CONTEXT_USED: &str = "context_window.used_percentage";
+pub(crate) const PATH_SESSION_COST: &str = "cost.total_cost_usd";
+pub(crate) const PATH_LINES_ADDED: &str = "cost.total_lines_added";
+pub(crate) const PATH_LINES_REMOVED: &str = "cost.total_lines_removed";
+
+/// The value at a dot-separated path of the raw payload, or `None` when a
+/// parent is absent or not an object.
+pub(crate) fn at_path<'a>(raw: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    let mut value = raw;
+    for key in path.split('.') {
+        value = value.get(key)?;
+    }
+    Some(value)
+}
+
 /// What the line shows besides the payload's model, effort and folder.
+#[derive(Clone)]
 pub(crate) struct Facts {
     pub user: String,
     pub host: String,
@@ -42,6 +152,7 @@ pub(crate) struct Facts {
 }
 
 /// The live account's short text and colours.
+#[derive(Clone)]
 pub(crate) struct AccountFacts {
     pub abbr: String,
     pub color: String,
@@ -49,6 +160,7 @@ pub(crate) struct AccountFacts {
 }
 
 /// One limit: a percent and its reset, when the source has one.
+#[derive(Clone, Copy)]
 pub(crate) struct Limit2 {
     pub percent: f64,
     pub resets_at: Option<DateTime<Utc>>,
@@ -59,10 +171,12 @@ pub(crate) struct Limit2 {
 /// text before it ends in a space and a segment between them was left out: a
 /// missing segment leaves no gap.
 struct Piece {
+    kind: SegmentKind,
     prefix: String,
     text: String,
     suffix: String,
-    sgr: Option<String>,
+    fg: Option<Color>,
+    bg: Option<Color>,
     drop: Option<u8>,
     /// At least one segment between the previous piece and this one in the
     /// configuration has no value. Together with a segment dropped by the
@@ -70,17 +184,44 @@ struct Piece {
     missing_before: bool,
 }
 
-/// The line with ANSI colours. `width = None`: the right part follows the left
-/// after two spaces and nothing is dropped. With a width the right part is
-/// flush with `width - margin`, and segments are dropped by their `drop` number
-/// until the line fits; when nothing is left to drop it is printed anyway.
-pub(crate) fn render<Tz: TimeZone>(
+/// A fitted line and what the fitting removed: the drop numbers and the kinds
+/// of the pieces they removed, ordered by the drop number that removed them and
+/// then by their place in the line.
+pub(crate) struct FittedLine {
+    pub spans: Vec<Span>,
+    pub dropped: Vec<u8>,
+    pub dropped_kinds: Vec<SegmentKind>,
+}
+
+/// The fitted line as spans: left spans, one span of spaces for the gap, right
+/// spans. `width = None`: the right part follows the left after two spaces and
+/// nothing is dropped. With a width the right part is flush with `width -
+/// margin`, and segments are dropped by their `drop` number until the line
+/// fits; when nothing is left to drop it is printed anyway. The second value
+/// is the drop numbers removed.
+pub(crate) fn render_spans<Tz: TimeZone>(
     config: &StatuslineConfig,
     payload: &Payload,
     facts: &Facts,
     width: Option<u16>,
     tz: &Tz,
-) -> String
+) -> (Vec<Span>, Vec<u8>)
+where
+    Tz::Offset: std::fmt::Display,
+{
+    let fitted = fitted_line(config, payload, facts, width, tz);
+    (fitted.spans, fitted.dropped)
+}
+
+/// The one fitting rule: the fitted line with the drop numbers it removed and
+/// the kinds of the pieces those numbers removed.
+pub(crate) fn fitted_line<Tz: TimeZone>(
+    config: &StatuslineConfig,
+    payload: &Payload,
+    facts: &Facts,
+    width: Option<u16>,
+    tz: &Tz,
+) -> FittedLine
 where
     Tz::Offset: std::fmt::Display,
 {
@@ -110,40 +251,118 @@ where
         }
     }
 
-    let (left_text, right_text) = compose(&left, &right, level);
-    let left_width = visible_width(&left_text);
-    let right_width = visible_width(&right_text);
-    if right_text.is_empty() {
-        return left_text;
-    }
-    if left_text.is_empty() {
-        return match width {
-            Some(width) => {
-                let target = usize::from(width).saturating_sub(usize::from(config.margin));
-                format!(
-                    "{}{right_text}",
-                    " ".repeat(target.saturating_sub(right_width))
-                )
-            }
-            None => right_text,
+    let dropped: Vec<u8> = match level {
+        Some(level) => {
+            let mut dropped: Vec<u8> = left
+                .iter()
+                .chain(right.iter())
+                .filter_map(|piece| piece.drop)
+                .filter(|drop| *drop <= level)
+                .collect();
+            dropped.sort_unstable();
+            dropped.dedup();
+            dropped
+        }
+        None => Vec::new(),
+    };
+    let dropped_kinds: Vec<SegmentKind> = match level {
+        Some(level) => {
+            let mut removed: Vec<(u8, SegmentKind)> = left
+                .iter()
+                .chain(right.iter())
+                .filter_map(|piece| {
+                    piece
+                        .drop
+                        .filter(|drop| *drop <= level)
+                        .map(|drop| (drop, piece.kind))
+                })
+                .collect();
+            removed.sort_by_key(|(drop, _)| *drop);
+            removed.into_iter().map(|(_, kind)| kind).collect()
+        }
+        None => Vec::new(),
+    };
+
+    let left_spans = compose_zone(&left, level);
+    let right_spans = compose_zone(&right, level);
+    let left_width = spans_width(&left_spans);
+    let right_width = spans_width(&right_spans);
+    if right_spans.is_empty() {
+        return FittedLine {
+            spans: left_spans,
+            dropped,
+            dropped_kinds,
         };
     }
-    let gap = match width {
-        Some(width) => {
-            let target = usize::from(width).saturating_sub(usize::from(config.margin));
-            target.saturating_sub(left_width + right_width).max(2)
+    let mut spans = left_spans;
+    let gap = if spans.is_empty() {
+        match width {
+            Some(width) => {
+                let target = usize::from(width).saturating_sub(usize::from(config.margin));
+                target.saturating_sub(right_width)
+            }
+            None => 0,
         }
-        None => 2,
+    } else {
+        match width {
+            Some(width) => {
+                let target = usize::from(width).saturating_sub(usize::from(config.margin));
+                target.saturating_sub(left_width + right_width).max(2)
+            }
+            None => 2,
+        }
     };
-    format!("{left_text}{}{right_text}", " ".repeat(gap))
+    if gap > 0 {
+        spans.push(Span {
+            text: " ".repeat(gap),
+            fg: None,
+            bg: None,
+            bold: false,
+        });
+    }
+    spans.extend(right_spans);
+    FittedLine {
+        spans,
+        dropped,
+        dropped_kinds,
+    }
+}
+
+/// The spans as the terminal line: exactly the SGR bytes the status line
+/// command printed before the spans were split out.
+pub(crate) fn ansi(spans: &[Span]) -> String {
+    let mut out = String::new();
+    for span in spans {
+        if span.fg.is_none() && span.bg.is_none() && !span.bold {
+            out.push_str(&span.text);
+            continue;
+        }
+        if span.bold {
+            out.push_str("\x1b[1m");
+        }
+        if let Some(background) = span.bg {
+            out.push_str(&background.sgr(true));
+        }
+        if let Some(foreground) = span.fg {
+            out.push_str(&foreground.sgr(false));
+        }
+        out.push_str(&span.text);
+        out.push_str(RESET);
+    }
+    out
+}
+
+/// The printed width of a list of spans.
+fn spans_width(spans: &[Span]) -> usize {
+    spans.iter().map(|span| visible_width(&span.text)).sum()
 }
 
 /// Whether the line built from the segments above `level` keeps the margin and
 /// the two spaces between the zones.
 fn fits(left: &[Piece], right: &[Piece], level: Option<u8>, margin: u16, width: u16) -> bool {
-    let (left_text, right_text) = compose(left, right, level);
-    visible_width(&left_text) + 2 + visible_width(&right_text) + usize::from(margin)
-        <= usize::from(width)
+    let left = compose_zone(left, level);
+    let right = compose_zone(right, level);
+    spans_width(&left) + 2 + spans_width(&right) + usize::from(margin) <= usize::from(width)
 }
 
 /// `text` without its ANSI escape sequences.
@@ -265,10 +484,12 @@ where
             continue;
         };
         pieces.push(Piece {
+            kind: segment.kind,
             prefix: segment.prefix.clone(),
             text,
             suffix: segment.suffix.clone(),
-            sgr: color(segment, payload, facts),
+            fg: color(segment, payload, facts),
+            bg: background(segment, facts),
             drop: segment.drop,
             missing_before: missing,
         });
@@ -347,6 +568,33 @@ where
         SegmentKind::Clock => Some(facts.now.with_timezone(tz).format("%H:%M").to_string()),
         SegmentKind::Text => segment.text.clone(),
         SegmentKind::Separator => Some("|".to_string()),
+        SegmentKind::ContextUsed => {
+            number_at(payload, PATH_CONTEXT_USED).map(|value| format!("{}%", whole(value)))
+        }
+        SegmentKind::SessionCost => {
+            number_at(payload, PATH_SESSION_COST).map(|value| format!("${value:.2}"))
+        }
+        SegmentKind::LinesChanged => {
+            let added = number_at(payload, PATH_LINES_ADDED)?;
+            let removed = number_at(payload, PATH_LINES_REMOVED)?;
+            Some(format!("+{} -{}", whole(added), whole(removed)))
+        }
+    }
+}
+
+/// The number at a payload path; absent, `null` and every other JSON type are
+/// `None`, so the segment prints nothing.
+fn number_at(payload: &Payload, path: &str) -> Option<f64> {
+    at_path(&payload.raw, path).and_then(serde_json::Value::as_f64)
+}
+
+/// A number as an integer: exactly when it is whole, else rounded the way
+/// [`integer_percent`] rounds.
+fn whole(value: f64) -> String {
+    if value.fract() == 0.0 {
+        format!("{value:.0}")
+    } else {
+        integer_percent(value).to_string()
     }
 }
 
@@ -369,22 +617,22 @@ where
     }
 }
 
-/// The SGR prefix of a segment's colour rule, if it has one.
-fn color(segment: &Segment, payload: &Payload, facts: &Facts) -> Option<String> {
+/// The foreground colour of a segment's colour rule, if it has one.
+fn color(segment: &Segment, payload: &Payload, facts: &Facts) -> Option<Color> {
     match &segment.color {
         ColorRule::None => None,
         ColorRule::Fixed { color } => {
             let [red, green, blue] = parse_color(color)?;
-            Some(format!("\x1b[38;2;{red};{green};{blue}m"))
+            Some(Color::Rgb([red, green, blue]))
         }
         ColorRule::ByLoad { warn, bad } => {
             let percent = load_percent(segment.kind, facts)?;
             if percent >= f64::from(*bad) {
-                Some(RED.to_string())
+                Some(Color::Named(RED))
             } else if percent >= f64::from(*warn) {
-                Some(YELLOW.to_string())
+                Some(Color::Named(YELLOW))
             } else {
-                Some(GREEN.to_string())
+                Some(Color::Named(GREEN))
             }
         }
         ColorRule::ByModelFamily => {
@@ -394,13 +642,13 @@ fn color(segment: &Segment, payload: &Payload, facts: &Facts) -> Option<String> 
                 .and_then(|model| model.id.as_deref())?
                 .to_ascii_lowercase();
             if id.contains("opus") {
-                Some(MAGENTA.to_string())
+                Some(Color::Named(MAGENTA))
             } else if id.contains("sonnet") {
-                Some(CYAN.to_string())
+                Some(Color::Named(CYAN))
             } else if id.contains("haiku") {
-                Some(GREEN.to_string())
+                Some(Color::Named(GREEN))
             } else {
-                Some(YELLOW.to_string())
+                Some(Color::Named(YELLOW))
             }
         }
         ColorRule::ByEffort => {
@@ -409,21 +657,31 @@ fn color(segment: &Segment, payload: &Payload, facts: &Facts) -> Option<String> 
                 .as_ref()
                 .and_then(|effort| effort.level.as_deref())?;
             match level {
-                "low" => Some(GREEN.to_string()),
-                "medium" => Some(YELLOW.to_string()),
-                "high" => Some(BRIGHT_YELLOW.to_string()),
-                "xhigh" => Some(RED.to_string()),
-                "max" => Some(BRIGHT_RED.to_string()),
+                "low" => Some(Color::Named(GREEN)),
+                "medium" => Some(Color::Named(YELLOW)),
+                "high" => Some(Color::Named(BRIGHT_YELLOW)),
+                "xhigh" => Some(Color::Named(RED)),
+                "max" => Some(Color::Named(BRIGHT_RED)),
                 _ => None,
             }
         }
         ColorRule::Account => {
             let [red, green, blue] = parse_color(&facts.account.as_ref()?.color)?;
             let [text_red, text_green, text_blue] = letter_color([red, green, blue]);
-            Some(format!(
-                "\x1b[48;2;{red};{green};{blue}m\x1b[38;2;{text_red};{text_green};{text_blue}m"
-            ))
+            Some(Color::Rgb([text_red, text_green, text_blue]))
         }
+    }
+}
+
+/// The background colour of a segment's colour rule, if it has one. Only the
+/// account tag paints one today.
+fn background(segment: &Segment, facts: &Facts) -> Option<Color> {
+    match &segment.color {
+        ColorRule::Account => {
+            let [red, green, blue] = parse_color(&facts.account.as_ref()?.color)?;
+            Some(Color::Rgb([red, green, blue]))
+        }
+        _ => None,
     }
 }
 
@@ -437,18 +695,14 @@ fn load_percent(kind: SegmentKind, facts: &Facts) -> Option<f64> {
     }
 }
 
-/// The two zones as they print with the drop `level`: every segment whose drop
+/// One zone as it prints with the drop `level`: every segment whose drop
 /// number is above `level` (or has none) stays. A segment's prefix loses its
 /// leading spaces only when the text before it ends in a space and at least one
 /// segment between them was left out (no value, or dropped by the fitting), so
 /// a gap leaves no leading spaces while two segments adjacent in the
 /// configuration print their suffix and prefix as written.
-fn compose(left: &[Piece], right: &[Piece], level: Option<u8>) -> (String, String) {
-    (compose_zone(left, level), compose_zone(right, level))
-}
-
-fn compose_zone(pieces: &[Piece], level: Option<u8>) -> String {
-    let mut out = String::new();
+fn compose_zone(pieces: &[Piece], level: Option<u8>) -> Vec<Span> {
+    let mut spans = Vec::new();
     let mut ends_space = false;
     let mut left_out = false;
     for piece in pieces {
@@ -467,16 +721,14 @@ fn compose_zone(pieces: &[Piece], level: Option<u8>) -> String {
         let text = format!("{prefix}{}{}", piece.text, piece.suffix);
         ends_space = text.ends_with(' ');
         left_out = false;
-        match &piece.sgr {
-            Some(sgr) => {
-                out.push_str(sgr);
-                out.push_str(&text);
-                out.push_str(RESET);
-            }
-            None => out.push_str(&text),
-        }
+        spans.push(Span {
+            text,
+            fg: piece.fg,
+            bg: piece.bg,
+            bold: false,
+        });
     }
-    out
+    spans
 }
 
 #[cfg(test)]
@@ -530,9 +782,23 @@ mod tests {
         FixedOffset::east_opt(3_600).expect("a fixed offset")
     }
 
+    /// The old `render`, now the two steps the command uses.
+    fn rendered<Tz: TimeZone>(
+        config: &StatuslineConfig,
+        payload: &Payload,
+        facts: &Facts,
+        width: Option<u16>,
+        tz: &Tz,
+    ) -> String
+    where
+        Tz::Offset: std::fmt::Display,
+    {
+        ansi(&render_spans(config, payload, facts, width, tz).0)
+    }
+
     #[test]
     fn the_current_line_at_120_columns() {
-        let line = render(
+        let line = rendered(
             &StatuslineConfig::current_line(),
             &payload(),
             &facts(),
@@ -558,7 +824,7 @@ mod tests {
         // reset times; the plan's value follows only when the folder is not
         // shortened (left 66, 66 + 2 + 11 + 4 = 83 > 80). The rule is kept and
         // the value reported, not forced.
-        let line = render(
+        let line = rendered(
             &StatuslineConfig::current_line(),
             &payload(),
             &facts(),
@@ -569,7 +835,7 @@ mod tests {
 
         // The next drop number removes the 5 h percent too, and the week
         // percent's separator leaves no gap after it.
-        let line = render(
+        let line = rendered(
             &StatuslineConfig::current_line(),
             &payload(),
             &facts(),
@@ -581,7 +847,7 @@ mod tests {
 
     #[test]
     fn without_a_width_the_right_part_follows_after_two_spaces() {
-        let line = render(
+        let line = rendered(
             &StatuslineConfig::current_line(),
             &payload(),
             &facts(),
@@ -596,7 +862,7 @@ mod tests {
 
     #[test]
     fn narrower_than_the_left_part_still_prints() {
-        let line = render(
+        let line = rendered(
             &StatuslineConfig::current_line(),
             &payload(),
             &facts(),
@@ -612,7 +878,7 @@ mod tests {
     fn no_session_limit_leaves_no_gap() {
         let mut facts = facts();
         facts.five_hour = None;
-        let line = render(
+        let line = rendered(
             &StatuslineConfig::current_line(),
             &payload(),
             &facts,
@@ -644,11 +910,288 @@ mod tests {
                 percent,
                 resets_at: None,
             });
-            render(&config, &payload(), &facts, None, &offset())
+            rendered(&config, &payload(), &facts, None, &offset())
         }
         assert!(line(49.0).contains("\x1b[32m"), "{}", line(49.0));
         assert!(line(50.0).contains("\x1b[33m"), "{}", line(50.0));
         assert!(line(80.0).contains("\x1b[31m"), "{}", line(80.0));
+    }
+
+    #[test]
+    fn a_named_colour_serialises_as_its_hex_and_ansi_writes_its_sgr() {
+        let mut config = StatuslineConfig::current_line();
+        config.left.clear();
+        config.right = vec![config.right[1].clone()];
+        let mut facts = facts();
+        facts.five_hour = Some(Limit2 {
+            percent: 49.0,
+            resets_at: None,
+        });
+
+        let (spans, _) = render_spans(&config, &payload(), &facts, None, &offset());
+        let span = spans.first().expect("the one 5 h percent span");
+        assert_eq!(span.fg, Some(Color::Named(GREEN)));
+        assert_eq!(
+            serde_json::to_value(span).expect("a serialised span")["fg"],
+            serde_json::json!("#00cd00")
+        );
+        assert_eq!(
+            ansi(std::slice::from_ref(span)),
+            "\x1b[32m49%\x1b[0m",
+            "ansi keeps the named colour's SGR bytes"
+        );
+    }
+
+    #[test]
+    fn ansi_of_spans_equals_the_old_render() {
+        // The four layout tests of step B, with their expected strings.
+        let line = rendered(
+            &StatuslineConfig::current_line(),
+            &payload(),
+            &facts(),
+            Some(120),
+            &offset(),
+        );
+        assert_eq!(
+            visible_text(&line),
+            format!(
+                "sam@atlas:~/projects/seatswap/crates/app/ui Fable 5.2 high{}AC 12% 4h45m  48% 3d16h",
+                " ".repeat(35)
+            )
+        );
+        assert_eq!(visible_width(&line), 116);
+
+        let line = rendered(
+            &StatuslineConfig::current_line(),
+            &payload(),
+            &facts(),
+            Some(80),
+            &offset(),
+        );
+        assert!(visible_text(&line).ends_with("AC 12%  48%"), "{line}");
+        let line = rendered(
+            &StatuslineConfig::current_line(),
+            &payload(),
+            &facts(),
+            Some(74),
+            &offset(),
+        );
+        assert!(visible_text(&line).ends_with("AC 48%"), "{line}");
+
+        let line = rendered(
+            &StatuslineConfig::current_line(),
+            &payload(),
+            &facts(),
+            None,
+            &offset(),
+        );
+        assert_eq!(
+            visible_text(&line),
+            "sam@atlas:~/projects/seatswap/crates/app/ui Fable 5.2 high  AC 12% 4h45m  48% 3d16h"
+        );
+
+        let line = rendered(
+            &StatuslineConfig::current_line(),
+            &payload(),
+            &facts(),
+            Some(20),
+            &offset(),
+        );
+        let text = visible_text(&line);
+        assert!(text.starts_with("sam@atlas:"), "{text}");
+        assert!(text.contains("AC 48%"), "{text}");
+    }
+
+    #[test]
+    fn an_empty_config_is_an_empty_line() {
+        let config = StatuslineConfig {
+            left: Vec::new(),
+            right: Vec::new(),
+            margin: 4,
+        };
+        for width in [None, Some(80)] {
+            let (spans, dropped) = render_spans(&config, &payload(), &facts(), width, &offset());
+            assert!(spans.is_empty(), "no segment has a value");
+            assert!(dropped.is_empty(), "nothing was dropped");
+            assert_eq!(ansi(&spans), "");
+        }
+    }
+
+    fn segment(kind: SegmentKind) -> Segment {
+        Segment {
+            kind,
+            color: ColorRule::None,
+            prefix: String::new(),
+            suffix: String::new(),
+            drop: None,
+            time_format: None,
+            text: None,
+        }
+    }
+
+    #[test]
+    fn the_optional_segments_read_their_paths() {
+        let payload = super::super::parse(
+            br#"{"context_window":{"used_percentage":41},"cost":{"total_cost_usd":3.2,"total_lines_added":120,"total_lines_removed":8}}"#,
+        );
+        let mut cost = segment(SegmentKind::SessionCost);
+        cost.prefix = " ".to_string();
+        let mut lines = segment(SegmentKind::LinesChanged);
+        lines.prefix = " ".to_string();
+        let config = StatuslineConfig {
+            left: vec![segment(SegmentKind::ContextUsed), cost, lines],
+            right: Vec::new(),
+            margin: 0,
+        };
+
+        assert_eq!(
+            rendered(&config, &payload, &facts(), None, &offset()),
+            "41% $3.20 +120 -8"
+        );
+    }
+
+    #[test]
+    fn an_absent_path_prints_nothing() {
+        let payload = super::super::parse(super::super::README_PAYLOAD.as_bytes());
+        let mut text = segment(SegmentKind::Text);
+        text.text = Some("x".to_string());
+        let mut context = segment(SegmentKind::ContextUsed);
+        context.prefix = " ctx ".to_string();
+        let config = StatuslineConfig {
+            left: vec![text, context],
+            right: Vec::new(),
+            margin: 0,
+        };
+
+        let line = rendered(&config, &payload, &facts(), None, &offset());
+        assert_eq!(visible_text(&line), "x");
+        assert!(!line.contains("ctx"), "{line}");
+    }
+
+    #[test]
+    fn a_null_field_prints_nothing_and_a_whole_cost_is_money() {
+        let payload = super::super::parse(
+            br#"{"context_window":{"used_percentage":null},"cost":{"total_cost_usd":0}}"#,
+        );
+        let mut context = segment(SegmentKind::ContextUsed);
+        context.prefix = " ctx ".to_string();
+        let config = StatuslineConfig {
+            left: vec![context],
+            right: vec![segment(SegmentKind::SessionCost)],
+            margin: 0,
+        };
+
+        let line = rendered(&config, &payload, &facts(), None, &offset());
+        assert_eq!(visible_text(&line), "$0.00");
+        assert!(!line.contains("ctx"), "{line}");
+    }
+
+    #[test]
+    fn the_preview_says_what_was_dropped() {
+        // A home folder that is not the payload's prefix shows the folder in
+        // full, so 80 columns need the second drop number as well.
+        let mut live_facts = facts();
+        live_facts.home = "/home/samuel".to_string();
+        let preview = super::super::preview_lines(
+            &StatuslineConfig::current_line(),
+            &payload(),
+            &live_facts,
+            &[120, 100, 80],
+            super::super::Scenario::Live,
+            &offset(),
+        )
+        .expect("a preview at three widths");
+
+        assert_eq!(preview.len(), 3);
+        assert_eq!(preview[0].note, "everything fits");
+        assert_eq!(preview[1].note, "everything fits");
+        assert_eq!(
+            preview[2].note,
+            "5 h reset, week reset and 5 h percent are dropped"
+        );
+        assert_eq!(preview[2].dropped, vec![1, 2]);
+    }
+
+    #[test]
+    fn the_note_names_only_the_segments_the_fitting_dropped() {
+        // The 5 h percent has a value but its reset has none, so the reset is
+        // not a piece the fitting can drop. Only the 5 h percent and the week
+        // reset were on the line and removed.
+        let mut live_facts = facts();
+        live_facts.five_hour = Some(Limit2 {
+            percent: 12.0,
+            resets_at: None,
+        });
+        let preview = super::super::preview_lines(
+            &StatuslineConfig::current_line(),
+            &payload(),
+            &live_facts,
+            &[60],
+            super::super::Scenario::Live,
+            &offset(),
+        )
+        .expect("a preview at 60 columns");
+
+        assert_eq!(
+            preview[0].note, "week reset and 5 h percent are dropped",
+            "the absent 5 h reset is not named"
+        );
+        assert!(
+            !preview[0].note.contains("5 h reset"),
+            "{}",
+            preview[0].note
+        );
+    }
+
+    #[test]
+    fn presets() {
+        let presets = StatuslineConfig::presets();
+        assert_eq!(presets.len(), 3);
+        assert_eq!(presets[0].0, "My current line");
+        assert_eq!(presets[0].1, StatuslineConfig::current_line());
+        assert_eq!(presets[1].0, "Limits only");
+        assert_eq!(presets[2].0, "Everything");
+
+        let kinds: Vec<SegmentKind> = presets[2]
+            .1
+            .left
+            .iter()
+            .chain(presets[2].1.right.iter())
+            .map(|segment| segment.kind)
+            .collect();
+        assert_eq!(kinds.len(), 19, "every kind once");
+        for (index, kind) in kinds.iter().enumerate() {
+            assert!(!kinds[..index].contains(kind), "{kind:?} appears once only");
+        }
+    }
+
+    #[test]
+    fn a_preview_width_is_positive_and_not_empty() {
+        let config = StatuslineConfig::current_line();
+        let empty = super::super::preview_lines(
+            &config,
+            &payload(),
+            &facts(),
+            &[],
+            super::super::Scenario::Live,
+            &offset(),
+        );
+        assert_eq!(
+            empty.err(),
+            Some("the preview needs at least one width".to_string())
+        );
+        let zero = super::super::preview_lines(
+            &config,
+            &payload(),
+            &facts(),
+            &[120, 0],
+            super::super::Scenario::Live,
+            &offset(),
+        );
+        assert_eq!(
+            zero.err(),
+            Some("a preview width must be at least 1 column; 0 cannot show a line".to_string())
+        );
     }
 
     /// `visible_width` is the number of columns the line takes in the
@@ -682,7 +1225,7 @@ mod tests {
         // The account (its suffix is a space) directly before the week
         // percent (its prefix is two spaces).
         config.right = vec![config.right[0].clone(), config.right[3].clone()];
-        let line = render(&config, &payload(), &facts(), None, &offset());
+        let line = rendered(&config, &payload(), &facts(), None, &offset());
         assert!(
             visible_text(&line).ends_with("AC   48%"),
             "the prefix of the week percent belongs to the line: {line}"

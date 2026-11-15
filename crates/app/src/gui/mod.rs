@@ -250,6 +250,8 @@ pub(crate) fn run(
             window::stats_rhythm,
             window::stats_activity,
             window::stats_hosts,
+            window::statusline_preview,
+            window::statusline_presets,
         ])
         .build(tauri::generate_context!());
     match result {

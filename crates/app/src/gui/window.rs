@@ -14,9 +14,13 @@ use chrono::{DateTime, Duration, FixedOffset, Local, Utc};
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "gui")]
+use seatswap_core::api::Usage;
+#[cfg(feature = "gui")]
 use seatswap_core::burn::decide::Regime;
 #[cfg(feature = "gui")]
 use seatswap_core::burn::plan::Inputs;
+#[cfg(feature = "gui")]
+use seatswap_core::feed::Feed;
 #[cfg(feature = "gui")]
 use seatswap_core::history::HistoryDir;
 #[cfg(feature = "gui")]
@@ -37,12 +41,19 @@ use seatswap_core::stats::{
     Empty, Query,
 };
 #[cfg(feature = "gui")]
-use seatswap_core::store::{self, Account, Settings};
+use seatswap_core::store::{self, Account, Settings, StatuslineConfig};
+#[cfg(feature = "gui")]
+use seatswap_core::switcher::LiveState;
 #[cfg(feature = "gui")]
 use seatswap_core::transcripts::Tokens;
 
 #[cfg(feature = "gui")]
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
+
+#[cfg(feature = "gui")]
+use crate::statusline::render::AccountFacts;
+#[cfg(feature = "gui")]
+use crate::statusline::{self, FactsSource, PreviewLine, Scenario};
 
 /// Window label used by `tauri.conf.json`'s capability and by every command.
 #[cfg(feature = "gui")]
@@ -962,6 +973,138 @@ pub(crate) async fn stats_hosts(state: State<'_, super::GuiState>) -> Result<Vec
     tauri::async_runtime::spawn_blocking(move || stats_hosts_at(&history))
         .await
         .map_err(|error| error.to_string())?
+}
+
+/// The preview's source: the data the page already has, never a file read of
+/// its own.
+#[cfg(feature = "gui")]
+struct SnapshotFacts<'a> {
+    snapshot: &'a super::worker::Snapshot,
+    app: &'a AppPaths,
+}
+
+#[cfg(feature = "gui")]
+impl FactsSource for SnapshotFacts<'_> {
+    fn host_name(&self) -> Option<&str> {
+        self.snapshot.settings.as_ref()?.host_name.as_deref()
+    }
+
+    fn account(&self, account_id: &str) -> Option<AccountFacts> {
+        self.snapshot
+            .views
+            .iter()
+            .find(|view| view.id == account_id)
+            .map(|view| AccountFacts {
+                abbr: view.abbr.clone(),
+                color: view.color.clone(),
+                plan: view.plan.clone(),
+            })
+    }
+
+    fn usage(&self, account_id: &str, _feed: Option<&Feed>) -> Option<Usage> {
+        // The snapshot's numbers are the engine's merged view already.
+        self.snapshot
+            .views
+            .iter()
+            .find(|view| view.id == account_id)?
+            .usage
+            .clone()
+    }
+
+    fn model_limits(&self, account_id: &str) -> Vec<(String, f64)> {
+        self.snapshot
+            .views
+            .iter()
+            .find(|view| view.id == account_id)
+            .and_then(|view| view.usage.as_ref())
+            .map(|usage| {
+                usage
+                    .weekly_scoped()
+                    .filter_map(|limit| {
+                        limit
+                            .model
+                            .as_ref()
+                            .map(|model| (model.clone(), limit.percent))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn burn_next(&self, now: DateTime<Utc>) -> Result<Option<(String, DateTime<Utc>)>, String> {
+        // The same file the command reads: the snapshot's burn plan says what
+        // auto-burn would do, whether or not it is on, while the line shows
+        // only what the tray app wrote.
+        statusline::burn_next_account(self.app, now, |account_id| {
+            self.snapshot
+                .views
+                .iter()
+                .find(|view| view.id == account_id)
+                .map(|view| view.abbr.clone())
+        })
+    }
+}
+
+/// The snapshot's live login in the shape [`statusline::facts_from_source`]
+/// takes.
+#[cfg(feature = "gui")]
+fn live_state_of(live: &super::worker::LiveView) -> LiveState {
+    match live {
+        super::worker::LiveView::NoLogin => LiveState::NoLogin,
+        super::worker::LiveView::Ended { account_id } => LiveState::Ended {
+            account_id: account_id.clone(),
+        },
+        super::worker::LiveView::Known { account_id } => LiveState::Known {
+            account_id: account_id.clone(),
+        },
+        super::worker::LiveView::Unknown { email, org_name } => LiveState::Unknown {
+            email: email.clone(),
+            org_name: org_name.clone(),
+        },
+    }
+}
+
+/// Render the builder's preview once per width: the given config, never the
+/// stored one, and README §5's payload for every scenario.
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub(crate) fn statusline_preview(
+    state: State<'_, super::GuiState>,
+    config: StatuslineConfig,
+    widths: Vec<u16>,
+    scenario: Scenario,
+) -> Result<Vec<PreviewLine>, String> {
+    if widths.is_empty() {
+        return Err("the preview needs at least one width".to_string());
+    }
+    if widths.contains(&0) {
+        return Err("a preview width must be at least 1 column; 0 cannot show a line".to_string());
+    }
+    let snapshot = state.snapshot()?;
+    if snapshot.settings.is_none() {
+        return Err("accounts.json cannot be read; the preview has no data".to_string());
+    }
+    let payload = statusline::parse(statusline::README_PAYLOAD.as_bytes());
+    let now = Utc::now();
+    let facts = statusline::facts_from_source(
+        &SnapshotFacts {
+            snapshot: &snapshot,
+            app: &state.app,
+        },
+        &payload,
+        &live_state_of(&snapshot.live),
+        state.claude.home(),
+        crate::cli::user_name()?,
+        now,
+    )?;
+    statusline::preview_lines(&config, &payload, &facts, &widths, scenario, &Local)
+}
+
+/// The builder's three presets, in the page's order.
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub(crate) fn statusline_presets() -> Vec<(String, StatuslineConfig)> {
+    StatuslineConfig::presets()
 }
 
 #[cfg(test)]
@@ -2097,6 +2240,72 @@ mod tests {
         assert_eq!(
             error, "the forecast needs a reading of every account first",
             "{error}"
+        );
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn the_preview_takes_its_auto_burn_from_burn_next_json() {
+        use seatswap_core::burn::burn_next;
+        use seatswap_core::engine::AccountView;
+        use seatswap_core::store::LoginState;
+
+        use super::super::burn_rt::BurnView;
+        use super::super::worker::Snapshot;
+
+        const AC_ID: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f0";
+        let now = DateTime::<Utc>::from_timestamp(1_794_473_100, 0).expect("a test time");
+        let switch_at = now + Duration::hours(2);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let app = AppPaths::at(&tmp.path().join("data"));
+
+        let mut snapshot = Snapshot::empty(None, None, None);
+        snapshot.views.push(AccountView {
+            id: AC_ID.to_string(),
+            label: "AC team".to_string(),
+            abbr: "AC".to_string(),
+            color: "#3b82f6".to_string(),
+            email: None,
+            plan: Some("Team".to_string()),
+            auto_burn: true,
+            is_active: false,
+            login_state: LoginState::Ok,
+            login_ends_at_ms: None,
+            login_days_left: None,
+            usage: None,
+            usable: true,
+            blocked_until: None,
+            blocker: None,
+            fetched_at: None,
+            last_error: None,
+        });
+        let mut burn = BurnView::default();
+        burn.planned.insert(AC_ID.to_string(), switch_at);
+        snapshot.burn = Some(burn);
+
+        let source = SnapshotFacts {
+            snapshot: &snapshot,
+            app: &app,
+        };
+        assert_eq!(
+            source.burn_next(now),
+            Ok(None),
+            "no burn-next.json, so no auto-burn value even with a filled plan"
+        );
+
+        burn_next::write(
+            &app,
+            &burn_next::BurnNext {
+                account: AC_ID.to_string(),
+                at: switch_at,
+                written: now,
+            },
+        )
+        .expect("burn-next.json");
+        assert_eq!(
+            source.burn_next(now),
+            Ok(Some(("AC".to_string(), switch_at))),
+            "the preview shows the line's next account and time"
         );
     }
 }
