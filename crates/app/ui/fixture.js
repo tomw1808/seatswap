@@ -24,6 +24,7 @@ const DEFAULT_SETTINGS = {
   notifyUsableAgain: true,
   notifyWaiting: true,
   notifyWaitingHosts: "thisHost",
+  notifyLoginEnds: true,
   agentsRead: true,
   agentsSwitch: false,
   statuslineFeed: true,
@@ -277,14 +278,48 @@ function makeFixture() {
     burn: {
       on: true,
       pausedUntil: null,
-      early: false,
-      why: "switching before 100 % does not pay",
+      early: true,
+      why: "switching before 100 % pays",
       learning: [],
       line: "On AC until its 5 h window is full, about 2h. Then LB.",
       planned: { [labId]: isoIn(2 * hour) },
       waiting: { to: privateId, latest: isoIn(40 * 60000), tiedBusy: 1 },
       suggestion: null,
+      measured: {
+        windowPercentOfWeek: {
+          [privateId]: 8.6,
+          [labId]: 9.4,
+          [acmeId]: 10.2,
+        },
+        switchCostPercentOfWindow: 0.8,
+        switchesPerDay: 5.6,
+      },
     },
+    skill: {
+      path: "~/.claude/skills/seatswap/SKILL.md",
+      installed: false,
+      differs: false,
+    },
+    agentCalls: [
+      {
+        at: isoIn(-3 * hour),
+        command: "status --json",
+        cwd: "~/projects/ledger",
+        allowed: true,
+      },
+      {
+        at: isoIn(-2 * hour),
+        command: "use PR",
+        cwd: "~/projects/ledger",
+        allowed: false,
+      },
+      {
+        at: isoIn(-1 * hour),
+        command: "status --json --refresh",
+        cwd: "~/projects/acme-kb",
+        allowed: true,
+      },
+    ],
     warnings: [{ kind: "soon", id: labId, daysLeft: 4 }],
     pending: null,
     secretsWarning: null,
@@ -661,6 +696,41 @@ export async function fixtureInvoke(command, args) {
       if (fixture.burn && fixture.settings.autoBurn) fixture.burn.suggestion = null;
       fixture.lastPollAt = fixture.lastPollAt || new Date().toISOString();
       return null;
+
+    case "open_window":
+      return null;
+
+    case "agent_calls": {
+      const limit = Number(args.limit);
+      if (!Number.isInteger(limit) || limit < 0) {
+        throw new Error(`agent_calls needs a limit of 0 or more, got ${args.limit}`);
+      }
+      return clone(
+        fixture.agentCalls
+          .slice()
+          .sort((a, b) => Date.parse(b.at) - Date.parse(a.at))
+          .slice(0, limit)
+      );
+    }
+
+    case "skill_status":
+      return clone(fixture.skill);
+
+    case "skill_install": {
+      if (typeof args.force !== "boolean") {
+        throw new Error("skill_install needs force true or false");
+      }
+      if (fixture.skill.installed && fixture.skill.differs && !args.force) {
+        throw new Error(
+          `${fixture.skill.path} already exists and differs from seatswap's bundled skill; use --force to replace it`
+        );
+      }
+      fixture.skill = Object.assign({}, fixture.skill, {
+        installed: true,
+        differs: false,
+      });
+      return clone(fixture.skill);
+    }
 
     case "icon_preview": {
       const abbr = String(args.abbr || "").toUpperCase();

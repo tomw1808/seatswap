@@ -127,11 +127,17 @@ impl Deduper {
             }
         }
 
-        for warning in &snapshot.warnings {
-            let id = warning_id(warning);
-            let key = (id.to_string(), WarningLevel::of(warning));
-            if self.warnings.insert(key) {
-                due.push(Notification::LoginWarning(warning.clone()));
+        if snapshot
+            .settings
+            .as_ref()
+            .is_some_and(|settings| settings.notify_login_ends)
+        {
+            for warning in &snapshot.warnings {
+                let id = warning_id(warning);
+                let key = (id.to_string(), WarningLevel::of(warning));
+                if self.warnings.insert(key) {
+                    due.push(Notification::LoginWarning(warning.clone()));
+                }
             }
         }
 
@@ -971,6 +977,31 @@ mod tests {
         };
         let other = snapshot(None, vec![other], LiveView::NoLogin);
         assert_eq!(deduper.due(&other, now).len(), 1);
+    }
+
+    #[test]
+    fn login_warnings_follow_their_setting() {
+        let mut deduper = Deduper::new();
+        let now = utc("2026-11-10T12:00:00Z");
+        let warning = LoginWarning::Soon {
+            id: "lb".to_string(),
+            days_left: 4,
+        };
+
+        let mut off = snapshot(None, vec![warning.clone()], LiveView::NoLogin);
+        off.settings = Some(Settings {
+            notify_login_ends: false,
+            ..Settings::default()
+        });
+        assert!(
+            deduper.due(&off, now).is_empty(),
+            "the login warnings are off"
+        );
+
+        let on = snapshot(None, vec![warning], LiveView::NoLogin);
+        let due = deduper.due(&on, now);
+        assert_eq!(due.len(), 1, "the login warnings are on again");
+        assert!(matches!(due[0], Notification::LoginWarning(_)));
     }
 
     #[test]

@@ -6,7 +6,6 @@
 //! in `seatswap_core`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -15,7 +14,6 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use seatswap_core::api::{Api, Usage};
-use seatswap_core::atomic::{self, Access};
 use seatswap_core::burn::live::{self, Readiness};
 use seatswap_core::burn::plan::{follow, slack, Policy};
 use seatswap_core::burn::replay::replay;
@@ -26,6 +24,7 @@ use seatswap_core::paths::{self, AppPaths, ClaudePaths, PathsError};
 use seatswap_core::store::{self, Account, AccountsFile, LoginState, Settings, Store, StoreError};
 use seatswap_core::switcher::{self, LiveState, SwitchError, UnsavedPolicy};
 
+use crate::agent_skill::{self, SkillError};
 use crate::burn_text;
 use crate::format::{class_name, format_age, format_reset_at, integer_percent, percent, tooltip};
 use crate::gui::ipc;
@@ -35,9 +34,6 @@ use crate::statusline;
 /// Colour used when there is no live account or no usage to judge (the grey of
 /// the unknown tray ring, docs/implementation.md icon.rs).
 const NO_LOAD_COLOR: &str = "#555b66";
-
-/// The skill shipped with the program (spec §6.4).
-const AGENT_SKILL: &str = include_str!("../assets/agent-skill/SKILL.md");
 
 const AGENTS_MAY_NOT_READ: &str = "agents may not read usage (seatswap settings → Agents)";
 const AGENTS_MAY_NOT_SWITCH: &str = "agents may not switch accounts (seatswap settings → Agents)";
@@ -1105,94 +1101,43 @@ fn edit(
 /// `<claude config dir>/skills/seatswap/`. Nothing outside these two commands
 /// writes to Claude Code's config folder.
 fn agent_skill(context: &Context, action: SkillAction) -> Result<(), CliError> {
-    let folder = context.claude.skills_dir().join("seatswap");
-    let path = folder.join("SKILL.md");
     match action {
-        SkillAction::Install { force } => install_skill(&folder, &path, force),
-        SkillAction::Uninstall { force } => uninstall_skill(&folder, &path, force),
-    }
-}
-
-fn install_skill(folder: &Path, path: &Path, force: bool) -> Result<(), CliError> {
-    let bundled = AGENT_SKILL.as_bytes();
-    match fs::read(path) {
-        Ok(existing) if existing == bundled => {
-            println!("already installed: {}", path.display());
-            return Ok(());
+        SkillAction::Install { force } => {
+            let before = agent_skill::status(&context.claude).map_err(skill_error)?;
+            let status = agent_skill::install(&context.claude, force).map_err(skill_error)?;
+            if before.installed && !before.differs {
+                println!("already installed: {}", status.path.display());
+            } else {
+                println!("{}", status.path.display());
+            }
         }
-        Ok(_) if !force => {
-            return Err(CliError::Message(format!(
-                "{} already exists and differs from seatswap's bundled skill; use --force to replace it",
-                path.display()
-            )))
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(source) => {
-            return Err(CliError::Store(StoreError::Io {
-                path: path.to_path_buf(),
-                source,
-            }))
+        SkillAction::Uninstall { force } => {
+            let before = agent_skill::status(&context.claude).map_err(skill_error)?;
+            if !before.installed {
+                println!("not installed: {}", before.path.display());
+                return Ok(());
+            }
+            let status = agent_skill::uninstall(&context.claude, force).map_err(skill_error)?;
+            println!("removed {}", status.path.display());
         }
     }
-    atomic::ensure_private_dir(folder).map_err(|source| {
-        CliError::Store(StoreError::Io {
-            path: folder.to_path_buf(),
-            source,
-        })
-    })?;
-    atomic::write_atomic(path, bundled, Access::Private).map_err(|source| {
-        CliError::Store(StoreError::Io {
-            path: path.to_path_buf(),
-            source,
-        })
-    })?;
-    println!("{}", path.display());
     Ok(())
 }
 
-fn uninstall_skill(folder: &Path, path: &Path, force: bool) -> Result<(), CliError> {
-    let existing = match fs::read(path) {
-        Ok(existing) => existing,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            println!("not installed: {}", path.display());
-            return Ok(());
-        }
-        Err(source) => {
-            return Err(CliError::Store(StoreError::Io {
-                path: path.to_path_buf(),
-                source,
-            }))
-        }
-    };
-    if existing != AGENT_SKILL.as_bytes() && !force {
-        return Err(CliError::Message(format!(
+/// Keep the command line's old texts and exit codes: a differing file was a
+/// message (exit 1) and a file error was a store error naming the path.
+fn skill_error(error: SkillError) -> CliError {
+    match error {
+        SkillError::DiffersOnInstall { path } => CliError::Message(format!(
+            "{} already exists and differs from seatswap's bundled skill; use --force to replace it",
+            path.display()
+        )),
+        SkillError::DiffersOnUninstall { path } => CliError::Message(format!(
             "{} differs from seatswap's bundled skill; use --force to remove it",
             path.display()
-        )));
+        )),
+        SkillError::Io { path, source } => CliError::Store(StoreError::Io { path, source }),
     }
-    fs::remove_file(path).map_err(|source| {
-        CliError::Store(StoreError::Io {
-            path: path.to_path_buf(),
-            source,
-        })
-    })?;
-    println!("removed {}", path.display());
-    match fs::remove_dir(folder) {
-        Ok(()) => {}
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
-            ) => {}
-        Err(source) => {
-            return Err(CliError::Store(StoreError::Io {
-                path: folder.to_path_buf(),
-                source,
-            }))
-        }
-    }
-    Ok(())
 }
 
 fn status(
@@ -1804,6 +1749,10 @@ fn i3blocks_lines(views: &[AccountView], now: DateTime<Utc>) -> (String, String,
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    use std::fs;
+
+    use crate::agent_skill::AGENT_SKILL;
 
     use chrono::Duration;
     use chrono::Utc;

@@ -5,6 +5,7 @@
 //! `window.__TAURI__.core.invoke` rejects with; the error text is shown in the
 //! panel.
 
+use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -17,13 +18,15 @@ use tauri::{
 };
 
 use seatswap_core::engine::PollReason;
-use seatswap_core::history::By;
+use seatswap_core::history::{By, Event, EventKind, HistoryDir, Hosts, Range};
 use seatswap_core::store::{self, Settings};
 use seatswap_core::switcher::UnsavedPolicy;
 
 use super::format;
 use super::worker::{ActionCommand, ActionReply, EngineCommand, Snapshot};
 use super::GuiState;
+use crate::agent_skill::{self, SkillStatus};
+use crate::format::with_tilde;
 use crate::icon::{self, IconSpec};
 
 /// Window label used by `tauri.conf.json`'s capability and by every command.
@@ -684,6 +687,113 @@ pub(crate) fn pause_burn(state: State<'_, GuiState>, hours: Option<i64>) -> Resu
     super::send_to_worker(state.action.send(ActionCommand::PauseBurn { hours }))
 }
 
+/// One call by an agent as the settings page lists it (spec §6.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentCallRow {
+    pub at: DateTime<Utc>,
+    pub command: String,
+    pub cwd: Option<String>,
+    pub allowed: bool,
+}
+
+/// The history folder and host the app already uses; a settings file that is
+/// not loaded or a folder that cannot be named is the error text.
+fn history_of(state: &GuiState) -> Result<HistoryDir, String> {
+    let snapshot = state.snapshot()?;
+    let settings = snapshot
+        .settings
+        .ok_or_else(|| "the settings are not loaded; cannot find the history folder".to_string())?;
+    let root = seatswap_core::paths::history_root(settings.history_dir.as_deref(), &state.app)
+        .map_err(|error| error.to_string())?;
+    let host = seatswap_core::paths::host_name(settings.host_name.as_deref())
+        .map_err(|error| error.to_string())?;
+    Ok(HistoryDir::at(&root, &host))
+}
+
+/// The `AgentCall` events of this host, newest first, at most `limit` of them,
+/// each folder shown with `~` for `home`. A history that cannot be read is an
+/// error, never an empty list.
+fn agent_calls_from(
+    history: &HistoryDir,
+    home: &Path,
+    limit: u32,
+) -> Result<Vec<AgentCallRow>, String> {
+    let read = history
+        .read::<Event>(
+            &Range {
+                from: DateTime::<Utc>::MIN_UTC,
+                to: DateTime::<Utc>::MAX_UTC,
+            },
+            &Hosts::One(history.host().to_string()),
+        )
+        .map_err(|error| error.to_string())?;
+    let mut rows: Vec<AgentCallRow> = read
+        .records
+        .into_iter()
+        .filter_map(|hosted| match hosted.record.kind {
+            EventKind::AgentCall {
+                command,
+                cwd,
+                allowed,
+            } => Some(AgentCallRow {
+                at: hosted.record.t,
+                command,
+                cwd: cwd.map(|cwd| with_tilde(&cwd, home)),
+                allowed,
+            }),
+            _ => None,
+        })
+        .collect();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.at));
+    Ok(rows.into_iter().take(limit as usize).collect())
+}
+
+// The three commands below read or write files: `async`, so they run off the
+// window's thread, like the other commands that touch files.
+#[tauri::command]
+pub(crate) async fn agent_calls(
+    state: State<'_, GuiState>,
+    limit: u32,
+) -> Result<Vec<AgentCallRow>, String> {
+    agent_calls_from(&history_of(&state)?, &state.claude.home, limit)
+}
+
+/// The skill file as the page shows it: [`SkillStatus`] with the path written
+/// with `~` for the home folder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SkillRow {
+    pub path: String,
+    pub installed: bool,
+    pub differs: bool,
+}
+
+fn skill_row(status: SkillStatus, home: &Path) -> SkillRow {
+    SkillRow {
+        path: with_tilde(&status.path.to_string_lossy(), home),
+        installed: status.installed,
+        differs: status.differs,
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn skill_status(state: State<'_, GuiState>) -> Result<SkillRow, String> {
+    agent_skill::status(&state.claude)
+        .map(|status| skill_row(status, &state.claude.home))
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) async fn skill_install(
+    state: State<'_, GuiState>,
+    force: bool,
+) -> Result<SkillRow, String> {
+    agent_skill::install(&state.claude, force)
+        .map(|status| skill_row(status, &state.claude.home))
+        .map_err(|error| error.to_string())
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct IconPx {
@@ -801,6 +911,11 @@ fn request(
 mod tests {
     use super::*;
 
+    use std::fs;
+
+    use seatswap_core::history::Recorder;
+    use seatswap_core::paths::ClaudePaths;
+
     fn monitor() -> Rect {
         Rect {
             x: 0.0,
@@ -851,6 +966,88 @@ mod tests {
         let (x, y) = place_panel((2000.0, 900.0), second, (380.0, 400.0), false);
         assert_eq!(x, 1920.0);
         assert_eq!(y, 900.0 - 400.0);
+    }
+
+    #[test]
+    fn agent_calls_returns_the_newest_first() {
+        let tmp = tempfile::tempdir().expect("a temp folder");
+        let history = HistoryDir::at(tmp.path(), "atlas");
+        let recorder = Recorder::new(HistoryDir::at(history.root(), history.host()));
+        let call = |at: &str, command: &str, allowed: bool| {
+            recorder
+                .event(
+                    DateTime::parse_from_rfc3339(at)
+                        .expect("a test time")
+                        .with_timezone(&Utc),
+                    EventKind::AgentCall {
+                        command: command.to_string(),
+                        cwd: Some("/home/sam/projects/ledger".to_string()),
+                        allowed,
+                    },
+                )
+                .expect("an agent call event");
+        };
+        call("2026-11-10T09:41:00Z", "status --json", true);
+        call("2026-11-10T09:42:00Z", "use PR", false);
+        call("2026-11-10T09:43:00Z", "next", true);
+        // Another host writes the same history folder; its calls are not this host's.
+        Recorder::new(HistoryDir::at(history.root(), "vega"))
+            .event(
+                DateTime::parse_from_rfc3339("2026-11-10T09:44:00Z")
+                    .expect("a test time")
+                    .with_timezone(&Utc),
+                EventKind::AgentCall {
+                    command: "status".to_string(),
+                    cwd: None,
+                    allowed: true,
+                },
+            )
+            .expect("another host's agent call");
+
+        let home = Path::new("/home/sam");
+        let rows = agent_calls_from(&history, home, 20).expect("the agent calls are read");
+        let commands: Vec<&str> = rows.iter().map(|row| row.command.as_str()).collect();
+        assert_eq!(commands, ["next", "use PR", "status --json"]);
+        assert!(!rows[1].allowed, "use PR was refused");
+        assert_eq!(rows[0].cwd.as_deref(), Some("~/projects/ledger"));
+
+        let two = agent_calls_from(&history, home, 2).expect("two agent calls are read");
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[0].command, "next");
+        assert_eq!(two[1].command, "use PR");
+    }
+
+    #[test]
+    fn skill_status_knows_missing_same_and_different() {
+        let tmp = tempfile::tempdir().expect("a temp folder");
+        let claude = ClaudePaths::for_config_dir(&tmp.path().join("claude"), tmp.path());
+        let path = claude.skills_dir().join("seatswap/SKILL.md");
+
+        let missing = agent_skill::status(&claude).expect("the status is readable");
+        assert!(!missing.installed, "no file yet");
+        assert!(!missing.differs);
+        assert_eq!(missing.path, path);
+
+        fs::create_dir_all(path.parent().expect("the skill folder")).expect("the skill folder");
+        fs::write(&path, agent_skill::AGENT_SKILL).expect("the bundled skill");
+        let same = agent_skill::status(&claude).expect("the status is readable");
+        assert!(same.installed);
+        assert!(!same.differs);
+
+        fs::write(&path, "another skill").expect("a different skill");
+        let different = agent_skill::status(&claude).expect("the status is readable");
+        assert!(different.installed);
+        assert!(different.differs);
+
+        let row = skill_row(different, tmp.path());
+        assert_eq!(
+            row.path,
+            format!(
+                "~{0}claude{0}skills{0}seatswap{0}SKILL.md",
+                std::path::MAIN_SEPARATOR
+            )
+        );
+        assert!(row.installed && row.differs);
     }
 
     #[test]

@@ -6,7 +6,6 @@ import {
   HAS_TAURI,
   LEVEL_COLORS,
   PALETTE,
-  TAURI_GLOBAL,
   TRAY_GREY,
   applyTheme,
   clamp,
@@ -22,6 +21,8 @@ import {
   mixHex,
   rgba,
   shortPercent,
+  switchButton,
+  textInput,
 } from "./common.js";
 import { currentFixture, ensureFixture } from "./fixture.js";
 
@@ -40,9 +41,6 @@ const state = {
   pendingLabel: "",
   unknownKey: null,
   unknownLabel: "",
-  settingsDraft: null,
-  // { text, title } for the settings header; null until loadVersion() has answered.
-  version: null,
   refreshing: false,
   lastPercents: new Map(),
   lastCardOrder: [],
@@ -54,11 +52,6 @@ const state = {
     editorColor: null,
     preview: null,
     add: null,
-    settings: null,
-    settingsConfigDir: null,
-    settingsHostName: null,
-    settingsHistoryDir: null,
-    settingsSaved: false,
   },
 };
 
@@ -78,7 +71,6 @@ function currentThemeSetting() {
   if (state.snapshot && isObject(state.snapshot.settings) && state.snapshot.settings.theme) {
     return state.snapshot.settings.theme;
   }
-  if (state.settingsDraft && state.settingsDraft.theme) return state.settingsDraft.theme;
   return "system";
 }
 
@@ -91,23 +83,6 @@ function button(label, variant, onclick, props) {
   });
   return h("button", merged, label);
 }
-
-function textInput(props) {
-  return h("input", Object.assign({ type: "text", spellcheck: "false" }, props || {}));
-}
-
-function selectInput(options, value, onchange) {
-  const select = h("select", {
-    onchange: (event) => onchange(event.target.value),
-  });
-  for (const [optionValue, optionLabel] of options) {
-    const option = h("option", { value: optionValue, text: optionLabel });
-    if (optionValue === value) option.selected = true;
-    select.appendChild(option);
-  }
-  return select;
-}
-
 
 // ---------------------------------------------------------------------------
 // snapshot field readers (the shape is docs/implementation.md, serde camelCase)
@@ -1669,528 +1644,6 @@ async function saveCurrent(labelValue) {
 }
 
 // ---------------------------------------------------------------------------
-// settings view (spec §10)
-// ---------------------------------------------------------------------------
-
-function renderSettings() {
-  const root = document.getElementById("view-settings");
-  if (!root) return;
-  clear(root);
-
-  root.appendChild(
-    h("div", { class: "view-head" }, [
-      button("‹ Back", "ghost", () => setView("main")),
-      h("span", { class: "view-heading", text: "Settings" }),
-      state.version
-        ? h("span", { class: "view-version", text: state.version.text, title: state.version.title })
-        : null,
-    ])
-  );
-
-  if (!state.snapshot) {
-    root.appendChild(h("div", { class: "setting-note", text: "Loading settings…" }));
-    fitPanel();
-    return;
-  }
-
-  if (!isObject(state.snapshot.settings)) {
-    // accounts.json could not be read: never show defaults that Save would
-    // write over the real settings.
-    const error = h("div", {
-      class: "inline-error",
-      id: "settings-error",
-      text:
-        state.snapshot.error ||
-        "The settings could not be read from accounts.json; Save is disabled.",
-    });
-    root.appendChild(error);
-    const disabled = button("Save", "primary", saveSettings);
-    disabled.disabled = true;
-    root.appendChild(h("div", { class: "settings-actions" }, [disabled]));
-    fitPanel();
-    return;
-  }
-
-  if (!state.settingsDraft) {
-    state.settingsDraft = Object.assign({}, state.snapshot.settings);
-  }
-  const draft = state.settingsDraft;
-  const settings = h("div", { class: "settings" });
-
-  settings.appendChild(
-    settingRow(
-      "Tray text",
-      selectInput(
-        [
-          ["percent", "Percent"],
-          ["percentReset", "Percent + reset"],
-          ["off", "Off"],
-        ],
-        draft.trayText,
-        (value) => {
-          draft.trayText = value;
-        }
-      ),
-      "What the tray label shows."
-    )
-  );
-
-  settings.appendChild(
-    settingRow(
-      "Tray ring",
-      selectInput(
-        [
-          ["binding", "Binding limit"],
-          ["session", "Session"],
-          ["week", "Week"],
-        ],
-        draft.iconLimit,
-        (value) => {
-          draft.iconLimit = value;
-        }
-      ),
-      "Which limit the tray icon ring shows."
-    )
-  );
-
-  settings.appendChild(
-    settingRow(
-      "Poll active account",
-      numberControl(draft, "pollActiveSecs", { min: "30", step: "30" }, "s"),
-      "Seconds between usage polls of the live account."
-    )
-  );
-
-  settings.appendChild(
-    settingRow(
-      "Poll other accounts",
-      numberControl(draft, "pollInactiveSecs", { min: "30", step: "30" }, "s"),
-      "Seconds between usage polls of accounts that are not live."
-    )
-  );
-
-  settings.appendChild(settingRow("Notify on switch", checkboxControl(draft, "notifyOnSwitch")));
-  settings.appendChild(
-    settingRow(
-      "Mirror live login",
-      checkboxControl(draft, "mirrorLive"),
-      "Keep the stored copy in step when Claude Code's login changes."
-    )
-  );
-  settings.appendChild(
-    settingRow(
-      "Refresh inactive logins",
-      checkboxControl(draft, "refreshInactive"),
-      "Refresh the saved logins of accounts that are not live. Off: their last known usage is shown with its age."
-    )
-  );
-  settings.appendChild(settingRow("Start at login", checkboxControl(draft, "startAtLogin")));
-  settings.appendChild(
-    settingRow(
-      "Theme",
-      selectInput(
-        [
-          ["system", "System"],
-          ["light", "Light"],
-          ["dark", "Dark"],
-        ],
-        draft.theme,
-        (value) => {
-          draft.theme = value;
-          applyTheme(value);
-        }
-      )
-    )
-  );
-
-  const hotkeyInput = textInput({
-    value: draft.hotkey || "",
-    readonly: true,
-    "aria-label": "Hotkey (read only)",
-  });
-  settings.appendChild(settingRow("Hotkey", hotkeyInput));
-  settings.appendChild(
-    h("div", { class: "hotkey-note" }, [
-      "Bind ",
-      h("code", { text: "seatswap panel" }),
-      " to a key in your desktop's keyboard settings.",
-    ])
-  );
-
-  const configInput = textInput({
-    value: draft.claudeConfigDir || "",
-    placeholder: "/home/you/.claude",
-    "aria-label": "Claude config directory",
-  });
-  configInput.addEventListener("input", () => {
-    draft.claudeConfigDir = configInput.value;
-    settingsFieldError("claudeConfigDir", null);
-  });
-  const configField = h("div", { class: "field" }, [
-    configInput,
-    h("div", {
-      class: "inline-error",
-      id: "claude-config-error",
-      hidden: !state.errors.settingsConfigDir,
-      text: state.errors.settingsConfigDir || "",
-    }),
-  ]);
-  settings.appendChild(
-    settingRow(
-      "Claude config folder",
-      configField,
-      "Empty: $CLAUDE_CONFIG_DIR or Claude Code's default folder."
-    )
-  );
-  settings.appendChild(
-    h("div", {
-      class: "setting-note",
-      text: "Takes effect after restarting seatswap.",
-    })
-  );
-
-  settings.appendChild(settingGroup("Auto-burn"));
-  settings.appendChild(
-    settingRow("Auto-burn", switchControl(draft, "autoBurn", "Auto-burn"))
-  );
-  settings.appendChild(
-    settingRow(
-      "Suggest switches",
-      switchControl(draft, "suggestSwitches", "Suggest switches"),
-      "while auto-burn is off"
-    )
-  );
-
-  settings.appendChild(settingGroup("History"));
-
-  const hostInput = textInput({
-    value: draft.hostName || "",
-    placeholder: "the machine's name",
-    "aria-label": "Name of this host",
-  });
-  hostInput.addEventListener("input", () => {
-    draft.hostName = hostInput.value;
-    settingsFieldError("hostName", null);
-  });
-  settings.appendChild(
-    settingRow(
-      "Name of this host",
-      h("div", { class: "field" }, [
-        hostInput,
-        h("div", {
-          class: "inline-error",
-          id: "host-name-error",
-          hidden: !state.errors.settingsHostName,
-          text: state.errors.settingsHostName || "",
-        }),
-      ]),
-      "Empty: the machine's name."
-    )
-  );
-
-  const historyInput = textInput({
-    value: draft.historyDir || "",
-    placeholder: "seatswap's own folder",
-    "aria-label": "History folder",
-  });
-  historyInput.addEventListener("input", () => {
-    draft.historyDir = historyInput.value;
-    settingsFieldError("historyDir", null);
-  });
-  settings.appendChild(
-    settingRow(
-      "History folder",
-      h("div", { class: "field" }, [
-        historyInput,
-        h("div", {
-          class: "inline-error",
-          id: "history-dir-error",
-          hidden: !state.errors.settingsHistoryDir,
-          text: state.errors.settingsHistoryDir || "",
-        }),
-      ]),
-      "Empty: seatswap's own folder."
-    )
-  );
-
-  settings.appendChild(
-    settingRow(
-      "Read Claude Code's session files",
-      checkboxControl(draft, "readSessions"),
-      "model, busy or idle, tokens per folder · never message text"
-    )
-  );
-  settings.appendChild(
-    h("div", {
-      class: "setting-note",
-      text: "Takes effect after restarting seatswap.",
-    })
-  );
-
-  settings.appendChild(settingGroup("Notifications"));
-  settings.appendChild(
-    settingRow("An account is usable again", checkboxControl(draft, "notifyUsableAgain"))
-  );
-  settings.appendChild(
-    settingRow("A session is waiting for you", checkboxControl(draft, "notifyWaiting"))
-  );
-
-  settings.appendChild(settingGroup("Agents"));
-  settings.appendChild(
-    settingRow("Agents may read usage", checkboxControl(draft, "agentsRead"))
-  );
-  settings.appendChild(
-    settingRow("Agents may switch accounts", checkboxControl(draft, "agentsSwitch"))
-  );
-  settings.appendChild(
-    h("div", { class: "setting-note" }, [
-      "These two switches work through a marker that Claude Code puts on every command it runs. An agent runs as you. It can remove the marker, or change seatswap's files directly. The switches stop agents that follow the rules. They are not a lock. To block the command itself, add a deny rule for ",
-      h("code", { text: "seatswap" }),
-      " to Claude Code's permissions.",
-    ])
-  );
-
-  root.appendChild(settings);
-
-  const errorNode = h("div", {
-    class: "inline-error",
-    id: "settings-error",
-    hidden: !state.errors.settings,
-    text: state.errors.settings || "",
-  });
-  root.appendChild(errorNode);
-
-  const saved = h("span", {
-    class: "inline-ok",
-    id: "settings-saved",
-    hidden: !state.errors.settingsSaved,
-    text: "Saved.",
-  });
-
-  root.appendChild(
-    h("div", { class: "settings-actions" }, [
-      button("Save", "primary", saveSettings),
-      saved,
-    ])
-  );
-
-  fitPanel();
-}
-
-function settingGroup(title) {
-  return h("div", {
-    class: "setting-group",
-    role: "heading",
-    "aria-level": "3",
-    text: title,
-  });
-}
-
-function settingRow(labelText, control, subText) {
-  const label = h("div", { class: "setting-label" }, [
-    h("span", { text: labelText }),
-  ]);
-  if (subText) label.appendChild(h("span", { class: "sub", text: subText }));
-  if (
-    control &&
-    typeof control.matches === "function" &&
-    control.matches("input, select, textarea") &&
-    !control.getAttribute("aria-label")
-  ) {
-    control.setAttribute("aria-label", labelText);
-  }
-  return h("div", { class: "setting" }, [
-    label,
-    h("div", { class: "setting-control" }, [control]),
-  ]);
-}
-
-function numberControl(draft, key, attrs, unit) {
-  const input = h(
-    "input",
-    Object.assign(
-      {
-        type: "number",
-        value: draft[key] === null || draft[key] === undefined ? "" : String(draft[key]),
-        "aria-label": key,
-      },
-      attrs
-    )
-  );
-  input.addEventListener("input", () => {
-    draft[key] = input.value === "" ? "" : Number(input.value);
-  });
-  return h("span", { class: "number-control" }, [
-    input,
-    h("span", { class: "unit", text: unit }),
-  ]);
-}
-
-function checkboxControl(draft, key) {
-  const input = h("input", { type: "checkbox", checked: Boolean(draft[key]), "aria-label": key });
-  input.addEventListener("change", () => {
-    draft[key] = input.checked;
-  });
-  return input;
-}
-
-// The switch used for auto-burn and for the two per-account switches.
-function switchButton(checked, label, onchange) {
-  const control = h("button", {
-    type: "button",
-    class: "switch",
-    role: "switch",
-    "aria-checked": checked ? "true" : "false",
-    "aria-label": label,
-  });
-  control.addEventListener("click", () => {
-    const next = control.getAttribute("aria-checked") !== "true";
-    control.setAttribute("aria-checked", next ? "true" : "false");
-    onchange(next);
-  });
-  return control;
-}
-
-function switchControl(draft, key, label) {
-  return switchButton(Boolean(draft[key]), label || key, (value) => {
-    draft[key] = value;
-  });
-}
-
-function settingsError(text) {
-  state.errors.settings = text || null;
-  const node = document.getElementById("settings-error");
-  if (node) {
-    node.textContent = text || "";
-    node.hidden = !text;
-  }
-  const saved = document.getElementById("settings-saved");
-  if (saved) saved.hidden = Boolean(text) || !state.errors.settingsSaved;
-  fitPanel();
-}
-
-const SETTINGS_FIELD_ERRORS = {
-  claudeConfigDir: ["settingsConfigDir", "claude-config-error"],
-  hostName: ["settingsHostName", "host-name-error"],
-  historyDir: ["settingsHistoryDir", "history-dir-error"],
-};
-
-function settingsFieldError(field, text) {
-  const target = SETTINGS_FIELD_ERRORS[field];
-  if (!target) return;
-  state.errors[target[0]] = text || null;
-  const node = document.getElementById(target[1]);
-  if (node) {
-    node.textContent = text || "";
-    node.hidden = !text;
-  }
-  fitPanel();
-}
-
-// Which row an error from the core belongs to. A relative path is not always
-// claudeConfigDir's fault: historyDir and hostName have their own rules.
-function settingsErrorField(message) {
-  if (message.includes("historyDir")) return "historyDir";
-  if (
-    message.includes("hostName") ||
-    /host name .*must be 1 to 63 characters/i.test(message)
-  ) {
-    return "hostName";
-  }
-  if (message.includes("claudeConfigDir")) return "claudeConfigDir";
-  return null;
-}
-
-function routeSettingsError(message) {
-  settingsFieldError("hostName", null);
-  settingsFieldError("historyDir", null);
-  settingsFieldError("claudeConfigDir", null);
-  const field = settingsErrorField(message);
-  if (field) {
-    settingsFieldError(field, message);
-    settingsError(null);
-  } else {
-    settingsError(message);
-  }
-}
-
-async function saveSettings() {
-  if (!state.snapshot || !isObject(state.snapshot.settings)) {
-    settingsError("The settings could not be read from accounts.json; re-open the panel.");
-    return;
-  }
-  if (!state.settingsDraft) return;
-  const draft = state.settingsDraft;
-
-  if (!Number.isInteger(draft.pollActiveSecs) || draft.pollActiveSecs < 30) {
-    settingsError("Poll active account must be a whole number of at least 30 seconds.");
-    return;
-  }
-  if (!Number.isInteger(draft.pollInactiveSecs) || draft.pollInactiveSecs < 30) {
-    settingsError("Poll other accounts must be a whole number of at least 30 seconds.");
-    return;
-  }
-
-  const configDir = String(draft.claudeConfigDir || "").trim();
-  const hostName = String(draft.hostName || "").trim();
-  const historyDir = String(draft.historyDir || "").trim();
-  // Keep every field the pop-up does not edit, so saving here never resets one
-  // of them to its default.
-  const payload = Object.assign({}, draft);
-  Object.assign(payload, {
-    trayText: draft.trayText,
-    iconLimit: draft.iconLimit,
-    pollActiveSecs: draft.pollActiveSecs,
-    pollInactiveSecs: draft.pollInactiveSecs,
-    autoBurn: Boolean(draft.autoBurn),
-    suggestSwitches: Boolean(draft.suggestSwitches),
-    notifyOnSwitch: Boolean(draft.notifyOnSwitch),
-    mirrorLive: Boolean(draft.mirrorLive),
-    refreshInactive: Boolean(draft.refreshInactive),
-    hotkey: draft.hotkey,
-    startAtLogin: Boolean(draft.startAtLogin),
-    theme: draft.theme,
-    claudeConfigDir: configDir === "" ? null : configDir,
-    hostName: hostName === "" ? null : hostName,
-    historyDir: historyDir === "" ? null : historyDir,
-    readSessions: Boolean(draft.readSessions),
-    notifyUsableAgain: Boolean(draft.notifyUsableAgain),
-    notifyWaiting: Boolean(draft.notifyWaiting),
-    agentsRead: Boolean(draft.agentsRead),
-    agentsSwitch: Boolean(draft.agentsSwitch),
-  });
-
-  try {
-    await invoke("save_settings", { settings: payload });
-    state.errors.settings = null;
-    state.errors.settingsConfigDir = null;
-    state.errors.settingsHostName = null;
-    state.errors.settingsHistoryDir = null;
-    state.errors.settingsSaved = true;
-    Object.assign(draft, payload);
-    state.settingsDraft = draft;
-    if (state.snapshot) state.snapshot.settings = Object.assign({}, payload);
-    applyTheme(payload.theme);
-    settingsFieldError("hostName", null);
-    settingsFieldError("historyDir", null);
-    settingsFieldError("claudeConfigDir", null);
-    settingsError(null);
-    afterCommand();
-  } catch (error) {
-    const message = errorMessage(error);
-    state.errors.settingsSaved = false;
-    if (message.startsWith("settings saved; start at login could not be set:")) {
-      // The settings themselves are saved; drop the draft and show only the
-      // autostart failure.
-      if (state.snapshot) state.snapshot.settings = Object.assign({}, payload);
-      state.settingsDraft = null;
-      renderSettings();
-    }
-    routeSettingsError(message);
-  }
-}
-
-// ---------------------------------------------------------------------------
 // commands
 // ---------------------------------------------------------------------------
 
@@ -2389,37 +1842,35 @@ async function updateTimes() {
 
 function viewFromHash() {
   const raw = String(location.hash || "").replace(/^#/, "").toLowerCase();
-  if (raw === "add" || raw === "settings") return raw;
+  if (raw === "add") return raw;
   return "main";
 }
 
+// The pop-up has no settings view (spec §3.7): its gear and the comma open the
+// large window at Settings instead.
+async function openSettings() {
+  try {
+    await invoke("open_window", { target: "settings" });
+  } catch (error) {
+    state.errors.banner = errorMessage(error);
+    if (state.view === "main") renderMain();
+  }
+}
+
 function setView(view, options) {
-  const wanted = view === "add" || view === "settings" ? view : "main";
+  const wanted = view === "add" ? view : "main";
   state.view = wanted;
 
   const main = document.getElementById("view-main");
   const add = document.getElementById("view-add");
-  const settingsView = document.getElementById("view-settings");
   if (main) main.hidden = wanted !== "main";
   if (add) add.hidden = wanted !== "add";
-  if (settingsView) settingsView.hidden = wanted !== "settings";
-  // The gear leads to settings; inside settings it would lead nowhere.
-  const settingsBtn = document.getElementById("settings-btn");
-  if (settingsBtn) settingsBtn.hidden = wanted === "settings";
 
   if (wanted === "main") {
     renderMain();
-  } else if (wanted === "add") {
+  } else {
     state.errors.add = null;
     renderAdd();
-  } else {
-    state.settingsDraft = null;
-    state.errors.settings = null;
-    state.errors.settingsConfigDir = null;
-    state.errors.settingsHostName = null;
-    state.errors.settingsHistoryDir = null;
-    state.errors.settingsSaved = false;
-    renderSettings();
   }
 
   if (!options || !options.noHash) {
@@ -2517,7 +1968,7 @@ function onKeyDown(event) {
 
   if (event.key === ",") {
     event.preventDefault();
-    setView("settings");
+    openSettings();
   }
 }
 
@@ -2530,7 +1981,7 @@ function wireStatic() {
   const refresh = document.getElementById("refresh-btn");
   if (refresh) refresh.addEventListener("click", refreshNow);
   const settings = document.getElementById("settings-btn");
-  if (settings) settings.addEventListener("click", () => setView("settings"));
+  if (settings) settings.addEventListener("click", openSettings);
   const close = document.getElementById("close-btn");
   if (close) close.addEventListener("click", hidePanel);
   const add = document.getElementById("add-btn");
@@ -2558,26 +2009,8 @@ function handleSnapshot(snapshot) {
         ? active.closest("input, textarea, select")
         : null;
     if (!typing) renderAdd();
-  } else if (state.view === "settings") {
-    if (!isObject(snapshot.settings)) state.settingsDraft = null;
-    if (!state.settingsDraft) renderSettings();
   }
   updateAge();
-}
-
-// The app's version (the workspace version in Cargo.toml) for the settings header.
-async function loadVersion() {
-  if (!HAS_TAURI) {
-    state.version = { text: "fixture", title: "No Tauri: built-in test data" };
-  } else {
-    try {
-      const version = await TAURI_GLOBAL.app.getVersion();
-      state.version = { text: `v${version}`, title: `seatswap ${version}` };
-    } catch (error) {
-      state.version = { text: "v?", title: `Version unknown: ${errorMessage(error)}` };
-    }
-  }
-  if (state.view === "settings") renderSettings();
 }
 
 async function boot() {
@@ -2586,14 +2019,14 @@ async function boot() {
   if (!HAS_TAURI) ensureFixture();
   applyTheme(currentThemeSetting());
   setView(viewFromHash(), { noHash: true });
-  loadVersion();
 
   await listen("snapshot", (payload) => handleSnapshot(payload));
   await listen("navigate", (payload) => {
     const view = typeof payload === "string" ? payload : payload && payload.view;
     // Sent each time the pop-up opens: start without a keyboard cursor.
     state.cursorId = null;
-    if (view === "main" || view === "add" || view === "settings") setView(view);
+    if (view === "settings") openSettings();
+    else if (view === "main" || view === "add") setView(view);
   });
 
   try {

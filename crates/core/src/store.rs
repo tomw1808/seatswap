@@ -404,6 +404,10 @@ fn default_notify_waiting_hosts() -> WaitingHosts {
     WaitingHosts::ThisHost
 }
 
+fn default_notify_login_ends() -> bool {
+    true
+}
+
 fn default_agents_read() -> bool {
     true
 }
@@ -486,6 +490,10 @@ pub struct Settings {
     pub notify_waiting: bool,
     #[serde(default = "default_notify_waiting_hosts")]
     pub notify_waiting_hosts: WaitingHosts,
+    /// Send the login warnings (5 days, 1 day, ended) while on (spec §3,
+    /// Notifications); default on, like the other notify settings.
+    #[serde(default = "default_notify_login_ends")]
+    pub notify_login_ends: bool,
     #[serde(default = "default_agents_read")]
     pub agents_read: bool,
     #[serde(default = "default_agents_switch")]
@@ -521,6 +529,7 @@ impl Default for Settings {
             notify_usable_again: default_notify_usable_again(),
             notify_waiting: default_notify_waiting(),
             notify_waiting_hosts: default_notify_waiting_hosts(),
+            notify_login_ends: default_notify_login_ends(),
             agents_read: default_agents_read(),
             agents_switch: default_agents_switch(),
             statusline_feed: default_statusline_feed(),
@@ -1900,6 +1909,10 @@ mod tests {
         assert!(file.settings.read_sessions);
         assert!(!file.settings.agents_switch);
         assert!(file.settings.statusline_feed);
+        assert!(
+            file.settings.notify_login_ends,
+            "an older file without notifyLoginEnds loads with it on"
+        );
         assert_eq!(file.settings.notify_waiting_hosts, WaitingHosts::ThisHost);
         assert_eq!(file.settings.history_dir, None);
     }

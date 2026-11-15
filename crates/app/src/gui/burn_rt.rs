@@ -12,9 +12,9 @@ use serde::Serialize;
 use seatswap_core::burn::burn_next::{self, BurnNext};
 use seatswap_core::burn::decide::{Decision, Regime, RegimeWhy, Situation};
 use seatswap_core::burn::live::{self, Learned, Readiness};
-use seatswap_core::burn::plan::{rates_known, Plan};
+use seatswap_core::burn::plan::{follow, rates_known, Plan, Policy};
 use seatswap_core::burn::{
-    FRESH_MIN, LEARN_RETRY_MIN, STALE_ASK_SECS, SWITCH_RELEARN_MIN, SWITCH_RETRY_MIN,
+    FRESH_MIN, HORIZON_H, LEARN_RETRY_MIN, STALE_ASK_SECS, SWITCH_RELEARN_MIN, SWITCH_RETRY_MIN,
 };
 use seatswap_core::engine::{AccountView, PollReason};
 use seatswap_core::history::{AccountRef, By, EventKind, HistoryDir};
@@ -49,6 +49,25 @@ pub(crate) struct BurnView {
     pub planned: BTreeMap<String, DateTime<Utc>>,
     pub waiting: Option<WaitingSwitch>,
     pub suggestion: Option<SwitchSuggestion>,
+    /// What auto-burn has measured so far (spec §2.13); `None` while there is
+    /// no situation to measure.
+    pub measured: Option<Measured>,
+}
+
+/// What the last regime was computed from, as the settings page shows it
+/// (spec §2.13, §3.7).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Measured {
+    /// A full 5 h window of each account auto-burn may use as a percent of its
+    /// week: `100 × c / s`.
+    pub window_percent_of_week: BTreeMap<String, f64>,
+    /// What one switch costs the active account as a percent of its 5 h
+    /// window: `cost.wu × s`.
+    pub switch_cost_percent_of_window: Option<f64>,
+    /// The eager plan's switches over its horizon, per day; `None` while early
+    /// switching is off.
+    pub switches_per_day: Option<f64>,
 }
 
 /// One snapshot's worth of inputs for [`BurnRuntime::after_snapshot`].
@@ -509,6 +528,7 @@ impl BurnRuntime {
             planned: burn_text::planned(plan, active),
             waiting: None,
             suggestion: None,
+            measured: Some(measured(situation, regime)),
         };
 
         match &decision {
@@ -600,6 +620,43 @@ impl BurnRuntime {
     }
 }
 
+/// What auto-burn has measured: a full 5 h window as a percent of each account's
+/// week (`100 × c / s`, for every account auto-burn may use whose `s` is known),
+/// what one switch costs the active account as a percent of its window
+/// (`cost.wu × s`), and the eager plan's switches per day while early switching
+/// is on. Missing values stay `None`; the page says what they wait for.
+fn measured(situation: &Situation, regime: &Regime) -> Measured {
+    let window_percent_of_week = situation
+        .inputs
+        .accounts
+        .iter()
+        .filter(|account| account.may_use)
+        .filter_map(|account| {
+            let rates = account.rates?;
+            let s = rates.s?;
+            Some((account.id.clone(), 100.0 * rates.c / s))
+        })
+        .collect();
+    let switch_cost_percent_of_window = situation.cost.and_then(|cost| {
+        let active = situation.inputs.active.as_deref()?;
+        let account = situation
+            .inputs
+            .accounts
+            .iter()
+            .find(|account| account.id == active)?;
+        Some(cost.wu * account.rates?.s?)
+    });
+    let switches_per_day = regime.early.then(|| {
+        let switches = follow(&situation.inputs, Policy::Eager).switches;
+        switches as f64 / (HORIZON_H as f64 / 24.0)
+    });
+    Measured {
+        window_percent_of_week,
+        switch_cost_percent_of_window,
+        switches_per_day,
+    }
+}
+
 /// The accounts auto-burn may use and whether each has rates: the value the
 /// regime was computed from, so a change computes it again.
 fn regime_basis(situation: &Situation) -> BTreeMap<String, bool> {
@@ -639,6 +696,7 @@ fn waiting_view(settings: &Settings, learning: Vec<String>) -> BurnView {
         planned: BTreeMap::new(),
         waiting: None,
         suggestion: None,
+        measured: None,
     }
 }
 
@@ -950,6 +1008,80 @@ mod tests {
             _ => panic!("not a switch"),
         }
         assert!(action_rx.try_recv().is_err(), "only one command");
+    }
+
+    #[test]
+    fn measured_comes_from_the_rates_and_the_cost() {
+        let now = utc("2026-11-10T12:00:00Z");
+        let (mut runtime, _action, _engine) = runtime();
+        let views = vec![
+            view("pr", "PR", 20.0, false, now - Duration::minutes(1)),
+            view("ac", "AC", 80.0, true, now - Duration::minutes(1)),
+        ];
+        let settings = Settings::default();
+        let situation = situation(now, Some("ac"));
+        let report = runtime.apply_decision(
+            Decision::Stay,
+            &situation,
+            &plan(now),
+            &regime(true),
+            &views,
+            &settings,
+            now,
+            offset(),
+        );
+        let measured = report
+            .view
+            .expect("a view")
+            .measured
+            .expect("a situation was measured");
+        assert_eq!(
+            measured.window_percent_of_week,
+            BTreeMap::from([("ac".to_string(), 4.0)]),
+            "PR has no learned s, so only AC's full window is shown"
+        );
+        let cost = measured
+            .switch_cost_percent_of_window
+            .expect("AC has an s and the situation a cost");
+        assert!((cost - 5.0).abs() < 1e-9, "cost 0.05 wu × s 100 = {cost}");
+        let expected = follow(&situation.inputs, Policy::Eager).switches as f64 / 7.0;
+        assert_eq!(measured.switches_per_day, Some(expected));
+
+        let no_early = runtime
+            .apply_decision(
+                Decision::Stay,
+                &situation,
+                &plan(now),
+                &regime(false),
+                &views,
+                &settings,
+                now,
+                offset(),
+            )
+            .view
+            .expect("a view")
+            .measured
+            .expect("a situation was measured");
+        assert_eq!(no_early.switches_per_day, None, "early switching is off");
+
+        let mut no_cost = situation;
+        no_cost.cost = None;
+        let measured = runtime
+            .apply_decision(
+                Decision::Stay,
+                &no_cost,
+                &plan(now),
+                &regime(true),
+                &views,
+                &settings,
+                now,
+                offset(),
+            )
+            .view
+            .expect("a view")
+            .measured
+            .expect("a situation was measured");
+        assert_eq!(measured.switch_cost_percent_of_window, None);
     }
 
     #[test]

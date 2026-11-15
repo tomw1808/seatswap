@@ -738,6 +738,86 @@ fn the_program_refuses_an_agent_that_may_not_switch() {
     );
 }
 
+/// The skill's texts and exit codes, as they were before the skill moved out
+/// of `cli.rs` into `agent_skill.rs` (step C1, Task 2).
+#[test]
+fn agent_skill_keeps_its_texts_and_exit_codes() {
+    let fixture = Fixture::new();
+    let path = fixture
+        .config_dir
+        .join("skills")
+        .join("seatswap")
+        .join("SKILL.md");
+
+    // A first install writes the file and says where it is.
+    let installed = fixture.run(&["agent-skill", "install"]);
+    assert_ok(&installed);
+    assert_eq!(stdout(&installed), format!("{}\n", path.display()));
+    assert!(path.is_file(), "the skill file is written");
+
+    // A second install changes nothing and says so.
+    let again = fixture.run(&["agent-skill", "install"]);
+    assert_ok(&again);
+    assert_eq!(
+        stdout(&again),
+        format!("already installed: {}\n", path.display())
+    );
+
+    // An uninstall removes the file and says so.
+    let removed = fixture.run(&["agent-skill", "uninstall"]);
+    assert_ok(&removed);
+    assert_eq!(stdout(&removed), format!("removed {}\n", path.display()));
+    assert!(!path.exists(), "the skill file is gone");
+
+    // A second uninstall says that there is nothing to remove.
+    let nothing = fixture.run(&["agent-skill", "uninstall"]);
+    assert_ok(&nothing);
+    assert_eq!(
+        stdout(&nothing),
+        format!("not installed: {}\n", path.display())
+    );
+
+    // A file that is not seatswap's own is kept, and the refusal is on stderr.
+    fs::create_dir_all(path.parent().expect("the skill folder")).expect("the skill folder");
+    fs::write(&path, "my own skill").expect("an edited skill");
+    let refused = fixture.run(&["agent-skill", "install"]);
+    assert_code(&refused, 1);
+    assert!(
+        stderr(&refused).contains(&format!(
+            "seatswap: {} already exists and differs from seatswap's bundled skill; use --force to replace it",
+            path.display()
+        )),
+        "{}",
+        stderr(&refused)
+    );
+    assert_eq!(
+        fs::read_to_string(&path).expect("the kept skill"),
+        "my own skill",
+        "the file is not replaced without --force"
+    );
+
+    let refused = fixture.run(&["agent-skill", "uninstall"]);
+    assert_code(&refused, 1);
+    assert!(
+        stderr(&refused).contains(&format!(
+            "seatswap: {} differs from seatswap's bundled skill; use --force to remove it",
+            path.display()
+        )),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(path.is_file(), "the edited skill is kept");
+
+    // --force replaces the file and removes it again.
+    let forced = fixture.run(&["agent-skill", "install", "--force"]);
+    assert_ok(&forced);
+    assert_eq!(stdout(&forced), format!("{}\n", path.display()));
+    let forced = fixture.run(&["agent-skill", "uninstall", "--force"]);
+    assert_ok(&forced);
+    assert_eq!(stdout(&forced), format!("removed {}\n", path.display()));
+    assert!(!path.exists(), "the skill file is gone");
+}
+
 #[test]
 fn the_program_treats_a_plain_shell_as_a_person() {
     let fixture = Fixture::new();

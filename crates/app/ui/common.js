@@ -184,6 +184,43 @@ function h(tag, props, children) {
   return node;
 }
 
+// The settings controls shared by the pop-up and the large window: one text
+// input, one select and one switch, so both pages build them the same way.
+function textInput(props) {
+  return h("input", Object.assign({ type: "text", spellcheck: "false" }, props || {}));
+}
+
+function selectInput(options, value, onchange) {
+  const select = h("select", {
+    class: "inp sel",
+    onchange: (event) => onchange(event.target.value),
+  });
+  for (const [optionValue, optionLabel] of options) {
+    const option = h("option", { value: optionValue, text: optionLabel });
+    if (optionValue === value) option.selected = true;
+    select.appendChild(option);
+  }
+  return select;
+}
+
+// A switch for a boolean setting. The caller saves and reverts the control when
+// the save is refused.
+function switchButton(checked, label, onchange) {
+  const control = h("button", {
+    type: "button",
+    class: "switch",
+    role: "switch",
+    "aria-checked": checked ? "true" : "false",
+    "aria-label": label,
+  });
+  control.addEventListener("click", () => {
+    const next = control.getAttribute("aria-checked") !== "true";
+    control.setAttribute("aria-checked", next ? "true" : "false");
+    onchange(next);
+  });
+  return control;
+}
+
 function applyTheme(setting) {
   // Callers that follow a stored setting pass it; this page alone knows where
   // that setting is kept.
@@ -282,4 +319,7 @@ export {
   listen,
   money,
   tokens,
+  textInput,
+  selectInput,
+  switchButton,
 };

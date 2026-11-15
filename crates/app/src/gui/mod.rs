@@ -81,6 +81,10 @@ struct Recheck {
 #[cfg(feature = "gui")]
 pub(crate) struct GuiState {
     snapshot: Mutex<Snapshot>,
+    /// The paths the app was started with, for the settings page's history and
+    /// skill rows.
+    pub(crate) app: AppPaths,
+    pub(crate) claude: seatswap_core::paths::ClaudePaths,
     /// The latest sessions summary; every snapshot is emitted with it.
     sessions: Mutex<Option<SessionsSummary>>,
     pub(crate) engine: std::sync::mpsc::Sender<EngineCommand>,
@@ -183,6 +187,9 @@ pub(crate) fn run(
             panel::time_texts,
             panel::fit_panel,
             panel::hide_panel,
+            panel::agent_calls,
+            panel::skill_status,
+            panel::skill_install,
             window::open_window,
         ])
         .build(tauri::generate_context!());
@@ -344,6 +351,8 @@ fn setup(
 
     tauri_app.manage(GuiState {
         snapshot: Mutex::new(initial.clone()),
+        app: app.clone(),
+        claude: claude.clone(),
         sessions: Mutex::new(None),
         engine: worker.engine.clone(),
         action: worker.action.clone(),

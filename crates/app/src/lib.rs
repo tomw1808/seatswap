@@ -1,6 +1,7 @@
 //! seatswap: CLI subcommands, and the tray app when built with the `gui` feature.
 //! The two programs `seatswap` and `seatswap-tray` both call [`run`].
 
+mod agent_skill;
 mod burn_text;
 mod cli;
 mod format;
