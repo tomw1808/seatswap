@@ -5,9 +5,9 @@
 import {
   HAS_TAURI,
   LEVEL_COLORS,
-  PALETTE,
   TRAY_GREY,
   applyTheme,
+  banner,
   clamp,
   clear,
   contrastText,
@@ -35,8 +35,6 @@ const state = {
   // The account a switch waits for the person to confirm; only a switch with
   // sessions on a model that loses its thinking asks (spec §2.12).
   confirmSwitchId: null,
-  editingId: null,
-  editor: null,
   pendingKey: null,
   pendingLabel: "",
   unknownKey: null,
@@ -48,9 +46,6 @@ const state = {
     banner: null,
     burn: null,
     accounts: {},
-    editor: null,
-    editorColor: null,
-    preview: null,
     add: null,
   },
 };
@@ -208,12 +203,6 @@ function renderMain() {
     state.cursorId = null;
   }
 
-  if (state.editingId && !findView(state.editingId)) {
-    state.editingId = null;
-    state.editor = null;
-    state.errors.editor = null;
-    state.errors.editorColor = null;
-  }
   if (state.confirmSwitchId && !views.some((view) => view.id === state.confirmSwitchId)) {
     state.confirmSwitchId = null;
   }
@@ -504,29 +493,6 @@ function renderBanners(container) {
   }
 }
 
-function banner(kind, icon, text, extraChildren) {
-  const body = h("div", { class: "banner-body" }, [
-    h("div", { class: "banner-text" }, Array.isArray(text) ? text : String(text)),
-  ]);
-  if (extraChildren) {
-    if (Array.isArray(extraChildren)) {
-      for (const child of extraChildren) {
-        if (child) body.appendChild(child);
-      }
-    } else {
-      body.appendChild(extraChildren);
-    }
-  }
-  return h(
-    "div",
-    {
-      class: `banner ${kind}`,
-      role: kind === "error" ? "alert" : "status",
-    },
-    [h("span", { class: "banner-icon", "aria-hidden": "true", text: icon }), body]
-  );
-}
-
 function pendingLabel(pending) {
   const key = `${pending.targetId || ""}|${pending.email || ""}|${pending.orgName || ""}`;
   if (state.pendingKey !== key) {
@@ -741,12 +707,15 @@ function renderCard(view, index) {
   );
   badge.style.background = accent;
   badge.style.color = contrastText(accent);
+  // The badge and the pencil open the large window on this account's row.
   const edit = (event) => {
     event.stopPropagation();
-    openEditor(view.id);
+    invoke("open_window", { target: `settings/accounts?${view.id}` }).catch((error) => {
+      state.errors.accounts[view.id] = errorMessage(error);
+      renderMain();
+    });
   };
   badge.addEventListener("click", edit);
-  // The badge opens the editor too; the pencil is the visible hint for it.
   const pencil = h(
     "button",
     {
@@ -841,10 +810,6 @@ function renderCard(view, index) {
   }
 
   card.appendChild(main);
-
-  if (state.editingId === view.id && state.editor) {
-    card.appendChild(renderEditor(view));
-  }
 
   return card;
 }
@@ -1004,505 +969,6 @@ function setupArc(gauge, arc, gradient, limit, view, slot) {
 
   state.lastPercents.set(key, target);
 }
-
-// ---------------------------------------------------------------------------
-// inline account editor
-// ---------------------------------------------------------------------------
-
-function openEditor(id) {
-  const account = findView(id);
-  if (!account) return;
-  const characters = String(account.abbr || "").split("");
-  const validColor = isColor(account.color);
-  state.editingId = id;
-  state.editor = {
-    label: account.label || "",
-    abbr1: characters[0] || "",
-    abbr2: characters[1] || "",
-    // An invalid saved colour leaves the field empty; it is never replaced by
-    // a palette colour that would silently be saved over the real value.
-    color: validColor ? account.color.toLowerCase() : "",
-    // Missing is not "off": Save refuses until the view carries the real value.
-    autoBurn:
-      typeof account.autoBurn === "boolean" ? account.autoBurn : null,
-    confirmRemove: false,
-  };
-  state.errors.editor = null;
-  state.errors.editorColor = validColor
-    ? null
-    : `The saved colour ${JSON.stringify(account.color)} is not #rrggbb. Choose a colour.`;
-  state.errors.preview = null;
-  if (typeof state.editor.autoBurn !== "boolean") {
-    state.errors.editor = "Auto-burn may use this account: the account's value is missing.";
-  }
-  renderMain();
-}
-
-function closeEditor() {
-  state.editingId = null;
-  state.editor = null;
-  state.errors.editor = null;
-  state.errors.editorColor = null;
-  state.errors.preview = null;
-  renderMain();
-}
-
-function sanitizeAbbrChar(value) {
-  const cleaned = String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
-  return cleaned.slice(0, 1);
-}
-
-function renderEditor(account) {
-  const editor = state.editor;
-  const wrapper = h("div", { class: "editor" });
-
-  const labelInput = textInput({
-    value: editor.label,
-    maxlength: "40",
-    "aria-label": "Label",
-    dataset: { field: "label" },
-  });
-  labelInput.addEventListener("input", () => {
-    editor.label = labelInput.value;
-  });
-
-  const firstBox = textInput({
-    value: editor.abbr1,
-    maxlength: "1",
-    class: "abbr-box",
-    "aria-label": "First abbreviation character",
-    autocapitalize: "characters",
-    autocomplete: "off",
-    dataset: { field: "abbr1" },
-  });
-  const secondBox = textInput({
-    value: editor.abbr2,
-    maxlength: "1",
-    class: "abbr-box",
-    "aria-label": "Second abbreviation character",
-    autocapitalize: "characters",
-    autocomplete: "off",
-    dataset: { field: "abbr2" },
-  });
-
-  firstBox.addEventListener("input", () => {
-    const value = sanitizeAbbrChar(firstBox.value);
-    firstBox.value = value;
-    editor.abbr1 = value;
-    if (value && !editor.abbr2 && secondBox) {
-      secondBox.focus();
-      secondBox.select();
-    }
-    schedulePreview();
-  });
-  firstBox.addEventListener("keydown", (event) => {
-    if (event.key === "ArrowRight" || event.key === "Tab") {
-      if (event.key === "Tab" && event.shiftKey) return;
-      if (secondBox) {
-        event.preventDefault();
-        secondBox.focus();
-        secondBox.select();
-      }
-    }
-  });
-
-  secondBox.addEventListener("input", () => {
-    const value = sanitizeAbbrChar(secondBox.value);
-    secondBox.value = value;
-    editor.abbr2 = value;
-    if (!value) {
-      // keep the first box as typed; focus stays for correction
-    }
-    schedulePreview();
-  });
-  secondBox.addEventListener("keydown", (event) => {
-    if (event.key === "Backspace" && !secondBox.value) {
-      event.preventDefault();
-      firstBox.focus();
-      firstBox.select();
-    } else if (event.key === "ArrowLeft") {
-      event.preventDefault();
-      firstBox.focus();
-      firstBox.select();
-    }
-  });
-
-  const pasteHandler = (event) => {
-    const pasted = (event.clipboardData && event.clipboardData.getData("text")) || "";
-    const cleaned = String(pasted).toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 2);
-    if (!cleaned) return;
-    event.preventDefault();
-    editor.abbr1 = cleaned[0] || "";
-    editor.abbr2 = cleaned[1] || "";
-    firstBox.value = editor.abbr1;
-    secondBox.value = editor.abbr2;
-    (editor.abbr2 ? secondBox : firstBox).focus();
-    schedulePreview();
-  };
-  firstBox.addEventListener("paste", pasteHandler);
-  secondBox.addEventListener("paste", pasteHandler);
-
-  const abbrBoxes = h("div", { class: "abbr-boxes" }, [firstBox, secondBox]);
-  const abbrField = h("label", { class: "field" }, [
-    h("span", { class: "field-label", text: "Abbreviation" }),
-    abbrBoxes,
-  ]);
-
-  const hexInput = textInput({
-    value: editor.color,
-    maxlength: "7",
-    class: "hex-input",
-    "aria-label": "Colour hex value",
-    spellcheck: "false",
-    dataset: { field: "hex" },
-  });
-
-  const swatches = h("div", { class: "swatches" });
-  const swatchButtons = [];
-  for (const color of PALETTE) {
-    const swatch = h("button", {
-      type: "button",
-      class: "swatch" + (sameColor(color, editor.color) ? " selected" : ""),
-      title: color,
-      "aria-label": `Colour ${color}`,
-    });
-    swatch.style.backgroundColor = color;
-    swatch.addEventListener("click", () => {
-      editor.color = color;
-      hexInput.value = color;
-      editorColorError(null);
-      updateSwatchSelection(swatchButtons, editor.color);
-      schedulePreview();
-    });
-    swatchButtons.push({ button: swatch, color });
-    swatches.appendChild(swatch);
-  }
-
-  hexInput.addEventListener("input", () => {
-    let value = hexInput.value.trim().toLowerCase();
-    if (value && !value.startsWith("#")) value = `#${value}`;
-    editor.color = value;
-    editorColorError(null);
-    updateSwatchSelection(swatchButtons, editor.color);
-    schedulePreview();
-  });
-  hexInput.addEventListener("blur", () => {
-    if (isColor(editor.color)) {
-      editor.color = editor.color.toLowerCase();
-      hexInput.value = editor.color;
-      schedulePreview();
-    }
-  });
-
-  const colorField = h("div", { class: "field grow" }, [
-    h("span", { class: "field-label", text: "Colour" }),
-    h("div", { class: "editor-row" }, [swatches, hexInput]),
-    h("div", {
-      class: "inline-error",
-      id: "editor-color-error",
-      hidden: !state.errors.editorColor,
-      text: state.errors.editorColor || "",
-    }),
-  ]);
-
-  const previews = h("div", { class: "previews" });
-  for (const size of [16, 22, 32]) {
-    const canvas = h("canvas", {
-      width: String(size),
-      height: String(size),
-      dataset: { size: String(size) },
-      "aria-label": `Tray icon preview at ${size} pixels`,
-    });
-    previews.appendChild(
-      h("div", { class: "preview-cell" }, [
-        canvas,
-        h("span", { class: "preview-size", text: `${size} px` }),
-      ])
-    );
-  }
-
-  const previewError = h("div", {
-    class: "inline-error",
-    id: "preview-error",
-    hidden: !state.errors.preview,
-    text: state.errors.preview || "",
-  });
-
-  const actions = h("div", { class: "editor-actions" }, [
-    button("Save", "primary", saveEditor),
-    button("Cancel", "ghost", closeEditor),
-    h("span", { class: "editor-spacer" }),
-    button("Remove account", "danger", () => {
-      editor.confirmRemove = true;
-      state.errors.editor = null;
-      renderMain();
-    }),
-  ]);
-
-  const errorNode = h("div", {
-    class: "inline-error",
-    id: "editor-error",
-    hidden: !state.errors.editor,
-    text: state.errors.editor || "",
-  });
-
-  wrapper.appendChild(
-    h("div", { class: "editor-row" }, [
-      h("label", { class: "field grow" }, [
-        h("span", { class: "field-label", text: "Label" }),
-        labelInput,
-      ]),
-      abbrField,
-    ])
-  );
-  wrapper.appendChild(colorField);
-  wrapper.appendChild(previews);
-  wrapper.appendChild(previewError);
-
-  wrapper.appendChild(
-    h("div", { class: "setting editor-setting" }, [
-      h("div", { class: "setting-label" }, [
-        h("span", { text: "Auto-burn may use this account" }),
-        h("span", {
-          class: "sub",
-          text:
-            "off: auto-burn never switches to it; it still leaves it when it is full",
-        }),
-      ]),
-      h("div", { class: "setting-control" }, [
-        switchButton(
-          editor.autoBurn === true,
-          "Auto-burn may use this account",
-          (value) => {
-            editor.autoBurn = value;
-            if (state.errors.editor) editorError(null);
-          }
-        ),
-      ]),
-    ])
-  );
-
-  if (editor.confirmRemove) {
-    const name = `${account.abbr || "?"} — ${account.label || "this account"}`;
-    wrapper.appendChild(
-      h("div", { class: "confirm" }, [
-        h("div", {
-          class: "confirm-text",
-          text: `Remove ${name}? The live login is not touched.`,
-        }),
-        h("div", { class: "confirm-actions" }, [
-          button("Remove", "danger", () => removeAccount(account.id)),
-          button("Keep it", "ghost", () => {
-            editor.confirmRemove = false;
-            renderMain();
-          }),
-        ]),
-      ])
-    );
-  }
-
-  wrapper.appendChild(errorNode);
-  wrapper.appendChild(actions);
-
-  schedulePreview();
-  return wrapper;
-}
-
-function sameColor(first, second) {
-  return String(first || "").toLowerCase() === String(second || "").toLowerCase();
-}
-
-function updateSwatchSelection(swatchButtons, color) {
-  for (const entry of swatchButtons) {
-    entry.button.classList.toggle("selected", sameColor(entry.color, color));
-  }
-}
-
-let previewTimer = null;
-let previewToken = 0;
-
-function schedulePreview() {
-  if (previewTimer !== null) clearTimeout(previewTimer);
-  previewTimer = setTimeout(() => {
-    previewTimer = null;
-    drawPreviews();
-  }, 110);
-}
-
-function clearPreviews() {
-  for (const canvas of document.querySelectorAll(".previews canvas")) {
-    const context = canvas.getContext("2d");
-    if (context) context.clearRect(0, 0, canvas.width, canvas.height);
-  }
-}
-
-function bytesOf(value) {
-  if (Array.isArray(value)) return value;
-  if (value instanceof Uint8Array || value instanceof Uint8ClampedArray) return value;
-  if (typeof value === "string") {
-    try {
-      const binary = atob(value);
-      const bytes = new Uint8Array(binary.length);
-      for (let index = 0; index < binary.length; index += 1) {
-        bytes[index] = binary.charCodeAt(index);
-      }
-      return bytes;
-    } catch {
-      return [];
-    }
-  }
-  if (value && Array.isArray(value.data)) return value.data;
-  return [];
-}
-
-function applyPreviewReply(reply) {
-  if (!Array.isArray(reply)) {
-    throw new Error("icon preview returned an unexpected reply");
-  }
-  for (const item of reply) {
-    if (!isObject(item)) continue;
-    const size = Number(item.size);
-    if (!Number.isFinite(size) || size <= 0) continue;
-    const canvas = document.querySelector(`.previews canvas[data-size="${String(size)}"]`);
-    if (!canvas) continue;
-    canvas.width = size;
-    canvas.height = size;
-    const context = canvas.getContext("2d");
-    if (!context) continue;
-    const source = bytesOf(item.rgba);
-    const expected = size * size * 4;
-    if (source.length < expected) {
-      throw new Error(`icon preview for ${size} px is too short`);
-    }
-    const image = context.createImageData(size, size);
-    for (let index = 0; index < expected; index += 1) {
-      image.data[index] = source[index] & 0xff;
-    }
-    context.putImageData(image, 0, 0);
-  }
-}
-
-async function drawPreviews() {
-  const editor = state.editor;
-  if (!editor) return;
-  const abbr = `${editor.abbr1 || ""}${editor.abbr2 || ""}`.trim().toUpperCase();
-  const color = String(editor.color || "").toLowerCase();
-  if (!/^[A-Z0-9]{1,2}$/.test(abbr) || !isColor(color)) {
-    clearPreviews();
-    return;
-  }
-  const token = ++previewToken;
-  try {
-    const reply = await invoke("icon_preview", { abbr, color });
-    if (token !== previewToken || !state.editor) return;
-    applyPreviewReply(reply);
-    if (state.errors.preview) {
-      state.errors.preview = null;
-      const node = document.getElementById("preview-error");
-      if (node) {
-        node.textContent = "";
-        node.hidden = true;
-      }
-      fitPanel();
-    }
-  } catch (error) {
-    if (token !== previewToken || !state.editor) return;
-    state.errors.preview = errorMessage(error);
-    const node = document.getElementById("preview-error");
-    if (node) {
-      node.textContent = state.errors.preview;
-      node.hidden = false;
-    }
-    fitPanel();
-  }
-}
-
-function editorAbbr() {
-  if (!state.editor) return "";
-  return `${state.editor.abbr1 || ""}${state.editor.abbr2 || ""}`.trim().toUpperCase();
-}
-
-function editorError(text) {
-  state.errors.editor = text;
-  const node = document.getElementById("editor-error");
-  if (node) {
-    node.textContent = text || "";
-    node.hidden = !text;
-  }
-  fitPanel();
-}
-
-function editorColorError(text) {
-  state.errors.editorColor = text;
-  const node = document.getElementById("editor-color-error");
-  if (node) {
-    node.textContent = text || "";
-    node.hidden = !text;
-  }
-  fitPanel();
-}
-
-async function saveEditor() {
-  const editor = state.editor;
-  if (!editor || !state.editingId) return;
-  const account = findView(state.editingId);
-  if (!account) {
-    closeEditor();
-    return;
-  }
-  const label = String(editor.label || "").trim();
-  const abbr = editorAbbr();
-  const color = String(editor.color || "").trim().toLowerCase();
-
-  if (!label || label.length > 40) {
-    editorError("Enter a label of 1 to 40 characters.");
-    return;
-  }
-  if (!/^[A-Z0-9]{1,2}$/.test(abbr)) {
-    editorError("Use 1 or 2 letters A–Z or digits for the abbreviation.");
-    return;
-  }
-  if (!isColor(color)) {
-    editorColorError("Use a colour of the form #rrggbb.");
-    return;
-  }
-  editorColorError(null);
-  if (typeof editor.autoBurn !== "boolean") {
-    editorError("Auto-burn may use this account: the account's value is missing; re-open the panel.");
-    return;
-  }
-
-  try {
-    await invoke("edit_account", {
-      key: account.id,
-      label,
-      abbr,
-      color,
-      autoBurn: editor.autoBurn,
-    });
-    state.errors.editor = null;
-    closeEditor();
-    afterCommand();
-  } catch (error) {
-    editorError(errorMessage(error));
-  }
-}
-
-async function removeAccount(id) {
-  try {
-    await invoke("remove_account", { key: id });
-    state.errors.editor = null;
-    closeEditor();
-    afterCommand();
-  } catch (error) {
-    editorError(errorMessage(error));
-    renderMain();
-  }
-}
-
-// ---------------------------------------------------------------------------
-// add view (spec §6.1)
-// ---------------------------------------------------------------------------
 
 function renderAdd() {
   const root = document.getElementById("view-add");
@@ -1925,10 +1391,6 @@ function onKeyDown(event) {
 
   if (event.key === "Escape") {
     event.preventDefault();
-    if (state.editingId) {
-      closeEditor();
-      return;
-    }
     if (state.view !== "main") {
       setView("main");
       return;

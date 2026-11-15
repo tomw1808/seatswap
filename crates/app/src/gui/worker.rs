@@ -37,7 +37,7 @@ use seatswap_core::history::{
 use seatswap_core::locks::{self, LockError};
 use seatswap_core::paths::{AppPaths, ClaudePaths};
 use seatswap_core::store::{self, Account, AccountsFile, Settings, Store};
-use seatswap_core::switcher::{self, LiveState, SwitchError, UnsavedPolicy};
+use seatswap_core::switcher::{self, LiveState, SwitchError, Synced, UnsavedPolicy};
 #[cfg(test)]
 use seatswap_core::types::Login;
 
@@ -89,6 +89,9 @@ const WAKE_THRESHOLD: Duration = Duration::from_secs(90);
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Snapshot {
     pub views: Vec<AccountView>,
+    /// The stored accounts behind the views: the Accounts group needs fields the
+    /// card does not (`price`, `orgName`) and never a usage payload.
+    pub accounts: Vec<AccountRow>,
     pub active_id: Option<String>,
     pub live: LiveView,
     pub burn: Option<super::burn_rt::BurnView>,
@@ -103,6 +106,45 @@ pub(crate) struct Snapshot {
     /// `None` when accounts.json cannot be read: the panel shows the error and
     /// disables Save instead of offering defaults that would overwrite it.
     pub settings: Option<Settings>,
+}
+
+/// One stored account as the Accounts group shows it. `loginDaysLeft` comes
+/// from the matching view, so the page need not do date arithmetic.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AccountRow {
+    pub id: String,
+    pub label: String,
+    pub abbr: String,
+    pub color: String,
+    pub email: Option<String>,
+    pub org_name: Option<String>,
+    pub plan: Option<String>,
+    pub price: Option<f64>,
+    pub auto_burn: bool,
+    pub login_ends_at_ms: Option<i64>,
+    pub login_days_left: Option<i64>,
+    pub is_active: bool,
+}
+
+impl AccountRow {
+    fn of(account: &Account, views: &[AccountView]) -> AccountRow {
+        let view = views.iter().find(|view| view.id == account.id);
+        AccountRow {
+            id: account.id.clone(),
+            label: account.label.clone(),
+            abbr: account.abbr.clone(),
+            color: account.color.clone(),
+            email: account.email.clone(),
+            org_name: account.org_name.clone(),
+            plan: account.plan.clone(),
+            price: account.price,
+            auto_burn: account.auto_burn,
+            login_ends_at_ms: account.login_ends_at_ms,
+            login_days_left: view.and_then(|view| view.login_days_left),
+            is_active: view.is_some_and(|view| view.is_active),
+        }
+    }
 }
 
 /// Claude Code's running sessions as the panel shows them (spec §1.6).
@@ -138,6 +180,7 @@ impl Snapshot {
     ) -> Snapshot {
         Snapshot {
             views: Vec::new(),
+            accounts: Vec::new(),
             active_id: None,
             live: LiveView::NoLogin,
             burn: None,
@@ -249,6 +292,8 @@ pub(crate) enum ActionCommand {
         abbr: Option<String>,
         color: Option<String>,
         auto_burn: Option<bool>,
+        /// `None` leaves the price alone; `Some(None)` clears it.
+        price: Option<Option<f64>>,
         reply: Sender<ActionReply>,
     },
     Remove {
@@ -384,8 +429,14 @@ pub(crate) struct SnapshotParts {
 /// the real rules.
 pub(crate) fn build_snapshot(parts: SnapshotParts) -> Snapshot {
     let mut error = parts.engine_error;
+    let mut accounts = Vec::new();
     let (settings, live, warnings) = match parts.accounts {
         Ok(file) => {
+            accounts = file
+                .accounts
+                .iter()
+                .map(|account| AccountRow::of(account, &parts.views))
+                .collect();
             let live = match parts.live {
                 Ok(state) => LiveView::from(state),
                 Err(live_error) => {
@@ -425,6 +476,7 @@ pub(crate) fn build_snapshot(parts: SnapshotParts) -> Snapshot {
         .map(|view| view.id.clone());
     Snapshot {
         views: parts.views,
+        accounts,
         active_id,
         live,
         burn: None,
@@ -1037,9 +1089,10 @@ impl ActionRuntime {
                     abbr,
                     color,
                     auto_burn,
+                    price,
                     reply,
                 } => {
-                    let _ = reply.send(self.edit(&key, label, abbr, color, auto_burn));
+                    let _ = reply.send(self.edit(&key, label, abbr, color, auto_burn, price));
                 }
                 ActionCommand::Remove { key, reply } => {
                     let _ = reply.send(self.remove(&key));
@@ -1136,6 +1189,12 @@ impl ActionRuntime {
                                         counts, now,
                                     ) {
                                         history_error = Some(error.to_string());
+                                    } else if let Some(change) = &outcome.plan_change {
+                                        if let Err(error) =
+                                            ops::record_plan_change(recorder, change, now)
+                                        {
+                                            history_error = Some(error.to_string());
+                                        }
                                     }
                                 }
                                 Err(error) => history_error = Some(error),
@@ -1260,6 +1319,7 @@ impl ActionRuntime {
         abbr: Option<String>,
         color: Option<String>,
         auto_burn: Option<bool>,
+        price: Option<Option<f64>>,
     ) -> ActionReply {
         let result = match self.store() {
             Ok(store) => switcher::edit_account(
@@ -1269,11 +1329,24 @@ impl ActionRuntime {
                 abbr.as_deref(),
                 color.as_deref(),
                 auto_burn,
+                price,
             ),
             Err(error) => return ActionReply::Failed(error),
         };
         match result {
-            Ok(_) => {
+            Ok(edited) => {
+                if edited.price_changed {
+                    // The currency setting does not exist yet (Task 4); the
+                    // value at the time of the change is therefore `None`.
+                    let event = EventKind::PriceChanged {
+                        account: AccountRef::of(&edited.account),
+                        amount: edited.account.price,
+                        currency: None,
+                    };
+                    if let Err(error) = self.record(event) {
+                        report_history_error(&error);
+                    }
+                }
                 let _ = self.engine.send(EngineCommand::Publish);
                 ActionReply::Done
             }
@@ -1363,6 +1436,19 @@ impl ActionRuntime {
                 Err(_) => None,
             };
             match result {
+                Some(Ok((
+                    _,
+                    Synced::Updated {
+                        plan_change: Some(change),
+                    },
+                ))) => match self.recorder() {
+                    Ok(recorder) => {
+                        if let Err(error) = ops::record_plan_change(recorder, &change, Utc::now()) {
+                            eprintln!("seatswap: watcher: {}", ops::history_unwritable(&error));
+                        }
+                    }
+                    Err(error) => eprintln!("seatswap: watcher: {error}"),
+                },
                 Some(Ok(_)) | None => {}
                 // Claude Code is mid-renewal; its next change calls us again.
                 Some(Err(SwitchError::Lock(LockError::Busy { .. }))) => lock_busy = true,
@@ -1896,6 +1982,7 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "accounts",
                 "activeId",
                 "burn",
                 "error",
@@ -2060,6 +2147,166 @@ mod tests {
             events.records[0].record.kind,
             EventKind::AutoBurnSet { on: true }
         );
+    }
+
+    #[test]
+    fn a_changed_price_is_written_to_the_history() {
+        let fixture = Fixture::new();
+        let (engine, _engine_rx) = mpsc::channel();
+        let mut action = ActionRuntime::new(
+            fixture.app.clone(),
+            fixture.claude.clone(),
+            Vec::new(),
+            engine,
+        );
+        let reply = action.edit(
+            &fixture.account.id,
+            None,
+            None,
+            None,
+            None,
+            Some(Some(180.0)),
+        );
+        assert!(matches!(reply, ActionReply::Done), "{reply:?}");
+
+        let host = seatswap_core::paths::host_name(None).expect("the host name");
+        let history = HistoryDir::at(&fixture.app.history_dir(), &host);
+        let read = history
+            .read::<Event>(
+                &Range {
+                    from: DateTime::<Utc>::MIN_UTC,
+                    to: DateTime::<Utc>::MAX_UTC,
+                },
+                &Hosts::One(host),
+            )
+            .expect("the events are read");
+        let prices: Vec<_> = read
+            .records
+            .iter()
+            .filter(|hosted| matches!(hosted.record.kind, EventKind::PriceChanged { .. }))
+            .collect();
+        assert_eq!(prices.len(), 1, "one event for one price change");
+        let value = serde_json::to_value(&prices[0].record.kind).expect("the event as JSON");
+        assert_eq!(value["type"], "priceChanged");
+        assert_eq!(value["amount"], json!(180.0));
+    }
+
+    /// The mirror copies the live login into the stored account. When the plan
+    /// of that account changes, the change belongs in the history, written by
+    /// the code that records the events of this path.
+    #[test]
+    fn a_changed_plan_is_written_to_the_history_when_the_live_login_is_mirrored() {
+        let fixture = Fixture::new();
+        let store = Store::new(
+            fixture.app.clone(),
+            Box::new(FileSecrets::new(fixture.app.secrets_dir())),
+        );
+        // The stored plan is stale; the live login's tier says "Team 5x".
+        let mut file = store.load().expect("accounts");
+        file.accounts[0].plan = Some("Team".to_string());
+        store.save(&file).expect("the stale plan is stored");
+
+        let (engine, _engine_rx) = mpsc::channel();
+        let mut action = ActionRuntime::new(
+            fixture.app.clone(),
+            fixture.claude.clone(),
+            Vec::new(),
+            engine,
+        );
+        action.sync_live();
+
+        assert_eq!(
+            store.load().expect("accounts").accounts[0].plan.as_deref(),
+            Some("Team 5x"),
+            "the plan of the account is the login's"
+        );
+
+        let host = seatswap_core::paths::host_name(None).expect("the host name");
+        let history = HistoryDir::at(&fixture.app.history_dir(), &host);
+        let read = history
+            .read::<Event>(
+                &Range {
+                    from: DateTime::<Utc>::MIN_UTC,
+                    to: DateTime::<Utc>::MAX_UTC,
+                },
+                &Hosts::One(host),
+            )
+            .expect("the events are read");
+        let changed: Vec<_> = read
+            .records
+            .iter()
+            .filter(|hosted| matches!(hosted.record.kind, EventKind::PlanChanged { .. }))
+            .collect();
+        assert_eq!(changed.len(), 1, "one event for one plan change");
+    }
+
+    /// One event per real change: the same price again writes nothing, and
+    /// clearing the price is a change of its own.
+    #[test]
+    fn an_unchanged_price_is_not_written_to_the_history() {
+        let fixture = Fixture::new();
+        let (engine, _engine_rx) = mpsc::channel();
+        let mut action = ActionRuntime::new(
+            fixture.app.clone(),
+            fixture.claude.clone(),
+            Vec::new(),
+            engine,
+        );
+        let host = seatswap_core::paths::host_name(None).expect("the host name");
+        let history = HistoryDir::at(&fixture.app.history_dir(), &host);
+        let prices = || {
+            let read = history
+                .read::<Event>(
+                    &Range {
+                        from: DateTime::<Utc>::MIN_UTC,
+                        to: DateTime::<Utc>::MAX_UTC,
+                    },
+                    &Hosts::One(host.clone()),
+                )
+                .expect("the events are read");
+            read.records
+                .iter()
+                .filter(|hosted| matches!(hosted.record.kind, EventKind::PriceChanged { .. }))
+                .count()
+        };
+
+        assert!(matches!(
+            action.edit(
+                &fixture.account.id,
+                None,
+                None,
+                None,
+                None,
+                Some(Some(180.0))
+            ),
+            ActionReply::Done
+        ));
+        assert_eq!(prices(), 1, "the first change is written");
+
+        assert!(matches!(
+            action.edit(
+                &fixture.account.id,
+                None,
+                None,
+                None,
+                None,
+                Some(Some(180.0))
+            ),
+            ActionReply::Done
+        ));
+        assert_eq!(prices(), 1, "the same price writes nothing");
+
+        assert!(matches!(
+            action.edit(&fixture.account.id, None, None, None, None, None),
+            ActionReply::Done
+        ));
+        assert_eq!(prices(), 1, "a field that does not change writes nothing");
+
+        assert!(matches!(
+            action.edit(&fixture.account.id, None, None, None, None, Some(None)),
+            ActionReply::Done
+        ));
+        assert_eq!(prices(), 2, "clearing the price is a change");
     }
 
     #[test]

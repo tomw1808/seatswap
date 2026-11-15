@@ -184,6 +184,31 @@ function h(tag, props, children) {
   return node;
 }
 
+// The one banner of the pop-up and the large window: a kind, an icon, the text
+// and optional children (buttons). Both pages show a snapshot error with it.
+function banner(kind, icon, text, extraChildren) {
+  const body = h("div", { class: "banner-body" }, [
+    h("div", { class: "banner-text" }, Array.isArray(text) ? text : String(text)),
+  ]);
+  if (extraChildren) {
+    if (Array.isArray(extraChildren)) {
+      for (const child of extraChildren) {
+        if (child) body.appendChild(child);
+      }
+    } else {
+      body.appendChild(extraChildren);
+    }
+  }
+  return h(
+    "div",
+    {
+      class: `banner ${kind}`,
+      role: kind === "error" ? "alert" : "status",
+    },
+    [h("span", { class: "banner-icon", "aria-hidden": "true", text: icon }), body]
+  );
+}
+
 // The settings controls shared by the pop-up and the large window: one text
 // input, one select and one switch, so both pages build them the same way.
 function textInput(props) {
@@ -219,6 +244,262 @@ function switchButton(checked, label, onchange) {
     onchange(next);
   });
   return control;
+}
+
+// ---------------------------------------------------------------------------
+// the account chip editor (spec §3.7): letter boxes, swatches, hex field and
+// the tray-icon preview. The pop-up's old inline editor used to build these;
+// the Accounts group in the large window is now their one user.
+// ---------------------------------------------------------------------------
+
+// One letter box holds a single A-Z or 0-9, upper case.
+function sanitizeAbbrChar(value) {
+  return String(value || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .slice(0, 1);
+}
+
+// Two letter boxes for the abbreviation. `onInput` gets the current value at
+// every keystroke; `onChange` gets it when the field is left or Enter is
+// pressed, never when the focus only moves to the second box.
+function abbrLetterBoxes(value, handlers) {
+  const callbacks = handlers || {};
+  const chars = String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 2);
+  const first = textInput({
+    value: chars[0] || "",
+    maxlength: "1",
+    class: "abbr-box",
+    "aria-label": "First abbreviation character",
+    autocapitalize: "characters",
+    autocomplete: "off",
+    dataset: { field: "abbr1" },
+  });
+  const second = textInput({
+    value: chars[1] || "",
+    maxlength: "1",
+    class: "abbr-box",
+    "aria-label": "Second abbreviation character",
+    autocapitalize: "characters",
+    autocomplete: "off",
+    dataset: { field: "abbr2" },
+  });
+  const boxes = [first, second];
+  const current = () => `${sanitizeAbbrChar(first.value)}${sanitizeAbbrChar(second.value)}`;
+
+  function changed() {
+    if (typeof callbacks.onInput === "function") callbacks.onInput(current());
+  }
+
+  function commit() {
+    if (typeof callbacks.onChange !== "function") return;
+    callbacks.onChange(current());
+  }
+
+  for (const [index, box] of boxes.entries()) {
+    box.addEventListener("input", () => {
+      const cleaned = sanitizeAbbrChar(box.value);
+      box.value = cleaned;
+      if (cleaned && index === 0 && !second.value) {
+        second.focus();
+        second.select();
+      }
+      changed();
+    });
+    box.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        commit();
+        return;
+      }
+      if (index === 0 && event.key === "ArrowRight") {
+        event.preventDefault();
+        second.focus();
+        second.select();
+      }
+    });
+    box.addEventListener("blur", (event) => {
+      const next = event.relatedTarget;
+      if (boxes.includes(next)) return;
+      commit();
+    });
+  }
+
+  return {
+    node: h("div", { class: "abbr-boxes" }, boxes),
+    value: current,
+    setValue(abbr) {
+      const cleaned = String(abbr || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+      first.value = cleaned[0] || "";
+      second.value = cleaned[1] || "";
+    },
+  };
+}
+
+// The ten palette colours as a swatch row; `onPick` gets the chosen colour.
+function colorSwatches(color, onPick) {
+  const node = h("div", { class: "swatches" });
+  const buttons = [];
+  function select(value) {
+    const wanted = String(value || "").toLowerCase();
+    for (const entry of buttons) {
+      entry.button.classList.toggle("selected", entry.color === wanted);
+    }
+  }
+  for (const entry of PALETTE) {
+    const swatch = h("button", {
+      type: "button",
+      class: "swatch",
+      "aria-label": `Colour ${entry}`,
+      title: entry,
+    });
+    swatch.style.backgroundColor = entry;
+    swatch.addEventListener("click", () => {
+      select(entry);
+      if (typeof onPick === "function") onPick(entry);
+    });
+    buttons.push({ button: swatch, color: entry });
+    node.appendChild(swatch);
+  }
+  select(color);
+  return { node, select };
+}
+
+// A `#rrggbb` field: `onInput` while typing, `onChange` on blur or Enter.
+function hexField(value, handlers) {
+  const callbacks = handlers || {};
+  const input = textInput({
+    value: value || "",
+    maxlength: "7",
+    class: "hex-input",
+    "aria-label": "Colour hex value",
+    dataset: { field: "hex" },
+  });
+  const current = () => input.value.trim().toLowerCase();
+  input.addEventListener("input", () => {
+    if (typeof callbacks.onInput === "function") callbacks.onInput(current());
+  });
+  input.addEventListener("change", () => {
+    if (typeof callbacks.onChange === "function") callbacks.onChange(current());
+  });
+  input.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    if (typeof callbacks.onChange === "function") callbacks.onChange(current());
+  });
+  return {
+    node: input,
+    value: current,
+    setValue(color) {
+      input.value = color || "";
+    },
+  };
+}
+
+function bytesOf(value) {
+  if (Array.isArray(value)) return value;
+  if (value instanceof Uint8Array || value instanceof Uint8ClampedArray) return value;
+  if (typeof value === "string") {
+    try {
+      const binary = atob(value);
+      const bytes = new Uint8Array(binary.length);
+      for (let index = 0; index < binary.length; index += 1) {
+        bytes[index] = binary.charCodeAt(index);
+      }
+      return bytes;
+    } catch {
+      return [];
+    }
+  }
+  if (value && Array.isArray(value.data)) return value.data;
+  return [];
+}
+
+// The tray icon at 16, 22 and 32 px. `draw` asks `icon_preview`; `schedule`
+// debounces it while the letters are typed. An error is returned, never hidden.
+function iconPreview() {
+  const node = h("div", { class: "previews" });
+  const canvases = new Map();
+  for (const size of [16, 22, 32]) {
+    const canvas = h("canvas", {
+      width: String(size),
+      height: String(size),
+      dataset: { size: String(size) },
+      "aria-label": `Tray icon preview at ${size} pixels`,
+    });
+    canvases.set(size, canvas);
+    node.appendChild(
+      h("div", { class: "preview-cell" }, [
+        canvas,
+        h("span", { class: "preview-size", text: `${size} px` }),
+      ])
+    );
+  }
+  let token = 0;
+  let timer = null;
+
+  function clear() {
+    for (const canvas of canvases.values()) {
+      const context = canvas.getContext("2d");
+      if (context) context.clearRect(0, 0, canvas.width, canvas.height);
+    }
+  }
+
+  function apply(reply) {
+    if (!Array.isArray(reply)) {
+      throw new Error("icon preview returned an unexpected reply");
+    }
+    for (const item of reply) {
+      if (!isObject(item)) continue;
+      const size = Number(item.size);
+      const canvas = canvases.get(size);
+      if (!canvas) continue;
+      canvas.width = size;
+      canvas.height = size;
+      const context = canvas.getContext("2d");
+      if (!context) continue;
+      const source = bytesOf(item.rgba);
+      const expected = size * size * 4;
+      if (source.length < expected) {
+        throw new Error(`icon preview for ${size} px is too short`);
+      }
+      const image = context.createImageData(size, size);
+      for (let index = 0; index < expected; index += 1) {
+        image.data[index] = source[index] & 0xff;
+      }
+      context.putImageData(image, 0, 0);
+    }
+  }
+
+  async function draw(abbr, color) {
+    if (!/^[A-Z0-9]{1,2}$/.test(abbr) || !isColor(color)) {
+      clear();
+      return null;
+    }
+    const current = ++token;
+    try {
+      const reply = await invoke("icon_preview", { abbr, color });
+      if (current !== token) return null;
+      apply(reply);
+      return null;
+    } catch (error) {
+      if (current !== token) return null;
+      clear();
+      return errorMessage(error);
+    }
+  }
+
+  function schedule(abbr, color, onError) {
+    if (timer !== null) clearTimeout(timer);
+    timer = setTimeout(() => {
+      timer = null;
+      draw(abbr, color).then((error) => {
+        if (error && typeof onError === "function") onError(error);
+      });
+    }, 110);
+  }
+
+  return { node, draw, schedule, clear };
 }
 
 function applyTheme(setting) {
@@ -314,6 +595,7 @@ export {
   applyProps,
   appendChildren,
   h,
+  banner,
   applyTheme,
   invoke,
   listen,
@@ -322,4 +604,9 @@ export {
   textInput,
   selectInput,
   switchButton,
+  sanitizeAbbrChar,
+  abbrLetterBoxes,
+  colorSwatches,
+  hexField,
+  iconPreview,
 };

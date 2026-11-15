@@ -57,6 +57,8 @@ pub enum StoreError {
     Keyring(String),
     #[error("invalid setting: {0}")]
     InvalidSetting(String),
+    #[error("invalid price {0}: use a number above 0 per month")]
+    InvalidPrice(f64),
     #[error("invalid account id {0:?}: expected 32 lower-case hex characters")]
     InvalidId(String),
     #[error("Claude Code's account identity (oauthAccount in {path}) is missing or incomplete")]
@@ -79,8 +81,13 @@ pub struct Account {
     pub color: String,
     pub email: Option<String>,
     pub org_name: Option<String>,
-    /// [`plan_label`], e.g. `"Ultra"` or `"Team"`.
+    /// [`plan_label`], e.g. `"Ultra"` or `"Team 5x"`.
     pub plan: Option<String>,
+    /// What the subscription costs per month, in the display currency; `None`
+    /// when it has not been entered. An older file without the key loads with
+    /// `None`.
+    #[serde(default)]
+    pub price: Option<f64>,
     /// A copy of `.claude.json`'s `oauthAccount`.
     pub oauth_account: OAuthAccount,
     pub added_at: DateTime<Utc>,
@@ -1027,8 +1034,9 @@ pub fn validate_color(color: &str) -> Result<String, StoreError> {
 
 /// The plan as Claude names it: the identity's `planDisplayName` ("Pro",
 /// "Max", "Ultra"), else the login's `subscriptionType` with a capital first
-/// letter ("Team", "Enterprise"). Rate-limit tiers (`default_claude_max_20x`)
-/// are not shown: the personal plans have names, not multipliers.
+/// letter plus its level from `rateLimitTier` (spec §3.7.1). A tier ending in
+/// `_<n>x` adds `" <n>x"` ("Team 5x"); any other tier adds
+/// `" (<tier without the prefix default_claude_>)"`; no tier adds nothing.
 pub fn plan_label(login: &Login, identity: &OAuthAccount) -> Option<String> {
     let named = identity
         .plan_display_name()
@@ -1039,26 +1047,77 @@ pub fn plan_label(login: &Login, identity: &OAuthAccount) -> Option<String> {
         let subscription = login.subscription_type()?.trim();
         let mut chars = subscription.chars();
         let first = chars.next()?;
-        Some(first.to_uppercase().chain(chars).collect())
+        let mut label: String = first.to_uppercase().chain(chars).collect();
+        if let Some(tier) = login.rate_limit_tier().map(str::trim) {
+            if tier.is_empty() {
+                return Some(label);
+            }
+            if let Some(level) = tier_multiplier(tier) {
+                label.push(' ');
+                label.push_str(level);
+            } else {
+                let name = tier.strip_prefix("default_claude_").unwrap_or(tier);
+                label.push_str(" (");
+                label.push_str(name);
+                label.push(')');
+            }
+        }
+        Some(label)
     })
+}
+
+/// The `"<n>x"` at the end of a tier written `_<n>x`, else `None`.
+fn tier_multiplier(tier: &str) -> Option<&str> {
+    let digits = tier.strip_suffix('x')?;
+    let start = digits.rfind('_')? + 1;
+    let number = &digits[start..];
+    if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(&tier[start..])
 }
 
 impl Account {
     /// Bring the fields that come from the stored login up to date after a
     /// login was stored for this account (switch, live sync, refresh): the plan
     /// ([`plan_label`] with the account's identity), the login's end date and
-    /// the login state. Returns whether anything changed. The one place these
-    /// fields are written for an existing account.
-    pub fn note_stored_login(&mut self, login: &Login) -> bool {
+    /// the login state.
+    pub fn note_stored_login(&mut self, login: &Login) -> LoginNote {
         let plan = plan_label(login, &self.oauth_account);
         let ends_at_ms = login.refresh_token_expires_at_ms();
-        let changed = self.plan != plan
+        let plan_changed = self.plan != plan;
+        let changed = plan_changed
             || self.login_ends_at_ms != ends_at_ms
             || self.login_state != LoginState::Ok;
+        let previous_plan = self.plan.clone();
         self.plan = plan;
         self.login_ends_at_ms = ends_at_ms;
         self.login_state = LoginState::Ok;
-        changed
+        LoginNote {
+            changed,
+            plan_changed,
+            previous_plan,
+        }
+    }
+}
+
+/// What [`Account::note_stored_login`] changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginNote {
+    /// The account must be saved: plan, login end date or state changed.
+    pub changed: bool,
+    /// The plan changed; the caller that records history writes `PlanChanged`.
+    pub plan_changed: bool,
+    /// The plan before the note, when [`Self::plan_changed`] is true.
+    pub previous_plan: Option<String>,
+}
+
+/// A monthly price must be a finite number above 0 (spec §1.4); anything else
+/// is [`StoreError::InvalidPrice`], never clamped or dropped.
+pub fn validate_price(price: Option<f64>) -> Result<Option<f64>, StoreError> {
+    match price {
+        Some(value) if !value.is_finite() || value <= 0.0 => Err(StoreError::InvalidPrice(value)),
+        other => Ok(other),
     }
 }
 
@@ -1128,6 +1187,7 @@ pub fn new_account(
         },
         login_ends_at_ms: login.refresh_token_expires_at_ms(),
         auto_burn: true,
+        price: None,
     })
 }
 
@@ -1377,7 +1437,7 @@ mod tests {
         let loaded = store.load().unwrap();
         assert_eq!(loaded, file);
         assert_eq!(loaded.accounts[0].oauth_account, sample_identity());
-        assert_eq!(loaded.accounts[0].plan.as_deref(), Some("Team"));
+        assert_eq!(loaded.accounts[0].plan.as_deref(), Some("Team 5x"));
         assert_eq!(loaded.accounts[0].abbr, "AC");
         assert_eq!(loaded.accounts[1].abbr, "PR");
     }
@@ -2150,6 +2210,15 @@ mod tests {
             .as_deref(),
             Some("Max")
         );
+        // A plan with a name of its own keeps it, whatever the tier says.
+        assert_eq!(
+            plan_label(
+                &login_with(Some("max"), Some("default_claude_max_20x")),
+                &personal("Max")
+            )
+            .as_deref(),
+            Some("Max")
+        );
         assert_eq!(
             plan_label(
                 &login_with(Some("pro"), Some("default_claude_pro")),
@@ -2158,13 +2227,26 @@ mod tests {
             .as_deref(),
             Some("Pro")
         );
-        // Team seats have no display name: the subscription type, capitalised.
+        // Team seats have no display name: the subscription type, capitalised,
+        // with the tier's multiplier.
         assert_eq!(
             plan_label(
                 &login_with(Some("team"), Some("default_claude_max_5x")),
                 &sample_identity()
             )
             .as_deref(),
+            Some("Team 5x")
+        );
+        assert_eq!(
+            plan_label(
+                &login_with(Some("team"), Some("default_claude_team_premium")),
+                &sample_identity()
+            )
+            .as_deref(),
+            Some("Team (team_premium)")
+        );
+        assert_eq!(
+            plan_label(&login_with(Some("team"), None), &sample_identity()).as_deref(),
             Some("Team")
         );
         assert_eq!(
@@ -2173,7 +2255,15 @@ mod tests {
                 &sample_identity()
             )
             .as_deref(),
-            Some("Max")
+            Some("Max 20x")
+        );
+        assert_eq!(
+            plan_label(
+                &login_with(Some("enterprise"), Some("default_claude_max_20x")),
+                &sample_identity()
+            )
+            .as_deref(),
+            Some("Enterprise 20x")
         );
         // A blank display name does not hide the subscription type.
         assert_eq!(
@@ -2184,6 +2274,66 @@ mod tests {
             plan_label(&login_with(None, None), &sample_identity()),
             None
         );
+    }
+
+    /// The tier shapes of spec §3.7.1: the multiplier at the end of the value
+    /// is read as it is, a value that is not a multiplier is shown without the
+    /// `default_claude_` part, and nothing is guessed.
+    #[test]
+    fn plan_label_reads_every_tier_shape() {
+        let label = |tier: Option<&str>| {
+            plan_label(&login_with(Some("team"), tier), &sample_identity())
+                .as_deref()
+                .map(str::to_string)
+        };
+        // The multiplier at the end of the value.
+        assert_eq!(
+            label(Some("default_claude_max_20x")),
+            Some("Team 20x".to_string())
+        );
+        assert_eq!(
+            label(Some("default_claude_max_5x")),
+            Some("Team 5x".to_string())
+        );
+        // A tier without the prefix: the multiplier is still the end of it.
+        assert_eq!(label(Some("max_5x")), Some("Team 5x".to_string()));
+        // A tier that is not a multiplier is shown as it is, without the prefix.
+        assert_eq!(
+            label(Some("default_claude_team_premium")),
+            Some("Team (team_premium)".to_string())
+        );
+        assert_eq!(
+            label(Some("team_premium")),
+            Some("Team (team_premium)".to_string())
+        );
+        // An empty tier adds nothing.
+        assert_eq!(label(Some("")), Some("Team".to_string()));
+        // "_x" without digits is not a multiplier: the value is shown as it is.
+        assert_eq!(
+            label(Some("default_claude_max_x")),
+            Some("Team (max_x)".to_string())
+        );
+        // "_05x" is shown as it is: nothing is guessed.
+        assert_eq!(
+            label(Some("default_claude_max_05x")),
+            Some("Team 05x".to_string())
+        );
+        // No tier at all adds nothing.
+        assert_eq!(label(None), Some("Team".to_string()));
+    }
+
+    #[test]
+    fn a_price_must_be_positive() {
+        assert!(matches!(
+            validate_price(Some(0.0)),
+            Err(StoreError::InvalidPrice(_))
+        ));
+        assert!(matches!(
+            validate_price(Some(-1.0)),
+            Err(StoreError::InvalidPrice(_))
+        ));
+        assert_eq!(validate_price(Some(180.0)).unwrap(), Some(180.0));
+        assert_eq!(validate_price(None).unwrap(), None);
     }
 
     #[test]
@@ -2200,17 +2350,19 @@ mod tests {
         account.plan = Some("team · max 5x".to_string());
         account.login_state = LoginState::LoggedOut;
 
-        assert!(account.note_stored_login(&login));
-        assert_eq!(account.plan.as_deref(), Some("Team"));
+        let note = account.note_stored_login(&login);
+        assert!(note.changed);
+        assert!(note.plan_changed);
+        assert_eq!(note.previous_plan.as_deref(), Some("team · max 5x"));
+        assert_eq!(account.plan.as_deref(), Some("Team 5x"));
         assert_eq!(account.login_state, LoginState::Ok);
         assert_eq!(
             account.login_ends_at_ms,
             login.refresh_token_expires_at_ms()
         );
-        assert!(
-            !account.note_stored_login(&login),
-            "nothing changes the second time"
-        );
+        let again = account.note_stored_login(&login);
+        assert!(!again.changed, "nothing changes the second time");
+        assert!(!again.plan_changed);
     }
 
     #[test]
@@ -2229,7 +2381,8 @@ mod tests {
         assert_eq!(account.color, "#3b82f6");
         assert_eq!(account.email.as_deref(), Some("someone@example.com"));
         assert_eq!(account.org_name.as_deref(), Some("Acme"));
-        assert_eq!(account.plan.as_deref(), Some("Team"));
+        assert_eq!(account.plan.as_deref(), Some("Team 5x"));
+        assert_eq!(account.price, None);
         assert_eq!(account.account_uuid, ONE_ACCOUNT_UUID);
         assert_eq!(account.organization_uuid, ONE_ORG_UUID);
         assert_eq!(account.oauth_account, identity);

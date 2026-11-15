@@ -936,7 +936,11 @@ fn record_cli_switch(
         let saved_new = outcome.saved_new.as_deref().and_then(|id| file.find(id));
         let recorder = ops::open_history(context.store.app_paths(), &context.settings)?;
         ops::record_switch(&recorder, from, to, saved_new, by, None, cwd, None, at)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        if let Some(change) = &outcome.plan_change {
+            ops::record_plan_change(&recorder, change, at).map_err(|error| error.to_string())?;
+        }
+        Ok(())
     })();
     if let Err(error) = result {
         eprintln!("seatswap: warning: the switch was not written to the history: {error}");
@@ -1085,15 +1089,16 @@ fn edit(
             "nothing to change; give --label, --abbr or --color".to_string(),
         ));
     }
-    let account = switcher::edit_account(
+    let edited = switcher::edit_account(
         &context.store,
         key,
         label.as_deref(),
         abbr.as_deref(),
         color.as_deref(),
         None,
+        None,
     )?;
-    println!("Updated {} — {}", account.abbr, account.label);
+    println!("Updated {} — {}", edited.account.abbr, edited.account.label);
     Ok(())
 }
 
@@ -2825,7 +2830,7 @@ pub(crate) mod tests {
         assert_eq!(added.len(), 1, "{events:?}");
         assert_eq!(added[0]["account"]["acc"], json!(FIRST_ACCOUNT_UUID));
         assert_eq!(added[0]["account"]["org"], json!(FIRST_ORG_UUID));
-        assert_eq!(added[0]["plan"], json!("Team"));
+        assert_eq!(added[0]["plan"], json!("Team 5x"));
 
         // Saving the same login again is an update, not a second account.
         fixture
@@ -2873,6 +2878,65 @@ pub(crate) mod tests {
             .is_empty());
     }
 
+    /// The account that is switched away from had a stale plan and the live
+    /// login says "Team 5x": the change belongs in the history, written by the
+    /// code that records the events of this path.
+    #[test]
+    fn a_changed_plan_is_written_to_the_history_when_the_account_is_switched_away() {
+        let fixture = Fixture::new();
+        fixture.add_account(0);
+        fixture.write_live(1);
+        fixture.add_account(1);
+        // The live account's stored plan is stale; its login says "Team 5x".
+        let store = fixture.store();
+        let mut file = store.load().expect("accounts");
+        let live = file
+            .accounts
+            .iter_mut()
+            .find(|account| account.account_uuid == SECOND_ACCOUNT_UUID)
+            .expect("the live account");
+        live.plan = Some("Team".to_string());
+        store.save(&file).expect("the stale plan is stored");
+
+        fixture
+            .run(
+                Command::Use {
+                    key: "AC".to_string(),
+                    save_current: None,
+                    discard_current: false,
+                },
+                Caller::Person,
+            )
+            .expect("the switch");
+
+        let file = store.load().expect("accounts");
+        assert_eq!(
+            file.accounts
+                .iter()
+                .find(|account| account.account_uuid == SECOND_ACCOUNT_UUID)
+                .expect("the live account")
+                .plan
+                .as_deref(),
+            Some("Team 5x"),
+            "the plan of the account is the login's"
+        );
+
+        let events = fixture.events();
+        let changed: Vec<&Value> = events
+            .iter()
+            .filter(|event| event["type"] == json!("planChanged"))
+            .collect();
+        assert_eq!(
+            changed.len(),
+            1,
+            "one event for one plan change: {events:?}"
+        );
+        assert_eq!(changed[0]["account"]["acc"], json!(SECOND_ACCOUNT_UUID));
+        assert_eq!(changed[0]["account"]["org"], json!(SECOND_ORG_UUID));
+        assert_eq!(changed[0]["from"], json!("Team"));
+        assert_eq!(changed[0]["to"], json!("Team 5x"));
+    }
+
     #[test]
     fn a_switch_that_saves_the_unsaved_login_writes_account_added_first() {
         let fixture = Fixture::new();
@@ -2918,7 +2982,7 @@ pub(crate) mod tests {
             .expect("the switch line");
         assert!(added < switched, "{events:?}");
         assert_eq!(events[added]["account"]["acc"], json!(THIRD_ACCOUNT_UUID));
-        assert_eq!(events[added]["plan"], json!("Team"));
+        assert_eq!(events[added]["plan"], json!("Team 5x"));
         assert_eq!(events[switched]["to"]["acc"], json!(FIRST_ACCOUNT_UUID));
     }
 
@@ -2948,6 +3012,7 @@ pub(crate) mod tests {
             login_state: LoginState::Ok,
             login_ends_at_ms: None,
             auto_burn: true,
+            price: None,
         }
     }
 

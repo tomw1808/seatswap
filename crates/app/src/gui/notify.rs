@@ -700,6 +700,7 @@ mod tests {
     ) -> Snapshot {
         Snapshot {
             views: Vec::new(),
+            accounts: Vec::new(),
             active_id: None,
             live,
             burn: suggestion.map(|suggestion| BurnView {
@@ -775,6 +776,7 @@ mod tests {
         settings: Option<Settings>,
     ) -> Snapshot {
         Snapshot {
+            accounts: Vec::new(),
             active_id: views
                 .iter()
                 .find(|view| view.is_active)

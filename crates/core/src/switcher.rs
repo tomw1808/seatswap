@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
+use crate::history::AccountRef;
 use crate::live::{self, LiveError};
 use crate::locks::{self, LockError};
 use crate::paths::ClaudePaths;
@@ -124,6 +125,16 @@ pub enum UnsavedPolicy {
     Save { label: Option<String> },
 }
 
+/// A plan change found while a login was stored. [`switch_to`] and
+/// [`sync_live`] report it; the caller that writes that path's history events
+/// writes `PlanChanged` from it, once per real change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanChange {
+    pub account: AccountRef,
+    pub from: Option<String>,
+    pub to: Option<String>,
+}
+
 /// The result of a switch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SwitchOutcome {
@@ -135,15 +146,17 @@ pub struct SwitchOutcome {
     pub saved_new: Option<String>,
     /// Target was already live: nothing was written to Claude's files.
     pub already_active: bool,
+    /// The plan of the account whose login was stored changed with the switch.
+    pub plan_change: Option<PlanChange>,
 }
 
 /// Whether [`sync_live`] wrote anything, and whether it created the account.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Synced {
     /// Nothing was written: the stored copy already matched.
     Unchanged,
-    /// The stored login or identity was updated.
-    Updated,
+    /// The stored login or identity was updated, and whether the plan changed.
+    Updated { plan_change: Option<PlanChange> },
     /// The live login was stored as a new account.
     Added,
 }
@@ -251,7 +264,7 @@ fn switch_to_with_timeouts(
     if current_id.as_deref() == Some(target_id.as_str()) {
         match &live {
             Some(login) if !login.is_ended() => {
-                save_current_login(
+                let plan_change = save_current_login(
                     store,
                     &mut file,
                     &target_id,
@@ -264,6 +277,7 @@ fn switch_to_with_timeouts(
                     to: target_id,
                     saved_new,
                     already_active: true,
+                    plan_change,
                 });
             }
             Some(_) => {
@@ -312,11 +326,12 @@ fn switch_to_with_timeouts(
     // Save the live login into the current account's slot only now that we know
     // its identity matches that account.
     let from_id = current_id.clone();
+    let mut plan_change = None;
     let mut live_label = current_id
         .as_ref()
         .and_then(|id| file.find(id).map(|account| account.label.clone()));
     if let Some(account_id) = &current_id {
-        save_current_login(
+        plan_change = save_current_login(
             store,
             &mut file,
             account_id,
@@ -387,40 +402,47 @@ fn switch_to_with_timeouts(
         to: target_id,
         saved_new,
         already_active: false,
+        plan_change,
     })
 }
 
 /// Save a fresh live login into an account's slot and update the account's copy
 /// of the identity. An ended login is never stored over the old one; the account
-/// is marked logged out instead.
+/// is marked logged out instead. A changed plan is reported for the caller's
+/// history recorder.
 fn save_current_login(
     store: &Store,
     file: &mut AccountsFile,
     account_id: &str,
     live: Option<&Login>,
     identity: Option<&OAuthAccount>,
-) -> Result<(), SwitchError> {
+) -> Result<Option<PlanChange>, SwitchError> {
     let Some(login) = live else {
-        return Ok(());
+        return Ok(None);
     };
     let Some(index) = file
         .accounts
         .iter()
         .position(|account| account.id == account_id)
     else {
-        return Ok(());
+        return Ok(None);
     };
     if login.is_ended() {
         file.accounts[index].login_state = LoginState::LoggedOut;
-        return Ok(());
+        return Ok(None);
     }
     store.secrets().set(account_id, login)?;
     let account = &mut file.accounts[index];
     if let Some(identity) = identity {
         account.oauth_account = identity.clone();
     }
-    account.note_stored_login(login);
-    Ok(())
+    let note = account.note_stored_login(login);
+    let plan_change = note.plan_changed.then(|| PlanChange {
+        account: AccountRef::of(account),
+        from: note.previous_plan,
+        to: account.plan.clone(),
+    });
+    Ok(plan_change)
 }
 
 /// Read the live login and compare it with the store. No lock is taken.
@@ -508,7 +530,7 @@ pub fn sync_live(
             LiveState::Ended {
                 account_id: Some(account_id),
             },
-            Synced::Updated,
+            Synced::Updated { plan_change: None },
         ));
     }
 
@@ -530,16 +552,22 @@ pub fn sync_live(
                 written = true;
             }
         }
-        if account.note_stored_login(&login) {
+        let note = account.note_stored_login(&login);
+        if note.changed {
             written = true;
         }
+        let plan_change = note.plan_changed.then(|| PlanChange {
+            account: AccountRef::of(account),
+            from: note.previous_plan,
+            to: account.plan.clone(),
+        });
         if written {
             store.save(&file)?;
         }
         return Ok((
             LiveState::Known { account_id },
             if written {
-                Synced::Updated
+                Synced::Updated { plan_change }
             } else {
                 Synced::Unchanged
             },
@@ -589,9 +617,18 @@ pub fn remove_account(store: &Store, key: &str) -> Result<Account, SwitchError> 
     Ok(removed)
 }
 
-/// Change label, abbreviation, colour or whether auto-burn may use the
-/// account. Every value goes through the store's validator first, so an
-/// invalid value leaves the account list untouched.
+/// What [`edit_account`] changed: the account as stored afterwards, and
+/// whether the price differs from what it was. The caller that records this
+/// path's history events writes `PriceChanged` only when `price_changed`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Edited {
+    pub account: Account,
+    pub price_changed: bool,
+}
+
+/// Change label, abbreviation, colour, whether auto-burn may use the account,
+/// or its monthly price. Every value goes through the store's validator first,
+/// so an invalid value leaves the account list untouched.
 pub fn edit_account(
     store: &Store,
     key: &str,
@@ -599,7 +636,8 @@ pub fn edit_account(
     abbr: Option<&str>,
     color: Option<&str>,
     auto_burn: Option<bool>,
-) -> Result<Account, SwitchError> {
+    price: Option<Option<f64>>,
+) -> Result<Edited, SwitchError> {
     let _app_lock = locks::acquire_app_lock(store.app_paths(), APP_LOCK_TIMEOUT)?;
     let mut file = store.load()?;
     let index = file
@@ -623,8 +661,13 @@ pub fn edit_account(
         None => None,
     };
     let color = color.map(store::validate_color).transpose()?;
+    let price = match price {
+        Some(value) => Some(store::validate_price(value)?),
+        None => None,
+    };
 
     let mut changed = false;
+    let mut price_changed = false;
     let account = &mut file.accounts[index];
     if let Some(label) = label {
         if account.label != label {
@@ -650,10 +693,20 @@ pub fn edit_account(
             changed = true;
         }
     }
+    if let Some(price) = price {
+        if account.price != price {
+            account.price = price;
+            changed = true;
+            price_changed = true;
+        }
+    }
     if changed {
         store.save(&file)?;
     }
-    Ok(file.accounts[index].clone())
+    Ok(Edited {
+        account: file.accounts[index].clone(),
+        price_changed,
+    })
 }
 
 #[cfg(test)]
@@ -1480,7 +1533,7 @@ mod tests {
                 account_id: w.a_id.clone()
             }
         );
-        assert_eq!(synced, Synced::Updated);
+        assert_eq!(synced, Synced::Updated { plan_change: None });
         assert_eq!(
             w.store.secrets().get(&w.a_id).unwrap(),
             Some(w.a_live_login.clone())
@@ -1566,7 +1619,7 @@ mod tests {
                 account_id: Some(w.a_id.clone())
             }
         );
-        assert_eq!(synced, Synced::Updated);
+        assert_eq!(synced, Synced::Updated { plan_change: None });
         assert_eq!(
             w.account_file().find(&w.a_id).unwrap().login_state,
             LoginState::LoggedOut
@@ -1654,21 +1707,21 @@ mod tests {
         let w = World::new();
         let before_accounts = w.accounts_bytes();
 
-        let clash = edit_account(&w.store, &w.a_id, None, Some("pr"), None, None);
+        let clash = edit_account(&w.store, &w.a_id, None, Some("pr"), None, None, None);
         match clash {
             Err(SwitchError::Store(StoreError::DuplicateAbbr(_))) => {}
             other => panic!("expected DuplicateAbbr, got {other:?}"),
         }
         assert_eq!(w.accounts_bytes(), before_accounts);
 
-        let bad_color = edit_account(&w.store, &w.a_id, None, None, Some("3b82f6"), None);
+        let bad_color = edit_account(&w.store, &w.a_id, None, None, Some("3b82f6"), None, None);
         match bad_color {
             Err(SwitchError::Store(StoreError::InvalidColor(_))) => {}
             other => panic!("expected InvalidColor, got {other:?}"),
         }
         assert_eq!(w.accounts_bytes(), before_accounts);
 
-        let bad_label = edit_account(&w.store, &w.a_id, Some("   "), None, None, None);
+        let bad_label = edit_account(&w.store, &w.a_id, Some("   "), None, None, None, None);
         match bad_label {
             Err(SwitchError::Store(StoreError::InvalidLabel(_))) => {}
             other => panic!("expected InvalidLabel, got {other:?}"),
@@ -1682,11 +1735,12 @@ mod tests {
             Some("z9"),
             Some("#ABCDEF"),
             None,
+            None,
         )
         .unwrap();
-        assert_eq!(edited.label, "Team A");
-        assert_eq!(edited.abbr, "Z9");
-        assert_eq!(edited.color, "#abcdef");
+        assert_eq!(edited.account.label, "Team A");
+        assert_eq!(edited.account.abbr, "Z9");
+        assert_eq!(edited.account.color, "#abcdef");
         let stored = w.account_file();
         let stored = stored.find(&w.a_id).unwrap();
         assert_eq!(stored.label, "Team A");
@@ -1699,8 +1753,8 @@ mod tests {
         let w = World::new();
         assert!(w.account_file().find(&w.a_id).unwrap().auto_burn);
 
-        let edited = edit_account(&w.store, &w.a_id, None, None, None, Some(false)).unwrap();
-        assert!(!edited.auto_burn);
+        let edited = edit_account(&w.store, &w.a_id, None, None, None, Some(false), None).unwrap();
+        assert!(!edited.account.auto_burn);
         let stored = w.account_file();
         assert!(!stored.find(&w.a_id).unwrap().auto_burn);
         assert!(
@@ -1708,9 +1762,61 @@ mod tests {
             "the other account keeps its own switch"
         );
 
-        let edited = edit_account(&w.store, &w.a_id, None, None, None, Some(true)).unwrap();
-        assert!(edited.auto_burn);
+        let edited = edit_account(&w.store, &w.a_id, None, None, None, Some(true), None).unwrap();
+        assert!(edited.account.auto_burn);
         assert!(w.account_file().find(&w.a_id).unwrap().auto_burn);
+    }
+
+    #[test]
+    fn edit_account_sets_and_clears_the_price() {
+        let w = World::new();
+        assert_eq!(w.account_file().find(&w.a_id).unwrap().price, None);
+
+        let edited =
+            edit_account(&w.store, &w.a_id, None, None, None, None, Some(Some(180.0))).unwrap();
+        assert_eq!(edited.account.price, Some(180.0));
+        assert_eq!(w.account_file().find(&w.a_id).unwrap().price, Some(180.0));
+        assert_eq!(
+            w.account_file().find(&w.b_id).unwrap().price,
+            None,
+            "the other account keeps its own price"
+        );
+
+        let cleared = edit_account(&w.store, &w.a_id, None, None, None, None, Some(None)).unwrap();
+        assert_eq!(cleared.account.price, None);
+        assert_eq!(w.account_file().find(&w.a_id).unwrap().price, None);
+
+        edit_account(&w.store, &w.a_id, None, None, None, None, Some(Some(180.0))).unwrap();
+        let unchanged = edit_account(&w.store, &w.a_id, None, None, None, None, None).unwrap();
+        assert_eq!(
+            unchanged.account.price,
+            Some(180.0),
+            "None leaves the price alone"
+        );
+    }
+
+    #[test]
+    fn edit_account_says_whether_the_price_changed() {
+        let w = World::new();
+
+        let first =
+            edit_account(&w.store, &w.a_id, None, None, None, None, Some(Some(180.0))).unwrap();
+        assert!(first.price_changed, "None to 180 is a change");
+
+        let same =
+            edit_account(&w.store, &w.a_id, None, None, None, None, Some(Some(180.0))).unwrap();
+        assert!(!same.price_changed, "the same price again is not a change");
+
+        let changed =
+            edit_account(&w.store, &w.a_id, None, None, None, None, Some(Some(200.0))).unwrap();
+        assert!(changed.price_changed, "180 to 200 is a change");
+        assert_eq!(changed.account.price, Some(200.0));
+
+        let untouched = edit_account(&w.store, &w.a_id, None, None, None, None, None).unwrap();
+        assert!(
+            !untouched.price_changed,
+            "a save that leaves the price alone is not a change"
+        );
     }
 
     #[test]

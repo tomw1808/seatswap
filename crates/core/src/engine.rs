@@ -843,13 +843,31 @@ impl<R: Remote> Engine<R> {
 
     /// Note the renewed login on that one account (plan, end date, state),
     /// loaded under the caller's app lock; an account that is gone is skipped.
-    fn save_refreshed_login(&self, id: &str, login: &Login) -> Result<(), EngineError> {
+    /// A plan change is written as `PlanChanged`, once, by this recorder.
+    fn save_refreshed_login(&mut self, id: &str, login: &Login) -> Result<(), EngineError> {
         let mut file = self.store.load()?;
         let Some(account) = file.accounts.iter_mut().find(|account| account.id == id) else {
             return Ok(());
         };
-        if account.note_stored_login(login) {
+        let account_ref = AccountRef::of(account);
+        let note = account.note_stored_login(login);
+        let plan = account.plan.clone();
+        if note.changed {
             self.store.save(&file)?;
+        }
+        if note.plan_changed {
+            if let Some(recorder) = self.recorder.as_ref() {
+                if let Err(error) = recorder.event(
+                    Utc::now(),
+                    EventKind::PlanChanged {
+                        account: account_ref,
+                        from: note.previous_plan,
+                        to: plan,
+                    },
+                ) {
+                    self.set_last_error(id, history_error_text(HistoryErrorKind::Event, &error));
+                }
+            }
         }
         Ok(())
     }
@@ -1396,6 +1414,7 @@ mod tests {
             login_state: LoginState::Ok,
             login_ends_at_ms,
             auto_burn: true,
+            price: None,
         }
     }
 
@@ -1825,7 +1844,7 @@ mod tests {
         let views = engine.poll(PollReason::Timer, t0()).unwrap();
 
         let file = engine.store().load().unwrap();
-        assert_eq!(file.find(B_ID).unwrap().plan.as_deref(), Some("Team"));
+        assert_eq!(file.find(B_ID).unwrap().plan.as_deref(), Some("Team 5x"));
         assert_eq!(
             views
                 .iter()
@@ -1833,7 +1852,48 @@ mod tests {
                 .unwrap()
                 .plan
                 .as_deref(),
-            Some("Team")
+            Some("Team 5x")
+        );
+    }
+
+    #[test]
+    fn a_changed_plan_is_written_to_the_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = Fixture::new(&tmp);
+        let root = tmp.path().join("history");
+        let dir = HistoryDir::at(&root, "atlas");
+        let (_app, _fake, engine) = fixture.into_engine();
+        let mut engine = engine.with_recorder(Recorder::new(HistoryDir::at(&root, "atlas")));
+
+        engine
+            .save_refreshed_login(B_ID, &b_stored_login())
+            .expect("the refreshed login is noted");
+
+        let read = dir
+            .read::<crate::history::Event>(
+                &crate::history::Range {
+                    from: DateTime::<Utc>::MIN_UTC,
+                    to: DateTime::<Utc>::MAX_UTC,
+                },
+                &crate::history::Hosts::One(dir.host().to_string()),
+            )
+            .expect("the events are read");
+        let changed: Vec<_> = read
+            .records
+            .iter()
+            .filter(|hosted| matches!(hosted.record.kind, EventKind::PlanChanged { .. }))
+            .collect();
+        assert_eq!(changed.len(), 1, "one event for one real plan change");
+        assert_eq!(
+            changed[0].record.kind,
+            EventKind::PlanChanged {
+                account: AccountRef {
+                    acc: B_UUID.to_string(),
+                    org: B_ORG.to_string(),
+                },
+                from: Some("Team".to_string()),
+                to: Some("Team 5x".to_string()),
+            }
         );
     }
 

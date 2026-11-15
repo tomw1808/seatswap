@@ -149,6 +149,17 @@ code,
   color: var(--danger);
 }
 
+/* The snapshot's error, shown above the area with the pop-up's banner (the
+   markup comes from common.js `banner`). */
+.area-banner {
+  flex-shrink: 0;
+}
+
+.area-banner .banner {
+  --banner-pad: 9px 11px;
+  --banner-size: 12px;
+}
+
 /* The mock-up's dense rows and cards (page-build/mock_other.py), with the
    pop-up's tokens. Later areas use these class names. */
 .row {
@@ -475,6 +486,254 @@ code,
 
 .settings-card .calls .lr:first-child {
   border-top: 1px solid var(--border);
+}
+
+/* ---------- the Accounts group ---------- */
+
+.acc-grid {
+  grid-template-columns: 62px 128px minmax(0, 1fr) 60px 232px 132px 84px 70px;
+}
+
+.acc-wrap {
+  border-top: 1px solid var(--border);
+}
+
+.acc-wrap .lr {
+  border-top: 0;
+  height: 40px;
+}
+
+.acc-wrap.selected {
+  background: var(--hover);
+}
+
+.acc-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  width: 40px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.acc-chip i {
+  font-style: normal;
+  font-size: 9px;
+  opacity: 0.6;
+}
+
+.acc-chip:hover {
+  border-color: var(--border-strong);
+}
+
+.acc-chip.open {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+.acc-text {
+  color: var(--muted);
+}
+
+.acc-label {
+  width: 100%;
+}
+
+.price-cell {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.acc-price {
+  width: 70px;
+  min-width: 70px;
+  flex: 0 0 70px;
+  font-variant-numeric: tabular-nums;
+}
+
+.currency-hint {
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.acc-switch {
+  display: flex;
+  align-items: center;
+}
+
+.acc-add {
+  height: 34px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+}
+
+.acc-wrap .row-error {
+  padding: 0 12px 6px 74px;
+  color: var(--danger);
+  font-size: 12px;
+  line-height: 16px;
+  white-space: normal;
+}
+
+.acc-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0 12px 9px 74px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+
+.acc-editor .editor-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 18px;
+  flex-wrap: wrap;
+}
+
+.acc-editor .editor-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.acc-editor .confirm {
+  margin: 0;
+}
+
+.acc-editor .field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.acc-editor .field-label {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.abbr-boxes {
+  display: flex;
+  gap: 4px;
+}
+
+.abbr-box {
+  width: 27px;
+  min-width: 27px;
+  padding: 4px 0;
+  text-align: center;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.color-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.hex-input {
+  width: 84px;
+  min-width: 84px;
+  font-variant-numeric: tabular-nums;
+  text-transform: lowercase;
+}
+
+.swatches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.swatch {
+  width: 17px;
+  height: 17px;
+  padding: 0;
+  border: 1px solid rgba(0, 0, 0, 0.18);
+  border-radius: 5px;
+}
+
+.swatch.selected {
+  box-shadow: 0 0 0 2px var(--surface), 0 0 0 3px var(--text);
+}
+
+.swatch:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+.previews {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  padding: 2px 0;
+}
+
+.preview-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+}
+
+.preview-cell canvas {
+  display: block;
+  image-rendering: pixelated;
+}
+
+.preview-size {
+  color: var(--muted);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+
+.confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0 12px 9px;
+  padding: 8px 10px;
+  border: 1px solid var(--danger);
+  border-radius: 9px;
+}
+
+.confirm-text {
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.confirm-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.hbtn.danger {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.hbtn.ghost {
+  border-color: transparent;
+  background: transparent;
+  color: var(--muted);
 }
 
 /* ---------- the settings controls ---------- */

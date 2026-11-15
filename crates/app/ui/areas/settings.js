@@ -4,11 +4,17 @@
 // control back to the saved value. Plain ES2020, no framework.
 
 import {
+  abbrLetterBoxes,
   applyTheme,
   clear,
   clone,
+  colorSwatches,
+  contrastText,
   errorMessage,
   h,
+  hexField,
+  iconPreview,
+  isColor,
   isObject,
   selectInput,
   shortPercent,
@@ -52,6 +58,12 @@ const state = {
   context: null,
   container: null,
   group: "general",
+  sub: null,
+  // The account whose chip editor is open, and the row the target marks.
+  openEditorId: null,
+  selectedId: null,
+  confirmRemoveId: null,
+  right: null,
   errors: Object.create(null),
   skillToken: 0,
   callsToken: 0,
@@ -69,9 +81,11 @@ function takeSettings(snapshot) {
 }
 
 function groupFrom(sub) {
-  if (typeof sub !== "string" || sub === "") return "general";
-  const id = String(sub).toLowerCase();
-  return ALIASES[id] || null;
+  if (typeof sub !== "string" || sub === "") return { group: "general", item: null };
+  const mark = sub.indexOf("?");
+  const name = (mark < 0 ? sub : sub.slice(0, mark)).toLowerCase();
+  const item = mark < 0 ? null : sub.slice(mark + 1);
+  return { group: ALIASES[name] || null, item };
 }
 
 function labelOf(id) {
@@ -85,7 +99,14 @@ function labelOf(id) {
 
 export function render(container, context) {
   const snapshot = isObject(context.snapshot) ? context.snapshot : {};
-  const group = groupFrom(context.sub);
+  const parsed = groupFrom(context.sub);
+  const group = parsed.group;
+  const sameTarget = state.sub === context.sub;
+  state.sub = context.sub;
+  if (parsed.item && !sameTarget) {
+    state.selectedId = parsed.item;
+    state.openEditorId = parsed.item;
+  }
   const active = document.activeElement;
   const typing =
     active && active.tagName === "INPUT" && container.contains(active);
@@ -135,6 +156,9 @@ function groupButton(group, right) {
 }
 
 function selectGroup(id, right) {
+  state.openEditorId = null;
+  state.selectedId = null;
+  state.confirmRemoveId = null;
   const target = `settings/${id}`;
   if (location.hash.slice(1) === target) {
     state.group = id;
@@ -147,15 +171,17 @@ function selectGroup(id, right) {
 function renderGroup(right, id) {
   clear(right);
   state.group = id;
+  state.right = right;
   if (!GROUPS.some((group) => group.id === id)) {
     right.appendChild(panel("Settings", "", [message("Unknown setting group.")]));
     return;
   }
-  if (!["general", "auto-burn", "notifications", "agents"].includes(id)) {
+  if (!["general", "accounts", "auto-burn", "notifications", "agents"].includes(id)) {
     right.appendChild(panel(labelOf(id), "", [message(NOT_YET)]));
     return;
   }
   if (id === "general") right.appendChild(generalCard());
+  else if (id === "accounts") right.appendChild(accountsCard());
   else if (id === "auto-burn") right.appendChild(autoBurnCard());
   else if (id === "notifications") right.appendChild(notificationsCard());
   else right.appendChild(agentsCard());
@@ -207,20 +233,42 @@ function note(children) {
 function fieldError(field, text) {
   state.errors[field] = text || null;
   if (!state.container) return;
-  const nodes = state.container.querySelectorAll(`.set-row[data-field="${field}"] .row-error`);
+  const nodes = state.container.querySelectorAll(`[data-field="${field}"] .row-error`);
   for (const node of nodes) {
     node.textContent = text || "";
     node.hidden = !text;
   }
 }
 
-function saveField(field, value) {
+// Every save (a setting or an account field) runs through one queue, one after
+// another, so a quick second change keeps the first.
+function queuedSave(run) {
   state.pendingSaves += 1;
-  const run = state.saving.then(() => saveNow(field, value));
-  state.saving = run.catch(() => false).finally(() => {
+  const task = state.saving.then(run);
+  state.saving = task.catch(() => false).finally(() => {
     state.pendingSaves -= 1;
   });
-  return run;
+  return task;
+}
+
+function saveField(field, value) {
+  return queuedSave(() => saveNow(field, value));
+}
+
+// An account field saves through the same `edit_account` the CLI uses. The
+// refused save's error stays under that account's row and the control goes
+// back to the stored value at the caller.
+function saveAccount(account, patch, field) {
+  return queuedSave(async () => {
+    try {
+      await state.context.invoke("edit_account", { key: account.id, ...patch });
+      fieldError(field, null);
+      return true;
+    } catch (error) {
+      fieldError(field, errorMessage(error));
+      return false;
+    }
+  });
 }
 
 async function saveNow(field, value) {
@@ -353,6 +401,373 @@ function textField(field, label, placeholder) {
 // ---------------------------------------------------------------------------
 // General
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Accounts (spec §3.7): a row per account, a chip editor, and the price.
+// ---------------------------------------------------------------------------
+
+function accountRows() {
+  const snapshot = state.snapshot || {};
+  if (Array.isArray(snapshot.accounts)) return snapshot.accounts;
+  return Array.isArray(snapshot.views) ? snapshot.views : [];
+}
+
+// Task 4 adds `settings.currency`; until then a missing code is said as such
+// and no made-up code is put beside a price.
+function currencyCode() {
+  const value = state.settings && state.settings.currency;
+  return typeof value === "string" && /^[A-Z]{3}$/.test(value) ? value : null;
+}
+
+function accountPlan(row) {
+  return typeof row.plan === "string" && row.plan !== "" ? row.plan : "—";
+}
+
+function accountEmail(row) {
+  return typeof row.email === "string" && row.email !== "" ? row.email : "—";
+}
+
+function loginEndsText(row) {
+  let days = row.loginDaysLeft;
+  if (typeof days !== "number" && typeof row.loginEndsAtMs === "number") {
+    days = Math.floor((row.loginEndsAtMs - Date.now()) / 86400000);
+  }
+  if (typeof days !== "number" || !Number.isFinite(days)) return "—";
+  if (days < 0) return "ended";
+  if (days === 0) return "today";
+  return `in ${Math.round(days)} days`;
+}
+
+function accountsCard() {
+  const card = panel(
+    "Accounts",
+    "the coloured field holds the abbreviation: click it to change the letters and the colour",
+    [],
+    [h("span", { class: "mf", text: "The ✎ in the pop-up opens this group." })]
+  );
+  const body = card.querySelector(".settings-body");
+  body.appendChild(
+    h("div", { class: "lr hd acc-grid" }, [
+      h("span", { text: "Abbr." }),
+      h("span", { text: "Label" }),
+      h("span", { text: "Account" }),
+      h("span", { text: "Plan" }),
+      h("span", { text: "Price / month" }),
+      h("span", { text: "Auto-burn may use it" }),
+      h("span", { text: "Organization" }),
+      h("span", { text: "Login ends" }),
+    ])
+  );
+  const rows = accountRows();
+  if (rows.length === 0) {
+    body.appendChild(h("div", { class: "lr", text: "No accounts yet." }));
+  }
+  for (const row of rows) body.appendChild(accountRow(row));
+  body.appendChild(
+    h("div", { class: "lr acc-add" }, [
+      h("span", {
+        class: "mf",
+        text: "+ Add account: log in with /login in Claude Code, then save it here.",
+      }),
+    ])
+  );
+  body.appendChild(
+    note([
+      "Account and plan come from the login and cannot be changed here. Price is what you pay per month, in the currency set under General. It turns percent into money, so accounts can be added up. Auto-burn may use it: switch it off for an account that should be left alone.",
+    ])
+  );
+  return card;
+}
+
+function accountRow(row) {
+  const field = `account:${row.id}`;
+  let accent = isColor(row.color) ? row.color.toLowerCase() : "#555b66";
+  let abbr = row.abbr || "?";
+
+  const wrap = h("div", {
+    class: `acc-wrap${state.selectedId === row.id ? " selected" : ""}`,
+    dataset: { field },
+  });
+  const chip = h("button", {
+    type: "button",
+    class: `acc-chip${state.openEditorId === row.id ? " open" : ""}`,
+    title: "Change the abbreviation and the colour",
+    "aria-label": `Edit account ${abbr}`,
+    "aria-expanded": state.openEditorId === row.id ? "true" : "false",
+  });
+  chip.appendChild(h("span", { text: abbr }));
+  chip.appendChild(h("i", { "aria-hidden": "true", text: "\u270E" }));
+  const paintChip = () => {
+    chip.firstChild.textContent = abbr;
+    chip.style.background = accent;
+    chip.style.color = contrastText(accent);
+    chip.setAttribute("aria-label", `Edit account ${abbr}`);
+  };
+  paintChip();
+  chip.addEventListener("click", () => {
+    state.openEditorId = state.openEditorId === row.id ? null : row.id;
+    state.selectedId = row.id;
+    state.confirmRemoveId = null;
+    renderGroup(state.right, "accounts");
+  });
+
+  const labelInput = textInput({
+    class: "inp tall acc-label",
+    value: row.label || "",
+    maxlength: "40",
+    "aria-label": "Label",
+  });
+  labelInput.addEventListener("change", async () => {
+    const next = labelInput.value.trim();
+    if (next === (row.label || "")) {
+      labelInput.value = row.label || "";
+      return;
+    }
+    const ok = await saveAccount(row, { label: next }, field);
+    if (ok) row.label = next;
+    else labelInput.value = row.label || "";
+  });
+
+  const priceInput = textInput({
+    class: "inp tall acc-price",
+    value: row.price === null || row.price === undefined ? "" : String(row.price),
+    inputmode: "decimal",
+    "aria-label": "Price per month",
+  });
+  const storedPrice = () =>
+    row.price === null || row.price === undefined ? "" : String(row.price);
+  priceInput.addEventListener("change", async () => {
+    const raw = priceInput.value.trim();
+    let amount = null;
+    if (raw !== "") {
+      amount = Number(raw);
+      if (!Number.isFinite(amount) || amount <= 0) {
+        fieldError(field, "The price must be a number above 0 per month.");
+        priceInput.value = storedPrice();
+        return;
+      }
+    }
+    if (amount === row.price) {
+      priceInput.value = storedPrice();
+      return;
+    }
+    const ok = await saveAccount(row, { price: amount }, field);
+    if (ok) {
+      row.price = amount;
+      priceInput.value = storedPrice();
+    } else {
+      priceInput.value = storedPrice();
+    }
+  });
+
+  const code = currencyCode();
+  const priceCell = h("div", { class: "price-cell" }, [
+    priceInput,
+    code
+      ? h("span", { class: "x11 mf", text: code })
+      : h("span", {
+          class: "x11 mf currency-hint",
+          text: "currency: set it under General",
+        }),
+  ]);
+
+  const auto = switchButton(
+    row.autoBurn === true,
+    `Auto-burn may use ${abbr}`,
+    async (next) => {
+      const ok = await saveAccount(row, { autoBurn: next }, field);
+      if (ok) row.autoBurn = next;
+      else auto.setAttribute("aria-checked", row.autoBurn ? "true" : "false");
+    }
+  );
+
+  wrap.appendChild(
+    h("div", { class: "lr acc-grid" }, [
+      chip,
+      labelInput,
+      h("span", { class: "acc-text", title: accountEmail(row), text: accountEmail(row) }),
+      h("span", { class: "acc-text", title: accountPlan(row), text: accountPlan(row) }),
+      priceCell,
+      h("div", { class: "acc-switch" }, [auto]),
+      h("span", {
+        class: "acc-text",
+        text: "—",
+        title: "The organization list comes with the Projects group",
+      }),
+      h("span", { class: "acc-text", text: loginEndsText(row) }),
+    ])
+  );
+  wrap.appendChild(
+    h("div", {
+      class: "row-error",
+      hidden: !state.errors[field],
+      text: state.errors[field] || "",
+    })
+  );
+
+  if (state.openEditorId === row.id) {
+    wrap.appendChild(
+      chipEditor(row, field, (next) => {
+        if (typeof next.abbr === "string") abbr = next.abbr;
+        if (typeof next.color === "string") accent = next.color;
+        paintChip();
+      })
+    );
+  }
+  return wrap;
+}
+
+function chipEditor(row, field, changed) {
+  let color = isColor(row.color) ? row.color.toLowerCase() : "";
+
+  const preview = iconPreview();
+  const schedule = () => {
+    preview.schedule(letters.value(), color, (error) => fieldError(field, error));
+  };
+
+  const letters = abbrLetterBoxes(row.abbr || "", {
+    onInput: schedule,
+    onChange: async (abbr) => {
+      if (!/^[A-Z0-9]{1,2}$/.test(abbr)) {
+        fieldError(field, "The abbreviation must be one or two letters A-Z or digits.");
+        letters.setValue(row.abbr || "");
+        return;
+      }
+      if (abbr === row.abbr) {
+        letters.setValue(row.abbr || "");
+        return;
+      }
+      const ok = await saveAccount(row, { abbr }, field);
+      if (ok) {
+        row.abbr = abbr;
+        changed({ abbr });
+      } else {
+        letters.setValue(row.abbr || "");
+      }
+    },
+  });
+
+  const swatches = colorSwatches(color, async (next) => {
+    hex.setValue(next);
+    color = next;
+    schedule();
+    await saveColor(next);
+  });
+
+  async function saveColor(next) {
+    if (next === row.color) return;
+    if (!isColor(next)) {
+      fieldError(field, "The colour must be #rrggbb.");
+      hex.setValue(row.color || "");
+      swatches.select(row.color);
+      color = row.color || "";
+      schedule();
+      return;
+    }
+    const ok = await saveAccount(row, { color: next }, field);
+    if (ok) {
+      row.color = next;
+      swatches.select(next);
+      changed({ color: next });
+    } else {
+      hex.setValue(row.color || "");
+      swatches.select(row.color);
+      color = row.color || "";
+      schedule();
+    }
+  }
+
+  const hex = hexField(color, {
+    onInput: (next) => {
+      color = next;
+      schedule();
+    },
+    onChange: saveColor,
+  });
+
+  const editor = h("div", { class: "acc-editor" }, [
+    h("div", { class: "editor-row" }, [
+      h("div", { class: "field" }, [
+        h("span", { class: "field-label", text: "Letters" }),
+        letters.node,
+      ]),
+      h("div", { class: "field" }, [
+        h("span", { class: "field-label", text: "Colour" }),
+        h("div", { class: "color-line" }, [swatches.node, hex.node]),
+      ]),
+      h("div", { class: "field" }, [
+        h("span", { class: "field-label", text: "Tray icon" }),
+        preview.node,
+      ]),
+    ]),
+    h("div", { class: "editor-actions" }, [
+      h("button", {
+        type: "button",
+        class: "hbtn xs danger",
+        text: "Remove",
+        "aria-label": `Remove account ${row.abbr || "?"}`,
+        onclick: () => {
+          state.confirmRemoveId = row.id;
+          renderGroup(state.right, "accounts");
+        },
+      }),
+    ]),
+  ]);
+  if (state.confirmRemoveId === row.id) editor.appendChild(confirmRemove(row, field));
+  preview.draw(letters.value(), color).then((error) => {
+    if (error) fieldError(field, error);
+  });
+  return editor;
+}
+
+function confirmRemove(row, field) {
+  const name = `${row.abbr || "?"} — ${row.label || "this account"}`;
+  return h("div", { class: "confirm" }, [
+    h("div", {
+      class: "confirm-text",
+      text: `Remove ${name}? The live login is not touched.`,
+    }),
+    h("div", { class: "confirm-actions" }, [
+      h("button", {
+        type: "button",
+        class: "hbtn xs danger",
+        text: "Remove",
+        onclick: () => removeAccount(row, field),
+      }),
+      h("button", {
+        type: "button",
+        class: "hbtn xs ghost",
+        text: "Keep it",
+        onclick: () => {
+          state.confirmRemoveId = null;
+          renderGroup(state.right, "accounts");
+        },
+      }),
+    ]),
+  ]);
+}
+
+async function removeAccount(row, field) {
+  try {
+    await state.context.invoke("remove_account", { key: row.id });
+    state.confirmRemoveId = null;
+    state.openEditorId = null;
+    state.selectedId = null;
+    delete state.errors[field];
+    const snapshot = state.snapshot;
+    if (snapshot) {
+      if (Array.isArray(snapshot.accounts)) {
+        snapshot.accounts = snapshot.accounts.filter((entry) => entry.id !== row.id);
+      }
+      if (Array.isArray(snapshot.views)) {
+        snapshot.views = snapshot.views.filter((entry) => entry.id !== row.id);
+      }
+    }
+    renderGroup(state.right, "accounts");
+  } catch (error) {
+    fieldError(field, errorMessage(error));
+  }
+}
 
 function generalCard() {
   return panel(

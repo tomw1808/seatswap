@@ -218,6 +218,7 @@ mod tests {
             login_state: LoginState::Ok,
             login_ends_at_ms: None,
             auto_burn: true,
+            price: None,
         }
     }
 

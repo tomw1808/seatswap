@@ -5,6 +5,7 @@
 import {
   HAS_TAURI,
   applyTheme,
+  banner,
   clear,
   errorMessage,
   h,
@@ -141,12 +142,30 @@ function message(text, className) {
   return h("p", { class: className ? `area-message ${className}` : "area-message" }, text);
 }
 
+// The snapshot's error, in the pop-up's banner above the area. The host sits
+// between the head and the area so an area module that clears its container
+// cannot remove it.
+function renderSnapshotBanner() {
+  const container = document.getElementById("area");
+  if (!container || !container.parentNode) return;
+  let host = document.getElementById("snapshot-banner");
+  if (!host) {
+    host = h("div", { id: "snapshot-banner", class: "area-banner" });
+    container.parentNode.insertBefore(host, container);
+  }
+  clear(host);
+  const text = state.snapshot && state.snapshot.error;
+  host.hidden = !text;
+  if (text) host.appendChild(banner("error", "⚠", String(text)));
+}
+
 // Render the current area into the container. A module that is not there yet
 // says so; a module that fails to render says what went wrong.
 async function renderArea() {
   const container = document.getElementById("area");
   if (!container) return;
   const token = ++renderToken;
+  renderSnapshotBanner();
   clear(container);
   if (state.error) container.appendChild(message(state.error, "error"));
 

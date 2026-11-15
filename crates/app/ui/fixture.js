@@ -154,6 +154,7 @@ function makeFixture() {
         color: "#8b5cf6",
         email: "sam.private@mail.example",
         plan: "Ultra",
+        price: 180.0,
         autoBurn: true,
         isActive: false,
         loginState: "ok",
@@ -199,6 +200,7 @@ function makeFixture() {
         color: "#10b981",
         email: "sam@lab.example",
         plan: "Max",
+        price: null,
         autoBurn: true,
         isActive: false,
         loginState: "ok",
@@ -235,6 +237,7 @@ function makeFixture() {
         color: "#3b82f6",
         email: "sam@acme.example",
         plan: "Team 5x",
+        price: 320.0,
         autoBurn: true,
         isActive: true,
         loginState: "ok",
@@ -375,6 +378,7 @@ function fixtureCreateFromLive(fixture, labelValue) {
     color: color || PALETTE[0],
     email: fixture.live.email || null,
     plan: "Ultra",
+    price: null,
     autoBurn: true,
     isActive: false,
     loginState: "ok",
@@ -528,8 +532,11 @@ export async function fixtureInvoke(command, args) {
   }
 
   switch (command) {
-    case "get_snapshot":
-      return clone(fixture);
+    case "get_snapshot": {
+      const snapshot = clone(fixture);
+      snapshot.accounts = fixture.views.map((view) => clone(view));
+      return snapshot;
+    }
 
     case "refresh_now":
       fixture.lastPollAt = new Date().toISOString();
@@ -632,10 +639,25 @@ export async function fixtureInvoke(command, args) {
       if (typeof autoBurn !== "boolean") {
         throw new Error("autoBurn must be true or false");
       }
+      let price = account.price === undefined ? null : account.price;
+      if (Object.prototype.hasOwnProperty.call(args, "price")) {
+        if (args.price === null || args.price === "") {
+          price = null;
+        } else {
+          const amount = Number(args.price);
+          if (!Number.isFinite(amount) || amount <= 0) {
+            throw new Error(
+              `invalid price ${String(args.price)}: use a number above 0 per month`
+            );
+          }
+          price = amount;
+        }
+      }
       account.label = label;
       account.abbr = abbr;
       account.color = color;
       account.autoBurn = autoBurn;
+      account.price = price;
       return clone(account);
     }
 

@@ -24,9 +24,11 @@ const WINDOW_WIDTH: f64 = 1280.0;
 const WINDOW_HEIGHT: f64 = 800.0;
 
 /// `"settings/accounts"` → `("settings", Some("accounts"))`;
+/// `"settings/accounts?<id>"` → `("settings", Some("accounts?<id>"))`;
 /// `"settings"` → `("settings", None)`. Anything else is an error with the
 /// reason: an unknown area, an empty sub-area, one that is not a plain name
-/// (`a-z`, `0-9`, `-`), or more than one `/`.
+/// (`a-z`, `0-9`, `-`) optionally followed by `?<item>` (the item a plain name
+/// too), or more than one `/`.
 pub(crate) fn parse_target(target: &str) -> Result<(&str, Option<&str>), String> {
     let mut parts = target.split('/');
     let area = parts.next().unwrap_or_default();
@@ -41,9 +43,9 @@ pub(crate) fn parse_target(target: &str) -> Result<(&str, Option<&str>), String>
         (Some(""), None) => Err(format!(
             "the sub-area of {target:?} is empty: use <area>/<sub>"
         )),
-        (Some(sub), None) if is_slug(sub) => Ok((area, Some(sub))),
+        (Some(sub), None) if is_sub_area(sub) => Ok((area, Some(sub))),
         (Some(sub), None) => Err(format!(
-            "the sub-area {sub:?} may hold only a-z, 0-9 and \"-\""
+            "the sub-area {sub:?} may hold only a-z, 0-9 and \"-\", optionally followed by ?<item>"
         )),
         _ => Err(format!(
             "{target:?} names more than one sub-area: use <area> or <area>/<sub>"
@@ -51,12 +53,22 @@ pub(crate) fn parse_target(target: &str) -> Result<(&str, Option<&str>), String>
     }
 }
 
-/// A sub-area is a name like `accounts` or `forecast`: lower-case letters,
-/// digits and `-`. It travels over the socket as one word and in the page's
-/// address unencoded, so nothing else may be in it.
-fn is_slug(sub: &str) -> bool {
-    sub.bytes()
-        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+/// A sub-area is a name like `accounts` or `forecast`, optionally followed by
+/// `?<item>` (`settings/accounts?<account id>`): lower-case letters, digits and
+/// `-`. It travels over the socket and in the page's address unencoded, so
+/// nothing else may be in it.
+fn is_sub_area(sub: &str) -> bool {
+    match sub.split_once('?') {
+        Some((name, item)) => is_slug(name) && is_slug(item),
+        None => is_slug(sub),
+    }
+}
+
+fn is_slug(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 /// Create the window (1280 × 800, resizable, decorated, in the taskbar, not
@@ -121,6 +133,16 @@ mod tests {
             parse_target("settings/accounts"),
             Ok(("settings", Some("accounts")))
         );
+        assert_eq!(
+            parse_target("settings/accounts?8564d960fb9a498daede9211fc09c9f8"),
+            Ok((
+                "settings",
+                Some("accounts?8564d960fb9a498daede9211fc09c9f8")
+            ))
+        );
+        assert!(parse_target("settings/accounts?").is_err());
+        assert!(parse_target("settings/?x").is_err());
+        assert!(parse_target("settings/accounts?a b").is_err());
         assert!(parse_target("nonsense").is_err());
         assert_eq!(parse_target("settings"), Ok(("settings", None)));
         assert!(parse_target("settings/").is_err());

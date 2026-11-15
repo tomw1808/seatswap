@@ -270,6 +270,15 @@ pub enum EventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to: Option<String>,
     },
+    /// An account's monthly price changed. `amount` is the new price; `currency`
+    /// is the setting's value at the time (spec §1.4).
+    PriceChanged {
+        account: AccountRef,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        amount: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        currency: Option<String>,
+    },
     LoginEnded {
         account: AccountRef,
     },
@@ -1108,9 +1117,9 @@ mod tests {
         let history = HistoryDir::at(dir.path(), "atlas");
         fs::create_dir_all(dir.path().join("atlas")).unwrap();
         let lines = [
-            "{\"t\":\"2026-11-14T10:00:00Z\",\"type\":\"priceChanged\",\"amount\":180.0}",
-            "{\"t\":\"2026-11-14T10:00:00Z\",\"type\":\"priceChanged\",\"amount\":180.0}",
-            "{\"t\":\"2026-11-14T10:00:00Z\",\"type\":\"priceChanged\",\"amount\":180.0}",
+            "{\"t\":\"2026-11-14T10:00:00Z\",\"type\":\"priceDropped\",\"amount\":180.0}",
+            "{\"t\":\"2026-11-14T10:00:00Z\",\"type\":\"priceDropped\",\"amount\":180.0}",
+            "{\"t\":\"2026-11-14T10:00:00Z\",\"type\":\"priceDropped\",\"amount\":180.0}",
             "{\"t\":\"2026-11-14T10:00:00Z\",\"type\":\"allBlocked\"}",
         ];
         fs::write(

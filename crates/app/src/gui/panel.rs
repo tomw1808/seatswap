@@ -597,7 +597,18 @@ pub(crate) async fn edit_account(
     abbr: Option<String>,
     color: Option<String>,
     auto_burn: Option<bool>,
+    // Absent leaves the price alone, `null` clears it, a number sets it. A
+    // plain `Option<Option<f64>>` cannot tell the first two apart over JSON.
+    price: Option<serde_json::Value>,
 ) -> Result<(), String> {
+    let price = match price {
+        None => None,
+        Some(serde_json::Value::Null) => Some(None),
+        Some(value) => match value.as_f64() {
+            Some(amount) => Some(Some(amount)),
+            None => return Err("the price must be a number above 0 per month".to_string()),
+        },
+    };
     let action = state.action.clone();
     let reply = tauri::async_runtime::spawn_blocking(move || {
         request(&action, |reply| ActionCommand::Edit {
@@ -606,6 +617,7 @@ pub(crate) async fn edit_account(
             abbr,
             color,
             auto_burn,
+            price,
             reply,
         })
     })

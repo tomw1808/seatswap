@@ -88,6 +88,24 @@ pub(crate) fn remove_account(
     Ok((removed, history_error))
 }
 
+/// The one place a plan change is written to the history, for the switch, the
+/// live sync and the mirror. The switcher reports the change; every path that
+/// records its events writes it here.
+pub(crate) fn record_plan_change(
+    recorder: &Recorder,
+    change: &switcher::PlanChange,
+    at: DateTime<Utc>,
+) -> Result<(), HistoryError> {
+    recorder.event(
+        at,
+        EventKind::PlanChanged {
+            account: change.account.clone(),
+            from: change.from.clone(),
+            to: change.to.clone(),
+        },
+    )
+}
+
 /// The one sentence the app uses when the history cannot be written.
 pub(crate) fn history_unwritable(error: &dyn std::fmt::Display) -> String {
     format!("the history cannot be written: {error}")
@@ -136,9 +154,10 @@ pub(crate) fn save_live_login(
                 .cloned()
                 .ok_or_else(|| format!("the store has no account {account_id}"))?;
             // Only a newly created account gets `accountAdded`; saving the
-            // stored copy again is an update, not an addition.
-            let history_error = if synced == Synced::Added {
-                recorder.and_then(|recorder| {
+            // stored copy again is an update, and a plan change is written as
+            // `PlanChanged` after it.
+            let history_error = match &synced {
+                Synced::Added => recorder.and_then(|recorder| {
                     recorder
                         .event(
                             now,
@@ -149,9 +168,15 @@ pub(crate) fn save_live_login(
                         )
                         .err()
                         .map(|error| history_unwritable(&error))
-                })
-            } else {
-                None
+                }),
+                Synced::Updated {
+                    plan_change: Some(change),
+                } => recorder.and_then(|recorder| {
+                    record_plan_change(recorder, change, now)
+                        .err()
+                        .map(|error| history_unwritable(&error))
+                }),
+                Synced::Unchanged | Synced::Updated { plan_change: None } => None,
             };
             Ok((account, history_error))
         }
@@ -405,13 +430,64 @@ mod tests {
         assert_eq!(events[0]["type"], "accountAdded");
         assert_eq!(events[0]["account"]["acc"], ACCOUNT_UUID);
         assert_eq!(events[0]["account"]["org"], ORG_UUID);
-        assert_eq!(events[0]["plan"], "Team");
+        assert_eq!(events[0]["plan"], "Team 5x");
 
         // Saving the same login again updates the stored copy, not a new account.
         save_live_login(&fixture.claude, &store, Some(&recorder), None, Utc::now())
             .expect("the stored copy is updated");
         assert_eq!(event_values(history.path()).len(), 1);
         assert_eq!(store.load().expect("accounts").accounts[0].id, account.id);
+    }
+
+    /// The live login is stored again and the plan of the account changed
+    /// (the login says "Team 5x", the stored plan says "Team"): the change
+    /// belongs in the history, written by the code that records the events of
+    /// this path.
+    #[test]
+    fn a_changed_plan_is_written_to_the_history_when_the_live_login_is_saved_again() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        save_live_login(
+            &fixture.claude,
+            &store,
+            None,
+            Some("Acme".to_string()),
+            Utc::now(),
+        )
+        .expect("the live login is saved");
+        // The stored plan is stale; the live login's tier says "Team 5x".
+        let mut file = store.load().expect("accounts");
+        file.accounts[0].plan = Some("Team".to_string());
+        store.save(&file).expect("the stale plan is stored");
+
+        let history = tempfile::tempdir().expect("history folder");
+        let recorder = Recorder::new(HistoryDir::at(history.path(), "atlas"));
+        save_live_login(&fixture.claude, &store, Some(&recorder), None, Utc::now())
+            .expect("the stored copy is updated");
+        assert_eq!(
+            store.load().expect("accounts").accounts[0].plan.as_deref(),
+            Some("Team 5x"),
+            "the plan of the account is the login's"
+        );
+
+        let events = if history.path().join("atlas").exists() {
+            event_values(history.path())
+        } else {
+            Vec::new()
+        };
+        let changed: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|event| event["type"] == "planChanged")
+            .collect();
+        assert_eq!(
+            changed.len(),
+            1,
+            "one event for one plan change: {events:?}"
+        );
+        assert_eq!(changed[0]["account"]["acc"], ACCOUNT_UUID);
+        assert_eq!(changed[0]["account"]["org"], ORG_UUID);
+        assert_eq!(changed[0]["from"], "Team");
+        assert_eq!(changed[0]["to"], "Team 5x");
     }
 
     #[test]
@@ -475,7 +551,7 @@ mod tests {
         assert_eq!(events.len(), 2, "{events:?}");
         assert_eq!(events[0]["type"], "accountAdded");
         assert_eq!(events[0]["account"]["acc"], ACCOUNT_UUID);
-        assert_eq!(events[0]["plan"], "Team");
+        assert_eq!(events[0]["plan"], "Team 5x");
         assert_eq!(events[1]["type"], "switch");
     }
 

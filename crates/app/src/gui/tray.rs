@@ -642,6 +642,7 @@ mod tests {
 
     fn snapshot_with(views: Vec<AccountView>, error: Option<&str>) -> Snapshot {
         Snapshot {
+            accounts: Vec::new(),
             active_id: views
                 .iter()
                 .find(|view| view.is_active)
