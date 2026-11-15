@@ -53,7 +53,7 @@ use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder
 #[cfg(feature = "gui")]
 use crate::statusline::render::AccountFacts;
 #[cfg(feature = "gui")]
-use crate::statusline::{self, FactsSource, PreviewLine, Scenario};
+use crate::statusline::{self, FactsSource, PreviewLine, RecordedKeys, Scenario};
 
 #[cfg(feature = "gui")]
 use super::burn_rt::KeptForecast;
@@ -1108,6 +1108,32 @@ pub(crate) fn statusline_preview(
 #[tauri::command]
 pub(crate) fn statusline_presets() -> Vec<(String, StatuslineConfig)> {
     StatuslineConfig::presets()
+}
+
+/// Start a recording for `minutes` by changing the one setting through the
+/// settings page's save command, the one writer of `accounts.json`.
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub(crate) async fn statusline_record(
+    state: State<'_, super::GuiState>,
+    minutes: u32,
+) -> Result<(), String> {
+    let until = statusline::record_until(minutes, Utc::now())?;
+    let value =
+        serde_json::to_value(until).map_err(|error| format!("statuslineRecordUntil: {error}"))?;
+    super::panel::save_setting(state, "statuslineRecordUntil".to_string(), value)
+        .await
+        .map(|_saved| ())
+}
+
+/// The field names recorded so far, or `None` when no recording has written
+/// the keys file.
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub(crate) fn statusline_keys(
+    state: State<'_, super::GuiState>,
+) -> Result<Option<RecordedKeys>, String> {
+    statusline::read_recorded_keys(&state.app)
 }
 
 #[cfg(test)]

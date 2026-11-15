@@ -649,6 +649,9 @@ fn statusline_line(cli: &Cli, stdin: &[u8], now: DateTime<Utc>) -> Result<String
         .validate()
         .map_err(|error| error.to_string())?;
     let payload = statusline::parse(stdin);
+    if let Err(reason) = statusline::record_keys(&app, &file.settings, &payload, now) {
+        return Err(format!("keys: {reason}"));
+    }
     if let Err(reason) = statusline::publish_feed(&app, &file.settings, &payload, now) {
         return Err(format!("feed: {reason}"));
     }

@@ -188,6 +188,11 @@ impl AppPaths {
     pub fn feed_file(&self) -> PathBuf {
         self.data_dir.join("feed.json")
     }
+    /// The field names and JSON kinds `seatswap statusline` recorded while the
+    /// recorder is on (spec §5.4).
+    pub fn statusline_keys_file(&self) -> PathBuf {
+        self.data_dir.join("statusline-keys.json")
+    }
     /// The next account auto-burn plans to switch to, for the status line
     /// (spec §7.6).
     pub fn burn_next_file(&self) -> PathBuf {

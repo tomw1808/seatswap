@@ -251,6 +251,8 @@ pub(crate) fn run(
             window::stats_hosts,
             window::statusline_preview,
             window::statusline_presets,
+            window::statusline_record,
+            window::statusline_keys,
         ])
         .build(tauri::generate_context!());
     match result {

@@ -10,6 +10,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
 use seatswap_core::api::Usage;
+use seatswap_core::atomic::{self, Access};
 use seatswap_core::burn::burn_next;
 use seatswap_core::engine::UsageCache;
 use seatswap_core::feed::{self, Feed, FeedLimit};
@@ -149,6 +150,168 @@ pub(crate) fn publish_feed(
         return Ok(());
     }
     ipc::send_feed(app).map_err(|error| error.to_string())
+}
+
+/// One key path of the payload and the JSON kind of the value found there.
+/// The value itself is never kept: the recorder exists to learn which fields
+/// Claude Code sends, not what they hold.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct KeyInfo {
+    pub path: String,
+    /// `string`, `number`, `boolean`, `null`, `object` or `array`.
+    pub kind: String,
+}
+
+/// The recorder's file (`statusline-keys.json`): the paths recorded so far
+/// and when they were last written.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RecordedKeys {
+    pub at: DateTime<Utc>,
+    pub keys: Vec<KeyInfo>,
+}
+
+/// The JSON kind of a value, as it is written in the file.
+fn kind_of(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Null => "null",
+        serde_json::Value::Object(_) => "object",
+        serde_json::Value::Array(_) => "array",
+    }
+}
+
+/// Every path of `raw` with the kind at that path, sorted by path. An array
+/// adds `path[]` for its elements (one entry per kind when they differ) and an
+/// array of objects continues below `path[].key`. `raw` that is not a JSON
+/// object has no payload paths. No value is read into the result.
+pub(crate) fn key_paths(raw: &serde_json::Value) -> Vec<KeyInfo> {
+    let mut found = Vec::new();
+    if raw.is_object() {
+        visit(raw, "", false, &mut found);
+    }
+    sorted_unique(found)
+}
+
+/// Collect the paths below `value`. `emit_self` is false for the root object
+/// (it has no path) and for an array's element, whose kind was already written
+/// as `path[]` by the caller.
+fn visit(value: &serde_json::Value, path: &str, emit_self: bool, found: &mut Vec<KeyInfo>) {
+    if emit_self {
+        found.push(KeyInfo {
+            path: path.to_string(),
+            kind: kind_of(value).to_string(),
+        });
+    }
+    match value {
+        serde_json::Value::Object(entries) => {
+            for (key, child) in entries {
+                let child_path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                visit(child, &child_path, true, found);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            let item_path = format!("{path}[]");
+            for item in items {
+                match item {
+                    serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                        // The element's kind belongs to `path[]`; its own
+                        // children continue below that same prefix.
+                        found.push(KeyInfo {
+                            path: item_path.clone(),
+                            kind: kind_of(item).to_string(),
+                        });
+                        visit(item, &item_path, false, found);
+                    }
+                    scalar => visit(scalar, &item_path, true, found),
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Sort by path (then kind) and drop repeats.
+fn sorted_unique(mut keys: Vec<KeyInfo>) -> Vec<KeyInfo> {
+    keys.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.kind.cmp(&b.kind)));
+    keys.dedup();
+    keys
+}
+
+/// The recorded keys in `<data>/statusline-keys.json`: `None` when the file is
+/// missing. A file that cannot be read or does not parse is an error naming
+/// the path and the reason; it is never replaced by an empty recording.
+pub(crate) fn read_recorded_keys(app: &AppPaths) -> Result<Option<RecordedKeys>, String> {
+    let path = app.statusline_keys_file();
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))
+}
+
+/// Write the recorded keys through [`atomic`], private like the feed file.
+pub(crate) fn write_recorded_keys(app: &AppPaths, recorded: &RecordedKeys) -> Result<(), String> {
+    let path = app.statusline_keys_file();
+    atomic::ensure_private_dir(&app.data_dir)
+        .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+    let bytes = serde_json::to_vec_pretty(recorded)
+        .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+    atomic::write_atomic(&path, &bytes, Access::Private)
+        .map_err(|error| format!("cannot write {}: {error}", path.display()))
+}
+
+/// While the setting's time is after `now`, merge the file's key paths with
+/// this payload's and write the union with `at = now`. Outside a recording, or
+/// for a payload that is not a JSON object, this neither reads nor writes the
+/// keys file. A file that does not parse is an error, never overwritten.
+pub(crate) fn record_keys(
+    app: &AppPaths,
+    settings: &Settings,
+    payload: &Payload,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    let Some(until) = settings.statusline_record_until else {
+        return Ok(());
+    };
+    if until <= now {
+        return Ok(());
+    }
+    if !payload.raw.is_object() {
+        return Ok(());
+    }
+    let mut keys = match read_recorded_keys(app)? {
+        Some(stored) => stored.keys,
+        None => Vec::new(),
+    };
+    keys.extend(key_paths(&payload.raw));
+    write_recorded_keys(
+        app,
+        &RecordedKeys {
+            at: now,
+            keys: sorted_unique(keys),
+        },
+    )
+}
+
+/// How long a recording lasts: 1 to 60 minutes from `now`. 0 and more than 60
+/// are refused with the reason; the page only asks for 1.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub(crate) fn record_until(minutes: u32, now: DateTime<Utc>) -> Result<DateTime<Utc>, String> {
+    if !(1..=60).contains(&minutes) {
+        return Err(format!("a recording lasts 1 to 60 minutes, got {minutes}"));
+    }
+    Ok(now + chrono::Duration::minutes(i64::from(minutes)))
 }
 
 fn cached_limit(limit: &seatswap_core::api::Limit) -> Limit2 {
@@ -859,5 +1022,321 @@ mod tests {
         );
 
         assert!(line.starts_with("seatswap: feed: "), "{line}");
+    }
+
+    /// The paths and kinds as a comparable list.
+    fn pairs(keys: &[KeyInfo]) -> Vec<(&str, &str)> {
+        keys.iter()
+            .map(|key| (key.path.as_str(), key.kind.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn key_paths_list_paths_and_kinds_only() {
+        let raw: serde_json::Value = serde_json::from_str(
+            r#"{"model":{"id":"claude-fable-5-2"},"rate_limits":{"five_hour":{"used_percentage":12}},"tags":["a"]}"#,
+        )
+        .expect("the test payload");
+        let keys = key_paths(&raw);
+
+        assert_eq!(
+            pairs(&keys),
+            vec![
+                ("model", "object"),
+                ("model.id", "string"),
+                ("rate_limits", "object"),
+                ("rate_limits.five_hour", "object"),
+                ("rate_limits.five_hour.used_percentage", "number"),
+                ("tags", "array"),
+                ("tags[]", "string"),
+            ]
+        );
+        let text = serde_json::to_string(&keys).expect("the keys as JSON");
+        assert!(
+            !text.contains("claude-fable-5-2"),
+            "no value is kept: {text}"
+        );
+    }
+
+    #[test]
+    fn recording_stops_at_its_time() {
+        let now = at("2026-11-14T14:00:00.336716Z");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let app = AppPaths::at(&tmp.path().join("data"));
+        let settings = Settings {
+            statusline_record_until: Some(now - chrono::Duration::seconds(1)),
+            ..Settings::default()
+        };
+        let payload = parse(README_PAYLOAD.as_bytes());
+
+        record_keys(&app, &settings, &payload, now)
+            .expect("outside a recording nothing is written");
+
+        assert!(!app.statusline_keys_file().exists(), "no keys file");
+    }
+
+    #[test]
+    fn recording_adds_to_what_is_there() {
+        let now = at("2026-11-14T14:00:00.336716Z");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let app = AppPaths::at(&tmp.path().join("data"));
+        let settings = Settings {
+            statusline_record_until: Some(now + chrono::Duration::minutes(1)),
+            ..Settings::default()
+        };
+        let first = parse(br#"{"model":{"id":"claude-fable-5-2"}}"#);
+        let second = parse(br#"{"effort":{"level":"high"}}"#);
+
+        record_keys(&app, &settings, &first, now).expect("the first payload is recorded");
+        record_keys(&app, &settings, &second, now + chrono::Duration::seconds(2))
+            .expect("the second payload is added");
+
+        let recorded = read_recorded_keys(&app)
+            .expect("the keys file is read")
+            .expect("a recording exists");
+        assert_eq!(
+            pairs(&recorded.keys),
+            vec![
+                ("effort", "object"),
+                ("effort.level", "string"),
+                ("model", "object"),
+                ("model.id", "string"),
+            ]
+        );
+        assert_eq!(recorded.at, now + chrono::Duration::seconds(2));
+    }
+
+    #[test]
+    fn an_array_of_objects_lists_its_keys() {
+        let raw: serde_json::Value =
+            serde_json::from_str(r#"{"items":[{"a":1},{"b":"x"}]}"#).expect("the test payload");
+
+        assert_eq!(
+            pairs(&key_paths(&raw)),
+            vec![
+                ("items", "array"),
+                ("items[]", "object"),
+                ("items[].a", "number"),
+                ("items[].b", "string"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_keys_file_that_does_not_parse_is_not_overwritten() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data = tmp.path().join("data");
+        fs::create_dir_all(&data).expect("the data folder");
+        let app = AppPaths::at(&data);
+        let now = at("2026-11-14T14:00:00.336716Z");
+        let mut file = AccountsFile::default();
+        file.settings.statusline_record_until = Some(now + chrono::Duration::minutes(1));
+        // The feed is not part of this test.
+        file.settings.statusline_feed = false;
+        fs::write(
+            data.join("accounts.json"),
+            serde_json::to_vec(&file).expect("accounts.json"),
+        )
+        .expect("the accounts file");
+        let broken = b"not a recording";
+        fs::write(app.statusline_keys_file(), broken).expect("the broken keys file");
+        let claude =
+            seatswap_core::paths::ClaudePaths::for_config_dir(&tmp.path().join("cfg"), tmp.path());
+
+        let line =
+            crate::cli::tests::statusline_output_at(&app, &claude, README_PAYLOAD.as_bytes(), now);
+
+        assert!(line.starts_with("seatswap: keys: "), "{line}");
+        assert_eq!(
+            fs::read(app.statusline_keys_file()).expect("the keys file is still there"),
+            broken,
+            "the broken file is unchanged"
+        );
+    }
+
+    #[test]
+    fn record_minutes_out_of_range_is_refused() {
+        let now = at("2026-11-14T14:00:00.336716Z");
+        for minutes in [0u32, 61] {
+            let error = record_until(minutes, now).expect_err("out of range");
+            assert!(
+                error.contains("1 to 60") && error.contains(&format!("got {minutes}")),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            record_until(1, now).expect("one minute"),
+            now + chrono::Duration::minutes(1)
+        );
+    }
+
+    // ---- proof tests of the review ----
+
+    /// The recorder's file holds the names of the fields and their kinds only.
+    /// No value of the payload (a folder, a model id, a session id, a
+    /// transcript path) is in it.
+    #[test]
+    fn the_recorded_file_holds_no_value_of_the_payload() {
+        let now = at("2026-11-14T14:00:00.336716Z");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let app = AppPaths::at(&tmp.path().join("data"));
+        let settings = Settings {
+            statusline_record_until: Some(now + chrono::Duration::minutes(1)),
+            ..Settings::default()
+        };
+        let payload = parse(
+            br#"{"session_id":"7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34","transcript_path":"/home/sam/.claude/projects/atlas/7c1e4b2a.jsonl","cwd":"/home/sam/projects/atlas","model":{"id":"claude-fable-5-2","display_name":"Fable 5.2"},"workspace":{"current_dir":"/home/sam/projects/atlas","added_dirs":["/home/sam/other"]}}"#,
+        );
+
+        record_keys(&app, &settings, &payload, now).expect("the payload is recorded");
+
+        let text = fs::read_to_string(app.statusline_keys_file()).expect("the keys file");
+        for value in [
+            "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34",
+            "/home/sam/.claude/projects/atlas/7c1e4b2a.jsonl",
+            "/home/sam/projects/atlas",
+            "claude-fable-5-2",
+            "Fable 5.2",
+            "/home/sam/other",
+        ] {
+            assert!(
+                !text.contains(value),
+                "the value {value} is in the file: {text}"
+            );
+        }
+        // The names are there, so the test is not vacuous.
+        for path in [
+            "session_id",
+            "transcript_path",
+            "cwd",
+            "model.id",
+            "workspace.added_dirs[]",
+        ] {
+            assert!(text.contains(path), "the path {path} is missing: {text}");
+        }
+    }
+
+    /// A data folder that is not there yet: the recording makes it.
+    #[test]
+    fn a_recording_works_in_a_data_folder_that_does_not_exist_yet() {
+        let now = at("2026-11-14T14:00:00.336716Z");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let app = AppPaths::at(&tmp.path().join("data"));
+        let settings = Settings {
+            statusline_record_until: Some(now + chrono::Duration::minutes(1)),
+            ..Settings::default()
+        };
+
+        assert!(!app.data_dir.exists(), "the data folder is not there");
+        record_keys(&app, &settings, &parse(README_PAYLOAD.as_bytes()), now)
+            .expect("the payload is recorded");
+
+        assert!(
+            app.statusline_keys_file().is_file(),
+            "the keys file is there"
+        );
+        let recorded = read_recorded_keys(&app)
+            .expect("the keys file is read")
+            .expect("a recording exists");
+        assert!(!recorded.keys.is_empty(), "the paths are recorded");
+    }
+
+    /// An accounts.json written before the setting existed, and one with the
+    /// setting set to `null`: neither records anything.
+    #[test]
+    fn an_older_accounts_file_and_a_null_setting_record_nothing() {
+        let now = at("2026-11-14T14:00:00.336716Z");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let app = AppPaths::at(&tmp.path().join("data"));
+
+        let older: Settings =
+            serde_json::from_value(serde_json::json!({})).expect("an older settings file");
+        let null: Settings = serde_json::from_value(serde_json::json!({
+            "statuslineRecordUntil": null
+        }))
+        .expect("a settings file with a null setting");
+        for settings in [older, null] {
+            assert!(
+                settings.statusline_record_until.is_none(),
+                "no recording is set"
+            );
+            record_keys(&app, &settings, &parse(README_PAYLOAD.as_bytes()), now)
+                .expect("nothing is recorded");
+            assert!(
+                !app.statusline_keys_file().exists(),
+                "no keys file is written"
+            );
+        }
+    }
+
+    /// A recording lasts one minute or an hour.
+    #[test]
+    fn a_recording_lasts_one_and_sixty_minutes() {
+        let now = at("2026-11-14T14:00:00.336716Z");
+        assert_eq!(
+            record_until(1, now).expect("one minute"),
+            now + chrono::Duration::minutes(1)
+        );
+        assert_eq!(
+            record_until(60, now).expect("an hour"),
+            now + chrono::Duration::minutes(60)
+        );
+    }
+
+    /// A key that is user text, a key with a dot in it and a key without a
+    /// name: the recorder writes the key as the path, so a dot in a key and a
+    /// nested key of the same name cannot be told apart, and a key without a
+    /// name has no path of its own.
+    #[test]
+    fn a_key_is_written_as_the_path_it_has() {
+        let raw: serde_json::Value =
+            serde_json::from_str(r#"{"a.b":1,"":{"c":2},"my secret is hunter2":3}"#)
+                .expect("the test payload");
+
+        assert_eq!(
+            pairs(&key_paths(&raw)),
+            vec![
+                ("", "object"),
+                ("a.b", "number"),
+                ("c", "number"),
+                ("my secret is hunter2", "number"),
+            ]
+        );
+    }
+
+    /// Arrays in arrays: every level adds its own `[]`, and the kinds of the
+    /// elements of one level are one entry each.
+    #[test]
+    fn an_array_of_arrays_lists_its_paths() {
+        let raw: serde_json::Value =
+            serde_json::from_str(r#"{"a":[[1,"x"],[{"b":2}]]}"#).expect("the test payload");
+
+        assert_eq!(
+            pairs(&key_paths(&raw)),
+            vec![
+                ("a", "array"),
+                ("a[]", "array"),
+                ("a[][]", "number"),
+                ("a[][]", "object"),
+                ("a[][]", "string"),
+                ("a[][].b", "number"),
+            ]
+        );
+    }
+
+    /// A setting that is not a time is refused, never silently replaced: the
+    /// settings path reads the whole object again after the change. The
+    /// settings page's writer names the field in front of the reason
+    /// (`statuslineRecordUntil: …`).
+    #[test]
+    fn a_setting_that_is_not_a_time_is_refused() {
+        let error = serde_json::from_value::<Settings>(
+            serde_json::json!({"statuslineRecordUntil": "noon"}),
+        )
+        .expect_err("a setting that is not a time");
+        assert!(
+            !error.to_string().is_empty(),
+            "the error says that the value is not a time"
+        );
     }
 }

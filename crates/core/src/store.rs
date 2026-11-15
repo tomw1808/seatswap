@@ -620,6 +620,11 @@ pub struct Settings {
     /// The status line's layout; absent in an older file, so the preset loads.
     #[serde(default = "StatuslineConfig::current_line")]
     pub statusline: StatuslineConfig,
+    /// While this time is in the future, `seatswap statusline` records the
+    /// field names Claude Code sends to `statusline-keys.json` (spec §5.4);
+    /// `None` (absent or `null`) records nothing.
+    #[serde(default)]
+    pub statusline_record_until: Option<DateTime<Utc>>,
     /// The currency every amount is shown in, three capital letters (spec
     /// §1.4); `None` until it is set, and never assumed.
     #[serde(default)]
@@ -662,6 +667,7 @@ impl Default for Settings {
             agents_switch: default_agents_switch(),
             statusline_feed: default_statusline_feed(),
             statusline: StatuslineConfig::current_line(),
+            statusline_record_until: None,
             currency: None,
             usd_rate: None,
             look_up_prices: default_look_up_prices(),
