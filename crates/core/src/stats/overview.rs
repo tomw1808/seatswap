@@ -21,7 +21,7 @@ use super::{
     account_abbr, account_id, account_position, account_weeks_valued, accounts_without_price,
     blocked_by_week, blocked_spans, date_text, hours_text, keep_warnings, lost_percent, money_of,
     money_text, percent_text, range_of, switch_counts, top_three, week_columns, week_of_record,
-    week_span, working_rhythm, AccountWeek, Ctx, Query, StatsError, SwitchCounts,
+    week_span, week_start, working_rhythm, AccountWeek, Ctx, Query, StatsError, SwitchCounts,
 };
 
 /// The Overview page's numbers for one range (spec §3.1).
@@ -45,22 +45,50 @@ pub struct Overview {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Kpis {
-    /// Money used of the priced account weeks: `paid − expired`.
+    /// Money used of the priced account weeks: `Σ week.used × pv`.
     pub used: f64,
-    /// Money paid for the priced account weeks: `100 × pv`.
+    /// Money paid for the priced account weeks: `100 × pv` each.
     pub paid: f64,
     /// `lost × pv` of the priced account weeks.
     pub expired: f64,
+    /// The used part of the offered weeks, in percent: every finished weekly
+    /// window offers one week of the account's price, so a week that a reset
+    /// split offers each of its windows. `used + expired + still open` make
+    /// 100 % of them, except that a window whose use passed 100 % counts its
+    /// whole use, so the two shares can then pass 100 % together (nothing is
+    /// cut). `None` when no account week has a price.
+    pub used_percent: Option<f64>,
+    /// The expired part of the offered weeks, in percent: each week's last
+    /// window's `lost` over the same offered windows. `None` without a price.
+    pub expired_percent: Option<f64>,
     /// The expired money per account id, largest first.
     pub expired_by_account: Vec<(String, f64)>,
     /// The working hours blocked in the range.
     pub blocked_hours: f64,
+    /// The hours blocked in the calendar weeks before the last account added
+    /// in the range was added; `None` when the range holds no such account.
+    pub blocked_before_added: Option<BlockedBefore>,
     /// The part of `blocked_hours` in which other quota expired.
     pub avoidable_hours: f64,
     pub switches: SwitchCounts,
+    /// The five switch counts added up.
+    pub switches_total: u32,
     /// What one switch costs the account in use at the range's end, as a
     /// percent of its 5 h window; `None` when the rates or the cost are missing.
     pub switch_cost_percent_of_window: Option<f64>,
+    /// The calendar weeks the page shows: the weeks of the range.
+    pub weeks: u32,
+}
+
+/// The blocked hours of the weeks before an account was added, and the account.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockedBefore {
+    /// The added account's short name ([`account_abbr`]), as the chart's
+    /// marks name it; the account may be one the page's filter leaves out.
+    pub name: String,
+    /// The blocked hours of the calendar weeks before the week it was added.
+    pub hours: f64,
 }
 
 /// One calendar week of the range, with the account weeks that fall in it.
@@ -73,8 +101,10 @@ pub struct OverviewWeek {
     pub projects: Vec<(String, f64)>,
     /// The working hours blocked in this week.
     pub blocked_hours: f64,
-    /// `expired / paid × 100` of the priced account weeks of this week;
-    /// `None` when no account week of the week has a price.
+    /// The expired money of the priced account weeks of this week over the
+    /// money their windows offered, in percent: the same rule as
+    /// [`Kpis::expired_percent`]. `None` when no account week of the week has
+    /// a price.
     pub expired_share: Option<f64>,
 }
 
@@ -152,15 +182,27 @@ pub(crate) fn overview_in<Tz: TimeZone + Copy>(
     let mut used = 0.0;
     let mut paid = 0.0;
     let mut expired = 0.0;
+    // The same parts as shares of the offered weeks: every finished weekly
+    // window offers one week of its account's price, so a week a reset split
+    // offers each of its windows (item 33, R-1).
+    let mut offered = 0.0;
+    let mut used_part = 0.0;
+    let mut expired_part = 0.0;
     let mut priced_weeks: BTreeMap<AccountRef, u32> = BTreeMap::new();
     let mut expired_by_account: BTreeMap<AccountRef, f64> = BTreeMap::new();
     let mut money: BTreeMap<DateTime<Utc>, WindowMoney> = BTreeMap::new();
+    let mut offered_by_week: BTreeMap<DateTime<Utc>, f64> = BTreeMap::new();
     for week in &finished {
         let week_money = money_of(week);
         if let Some(week_money) = week_money {
             used += week_money.used;
             paid += week_money.paid;
             expired += week_money.expired;
+            let week_offered = week_money.paid * week.windows.len() as f64;
+            offered += week_offered;
+            *offered_by_week.entry(week.week).or_insert(0.0) += week_offered;
+            used_part += week_money.used;
+            expired_part += week_money.expired;
             *priced_weeks.entry(week.account.clone()).or_insert(0) += 1;
             *expired_by_account
                 .entry(week.account.clone())
@@ -188,20 +230,29 @@ pub(crate) fn overview_in<Tz: TimeZone + Copy>(
             });
     }
 
+    let blocked_weeks = blocked_by_week(&spans, &rhythm, &ctx.zone);
+    let switches = switch_counts(&events.records, range, q.host.as_deref());
+    let switches_total =
+        switches.user + switches.cli + switches.auto + switches.agent + switches.external;
     let mut kpis = Kpis {
         used,
         paid,
         expired,
+        used_percent: (offered > 0.0).then_some(used_part / offered * 100.0),
+        expired_percent: (offered > 0.0).then_some(expired_part / offered * 100.0),
         expired_by_account: expired_by_account
             .into_iter()
             .map(|(reference, expired)| (account_id(ctx, &reference), expired))
             .collect(),
         blocked_hours: spans.iter().fold(0.0, |sum, span| sum + span.hours),
+        blocked_before_added: blocked_before_added(ctx, range, &events.records, &blocked_weeks),
         avoidable_hours: spans
             .iter()
             .fold(0.0, |sum, span| sum + span.avoidable_hours),
-        switches: switch_counts(&events.records, range, q.host.as_deref()),
+        switches,
+        switches_total,
         switch_cost_percent_of_window: switch_cost_percent(ctx, range, &events, &samples, &tokens),
+        weeks: weeks_by_start.len() as u32,
     };
     kpis.expired_by_account
         .sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -216,17 +267,17 @@ pub(crate) fn overview_in<Tz: TimeZone + Copy>(
         });
     }
 
-    for (week, hours) in blocked_by_week(&spans, &rhythm, &ctx.zone) {
+    for (week, hours) in &blocked_weeks {
         weeks_by_start
-            .entry(week)
-            .or_insert_with(|| empty_week(week))
-            .blocked_hours += hours;
+            .entry(*week)
+            .or_insert_with(|| empty_week(*week))
+            .blocked_hours += *hours;
     }
 
     for (start, week) in weeks_by_start.iter_mut() {
-        if let Some(week_money) = money.get(start) {
-            if week_money.paid > 0.0 {
-                week.expired_share = Some(week_money.expired / week_money.paid * 100.0);
+        if let (Some(week_money), Some(offered)) = (money.get(start), offered_by_week.get(start)) {
+            if *offered > 0.0 {
+                week.expired_share = Some(week_money.expired / offered * 100.0);
             }
         }
     }
@@ -323,6 +374,62 @@ fn reading_range(range: &Range, finished: &[AccountWeek]) -> Range {
         span.to = span.to.max(week.to);
     }
     span
+}
+
+/// The hours blocked in the calendar weeks before the week the last account
+/// added in the range was added, and that account's short name. The week it was added
+/// is not counted: the page's hours are counted per calendar week, not split at
+/// the moment of the addition. `None` when the range holds no `AccountAdded`
+/// of a stored account.
+fn blocked_before_added<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
+    range: &Range,
+    events: &[Hosted<Event>],
+    blocked_weeks: &BTreeMap<DateTime<Utc>, f64>,
+) -> Option<BlockedBefore> {
+    let (at, reference) = last_account_added(ctx, range, events)?;
+    let added_week = week_start(at, &ctx.zone);
+    let hours = blocked_weeks
+        .iter()
+        .filter(|(week, _)| **week < added_week)
+        .map(|(_, hours)| *hours)
+        .sum();
+    Some(BlockedBefore {
+        name: account_abbr(ctx, &reference),
+        hours,
+    })
+}
+
+/// The latest `AccountAdded` event in the range of an account the settings
+/// still store; ties go to the larger [`AccountRef`], so the choice does not
+/// depend on the order of the history's files.
+fn last_account_added<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
+    range: &Range,
+    events: &[Hosted<Event>],
+) -> Option<(DateTime<Utc>, AccountRef)> {
+    let mut latest: Option<(DateTime<Utc>, AccountRef)> = None;
+    for hosted in events {
+        let at = hosted.record.t;
+        if at < range.from || at >= range.to {
+            continue;
+        }
+        let EventKind::AccountAdded { account, .. } = &hosted.record.kind else {
+            continue;
+        };
+        if !ctx
+            .accounts
+            .iter()
+            .any(|stored| AccountRef::of(stored) == *account)
+        {
+            continue;
+        }
+        let candidate = (at, account.clone());
+        if latest.as_ref().is_none_or(|current| candidate > *current) {
+            latest = Some(candidate);
+        }
+    }
+    latest
 }
 
 /// A week with no accounts yet.
@@ -997,6 +1104,152 @@ mod tests {
         }
     }
 
+    /// A week that a reset split into two windows counts both windows' use:
+    /// 62 % from 0, a reset, then 30 % from 0 → the week used 92 %. Its expired
+    /// part is the last window's `lost` (70 %), never the reset window's unused
+    /// part (the reset gave that quota back). The page's percentages count each
+    /// offered window (see `the_overview_percentages_are_shares_of_the_offered_weeks`),
+    /// so this week is 46 % used and 35 % expired of the two weeks it offered.
+    #[test]
+    fn used_counts_every_window_of_a_week_with_a_reset() {
+        let tiny = tiny();
+        let dir = tempdir().expect("a temp history");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        history
+            .append_many(&[
+                WindowRecord {
+                    account: tiny.lb_ref(),
+                    k: LimitKind::WeeklyAll,
+                    m: None,
+                    start: Some(utc("2026-11-02T00:00:00Z")),
+                    end: utc("2026-11-05T12:00:00Z"),
+                    final_percent: 62.0,
+                    lost: None,
+                    last_sample: utc("2026-11-05T11:58:00Z"),
+                    plan: Some("Max".to_string()),
+                    uncertain: false,
+                    reset: true,
+                    from: None,
+                },
+                WindowRecord {
+                    account: tiny.lb_ref(),
+                    k: LimitKind::WeeklyAll,
+                    m: None,
+                    start: Some(utc("2026-11-05T12:00:00Z")),
+                    end: utc("2026-11-09T12:00:00Z"),
+                    final_percent: 30.0,
+                    lost: Some(70.0),
+                    last_sample: utc("2026-11-09T11:58:00Z"),
+                    plan: Some("Max".to_string()),
+                    uncertain: false,
+                    reset: false,
+                    from: Some(0.0),
+                },
+            ])
+            .expect("the two windows of the reset week");
+        let ctx = Ctx {
+            history: &history,
+            ..tiny.ctx()
+        };
+
+        let page = overview_in(&ctx, &two_weeks(), &all()).unwrap();
+        let first = week(&page, "2026-11-02T00:00:00Z");
+        let lb = first
+            .accounts
+            .iter()
+            .find(|account| account.id == tiny.lb().id)
+            .expect("LB's week");
+        assert_eq!(lb.used_percent, 92.0, "62 % then 30 % from 0");
+        assert_eq!(lb.expired_percent, 70.0, "only the last window's lost");
+        let weekly = tiny.lb().price.expect("LB's price") * 12.0 / 52.0;
+        assert!(
+            close(lb.used.expect("LB's price"), 0.92 * weekly),
+            "used money {}",
+            lb.used.unwrap()
+        );
+        assert!(
+            close(lb.expired.expect("LB's price"), 0.70 * weekly),
+            "expired money {}",
+            lb.expired.unwrap()
+        );
+        assert!(
+            close(page.kpis.used, 0.92 * weekly),
+            "used {}",
+            page.kpis.used
+        );
+        assert!(
+            close(page.kpis.paid, weekly),
+            "paid {}: one week's price, not two",
+            page.kpis.paid
+        );
+        assert!(
+            close(page.kpis.used_percent.expect("a priced week"), 46.0),
+            "the two offered windows: {:?}",
+            page.kpis.used_percent
+        );
+        assert!(
+            close(page.kpis.expired_percent.expect("a priced week"), 35.0),
+            "the two offered windows: {:?}",
+            page.kpis.expired_percent
+        );
+    }
+
+    /// Used and Expired are shares of the offered weeks. Every finished weekly
+    /// window offers one week of its account's price; a week that a reset split
+    /// offers each of its windows. Used is the weeks' use (Σ final − from),
+    /// expired is each week's last window's lost, and the rest is still open, so
+    /// used + expired + still open make 100 % of the windows counted. With one
+    /// window per week this is the mock-up's `used / paid` and `expired / paid`.
+    #[test]
+    fn the_overview_percentages_are_shares_of_the_offered_weeks() {
+        let tiny = tiny();
+        let page = overview_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+
+        let used = page.kpis.used_percent.expect("the weeks have prices");
+        let expired = page.kpis.expired_percent.expect("the weeks have prices");
+        assert!(close(used, 81.25), "used {used}");
+        assert!(close(expired, 18.75), "expired {expired}");
+        assert!(
+            close(used + expired, 100.0),
+            "used + expired = {}",
+            used + expired
+        );
+        assert_eq!(page.kpis.weeks, 2, "the range's two calendar weeks");
+        assert_eq!(
+            page.kpis.switches_total, 3,
+            "you 1 · cli 0 · auto-burn 1 · agents 1 · external 0"
+        );
+    }
+
+    /// The Blocked sub-line's number: the hours of the calendar weeks before the
+    /// week the last account added in the range was added. AC was added on
+    /// 12 Nov; the 2 h block of 7 Nov lies in the week before it.
+    #[test]
+    fn the_blocked_hours_before_the_last_added_account() {
+        let tiny = tiny();
+        tiny.history
+            .append(&Event {
+                t: utc("2026-11-12T00:00:00Z"),
+                kind: EventKind::AccountAdded {
+                    account: tiny.ac_ref(),
+                    plan: Some("Team 5x".to_string()),
+                },
+            })
+            .expect("AC added");
+
+        let page = overview_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        let before = page
+            .kpis
+            .blocked_before_added
+            .expect("AC was added in the range");
+        assert_eq!(before.name, tiny.ac().abbr);
+        assert!(
+            close(before.hours, 2.0),
+            "the hours before AC: {}",
+            before.hours
+        );
+    }
+
     /// The hours the page shows are the hours its weeks show: every calendar
     /// week of the range is on the page, so the blocked hours of all of them
     /// add up to the KPI.
@@ -1052,5 +1305,93 @@ mod tests {
         let after = overview_in(&with.ctx(), &two_weeks(), &all()).expect("the overview");
 
         assert_eq!(after, before, "a Codex record changed the Claude overview");
+    }
+
+    /// A window that ended above 100 % used more than it was offered. Its whole
+    /// use counts in the used share, so the two shares the page shows pass
+    /// 100 % together (here 82.7 % + 18.8 %): nothing is cut, and the rule on
+    /// `Kpis::used_percent` says so.
+    #[test]
+    fn a_window_above_100_percent_counts_its_whole_use_in_the_used_share() {
+        let tiny = tiny();
+        tiny.history
+            .append(&window(
+                &tiny.lb_ref(),
+                "2026-11-02T17:00:00Z",
+                "2026-11-09T17:00:00Z",
+                105.0,
+            ))
+            .expect("LB's window at 105 %");
+        let page = overview_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+
+        let used = page.kpis.used_percent.expect("the weeks have prices");
+        let expired = page.kpis.expired_percent.expect("the weeks have prices");
+        assert!(close(used, 82.65625), "the used share: {used} %");
+        assert!(close(expired, 18.75), "the expired share: {expired} %");
+        assert!(
+            used + expired > 100.0,
+            "the whole use counts, nothing is cut"
+        );
+    }
+
+    /// The KPI's expired share and the "Share that expired, per week" chart's
+    /// share of the same week follow one rule: the expired money over the money
+    /// the week's windows offered. A week a reset split offers two windows, so
+    /// both say 35 % (70 % of one window over two).
+    #[test]
+    fn the_overview_share_and_the_weeks_own_share_are_the_same_number() {
+        let tiny = tiny();
+        let dir = tempdir().expect("a temp history");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        history
+            .append_many(&[
+                WindowRecord {
+                    account: tiny.lb_ref(),
+                    k: LimitKind::WeeklyAll,
+                    m: None,
+                    start: Some(utc("2026-11-02T00:00:00Z")),
+                    end: utc("2026-11-05T12:00:00Z"),
+                    final_percent: 62.0,
+                    lost: None,
+                    last_sample: utc("2026-11-05T11:58:00Z"),
+                    plan: Some("Max".to_string()),
+                    uncertain: false,
+                    reset: true,
+                    from: None,
+                },
+                WindowRecord {
+                    account: tiny.lb_ref(),
+                    k: LimitKind::WeeklyAll,
+                    m: None,
+                    start: Some(utc("2026-11-05T12:00:00Z")),
+                    end: utc("2026-11-09T12:00:00Z"),
+                    final_percent: 30.0,
+                    lost: Some(70.0),
+                    last_sample: utc("2026-11-09T11:58:00Z"),
+                    plan: Some("Max".to_string()),
+                    uncertain: false,
+                    reset: false,
+                    from: Some(0.0),
+                },
+            ])
+            .expect("the two windows of the reset week");
+        let ctx = Ctx {
+            history: &history,
+            ..tiny.ctx()
+        };
+        let one_week = Range {
+            from: utc("2026-11-02T00:00:00Z"),
+            to: utc("2026-11-09T00:00:00Z"),
+        };
+
+        let page = overview_in(&ctx, &one_week, &all()).unwrap();
+        let first = week(&page, "2026-11-02T00:00:00Z");
+        let kpi = page.kpis.expired_percent.expect("the week has a price");
+        let own = first.expired_share.expect("the week has a price");
+        assert!(close(kpi, 35.0), "the KPI's expired share: {kpi} %");
+        assert!(
+            close(kpi, own),
+            "the KPI says {kpi} %, the week's own share says {own} %"
+        );
     }
 }

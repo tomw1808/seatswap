@@ -46,7 +46,18 @@ function projectColours(weeks) {
 }
 
 function switchText(switches) {
-  return `you ${switches.user} · auto ${switches.auto}`;
+  return `you ${switches.user} · cli ${switches.cli} · auto-burn ${switches.auto} · agents ${switches.agent} · external ${switches.external}`;
+}
+
+// A KPI value with its percent beside the money, as the mock-up writes it.
+// The percent is a number the view carries; the page only formats it.
+function percentFigure(amount, percent) {
+  return h("span", {}, [
+    amount,
+    ...(typeof percent === "number"
+      ? [h("span", { class: "stats-kpi-percent", text: percentText(percent) })]
+      : []),
+  ]);
 }
 
 export async function show(container, env) {
@@ -68,27 +79,41 @@ export async function show(container, env) {
     typeof data.kpis.switchCostPercentOfWindow === "number"
       ? ` · a switch costs ${percentText(data.kpis.switchCostPercentOfWindow)} of its 5 h window`
       : " · switch cost —";
+  const weeks = data.kpis.weeks === 1 ? "week" : "weeks";
   kpis.appendChild(
     kpi(
       "Used",
-      amountNode(data.kpis.used, currency),
-      h("span", {}, ["of ", amountNode(data.kpis.paid, currency), " paid for the chosen weeks"]),
+      percentFigure(amountNode(data.kpis.used, currency), data.kpis.usedPercent),
+      h("span", {}, [
+        "of ",
+        amountNode(data.kpis.paid, currency),
+        ` paid for ${data.kpis.weeks} ${weeks}`,
+      ]),
       "Used | money used of the priced account weeks; an account without a price is left out"
     )
   );
   kpis.appendChild(
     kpi(
       "Expired unused",
-      amountNode(data.kpis.expired, currency),
+      percentFigure(amountNode(data.kpis.expired, currency), data.kpis.expiredPercent),
       expiredRows,
       "Expired unused | quota left at a weekly reset, in money; per account, largest first"
     )
   );
+  const blockedBefore = data.kpis.blockedBeforeAdded;
+  const blockedSub = blockedBefore
+    ? [
+        hoursText(blockedBefore.hours),
+        " of them before ",
+        blockedBefore.name,
+        " was added",
+      ]
+    : "working hours the active account was full";
   kpis.appendChild(
     kpi(
       "Blocked",
       hoursText(data.kpis.blockedHours),
-      "working hours the active account was full",
+      blockedSub,
       "Blocked | working hours in which the active account was at 100 %"
     )
   );
@@ -104,9 +129,9 @@ export async function show(container, env) {
   kpis.appendChild(
     kpi(
       "Switches",
-      switchText(data.kpis.switches),
-      `agents ${data.kpis.switches.agent} · cli ${data.kpis.switches.cli} · external ${data.kpis.switches.external}${cost}`,
-      "Switches | every change of the live account, by who made it"
+      String(data.kpis.switchesTotal),
+      `${switchText(data.kpis.switches)}${cost}`,
+      "Switches | every change of the live account, by who made it; the total of the five counts"
     )
   );
 

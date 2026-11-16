@@ -55,6 +55,14 @@
   color: var(--danger);
 }
 
+/* The Used and Expired share beside the money, as mock-up 3 writes it. */
+.stats-kpi-percent {
+  margin-left: 3px;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--muted);
+}
+
 .stats-kpi-sub {
   color: var(--muted);
   font-size: 11px;
