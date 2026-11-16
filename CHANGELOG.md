@@ -50,6 +50,8 @@ All notable changes to this project are documented here. The format follows
   Code's settings and can put the earlier value back.
 - Status line segments for context used, session cost and lines changed (shown when Claude Code
   sends those fields).
+- Read-only cards for Codex (5 h and weekly limits) and Ollama's cloud plan (credits left, reset
+  date, spend in the last 24 h), each off by default, in Settings → Providers.
 
 ### Changed
 - Settings and the account editor moved from the pop-up to the large window; the gear, `,` and an

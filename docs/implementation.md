@@ -3612,3 +3612,415 @@ show the command's error as a banner and their success as a notice. `fixture.js`
 every `statusline_*` reply with the same shape (including the kinds table) and its own small preview
 drawing, so the browser page works with no tray app; that drawing is for pictures only and is not
 the app's renderer.
+
+---
+
+## Step D: Codex and Ollama cards
+
+Two read-only providers. One reader per provider turns the provider's answer into the `Usage` and
+`Limit` types an account already uses, so a card, its colours and the history need no second
+implementation. A provider thread in the tray app polls each switched-on card; nothing of Codex or
+Ollama is ever written, no token is refreshed and no request generates text.
+
+| Module | Job |
+|---|---|
+| `core::paths` (extended) | `CodexPaths`: the Codex folder and its `auth.json` |
+| `core::store` (extended) | the four settings and `validate_ollama_url` |
+| `core::providers` | one reader per provider into `ProviderReading` |
+| `core::api` (extended) | Codex's usage and Ollama's balance and usage; `NoConnection` |
+| `core::history` (extended) | `is_claude`, `read_claude`, `finished_claude_windows`: provider records out of every Claude reader |
+| `app::gui::providers_rt` | the provider thread, its client and the snapshot's `providers` |
+| `app::ui/panel.js` | the pop-up's card under "Other providers" |
+| `app::ui/areas/settings.js` | the Providers group |
+
+## paths.rs additions — `CodexPaths` (step D)
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexPaths {
+    pub home: PathBuf,      // the Codex folder; seatswap only reads here
+    pub auth_file: PathBuf, // <home>/auth.json
+}
+impl CodexPaths {
+    pub fn resolve(explicit: Option<&Path>) -> Result<CodexPaths, PathsError>;
+    pub fn resolve_with(explicit: Option<&Path>, env_codex_home: Option<OsString>,
+                        home: &Path) -> Result<CodexPaths, PathsError>; // tests
+    pub fn at(home: &Path) -> CodexPaths;
+}
+```
+
+`resolve` takes the `codexHome` setting first, then a non-empty `$CODEX_HOME`, then `~/.codex`.
+`resolve_with` does the same without reading the process environment, so a test passes its own
+folder. A relative explicit folder or `$CODEX_HOME` is `PathsError::RelativeCodexHome` and is never
+resolved against the current folder: `the Codex folder (codexHome or $CODEX_HOME) must be an absolute
+path, got {path}`. `at` is the test and caller shorthand for a given folder; `auth_file` is always
+`<home>/auth.json`.
+
+## store.rs additions — the four settings (step D)
+
+```rust
+pub codex_card: bool,                    // serde default: default_codex_card() = false
+pub codex_home: Option<PathBuf>,        // serde default: None
+pub ollama_card: bool,                  // serde default: default_ollama_card() = false
+pub ollama_url: String,                 // serde default: "http://127.0.0.1:11434"
+pub fn validate_ollama_url(url: &str) -> Result<(), StoreError>;
+```
+
+An older `accounts.json` without the four fields loads with both cards off, no Codex folder and the
+local Ollama URL: each field has a `#[serde(default = "…")]` or `#[serde(default)]`, so nothing has to
+be rewritten. `Settings::validate` checks `codexHome` with the other paths (it must be absolute when
+`Some`) and always calls `validate_ollama_url`. The URL rule is: no whitespace or control character
+anywhere; it must start with `http://` or `https://`; the text after the scheme up to the first `/`,
+`?` or `#` must not be empty and must have a non-empty part before a port colon; no `?`, no `#`, and
+no `//` after the authority. A port, a path, an IPv6 host and one trailing `/` are accepted. Every
+refusal is `StoreError::InvalidSetting`, names `ollamaUrl` and quotes the value; there is no
+fallback. `providers::ollama::read` calls the same function again before it asks the server.
+
+## providers — the one reading type and its errors (step D)
+
+```rust
+pub const CODEX_ORG: &str = "codex";
+pub const OLLAMA_ORG: &str = "ollama";
+
+#[derive(Debug, thiserror::Error)]
+pub enum ProviderError {
+    #[error("No Codex login found in {path}.")]
+    NoLogin { path: PathBuf },
+    #[error("Codex keeps its login in the system keyring. seatswap reads the login file only.")]
+    KeyringLogin,
+    #[error("Codex's login has expired. Run codex once to renew it.")]
+    LoginExpired,
+    #[error("Ollama is not running on {url}.")]
+    NotRunning { url: String },
+    #[error("{0}")]
+    Setting(String),
+    #[error(transparent)]
+    Api(ApiError),
+    #[error("Unexpected answer: {0}")]
+    Shape(String),
+    #[error("cannot read {path}: {source}")]
+    Io { path: PathBuf, #[source] source: io::Error },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Credits {
+    pub left: f64,                 // USD
+    pub allowance: Option<f64>,   // USD
+    pub until: Option<DateTime<Utc>>,
+    pub purchased: Option<f64>,   // USD, only when the answer names it
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderReading {
+    pub account: AccountRef,      // org CODEX_ORG or OLLAMA_ORG
+    pub plan: Option<String>,
+    pub usage: Option<Usage>,     // None when the answer has no limit to record
+    pub credits: Option<Credits>, // Ollama's new plan only
+    pub spend_24h: Option<f64>,   // USD, Ollama only
+}
+
+pub(crate) fn mark_highest_active(limits: &mut [Limit]);
+```
+
+`mark_highest_active` sets `is_active` on exactly one limit: the one with the highest percent, the
+first of equals. `ProviderError::Setting` carries the text of the setting or path that refused the
+reading; it is not a second setting error. The `Api` variant is transparent, so the card prints the
+API error's own text.
+
+## codex — `auth.json` and the usage answer (step D)
+
+```rust
+pub fn read(paths: &CodexPaths, api: &Api) -> Result<ProviderReading, ProviderError>;
+pub fn usage_from(answer: &Value) -> Result<(Usage, Option<String>, AccountRef), ProviderError>;
+fn window_kind(seconds: i64, additional: bool) -> LimitKind;
+fn plan_type(value: Option<&Value>) -> Result<Option<String>, ProviderError>;
+```
+
+`read` reads `paths.auth_file` once. A missing file is `NoLogin`. A file that is not JSON, or whose
+`tokens` is not an object, is `Shape` with a sentence that never quotes a token. `tokens` absent or
+`null` with `auth_mode == "chatgpt"` is `KeyringLogin`; otherwise `NoLogin`. `tokens.access_token` and
+`tokens.account_id` must be non-empty strings (`Shape` with the field's name only). It then calls
+`api.codex_usage(access_token, account_id)`; HTTP 401 is `LoginExpired`, every other API error stays
+`Api`. The request carries both values; the file is not changed.
+
+`usage_from` reads `rate_limit.primary_window` and `.secondary_window` as the account's limits:
+`used_percent` is the percent, `limit_window_seconds` picks the kind, `reset_at` (seconds since the
+epoch) is the reset. `rate_limit` missing is a shape error; `null` carries no limits; either window
+may be absent or `null`. `additional_rate_limits` may be absent, `null` or an array; an entry's
+`rate_limit` may be `null` (skipped), and its `limit_name` is required and becomes the limit's
+`model`. `window_kind` is the one mapping:
+
+| `limit_window_seconds` | additional entry | Kind |
+|---|---|---|
+| 18000 | no | `Session` |
+| 604800 | no | `WeeklyAll` |
+| 604800 | yes | `WeeklyScoped` |
+| a multiple of 3600 | either | `Other("{h} h limit")` |
+| a multiple of 60 | either | `Other("{m} min limit")` |
+| anything else | either | `Other("{s} s limit")` |
+
+Every limit's `severity` is `Normal`; the load level comes from the percent. The account is the
+answer's non-empty `account_id` with `org` `codex`; `plan_type` is `None` when absent or `null`, a
+string with its first character uppercased when present, and a shape error for any other type.
+`mark_highest_active` runs last. `ProviderReading.credits` and `.spend_24h` stay `None`.
+
+## ollama — the balance and the last 24 h (step D)
+
+```rust
+pub fn read(base_url: &str, api: &Api) -> Result<ProviderReading, ProviderError>;
+pub fn amount(value: &Value) -> Option<f64>; // a JSON number, whole or fractional; else None
+```
+
+`read` first runs `store::validate_ollama_url(base_url)`; a URL the settings refuse is
+`ProviderError::Setting` and no request is made. It then calls `api.ollama_balance(base_url)`; a
+refused connection (`ApiError::NoConnection`) becomes `NotRunning { url }`, every other API error
+stays `Api`. The balance answer is `balance_reading`:
+
+- `included.balance_usd` present selects the **new plan**: `balance_usd` (required, not negative),
+  `allowance_usd` (optional, not negative, and `left > allowance` is refused),
+  `period.until` (optional RFC 3339), and `purchased.balance_usd` (optional). It returns
+  `Some(Credits)`. When an allowance is present and not zero it also returns one
+  `Usage { limits: [Other("monthly_credits")] }` with `percent = (allowance − left) / allowance × 100`,
+  `resets_at = period.until` and `is_active = true`; without an allowance, or with a zero one, the
+  usage is `None` and the credits are still returned.
+- `included.session` or `included.weekly` without `balance_usd` selects the **old plan**: each
+  non-null window becomes `Session` or `WeeklyAll` with `percent = 100 − remaining_percent` (the
+  remaining must be within 0..=100) and `resets_at` from `resets_at`; both null is a shape error and
+  no credits are returned. `mark_highest_active` runs over the two.
+- An `included` with `balance_usd` and also `session`/`weekly` is refused as both plan shapes at
+  once; an `included` with neither is refused. A non-object answer, a missing `included`, a number
+  given as a string and a bad time are `Shape` errors naming the field path.
+
+The usage call is made after a successful balance. `api.ollama_usage_24h(base_url).ok()` then
+`totals.usage_usd` is used through `amount`; any failure (HTTP, network, decode, a missing number)
+leaves `spend_24h` `None` and does not fail the reading. The account is
+`AccountRef { acc: "ollama", org: "ollama" }`, the plan `None`, and nothing is written.
+
+## api.rs additions (step D)
+
+```rust
+pub const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+impl Api {
+    pub fn with_codex_url(mut self, url: &str) -> Api;                                  // tests
+    pub fn codex_usage(&self, access_token: &str, account_id: &str)
+        -> Result<serde_json::Value, ApiError>;
+    pub fn ollama_balance(&self, base_url: &str) -> Result<serde_json::Value, ApiError>;
+    pub fn ollama_usage_24h(&self, base_url: &str) -> Result<serde_json::Value, ApiError>;
+}
+fn get_json(request: ureq::Request) -> Result<serde_json::Value, ApiError>;
+fn ollama_url(base_url: &str, path: &str) -> String;
+fn transport_error(error: ureq::Transport) -> ApiError;
+fn refused_connection(error: &ureq::Transport) -> bool;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ApiError {
+    // …
+    #[error("cannot connect: {0}")]
+    NoConnection(String),
+    // …
+}
+```
+
+`codex_usage` sends `GET CODEX_USAGE_URL` with `User-Agent: seatswap/<version>`,
+`Authorization: Bearer <access token>` and `chatgpt-account-id: <account id>`; it returns the parsed
+JSON and knows nothing about `auth.json`. `ollama_balance` asks `<base>/api/balance` and
+`ollama_usage_24h` asks `<base>/api/usage?range=24h`, both with only the User-Agent. `ollama_url`
+removes one trailing `/` from the base and appends the endpoint's own path, so a base with a path
+keeps it. `get_json` is the one status/body/decode path for these three GETs: a non-2xx answer is
+`ApiError::Http` (or `Unauthorized`, `RateLimited`, `Server` by status), an unreadable body is
+`Network`, and unparsable JSON is `Decode`.
+
+`transport_error` maps a transport failure: `ConnectionFailed` whose source chain holds an
+`io::Error` of kind `ConnectionRefused` becomes `ApiError::NoConnection` (displayed as `cannot
+connect: {reason}`); `BadHeader` becomes the fixed `network error: a request header holds a character
+that is not allowed`, because ureq's own text is the whole header line and an `Authorization` line
+contains the token; every other kind is `Network`. `ApiError::is_transient` counts `RateLimited`,
+`Server`, `Network` and `NoConnection`; the provider thread simply tries again at its next round.
+
+## history — provider readings stay out of every Claude reader (step D)
+
+```rust
+pub trait Record {
+    // The default: a record that names no account belongs to no provider either.
+    fn is_claude(&self) -> bool { true }
+}
+impl AccountRef {
+    pub fn is_claude(&self) -> bool; // org != CODEX_ORG && org != OLLAMA_ORG
+}
+impl Record for Event {
+    fn is_claude(&self) -> bool;     // no account, or at least one Claude account
+}
+impl HistoryDir {
+    pub fn read_claude<R: Record>(&self, range: &Range, hosts: &Hosts) -> Result<Read<R>, HistoryError>;
+    pub fn finished_claude_windows(&self, range: &Range, hosts: &Hosts)
+        -> Result<Vec<Hosted<WindowRecord>>, HistoryError>;
+}
+```
+
+`Sample` and `WindowRecord` implement `Record::is_claude` through their `AccountRef`; the other
+record kinds keep the default `true`. `Event` is Claude's when the event names no account or at
+least one Claude account; an event about a provider alone is not. `read_claude` is `read` followed by
+`retain(record.is_claude())` and keeps the warnings; `finished_claude_windows` is
+`finished_windows` followed by the same filter. Every reader that serves Claude's accounts uses
+these — auto-burn's live situation and replay, money, and all `stats` pages. `read` and
+`finished_windows` remain for the recorder (which loads a provider's own last line), the export, the
+import and the tests.
+
+The provider thread records a reading through the existing `Recorder::reading(account, plan, usage,
+at, Source::Poll)`; it writes a `Sample` (a `WindowRecord` when one of the reading's windows ends, and
+`Blocked`/`Unblocked` events on a 100 % crossing) exactly as for an account. The `AccountRef` is
+`{acc: <the provider's id>, org: "codex" | "ollama"}`, so a Claude organization UUID can never equal
+it. A reading with `usage == None` (Ollama's new plan without an allowance) records nothing. The
+export is raw history: it writes finished windows and daily token rows through `read` and
+`finished_windows`, so a provider's finished window can appear in it while its samples do not (the
+export has no sample rows); an import copies a host folder as it is, provider lines included.
+
+## providers_rt — the thread, its client and the snapshot (step D)
+
+```rust
+pub(crate) const PROVIDER_POLL_SECS: u64 = 300;
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProviderView {
+    pub provider: String,  // "codex" | "ollama"
+    pub title: String,     // "Codex" | "Ollama"
+    pub plan: Option<String>,
+    pub usage: Option<Usage>,
+    pub credits: Option<Credits>,
+    pub spend_24h: Option<f64>,
+    pub fetched_at: Option<DateTime<Utc>>,
+    pub error: Option<String>,
+}
+
+enum ProvidersCommand { Opened, SettingsSaved, Stop }
+#[derive(Clone)]
+pub(crate) struct ProvidersClient { commands: Sender<ProvidersCommand> }
+impl ProvidersClient {
+    pub(crate) fn opened(&self) -> Result<(), String>;
+    pub(crate) fn settings_saved(&self) -> Result<(), String>;
+}
+pub(crate) struct ProvidersHandle { /* client, stop flag, JoinHandle */ }
+impl ProvidersHandle { pub(crate) fn client(&self) -> ProvidersClient; pub(crate) fn stop(&mut self); }
+
+pub(crate) type CodexPathsLookup =
+    Box<dyn Fn(Option<&Path>) -> Result<CodexPaths, PathsError> + Send>;
+pub(crate) type ReportError = Box<dyn Fn(&str) + Send>;
+
+pub(crate) fn spawn(app: AppPaths, history: Result<HistoryDir, String>, api: Api,
+                    ui: Sender<UiEvent>) -> Result<ProvidersHandle, String>;
+
+pub(crate) struct ProvidersRuntime { /* api, ui, codex_paths, recorder, report, … */ }
+impl ProvidersRuntime {
+    pub(crate) fn new(history: Result<HistoryDir, String>, api: Api, ui: Option<Sender<UiEvent>>,
+                      codex_paths: CodexPathsLookup, report: ReportError) -> ProvidersRuntime;
+    pub(crate) fn views(&self) -> Vec<ProviderView>;
+    pub(crate) fn poll_round(&mut self, settings: &Settings, now: DateTime<Utc>) -> Vec<ProviderView>;
+    pub(crate) fn opened(&mut self, settings: &Settings, now: DateTime<Utc>) -> Vec<ProviderView>;
+    pub(crate) fn settings_saved(&mut self, settings: &Settings, now: DateTime<Utc>)
+        -> Vec<ProviderView>;
+    pub(crate) fn report_error(&mut self, text: &str);
+}
+```
+
+`spawn` always starts one named thread (`seatswap-providers`), whatever the two switches say. `run`
+sets `next = now`, so the first round happens at once, then waits on the command channel until
+`next`; a timeout is `poll_round` and the next wait is 300 s. `Opened`, `SettingsSaved` and a save do
+not move the five-minute instant. `settings_of` reads `accounts.json` again for every command and
+round, so a switch, a Codex folder or an Ollama URL counts without a restart; a load failure is
+reported once per distinct text and the round is skipped.
+
+`ProvidersRuntime` keeps one `Option<ProviderView>` and one last-attempt time for each provider, in
+the order Codex, Ollama. `poll_round` calls `settle` (a card that is now off drops its view and its
+last attempt), then polls every switched-on card. `opened` polls only a switched-on card whose last
+*attempt* is more than 60 s old (exactly 60 s is not older). `settings_saved` compares with the
+previous settings: a card that was just switched on, or whose `codexHome`/`ollamaUrl` changed, is
+polled at once; a changed folder or URL first drops the old view because those numbers belong to
+another login or server; a card that is now off is dropped at once. Any other save does not poll.
+
+`poll` marks the attempt time before the reading, runs `read_codex` or
+`providers::ollama::read`, and turns a success into `ProviderView { fetched_at: Some(now),
+error: None, … }` or a failure into a view that copies every number, plan and `fetched_at` of the last
+view and sets `error` to the `ProviderError`'s text. A success with a `usage` is recorded through
+`Recorder::reading`; a history write failure is turned into the app's history text
+(`ops::history_unwritable`) and reported once per distinct text, and never changes the card.
+`publish` compares the list with the one sent last and sends `UiEvent::Providers(list)` only when it
+changes.
+
+`Snapshot.providers: Vec<ProviderView>` is always present (empty when no card is on). The main thread
+keeps it in `GuiState.providers`, fills it on `UiEvent::Providers`, and `apply_snapshot` copies it into
+every snapshot, so the pop-up and the large window see the same list. The JSON is camelCase:
+`provider`, `title`, `plan`, `usage`, `credits`, `spend24h`, `fetchedAt`, `error`. `Usage` is
+`{limits: [{kind, percent, severity, resetsAt, model, isActive}], extraUsageEnabled}`; a
+`LimitKind::Other("monthly_credits")` is `{"other":"monthly_credits"}`; `Credits` is
+`{left, allowance, until, purchased}`. Example:
+
+```json
+"providers": [
+  {"provider":"codex","title":"Codex","plan":"Plus",
+   "usage":{"limits":[
+     {"kind":"session","percent":12.0,"severity":"normal","resetsAt":null,"model":null,"isActive":false},
+     {"kind":"weekly_all","percent":48.0,"severity":"normal","resetsAt":null,"model":null,"isActive":true}],
+    "extraUsageEnabled":false},
+   "credits":null,"spend24h":null,"fetchedAt":"2026-11-14T09:00:00Z","error":null},
+  {"provider":"ollama","title":"Ollama","plan":null,
+   "usage":{"limits":[
+     {"kind":{"other":"monthly_credits"},"percent":29.2,"severity":"normal",
+      "resetsAt":"2026-12-03T00:00:00Z","model":null,"isActive":true}],
+    "extraUsageEnabled":false},
+   "credits":{"left":212.4,"allowance":300.0,"until":"2026-12-03T00:00:00Z","purchased":0.0},
+   "spend24h":3.18,"fetchedAt":"2026-11-14T09:00:00Z","error":null}
+]
+```
+
+## app: the pop-up's provider card (step D)
+
+`panel.js` reads `state.snapshot.providers` through `providerViews()` (only objects), and
+`renderProviders()` fills `#provider-cards` under `#providers`; with no switched-on card it clears
+the list and hides the section, so neither heading nor gap remains. The heading is the static
+`Other providers` in `index.html`. The keyboard cursor and the card-order animation stay on account
+cards.
+
+`renderProviderCard(view)` uses `credits = isObject(view.credits)` and `numbers = credits || usage`.
+A credits card takes its gauge from the `monthly_credits` limit when that exists (an allowance was
+known) and gets the `no-gauge` class otherwise; a Codex or old-plan card takes the usual gauge from
+`weekly_all` and `session`. The title is `view.title`. The plan and the age are shown only with
+numbers: the plan first, then `usage {age}` from `usageAge(view)`, which returns nothing unless
+`usage` or `credits` and `fetchedAt` exist and the reading is older than 120000 ms. A failed poll adds
+the `stale` class (the CSS greys the gauge and both row lists, opacity 0.55) and the error text in a
+`card-note error` under the rows; a first failure with no numbers leaves the title and the error
+text.
+
+The limit rows are the account card's `renderLimitRows`: `Week`, `Session`, the scoped limits by
+their model (or `Scoped`) and every other limit by its kind name, in that order, each with its reset
+when it has one. With no rows the card says `No usage limits in the reply.` A credits card instead
+uses `renderCreditRows`:
+
+| Row | Value |
+|---|---|
+| `Credits` | `{left} of {allowance} USD`, or `{left} USD` without an allowance; with the reset date, `  ·  resets {day}` |
+| `Last 24 h` | `{spend24h} USD`, only when it is a finite number |
+| `Purchased` | `{purchased} USD`, only when it is a number above zero |
+
+Amounts use `twoDecimalAmount`. A provider card has no accent bar and no Switch button.
+
+## app: the Providers settings group (step D)
+
+`settings.js`'s `GROUPS` gains `{ id: "providers", label: "Providers" }` after Agents and before
+History and hosts; the alias `prov` is accepted, and `#providers` in the address opens the group.
+`providersCard()` is the panel `Providers` with the subtitle `read-only cards for Codex and Ollama's
+cloud plan` and two sections:
+
+- **Codex**: `Show a Codex card` (toggle `codexCard`, note `read only · every 5 minutes`), the note
+  `seatswap reads Codex's login file and asks chatgpt.com for your usage every 5 minutes. It never
+  changes Codex's files.`, and `Codex folder` (text field `codexHome`, note
+  `empty: $CODEX_HOME or ~/.codex`).
+- **Ollama**: `Show an Ollama card` (toggle `ollamaCard`, note `asks the Ollama server on this machine
+  for your cloud balance every 5 minutes`) and `Ollama server` (text field `ollamaUrl`).
+
+The fields save through the settings page's one writer; the backend's `Settings::validate` refuses a
+relative `codexHome` or a bad `ollamaUrl` and the page shows that text under the row and puts the
+control back. After every successful save the worker calls `ProvidersClient::settings_saved`, which
+is what makes a newly switched-on card or a changed folder/URL poll at once. The pop-up calls
+`ProvidersClient::opened` when it opens (`panel.rs`), which is the 60 s rule above.

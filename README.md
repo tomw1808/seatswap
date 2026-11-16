@@ -66,6 +66,11 @@ read or write that yet.
 - **Usage at a glance.** The icon ring shows the active account's binding limit, coloured green,
   amber or red. The pop-up shows every account's session (5 h) and weekly limits, with the time
   until each one resets — and its plan, such as "Team 5x".
+- **Two read-only provider cards.** With a switch in *Settings → Providers*, the pop-up shows a
+  Codex card (its 5 h and weekly limits, or whatever window lengths Codex sends) and an Ollama card
+  (credits left, reset date, spend in the last 24 h, or session and weekly limits on an old plan).
+  Both are off by default; while one is off, seatswap reads no Codex file and sends no request. The
+  cards never switch, sign in or refresh a token.
 - **Auto-burn.** Switched on, seatswap moves between accounts by itself so that as little work as
   possible is blocked; it switches before an account is full only when the measured gain is worth
   the switch. Switched off, it suggests the same switch instead.
@@ -290,11 +295,19 @@ the tray app, and `seatswap.exe` for everything you want to read in a terminal.
   `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` on Windows). On Windows it also registers
   the name its notifications are shown under
   (`HKCU\Software\Classes\AppUserModelId\dev.seatswap.app`).
+- **Codex and Ollama:** with the Codex card on, seatswap reads Codex's `auth.json` for the access
+  token and account id it sends to `chatgpt.com`; it never writes that file, never refreshes the
+  token and never reads the OS keyring. With the Ollama card on it only asks the Ollama server for
+  the balance and the last 24 h's spend. Both cards are off by default, and neither card sends a
+  request that generates text.
 - **Network:** the usage endpoint (`api.anthropic.com/api/oauth/usage`) and Claude Code's token
   endpoint (`platform.claude.com/v1/oauth/token`, with Claude Code's own client id) to refresh
-  stored logins. And, only while *Look up prices and the dollar rate* is on, `models.dev` for API
-  prices and `api.frankfurter.dev` for the dollar rate; those two send a User-Agent and nothing
-  about you, your accounts or this machine. Nothing else.
+  stored logins. While the Codex card is on, `chatgpt.com/backend-api/wham/usage` with Codex's own
+  access token and account id; while the Ollama card is on, the server at `ollamaUrl` (default
+  `http://127.0.0.1:11434`) for `/api/balance` and `/api/usage?range=24h`, with no secret. And, only
+  while *Look up prices and the dollar rate* is on, `models.dev` for API prices and
+  `api.frankfurter.dev` for the dollar rate; those two send a User-Agent and nothing about you, your
+  accounts or this machine. Nothing else.
 - **Logs and output** never contain a token; at most the last four characters of a refresh token.
 - **Locks:** a switch holds Claude Code's own lock files (the renewal locks of the main and the two
   secondary logins, credentials write, identity write) and its own app lock, so it never
