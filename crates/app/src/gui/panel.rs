@@ -937,6 +937,12 @@ pub(crate) struct HistoryView {
     bytes: u64,
     saved_host: Option<String>,
     saved_dir: Option<String>,
+    /// `<Dropbox>/seatswap` when Dropbox's `info.json` names a folder and no
+    /// `historyDir` is set: a suggestion only, nothing is created or written.
+    suggested_folder: Option<String>,
+    /// Why Dropbox's `info.json` could not be read, when it could not; the
+    /// suggestion is then absent and the page shows this text.
+    suggested_error: Option<String>,
 }
 
 /// What an import copied, the hosts it refused, and the folder afterwards.
@@ -972,6 +978,8 @@ fn history_view_of(
     home: &Path,
     saved_host: Option<String>,
     saved_dir: Option<String>,
+    suggested_folder: Option<String>,
+    suggested_error: Option<String>,
 ) -> Result<HistoryView, String> {
     let hosts = history.host_infos().map_err(|error| error.to_string())?;
     let bytes = hosts
@@ -985,16 +993,55 @@ fn history_view_of(
         bytes,
         saved_host,
         saved_dir,
+        suggested_folder,
+        suggested_error,
     })
+}
+
+/// Dropbox's suggested history folder, `<Dropbox>/seatswap`, and the error when
+/// Dropbox's `info.json` cannot be read. The file is only read when no
+/// `historyDir` is set, and nothing is created or written for the suggestion.
+fn dropbox_suggestion(home: &Path) -> (Option<String>, Option<String>) {
+    match seatswap_core::paths::dropbox_folder() {
+        Ok(Some(dropbox)) => (
+            Some(with_tilde(
+                &dropbox.join("seatswap").to_string_lossy(),
+                home,
+            )),
+            None,
+        ),
+        Ok(None) => (None, None),
+        Err(error) => (None, Some(error.to_string())),
+    }
+}
+
+/// Whether the view may suggest Dropbox's folder: only when the saved settings
+/// name no history folder. Settings that could not be read never make a
+/// suggestion.
+fn wants_dropbox_suggestion(settings: Option<&Settings>) -> bool {
+    settings.is_some_and(|settings| settings.history_dir.is_none())
 }
 
 /// The history view of the folder in effect, with the saved values that a
 /// restart would use.
 fn history_view_for(state: &GuiState, history: &HistoryDir) -> Result<HistoryView, String> {
     let snapshot = state.snapshot()?;
+    let (suggested_folder, suggested_error) =
+        if wants_dropbox_suggestion(snapshot.settings.as_ref()) {
+            dropbox_suggestion(&state.claude.home)
+        } else {
+            (None, None)
+        };
     let (saved_host, saved_dir) =
         saved_history(&state.app, &state.claude.home, snapshot.settings, history)?;
-    history_view_of(history, &state.claude.home, saved_host, saved_dir)
+    history_view_of(
+        history,
+        &state.claude.home,
+        saved_host,
+        saved_dir,
+        suggested_folder,
+        suggested_error,
+    )
 }
 
 /// The Settings page's History and hosts group.
@@ -1731,6 +1778,49 @@ mod tests {
             assert_eq!(saved_host, None, "the saved and the open host agree");
             assert_eq!(saved_dir, None, "the saved and the open folder agree");
         }
+    }
+
+    #[test]
+    fn a_dropbox_suggestion_needs_no_history_folder() {
+        assert!(wants_dropbox_suggestion(Some(&Settings::default())));
+        let with_dir = Settings {
+            history_dir: Some(Path::new("/home/sam/Sync/seatswap-history").to_path_buf()),
+            ..Settings::default()
+        };
+        assert!(!wants_dropbox_suggestion(Some(&with_dir)));
+        // Settings that could not be read must not make one up either.
+        assert!(!wants_dropbox_suggestion(None));
+    }
+
+    /// The names the page reads: `suggestedFolder` and `suggestedError`. A
+    /// renamed field would leave the page without a suggestion and without
+    /// the reason, and nothing else would show it.
+    #[test]
+    fn the_history_view_carries_the_suggestion_the_page_reads() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let history = HistoryDir::at(tmp.path(), "atlas");
+        let view = history_view_of(
+            &history,
+            Path::new("/home/sam"),
+            None,
+            None,
+            Some("~/Dropbox/seatswap".to_string()),
+            Some("Dropbox's info file /home/sam/.dropbox/info.json: not JSON".to_string()),
+        )
+        .expect("the history view");
+        let json = serde_json::to_value(&view).expect("the view as JSON");
+        assert_eq!(json["suggestedFolder"], "~/Dropbox/seatswap");
+        assert_eq!(
+            json["suggestedError"],
+            "Dropbox's info file /home/sam/.dropbox/info.json: not JSON"
+        );
+
+        // Without a suggestion the fields are null, never missing.
+        let view = history_view_of(&history, Path::new("/home/sam"), None, None, None, None)
+            .expect("the history view");
+        let json = serde_json::to_value(&view).expect("the view as JSON");
+        assert!(json["suggestedFolder"].is_null());
+        assert!(json["suggestedError"].is_null());
     }
 
     #[test]

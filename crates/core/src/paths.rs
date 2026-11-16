@@ -34,6 +34,8 @@ pub enum PathsError {
     HistoryDir(String),
     #[error("the Codex folder (codexHome or $CODEX_HOME) must be an absolute path, got {0}")]
     RelativeCodexHome(PathBuf),
+    #[error("Dropbox's info file {path}: {detail}")]
+    DropboxInfo { path: PathBuf, detail: String },
 }
 
 /// Claude Code's files for one config folder.
@@ -342,6 +344,90 @@ pub fn history_root(explicit: Option<&Path>, app: &AppPaths) -> Result<PathBuf, 
         }
         None => Ok(app.history_dir()),
     }
+}
+
+/// The folder Dropbox syncs into, from Dropbox's own `info.json` (spec §1.5):
+/// `personal.path` when it has one, else `business.path`. Dropbox not installed
+/// (`info.json` missing) and an `info.json` without either key are `Ok(None)`;
+/// an unreadable file, a file that is not JSON, a section that is neither an
+/// object nor `null`, or a path that is not a non-empty string is
+/// [`PathsError::DropboxInfo`], never a made-up folder.
+pub fn dropbox_folder() -> Result<Option<PathBuf>, PathsError> {
+    for info_json in dropbox_info_files()? {
+        if info_json.exists() {
+            return dropbox_folder_in(&info_json);
+        }
+    }
+    Ok(None)
+}
+
+/// The one reader of Dropbox's `info.json`, so a test names the file it built
+/// in a tempdir instead of the real Dropbox folder (AGENTS.md hard rule 1).
+pub fn dropbox_folder_in(info_json: &Path) -> Result<Option<PathBuf>, PathsError> {
+    let bytes = match std::fs::read(info_json) {
+        Ok(bytes) => bytes,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(dropbox_error(
+                info_json,
+                format!("cannot read the file: {source}"),
+            ))
+        }
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| dropbox_error(info_json, format!("not JSON: {error}")))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| dropbox_error(info_json, "the file is not a JSON object"))?;
+    for key in ["personal", "business"] {
+        // An absent or `null` section has no path; another kind is refused.
+        let Some(section) = object.get(key).filter(|section| !section.is_null()) else {
+            continue;
+        };
+        let section = section
+            .as_object()
+            .ok_or_else(|| dropbox_error(info_json, format!("{key} is not an object")))?;
+        let Some(path) = section.get("path") else {
+            continue;
+        };
+        let path = path
+            .as_str()
+            .ok_or_else(|| dropbox_error(info_json, format!("{key}.path is not a string")))?;
+        if path.is_empty() {
+            return Err(dropbox_error(info_json, format!("{key}.path is empty")));
+        }
+        return Ok(Some(PathBuf::from(path)));
+    }
+    Ok(None)
+}
+
+fn dropbox_error(info_json: &Path, detail: impl Into<String>) -> PathsError {
+    PathsError::DropboxInfo {
+        path: info_json.to_path_buf(),
+        detail: detail.into(),
+    }
+}
+
+/// Dropbox's `info.json`, in the order the platforms write it. The operating
+/// system's difference belongs here, not at the caller. Linux and macOS both
+/// keep it in `~/.dropbox`.
+#[cfg(not(windows))]
+fn dropbox_info_files() -> Result<Vec<PathBuf>, PathsError> {
+    let home = dirs::home_dir().ok_or(PathsError::NoHome)?;
+    Ok(vec![home.join(".dropbox").join("info.json")])
+}
+
+#[cfg(windows)]
+fn dropbox_info_files() -> Result<Vec<PathBuf>, PathsError> {
+    let mut files = Vec::new();
+    for variable in ["APPDATA", "LOCALAPPDATA"] {
+        if let Some(folder) = std::env::var_os(variable) {
+            if !folder.is_empty() {
+                files.push(PathBuf::from(folder).join("Dropbox").join("info.json"));
+            }
+        }
+    }
+    Ok(files)
 }
 
 /// The name this host writes its history under: `explicit` if set, else the
@@ -768,5 +854,115 @@ mod tests {
         assert!(!plain.as_os_str().to_string_lossy().starts_with(r"\\?\"));
         let err = std::fs::create_dir(&plain).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn a_personal_dropbox_is_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let info = tmp.path().join("info.json");
+        std::fs::write(
+            &info,
+            r#"{"personal":{"path":"/home/sam/Dropbox","host":123456789,"is_team":false,"subscription_type":"Basic"},"business":{"path":"/home/sam/Dropbox (Acme)","host":987654321}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            dropbox_folder_in(&info).unwrap(),
+            Some(PathBuf::from("/home/sam/Dropbox"))
+        );
+    }
+
+    #[test]
+    fn business_is_used_without_personal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let info = tmp.path().join("info.json");
+        std::fs::write(
+            &info,
+            r#"{"business":{"path":"/home/sam/Dropbox (Acme)","host":987654321}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            dropbox_folder_in(&info).unwrap(),
+            Some(PathBuf::from("/home/sam/Dropbox (Acme)"))
+        );
+    }
+
+    #[test]
+    fn no_info_json_is_no_suggestion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let info = tmp.path().join("info.json");
+        assert_eq!(dropbox_folder_in(&info).unwrap(), None);
+    }
+
+    #[test]
+    fn a_broken_info_json_is_an_error_naming_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let info = tmp.path().join("info.json");
+        let named = info.display().to_string();
+
+        std::fs::write(&info, "{\"personal\":").unwrap();
+        let error = dropbox_folder_in(&info).unwrap_err();
+        assert!(
+            error.to_string().contains(&named),
+            "the error must name {named}, got {error}"
+        );
+        assert!(matches!(error, PathsError::DropboxInfo { .. }));
+
+        // The file is JSON, but `personal.path` is not a string.
+        std::fs::write(&info, r#"{"personal":{"path":7}}"#).unwrap();
+        let error = dropbox_folder_in(&info).unwrap_err();
+        assert!(
+            error.to_string().contains(&named),
+            "the error must name {named}, got {error}"
+        );
+        assert!(error.to_string().contains("personal.path is not a string"));
+    }
+
+    /// The rule of the task: `personal.path` if present, else `business.path`.
+    /// A `personal` section without a `path` has no `personal.path`, so the
+    /// business folder is the one that counts.
+    #[test]
+    fn a_personal_section_without_a_path_leaves_the_business_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let info = tmp.path().join("info.json");
+        std::fs::write(
+            &info,
+            r#"{"personal":{"host":123456789,"is_team":false},"business":{"path":"/home/sam/Dropbox (Acme)","host":987654321}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            dropbox_folder_in(&info).unwrap(),
+            Some(PathBuf::from("/home/sam/Dropbox (Acme)"))
+        );
+    }
+
+    /// The same rule when the `personal` section is not an object at all: it
+    /// has no `personal.path` either, so the business folder counts and the
+    /// file is not refused.
+    #[test]
+    fn a_personal_section_that_is_not_an_object_leaves_the_business_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let info = tmp.path().join("info.json");
+        std::fs::write(
+            &info,
+            r#"{"personal":null,"business":{"path":"/home/sam/Dropbox (Acme)","host":987654321}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            dropbox_folder_in(&info).unwrap(),
+            Some(PathBuf::from("/home/sam/Dropbox (Acme)"))
+        );
+    }
+
+    /// macOS is a supported desktop (docs/spec.md §1) and Dropbox writes the
+    /// same `~/.dropbox/info.json` there as on Linux; the suggestion must not
+    /// be silently missing there.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn the_dropbox_file_is_looked_for_on_macos() {
+        let files = dropbox_info_files().expect("the Dropbox files");
+        assert!(
+            !files.is_empty(),
+            "macOS must look for Dropbox's info.json as Linux does"
+        );
     }
 }

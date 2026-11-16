@@ -18,7 +18,30 @@ export function fixtureHistoryView(fixture) {
     typeof settings.historyDir === "string" ? settings.historyDir.trim() : "";
   view.savedDir = dir !== "" && dir !== view.dir ? dir : null;
   view.bytes = view.hosts.reduce((total, host) => total + (Number(host.bytes) || 0), 0);
+  // Decision 3: a machine with Dropbox and no history folder set gets
+  // `<Dropbox>/seatswap` as a suggestion. Only the `?fixture=dropbox` variant
+  // pretends such a machine; every other fixture has no Dropbox.
+  view.suggestedFolder = fixtureDropboxSuggestion(dir);
+  view.suggestedError = fixtureDropboxError();
   return view;
+}
+
+// The suggestion path Dropbox's info.json would give, as the view shows it with
+// `~` for the home folder. No file is read or written for it.
+function fixtureDropboxSuggestion(dir) {
+  if (typeof location === "undefined" || typeof URLSearchParams !== "function") return null;
+  if (new URLSearchParams(location.search).get("fixture") !== "dropbox") return null;
+  if (dir !== "") return null;
+  return "~/Dropbox/seatswap";
+}
+
+// The proof of the error line: `?fixture=dropbox-error` is a machine whose
+// Dropbox file cannot be read, so the view carries the reason and no
+// suggestion.
+function fixtureDropboxError() {
+  if (typeof location === "undefined" || typeof URLSearchParams !== "function") return null;
+  if (new URLSearchParams(location.search).get("fixture") !== "dropbox-error") return null;
+  return "Dropbox's info file /home/sam/.dropbox/info.json: not JSON: expected value at line 1 column 12";
 }
 
 // The command's `expand_tilde`: `~/…` is the fixture's home folder.

@@ -2715,11 +2715,17 @@ function historyCard() {
       width: 280,
     })
   );
+  const suggestion = dropboxSuggestion(view);
+  if (suggestion) body.appendChild(suggestion);
 
   body.appendChild(section("Hosts found in the folder"));
   const hosts = h("div", { class: "col hist-hosts" });
   body.appendChild(hosts);
-  renderHosts(hosts, view, state.historyError);
+  renderHosts(
+    hosts,
+    view,
+    [state.historyError, dropboxSuggestionError(view)].filter(Boolean).join(" · ") || null
+  );
 
   body.appendChild(
     note([
@@ -2734,6 +2740,53 @@ function historyCard() {
   body.appendChild(exportRow());
   body.appendChild(importRow());
   return card;
+}
+
+// Decision 3: Dropbox's own info.json named a folder and no history folder is
+// set, so the view suggests `<Dropbox>/seatswap`. It is only a suggestion:
+// nothing is created until Use is pressed, and Use saves through the same
+// `save_setting` command the field uses.
+function dropboxSuggestion(view) {
+  if (!isObject(view) || view.suggestedFolder === null) return null;
+  const folder = view.suggestedFolder;
+  if (typeof folder !== "string" || folder === "") {
+    throw new Error(
+      `the history view's suggestedFolder is not a folder: ${JSON.stringify(folder)}`
+    );
+  }
+  const use = h("button", { type: "button", class: "hbtn xs", text: "Use" });
+  use.setAttribute("aria-label", `Use ${folder} as the history folder`);
+  use.addEventListener("click", async () => {
+    use.disabled = true;
+    const ok = await saveField("historyDir", folder);
+    use.disabled = false;
+    if (!ok) return;
+    // Read the view again: with a folder set the suggestion is gone.
+    await loadHistory();
+    if (state.group === "history" && state.right) renderGroup(state.right, "history");
+  });
+  return h("div", { class: "set" }, [
+    h("span"),
+    h("span", {}, [
+      h("span", { class: "mf" }, [
+        "Dropbox found: ",
+        h("span", { class: "mono x11", text: folder }),
+      ]),
+      use,
+    ]),
+  ]);
+}
+
+// A broken Dropbox info.json is shown in the group's existing error place,
+// beside the host folders; it is never silently dropped.
+function dropboxSuggestionError(view) {
+  if (!isObject(view) || view.suggestedError === null) return null;
+  if (typeof view.suggestedError !== "string" || view.suggestedError === "") {
+    throw new Error(
+      `the history view's suggestedError is not a text: ${JSON.stringify(view.suggestedError)}`
+    );
+  }
+  return view.suggestedError;
 }
 
 // Read the host folders when the group opens, after an import and after a
