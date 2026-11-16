@@ -250,8 +250,11 @@ export function stackedColumns({ columns, marks } = {}) {
 // lines — the expired share and the curves
 // ---------------------------------------------------------------------------
 
-export function lines({ series, yMax, marks, ySuffix, yDecimals, yFormat } = {}) {
+export function lines({ series, yMax, marks, hlines, ySuffix, yDecimals, yFormat } = {}) {
   if (!Array.isArray(series)) throw new Error("lines needs a list of series");
+  if (hlines !== undefined && !Array.isArray(hlines)) {
+    throw new Error("lines needs a list of reference lines");
+  }
   const root = h("div", { class: "chart chart-lines" });
   const plot = h("div", { class: "chart-plot" });
   const svg = svgNode("svg", {
@@ -367,6 +370,28 @@ export function lines({ series, yMax, marks, ySuffix, yDecimals, yFormat } = {})
 
   const markTimes = [];
   if (bounds.min !== null && bounds.max !== null) markTimes.push(bounds.min, bounds.max);
+  // Horizontal reference lines (`{ y, label }`): the 100 % line of a window.
+  // A line outside the chart's 0..top scale is an error, never moved to fit.
+  for (const line of Array.isArray(hlines) ? hlines : []) {
+    if (!line || !finite(line.y)) {
+      throw new Error(`a reference line needs a finite y, not ${JSON.stringify(line)}`);
+    }
+    if (line.y < 0 || line.y > top) {
+      throw new Error(
+        `a reference line at ${line.y} lies outside the chart's 0..${top}`
+      );
+    }
+    const node = h("div", {
+      class: "chart-hline",
+      style: { bottom: `${(line.y / top) * 100}%` },
+    });
+    if (line.label !== undefined && line.label !== null) {
+      node.appendChild(
+        h("span", { class: "chart-hline-label", text: String(line.label) })
+      );
+    }
+    plot.appendChild(node);
+  }
   const layer = markLayer(
     marks,
     (at) => {
@@ -466,6 +491,28 @@ export function grid({ rows, headers } = {}) {
   const root = h("div", { class: "chart chart-grid" });
   const template = `minmax(96px, 1.3fr) repeat(${headers.length}, minmax(0, 1fr))`;
   root.style.setProperty("--chart-grid-columns", template);
+  // A cell's track is its height for 100 %. A week with a reset sums its
+  // windows and may pass 100: the bar then grows into the headroom above the
+  // cell, while the 100 % line stays at the cell's top. The gap between rows
+  // holds the largest overshoot, so a bar never covers the row above it.
+  // `.chart-cell` is 42 px high (charts.css); the headroom is that scale.
+  let highest = 100;
+  for (const row of rows) {
+    const cells = row && Array.isArray(row.cells) ? row.cells : [];
+    for (const cell of cells) {
+      if (!cell) continue;
+      const parts = Array.isArray(cell.parts) ? cell.parts : null;
+      const total = finite(cell.total)
+        ? cell.total
+        : finite(cell.fill)
+          ? cell.fill
+          : parts !== null
+            ? parts.reduce((sum, part) => sum + (finite(part) ? part : 0), 0)
+            : null;
+      if (total !== null && total > highest) highest = total;
+    }
+  }
+  root.style.setProperty("--chart-grid-over", String(highest - 100));
 
   const head = h("div", { class: "chart-grid-row chart-grid-headrow" });
   head.appendChild(h("span", { class: "chart-grid-corner" }));
@@ -510,13 +557,48 @@ export function grid({ rows, headers } = {}) {
       if (cell.color) style["--chart-cell-color"] = cell.color;
       if (cell.textColor) style["--chart-cell-text"] = cell.textColor;
       const node = h("div", { class: classes.join(" "), style });
-      if (finite(cell.fill)) {
+      const parts = Array.isArray(cell.parts) ? cell.parts : null;
+      if (parts) {
+        for (const part of parts) {
+          if (!finite(part)) {
+            throw new Error(`a cell's window part must be a finite percent, not ${JSON.stringify(part)}`);
+          }
+          if (part < 0) {
+            throw new Error(`a cell's window part must be 0 or more, not ${JSON.stringify(part)}`);
+          }
+        }
+      }
+      const total = finite(cell.total) ? cell.total : finite(cell.fill) ? cell.fill : null;
+      const over = total !== null && total > 100;
+      const splitBar = parts !== null && (parts.length > 1 || over);
+      if (splitBar && total !== null) {
+        // One part per window, oldest first, from the bottom up.
+        const bar = h("div", {
+          class: "chart-cell-bar",
+          style: { height: `${total}%` },
+        });
+        for (const part of parts) {
+          // A 0 % window used nothing: do not draw a 1 px part for it. The
+          // cell's total and tooltip still count it.
+          if (part === 0) continue;
+          bar.appendChild(
+            h("div", {
+              class: "chart-cell-part",
+              style: { height: `${total === 0 ? 0 : (part / total) * 100}%` },
+            })
+          );
+        }
+        node.appendChild(bar);
+        // The 100 % line stays at the top of the cell; the bar may pass it.
+        node.appendChild(h("div", { class: "chart-cell-limit" }));
+      } else if (total !== null) {
         node.appendChild(
           h("div", {
             class: "chart-cell-fill",
-            style: { height: `${clampPercent(cell.fill)}%` },
+            style: { height: `${total}%` },
           })
         );
+        if (over) node.appendChild(h("div", { class: "chart-cell-limit" }));
       }
       if (cell.text !== undefined && cell.text !== null && cell.text !== "") {
         node.appendChild(h("span", { class: "chart-cell-text", text: String(cell.text) }));

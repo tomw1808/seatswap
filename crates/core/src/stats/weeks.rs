@@ -8,6 +8,7 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde::Serialize;
 
 use crate::api::LimitKind;
+use crate::burn::Rhythm;
 use crate::history::{
     same_reset, AccountRef, By, Event, EventKind, Hosted, Hosts, Range, Sample, WindowRecord,
 };
@@ -41,6 +42,9 @@ pub struct WeeksPage {
     pub blocked: Vec<f64>,
     /// One curve per row: the weekly percent of the last 14 days.
     pub recent: Vec<Curve>,
+    /// The instant the page was computed; the "now" mark of the recent curves
+    /// sits there.
+    pub now: DateTime<Utc>,
 }
 
 /// One account's row of the grid.
@@ -63,8 +67,14 @@ pub struct WeeksRow {
 #[serde(rename_all = "camelCase")]
 pub struct WeekCell {
     pub end: DateTime<Utc>,
-    /// The window's final percent.
+    /// The sum of the week's windows' use (an account week may hold several
+    /// windows after a reset); it may pass 100.
     pub used: f64,
+    /// One part per window of the account week, oldest first: each window's own
+    /// use. Their sum is `used`. A window that ended below its start adds 0
+    /// (the rule of `stats::window_used`; `account_weeks_valued` names it once
+    /// in the page's warnings).
+    pub parts: Vec<f64>,
     /// The share that expired: the window's `lost` percent.
     pub expired: f64,
     /// The money that expired; `None` without a price for the week.
@@ -101,8 +111,14 @@ pub struct WeekSummary {
     /// The working hours blocked in the week.
     pub blocked_hours: f64,
     pub switches: SwitchCounts,
-    /// The money used per account id, priced account weeks only.
-    pub per_account: Vec<(String, f64)>,
+    /// The sum of every `by` in `switches`: the "N switches" sub-line.
+    pub switches_total: u64,
+    /// Each account week's use in percent, per account id, every account week
+    /// of the week (priced or not). The page's per-account line uses this.
+    pub per_account_percent: Vec<(String, f64)>,
+    /// The expired share of the money paid in the week: `expired / paid × 100`,
+    /// `None` like `used_percent_of_paid`.
+    pub expired_percent_of_paid: Option<f64>,
     /// The projects' share in % of the week's API value, the three largest
     /// then `other`; empty when `values.api` is `None`.
     pub top_projects: Vec<(String, f64)>,
@@ -125,7 +141,15 @@ pub struct WeekSummary {
 #[serde(rename_all = "camelCase")]
 pub struct WindowDetail {
     pub id: String,
+    /// The window's recorded start ([`WindowRecord::weekly_start`]): the reset's
+    /// date when a reset began it, otherwise seven days before `end`.
+    pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
+    /// The plan of the window's record; `None` when it carried none.
+    pub plan: Option<String>,
+    /// The money paid for one week at the window's price (monthly price ×
+    /// 12 / 52), in the display currency; `None` without a price.
+    pub weekly_price: Option<f64>,
     /// The window's final percent.
     pub used: f64,
     /// Money used; `None` without a price for the window.
@@ -143,6 +167,21 @@ pub struct WindowDetail {
     /// The finished session windows of the account that ended inside the
     /// window with `final > 0`; `None` when it has no session window at all.
     pub session_windows_used: Option<u32>,
+    /// How many 5 h session windows fit into the account's typical week: the
+    /// working hours of the learned rhythm (the same `working_rhythm` figure the
+    /// Forecast and Rhythm pages use) divided by 5 and rounded. The rhythm
+    /// covers the four weeks before the window's end, not the Rhythm page's
+    /// span. `None` when the account has no session limit or the rhythm knows
+    /// no working hour.
+    pub possible_session_windows: Option<u32>,
+    /// `true` when `session_windows_used` is above
+    /// `possible_session_windows`: the page then says the used windows are more
+    /// than the usual working hours hold, instead of claiming fewer possible
+    /// ones than used.
+    pub used_more_than_possible: bool,
+    /// One sentence about the window's reset, its start after a reset or an
+    /// uncertain last reading; the detail card's Note row.
+    pub note: Option<String>,
     pub switches_in_out: u32,
     pub switches_auto: u32,
     /// `end − lastSample` of the window.
@@ -265,6 +304,7 @@ pub(crate) fn weeks_in<Tz: TimeZone + Copy>(
         rows,
         blocked,
         recent,
+        now: ctx.now,
     })
 }
 
@@ -300,9 +340,18 @@ fn row_for(
 /// One account week as the grid shows it.
 fn week_cell(week: &AccountWeek) -> Result<WeekCell, StatsError> {
     let money = money_of(week);
+    // The windows of the account week, oldest first. A window that ended below
+    // its start adds no use (`stats::window_used`, named once in the warnings by
+    // `account_weeks_valued`), exactly as `week.used` counted it.
+    let parts = week
+        .windows
+        .iter()
+        .map(|window| window_used(window).unwrap_or(0.0))
+        .collect();
     Ok(WeekCell {
         end: week.window.end,
         used: week.used,
+        parts,
         expired: lost_percent(&week.window)?,
         expired_money: money.map(|money| money.expired),
         full: week.used >= 100.0,
@@ -404,20 +453,18 @@ pub fn week_summary<Tz: TimeZone + Copy>(
     let mut expired = 0.0;
     let mut used_priced = false;
     let mut missing_reason: Option<String> = None;
-    let mut used_by_account: BTreeMap<AccountRef, f64> = BTreeMap::new();
+    let mut percent_by_account: BTreeMap<AccountRef, f64> = BTreeMap::new();
     for account_week in weeks
         .iter()
         .filter(|account_week| account_week.week == week)
     {
+        percent_by_account.insert(account_week.account.clone(), account_week.used);
         match money_of(account_week) {
             Some(money) => {
                 used += money.used;
                 paid += money.paid;
                 expired += money.expired;
                 used_priced = true;
-                *used_by_account
-                    .entry(account_week.account.clone())
-                    .or_insert(0.0) += money.used;
             }
             None if missing_reason.is_none() => {
                 missing_reason = account_week.price_missing.as_ref().map(ToString::to_string);
@@ -516,11 +563,11 @@ pub fn week_summary<Tz: TimeZone + Copy>(
         _ => Vec::new(),
     };
 
-    let mut per_account: Vec<(String, f64)> = used_by_account
+    let mut per_account_percent: Vec<(String, f64)> = percent_by_account
         .iter()
-        .map(|(reference, money)| (account_id(ctx, reference), *money))
+        .map(|(reference, percent)| (account_id(ctx, reference), *percent))
         .collect();
-    per_account.sort_by(|a, b| {
+    per_account_percent.sort_by(|a, b| {
         account_position(ctx, &a.0)
             .cmp(&account_position(ctx, &b.0))
             .then_with(|| a.0.cmp(&b.0))
@@ -532,6 +579,12 @@ pub fn week_summary<Tz: TimeZone + Copy>(
         None
     };
     let used_percent_of_paid = (paid > 0.0).then_some(used / paid * 100.0);
+    let expired_percent_of_paid = (paid > 0.0).then_some(expired / paid * 100.0);
+    let switches_total = u64::from(switches.user)
+        + u64::from(switches.cli)
+        + u64::from(switches.auto)
+        + u64::from(switches.agent)
+        + u64::from(switches.external);
 
     let mut conclusion = Vec::new();
     if blocked_hours <= 0.0 {
@@ -574,7 +627,9 @@ pub fn week_summary<Tz: TimeZone + Copy>(
         money_missing,
         blocked_hours,
         switches,
-        per_account,
+        switches_total,
+        per_account_percent,
+        expired_percent_of_paid,
         top_projects,
         tokens,
         values,
@@ -626,6 +681,95 @@ fn waited_switches(events: &[Hosted<Event>], range: &Range, host: Option<&str>) 
         }
     }
     (waited, seconds)
+}
+
+/// The length of a session window in hours, as the detail card's "5 h windows"
+/// row names it.
+const SESSION_WINDOW_HOURS: f64 = 5.0;
+
+/// How many [`SESSION_WINDOW_HOURS`] windows fit into the typical week: the
+/// working hours of `[from, to)` counted with [`working_hours`] over a seven-day
+/// span, from the rhythm the [`working_rhythm`] figure learned over the four
+/// weeks before the window's end (the same figure the Forecast and Rhythm pages
+/// use, not the Rhythm page's span). `None` when the rhythm knows no working
+/// hour.
+fn possible_5h_windows<Tz: TimeZone + Copy>(
+    rhythm: &Rhythm,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    zone: &Tz,
+) -> Option<u32> {
+    let working = working_hours(from, to, rhythm, zone);
+    (working > 0.0).then(|| (working / SESSION_WINDOW_HOURS).round() as u32)
+}
+
+/// The detail card's Note: what the window's record says about its reset and
+/// its expired share. Never a made-up history: every sentence names a field of
+/// `window` (or its `expired` percent). `began_at_reset` is true when a reset
+/// record of the same account and limit ends where this window starts;
+/// `reset_model` names the model whose limit was given back together with the
+/// week, when a scoped reset record says so.
+fn window_note(
+    window: &WindowRecord,
+    expired: f64,
+    began_at_reset: bool,
+    reset_model: Option<&str>,
+) -> Option<String> {
+    let mut sentences = Vec::new();
+    let late = window.end.signed_duration_since(window.last_sample) > Duration::hours(1);
+    // A window after a reset whose first reading is missing has no `from`
+    // (write.rs's `Opened::mark`): its use is counted from 0 %, which may be too
+    // high. A normal window also has no `from`; a reset that began it (its
+    // recorded start differs from end − 7 days, or a reset record ends there)
+    // or a last reading too early to be the late-reading case marks the missing
+    // first percent.
+    let reset_started = began_at_reset
+        || window
+            .start
+            .is_some_and(|start| start != window.end - Duration::days(7));
+    let first_unknown = window.uncertain && window.from.is_none() && (reset_started || !late);
+    if window.reset {
+        let model = reset_model.or(window.m.as_deref());
+        if let Some(model) = model {
+            sentences.push(format!(
+                "{model}'s limit was given back before its reset, so the use before it stays counted."
+            ));
+        } else {
+            sentences.push(
+                "The week's limit was given back before its reset, so the use before it stays counted."
+                    .to_string(),
+            );
+        }
+    } else if let Some(from) = window.from {
+        sentences.push(format!(
+            "The week began at {} after a reset.",
+            percent_text(from)
+        ));
+    }
+    if first_unknown {
+        sentences.push(
+            "No reading right after the reset; the use is counted from 0 % and may be too high."
+                .to_string(),
+        );
+    }
+    if late {
+        sentences.push(format!(
+            "The last reading came {} before the reset; the use may be low.",
+            hours_text(
+                window
+                    .end
+                    .signed_duration_since(window.last_sample)
+                    .num_seconds() as f64
+                    / 3600.0,
+            )
+        ));
+    }
+    if expired > 0.0 {
+        sentences.push(format!("{} expired at its reset.", percent_text(expired)));
+    } else {
+        sentences.push("Nothing expired at its reset.".to_string());
+    }
+    Some(sentences.join(" "))
 }
 
 /// The detail of the finished weekly window of the stored account that ends at
@@ -729,6 +873,50 @@ pub fn window_detail<Tz: TimeZone + Copy>(
             })
             .count() as u32
     });
+    // The typical week of the window: the same learned rhythm the Forecast and
+    // Rhythm pages take, over the four weeks before the window's reset. The row
+    // is a session-limit row, so it is absent without a session window.
+    let possible_session_windows = if session_windows_used.is_some() {
+        let rhythm = working_rhythm(ctx, &reading)?;
+        possible_5h_windows(
+            &rhythm,
+            window.end - Duration::weeks(1),
+            window.end,
+            &ctx.zone,
+        )
+    } else {
+        None
+    };
+    let used_more_than_possible = matches!(
+        (session_windows_used, possible_session_windows),
+        (Some(used), Some(possible)) if used > possible
+    );
+    // A reset record of the same limit ending where this window starts says a
+    // reset began it; a scoped reset record ending with this weekly reset names
+    // the model whose limit was given back together with the week.
+    let began_at_reset = window.start.is_some_and(|window_start| {
+        finished.iter().any(|hosted| {
+            hosted.record.account == reference
+                && hosted.record.k == window.k
+                && hosted.record.reset
+                && same_reset(hosted.record.end, window_start)
+        })
+    });
+    let reset_model = if window.reset {
+        finished
+            .iter()
+            .filter(|hosted| {
+                hosted.record.account == reference
+                    && hosted.record.k == LimitKind::WeeklyScoped
+                    && hosted.record.reset
+                    && same_reset(hosted.record.end, window.end)
+            })
+            .find_map(|hosted| hosted.record.m.clone())
+    } else {
+        None
+    };
+    let note = window_note(&window, expired, began_at_reset, reset_model.as_deref());
+    let weekly_price = week.price.map(|price| money_at(price, 100.0, 0.0).paid);
 
     let mut switches_in_out = 0;
     let mut switches_auto = 0;
@@ -771,7 +959,10 @@ pub fn window_detail<Tz: TimeZone + Copy>(
 
     Ok(WindowDetail {
         id: super::account_id(ctx, &reference),
+        start,
         end: window.end,
+        plan: window.plan.clone(),
+        weekly_price,
         used,
         used_money: money.map(|money| money.used),
         expired,
@@ -779,6 +970,9 @@ pub fn window_detail<Tz: TimeZone + Copy>(
         reached_100_at,
         blocked_hours_after,
         session_windows_used,
+        possible_session_windows,
+        used_more_than_possible,
+        note,
         switches_in_out,
         switches_auto,
         last_sample_before_end_secs: (window.end - window.last_sample).num_seconds(),
@@ -1015,18 +1209,18 @@ mod tests {
             summary.used_change_percent
         );
 
-        assert_eq!(summary.per_account.len(), 2);
-        assert_eq!(summary.per_account[0].0, tiny.lb().id);
+        assert_eq!(summary.per_account_percent.len(), 2);
+        assert_eq!(summary.per_account_percent[0].0, tiny.lb().id);
         assert!(
-            close(summary.per_account[0].1, 33.231),
+            close(summary.per_account_percent[0].1, 80.0),
             "LB {}",
-            summary.per_account[0].1
+            summary.per_account_percent[0].1
         );
-        assert_eq!(summary.per_account[1].0, tiny.ac().id);
+        assert_eq!(summary.per_account_percent[1].0, tiny.ac().id);
         assert!(
-            close(summary.per_account[1].1, 29.077),
+            close(summary.per_account_percent[1].1, 90.0),
             "AC {}",
-            summary.per_account[1].1
+            summary.per_account_percent[1].1
         );
 
         assert_eq!(
@@ -1036,6 +1230,25 @@ mod tests {
                 "20 % of LB's week expired, 8.31 EUR.".to_string(),
                 "Auto-burn held back 1 planned switch, 2 minutes in total.".to_string(),
             ]
+        );
+    }
+
+    /// The summary's view has one per-account figure: the percent the page
+    /// shows. The money per account (`perAccount`) is not part of the view.
+    #[test]
+    fn the_summary_shows_no_money_per_account() {
+        let tiny = tiny();
+        let summary = week_summary(&tiny.ctx(), &all(), utc("2026-11-09T00:00:00Z")).unwrap();
+        let view = serde_json::to_value(&summary).expect("the summary's view");
+        let object = view.as_object().expect("the summary is an object");
+
+        assert!(
+            !object.contains_key("perAccount"),
+            "the view still carries money per account: {view}"
+        );
+        assert!(
+            object.contains_key("perAccountPercent"),
+            "the view carries the per-account percent: {view}"
         );
     }
 
@@ -1104,7 +1317,7 @@ mod tests {
         );
         assert_eq!(summary.blocked_hours, 0.0);
         assert_eq!(summary.switches, SwitchCounts::default());
-        assert!(summary.per_account.is_empty());
+        assert!(summary.per_account_percent.is_empty());
         assert!(summary.top_projects.is_empty());
         assert_eq!(summary.tokens, Tokens::default());
         assert_eq!(summary.values.api, None);
@@ -1409,11 +1622,586 @@ mod tests {
             summary.used
         );
         assert!(
-            close(summary.per_account[0].1, 66.462),
-            "LB's money of the week: {}",
-            summary.per_account[0].1
+            close(summary.per_account_percent[0].1, 160.0),
+            "LB's use of the week: {}",
+            summary.per_account_percent[0].1
         );
     }
+
+    /// A reset inside one calendar week keeps both windows: the cell lists each
+    /// window's own use oldest first, and its total is their sum, which may pass
+    /// 100 %. The first case is 62 % then a reset, then 30 % from 0 (92 %); the
+    /// second is 70 % then a model reset to 45 % and up to 80 % (105 %).
+    #[test]
+    fn a_week_with_a_reset_sums_its_windows() {
+        let tiny = tiny();
+        let window = |start: &str,
+                      end: &str,
+                      from: Option<f64>,
+                      final_percent: f64,
+                      lost: Option<f64>,
+                      reset: bool| {
+            WindowRecord {
+                account: tiny.lb_ref(),
+                k: LimitKind::WeeklyAll,
+                m: None,
+                start: Some(utc(start)),
+                end: utc(end),
+                final_percent,
+                lost,
+                last_sample: utc(end) - Duration::minutes(2),
+                plan: Some("Max".to_string()),
+                uncertain: false,
+                reset,
+                from,
+            }
+        };
+
+        // 62 %, then the limit was given back and the week ran to 30 % from 0.
+        let dir = tempdir().expect("a temp history");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        history
+            .append_many(&[
+                window(
+                    "2026-11-02T00:00:00Z",
+                    "2026-11-05T12:00:00Z",
+                    None,
+                    62.0,
+                    None,
+                    true,
+                ),
+                window(
+                    "2026-11-05T12:00:00Z",
+                    "2026-11-09T12:00:00Z",
+                    Some(0.0),
+                    30.0,
+                    Some(70.0),
+                    false,
+                ),
+            ])
+            .expect("the two windows");
+        let ctx = Ctx {
+            history: &history,
+            ..tiny.ctx()
+        };
+        let page = weeks_in(&ctx, &two_weeks(), &all()).unwrap();
+        let cell = page.rows[0].cells[0].as_ref().expect("LB's week");
+        assert_eq!(cell.parts, vec![62.0, 30.0], "62 % then 30 % from 0");
+        assert_eq!(cell.used, 92.0, "the week's total");
+
+        // 70 %, then a model reset to 45 % and up to 80 %: 70 + 35 = 105 %.
+        let dir = tempdir().expect("a second temp history");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        history
+            .append_many(&[
+                // The model window that reset with the week: the record that
+                // makes the 45 % start a model reset, not only `from: Some(45.0)`.
+                WindowRecord {
+                    account: tiny.lb_ref(),
+                    k: LimitKind::WeeklyScoped,
+                    m: Some("Fable".to_string()),
+                    start: Some(utc("2026-10-30T12:00:00Z")),
+                    end: utc("2026-11-06T12:00:00Z"),
+                    final_percent: 50.0,
+                    lost: None,
+                    last_sample: utc("2026-11-06T11:58:00Z"),
+                    plan: Some("Max".to_string()),
+                    uncertain: false,
+                    reset: true,
+                    from: None,
+                },
+                window(
+                    "2026-11-02T00:00:00Z",
+                    "2026-11-06T12:00:00Z",
+                    None,
+                    70.0,
+                    None,
+                    true,
+                ),
+                window(
+                    "2026-11-06T12:00:00Z",
+                    "2026-11-09T12:00:00Z",
+                    Some(45.0),
+                    80.0,
+                    Some(20.0),
+                    false,
+                ),
+            ])
+            .expect("the two windows");
+        let ctx = Ctx {
+            history: &history,
+            ..tiny.ctx()
+        };
+        let page = weeks_in(&ctx, &two_weeks(), &all()).unwrap();
+        let cell = page.rows[0].cells[0].as_ref().expect("LB's week");
+        assert_eq!(cell.parts, vec![70.0, 35.0], "70 % then 45 % to 80 %");
+        assert_eq!(cell.used, 105.0, "the week's total passes 100 %");
+    }
+
+    /// "Of about N possible" counts the typical week's working hours: the
+    /// learned [`working_rhythm`] of the four weeks before the window's reset
+    /// (the same figure the Forecast and Rhythm pages use), counted with
+    /// [`working_hours`] over the seven days before the window's end and divided
+    /// by the 5 h session window. This history has 40 working hours in that
+    /// rhythm, so 8 session windows fit.
+    #[test]
+    fn possible_is_counted_from_the_typical_week() {
+        let tiny = tiny();
+        let dir = tempdir().expect("a temp history");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let start = utc("2026-11-09T12:00:00Z");
+        let end = utc("2026-11-16T12:00:00Z");
+        history
+            .append_many(&[
+                WindowRecord {
+                    account: tiny.lb_ref(),
+                    k: LimitKind::WeeklyAll,
+                    m: None,
+                    start: Some(start),
+                    end,
+                    final_percent: 80.0,
+                    lost: Some(20.0),
+                    last_sample: end - Duration::minutes(2),
+                    plan: Some("Max".to_string()),
+                    uncertain: false,
+                    reset: false,
+                    from: None,
+                },
+                WindowRecord {
+                    account: tiny.lb_ref(),
+                    k: LimitKind::Session,
+                    m: None,
+                    start: Some(utc("2026-11-09T13:00:00Z")),
+                    end: utc("2026-11-09T18:00:00Z"),
+                    final_percent: 50.0,
+                    lost: Some(50.0),
+                    last_sample: utc("2026-11-09T17:58:00Z"),
+                    plan: Some("Max".to_string()),
+                    uncertain: false,
+                    reset: false,
+                    from: None,
+                },
+            ])
+            .expect("the windows");
+        for hour in 0..40 {
+            history
+                .append(&crate::history::TokenRecord {
+                    t: utc("2026-11-09T00:00:00Z") + Duration::hours(hour),
+                    session: "session-1".to_string(),
+                    cwd: "/home/sam/atlas".to_string(),
+                    project: crate::project::ProjectKey::Folder("/home/sam/atlas".to_string()),
+                    model: "claude-opus-5-5".to_string(),
+                    input: 0,
+                    out: 1,
+                    cw: 0,
+                    cr: 0,
+                    answers: 1,
+                    agent_answers: 0,
+                })
+                .expect("a token record");
+        }
+        let ctx = Ctx {
+            history: &history,
+            ..tiny.ctx()
+        };
+
+        let detail = window_detail(&ctx, &tiny.lb().id, end).expect("the detail");
+        let rhythm = working_rhythm(
+            &ctx,
+            &Range {
+                from: start,
+                to: end,
+            },
+        )
+        .expect("the rhythm");
+        let working = working_hours(end - Duration::weeks(1), end, &rhythm, &ctx.zone);
+        assert!(
+            close(working, 40.0),
+            "the typical week is working_hours over the seven days before the window's end: {working}"
+        );
+        assert_eq!(
+            detail.possible_session_windows,
+            Some(8),
+            "40 typical working hours / 5 h windows"
+        );
+    }
+
+    /// Review of T-2: "of about N possible" counts the typical week's working
+    /// hours, but the used windows are the session windows that ended in that
+    /// week. A week with more session windows than the typical week has
+    /// working hours must not print "12 used of about 8 possible in your
+    /// working hours": the view says the used count is above the possible one,
+    /// and the page then words the line "12 used, more than the about 8 your
+    /// usual working hours hold".
+    #[test]
+    fn proof_the_page_does_not_claim_fewer_possible_windows_than_used() {
+        let tiny = tiny();
+        let dir = tempdir().expect("a temp history");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let start = utc("2026-11-09T12:00:00Z");
+        let end = utc("2026-11-16T12:00:00Z");
+        let mut windows = vec![WindowRecord {
+            account: tiny.lb_ref(),
+            k: LimitKind::WeeklyAll,
+            m: None,
+            start: Some(start),
+            end,
+            final_percent: 80.0,
+            lost: Some(20.0),
+            last_sample: end - Duration::minutes(2),
+            plan: Some("Max".to_string()),
+            uncertain: false,
+            reset: false,
+            from: None,
+        }];
+        // Twelve session windows of one percent each, all inside the week.
+        for index in 0..12i64 {
+            let session_end = start + Duration::hours(1 + 5 * index);
+            windows.push(WindowRecord {
+                account: tiny.lb_ref(),
+                k: LimitKind::Session,
+                m: None,
+                start: Some(session_end - Duration::hours(5)),
+                end: session_end,
+                final_percent: 1.0,
+                lost: Some(99.0),
+                last_sample: session_end - Duration::minutes(2),
+                plan: Some("Max".to_string()),
+                uncertain: false,
+                reset: false,
+                from: None,
+            });
+        }
+        history.append_many(&windows).expect("the windows");
+        // The typical week: 40 working hours, so eight 5 h windows.
+        for hour in 0..40 {
+            history
+                .append(&crate::history::TokenRecord {
+                    t: utc("2026-11-09T00:00:00Z") + Duration::hours(hour),
+                    session: "session-1".to_string(),
+                    cwd: "/home/sam/atlas".to_string(),
+                    project: crate::project::ProjectKey::Folder("/home/sam/atlas".to_string()),
+                    model: "claude-opus-5-5".to_string(),
+                    input: 0,
+                    out: 1,
+                    cw: 0,
+                    cr: 0,
+                    answers: 1,
+                    agent_answers: 0,
+                })
+                .expect("a token record");
+        }
+        let ctx = Ctx {
+            history: &history,
+            ..tiny.ctx()
+        };
+
+        let detail = window_detail(&ctx, &tiny.lb().id, end).expect("the detail");
+        assert_eq!(
+            detail.session_windows_used,
+            Some(12),
+            "twelve session windows ended in the week"
+        );
+        assert_eq!(
+            detail.possible_session_windows,
+            Some(8),
+            "40 typical working hours / 5 h windows"
+        );
+        assert!(
+            detail.used_more_than_possible,
+            "the used 5 h windows ({:?}) are above the possible ones ({:?}), so the page must not \
+             print \"12 used of about 8 possible in your working hours\"",
+            detail.session_windows_used, detail.possible_session_windows
+        );
+    }
+
+    /// Review of T-2: a window whose first percent after a reset is unknown
+    /// (the sample after the reset is missing) is marked uncertain, and its
+    /// use is counted from 0 % — it may be too high, not low. The Note must
+    /// say that and must not say the use "may be low".
+    #[test]
+    fn proof_the_note_does_not_call_an_over_counted_use_low() {
+        let tiny = tiny();
+        let dir = tempdir().expect("a temp history");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let start = utc("2026-11-09T12:00:00Z");
+        let end = utc("2026-11-16T12:00:00Z");
+        history
+            .append_many(&[WindowRecord {
+                account: tiny.lb_ref(),
+                k: LimitKind::WeeklyAll,
+                m: None,
+                start: Some(start),
+                end,
+                final_percent: 80.0,
+                lost: Some(20.0),
+                last_sample: end - Duration::minutes(2),
+                plan: Some("Max".to_string()),
+                // The sample after the reset is missing: the window's first
+                // percent is unknown, so its use is counted from 0 %.
+                uncertain: true,
+                reset: false,
+                from: None,
+            }])
+            .expect("the window");
+        let ctx = Ctx {
+            history: &history,
+            ..tiny.ctx()
+        };
+
+        let detail = window_detail(&ctx, &tiny.lb().id, end).expect("the detail");
+        let note = detail.note.clone().unwrap_or_default();
+        assert!(
+            note.contains(
+                "No reading right after the reset; the use is counted from 0 % and may be too high."
+            ),
+            "the note must say the use is counted from 0 % and may be too high: {note:?}"
+        );
+        assert!(
+            !note.contains("may be low"),
+            "the note must not say the use may be low when the window's first percent \
+             is unknown and its use is counted from 0 %: {note:?}"
+        );
+    }
+
+    /// A last reading more than an hour before the reset is the late-reading
+    /// kind of uncertain window: the Note names how early the reading came and
+    /// says the use may be low.
+    #[test]
+    fn the_note_of_a_late_last_reading_says_the_use_may_be_low() {
+        let tiny = tiny();
+        let window = WindowRecord {
+            account: tiny.lb_ref(),
+            k: LimitKind::WeeklyAll,
+            m: None,
+            start: Some(utc("2026-11-09T12:00:00Z")),
+            end: utc("2026-11-16T12:00:00Z"),
+            final_percent: 80.0,
+            lost: Some(20.0),
+            // Two hours before the end: write.rs's late-reading rule.
+            last_sample: utc("2026-11-16T10:00:00Z"),
+            plan: Some("Max".to_string()),
+            uncertain: true,
+            reset: false,
+            from: Some(30.0),
+        };
+
+        let note = window_note(&window, 20.0, false, None).unwrap_or_default();
+        assert!(
+            note.contains("The last reading came 2 h before the reset; the use may be low."),
+            "the note names the early reading and that the use may be low: {note:?}"
+        );
+        assert!(
+            !note.contains("counted from 0 %"),
+            "a known first percent is not counted from 0 %: {note:?}"
+        );
+    }
+
+    /// A window with both kinds of uncertain reading says both: its first
+    /// percent after a reset is unknown and its last reading came early.
+    #[test]
+    fn the_note_of_both_uncertain_kinds_says_both() {
+        let tiny = tiny();
+        let window = WindowRecord {
+            account: tiny.lb_ref(),
+            k: LimitKind::WeeklyAll,
+            m: None,
+            // A reset began it, so `from: None` means the first reading is
+            // missing rather than the ordinary 0 %.
+            start: Some(utc("2026-11-09T12:00:00Z")),
+            end: utc("2026-11-16T12:00:00Z"),
+            final_percent: 80.0,
+            lost: Some(20.0),
+            last_sample: utc("2026-11-16T09:00:00Z"),
+            plan: Some("Max".to_string()),
+            uncertain: true,
+            reset: false,
+            from: None,
+        };
+
+        let note = window_note(&window, 20.0, true, None).unwrap_or_default();
+        assert!(
+            note.contains(
+                "No reading right after the reset; the use is counted from 0 % and may be too high."
+            ),
+            "the note says the first percent is missing: {note:?}"
+        );
+        assert!(
+            note.contains("The last reading came 3 h before the reset; the use may be low."),
+            "the note names the early reading too: {note:?}"
+        );
+    }
+
+    /// The "given back" sentence names which limit was given back: the week's
+    /// own reset when the record is the week, a model's when a scoped reset
+    /// record ends with it.
+    #[test]
+    fn the_note_names_the_limit_that_was_given_back() {
+        let tiny = tiny();
+        let week_start = utc("2026-11-02T12:00:00Z");
+        let end = utc("2026-11-06T12:00:00Z");
+        let reset = |model: Option<&str>| WindowRecord {
+            account: tiny.lb_ref(),
+            k: if model.is_some() {
+                LimitKind::WeeklyScoped
+            } else {
+                LimitKind::WeeklyAll
+            },
+            m: model.map(str::to_string),
+            start: Some(week_start),
+            end,
+            final_percent: 70.0,
+            lost: None,
+            last_sample: end - Duration::minutes(2),
+            plan: Some("Max".to_string()),
+            uncertain: false,
+            reset: true,
+            from: None,
+        };
+
+        let week = window_note(&reset(None), 0.0, false, None).unwrap_or_default();
+        assert!(
+            week.contains(
+                "The week's limit was given back before its reset, so the use before it stays counted."
+            ),
+            "the week's own reset is named: {week:?}"
+        );
+        let model = window_note(&reset(Some("Fable")), 0.0, false, None).unwrap_or_default();
+        assert!(
+            model.contains(
+                "Fable's limit was given back before its reset, so the use before it stays counted."
+            ),
+            "a model's reset names the model: {model:?}"
+        );
+        let together = window_note(&reset(None), 0.0, false, Some("Fable")).unwrap_or_default();
+        assert!(
+            together.contains(
+                "Fable's limit was given back before its reset, so the use before it stays counted."
+            ),
+            "a scoped reset record ending with the week names the model: {together:?}"
+        );
+    }
+
+    /// The detail of a window that a reset began and whose last reading came
+    /// early says both uncertain sentences: the first percent is unknown and
+    /// the use may be too high, and the last reading may make it low.
+    #[test]
+    fn the_detail_of_a_reset_started_window_says_both_uncertain_kinds() {
+        let tiny = tiny();
+        let dir = tempdir().expect("a temp history");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let reset_end = utc("2026-11-09T12:00:00Z");
+        let end = utc("2026-11-12T12:00:00Z");
+        history
+            .append_many(&[
+                WindowRecord {
+                    account: tiny.lb_ref(),
+                    k: LimitKind::WeeklyAll,
+                    m: None,
+                    start: Some(utc("2026-11-02T12:00:00Z")),
+                    end: reset_end,
+                    final_percent: 70.0,
+                    lost: None,
+                    last_sample: reset_end - Duration::minutes(2),
+                    plan: Some("Max".to_string()),
+                    uncertain: false,
+                    reset: true,
+                    from: None,
+                },
+                WindowRecord {
+                    account: tiny.lb_ref(),
+                    k: LimitKind::WeeklyAll,
+                    m: None,
+                    start: Some(reset_end),
+                    end,
+                    final_percent: 80.0,
+                    lost: Some(20.0),
+                    last_sample: end - Duration::hours(2),
+                    plan: Some("Max".to_string()),
+                    uncertain: true,
+                    reset: false,
+                    from: None,
+                },
+            ])
+            .expect("the two windows");
+        let ctx = Ctx {
+            history: &history,
+            ..tiny.ctx()
+        };
+
+        let detail = window_detail(&ctx, &tiny.lb().id, end).expect("the detail");
+        let note = detail.note.clone().unwrap_or_default();
+        assert!(
+            note.contains(
+                "No reading right after the reset; the use is counted from 0 % and may be too high."
+            ),
+            "the reset began the window and its first percent is unknown: {note:?}"
+        );
+        assert!(
+            note.contains("The last reading came 2 h before the reset; the use may be low."),
+            "the last reading came early too: {note:?}"
+        );
+    }
+
+    /// A weekly reset that a scoped reset ended with names the model in the
+    /// detail's Note, as the history's scoped record tells them apart.
+    #[test]
+    fn the_detail_names_the_model_that_reset_with_the_week() {
+        let tiny = tiny();
+        let dir = tempdir().expect("a temp history");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let end = utc("2026-11-06T12:00:00Z");
+        history
+            .append_many(&[
+                WindowRecord {
+                    account: tiny.lb_ref(),
+                    k: LimitKind::WeeklyAll,
+                    m: None,
+                    start: Some(utc("2026-11-02T00:00:00Z")),
+                    end,
+                    final_percent: 70.0,
+                    lost: None,
+                    last_sample: end - Duration::minutes(2),
+                    plan: Some("Max".to_string()),
+                    uncertain: false,
+                    reset: true,
+                    from: None,
+                },
+                WindowRecord {
+                    account: tiny.lb_ref(),
+                    k: LimitKind::WeeklyScoped,
+                    m: Some("Fable".to_string()),
+                    start: Some(utc("2026-10-30T00:00:00Z")),
+                    end,
+                    final_percent: 50.0,
+                    lost: None,
+                    last_sample: end - Duration::minutes(2),
+                    plan: Some("Max".to_string()),
+                    uncertain: false,
+                    reset: true,
+                    from: None,
+                },
+            ])
+            .expect("the two reset records");
+        let ctx = Ctx {
+            history: &history,
+            ..tiny.ctx()
+        };
+
+        let detail = window_detail(&ctx, &tiny.lb().id, end).expect("the detail");
+        let note = detail.note.clone().unwrap_or_default();
+        assert!(
+            note.contains(
+                "Fable's limit was given back before its reset, so the use before it stays counted."
+            ),
+            "the scoped reset record names the model: {note:?}"
+        );
+        assert!(
+            !note.contains("The week's limit was given back"),
+            "a model reset is not worded as the week's own reset: {note:?}"
+        );
+    }
+
     /// The host filter applies to the summary's tokens, API value and top
     /// projects: host vega has neither of atlas's records, so none of atlas's
     /// tokens is in the week.

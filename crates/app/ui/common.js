@@ -685,6 +685,12 @@ function hoursText(value) {
   return Number.isInteger(rounded) ? `${rounded} h` : `${rounded.toFixed(1)} h`;
 }
 
+// The switches of a span by who made them, the one text of the statistics
+// pages (Overview's KPI and the Weeks summary).
+function switchText(switches) {
+  return `you ${switches.user} · cli ${switches.cli} · auto-burn ${switches.auto} · agents ${switches.agent} · external ${switches.external}`;
+}
+
 // "27 %" or "21.9 %", one decimal only when the value has one.
 function percentText(value) {
   if (typeof value !== "number" || !Number.isFinite(value)) {
@@ -1074,6 +1080,7 @@ export {
   dateTimeText,
   weekdayTimeText,
   hoursText,
+  switchText,
   percentText,
   amountText,
   amountNode,

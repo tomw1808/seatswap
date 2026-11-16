@@ -18,6 +18,7 @@ import {
   legendItem,
   percentText,
   shortDate,
+  switchText,
 } from "../../common.js";
 import { lines, stackedColumns } from "../../charts.js";
 
@@ -43,10 +44,6 @@ function projectColours(weeks) {
     }
   }
   return colours;
-}
-
-function switchText(switches) {
-  return `you ${switches.user} · cli ${switches.cli} · auto-burn ${switches.auto} · agents ${switches.agent} · external ${switches.external}`;
 }
 
 // A KPI value with its percent beside the money, as the mock-up writes it.
@@ -179,7 +176,7 @@ export async function show(container, env) {
           tip: `${name} · week from ${label} | expired ${percentText(
             account.expiredPercent
           )} = ${amountTip(account.expired, currency)}${
-            account.uncertain ? " | uncertain: seatswap was off at the reset" : ""
+            account.uncertain ? " | uncertain: a reading near a reset is missing" : ""
           }`,
         });
       }

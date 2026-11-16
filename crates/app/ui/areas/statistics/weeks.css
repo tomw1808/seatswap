@@ -208,3 +208,9 @@
   display: flex;
 }
 
+/* The detail's Expired unused line when the week was mostly unused: the
+   mock-up's red, the same meaning as `stats-kpi-value-bad` on Overview. */
+.stats-week-bad {
+  color: var(--danger);
+}
+

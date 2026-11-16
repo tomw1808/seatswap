@@ -21,6 +21,7 @@ import {
   percentText,
   shortDate,
   shortPercent,
+  switchText,
   tokens,
   valueTip,
 } from "../../common.js";
@@ -34,12 +35,43 @@ function accountLabel(row, env) {
   return label;
 }
 
-function switchLine(switches) {
-  return `you ${switches.user} · cli ${switches.cli} · auto-burn ${switches.auto} · agents ${switches.agent} · external ${switches.external}`;
+// The earliest time of a curve's points, for the history mark's "before the
+// chart's first column" rule. A point the chart cannot read is left to the
+// chart, which names it; here only the readable times count.
+function firstPointTime(points) {
+  let first = null;
+  for (const point of points) {
+    const time = Date.parse(String(point[0]));
+    if (Number.isNaN(time)) continue;
+    if (first === null || time < first) first = time;
+  }
+  return first;
+}
+
+// Item 31: on a chart of subscription values, a mark at the history's start,
+// "history from <date> · no subscription value before". Before the chart's
+// first column there is nothing to mark; absent or null, no mark.
+function historyMark(env, points) {
+  if (typeof env.historyStart !== "string" || env.historyStart === "") return [];
+  const start = Date.parse(env.historyStart);
+  if (Number.isNaN(start)) {
+    throw new Error(`the history start ${JSON.stringify(env.historyStart)} is not a time`);
+  }
+  const first = firstPointTime(points);
+  if (first === null || start < first) return [];
+  return [
+    {
+      at: env.historyStart,
+      label: `history from ${dateText(env.historyStart)} · no subscription value before`,
+    },
+  ];
 }
 
 export async function show(container, env) {
   const data = await env.call("stats_weeks");
+  if (typeof data.now !== "string" || Number.isNaN(Date.parse(data.now))) {
+    throw new Error("stats_weeks returned no time for the now mark");
+  }
   clear(container);
 
   const state = {
@@ -71,6 +103,12 @@ export async function show(container, env) {
 
   function summaryCard() {
     const summary = state.summary;
+    if (!Array.isArray(summary.perAccountPercent)) {
+      throw new Error("the week summary has no perAccountPercent");
+    }
+    if (typeof summary.switchesTotal !== "number") {
+      throw new Error("the week summary has no switchesTotal");
+    }
     const reason = summary.moneyMissing;
     const missingTitle = typeof reason === "string" ? reason : undefined;
     const usedPercent = h("span", {
@@ -100,14 +138,24 @@ export async function show(container, env) {
       h("div", { class: "stats-mini-kpi" }, [
         h("span", { class: "stats-kpi-label", text: "Expired" }),
         h("span", { class: "stats-kpi-value" }, [expiredMoney]),
-        h("span", { class: "stats-kpi-sub", text: "quota left at the resets" }),
+        h("span", {
+          class: "stats-kpi-sub",
+          text:
+            typeof summary.expiredPercentOfPaid === "number"
+              ? `${percentText(summary.expiredPercentOfPaid)} of value`
+              : "—",
+          title: missingTitle,
+        }),
       ])
     );
     kpis.appendChild(
       h("div", { class: "stats-mini-kpi" }, [
         h("span", { class: "stats-kpi-label", text: "Blocked" }),
         h("span", { class: "stats-kpi-value", text: hoursText(summary.blockedHours) }),
-        h("span", { class: "stats-kpi-sub", text: "working hours" }),
+        h("span", {
+          class: "stats-kpi-sub",
+          text: `${summary.switchesTotal} ${summary.switchesTotal === 1 ? "switch" : "switches"}`,
+        }),
       ])
     );
     card.appendChild(kpis);
@@ -115,16 +163,14 @@ export async function show(container, env) {
     const apiValue = amountNode(summary.values.api, summary.values.apiCurrency);
     apiValue.title = valueTip(summary.values, "api", "in this week");
     const beforeTitle = missingTitle || undefined;
+    const tokenLine = h("span", {}, [
+      `${tokens(summary.tokens.out)} · worth `,
+      apiValue,
+      " at API prices",
+    ]);
     const list = h("dl", { class: "stats-kv" });
     for (const [term, value] of [
-      ["Switches", switchLine(summary.switches)],
-      [
-        "Tokens",
-        `out ${tokens(summary.tokens.out)} · in ${tokens(summary.tokens.input)} · cache read ${tokens(
-          summary.tokens.cr
-        )} · written ${tokens(summary.tokens.cw)}`,
-      ],
-      ["API value", apiValue],
+      ["Tokens", tokenLine],
       [
         "Week before",
         h("span", {
@@ -133,26 +179,27 @@ export async function show(container, env) {
               ? "—"
               : `${summary.usedChangePercent >= 0 ? "+" : ""}${percentText(
                   summary.usedChangePercent
-                )}`,
+                )} used`,
           title: beforeTitle,
         }),
       ],
+      ["Switches", switchText(summary.switches)],
     ]) {
       list.appendChild(h("dt", { text: term }));
       list.appendChild(h("dd", {}, value));
     }
     card.appendChild(list);
 
-    card.appendChild(h("p", { class: "stats-detail-label", text: "Used per account" }));
-    if (summary.perAccount.length === 0) {
+    card.appendChild(h("p", { class: "stats-detail-label", text: "Per account" }));
+    if (summary.perAccountPercent.length === 0) {
       card.appendChild(emptyLine("no account week in this week"));
     } else {
       const perAccount = h("div", { class: "stats-chipline" });
-      for (const [id, amount] of summary.perAccount) {
+      for (const [id, percent] of summary.perAccountPercent) {
         perAccount.appendChild(
           h("span", { class: "stats-account-line" }, [
             accountName(env.accounts, id),
-            h("span", {}, amountNode(amount, env.currency)),
+            h("span", { text: percentText(percent) }),
           ])
         );
       }
@@ -191,51 +238,63 @@ export async function show(container, env) {
 
   function windowCard(detail) {
     const card = h("div", { class: "stats-detail-body" });
-    const kpis = h("div", { class: "stats-mini-kpis" });
-    kpis.appendChild(
-      h("div", { class: "stats-mini-kpi" }, [
-        h("span", { class: "stats-kpi-label", text: "Used" }),
-        h("span", { class: "stats-kpi-value", text: percentText(detail.used) }),
-        h("span", { class: "stats-kpi-sub" }, [amountNode(detail.usedMoney, env.currency)]),
-      ])
-    );
-    kpis.appendChild(
-      h("div", { class: "stats-mini-kpi" }, [
-        h("span", { class: "stats-kpi-label", text: "Expired" }),
-        h("span", { class: "stats-kpi-value", text: percentText(detail.expired) }),
-        h("span", { class: "stats-kpi-sub" }, [amountNode(detail.expiredMoney, env.currency)]),
-      ])
-    );
-    kpis.appendChild(
-      h("div", { class: "stats-mini-kpi" }, [
-        h("span", { class: "stats-kpi-label", text: "Blocked after 100 %" }),
-        h("span", { class: "stats-kpi-value", text: hoursText(detail.blockedHoursAfter) }),
-        h("span", { class: "stats-kpi-sub", text: "working hours" }),
-      ])
-    );
-    card.appendChild(kpis);
-
     const list = h("dl", { class: "stats-kv" });
     const rows = [
-      ["Reached 100 %", detail.reached100At === null ? "not reached" : dateTimeText(detail.reached100At)],
-      ["5 h windows", detail.sessionWindowsUsed === null ? "—" : String(detail.sessionWindowsUsed)],
+      [
+        "Used",
+        h("span", {}, [
+          h("b", { text: percentText(detail.used) }),
+          " = ",
+          amountNode(detail.usedMoney, env.currency),
+        ]),
+      ],
+      [
+        "Expired unused",
+        h("span", { class: detail.used < 80 ? "stats-week-bad" : undefined }, [
+          percentText(detail.expired),
+          " = ",
+          amountNode(detail.expiredMoney, env.currency),
+        ]),
+      ],
+      [
+        "Reached 100 %",
+        detail.reached100At === null
+          ? "not reached"
+          : `${dateTimeText(detail.reached100At)} · blocked ${hoursText(
+              detail.blockedHoursAfter
+            )} after that`,
+      ],
+    ];
+    if (detail.sessionWindowsUsed !== null) {
+      rows.push([
+        "5 h windows",
+        typeof detail.possibleSessionWindows === "number"
+          ? detail.usedMoreThanPossible
+            ? `${detail.sessionWindowsUsed} used, more than the about ${detail.possibleSessionWindows} your usual working hours hold`
+            : `${detail.sessionWindowsUsed} used of about ${detail.possibleSessionWindows} possible in your working hours`
+          : `${detail.sessionWindowsUsed} used`,
+      ]);
+    }
+    rows.push(
       [
         "Switches",
-        `into or out ${detail.switchesInOut} · auto-burn ${detail.switchesAuto}`,
+        `${detail.switchesInOut} into or out of it · ${detail.switchesAuto} by auto-burn`,
       ],
       [
         "Last reading",
         `${Math.round(detail.lastSampleBeforeEndSecs / 60)} min before the reset`,
       ],
-      ["Certainty", detail.uncertain ? "uncertain: seatswap was off at the reset" : "fresh"],
-    ];
+      ["Note", detail.note === null || detail.note === undefined ? "—" : detail.note]
+    );
     for (const [term, value] of rows) {
       list.appendChild(h("dt", { text: term }));
       list.appendChild(h("dd", {}, value));
     }
     card.appendChild(list);
 
-    card.appendChild(h("p", { class: "stats-detail-label", text: "Curve of the week" }));
+    card.appendChild(
+      h("p", { class: "stats-detail-label", text: "Percent of the week, hour by hour" })
+    );
     const chart = h("div", { class: "stats-detail-chart" });
     if (detail.curve.length === 0) {
       chart.appendChild(emptyLine("no reading in this window"));
@@ -253,6 +312,7 @@ export async function show(container, env) {
           ],
           yMax: 100,
           ySuffix: " %",
+          hlines: [{ y: 100, label: "limit" }],
         })
       );
     }
@@ -263,16 +323,27 @@ export async function show(container, env) {
   function detailHead() {
     const head = h("div", { class: "ch" });
     if (state.window !== null) {
-      head.appendChild(h("span", { class: "t", text: "Week ending" }));
-      head.appendChild(h("span", { class: "stats-plan", text: dateTimeText(state.window.end) }));
       head.appendChild(accountName(env.accounts, state.window.id));
+      head.appendChild(
+        h("span", { class: "t", text: `Week from ${dateText(state.window.start)}` })
+      );
+      const meta = h("span", { class: "stats-plan" });
+      if (state.window.plan) meta.appendChild(document.createTextNode(state.window.plan));
+      if (typeof state.window.weeklyPrice === "number") {
+        if (meta.textContent !== "") meta.appendChild(document.createTextNode(" · "));
+        meta.appendChild(amountNode(state.window.weeklyPrice, env.currency));
+        meta.appendChild(document.createTextNode(" a week"));
+      }
+      if (meta.textContent !== "") head.appendChild(meta);
       if (state.window.uncertain) {
         head.appendChild(h("span", { class: "stats-tag stats-tag-warn", text: "uncertain" }));
       }
     } else if (state.summary !== null) {
-      head.appendChild(h("span", { class: "t", text: "Summary" }));
       head.appendChild(
-        h("span", { class: "stats-plan", text: `week from ${dateText(state.summary.week)}` })
+        h("span", {
+          class: "t",
+          text: `Summary · week from ${dateText(state.summary.week)}`,
+        })
       );
       const names = h("span", { class: "s" });
       for (const [index, view] of env.accounts.entries()) {
@@ -294,16 +365,23 @@ export async function show(container, env) {
     gridCard.appendChild(
       h("div", { class: "ch" }, [
         h("span", { class: "t", text: "Every weekly window" }),
-        h("span", { class: "s", text: "a click on a date shows the week; on a cell the account's week" }),
+        h("span", {
+          class: "s",
+          text: "the filled part was used, the hatched part expired · a click on a week shows it",
+        }),
       ])
     );
     const gridBody = h("div", { class: "stats-grid-body" });
-    const headers = data.weekStarts.map((week) => ({
-      label: shortDate(week),
-      tip: `Summary of the week from ${dateText(week)}`,
-      selected: state.summaryWeek === week,
-      onClick: () => void selectSummary(week),
-    }));
+    const headers = data.weekStarts.map((week, index) => {
+      const current = lastIsCurrent && index === data.weekStarts.length - 1;
+      return {
+        label: current ? "now" : shortDate(week),
+        tip: current ? "the running week" : `Summary of the week from ${dateText(week)}`,
+        selected: !current && state.summaryWeek === week,
+        current,
+        onClick: current ? undefined : () => void selectSummary(week),
+      };
+    });
     if (!lastIsCurrent) {
       headers.push({ label: "now", tip: "the running week", current: true });
     }
@@ -313,13 +391,21 @@ export async function show(container, env) {
       const cells = row.cells.map((cell, index) => {
         if (!cell) return null;
         const week = data.weekStarts[index];
+        const parts =
+          Array.isArray(cell.parts) && cell.parts.length > 1
+            ? ` (${cell.parts.map((part) => percentText(part)).join(" + ")})`
+            : "";
         const tip = `${accountNameText(env.accounts, row.id)} · week from ${dateText(week)} | used ${percentText(
           cell.used
-        )} · expired ${percentText(cell.expired)} = ${amountTip(cell.expiredMoney, env.currency)}${
-          cell.full ? " | full" : ""
-        }${cell.uncertain ? " | uncertain: seatswap was off at the reset" : ""}`;
+        )}${parts} · expired ${percentText(cell.expired)} = ${amountTip(
+          cell.expiredMoney,
+          env.currency
+        )}${cell.full ? " | full" : ""}${
+          cell.uncertain ? " | uncertain: a reading near a reset is missing" : ""
+        }`;
         return {
-          fill: cell.used,
+          total: cell.used,
+          parts: cell.parts,
           color,
           textColor: contrastText(color),
           hatch: true,
@@ -327,14 +413,14 @@ export async function show(container, env) {
           tip,
           full: cell.full,
           uncertain: cell.uncertain,
-          onClick: () => void selectWindow(row, cell),
+          onClick: () => void selectWindow(row, cell, week),
         };
       });
       const nowCell =
         typeof row.nowPercent !== "number"
           ? null
           : {
-              fill: row.nowPercent,
+              total: row.nowPercent,
               color,
               textColor: contrastText(color),
               hatch: true,
@@ -373,7 +459,10 @@ export async function show(container, env) {
     recentCard.appendChild(
       h("div", { class: "ch" }, [
         h("span", { class: "t", text: "Last week and this one" }),
-        h("span", { class: "s", text: "weekly percent over the last 14 days" }),
+        h("span", {
+          class: "s",
+          text: "percent of each account's week; a drop to 0 is its reset",
+        }),
         h("span", { class: "sp" }),
         h(
           "span",
@@ -386,6 +475,7 @@ export async function show(container, env) {
     if (data.recent.length === 0) {
       recentBody.appendChild(emptyLine("no week in the range"));
     } else {
+      const recentPoints = data.recent.flatMap((curve) => curve.points);
       recentBody.appendChild(
         lines({
           series: data.recent.map((curve) => {
@@ -401,6 +491,7 @@ export async function show(container, env) {
           }),
           yMax: 100,
           ySuffix: " %",
+          marks: [{ at: data.now, label: "now" }, ...historyMark(env, recentPoints)],
         })
       );
     }
@@ -436,7 +527,7 @@ export async function show(container, env) {
     }
   }
 
-  async function selectWindow(row, cell) {
+  async function selectWindow(row, cell, week) {
     const token = ++state.detailToken;
     try {
       const detail = await env.call("stats_window_detail", {
@@ -446,7 +537,7 @@ export async function show(container, env) {
       if (token !== state.detailToken) return;
       state.window = detail;
       state.summary = null;
-      state.summaryWeek = null;
+      state.summaryWeek = week;
       state.detailError = null;
       state.detailEmpty = false;
       paint();

@@ -294,7 +294,12 @@
 .chart-grid {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  /* A week whose windows total more than 100 % grows into this headroom; the
+     row gap holds the largest overshoot in the grid (charts.js sets
+     --chart-grid-over from the cells' totals). The 42px is `.chart-cell`'s
+     height, the scale of a percent. */
+  gap: calc(3px + var(--chart-grid-over, 0) * 0.42px);
+  padding-top: calc(var(--chart-grid-over, 0) * 0.42px);
   font-size: 11px;
 }
 
@@ -351,7 +356,9 @@
   position: relative;
   height: 42px;
   border-radius: 6px;
-  overflow: hidden;
+  /* The bar of a week with a reset may pass 100 %: it grows above the cell
+     into the row gap, while the 100 % line stays at the cell's top. */
+  overflow: visible;
   display: flex;
   align-items: flex-end;
   justify-content: center;
@@ -384,11 +391,50 @@
   background: var(--chart-cell-color, var(--focus));
 }
 
+/* A week with a reset: one part per window, oldest first from the bottom, and
+   the bar's 100 % line at the cell's top even when the sum passes it. */
+.chart-cell-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  flex-direction: column-reverse;
+}
+
+.chart-cell-part {
+  display: block;
+  width: 100%;
+  min-height: 0;
+  background: var(--chart-cell-color, var(--focus));
+  border-top: 1px solid var(--card);
+}
+
+.chart-cell-limit {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 100%;
+  border-top: 1px dashed var(--border-strong);
+  pointer-events: none;
+}
+
+/* A week block opens a detail: the pointer says so, no outline marks it (every
+   cell is clickable, and an outline looks like the uncertain marker). */
+.chart-cell.chart-click {
+  cursor: pointer;
+}
+
 .chart-cell-text {
   position: relative;
   z-index: 1;
   padding-bottom: 4px;
   font-variant-numeric: tabular-nums;
+}
+
+.chart-grid .chart-cell-text {
+  font-size: 11px;
+  font-weight: 600;
 }
 
 .chart-cell-empty {
@@ -541,6 +587,28 @@
   padding-left: 0;
   padding-right: 4px;
   transform: translateX(-100%);
+}
+
+/* A horizontal reference line of a lines chart (the window's 100 % line). */
+.chart-hline {
+  position: absolute;
+  left: 0;
+  right: 0;
+  border-top: 1px dashed var(--border-strong);
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* Under its line at the left: a line at the chart's top (the 100 % limit)
+   leaves no room above it, and a week's curve starts low on the left. */
+.chart-hline-label {
+  position: absolute;
+  left: 4px;
+  top: 1px;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 13px;
+  white-space: nowrap;
 }
 
 .stats-fc-none .chart-lanes-label {

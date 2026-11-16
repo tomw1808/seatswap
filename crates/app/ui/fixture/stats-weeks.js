@@ -62,6 +62,18 @@ function recentCurve(account) {
     .map(([time, value]) => [new Date(time).toISOString(), value]);
 }
 
+// The windows of one account week, oldest first. One made-up week has a reset:
+// LB's 2 Nov week is 62 % then 35 % from 0, 97 % in total. LB's 26 Oct week
+// holds a window that used nothing, so the page must not draw a 1 px part for
+// it while its total and tooltip still count it.
+function partsFor(account, index) {
+  const used = account.used[index];
+  if (used === null) return [];
+  if (account.abbr === "LB" && index === 11) return [62, 35];
+  if (account.abbr === "LB" && index === 10) return [94, 0];
+  return [used];
+}
+
 export function weeks(query) {
   const { indexes, chosen } = chosenAccounts(query);
   return {
@@ -79,6 +91,8 @@ export function weeks(query) {
         return {
           end: resetEnd(account, index),
           used,
+          total: used,
+          parts: partsFor(account, index),
           expired: 100 - used,
           expiredMoney: expiredMoney(account, index),
           full: used >= 100,
@@ -89,6 +103,7 @@ export function weeks(query) {
     })),
     blocked: indexes.map((index) => BLOCKED[index]),
     recent: chosen.map((account) => ({ id: account.id, points: recentCurve(account) })),
+    now: new Date(NOW_MS).toISOString(),
   };
 }
 
@@ -160,7 +175,10 @@ export function weekSummary(query, week) {
     moneyMissing: paid > 0 ? null : "no finished, priced weekly window in this week",
     blockedHours: BLOCKED[index],
     switches,
-    perAccount: accounts.map((account) => [account.id, account.used ?? 0]),
+    switchesTotal:
+      switches.user + switches.cli + switches.auto + switches.agent + switches.external,
+    perAccountPercent: accounts.map((account) => [account.id, account.usedPercent]),
+    expiredPercentOfPaid: paid > 0 ? (expired / paid) * 100 : null,
     topProjects: topProjects(index, used, true),
     tokens,
     values: fixtureValues(out > 0 ? (out / 1000000) * API_PER_M : null, null),
@@ -185,6 +203,24 @@ function windowCurve(account, index, reachedAt) {
   return points;
 }
 
+// The mock-up's notes for the weeks its detail card shows; every other week
+// gets the note its numbers state.
+const NOTES = {
+  "LB:11": "Second week with auto-burn. 3 % expired at the reset on Monday 17:00.",
+  "AC:8": "51 % expired. All work that week went to PR and LB; AC was opened on two days only.",
+  "PR:5": "First week of this subscription.",
+  "LB:1": "AC was full that week too: 14 h with no usable account.",
+};
+
+function noteFor(account, index) {
+  const note = NOTES[`${account.abbr}:${index}`];
+  if (note !== undefined) return note;
+  const expiredPercent = 100 - account.used[index];
+  return expiredPercent > 0
+    ? `${fixtureWholePercent(expiredPercent)} expired at its reset.`
+    : "Nothing expired at its reset.";
+}
+
 export function windowDetail(query, accountId, end) {
   const { indexes, chosen } = chosenAccounts(query);
   const account = chosen.find((candidate) => candidate.id === accountId);
@@ -197,16 +233,36 @@ export function windowDetail(query, accountId, end) {
     reached100At = new Date(weekTime(index) + 4 * DAY + 10 * HOUR).toISOString();
   }
   const switches = switchesOf([index]);
+  const windowEnd = Date.parse(resetEnd(account, index));
+  // A typical week holds 24 windows; LB's 26 Oct week is the demo of a week
+  // that used more windows (12) than its usual working hours hold (8).
+  const possibleSessionWindows =
+    account.abbr === "PR" ? null : account.abbr === "LB" && index === 10 ? 8 : 24;
+  const sessionWindowsUsed =
+    possibleSessionWindows === null
+      ? null
+      : account.abbr === "LB" && index === 10
+        ? 12
+        : used > 0
+          ? Math.round(used / (account.abbr === "AC" ? 8 : 10))
+          : 0;
   return {
     id: account.id,
+    start: new Date(windowEnd - 7 * DAY).toISOString(),
     end: resetEnd(account, index),
+    plan: account.plan,
+    weeklyPrice: (account.price * 12) / 52,
     used,
     usedMoney: usedMoney(account, index),
     expired: 100 - used,
     expiredMoney: expiredMoney(account, index),
     reached100At,
     blockedHoursAfter: reached100At !== null ? BLOCKED[index] : 0,
-    sessionWindowsUsed: used > 0 ? Math.round(used / 10) : 0,
+    sessionWindowsUsed,
+    possibleSessionWindows,
+    usedMoreThanPossible:
+      possibleSessionWindows !== null && sessionWindowsUsed > possibleSessionWindows,
+    note: noteFor(account, index),
     switchesInOut: switches.user + switches.cli + switches.auto + switches.agent + switches.external,
     switchesAuto: switches.auto,
     lastSampleBeforeEndSecs: 120,
