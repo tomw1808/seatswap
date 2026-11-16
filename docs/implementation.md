@@ -1852,8 +1852,10 @@ pages use. Exported: `PALETTE`, `TRAY_GREY`, `LEVEL_COLORS`, `TAURI_GLOBAL`, `HA
 `clamp`, `clone`, `errorMessage`, `isColor`, `hexToRgb`, `rgba`, `rgbToHex`, `mixHex`,
 `relativeLuminance`, `contrastText`, `limitLevel`, `shortPercent`, `clear`, `setStyles`, `applyProps`,
 `appendChildren`, `h`, `banner`, `applyTheme`, `followTheme`, `invoke`, `listen`, `money`, `tokens`, `textInput`,
-`selectInput`, `switchButton`, `sanitizeAbbrChar`, `abbrLetterBoxes`, `colorSwatches`, `hexField`,
-`iconPreview`. `followTheme(getSetting)` is the one system light/dark follower both pages call; it
+`selectInput`, `switchControl`, `sanitizeAbbrChar`, `abbrLetterBoxes`, `colorSwatches`, `hexField`,
+`iconPreview`. `switchControl` is the one switch for a boolean setting: the window's `.sws` with its
+On/Off word (or `{ words: false }` without it) and, with `{ popup: true }`, the pop-up's `.switch`;
+the caller saves and reverts it through `set`. `followTheme(getSetting)` is the one system light/dark follower both pages call; it
 applies `applyTheme("system")` on a change while `getSetting()` is "system". `money(amount, currency)` gives `"1,234 EUR"` for `(1234, "EUR")` and two decimals
 below 10, `"6.47 EUR"`, and throws on a negative or non-finite amount or a currency that is not
 three capital letters; `tokens(n)` returns `"12.4 M"`, `"845 k"` or `"0"` and throws on an invalid
@@ -3203,8 +3205,8 @@ key seatswap writes in Claude Code's settings; one page edits `settings.statusli
 | `core::atomic` (extended) | `write_atomic` writes through a symbolic link and keeps the link |
 | `app::statusline::render` (extended) | the three new segments, their field path table, spans, the one fitting |
 | `app::statusline` (extended) | the preview's lines and scenarios, the recorder of field names |
-| `app::gui::window` (extended) | the eight `statusline_*` commands, the install record's two decisions |
-| `app::gui::autostart` (extended) | `console_program`: the `seatswap` program beside the running one |
+| `app::gui::window` (extended) | the nine `statusline_*` commands, the install record's two decisions |
+| `app::gui::autostart` (extended) | `running_program` and `program_beside` (`EXE_SUFFIX`): the console and tray programs beside the running one |
 | `app::ui/areas/statusline.js` | the Status line area: palette, zones, options, preview, install card, recorder |
 
 ## store.rs additions (step C4)
@@ -3251,6 +3253,7 @@ pub(crate) fn render_spans<Tz: TimeZone>(config: &StatuslineConfig, payload: &Pa
 pub(crate) fn fitted_line<Tz: TimeZone>(config: &StatuslineConfig, payload: &Payload, facts: &Facts,
     width: Option<u16>, tz: &Tz) -> FittedLine where Tz::Offset: Display;
 pub(crate) fn ansi(spans: &[Span]) -> String;
+fn zone_gap(left_width: usize, right_width: usize) -> usize;
 pub(crate) fn at_path<'a>(raw: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value>;
 pub(crate) fn visible_width(text: &str) -> usize;   // ANSI stripped, each code point by char_width
 ```
@@ -3263,14 +3266,15 @@ step B: `\x1b[1m` for bold, then the background, then the foreground, the text a
 with no colour and no bold is written as plain text. An empty list of spans is the empty line.
 
 The fitting itself is step B's rule: the drop numbers of the pieces that have a value, sorted and
-deduplicated, are raised one at a time until `fits` holds — left width + 2 + right width + margin ≤
-width — and every number at or below the last level is dropped. Without a width nothing is dropped
-and the right zone follows the left after two spaces. A right zone that is empty leaves no gap; an
-empty left zone puts the right zone flush with `width - margin`; otherwise the gap is
-`width - margin - left - right`, at least 2. `visible_width` strips ANSI CSI sequences and counts a
-code point as 2 columns in the East Asian wide/fullwidth and emoji ranges, 0 for a combining mark or
-a zero-width format character, else 1 — an approximation kept without a dependency, so a code point
-outside those tables counts as one column.
+deduplicated, are raised one at a time until `fits` holds — left width + `zone_gap` + right width +
+margin ≤ width — and every number at or below the last level is dropped. Without a width nothing is
+dropped and the right zone follows the left after the same gap. `zone_gap` is 2 when both zones
+print something and 0 when one of them is empty, in `fits` and in the drawn span alike, so an empty
+zone leaves the other flush with `width - margin` (or with the line's start without a width).
+Otherwise the gap is `width - margin - left - right`, at least 2. `visible_width` strips ANSI CSI
+sequences and counts a code point as 2 columns in the East Asian wide/fullwidth and emoji ranges, 0
+for a combining mark or a zero-width format character, else 1 — an approximation kept without a
+dependency, so a code point outside those tables counts as one column.
 
 ## the field path table and the three new segments (step C4)
 
@@ -3302,7 +3306,9 @@ a whole number exactly (`120`) and otherwise the `integer_percent` rounding. The
 the payload's raw JSON (`Payload.raw`), which is the whole payload Claude Code sent (`Null` when
 standard input was not JSON): the typed `Payload` fields did not grow a `context_window` or a `cost`
 struct, because the path table and `at_path` already read any shape. Before a session's first answer
-`used_percentage` is `null` (nothing printed) and `total_cost_usd` is a whole `0` (`$0.00`).
+`used_percentage` is `null` (nothing printed) and `total_cost_usd` is a whole `0` (`$0.00`). A `Text`
+segment whose `text` is absent or the empty string is no value either: it prints nothing, prefix and
+suffix included.
 
 ## the preview (step C4)
 
@@ -3315,25 +3321,37 @@ pub(crate) struct PreviewLine { pub width: u16, pub spans: Vec<Span>,
                                 pub dropped: Vec<u8>, pub note: String }
 pub(crate) fn preview_lines<Tz: TimeZone>(config: &StatuslineConfig, payload: &Payload, facts: &Facts,
     widths: &[u16], scenario: Scenario, tz: &Tz) -> Result<Vec<PreviewLine>, String>;
+pub(crate) fn preview_payload(home: &std::path::Path) -> Payload;
+const PREVIEW_BRANCH: &str = "main";
 ```
 
 `preview_lines` renders the given config — never the stored one — once per width, in the width
 order it was given. An empty list is `the preview needs at least one width`, and a width of 0 is
-`a preview width must be at least 1 column; 0 cannot show a line`. A scenario changes one value of
-the facts and nothing else: `Live` takes them as they are, `NearFull` sets the week to 97 %,
-`Blocked` to 100 % (each keeps the week's reset), `NoSessionLimit` drops the 5 h values. `dropped`
-is the drop numbers the fitting removed; `note` is built from the kinds those numbers removed, one
-name per kind, in drop order then line order: `everything fits`, or
+`a preview width must be at least 1 column; 0 cannot show a line`; the window command does not
+repeat those checks. A scenario changes one value of the facts and nothing else: `Live` takes them
+as they are, `NearFull` sets the week to 97 %, `Blocked` to 100 % (each keeps the week's reset),
+`NoSessionLimit` drops the 5 h values. The preview's session is made up: `preview_lines` sets the
+branch to `PREVIEW_BRANCH` (`main`) before the scenario's change, because the payload's folder does
+not exist on the machine and `.git/HEAD` has no branch to read. `dropped` is the drop numbers the
+fitting removed; `note` is built from the kinds those numbers removed, one label per kind from the
+store's one kind table (`kind.spec().label`), in drop order then line order: `everything fits`, or
 `{names joined with ", " and " and "} {is|are} dropped`
 (`5 h reset, week reset and 5 h percent are dropped`). A segment without a value is not a piece the
-fitting can drop, so the note never names it (`kind_name` is the page's word for each kind).
+fitting can drop, so the note never names it. The note and the page therefore use the same word for
+a kind (`git branch`, not `branch`).
 
-The window's `statusline_preview` builds the facts from the snapshot (`SnapshotFacts`: the views'
-abbr, colour and plan, the cache's usage, the per-model limits, `burn-next.json` through the
-snapshot's views, the live state, `claude.home()` and `$USER`/`%USERNAME%`) and
-`statusline::README_PAYLOAD` for the payload, so every scenario has the same folder, model and
-effort. It is the same `facts_from_source` the command uses, with a different `FactsSource`; the
-facts builder, not the page, decides what a segment shows.
+`preview_payload(home)` is README §5's payload with the folder `<home>/projects/atlas` and the keys
+Claude Code sends after a session's first answer: `context_window.used_percentage` 41,
+`cost.total_cost_usd` 3.2, `total_lines_added` 120 and `total_lines_removed` 8. The window's
+`statusline_preview` builds the facts from the snapshot (`SnapshotFacts`: the views' abbr, colour and
+plan, the cache's usage, the per-model limits, `burn-next.json` through the snapshot's views, the
+live state, `claude.home()` and `$USER`/`%USERNAME%`) and passes that payload, so every scenario has
+the same folder, model and effort while the limits and the account are the live account's (the
+snapshot's usage is already the engine's merged view, so the payload's own limits are not used). It
+is the same `facts_from_source` the command uses, with a different `FactsSource`; the facts builder,
+not the page, decides what a segment shows. When there is no live login, or it has ended,
+`facts_from_source` returns `no live login; run seatswap add` or `the live login has ended; log in
+again` and `statusline_preview` returns that error: the page shows the error instead of a line.
 
 ## the recorder of field names (step C4)
 
@@ -3357,12 +3375,14 @@ holds a dot is written as it is, so it cannot be told apart from a nested key of
 key with an empty name is written as the empty path, and its children lose that level (`c`, not
 `.c`). A payload that is not a JSON object has no paths.
 
-`record_keys` runs from `seatswap statusline` before the feed and the render: outside a recording
-(`statuslineRecordUntil` absent or not in the future) or for a payload that is not an object it
-neither reads nor writes the file; inside one it merges the file's paths with this payload's,
-writes the union through `atomic::write_atomic` with mode 0600 (making the data folder private
-first) and stamps it with `now`. A keys file that does not parse is an error, never replaced; the
-command prints it as `seatswap: keys: …` and still exits 0. `record_until` accepts 1 to 60 minutes
+`record_keys` runs from `seatswap statusline` last: after `publish_feed` and after the line is
+rendered, and its result is discarded. A broken keys file therefore does not change the printed
+line and does not stop the feed; the window's `statusline_keys` command reads the same file and
+shows its error on the page. Outside a recording (`statuslineRecordUntil` absent or not in the
+future) or for a payload that is not an object it neither reads nor writes the file; inside one it
+merges the file's paths with this payload's, writes the union through `atomic::write_atomic` with
+mode 0600 (making the data folder private first) and stamps it with `now`. A keys file that does not
+parse is an error, never replaced. `record_until` accepts 1 to 60 minutes
 and refuses 0 and more with `a recording lasts 1 to 60 minutes, got N`; the page asks for 1.
 
 `AppPaths::statusline_keys_file()` is `<data_dir>/statusline-keys.json`. The page's *Record for a
@@ -3439,48 +3459,67 @@ pub(crate) struct InstallState {
 }
 struct InstallDecision { record: Option<StatuslineInstall>, write: Option<Value>, state: InstallState }
 struct RestoreDecision { restore: Option<Value>, before: Option<Value>, state: InstallState }
-fn install_state_of(claude: &ClaudePaths, exe: &Path, record: Option<StatuslineInstall>)
-    -> Result<InstallState, String>;
+struct StatusLineReading { ours: Value, current: Option<Value>, settings_file: String }
+impl StatusLineReading { fn with_current(&self, current: Option<Value>) -> Self; }
+fn read_status_lines(claude: &ClaudePaths, exe: &Path) -> Result<StatusLineReading, String>;
+fn install_state_of(reading: &StatusLineReading, record: Option<&StatuslineInstall>) -> InstallState;
 fn restorable(record: Option<&StatuslineInstall>, current: Option<&Value>, ours: &Value) -> bool;
 fn install_decision(claude: &ClaudePaths, exe: &Path, record: Option<StatuslineInstall>)
     -> Result<InstallDecision, String>;
 fn restore_decision(claude: &ClaudePaths, exe: &Path, record: Option<StatuslineInstall>)
     -> Result<RestoreDecision, String>;
-fn console_program() -> Result<PathBuf, String>;   // autostart::console_program(current_exe)
+async fn install_status_line<F, Fut>(claude: &ClaudePaths, exe: &Path,
+    record: Option<StatuslineInstall>, save: F) -> Result<InstallState, String>
+    where F: FnOnce(StatuslineInstall) -> Fut, Fut: Future<Output = Result<(), String>>;
+async fn restore_status_line<F, Fut>(claude: &ClaudePaths, exe: &Path,
+    record: Option<StatuslineInstall>, save: F) -> Result<InstallState, String>
+    where F: FnOnce() -> Fut, Fut: Future<Output = Result<(), String>>;
+fn console_program() -> Result<PathBuf, String>;   // running_program, then console_program
 fn saved_install(state: &GuiState) -> Result<Option<StatuslineInstall>, String>;
 ```
 
-Both decisions are taken from one reading of Claude Code's file and the saved record; the decision
-functions take plain paths and the record, so the tests run them without Tauri.
+Both decisions are taken from one `read_status_lines` reading of Claude Code's file and the saved
+record, and `install_state_of` is the one place an `InstallState` is built; after a change the
+decisions build the state from the same reading through `StatusLineReading::with_current`. The
+decision functions take plain paths and the record, so the tests run them without Tauri. The
+commands' bodies are `install_status_line` and `restore_status_line`, which take the save as a
+parameter: `statusline_install` and `statusline_restore` pass a closure around `save_setting`, and
+the tests pass a fake, so the order the commands really use is the one under test.
 
 - **Install.** (a) The current line is seatswap's: write nothing, keep the record, `installed` and
   `restorable` true. (b) A record exists and the current line is the record's `installed` line (an
   older seatswap path): keep the record's `previous` and write today's line. (c) Otherwise — the
   user's own line, or no record: the current value (a present `null` kept as `Some(null)`, an absent
-  key as `None`) becomes the new record's `previous`. The command saves the record through
-  `save_setting("statuslineInstall", …)` **before** it writes the line, so a line it could not write
-  leaves a record whose `installed` value is not in the file: an install started again then falls
-  into (c) and keeps the user's line as `previous`, and a restore refuses because the file does not
-  hold seatswap's line.
+  key as `None`) becomes the new record's `previous`. `install_status_line` saves the record through
+  `save` (the command's `save_setting("statuslineInstall", …)`) **before** it writes the line, so a
+  refused save leaves Claude Code's file untouched; a line it could not write leaves a record whose
+  `installed` value is not in the file: an install started again then falls into (c) and keeps the
+  user's line as `previous`, and a restore refuses because the file does not hold seatswap's line.
 - **Restore.** Without a record: `seatswap has no record of the line before its own: nothing to
   restore`. With a current line that is neither seatswap's nor the record's `installed` line:
   `the status line in Claude Code is not seatswap's: nothing to restore`; both leave the file
   untouched. Otherwise it writes the record's `previous` exactly (`None` removes the key), then
-  clears the record through `save_setting("statuslineInstall", null)`; if clearing fails, the line
-  that was there before the restore is written back and the error is returned, with the rollback's
-  own error appended when that also fails.
-- `console_program` is `autostart::console_program(current_exe)`: `seatswap.exe` (`seatswap` on
-  Linux) beside the running program, an error naming the path when it is not a file. On Windows the
-  tray program makes the change too, so the line never names `seatswap-tray.exe`.
+  clears the record with `save` (the command's `save_setting("statuslineInstall", null)`); if clearing
+  fails, the line that was there before the restore is written back and the error is returned, with
+  the rollback's own error appended when that also fails.
+- `console_program` reads the running program through `autostart::running_program()` and then calls
+  `autostart::console_program(&current)`: `seatswap.exe` (`seatswap` on Linux) beside the running
+  program, an error naming the path when it is not a file. `running_program()` is the one read of
+  `std::env::current_exe()`, with `cannot find the running seatswap program: …`; `apply_autostart`
+  uses it too. `program_beside(current_exe, console)` builds the sibling's name as `seatswap` or
+  `seatswap-tray` plus `std::env::consts::EXE_SUFFIX`, so the Windows and Linux difference needs no
+  `cfg`. On Windows the tray program makes the change too, so the line never names
+  `seatswap-tray.exe`.
 
 ## the status line commands and their JSON shapes (step C4)
 
-All eight are `#[cfg(feature = "gui")]` and are registered in `gui/mod.rs`'s handler list.
+All nine are `#[cfg(feature = "gui")]` and are registered in `gui/mod.rs`'s handler list.
 
 | Command | Arguments | Reply |
 |---|---|---|
 | `statusline_preview` | `{config, widths: [u16], scenario}` | `[{width, spans: [{text, fg, bg, bold}], dropped: [u8], note}]` |
 | `statusline_presets` | — | `[["My current line", config], ["Limits only", config], ["Everything", config]]` |
+| `statusline_kinds` | — | `[{kind, label, group, colors: [rule], time, text, repeatable}]`, the one kind table in `SegmentKind::ALL`'s order |
 | `statusline_record` | `{minutes: u32}` | `null`; saves `statuslineRecordUntil` |
 | `statusline_keys` | — | `{at, keys: [{path, kind}]}`, or `null` when no recording wrote the file |
 | `statusline_fields` | — | `[{kind, paths: [path]}]`, the field path table in its order |
@@ -3506,17 +3545,25 @@ crates/app/ui/fixture.js            the browser fixture: the commands' replies a
 
 `statusline.js` exports `render(container, context)`, `update(snapshot)` and `unmount()`. `render`
 reads `settings.statusline` and `settings.statuslineFeed` (naming every value it cannot read, never
-replacing one), then loads the install state, the recorded keys and the field paths once, and draws:
-the head (preset, Restore previous, Use in Claude Code), the palette, the line, the options, the
-preview and the fields card. `update(snapshot)` takes the snapshot's settings and redraws, except
-while a save is pending (the page's copy wins) or while focus is inside the page (only the settings
-are taken, so a redraw does not take a field away mid-typing). Every change is saved through
+replacing one), then loads the kinds table and the presets, the install state, the recorded keys and
+the field paths once, and draws: the head (preset, Restore previous, Use in Claude Code), the
+palette, the line, the options, the preview and the fields card. `update(snapshot)` takes the
+snapshot's settings, clears the preview's cached key so the next preview request is not skipped, and
+reads the install state again before the head and the card are drawn; it redraws, except while a save
+is pending (the page's copy wins) or while focus is inside the page (only the settings are taken and
+the preview is re-requested, so a redraw does not take a field away mid-typing). Every change is
+saved through
 `save_setting` at once, queued one after another each built from the settings the one before left;
 a refused save restores the stored layout and shows its text, and changes queued behind it are
 counted as dropped rather than saved stale.
 
-The page's kinds table (`KINDS`) is the one place the page names a segment and the options its kind
-offers; it mirrors `SegmentKind`, `ColorRule`, `TimeFormat` and `render.rs`:
+The kinds and the options each kind offers are one table in Rust: `SegmentKind::spec()` returns a
+`KindSpec` (label, group, the colour rules it takes, and whether it takes a time format, text or
+repeats), in `SegmentKind::ALL`'s palette order. `statusline_kinds` sends it to the page, and
+`store.rs`'s `validate_statusline` uses the same table to refuse a colour rule, a time format or text
+that the kind does not take (`statusline.left[2].color: folder does not take byLoad`,
+`….timeFormat: … does not take a time format`, `….text: … does not take text`). The page keeps no
+copy; it reads the reply into `state.kinds`:
 
 | Kind (`id`) | Group | Label | Colour rules | Time format | Text | Repeatable |
 |---|---|---|---|---|---|---|
@@ -3548,16 +3595,20 @@ or a drop number outside the table are shown as stored with "not offered" and le
 
 The preview asks `statusline_preview` with the whole config, the three parsed widths and the chosen
 scenario, 150 ms after the last change, and drops a reply that a newer request has overtaken. The
-width fields are read as typed: a value that is not a whole number of columns or outside 1–65535 is
-shown as its error, not replaced. The terminal tab recolours the boxes only; the spans' colours come
+width fields are read as typed: the page checks that each is a whole number of columns, and the
+command refuses 0 (`a preview width must be at least 1 column; 0 cannot show a line`), an empty list
+and a value `u16` cannot hold; the error is shown, not replaced by a number. The terminal tab
+recolours the boxes only; the spans' colours come
 from the reply. A segment whose kind is in the field path table and whose path is not in a recorded
 list carries `Claude Code did not send this field (<time of the recording>)` as a warning banner in
 its options and in its chip's tooltip; the note exists only when a recorded list exists.
 
-The head's *Use in Claude Code* opens the card (the file, `now` and `after` as JSON, the sentence
-`seatswap changes only this key. The value it replaces is kept and can be put back.`, Install and
-Cancel) and never writes before Install is pressed; the button reads *In use in Claude Code* and is
-disabled while `installed`. *Restore previous* is drawn only when `restorable`. Both show the
-command's error as a banner and their success as a notice. `fixture.js` has a stand-in for every
-`statusline_*` reply with the same shape and its own small preview drawing, so the browser page works
-with no tray app; that drawing is for pictures only and is not the app's renderer.
+The head's *Use in Claude Code* reads the install state again when the card opens (the file may have
+changed by hand or in another window) and then opens the card (the file, `now` and `after` as JSON,
+the sentence `seatswap changes only this key. The value it replaces is kept and can be put back.`,
+Install and Cancel); it never writes before Install is pressed. The button reads *In use in Claude
+Code* and is disabled while `installed`. *Restore previous* is drawn only when `restorable`. Both
+show the command's error as a banner and their success as a notice. `fixture.js` has a stand-in for
+every `statusline_*` reply with the same shape (including the kinds table) and its own small preview
+drawing, so the browser page works with no tray app; that drawing is for pictures only and is not
+the app's renderer.

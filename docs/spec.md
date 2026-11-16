@@ -585,13 +585,16 @@ from its cache, and prints one line.
   right. A segment without a value prints nothing, with its prefix and suffix. The right part is
   flush with the terminal's right edge minus the margin; when the line does not fit, segments are
   dropped by their `drop` number (1 first) until it does, and when nothing is left to drop it is
-  printed anyway. Without a width the right part follows the left after two spaces.
+  printed anyway. Without a width the right part follows the left after two spaces while both
+  zones print something, and directly when one of them is empty.
 - **The width** is the terminal of the nearest ancestor process that has one, else `$COLUMNS`,
   else none.
 - **Never slow, never a failure:** it uses no network, takes no lock that can wait, does not build
   the engine or the HTTP client, and always exits 0. Any error becomes the line itself:
   `seatswap: <reason>`, because a non-zero exit makes Claude Code hide the whole line. `CLAUDECODE`
   may be set; the command is never gated and writes no `agentCall` event.
+- **The recorder's file is not the line:** a `statusline-keys.json` that cannot be parsed does not
+  change the printed line and does not stop the feed; the page shows that file's error (§11.4).
 - **The preset and the segments:** the preset reproduces the old script. The layout can also hold
   the account (abbreviation in its colour), plan, 5 h percent and reset, week percent and reset,
   per-model percent, auto-burn, model, effort, folder (`~` short), git branch, context used, session
@@ -1325,7 +1328,8 @@ puts the stored layout back and shows the reason at the top of the page.
 segment that is already on the line is not in the palette. A click adds it to the zone last used.
 
 **The two zones and the margin.** *Left*, and *Right* which is flush with the right edge of the
-terminal; at least two spaces stay between the zones. A segment is dragged from the palette into a
+terminal; at least two spaces stay between the zones while both print something, and an empty
+zone takes no gap. A segment is dragged from the palette into a
 zone, between two zones and inside one; the keyboard does the same: ←/→ reorder it, `L`/`R` move it
 to that zone, `Delete` sends it back to the palette. A segment dropped onto itself, or a drop
 outside a zone, changes nothing. Below the zones: the *margin*, the columns kept free at the
@@ -1338,22 +1342,28 @@ terminal's right edge, and the switch *Pass Claude Code's live numbers on to sea
 |---|---|
 | Colour | *none* · *fixed colour* (`#rrggbb`) for every kind; *by load* (yellow from, red from) only for the 5 h percent, the week percent and the per-model percent; *by model family* only for the model; *by effort* only for the effort; *the account's colour* only for the account |
 | Time format | Only the 5 h reset and the week reset: *Compact time left* · *seatswap's* (the rule of §7.2) · *Clock time*; without one seatswap's own format is used |
-| Text | Only free text; a segment whose text is empty prints nothing |
+| Text | Only free text; a segment whose text is empty prints nothing, with its prefix and suffix |
 | Prefix / suffix | Every kind; printed only when the segment has a value |
 | Drop when narrow | *never* · *1 · first* · *2* · *3* |
 
-The folder has no style option: it is always `~`-shortened. A value the page cannot read (an unknown
-kind, a colour rule its kind does not offer, a drop number above 3) is shown as it was stored, never
-replaced by a guess.
+The folder has no style option: it is always `~`-shortened. The settings check refuses a colour
+rule, a time format or text that the segment's kind does not offer, naming the kind and its place
+in the layout. A value the page cannot read (an unknown kind, a colour rule its kind does not
+offer, a drop number above 3) is shown as it was stored, never replaced by a guess.
 
 **The preview.** Three width fields (120, 100 and 80 columns at start, each 1 to 65535 and
 editable), a *Dark terminal* and a *Light terminal* tab, and the scenario *Live data* · *Test: 97 %*
 · *Test: account blocked* · *Test: no 5 h limit*. Every width gets its own line, drawn with the
 spans' own colours and bold flags on the terminal background, in a monospace terminal font, in a box
 as wide as its width in columns; the line ends the margin before the right edge, as in a terminal. Beside each line is its note: `everything fits`, or the kinds the fitting
-removed, as `5 h reset, week reset and 5 h percent are dropped`. The text and the colours come from
+removed, as `5 h reset, week reset and 5 h percent are dropped`. The preview draws a made-up
+session with the live account's numbers: the folder `~/projects/atlas` under the user's home,
+the branch `main`, context used `41%`, session cost `$3.20`, lines changed `+120 -8`, and the
+model and effort the payload names; the account's abbreviation, colour, plan and limits are the
+live account's. The text and the colours come from
 `statusline_preview`, the command's own renderer (§7.6): the preview and the real line are one
-implementation. The preview is requested again 150 ms after the last change.
+implementation. The preview is requested again with every new reading, and 150 ms after the last
+change. Without a live login the preview shows the command's error instead of a line.
 
 **The presets.** *My current line* (what the script of §5.1 printed; the stored default), *Limits
 only* and *Everything*. A layout that equals none of them shows *Custom layout*. Choosing a preset

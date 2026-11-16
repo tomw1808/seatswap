@@ -56,6 +56,9 @@ All notable changes to this project are documented here. The format follows
   account's badge or ✎ open it there.
 - A per-model limit blocks an account only while a session on that model is open.
 - Files seatswap rewrites that are symbolic links stay links; the link's target is rewritten.
+- A file seatswap rewrites (`.claude.json`, `.credentials.json`, accounts.json, the history and
+  the others) that is a symbolic link pointing nowhere is now an error that names the link,
+  instead of being replaced by a file.
 - `seatswap status --json`: `suggestion` has a new shape, `{toId, text}` instead of the old
   `{fromId, toId, fromPercent, toPercent, fromResetsAt}`, so the target and the whole sentence are
   both there.
