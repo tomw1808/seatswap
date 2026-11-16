@@ -1023,7 +1023,7 @@ impl Valuer {
             .find(|window| &window.account == account && window.start <= at && at < window.end)
             .ok_or(Missing::NoReading)?;
         let used = window.used.ok_or(Missing::NoReading)?;
-        let price = self.window_price(&window.account, window.end)?;
+        let price = self.window_price(&window.account, window.start, window.end)?;
         if let Some(model) = &window.unpriced {
             return Err(Missing::UnpricedInWeek {
                 model: model.clone(),
@@ -1037,14 +1037,18 @@ impl Valuer {
         Ok(usd / window.api_sum * window_money(price, used).used)
     }
 
-    /// The price of a window ending at `end`: the account's price at the
-    /// window's midpoint (`end − 84 h`), through [`Valuer::price_at`].
+    /// The price of the window from `start` to `end`: the account's price at
+    /// the window's midpoint `start + (end − start) / 2`, through
+    /// [`Valuer::price_at`]. A window can be shorter than a week (one that a
+    /// reset ended or began), so its length is never assumed; a
+    /// [`WindowRecord`]'s start is [`WindowRecord::weekly_start`].
     pub(crate) fn window_price(
         &self,
         account: &AccountRef,
+        start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<f64, Missing> {
-        self.price_at(account, end - Duration::hours(84))
+        self.price_at(account, start + (end - start) / 2)
     }
 
     /// The account's monthly price at `at`: the last [`EventKind::PriceChanged`]
@@ -1260,6 +1264,8 @@ mod tests {
             last_sample: end - Duration::hours(1),
             plan: None,
             uncertain: false,
+            reset: false,
+            from: None,
         }
     }
 
@@ -1679,6 +1685,50 @@ mod tests {
         assert!(
             (one.subscription.expect("a value") + two.subscription.expect("a value") - week).abs()
                 < 1e-9
+        );
+    }
+
+    #[test]
+    fn a_short_window_takes_the_price_at_its_midpoint() {
+        let dir = tempfile::tempdir().expect("a temp folder");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        for (at, amount) in [
+            ("2026-11-01T00:00:00Z", 140.0),
+            ("2026-11-12T12:00:00Z", 200.0),
+        ] {
+            history
+                .append(&price_changed(utc(at), Some(amount), Some("EUR")))
+                .expect("a price change");
+        }
+        let valuer = Valuer::build(
+            &history,
+            &range("2026-11-10T00:00:00Z", "2026-11-15T00:00:00Z"),
+            &Prices::default(),
+            &empty_fx(),
+            &settings_eur(),
+            &[account_with_price(Some(200.0))],
+            &RefCell::new(Vec::new()),
+        )
+        .expect("a valuer");
+
+        // The window after a reset ran two days: its midpoint is Friday 00:00,
+        // after the change; 84 h before its end would be Tuesday noon.
+        assert_eq!(
+            valuer.window_price(
+                &ac(),
+                utc("2026-11-12T00:00:00Z"),
+                utc("2026-11-14T00:00:00Z")
+            ),
+            Ok(200.0)
+        );
+        // A full week's midpoint lies before the change.
+        assert_eq!(
+            valuer.window_price(
+                &ac(),
+                utc("2026-11-07T00:00:00Z"),
+                utc("2026-11-14T00:00:00Z")
+            ),
+            Ok(140.0)
         );
     }
 

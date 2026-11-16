@@ -1337,6 +1337,8 @@ mod tests {
                 last_sample: utc("2026-11-05T11:58:00Z"),
                 plan: Some("Max".to_string()),
                 uncertain: false,
+                reset: false,
+                from: None,
             })
             .expect("the window");
         let ctx = Ctx {

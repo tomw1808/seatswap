@@ -1011,6 +1011,8 @@ mod tests {
             last_sample: end,
             plan: None,
             uncertain: false,
+            reset: false,
+            from: None,
         }
     }
 

@@ -405,7 +405,7 @@ mod tests {
 
     use crate::api::{Limit, LimitKind, Severity, Usage};
     use crate::burn::decide::{Reason, RegimeWhy};
-    use crate::burn::plan::{follow, followed, Policy};
+    use crate::burn::plan::{follow, followed, usable, usable_again, Policy};
     use crate::history::{Recorder, Source, TokenRecord};
     use crate::project::ProjectKey;
     use crate::stats::tests::{append_codex_records, tiny};
@@ -1394,5 +1394,64 @@ mod tests {
             assert_eq!(learned.c, rates.c);
             assert_eq!(learned.s, rates.s);
         }
+    }
+
+    /// AC's week is reset by hand from 100 % to 0 % days before its reset time
+    /// (a reset event, decision 12 of the 1.2.0 plan): the next poll's reading
+    /// is all the plan and the "usable again" notification need. The
+    /// notification reads the engine's `usable`, which is [`crate::engine::blocker`].
+    #[test]
+    fn a_reset_account_is_usable_at_once() {
+        let now = utc("2026-11-10T12:00:00Z");
+        let pr = account("pr", "PR", PR_ACC, true);
+        let ac = account("ac", "AC", AC_ACC, true);
+        let learned = learned("atlas", Vec::new());
+        let state = |situation: &Situation, id: &str| {
+            situation
+                .inputs
+                .accounts
+                .iter()
+                .find(|state| state.id == id)
+                .cloned()
+                .expect("the account is in the inputs")
+        };
+
+        let before = vec![
+            view("pr", "PR", 100.0, None, now - Duration::minutes(1)),
+            view("ac", "AC", 100.0, None, now - Duration::minutes(1)),
+        ];
+        let full = ready(
+            &learned,
+            &before,
+            &[pr.clone(), ac.clone()],
+            Some("pr"),
+            now,
+        );
+        let ac_full = state(&full, "ac");
+        assert!(!usable(&ac_full, now));
+        assert_eq!(usable_again(&ac_full, now), Some(utc(RESET)));
+        assert_eq!(follow(&full.inputs, Policy::Lazy).segments[0].account, None);
+        let usage = before[1].usage.as_ref().expect("a reading");
+        assert!(crate::engine::blocker(usage, None, now).is_some());
+
+        // The next poll: AC reads 0 %, its reset time unchanged.
+        let next = now + Duration::minutes(1);
+        let after = vec![
+            view("pr", "PR", 100.0, None, next),
+            view("ac", "AC", 0.0, None, next),
+        ];
+        let reset = ready(&learned, &after, &[pr, ac], Some("pr"), next);
+        let ac_reset = state(&reset, "ac");
+        assert_eq!(ac_reset.week_percent, 0.0);
+        assert!(usable(&ac_reset, next));
+        assert_eq!(usable_again(&ac_reset, next), None);
+        assert_eq!(
+            follow(&reset.inputs, Policy::Lazy).segments[0]
+                .account
+                .as_deref(),
+            Some("ac")
+        );
+        let usage = after[1].usage.as_ref().expect("a reading");
+        assert!(crate::engine::blocker(usage, None, next).is_none());
     }
 }

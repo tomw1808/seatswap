@@ -51,8 +51,14 @@ pub enum ApiError {
         expected: (String, String),
         got: (String, String),
     },
-    #[error("rate limited; retry after {retry_after_secs:?} seconds")]
-    RateLimited { retry_after_secs: Option<u64> },
+    /// A 429 reply from `service`, named as a person knows it ("Claude",
+    /// "Codex", "Ollama", "models.dev", "Frankfurter"). The text names no
+    /// seconds: the engine adds when it asks again (`engine::record_api_error`).
+    #[error("{service} limits how often seatswap may ask")]
+    RateLimited {
+        service: &'static str,
+        retry_after_secs: Option<u64>,
+    },
     #[error("server error {0}")]
     Server(u16),
     #[error("HTTP {status}: {body}")]
@@ -138,7 +144,7 @@ impl Api {
             .set("User-Agent", USER_AGENT)
             .set("Authorization", &format!("Bearer {access_token}"))
             .set("anthropic-beta", OAUTH_BETA);
-        Usage::from_json(&get_json(request)?)
+        Usage::from_json(&get_json(request, CLAUDE)?)
     }
 
     /// GET Codex's usage with the access token and account id from its
@@ -155,7 +161,7 @@ impl Api {
             .set("User-Agent", USER_AGENT)
             .set("Authorization", &format!("Bearer {access_token}"))
             .set("chatgpt-account-id", account_id);
-        get_json_no_redirect(request)
+        get_json_no_redirect(request, CODEX)
     }
 
     /// GET Ollama's cloud balance from the server at `base_url`.
@@ -164,7 +170,7 @@ impl Api {
             .lookup_agent
             .get(&ollama_url(base_url, "/api/balance"))
             .set("User-Agent", USER_AGENT);
-        get_json_no_redirect(request)
+        get_json_no_redirect(request, OLLAMA)
     }
 
     /// GET Ollama's usage over the last 24 hours from the server at `base_url`.
@@ -173,7 +179,7 @@ impl Api {
             .lookup_agent
             .get(&ollama_url(base_url, "/api/usage?range=24h"))
             .set("User-Agent", USER_AGENT);
-        get_json_no_redirect(request)
+        get_json_no_redirect(request, OLLAMA)
     }
 
     /// Exchange a login's refresh token for a new access token. `expected` is the
@@ -203,7 +209,7 @@ impl Api {
         let response = match response {
             Ok(response) => response,
             Err(ureq::Error::Status(status, response)) => {
-                return Err(status_error(status, response))
+                return Err(status_error(status, response, CLAUDE))
             }
             Err(ureq::Error::Transport(error)) => return Err(transport_error(error)),
         };
@@ -229,7 +235,7 @@ impl Api {
             Ok(response) => no_redirect(response)?,
             Err(ureq::Error::Status(304, _)) => return Ok(Fetched::NotModified),
             Err(ureq::Error::Status(status, response)) => {
-                return Err(status_error(status, response))
+                return Err(status_error(status, response, MODELS_DEV))
             }
             Err(ureq::Error::Transport(error)) => return Err(transport_error(error)),
         };
@@ -265,7 +271,7 @@ impl Api {
         }
         let url = format!("{}?base=USD&symbols={}", self.frankfurter_url, currency);
         let request = self.lookup_agent.get(&url).set("User-Agent", USER_AGENT);
-        let value = get_json_no_redirect(request)?;
+        let value = get_json_no_redirect(request, FRANKFURTER)?;
         let date = value
             .get("date")
             .and_then(Value::as_str)
@@ -287,22 +293,22 @@ impl Api {
 
 /// Send one GET and read its JSON answer. The status, body and decode handling
 /// of every plain GET lives here; a GET that follows no redirect goes through
-/// [`get_json_no_redirect`].
-fn get_json(request: ureq::Request) -> Result<Value, ApiError> {
-    read_json(call(request)?)
+/// [`get_json_no_redirect`]. `service` names who is asked (see [`status_error`]).
+fn get_json(request: ureq::Request, service: &'static str) -> Result<Value, ApiError> {
+    read_json(call(request, service)?)
 }
 
 /// Send one GET that follows no redirect and read its JSON answer. A redirect
 /// answer is an error ([`no_redirect`]).
-fn get_json_no_redirect(request: ureq::Request) -> Result<Value, ApiError> {
-    read_json(no_redirect(call(request)?)?)
+fn get_json_no_redirect(request: ureq::Request, service: &'static str) -> Result<Value, ApiError> {
+    read_json(no_redirect(call(request, service)?)?)
 }
 
-/// Send one request and map a status or transport failure.
-fn call(request: ureq::Request) -> Result<ureq::Response, ApiError> {
+/// Send one request to `service` and map a status or transport failure.
+fn call(request: ureq::Request, service: &'static str) -> Result<ureq::Response, ApiError> {
     match request.call() {
         Ok(response) => Ok(response),
-        Err(ureq::Error::Status(status, response)) => Err(status_error(status, response)),
+        Err(ureq::Error::Status(status, response)) => Err(status_error(status, response, service)),
         Err(ureq::Error::Transport(error)) => Err(transport_error(error)),
     }
 }
@@ -401,11 +407,20 @@ fn read_body(response: ureq::Response) -> Result<String, ApiError> {
         .map_err(|error| ApiError::Network(error.to_string()))
 }
 
-/// Map a 4xx/5xx reply (ureq's `Error::Status`) to the contract's variants.
-fn status_error(status: u16, response: ureq::Response) -> ApiError {
+/// The services seatswap calls, as a rate-limit message names them.
+const CLAUDE: &str = "Claude";
+const CODEX: &str = "Codex";
+const OLLAMA: &str = "Ollama";
+const MODELS_DEV: &str = "models.dev";
+const FRANKFURTER: &str = "Frankfurter";
+
+/// Map a 4xx/5xx reply (ureq's `Error::Status`) of `service` to the
+/// contract's variants: the one mapping every call goes through.
+fn status_error(status: u16, response: ureq::Response, service: &'static str) -> ApiError {
     match status {
         401 => ApiError::Unauthorized,
         429 => ApiError::RateLimited {
+            service,
             retry_after_secs: retry_after_secs(&response),
         },
         500..=599 => ApiError::Server(status),
@@ -1272,8 +1287,16 @@ mod tests {
             start_server(Reply::status(429, "").header("Retry-After", "30"));
         let error = api_for(&base).usage(&token).unwrap_err();
         let _ = captured(&receiver, handle);
+        assert_eq!(
+            error.to_string(),
+            "Claude limits how often seatswap may ask"
+        );
         match error {
-            ApiError::RateLimited { retry_after_secs } => {
+            ApiError::RateLimited {
+                service,
+                retry_after_secs,
+            } => {
+                assert_eq!(service, "Claude");
                 assert_eq!(retry_after_secs, Some(30))
             }
             other => panic!("expected RateLimited, got {other:?}"),
@@ -1937,7 +1960,70 @@ mod tests {
         assert!(error.to_string().contains("EUR"), "got {error}");
     }
 
+    #[test]
+    fn rate_limited_text_has_no_debug_option() {
+        for retry_after_secs in [Some(0), Some(30), None] {
+            let text = ApiError::RateLimited {
+                service: CLAUDE,
+                retry_after_secs,
+            }
+            .to_string();
+            assert_eq!(text, "Claude limits how often seatswap may ask");
+            assert!(!text.contains("Some("), "{text}");
+            assert!(!text.contains("None"), "{text}");
+        }
+    }
+
+    /// Every service's 429 names that service: the one `status_error` gets the
+    /// name from the call that asked.
+    #[test]
+    fn each_service_names_itself_when_it_limits() {
+        let expect = |error: ApiError, service: &str| {
+            assert_eq!(
+                error.to_string(),
+                format!("{service} limits how often seatswap may ask")
+            );
+        };
+
+        let (base, receiver, handle) = start_server(Reply::status(429, ""));
+        let error = lookup_api(&base).usd_rate("EUR").unwrap_err();
+        let _ = captured(&receiver, handle);
+        expect(error, "Frankfurter");
+
+        let (base, receiver, handle) = start_server(Reply::status(429, ""));
+        let error = lookup_api(&base).models_dev(None).unwrap_err();
+        let _ = captured(&receiver, handle);
+        expect(error, "models.dev");
+
+        let (base, receiver, handle) = start_server(Reply::status(429, ""));
+        let error = Api::new().ollama_balance(&base).unwrap_err();
+        let _ = captured(&receiver, handle);
+        expect(error, "Ollama");
+
+        let (base, receiver, handle) = start_server(Reply::status(429, ""));
+        let error = Api::new()
+            .with_codex_url(&format!("{base}/backend-api/wham/usage"))
+            .codex_usage("codex-access", "f3a1c2d4-5b6e-4f70-8a9b-0c1d2e3f4a5b")
+            .unwrap_err();
+        let _ = captured(&receiver, handle);
+        expect(error, "Codex");
+    }
+
     // ---- proof tests of the review ----
+
+    /// Proof (review of R-1): `status_error` is shared by every GET (models.dev,
+    /// Frankfurter, Codex, Ollama), so a 429 from a lookup host must not be
+    /// worded as a Claude limit.
+    #[test]
+    fn a_rate_limited_lookup_does_not_blame_claude() {
+        let (base, receiver, handle) = start_server(Reply::status(429, ""));
+        let error = lookup_api(&base).usd_rate("EUR").unwrap_err();
+        let _ = captured(&receiver, handle);
+        assert!(
+            !error.to_string().contains("Claude"),
+            "a Frankfurter 429 reads: {error}"
+        );
+    }
 
     /// ureq's `ConnectionFailed` is its kind for *every* connect error, and a
     /// failed TLS handshake is one of them (ureq's `rtls.rs` maps the handshake

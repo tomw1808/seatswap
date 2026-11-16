@@ -599,6 +599,8 @@ mod tests {
             last_sample: end - Duration::minutes(2),
             plan: Some("Max".to_string()),
             uncertain: false,
+            reset: false,
+            from: None,
         };
         let sample = Sample {
             t: end - (reset - now),

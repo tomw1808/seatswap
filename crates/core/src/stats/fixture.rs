@@ -468,6 +468,8 @@ fn weekly_window(
         last_sample: end - Duration::minutes(2),
         plan: Some(plan.to_string()),
         uncertain: false,
+        reset: false,
+        from: None,
     }
 }
 

@@ -228,6 +228,15 @@ pub struct WindowRecord {
     pub plan: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub uncertain: bool,
+    /// The window ended before its reset time because the limit dropped (a
+    /// reset: by hand, of a model, or by the provider). Nothing expired then,
+    /// so such a record has `lost: None`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reset: bool,
+    /// On the window that follows a reset: the percent of its first reading.
+    /// The window's own use is `final − from`; absent means 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<f64>,
 }
 
 impl WindowRecord {
@@ -775,6 +784,12 @@ pub fn same_reset(a: DateTime<Utc>, b: DateTime<Utc>) -> bool {
     (a - b).abs() <= chrono::Duration::seconds(RESET_JITTER)
 }
 
+/// A reading at least this many percentage points below the previous reading
+/// of the same account, limit and model, before the previous reading's reset
+/// time, is a reset: the window ends there. A smaller drop is kept as a reading
+/// and named once in a warning, never smoothed.
+pub const RESET_DROP_POINTS: f64 = 1.0;
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -1085,6 +1100,8 @@ mod tests {
             last_sample: at,
             plan: None,
             uncertain: false,
+            reset: false,
+            from: None,
         };
         let blocked = |account: AccountRef| Event {
             t: at,
@@ -1349,6 +1366,25 @@ mod tests {
     }
 
     #[test]
+    fn a_window_written_by_1_1_0_reads_without_reset_and_from() {
+        let line = r#"{"acc":"6f1c2a9e-1d4b-4c7f-9a3e-8b5d2e6f1c04","org":"a92d7b31-5c8e-4f2a-9d6b-1e3c5a7f9b20","k":"weekly_all","start":"2026-11-09T16:00:00Z","end":"2026-11-16T16:00:00Z","final":87.0,"lost":13.0,"lastSample":"2026-11-16T15:58:10Z"}"#;
+        let window: WindowRecord = serde_json::from_str(line).unwrap();
+        assert!(!window.reset);
+        assert_eq!(window.from, None);
+        assert_eq!(serde_json::to_string(&window).unwrap(), line);
+
+        let after_reset = WindowRecord {
+            reset: true,
+            from: Some(45.0),
+            lost: None,
+            ..window
+        };
+        let text = serde_json::to_string(&after_reset).unwrap();
+        assert!(text.contains(r#""reset":true"#), "{text}");
+        assert!(text.contains(r#""from":45.0"#), "{text}");
+    }
+
+    #[test]
     fn a_torn_line_inside_the_file_is_only_a_warning() {
         let dir = tempdir().unwrap();
         let history = HistoryDir::at(dir.path(), "atlas");
@@ -1460,6 +1496,8 @@ mod tests {
             last_sample: utc("2026-11-16T15:58:10Z"),
             plan: None,
             uncertain: false,
+            reset: false,
+            from: None,
         };
         assert!(matches!(
             history.append(&window),
@@ -1637,6 +1675,8 @@ mod tests {
             last_sample: end - chrono::Duration::minutes(2),
             plan: None,
             uncertain: false,
+            reset: false,
+            from: None,
         }
     }
 
@@ -2156,6 +2196,47 @@ mod tests {
         assert_eq!(windows.records.len(), 1);
         assert_eq!(windows.records[0].host, "vega");
         assert_eq!(windows.records[0].record.final_percent, 63.0);
+    }
+
+    #[test]
+    fn two_models_ending_together_read_as_two_windows() {
+        let dir = tempdir().unwrap();
+        let end = utc("2026-11-16T16:00:00Z");
+        let atlas = HistoryDir::at(dir.path(), "atlas");
+        for (model, percent) in [("Fable", 61.0), ("Sonnet", 40.0)] {
+            let mut window = a_window(end, percent);
+            window.k = LimitKind::WeeklyScoped;
+            window.m = Some(model.to_string());
+            atlas.append(&window).unwrap();
+        }
+
+        let windows = atlas.finished_windows(&wide_range(), &Hosts::All).unwrap();
+        let models: Vec<Option<&str>> = windows
+            .records
+            .iter()
+            .map(|hosted| hosted.record.m.as_deref())
+            .collect();
+        assert_eq!(windows.records.len(), 2, "{models:?}");
+        assert!(models.contains(&Some("Fable")));
+        assert!(models.contains(&Some("Sonnet")));
+    }
+
+    #[test]
+    fn two_resets_of_one_host_stay_two_windows() {
+        let dir = tempdir().unwrap();
+        let atlas = HistoryDir::at(dir.path(), "atlas");
+        for (last_sample, end) in [
+            ("2026-11-17T12:00:00Z", "2026-11-18T08:30:00Z"),
+            ("2026-11-18T08:30:00Z", "2026-11-18T14:00:00Z"),
+        ] {
+            let mut window = a_window(utc(end), 50.0);
+            window.last_sample = utc(last_sample);
+            window.reset = true;
+            atlas.append(&window).unwrap();
+        }
+
+        let windows = atlas.finished_windows(&wide_range(), &Hosts::All).unwrap();
+        assert_eq!(windows.records.len(), 2);
     }
 
     #[test]

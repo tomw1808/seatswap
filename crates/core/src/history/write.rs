@@ -6,31 +6,36 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 
-use chrono::{DateTime, Datelike, Utc};
+use chrono::{DateTime, Datelike, Duration, Utc};
 
 use crate::api::{LimitKind, Usage};
 
 use super::read::{month_start, months_of_kind};
 use super::{
-    reset_minute, AccountRef, Event, EventKind, HistoryDir, HistoryError, Hosts, Kind, LimitSample,
-    Sample, SessionRecord, Source, TokenRecord, UpRecord, WindowRecord, RESET_JITTER,
+    reset_minute, same_reset, AccountRef, Event, EventKind, HistoryDir, HistoryError, Hosts, Kind,
+    LimitSample, Range, Sample, SessionRecord, Source, TokenRecord, UpRecord, WindowRecord,
+    RESET_DROP_POINTS, RESET_JITTER,
 };
 
 /// Turns usage answers into history lines. Per account it keeps the last written
 /// line (which decides when a sample is written again) and every limit it has
 /// seen with the time of the reading that carried it (which decides finished
-/// windows and the 100 % crossings). A new recorder reads both back from this
-/// host's own files. Finished windows are remembered by (account, kind, model,
-/// end) so one window is written once even while the server still sends its old
-/// reset time.
+/// windows, resets and the 100 % crossings). A new recorder reads both back from
+/// this host's own files. Finished windows are remembered by (account, kind,
+/// model, end) so one window is written once even while the server still sends
+/// its old reset time.
 pub struct Recorder {
     dir: HistoryDir,
     state: HashMap<AccountRef, AccountState>,
     windows: HashSet<WindowKey>,
     last_up: Option<DateTime<Utc>>,
-    /// Warnings from the lines this recorder read back (spec §1.2), each
-    /// returned once by [`take_warnings`](Self::take_warnings).
+    /// Warnings from the lines this recorder read back (spec §1.2) and about
+    /// readings that went down without a reset, each returned once by
+    /// [`take_warnings`](Self::take_warnings).
     warnings: Vec<String>,
+    /// The windows (account, limit, reset time) whose small drop was already
+    /// named in a warning: one warning per window.
+    small_drops: HashSet<(AccountRef, LimitKey, DateTime<Utc>)>,
 }
 
 /// What one account's readings have shown so far.
@@ -53,6 +58,7 @@ impl AccountState {
                 .or_insert_with(|| RememberedLimit {
                     limit: limit.clone(),
                     t: line.t,
+                    opened: None,
                 });
         }
     }
@@ -72,6 +78,14 @@ impl LimitKey {
             m: limit.m.clone(),
         }
     }
+
+    /// The limit as a warning names it: `weekly_all`, `weekly_scoped (Fable)`.
+    fn name(&self) -> String {
+        match &self.m {
+            Some(model) => format!("{} ({model})", self.k.as_api()),
+            None => self.k.as_api().to_string(),
+        }
+    }
 }
 
 /// A limit's latest reading, and when that reading happened.
@@ -79,6 +93,30 @@ impl LimitKey {
 struct RememberedLimit {
     limit: LimitSample,
     t: DateTime<Utc>,
+    /// Where the open window began when a reset began it; `None` when it began
+    /// at its usual start (its reset time minus its length).
+    opened: Option<Opened>,
+}
+
+/// A window that a reset began: the time of the first lower reading and that
+/// reading's percent. `from` is `None` only when a restart could not find that
+/// reading's sample on this host.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Opened {
+    start: DateTime<Utc>,
+    from: Option<f64>,
+}
+
+impl Opened {
+    /// Put the window's start and first percent on its record. A record whose
+    /// first percent is unknown is uncertain.
+    fn mark(&self, record: &mut WindowRecord) {
+        record.start = Some(self.start);
+        record.from = self.from;
+        if self.from.is_none() {
+            record.uncertain = true;
+        }
+    }
 }
 
 /// A finished window, as remembered by the recorder.
@@ -109,6 +147,7 @@ impl Recorder {
             windows: HashSet::new(),
             last_up: None,
             warnings: Vec::new(),
+            small_drops: HashSet::new(),
         }
     }
 
@@ -125,10 +164,13 @@ impl Recorder {
 
     /// One usage answer. Appends a Sample if a number or a reset time differs
     /// from the account's last line, or the last line is at least 1 h old.
-    /// Before that, appends a WindowRecord for every window that ended
-    /// (closed_windows), and a Blocked / Unblocked event for every limit that
-    /// crossed 100 %. Returns the events it wrote. The account's last line and
-    /// limits are read from the files on first use.
+    /// Before that, appends a WindowRecord for every window that ended: by a
+    /// reset (a reading at least [`RESET_DROP_POINTS`] lower before the reset
+    /// time, [`reset_window`]) or as [`closed_windows`] says; and a Blocked /
+    /// Unblocked event for every limit that crossed 100 %. A smaller drop
+    /// before the reset time is kept as the reading and named once per window
+    /// in [`take_warnings`](Self::take_warnings). Returns the events it wrote.
+    /// The account's last line and limits are read from the files on first use.
     pub fn reading(
         &mut self,
         account: &AccountRef,
@@ -152,6 +194,8 @@ impl Recorder {
         // Every remembered limit is measured against this reading on its own:
         // a limit the reading does not carry ends nothing by itself.
         let mut closed: HashMap<LimitKey, DateTime<Utc>> = HashMap::new();
+        // The windows a reset began at this reading.
+        let mut opened: HashMap<LimitKey, Opened> = HashMap::new();
         let mut windows: Vec<(WindowKey, WindowRecord)> = Vec::new();
         let mut unblocked: Vec<EventKind> = Vec::new();
         for (key, remembered) in &state.limits {
@@ -161,9 +205,47 @@ impl Recorder {
                 src: next.src,
                 l: vec![remembered.limit.clone()],
             };
-            let ended = closed_windows(&prev, &next, plan);
-            if ended.is_empty() {
+            let current = find_limit(&next, &remembered.limit);
+            if let Some(mut window) = reset_window(&prev, &next, plan) {
+                if let Some(began) = &remembered.opened {
+                    began.mark(&mut window);
+                }
+                let window_key = WindowKey::of(&window);
+                if !self.windows.contains(&window_key) {
+                    windows.push((window_key, window));
+                }
+                if let Some(current) = current {
+                    opened.insert(
+                        key.clone(),
+                        Opened {
+                            start: at,
+                            from: Some(current.p),
+                        },
+                    );
+                }
                 continue;
+            }
+            let mut ended = closed_windows(&prev, &next, plan);
+            if ended.is_empty() {
+                // A drop too small for a reset, before the reset time: kept
+                // as the reading, named once per window.
+                if let (Some(current), Some(reset_at)) = (current, remembered.limit.r) {
+                    let points = remembered.limit.p - current.p;
+                    let window = (account.clone(), key.clone(), reset_at);
+                    if points > 0.0 && self.small_drops.insert(window) {
+                        self.warnings.push(format!(
+                            "usage of account {} {} went down by {points:.1} points without a reset",
+                            account.acc,
+                            key.name()
+                        ));
+                    }
+                }
+                continue;
+            }
+            if let Some(began) = &remembered.opened {
+                for window in &mut ended {
+                    began.mark(window);
+                }
             }
             // A full limit whose window ends while no reading carries it was
             // never seen below 100 %, so nobody else can say it is free again.
@@ -229,15 +311,32 @@ impl Recorder {
         // jitter, a stale answer) is that same window: it keeps the written
         // end, or the window would be written a second time with this
         // reading's numbers.
+        // The open window keeps where a reset began it until it ends; a reset
+        // at this reading begins a new one here.
         for limit in &next.l {
             let key = LimitKey::of(limit);
             let mut limit = limit.clone();
             if let (Some(end), Some(r)) = (closed.get(&key), limit.r) {
-                if r <= *end + chrono::Duration::seconds(RESET_JITTER) {
+                if r <= *end + Duration::seconds(RESET_JITTER) {
                     limit.r = Some(*end);
                 }
             }
-            state.limits.insert(key, RememberedLimit { limit, t: at });
+            let began = match (opened.get(&key), closed.contains_key(&key)) {
+                (Some(began), _) => Some(*began),
+                (None, true) => None,
+                (None, false) => state
+                    .limits
+                    .get(&key)
+                    .and_then(|remembered| remembered.opened),
+            };
+            state.limits.insert(
+                key,
+                RememberedLimit {
+                    limit,
+                    t: at,
+                    opened: began,
+                },
+            );
         }
         for key in closed.keys() {
             let present = next.l.iter().any(|limit| LimitKey::of(limit) == *key);
@@ -290,7 +389,12 @@ impl Recorder {
     /// adds the limits it carries that no newer line already gave, until the
     /// first `Poll` line has been taken in (it carries every limit) or the files
     /// run out. Then the windows already written for the months of those
-    /// limits' ends.
+    /// limits' ends and of their current windows' starts (every month when a
+    /// limit's kind has no known length); per limit, the newest reset record
+    /// inside its current window (for a kind of unknown length: after its
+    /// newest ordinary window end) says where that window began, and
+    /// this host's sample at that moment its first percent (missing: the window
+    /// is marked uncertain and one warning names it).
     fn load_once(&mut self, account: &AccountRef) -> Result<(), HistoryError> {
         if self.state.contains_key(account) {
             return Ok(());
@@ -325,17 +429,36 @@ impl Recorder {
             }
         }
 
-        let ends: Vec<DateTime<Utc>> = state
+        // The months that hold a remembered limit's reset time, and the start
+        // of its current window, where a reset that began it would lie.
+        let mut months: Vec<DateTime<Utc>> = Vec::new();
+        for remembered in state.limits.values() {
+            let Some(reset_at) = remembered.limit.r else {
+                continue;
+            };
+            let mut times = vec![reset_at];
+            if let Some(earliest) = current_window_from(&remembered.limit) {
+                times.push(earliest);
+            }
+            for time in times {
+                if let Some(month) = month_start(time.year(), time.month()) {
+                    if !months.contains(&month) {
+                        months.push(month);
+                    }
+                }
+            }
+        }
+        // A limit of a kind whose length is unknown has no "current window"
+        // to look in: its bound is its newest ordinary window end, which can
+        // lie in any month, so then every month file is read.
+        let unknown_length = state
             .limits
-            .values()
-            .filter_map(|remembered| remembered.limit.r)
-            .collect();
-        if !ends.is_empty() {
+            .keys()
+            .any(|key| window_length(&key.k).is_none());
+        let mut written: Vec<WindowRecord> = Vec::new();
+        if !months.is_empty() || unknown_length {
             for range in months_of_kind(&host_dir, Kind::Windows)? {
-                let holds_end = ends
-                    .iter()
-                    .any(|end| month_start(end.year(), end.month()) == Some(range.from));
-                if !holds_end {
+                if !unknown_length && !months.contains(&range.from) {
                     continue;
                 }
                 let read = self.dir.read::<WindowRecord>(&range, &own)?;
@@ -343,14 +466,103 @@ impl Recorder {
                 for hosted in read.records {
                     if &hosted.record.account == account {
                         self.windows.insert(WindowKey::of(&hosted.record));
+                        written.push(hosted.record);
                     }
                 }
             }
         }
 
+        // A window that a reset began: the newest reset record of the limit
+        // inside its current window gives the start; this host's sample at
+        // that moment gives the first percent. For a kind of unknown length
+        // the current window is everything after the limit's newest ordinary
+        // window end (every month was read, so that bound is known).
+        for (key, remembered) in state.limits.iter_mut() {
+            let of_limit = |window: &&WindowRecord| window.k == key.k && window.m == key.m;
+            let in_current: Box<dyn Fn(DateTime<Utc>) -> bool> = match (
+                window_length(&key.k),
+                current_window_from(&remembered.limit),
+            ) {
+                (Some(_), Some(earliest)) => Box::new(move |end| end >= earliest),
+                (Some(_), None) => continue,
+                (None, _) => {
+                    let last_ordinary = written
+                        .iter()
+                        .filter(of_limit)
+                        .filter(|window| !window.reset)
+                        .map(|window| window.end)
+                        .max();
+                    Box::new(move |end| last_ordinary.is_none_or(|last| end > last))
+                }
+            };
+            let newest = written
+                .iter()
+                .filter(of_limit)
+                .filter(|window| window.reset && window.end <= remembered.t)
+                .filter(|window| in_current(window.end))
+                .max_by_key(|window| window.end);
+            let Some(reset) = newest else {
+                continue;
+            };
+            let from = self.percent_at(account, key, reset.end)?;
+            if from.is_none() {
+                self.warnings.push(format!(
+                    "account {} {}: no sample on this host at {}, the first reading after its reset; \
+                     the window's first percent is unknown and its record is marked uncertain",
+                    account.acc,
+                    key.name(),
+                    reset.end.to_rfc3339()
+                ));
+            }
+            remembered.opened = Some(Opened {
+                start: reset.end,
+                from,
+            });
+        }
+
         self.state.insert(account.clone(), state);
         Ok(())
     }
+
+    /// The percent of `key` in this host's sample of `account` taken at `at`,
+    /// `None` when there is no such sample or it does not carry the limit.
+    fn percent_at(
+        &mut self,
+        account: &AccountRef,
+        key: &LimitKey,
+        at: DateTime<Utc>,
+    ) -> Result<Option<f64>, HistoryError> {
+        let range = Range {
+            from: at,
+            to: at + Duration::seconds(1),
+        };
+        let read = self
+            .dir
+            .read::<Sample>(&range, &Hosts::One(self.dir.host().to_string()))?;
+        self.warnings.extend(read.warnings);
+        Ok(read
+            .records
+            .iter()
+            .map(|hosted| &hosted.record)
+            .filter(|sample| &sample.account == account && sample.t == at)
+            .find_map(|sample| {
+                sample
+                    .l
+                    .iter()
+                    .find(|limit| LimitKey::of(limit) == *key)
+                    .map(|limit| limit.p)
+            }))
+    }
+}
+
+/// The earliest moment a reset that began `limit`'s current window can lie
+/// at: its reset time minus its length, less [`RESET_JITTER`] (a reset time
+/// set from the reset's moment is rounded up to the minute). `None` without a
+/// reset time or for a kind of unknown length.
+fn current_window_from(limit: &LimitSample) -> Option<DateTime<Utc>> {
+    let reset_at = limit.r?;
+    let length = window_length(&limit.k)?;
+    Some(reset_at - length - Duration::seconds(RESET_JITTER))
 }
 
 /// One usage answer as a history sample, with reset times through
@@ -374,27 +586,60 @@ pub fn sample_of(account: &AccountRef, usage: &Usage, at: DateTime<Utc>, src: So
     }
 }
 
-/// The windows of `prev` that have ended by `next`. A limit (matched by `k` and
-/// `m`) has ended when `prev.r` is `Some(end)` and: `next.t >= end`, or next has
-/// the limit with `next.r > end + 60 s`. A limit missing from `next`, or with
-/// `r` None, ends nothing by itself. `end = prev.r`; `final = prev.p`;
-/// `lastSample = prev.t`; `uncertain = end - prev.t > 1 h`.
-/// `start = end - 7 d` for weekly_all and weekly_scoped, `end - 5 h` for
-/// session, `None` otherwise. `lost = max(0, 100 - final)` for the two weekly
-/// kinds, `None` otherwise.
+/// The windows of `prev` that have ended by `next` at their reset time. A limit
+/// (matched by `k` and `m`) has ended when `prev.r` is `Some(end)` and:
+/// `next.t >= end`, or next has the limit with `next.r > end + 60 s`, or next
+/// has the limit at least [`RESET_DROP_POINTS`] lower within [`RESET_JITTER`]
+/// of `end` (the reset seen a moment early by this computer's clock). A limit
+/// missing from `next`, or with `r` None, ends nothing by itself. A drop that
+/// comes earlier is a reset ([`reset_window`]), which the caller checks first.
+/// `end = prev.r`; `final = prev.p`; `lastSample = prev.t`;
+/// `uncertain = end - prev.t > 1 h`. `start = end - 7 d` for weekly_all and
+/// weekly_scoped, `end - 5 h` for session, `None` otherwise.
+/// `lost = max(0, 100 - final)` for the two weekly kinds, `None` otherwise.
 pub fn closed_windows(prev: &Sample, next: &Sample, plan: Option<&str>) -> Vec<WindowRecord> {
     let mut windows = Vec::new();
     for limit in &prev.l {
         let Some(end) = limit.r else { continue };
-        let same_later = find_limit(next, limit)
+        let current = find_limit(next, limit);
+        let same_later = current
             .and_then(|current| current.r)
-            .map(|new_end| new_end > end + chrono::Duration::seconds(RESET_JITTER))
+            .map(|new_end| new_end > end + Duration::seconds(RESET_JITTER))
             .unwrap_or(false);
-        if next.t >= end || same_later {
-            windows.push(window_of(prev, limit, end, plan));
+        let dropped_at_end =
+            current.is_some_and(|current| dropped(limit, current)) && same_reset(next.t, end);
+        if next.t >= end || same_later || dropped_at_end {
+            windows.push(window_of(prev, limit, end, end, plan));
         }
     }
     windows
+}
+
+/// The window of `prev`'s one limit that a reset ended at `next`: `next`
+/// carries the limit at least [`RESET_DROP_POINTS`] lower while `next.t` is
+/// more than [`RESET_JITTER`] before `prev.r`, whether or not the reset time
+/// moved. `end = next.t`, `reset = true`, `lost = None` (the limit was given
+/// back, nothing expired); `start`, `final`, `lastSample`, `uncertain` and
+/// `plan` as [`closed_windows`] has them, `start` from `prev.r`. `None` when
+/// the limit did not drop that far, has no reset time, or the drop comes at
+/// or after the reset time.
+fn reset_window(prev: &Sample, next: &Sample, plan: Option<&str>) -> Option<WindowRecord> {
+    let limit = prev.l.first()?;
+    let reset_at = limit.r?;
+    let current = find_limit(next, limit)?;
+    let early = reset_at.signed_duration_since(next.t) > Duration::seconds(RESET_JITTER);
+    if !early || !dropped(limit, current) {
+        return None;
+    }
+    let mut window = window_of(prev, limit, reset_at, next.t, plan);
+    window.lost = None;
+    window.reset = true;
+    Some(window)
+}
+
+/// Whether `current` is at least [`RESET_DROP_POINTS`] below `previous`.
+fn dropped(previous: &LimitSample, current: &LimitSample) -> bool {
+    previous.p - current.p >= RESET_DROP_POINTS
 }
 
 fn find_limit<'a>(sample: &'a Sample, limit: &LimitSample) -> Option<&'a LimitSample> {
@@ -404,31 +649,42 @@ fn find_limit<'a>(sample: &'a Sample, limit: &LimitSample) -> Option<&'a LimitSa
         .find(|other| other.k == limit.k && other.m == limit.m)
 }
 
+/// How long a window of `kind` runs: a week for the two weekly kinds, 5 h for
+/// the session; `None` for a kind this version does not know.
+fn window_length(kind: &LimitKind) -> Option<Duration> {
+    match kind {
+        LimitKind::WeeklyAll | LimitKind::WeeklyScoped => Some(Duration::days(7)),
+        LimitKind::Session => Some(Duration::hours(5)),
+        LimitKind::Other(_) => None,
+    }
+}
+
+/// The record of `limit`'s window, whose reset time is `reset_at`, ending at
+/// `end` (the reset time, or the reading of a reset).
 fn window_of(
     prev: &Sample,
     limit: &LimitSample,
+    reset_at: DateTime<Utc>,
     end: DateTime<Utc>,
     plan: Option<&str>,
 ) -> WindowRecord {
-    let (start, lost) = match &limit.k {
-        LimitKind::WeeklyAll | LimitKind::WeeklyScoped => (
-            Some(end - chrono::Duration::days(7)),
-            Some((100.0 - limit.p).max(0.0)),
-        ),
-        LimitKind::Session => (Some(end - chrono::Duration::hours(5)), None),
-        LimitKind::Other(_) => (None, None),
+    let lost = match &limit.k {
+        LimitKind::WeeklyAll | LimitKind::WeeklyScoped => Some((100.0 - limit.p).max(0.0)),
+        LimitKind::Session | LimitKind::Other(_) => None,
     };
     WindowRecord {
         account: prev.account.clone(),
         k: limit.k.clone(),
         m: limit.m.clone(),
-        start,
+        start: window_length(&limit.k).map(|length| reset_at - length),
         end,
         final_percent: limit.p,
         lost,
         last_sample: prev.t,
         plan: plan.map(str::to_string),
-        uncertain: end.signed_duration_since(prev.t) > chrono::Duration::hours(1),
+        uncertain: end.signed_duration_since(prev.t) > Duration::hours(1),
+        reset: false,
+        from: None,
     }
 }
 
@@ -699,6 +955,8 @@ mod tests {
                 last_sample: utc("2026-11-16T15:58:10Z"),
                 plan: None,
                 uncertain: false,
+                reset: false,
+                from: None,
             }]
         );
     }
@@ -1464,5 +1722,456 @@ mod tests {
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0].end, utc("2026-11-16T16:00:00Z"));
         assert_eq!(windows[0].final_percent, 87.0);
+    }
+
+    /// One reading after another for the atlas account, all polled.
+    fn readings(recorder: &mut Recorder, list: &[(&str, Usage)]) {
+        for (at, usage) in list {
+            recorder
+                .reading(&atlas_account(), None, usage, utc(at), Source::Poll)
+                .unwrap();
+        }
+    }
+
+    /// A window's own use: `final − from`, `from` absent = 0.
+    fn own_use(window: &WindowRecord) -> f64 {
+        window.final_percent - window.from.unwrap_or(0.0)
+    }
+
+    #[test]
+    fn a_drop_to_zero_before_the_reset_time_ends_the_window() {
+        let dir = tempdir().unwrap();
+        let mut recorder = Recorder::new(history(dir.path()));
+        let friday = Some(utc("2026-11-20T10:00:00Z"));
+        readings(
+            &mut recorder,
+            &[
+                ("2026-11-16T09:00:00Z", weekly(40.0, friday)),
+                ("2026-11-17T12:00:00Z", weekly(62.0, friday)),
+                ("2026-11-18T08:30:00Z", weekly(0.0, friday)),
+            ],
+        );
+
+        let windows = windows_of(dir.path());
+        assert_eq!(
+            windows,
+            vec![WindowRecord {
+                account: atlas_account(),
+                k: LimitKind::WeeklyAll,
+                m: None,
+                start: Some(utc("2026-11-13T10:00:00Z")),
+                end: utc("2026-11-18T08:30:00Z"),
+                final_percent: 62.0,
+                lost: None,
+                last_sample: utc("2026-11-17T12:00:00Z"),
+                plan: None,
+                uncertain: true,
+                reset: true,
+                from: None,
+            }]
+        );
+
+        // The open window starts at the 0 % reading: its record says so when
+        // it ends at Friday's reset.
+        readings(
+            &mut recorder,
+            &[
+                ("2026-11-18T15:00:00Z", weekly(30.0, friday)),
+                (
+                    "2026-11-20T10:02:00Z",
+                    weekly(1.0, Some(utc("2026-11-27T10:00:00Z"))),
+                ),
+            ],
+        );
+        let windows = windows_of(dir.path());
+        assert_eq!(windows.len(), 2, "{windows:?}");
+        let after = &windows[1];
+        assert_eq!(after.start, Some(utc("2026-11-18T08:30:00Z")));
+        assert_eq!(after.end, utc("2026-11-20T10:00:00Z"));
+        assert_eq!(after.final_percent, 30.0);
+        assert_eq!(after.from, Some(0.0));
+        assert!(!after.reset);
+        assert_eq!(after.lost, Some(70.0));
+    }
+
+    #[test]
+    fn a_model_reset_splits_the_model_and_the_week() {
+        let dir = tempdir().unwrap();
+        let mut recorder = Recorder::new(history(dir.path()));
+        let friday = Some(utc("2026-11-20T10:00:00Z"));
+        let next_friday = Some(utc("2026-11-27T10:00:00Z"));
+        readings(
+            &mut recorder,
+            &[
+                (
+                    "2026-11-16T09:00:00Z",
+                    all_and_scoped(70.0, friday, "Fable", 50.0, friday),
+                ),
+                (
+                    "2026-11-18T08:30:00Z",
+                    all_and_scoped(45.0, friday, "Fable", 0.0, friday),
+                ),
+            ],
+        );
+
+        let windows = windows_of(dir.path());
+        assert_eq!(windows.len(), 2, "{windows:?}");
+        for window in &windows {
+            assert!(window.reset, "{window:?}");
+            assert_eq!(window.end, utc("2026-11-18T08:30:00Z"));
+            assert_eq!(window.lost, None);
+        }
+        let fable = windows
+            .iter()
+            .find(|window| window.k == LimitKind::WeeklyScoped)
+            .unwrap();
+        assert_eq!(fable.m.as_deref(), Some("Fable"));
+        assert_eq!(fable.final_percent, 50.0);
+
+        let later = 60.0;
+        readings(
+            &mut recorder,
+            &[
+                (
+                    "2026-11-19T12:00:00Z",
+                    all_and_scoped(later, friday, "Fable", 20.0, friday),
+                ),
+                (
+                    "2026-11-20T10:02:00Z",
+                    all_and_scoped(1.0, next_friday, "Fable", 0.0, next_friday),
+                ),
+            ],
+        );
+        let week: Vec<WindowRecord> = windows_of(dir.path())
+            .into_iter()
+            .filter(|window| window.k == LimitKind::WeeklyAll)
+            .collect();
+        assert_eq!(week.len(), 2, "{week:?}");
+        assert_eq!(week[1].start, Some(utc("2026-11-18T08:30:00Z")));
+        assert_eq!(week[1].from, Some(45.0));
+        let sum: f64 = week.iter().map(own_use).sum();
+        assert_eq!(sum, 70.0 + (later - 45.0));
+    }
+
+    #[test]
+    fn a_drop_seen_after_a_restart_is_a_reset() {
+        let dir = tempdir().unwrap();
+        let mut first = Recorder::new(history(dir.path()));
+        readings(
+            &mut first,
+            &[(
+                "2026-11-16T10:00:00Z",
+                weekly(80.0, Some(utc("2026-11-20T10:00:00Z"))),
+            )],
+        );
+        drop(first);
+
+        // seatswap was off for 20 h; the reset time moved, still in the future.
+        let moved = Some(utc("2026-11-24T06:00:00Z"));
+        let mut second = Recorder::new(history(dir.path()));
+        readings(&mut second, &[("2026-11-17T06:00:00Z", weekly(5.0, moved))]);
+
+        let windows = windows_of(dir.path());
+        assert_eq!(windows.len(), 1, "{windows:?}");
+        assert!(windows[0].reset);
+        assert_eq!(windows[0].end, utc("2026-11-17T06:00:00Z"));
+        assert_eq!(windows[0].final_percent, 80.0);
+        assert_eq!(windows[0].last_sample, utc("2026-11-16T10:00:00Z"));
+        assert_eq!(windows[0].lost, None);
+        assert!(windows[0].uncertain);
+        drop(second);
+
+        // A later restart still knows where the window after the reset began
+        // and its first percent.
+        let mut third = Recorder::new(history(dir.path()));
+        readings(
+            &mut third,
+            &[
+                ("2026-11-19T09:00:00Z", weekly(30.0, moved)),
+                (
+                    "2026-11-24T06:02:00Z",
+                    weekly(2.0, Some(utc("2026-12-01T06:00:00Z"))),
+                ),
+            ],
+        );
+        let windows = windows_of(dir.path());
+        assert_eq!(windows.len(), 2, "{windows:?}");
+        assert_eq!(windows[1].start, Some(utc("2026-11-17T06:00:00Z")));
+        assert_eq!(windows[1].from, Some(5.0));
+        assert!(!windows[1].reset);
+        assert!(third.take_warnings().is_empty());
+    }
+
+    #[test]
+    fn a_small_drop_is_kept_and_logged_not_a_reset() {
+        let dir = tempdir().unwrap();
+        let mut recorder = Recorder::new(history(dir.path()));
+        let friday = Some(utc("2026-11-20T10:00:00Z"));
+        readings(
+            &mut recorder,
+            &[
+                ("2026-11-16T09:00:00Z", weekly(50.0, friday)),
+                ("2026-11-16T09:02:00Z", weekly(49.6, friday)),
+            ],
+        );
+
+        assert_eq!(window_lines(dir.path()), 0);
+        assert_eq!(sample_lines(dir.path()), 2, "the lower reading is kept");
+        let warnings = recorder.take_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("went down by 0.4 points without a reset"),
+            "{warnings:?}"
+        );
+
+        // Once per window: a second small drop says nothing new.
+        readings(
+            &mut recorder,
+            &[("2026-11-16T09:04:00Z", weekly(49.3, friday))],
+        );
+        assert!(recorder.take_warnings().is_empty());
+        assert_eq!(window_lines(dir.path()), 0);
+    }
+
+    #[test]
+    fn a_reset_at_the_reset_time_is_an_ordinary_window_end() {
+        let dir = tempdir().unwrap();
+        let mut recorder = Recorder::new(history(dir.path()));
+        readings(
+            &mut recorder,
+            &[
+                (
+                    "2026-11-16T15:58:00Z",
+                    weekly(87.0, Some(utc("2026-11-16T16:00:00Z"))),
+                ),
+                (
+                    "2026-11-16T16:02:00Z",
+                    weekly(1.0, Some(utc("2026-11-23T16:00:00Z"))),
+                ),
+            ],
+        );
+
+        let windows = windows_of(dir.path());
+        assert_eq!(windows.len(), 1, "{windows:?}");
+        assert!(!windows[0].reset);
+        assert_eq!(windows[0].end, utc("2026-11-16T16:00:00Z"));
+        assert_eq!(windows[0].lost, Some(13.0));
+        assert_eq!(windows[0].from, None);
+    }
+
+    #[test]
+    fn a_drop_seconds_before_the_reset_time_is_an_ordinary_window_end() {
+        let dir = tempdir().unwrap();
+        let mut recorder = Recorder::new(history(dir.path()));
+        let reset = Some(utc("2026-11-16T16:00:00Z"));
+        readings(
+            &mut recorder,
+            &[
+                ("2026-11-16T15:58:00Z", weekly(87.0, reset)),
+                // This computer's clock is 30 s behind the server's.
+                ("2026-11-16T15:59:30Z", weekly(0.0, reset)),
+                (
+                    "2026-11-16T16:02:00Z",
+                    weekly(1.0, Some(utc("2026-11-23T16:00:00Z"))),
+                ),
+            ],
+        );
+
+        let windows = windows_of(dir.path());
+        assert_eq!(windows.len(), 1, "{windows:?}");
+        assert!(!windows[0].reset);
+        assert_eq!(windows[0].end, utc("2026-11-16T16:00:00Z"));
+        assert_eq!(windows[0].final_percent, 87.0);
+        assert_eq!(windows[0].lost, Some(13.0));
+    }
+
+    #[test]
+    fn a_reset_of_a_limit_of_unknown_length_survives_a_restart() {
+        let dir = tempdir().unwrap();
+        let credits = |percent: f64, reset: &str| Usage {
+            limits: vec![limit(
+                LimitKind::Other("monthly_credits".to_string()),
+                percent,
+                Some(utc(reset)),
+            )],
+            extra_usage_enabled: false,
+            warnings: Vec::new(),
+        };
+        let mut first = Recorder::new(history(dir.path()));
+        readings(
+            &mut first,
+            &[
+                (
+                    "2026-11-09T09:00:00Z",
+                    credits(50.0, "2026-11-10T00:00:00Z"),
+                ),
+                // An ordinary end on the 10th, then a reset on the 18th.
+                (
+                    "2026-11-10T00:02:00Z",
+                    credits(10.0, "2026-11-30T00:00:00Z"),
+                ),
+                (
+                    "2026-11-16T09:00:00Z",
+                    credits(70.0, "2026-11-30T00:00:00Z"),
+                ),
+                ("2026-11-18T08:30:00Z", credits(4.0, "2026-11-30T00:00:00Z")),
+            ],
+        );
+        drop(first);
+
+        let mut restarted = Recorder::new(history(dir.path()));
+        readings(
+            &mut restarted,
+            &[
+                (
+                    "2026-11-19T09:00:00Z",
+                    credits(25.0, "2026-11-30T00:00:00Z"),
+                ),
+                ("2026-11-30T00:02:00Z", credits(2.0, "2026-12-31T00:00:00Z")),
+            ],
+        );
+
+        let windows = windows_of(dir.path());
+        assert_eq!(windows.len(), 3, "{windows:?}");
+        assert!(windows[1].reset);
+        let after = &windows[2];
+        assert_eq!(after.end, utc("2026-11-30T00:00:00Z"));
+        assert_eq!(after.start, Some(utc("2026-11-18T08:30:00Z")));
+        assert_eq!(after.from, Some(4.0));
+        assert!(restarted.take_warnings().is_empty());
+    }
+
+    #[test]
+    fn a_reset_whose_first_sample_is_missing_is_uncertain_and_named() {
+        let dir = tempdir().unwrap();
+        let dir_history = history(dir.path());
+        let friday = Some(utc("2026-11-20T10:00:00Z"));
+        // A reset was recorded on Tuesday, but its sample is not on this host.
+        dir_history
+            .append(&WindowRecord {
+                account: atlas_account(),
+                k: LimitKind::WeeklyAll,
+                m: None,
+                start: Some(utc("2026-11-13T10:00:00Z")),
+                end: utc("2026-11-17T06:00:00Z"),
+                final_percent: 80.0,
+                lost: None,
+                last_sample: utc("2026-11-17T05:58:00Z"),
+                plan: None,
+                uncertain: false,
+                reset: true,
+                from: None,
+            })
+            .unwrap();
+        dir_history
+            .append(&sample(
+                utc("2026-11-18T09:00:00Z"),
+                vec![limit_sample(LimitKind::WeeklyAll, None, 30.0, friday)],
+            ))
+            .unwrap();
+
+        let mut recorder = Recorder::new(history(dir.path()));
+        readings(
+            &mut recorder,
+            &[(
+                "2026-11-20T10:02:00Z",
+                weekly(1.0, Some(utc("2026-11-27T10:00:00Z"))),
+            )],
+        );
+
+        let windows = windows_of(dir.path());
+        assert_eq!(windows.len(), 2, "{windows:?}");
+        assert_eq!(windows[1].start, Some(utc("2026-11-17T06:00:00Z")));
+        assert_eq!(windows[1].from, None);
+        assert!(windows[1].uncertain);
+        let warnings = recorder.take_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("weekly_all"), "{warnings:?}");
+        assert!(warnings[0].contains(&atlas_account().acc), "{warnings:?}");
+    }
+
+    /// Proof (review of R-1): two hosts poll the same account and each records
+    /// the one reset at its own reading time (here 90 s apart, more than
+    /// `RESET_JITTER`). A reader that merges the hosts sees one reset, not two.
+    #[test]
+    fn two_hosts_recording_one_reset_read_as_one_window() {
+        let dir = tempdir().unwrap();
+        let friday = Some(utc("2026-11-20T10:00:00Z"));
+        for (host, at) in [
+            ("atlas", "2026-11-18T08:30:00Z"),
+            ("vega", "2026-11-18T08:31:30Z"),
+        ] {
+            let mut recorder = Recorder::new(HistoryDir::at(dir.path(), host));
+            readings(
+                &mut recorder,
+                &[
+                    ("2026-11-17T12:00:00Z", weekly(62.0, friday)),
+                    (at, weekly(0.0, friday)),
+                ],
+            );
+        }
+        // The second host is another computer: its folder needs a marker.
+        if !dir.path().join("vega/host.json").exists() {
+            fs::write(
+                dir.path().join("vega/host.json"),
+                r#"{"machineId":"vega-machine"}"#,
+            )
+            .unwrap();
+        }
+        let read = history(dir.path())
+            .finished_windows(&wide_range(), &Hosts::All)
+            .unwrap();
+        let resets: Vec<_> = read.records.iter().filter(|w| w.record.reset).collect();
+        assert_eq!(
+            resets.len(),
+            1,
+            "one reset is read as {} windows: {:?}",
+            resets.len(),
+            read.records
+        );
+    }
+
+    /// Proof (second review of R-1): host atlas records a reset and the end of
+    /// the window after it; host vega was off over the reset and records only
+    /// the ordinary end with its old reading. A reader gets atlas's two windows.
+    #[test]
+    fn a_host_off_over_a_reset_adds_no_window_to_the_reader() {
+        let dir = tempdir().unwrap();
+        let friday = Some(utc("2026-11-20T10:00:00Z"));
+        let next = Some(utc("2026-11-27T10:00:00Z"));
+        let mut atlas = Recorder::new(HistoryDir::at(dir.path(), "atlas"));
+        readings(
+            &mut atlas,
+            &[
+                ("2026-11-17T12:00:00Z", weekly(62.0, friday)),
+                ("2026-11-18T08:30:00Z", weekly(0.0, friday)),
+                ("2026-11-19T12:00:00Z", weekly(30.0, friday)),
+                ("2026-11-20T10:02:00Z", weekly(1.0, next)),
+            ],
+        );
+        let mut vega = Recorder::new(HistoryDir::at(dir.path(), "vega"));
+        readings(
+            &mut vega,
+            &[
+                ("2026-11-16T09:00:00Z", weekly(40.0, friday)),
+                ("2026-11-20T10:05:00Z", weekly(1.0, next)),
+            ],
+        );
+        fs::write(dir.path().join("vega/host.json"), r#"{"machineId":"v"}"#).unwrap();
+        let read = history(dir.path())
+            .finished_windows(&wide_range(), &Hosts::All)
+            .unwrap();
+        let shape: Vec<_> = read
+            .records
+            .iter()
+            .map(|w| (w.host.clone(), w.record.reset, w.record.final_percent))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("atlas".to_string(), true, 62.0),
+                ("atlas".to_string(), false, 30.0)
+            ]
+        );
     }
 }

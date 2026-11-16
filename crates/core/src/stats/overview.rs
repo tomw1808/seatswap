@@ -859,6 +859,8 @@ mod tests {
             last_sample: utc(end) - Duration::minutes(1),
             plan: None,
             uncertain: false,
+            reset: false,
+            from: None,
         }
     }
 

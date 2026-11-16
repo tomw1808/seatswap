@@ -11,7 +11,7 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -631,12 +631,12 @@ impl<R: Remote> Engine<R> {
                         Err(ApiError::Unauthorized) => {
                             self.set_last_error(id, WAITING_MESSAGE.to_string())
                         }
-                        Err(error) => self.record_api_error(id, error, now),
+                        Err(error) => self.record_api_error(id, error, now, &Local),
                     },
                     None => self.set_last_error(id, WAITING_MESSAGE.to_string()),
                 }
             }
-            Err(error) => self.record_api_error(id, error, now),
+            Err(error) => self.record_api_error(id, error, now, &Local),
         }
     }
 
@@ -690,7 +690,7 @@ impl<R: Remote> Engine<R> {
                 self.refresh_account(account, &stored, now, true)
             }
             Err(error) => {
-                self.record_api_error(id, error, now);
+                self.record_api_error(id, error, now, &Local);
                 Ok(())
             }
         }
@@ -773,7 +773,7 @@ impl<R: Remote> Engine<R> {
             drop(lock);
             match self.remote.usage(&token) {
                 Ok(usage) => self.record_success(id, &current_ref, plan.as_deref(), usage, now),
-                Err(error) => self.record_api_error(id, error, now),
+                Err(error) => self.record_api_error(id, error, now, &Local),
             }
             return Ok(());
         }
@@ -797,7 +797,7 @@ impl<R: Remote> Engine<R> {
                     // The reply belongs to another account: store nothing.
                     self.set_last_error(id, error.to_string());
                 } else {
-                    self.record_api_error(id, error, now);
+                    self.record_api_error(id, error, now, &Local);
                 }
                 return Ok(());
             }
@@ -820,7 +820,7 @@ impl<R: Remote> Engine<R> {
                 let token = token.to_string();
                 match self.remote.usage(&token) {
                     Ok(usage) => self.record_success(id, &current_ref, plan.as_deref(), usage, now),
-                    Err(error) => self.record_api_error(id, error, now),
+                    Err(error) => self.record_api_error(id, error, now, &Local),
                 }
             }
             None => self.set_last_error(id, "the renewed login has no access token".to_string()),
@@ -1057,8 +1057,18 @@ impl<R: Remote> Engine<R> {
 
     /// Record an API failure. Transient failures back off 1, 2, 4, 8, 16, 30,
     /// 30 … minutes (spec §7.1); a rate-limit reply waits at least its
-    /// `Retry-After`. Anything else is not retried until it is due again.
-    fn record_api_error(&mut self, id: &str, error: ApiError, now: DateTime<Utc>) {
+    /// `Retry-After`, and its text names the next try in `zone` ("…; next try
+    /// at 10:42"; the app passes `chrono::Local`). Anything else is not retried
+    /// until it is due again.
+    fn record_api_error<Tz: TimeZone>(
+        &mut self,
+        id: &str,
+        error: ApiError,
+        now: DateTime<Utc>,
+        zone: &Tz,
+    ) where
+        Tz::Offset: std::fmt::Display,
+    {
         if !error.is_transient() {
             let entry = self.cache.entries.entry(id.to_string()).or_default();
             entry.failures = 0;
@@ -1068,7 +1078,9 @@ impl<R: Remote> Engine<R> {
         }
 
         let retry_after_secs = match &error {
-            ApiError::RateLimited { retry_after_secs } => *retry_after_secs,
+            ApiError::RateLimited {
+                retry_after_secs, ..
+            } => *retry_after_secs,
             _ => None,
         };
         let entry = self.cache.entries.entry(id.to_string()).or_default();
@@ -1082,7 +1094,13 @@ impl<R: Remote> Engine<R> {
         let backoff = chrono::Duration::try_seconds(i64::try_from(secs).unwrap_or(i64::MAX))
             .unwrap_or(chrono::Duration::MAX);
         entry.backoff_until = now.checked_add_signed(backoff);
-        entry.last_error = Some(error.to_string());
+        entry.last_error = Some(match (&error, entry.backoff_until) {
+            (ApiError::RateLimited { .. }, Some(next_try)) => format!(
+                "{error}; next try at {}",
+                next_try.with_timezone(zone).format("%H:%M")
+            ),
+            _ => error.to_string(),
+        });
     }
 }
 
@@ -2450,6 +2468,7 @@ mod tests {
         fake.script_usage(
             &live_access(),
             Err(ApiError::RateLimited {
+                service: "Claude",
                 retry_after_secs: Some(300),
             }),
         );
@@ -2462,6 +2481,60 @@ mod tests {
 
         engine.poll(PollReason::Timer, at(299)).unwrap();
         assert_eq!(fake.usage_tokens().len(), 1);
+    }
+
+    #[test]
+    fn a_rate_limit_names_the_next_try() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = Fixture::new(&tmp);
+        let (_app, _fake, mut engine) = fixture.into_engine();
+        // Vienna in winter: one hour ahead of UTC, whatever this machine's zone.
+        let vienna = chrono::FixedOffset::east_opt(3600).unwrap();
+
+        engine.record_api_error(
+            A_ID,
+            ApiError::RateLimited {
+                service: "Claude",
+                retry_after_secs: Some(0),
+            },
+            t0(),
+            &vienna,
+        );
+        let entry = engine.cache.entries.get(A_ID).unwrap();
+        assert_eq!(entry.backoff_until, Some(at(60)));
+        assert_eq!(
+            entry.last_error.as_deref(),
+            Some("Claude limits how often seatswap may ask; next try at 13:01")
+        );
+
+        engine.record_api_error(
+            A_ID,
+            ApiError::RateLimited {
+                service: "Claude",
+                retry_after_secs: None,
+            },
+            at(60),
+            &vienna,
+        );
+        let entry = engine.cache.entries.get(A_ID).unwrap();
+        assert_eq!(entry.backoff_until, Some(at(180)));
+        assert_eq!(
+            entry.last_error.as_deref(),
+            Some("Claude limits how often seatswap may ask; next try at 13:03")
+        );
+
+        // Other errors keep their text.
+        engine.record_api_error(A_ID, ApiError::Server(503), at(180), &vienna);
+        assert_eq!(
+            engine
+                .cache
+                .entries
+                .get(A_ID)
+                .unwrap()
+                .last_error
+                .as_deref(),
+            Some("server error 503")
+        );
     }
 
     #[test]

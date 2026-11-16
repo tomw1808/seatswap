@@ -1354,6 +1354,8 @@ mod tests {
                 last_sample: utc("2026-11-17T23:58:00Z"),
                 plan: Some("Team 5x".to_string()),
                 uncertain: false,
+                reset: false,
+                from: None,
             })
             .expect("AC's window reaching past the range");
         tiny.history

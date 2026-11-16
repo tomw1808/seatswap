@@ -129,8 +129,10 @@ impl HistoryDir {
         Ok(read)
     }
 
-    /// The window records of the range, one per (account, kind, end within
-    /// `same_reset`): the one with the latest `last_sample` counts (spec §1.5).
+    /// The window records of the range, one per window (account, kind, model,
+    /// and an end within `same_reset`, or for a reset seen by two hosts
+    /// overlapping spans; [`same_window`]): the one with the latest
+    /// `last_sample` counts (spec §1.5).
     /// On a tie the host name that sorts first wins, so the result does not
     /// depend on read order. Sorted by end, then account. The read's warnings
     /// are kept, so a caller that shows them gets them here too.
@@ -177,17 +179,15 @@ impl HistoryDir {
     }
 }
 
-/// The finished windows of a window read: one per (account, kind, end within
-/// `same_reset`), the one with the latest `last_sample`; on a tie the host name
-/// that sorts first wins. Sorted by end, then account.
+/// The finished windows of a window read: one per window, the record with the
+/// latest `last_sample`; on a tie the host name that sorts first wins. Sorted
+/// by end, then account. Two records are one window when [`same_window`] says
+/// so. The kept record's `start` and `from` are that host's own: the host that
+/// saw the window longest also saw where it began.
 fn finished_of(mut records: Vec<Hosted<WindowRecord>>) -> Vec<Hosted<WindowRecord>> {
     let mut windows: Vec<Hosted<WindowRecord>> = Vec::new();
     for hosted in records.drain(..) {
-        let same = windows.iter().position(|kept| {
-            kept.record.account == hosted.record.account
-                && kept.record.k == hosted.record.k
-                && same_reset(kept.record.end, hosted.record.end)
-        });
+        let same = windows.iter().position(|kept| same_window(kept, &hosted));
         let Some(index) = same else {
             windows.push(hosted);
             continue;
@@ -206,6 +206,26 @@ fn finished_of(mut records: Vec<Hosted<WindowRecord>>) -> Vec<Hosted<WindowRecor
             .then_with(|| a.record.account.cmp(&b.record.account))
     });
     windows
+}
+
+/// Whether two window records are the same window: the same account, kind and
+/// model, and
+/// - two ordinary ends: their ends are within [`same_reset`];
+/// - two resets from different hosts: their spans `(lastSample, end]` overlap.
+///   Each host records a reset at its own first lower reading, and each span
+///   holds the moment the limit dropped, so no tolerance is needed.
+///
+/// An ordinary end and a reset are never the same window.
+fn same_window(a: &Hosted<WindowRecord>, b: &Hosted<WindowRecord>) -> bool {
+    let (x, y) = (&a.record, &b.record);
+    if x.account != y.account || x.k != y.k || x.m != y.m {
+        return false;
+    }
+    match (x.reset, y.reset) {
+        (false, false) => same_reset(x.end, y.end),
+        (true, true) => a.host != b.host && x.last_sample < y.end && y.last_sample < x.end,
+        _ => false,
+    }
 }
 
 /// The month files of one kind in one host folder whose month overlaps the

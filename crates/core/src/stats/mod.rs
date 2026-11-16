@@ -309,10 +309,11 @@ pub(crate) fn account_weeks_valued<Tz: TimeZone + Copy>(
         if !account_chosen(ctx, q, Some(&window.account)) {
             continue;
         }
-        let (price, price_missing) = match valuer.window_price(&window.account, window.end) {
-            Ok(price) => (Some(price), None),
-            Err(missing) => (None, Some(missing)),
-        };
+        let (price, price_missing) =
+            match valuer.window_price(&window.account, window.weekly_start(), window.end) {
+                Ok(price) => (Some(price), None),
+                Err(missing) => (None, Some(missing)),
+            };
         let account_week = AccountWeek {
             week: week_start(midpoint, &ctx.zone),
             account: window.account.clone(),
@@ -1058,6 +1059,8 @@ pub(crate) mod tests {
                 last_sample: at,
                 plan: Some("Plus".to_string()),
                 uncertain: false,
+                reset: false,
+                from: None,
             })
             .expect("the Codex window");
         history
