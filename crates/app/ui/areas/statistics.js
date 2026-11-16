@@ -55,6 +55,8 @@ const state = {
   pageHost: null,
   accounts: [],
   hosts: null,
+  historyStart: null,
+  historyBytes: null,
   hostError: null,
   choiceError: null,
   range: "thisWeek",
@@ -248,6 +250,15 @@ function renderPageTabs() {
   return tabs;
 }
 
+// "4.6 MB": the history's size as the frame writes it, one decimal and one
+// megabyte = 1 048 576 bytes.
+function historySizeText(bytes) {
+  if (typeof bytes !== "number" || !Number.isSafeInteger(bytes) || bytes < 0) {
+    throw new Error(`invalid history size ${String(bytes)}: use a whole number of bytes`);
+  }
+  return `${(bytes / 1048576).toFixed(1)} MB`;
+}
+
 function renderFrame() {
   if (!state.head || !state.tabrow) return;
   clear(state.head);
@@ -255,10 +266,14 @@ function renderFrame() {
 
   const accounts = state.accounts.length;
   const hosts = Array.isArray(state.hosts) ? String(state.hosts.length) : "—";
+  const meta = [`${accounts} accounts`, `${hosts} hosts`];
+  if (typeof state.historyStart === "string") {
+    meta.push(`since ${dateText(state.historyStart)} · now`);
+  }
   state.head.appendChild(
     h("p", {
       class: "stats-meta",
-      text: `${accounts} accounts · ${hosts} hosts`,
+      text: meta.join(" · "),
       title:
         state.hostError === null
           ? undefined
@@ -276,15 +291,26 @@ function renderFrame() {
   state.tabrow.appendChild(renderPageTabs());
   const spacer = h("span", { class: "sp" });
   state.tabrow.appendChild(spacer);
+  if (state.historyBytes !== null) {
+    state.tabrow.appendChild(
+      h("span", {
+        class: "stats-history",
+        text: `history: ${historySizeText(state.historyBytes)}`,
+      })
+    );
+  }
   state.tabrow.appendChild(
     h(
-      "a",
+      "button",
       {
-        class: "stats-export",
-        href: "#settings/history",
+        type: "button",
+        class: "hbtn xs stats-export",
         title: "The export lives in Settings → History and hosts",
+        onclick: () => {
+          location.hash = "settings/history";
+        },
       },
-      "Export…"
+      "Export"
     )
   );
 }
@@ -363,16 +389,33 @@ function pageCurrency() {
   return isObject(settings) && typeof settings.currency === "string" ? settings.currency : null;
 }
 
-async function loadHosts() {
+async function loadFrame() {
   try {
-    const names = await state.context.invoke("stats_hosts", {});
+    const reply = await state.context.invoke("stats_frame", {});
+    if (!isObject(reply)) throw new Error("stats_frame returned an unexpected reply");
+    const names = reply.hosts;
     if (!Array.isArray(names) || !names.every((name) => typeof name === "string")) {
-      throw new Error("stats_hosts returned an unexpected reply");
+      throw new Error("stats_frame returned an unexpected host list");
+    }
+    const start = reply.historyStart;
+    if (
+      start !== null &&
+      (typeof start !== "string" || start === "" || Number.isNaN(Date.parse(start)))
+    ) {
+      throw new Error("stats_frame returned an unexpected history start");
+    }
+    const bytes = reply.historyBytes;
+    if (typeof bytes !== "number" || !Number.isSafeInteger(bytes) || bytes < 0) {
+      throw new Error("stats_frame returned an unexpected history size");
     }
     state.hosts = names;
+    state.historyStart = start;
+    state.historyBytes = bytes;
     state.hostError = null;
   } catch (error) {
     state.hosts = null;
+    state.historyStart = null;
+    state.historyBytes = null;
     state.hostError = errorMessage(error);
   }
 }
@@ -415,6 +458,7 @@ async function loadPage() {
     accounts: chosenAccounts(),
     open,
     currency: pageCurrency(),
+    historyStart: typeof state.historyStart === "string" ? state.historyStart : null,
   };
   // A page draws into its own stage: a page that loses the race to a newer load
   // writes into a stage that is never shown, so it cannot leave half a page.
@@ -499,11 +543,13 @@ export async function render(container, context) {
   state.host = readChoice(HOST_KEY, (value) => typeof value === "string" && value !== "", "*");
   state.page = pageFromSub(context.sub) || readChoice(TAB_KEY, PAGE_IDS, "overview");
   state.query = buildQuery();
+  state.historyStart = null;
+  state.historyBytes = null;
   state.hostError = null;
   state.loadToken += 1;
 
   buildRoot(container);
-  await loadHosts();
+  await loadFrame();
   if (!state.active) return;
   if (state.hosts && state.host !== "*" && !state.hosts.includes(state.host)) {
     console.warn(`[statistics] dropped the kept host ${JSON.stringify(state.host)}: it is not in the history`);
@@ -547,6 +593,8 @@ export function unmount() {
   state.pageHost = null;
   state.accounts = [];
   state.hosts = null;
+  state.historyStart = null;
+  state.historyBytes = null;
   state.hostError = null;
   state.choiceError = null;
   state.excluded = new Set();

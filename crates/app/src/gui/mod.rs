@@ -291,7 +291,7 @@ pub(crate) fn run(
             window::stats_forecast,
             window::stats_rhythm,
             window::stats_activity,
-            window::stats_hosts,
+            window::stats_frame,
             window::statusline_preview,
             window::statusline_presets,
             window::statusline_kinds,

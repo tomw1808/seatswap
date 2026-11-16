@@ -523,9 +523,9 @@ fn row_for(facts: RowFacts<'_>) -> Result<SubRow, StatsError> {
     let mut paid = Some(0.0);
     let mut full_weeks = 0;
     for week in &weeks {
-        used_sum += week.window.final_percent;
+        used_sum += week.used;
         lost_sum += lost_percent(&week.window)?;
-        if week.window.final_percent >= 100.0 {
+        if week.used >= 100.0 {
             full_weeks += 1;
         }
         match money_of(week) {
@@ -553,7 +553,7 @@ fn row_for(facts: RowFacts<'_>) -> Result<SubRow, StatsError> {
 
     let mut tokens_per_percent: Vec<(DateTime<Utc>, f64)> = Vec::new();
     for week in &weeks {
-        let percent = week.window.final_percent;
+        let percent = week.used;
         if percent <= 0.0 {
             continue;
         }
@@ -922,7 +922,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::api::LimitKind;
-    use crate::history::{LimitSample, Source, WindowRecord};
+    use crate::history::{Event, EventKind, HistoryDir, LimitSample, Source, WindowRecord};
     use crate::stats::tests::{all, append_codex_records, tiny, utc, Tiny};
     use crate::stats::{Ctx, Range};
 
@@ -1513,8 +1513,88 @@ mod tests {
             .expect("AC's week of 9 Nov");
 
         assert!(
-            close(ratio.1, 5_000_000.0 / 100.0),
-            "AC's 100 % window counts the 3 M of 14 Nov and the 2 M of 17 Nov: {}",
+            close(ratio.1, 5_000_000.0 / 190.0),
+            "AC's two windows of the week use 90 % and 100 %: {}",
+            ratio.1
+        );
+    }
+
+    /// A record in the first window of a week that a reset split in two counts
+    /// for that week's tokens per percent: the token of 3 Nov is in the
+    /// 2 Nov .. 5 Nov 12:00 window, while the week uses 92 %.
+    #[test]
+    fn a_token_in_the_first_window_of_a_reset_week_is_counted() {
+        let tiny = tiny();
+        let dir = tempdir().expect("a temp history");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        history
+            .append(&Event {
+                t: utc("2026-11-02T08:00:00Z"),
+                kind: EventKind::Live {
+                    account: Some(tiny.lb_ref()),
+                },
+            })
+            .expect("LB live");
+        history
+            .append_many(&[
+                WindowRecord {
+                    account: tiny.lb_ref(),
+                    k: LimitKind::WeeklyAll,
+                    m: None,
+                    start: Some(utc("2026-11-02T00:00:00Z")),
+                    end: utc("2026-11-05T12:00:00Z"),
+                    final_percent: 62.0,
+                    lost: None,
+                    last_sample: utc("2026-11-05T11:58:00Z"),
+                    plan: Some("Max".to_string()),
+                    uncertain: false,
+                    reset: true,
+                    from: None,
+                },
+                WindowRecord {
+                    account: tiny.lb_ref(),
+                    k: LimitKind::WeeklyAll,
+                    m: None,
+                    start: Some(utc("2026-11-05T12:00:00Z")),
+                    end: utc("2026-11-09T12:00:00Z"),
+                    final_percent: 30.0,
+                    lost: Some(70.0),
+                    last_sample: utc("2026-11-09T11:58:00Z"),
+                    plan: Some("Max".to_string()),
+                    uncertain: false,
+                    reset: false,
+                    from: Some(0.0),
+                },
+            ])
+            .expect("the two windows of the reset week");
+        history
+            .append(&record("2026-11-03T10:00:00Z", 1_000_000))
+            .expect("the token in the first window");
+        let ctx = Ctx {
+            history: &history,
+            ..tiny.ctx()
+        };
+
+        // The range starts after the token and before the first window's
+        // midpoint; the whole week counts, so the token counts too.
+        let page = subscriptions_in(
+            &ctx,
+            &Range {
+                from: utc("2026-11-03T12:00:00Z"),
+                to: utc("2026-11-21T00:00:00Z"),
+            },
+            &all(),
+        )
+        .unwrap();
+        let lb = row(&page, &tiny.lb().id);
+        let ratio = lb
+            .tokens_per_percent
+            .iter()
+            .find(|(week, _)| *week == utc("2026-11-02T00:00:00Z"))
+            .expect("LB's week of 2 Nov");
+        assert!(
+            close(ratio.1, 1_000_000.0 / 92.0),
+            "the token of 3 Nov lies in the first window and the week uses 92 %: {}",
             ratio.1
         );
     }

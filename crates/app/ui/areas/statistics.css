@@ -135,23 +135,11 @@
   flex: 1;
 }
 
-.stats-export {
-  display: inline-flex;
-  align-items: center;
-  height: 24px;
-  padding: 0 8px;
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  background: var(--button-bg);
-  color: var(--text);
+.stats-history {
+  color: var(--muted);
   font-size: 12px;
-  font-weight: 500;
-  text-decoration: none;
+  line-height: 16px;
   white-space: nowrap;
-}
-
-.stats-export:hover {
-  background: var(--hover);
 }
 
 .stats-errors:empty {

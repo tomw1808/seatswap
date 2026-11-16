@@ -21,7 +21,7 @@ use super::{
     account_abbr, account_id, account_position, account_weeks_valued, accounts_without_price,
     blocked_by_week, blocked_spans, date_text, hours_text, keep_warnings, lost_percent, money_of,
     money_text, percent_text, range_of, switch_counts, top_three, week_columns, week_of_record,
-    working_rhythm, AccountWeek, Ctx, Query, StatsError, SwitchCounts,
+    week_span, working_rhythm, AccountWeek, Ctx, Query, StatsError, SwitchCounts,
 };
 
 /// The Overview page's numbers for one range (spec §3.1).
@@ -180,7 +180,7 @@ pub(crate) fn overview_in<Tz: TimeZone + Copy>(
             .accounts
             .push(WeekAccount {
                 id: account_id(ctx, &week.account),
-                used_percent: week.window.final_percent,
+                used_percent: week.used,
                 used: week_money.map(|money| money.used),
                 expired_percent: lost_percent(&week.window)?,
                 expired: week_money.map(|money| money.expired),
@@ -311,15 +311,16 @@ pub(crate) fn overview_in<Tz: TimeZone + Copy>(
 }
 
 /// The range the token and sample reads cover: the range itself, the 14 days
-/// the rates are learned over before its end, and every account week's window.
+/// the rates are learned over before its end, and every account week's windows.
 fn reading_range(range: &Range, finished: &[AccountWeek]) -> Range {
     let mut span = Range {
         from: range.from.min(range.to - Duration::days(RATES_DAYS)),
         to: range.to,
     };
     for week in finished {
-        span.from = span.from.min(week.window.weekly_start());
-        span.to = span.to.max(week.window.end);
+        let week = week_span(week);
+        span.from = span.from.min(week.from);
+        span.to = span.to.max(week.to);
     }
     span
 }
@@ -505,7 +506,7 @@ fn finding_full<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, finished: &[AccountWeek]) ->
             .count() as u32;
         let full = finished
             .iter()
-            .filter(|week| week.account == reference && week.window.final_percent >= 100.0)
+            .filter(|week| week.account == reference && week.used >= 100.0)
             .count() as u32;
         if full == 0 {
             continue;
@@ -526,6 +527,9 @@ fn finding_full<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, finished: &[AccountWeek]) ->
 mod tests {
     use super::*;
 
+    use tempfile::tempdir;
+
+    use crate::history::HistoryDir;
     use crate::stats::tests::{all, append_codex_records, tiny, utc};
     use crate::stats::RangeKey;
 
@@ -634,6 +638,100 @@ mod tests {
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].0, "atlas");
         assert!(close(second[0].1, 62.308), "atlas W2 {}", second[0].1);
+    }
+
+    /// A token in the first window of a week that a reset split in two is
+    /// attributed to that week: the token of 3 Nov lies in the 2 Nov .. 5 Nov
+    /// 12:00 window, and its subscription value is the week's Atlas bar.
+    #[test]
+    fn a_token_in_the_first_window_of_a_reset_week_is_counted() {
+        let tiny = tiny();
+        let dir = tempdir().expect("a temp history");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        history
+            .append(&Event {
+                t: utc("2026-11-02T08:00:00Z"),
+                kind: EventKind::Live {
+                    account: Some(tiny.lb_ref()),
+                },
+            })
+            .expect("LB live");
+        history
+            .append_many(&[
+                WindowRecord {
+                    account: tiny.lb_ref(),
+                    k: crate::api::LimitKind::WeeklyAll,
+                    m: None,
+                    start: Some(utc("2026-11-02T00:00:00Z")),
+                    end: utc("2026-11-05T12:00:00Z"),
+                    final_percent: 62.0,
+                    lost: None,
+                    last_sample: utc("2026-11-05T11:58:00Z"),
+                    plan: Some("Max".to_string()),
+                    uncertain: false,
+                    reset: true,
+                    from: None,
+                },
+                WindowRecord {
+                    account: tiny.lb_ref(),
+                    k: crate::api::LimitKind::WeeklyAll,
+                    m: None,
+                    start: Some(utc("2026-11-05T12:00:00Z")),
+                    end: utc("2026-11-09T12:00:00Z"),
+                    final_percent: 30.0,
+                    lost: Some(70.0),
+                    last_sample: utc("2026-11-09T11:58:00Z"),
+                    plan: Some("Max".to_string()),
+                    uncertain: false,
+                    reset: false,
+                    from: Some(0.0),
+                },
+            ])
+            .expect("the two windows of the reset week");
+        history
+            .append(&TokenRecord {
+                t: utc("2026-11-03T10:00:00Z"),
+                session: "s0".to_string(),
+                cwd: "/home/sam/projects/atlas/engine".to_string(),
+                project: crate::project::ProjectKey::Repo("github.com/sam/atlas".to_string()),
+                model: "claude-opus-5-5".to_string(),
+                input: 0,
+                out: 1_000_000,
+                cw: 0,
+                cr: 0,
+                answers: 1,
+                agent_answers: 0,
+            })
+            .expect("the token in the first window");
+        let ctx = Ctx {
+            history: &history,
+            ..tiny.ctx()
+        };
+
+        // The range starts after the token and before the first window's
+        // midpoint; the whole week counts, so the token counts too.
+        let page = overview_in(
+            &ctx,
+            &Range {
+                from: utc("2026-11-03T12:00:00Z"),
+                to: utc("2026-11-21T00:00:00Z"),
+            },
+            &all(),
+        )
+        .unwrap();
+        let first = week(&page, "2026-11-02T00:00:00Z");
+        assert_eq!(
+            first.projects.len(),
+            1,
+            "the token of 3 Nov is attributed to the week: {:?}",
+            first.projects
+        );
+        assert_eq!(first.projects[0].0, "atlas");
+        assert!(
+            close(first.projects[0].1, 41.538_461_5 * 0.62),
+            "the token's share of the first window's 62 %: {}",
+            first.projects[0].1
+        );
     }
 
     /// The week's project bars follow the host filter: vega has none of atlas's

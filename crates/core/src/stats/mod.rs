@@ -65,13 +65,30 @@ pub(crate) fn add_value<K: Ord>(values: &mut BTreeMap<K, Values>, key: K, next: 
     }
 }
 
+/// The span of one account week: from the start of its first window to the end
+/// of its last one. A week may hold several windows after a reset.
+pub(crate) fn week_span(week: &AccountWeek) -> Range {
+    // `window` is the last of `windows`; starting from it keeps the span right
+    // without assuming `windows` is filled.
+    let from = week
+        .windows
+        .iter()
+        .map(WindowRecord::weekly_start)
+        .fold(week.window.weekly_start(), DateTime::min);
+    Range {
+        from,
+        to: week.window.end,
+    }
+}
+
 /// The range that covers every account week whole, widened from `range` so a
 /// ratio divides a window by its own span.
 pub(crate) fn windows_span(weeks: &[AccountWeek], range: &Range) -> Range {
     let mut span = *range;
     for week in weeks {
-        span.from = span.from.min(week.window.weekly_start());
-        span.to = span.to.max(week.window.end);
+        let week = week_span(week);
+        span.from = span.from.min(week.from);
+        span.to = span.to.max(week.to);
     }
     span
 }
@@ -243,14 +260,68 @@ pub(crate) fn previous_week_start<Tz: TimeZone + Copy>(
     local_date_start(monday, zone)
 }
 
+/// The statistics frame: the hosts, when the history's subscription values
+/// begin and how large the whole history is.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatsFrame {
+    pub hosts: Vec<String>,
+    /// The earliest usage reading or switch of any host; token and session
+    /// records are older and do not set it. `None` for a history with neither.
+    pub history_start: Option<DateTime<Utc>>,
+    /// The size of every host folder of the history, as Settings → History
+    /// counts it ([`HistoryDir::host_bytes`]).
+    pub history_bytes: u64,
+}
+
+/// The frame's answer: the host list, the history's first reading or switch and
+/// its size. Only the month files up to the first reading or switch are read.
+pub fn frame(history: &HistoryDir) -> Result<StatsFrame, StatsError> {
+    let hosts = history.hosts()?;
+    let mut history_start: Option<DateTime<Utc>> = None;
+    let mut history_bytes = 0u64;
+    for host in &hosts {
+        let firsts = [
+            history.first_where::<Sample>(host, |_| true)?,
+            history.first_where::<Event>(host, |event| {
+                matches!(event.kind, EventKind::Switch { .. })
+            })?,
+        ];
+        for first in firsts.into_iter().flatten() {
+            history_start = Some(history_start.map_or(first, |at| at.min(first)));
+        }
+        history_bytes = history_bytes
+            .checked_add(history.host_bytes(host)?)
+            .ok_or_else(|| {
+                StatsError::Message(format!(
+                    "the history files add up to more than 2^64 bytes: {}",
+                    history.root().display()
+                ))
+            })?;
+    }
+    Ok(StatsFrame {
+        hosts,
+        history_start,
+        history_bytes,
+    })
+}
+
 /// One finished weekly window, put into the calendar week its midpoint falls in.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountWeek {
     pub week: DateTime<Utc>,
     pub account: AccountRef,
+    /// Every finished weekly window of the account whose midpoint falls in
+    /// this calendar week, oldest end first.
+    pub windows: Vec<WindowRecord>,
+    /// The last of `windows`: the window whose end, lost percent and plan the
+    /// week shows.
     pub window: WindowRecord,
-    /// The account's monthly price at the window's midpoint, in the display
+    /// The sum of the windows' use: each window's `final` minus its `from`
+    /// (absent = 0). It may pass 100 after a reset.
+    pub used: f64,
+    /// The account's monthly price at the last window's midpoint, in the display
     /// currency, from the [`EventKind::PriceChanged`] events of the history;
     /// `None` when `price_missing` says why there is none.
     pub price: Option<f64>,
@@ -258,10 +329,15 @@ pub struct AccountWeek {
     pub price_missing: Option<Missing>,
 }
 
+/// The use of one window: its `final` percent minus its `from` (absent = 0).
+/// A reset window starts at 0, so its use is its final percent.
+pub(crate) fn window_used(window: &WindowRecord) -> f64 {
+    window.final_percent - window.from.unwrap_or(0.0)
+}
+
 /// Every finished weekly_all window whose midpoint lies in the range, of the chosen accounts, any host; if several
-/// hosts recorded the same window (same account and end), the one with the latest lastSample. One window per account
-/// and calendar week: when an account has two windows whose midpoints fall in one week (its reset moved), only the
-/// one with the later end is kept.
+/// hosts recorded the same window (same account and end), the one with the latest lastSample. One entry per account
+/// and calendar week: every window whose midpoint falls in that week is kept in `windows`, oldest first.
 pub fn account_weeks<Tz: TimeZone + Copy>(
     ctx: &Ctx<Tz>,
     range: &Range,
@@ -280,10 +356,10 @@ pub fn account_weeks<Tz: TimeZone + Copy>(
 }
 
 /// [`account_weeks`] with a [`Valuer`] the caller already built for the same
-/// range, so a page that values token records too builds only one. One window
-/// per account and calendar week: when an account has two windows whose
-/// midpoints fall in one week (its reset moved), only the one with the later
-/// end is kept.
+/// range, so a page that values token records too builds only one. One entry
+/// per account and calendar week: every window whose midpoint falls in that
+/// week is kept in `windows`, oldest first; `used` sums their use and `window`
+/// is the last.
 pub(crate) fn account_weeks_valued<Tz: TimeZone + Copy>(
     ctx: &Ctx<Tz>,
     range: &Range,
@@ -300,7 +376,8 @@ pub(crate) fn account_weeks_valued<Tz: TimeZone + Copy>(
         if window.k != LimitKind::WeeklyAll {
             continue;
         }
-        let Some(midpoint) = window.end.checked_sub_signed(Duration::hours(84)) else {
+        let start = window.weekly_start();
+        let Some(midpoint) = start.checked_add_signed((window.end - start) / 2) else {
             continue;
         };
         if midpoint < range.from || midpoint >= range.to {
@@ -309,29 +386,53 @@ pub(crate) fn account_weeks_valued<Tz: TimeZone + Copy>(
         if !account_chosen(ctx, q, Some(&window.account)) {
             continue;
         }
+        let week = week_start(midpoint, &ctx.zone);
+        let use_of = window_used(&window);
+        let used = if use_of < 0.0 {
+            ctx.warnings.borrow_mut().push(format!(
+                "the weekly window of {} ending {} ends at {} % below its start at {} %; \
+                 it adds nothing to the week's use",
+                window.account.acc,
+                window.end,
+                window.final_percent,
+                window.from.unwrap_or(0.0),
+            ));
+            0.0
+        } else {
+            use_of
+        };
+        match weeks
+            .iter_mut()
+            .find(|kept| kept.account == window.account && kept.week == week)
+        {
+            Some(kept) => {
+                kept.used += used;
+                kept.window = window.clone();
+                kept.windows.push(window);
+            }
+            None => {
+                let account = window.account.clone();
+                let last = window.clone();
+                weeks.push(AccountWeek {
+                    week,
+                    account,
+                    windows: vec![window],
+                    window: last,
+                    used,
+                    price: None,
+                    price_missing: None,
+                });
+            }
+        }
+    }
+    for week in &mut weeks {
         let (price, price_missing) =
-            match valuer.window_price(&window.account, window.weekly_start(), window.end) {
+            match valuer.window_price(&week.account, week.window.weekly_start(), week.window.end) {
                 Ok(price) => (Some(price), None),
                 Err(missing) => (None, Some(missing)),
             };
-        let account_week = AccountWeek {
-            week: week_start(midpoint, &ctx.zone),
-            account: window.account.clone(),
-            price,
-            price_missing,
-            window,
-        };
-        let same = weeks
-            .iter_mut()
-            .find(|kept| kept.account == account_week.account && kept.week == account_week.week);
-        match same {
-            Some(kept) => {
-                if account_week.window.end > kept.window.end {
-                    *kept = account_week;
-                }
-            }
-            None => weeks.push(account_week),
-        }
+        week.price = price;
+        week.price_missing = price_missing;
     }
     Ok(weeks)
 }
@@ -471,33 +572,53 @@ pub(crate) fn blocked_by_weekday<Tz: TimeZone + Copy>(
     by_day
 }
 
-/// The money of one account week from its price and its window's final percent:
-/// `paid = 100 × pv`, `expired = max(0, 100 − final) × pv`,
-/// `used = paid − expired`. `None` without a price.
+/// The money of `used` and `expired` percent of one week's `price`.
+pub(crate) fn money_at(price: f64, used: f64, expired: f64) -> WindowMoney {
+    let paid = window_money(price, 100.0).paid;
+    let percent_value = paid / 100.0;
+    WindowMoney {
+        used: used * percent_value,
+        paid,
+        expired: expired * percent_value,
+    }
+}
+
+/// The money of one account week from its price and its windows: `paid` is one
+/// week's price, `used` is `week.used` percent of it (which may pass 100), and
+/// `expired` is the last window's `lost` percent. A reset window's absent
+/// `lost` means nothing expired. `None` without a price.
 pub(crate) fn money_of(week: &AccountWeek) -> Option<WindowMoney> {
     week.price
-        .map(|price| window_money(price, week.window.final_percent))
+        .map(|price| money_at(price, week.used, week.window.lost.unwrap_or(0.0)))
 }
 
-/// The `lost` percent of a weekly window; a window without it is an error,
-/// because seatswap always writes it.
+/// The `lost` percent of a weekly window. A reset window has no `lost` because
+/// nothing expired then; any other window without it is an error, because
+/// seatswap writes it.
 pub(crate) fn lost_percent(window: &WindowRecord) -> Result<f64, StatsError> {
-    window.lost.ok_or_else(|| {
-        StatsError::Message(format!(
+    match window.lost {
+        Some(lost) => Ok(lost),
+        None if window.reset => Ok(0.0),
+        None => Err(StatsError::Message(format!(
             "the weekly window of {} ending {} has no lost percent; seatswap always writes it",
             window.account.acc, window.end
-        ))
-    })
+        ))),
+    }
 }
 
-/// The account week of `account` whose window holds `t`.
+/// The account week of `account` whose windows hold `t`: a record belongs to
+/// the week when it lies in any of its windows, not only in the last one.
 pub(crate) fn week_of_record<'a>(
     weeks: &'a [AccountWeek],
     account: &AccountRef,
     t: DateTime<Utc>,
 ) -> Option<&'a AccountWeek> {
     weeks.iter().find(|week| {
-        &week.account == account && week.window.weekly_start() <= t && t < week.window.end
+        &week.account == account
+            && week
+                .windows
+                .iter()
+                .any(|window| window.weekly_start() <= t && t < window.end)
     })
 }
 
@@ -1020,6 +1141,8 @@ pub(crate) mod tests {
     use chrono::{NaiveDate, NaiveTime};
     use tempfile::tempdir;
 
+    use crate::project::ProjectKey;
+
     pub(crate) use crate::stats::fixture::Tiny;
 
     pub(crate) fn utc(text: &str) -> DateTime<Utc> {
@@ -1431,6 +1554,259 @@ pub(crate) mod tests {
             })
             .expect("LB's window ending 9 Nov");
         assert_eq!(first.week, utc("2026-11-02T00:00:00Z"));
+    }
+
+    #[test]
+    fn a_week_with_a_reset_sums_its_windows_use() {
+        let tiny = tiny();
+        let dir = tempdir().expect("a temp history");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let first = WindowRecord {
+            account: tiny.lb_ref(),
+            k: LimitKind::WeeklyAll,
+            m: None,
+            start: Some(utc("2026-11-02T00:00:00Z")),
+            end: utc("2026-11-05T12:00:00Z"),
+            final_percent: 62.0,
+            lost: None,
+            last_sample: utc("2026-11-05T11:58:00Z"),
+            plan: Some("Max".to_string()),
+            uncertain: false,
+            reset: true,
+            from: None,
+        };
+        let second = WindowRecord {
+            account: tiny.lb_ref(),
+            k: LimitKind::WeeklyAll,
+            m: None,
+            start: Some(utc("2026-11-05T12:00:00Z")),
+            end: utc("2026-11-09T12:00:00Z"),
+            final_percent: 30.0,
+            lost: Some(70.0),
+            last_sample: utc("2026-11-09T11:58:00Z"),
+            plan: Some("Max".to_string()),
+            uncertain: false,
+            reset: false,
+            from: Some(0.0),
+        };
+        history
+            .append_many(&[first.clone(), second.clone()])
+            .expect("the two windows");
+        let ctx = Ctx {
+            history: &history,
+            ..tiny.ctx()
+        };
+
+        let weeks = account_weeks(&ctx, &two_weeks(), &all()).unwrap();
+        assert_eq!(weeks.len(), 1, "the two windows are one calendar week");
+        let week = &weeks[0];
+        assert_eq!(week.windows, vec![first, second.clone()], "oldest first");
+        assert_eq!(
+            week.window, second,
+            "the last window's end and lost are shown"
+        );
+        assert_eq!(week.used, 92.0, "62 % then 30 % from 0");
+        let money = money_of(week).expect("LB's price is known");
+        assert!(
+            close(money.paid, 180.0 * 12.0 / 52.0),
+            "one week's price, not two: {}",
+            money.paid
+        );
+        assert!(
+            close(money.expired, 0.70 * money.paid),
+            "the expired part is the last window's lost: {}",
+            money.expired
+        );
+        assert!(
+            close(money.used, 0.92 * money.paid),
+            "used money counts both windows: {}",
+            money.used
+        );
+    }
+
+    /// Review of T-1: a record in the first window of a week with a reset
+    /// belongs to that week; the week's `used` (92 %) counts that window.
+    #[test]
+    fn proof_a_token_in_the_first_window_of_a_reset_week_is_counted() {
+        let tiny = tiny();
+        let dir = tempdir().expect("a temp history");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let window = |start: &str, end: &str, final_percent: f64, lost, reset, from| WindowRecord {
+            account: tiny.lb_ref(),
+            k: LimitKind::WeeklyAll,
+            m: None,
+            start: Some(utc(start)),
+            end: utc(end),
+            final_percent,
+            lost,
+            last_sample: utc(end) - Duration::minutes(2),
+            plan: Some("Max".to_string()),
+            uncertain: false,
+            reset,
+            from,
+        };
+        history
+            .append_many(&[
+                window(
+                    "2026-11-02T00:00:00Z",
+                    "2026-11-05T12:00:00Z",
+                    62.0,
+                    None,
+                    true,
+                    None,
+                ),
+                window(
+                    "2026-11-05T12:00:00Z",
+                    "2026-11-09T12:00:00Z",
+                    30.0,
+                    Some(70.0),
+                    false,
+                    Some(0.0),
+                ),
+            ])
+            .expect("the two windows");
+        let ctx = Ctx {
+            history: &history,
+            ..tiny.ctx()
+        };
+        let weeks = account_weeks(&ctx, &two_weeks(), &all()).unwrap();
+        assert_eq!(weeks.len(), 1);
+        assert_eq!(weeks[0].used, 92.0);
+        let record = TokenRecord {
+            t: utc("2026-11-03T10:00:00Z"),
+            session: "s0".to_string(),
+            cwd: "/home/sam/ledger".to_string(),
+            project: ProjectKey::Folder("/home/sam/ledger".to_string()),
+            model: "claude-opus-5-5".to_string(),
+            input: 0,
+            out: 1_000_000,
+            cw: 0,
+            cr: 0,
+            answers: 1,
+            agent_answers: 0,
+        };
+        let account = tiny.lb_ref();
+        let by_week = output_by_account_week(&weeks, [(&account, &record)]);
+        assert_eq!(
+            by_week.get(&(account.clone(), weeks[0].week)),
+            Some(&1_000_000),
+            "the record lies in the first window (2 Nov to 5 Nov 12:00) of the week, \
+             which `used` counts, but `week_of_record` looks only at the last window"
+        );
+    }
+
+    #[test]
+    fn a_window_is_placed_by_its_own_midpoint() {
+        let tiny = tiny();
+        let dir = tempdir().expect("a temp history");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        history
+            .append(&WindowRecord {
+                account: tiny.lb_ref(),
+                k: LimitKind::WeeklyAll,
+                m: None,
+                start: Some(utc("2026-11-02T00:00:00Z")),
+                end: utc("2026-11-05T00:00:00Z"),
+                final_percent: 60.0,
+                lost: Some(40.0),
+                last_sample: utc("2026-11-04T23:58:00Z"),
+                plan: Some("Max".to_string()),
+                uncertain: false,
+                reset: false,
+                from: None,
+            })
+            .expect("the window");
+        let ctx = Ctx {
+            history: &history,
+            ..tiny.ctx()
+        };
+        let range = Range {
+            from: utc("2026-10-26T00:00:00Z"),
+            to: utc("2026-11-16T00:00:00Z"),
+        };
+
+        let weeks = account_weeks(&ctx, &range, &all()).unwrap();
+        assert_eq!(weeks.len(), 1);
+        assert_eq!(
+            weeks[0].week,
+            utc("2026-11-02T00:00:00Z"),
+            "the midpoint (3 Nov) is in the week of 2 Nov, not the week of end - 84 h (1 Nov)"
+        );
+        assert_eq!(weeks[0].window.end, utc("2026-11-05T00:00:00Z"));
+    }
+
+    #[test]
+    fn history_start_is_the_first_reading_or_switch() {
+        let tiny = tiny();
+        assert_eq!(
+            frame(&tiny.history).expect("the frame").history_start,
+            Some(utc("2026-11-07T12:00:00Z")),
+            "the fixture's first switch is earlier than its first sample"
+        );
+
+        tiny.history
+            .append(&TokenRecord {
+                t: utc("2026-10-01T09:00:00Z"),
+                session: "s0".to_string(),
+                cwd: "/home/sam/ledger".to_string(),
+                project: ProjectKey::Folder("/home/sam/ledger".to_string()),
+                model: "claude-opus-5-5".to_string(),
+                input: 0,
+                out: 1_000_000,
+                cw: 0,
+                cr: 0,
+                answers: 1,
+                agent_answers: 0,
+            })
+            .expect("an old token record");
+        tiny.history
+            .append(&SessionRecord {
+                t: utc("2026-10-02T09:00:00Z"),
+                session: "s0".to_string(),
+                cwd: "/home/sam/ledger".to_string(),
+                project: ProjectKey::Folder("/home/sam/ledger".to_string()),
+                entrypoint: Some("cli".to_string()),
+                first: utc("2026-10-02T08:00:00Z"),
+                last: utc("2026-10-02T09:00:00Z"),
+                agents_started: 0,
+                agents_finished: 0,
+                closed: true,
+            })
+            .expect("an old session record");
+        let frame_with_old_records = frame(&tiny.history).expect("the frame");
+        assert_eq!(
+            frame_with_old_records.history_start,
+            Some(utc("2026-11-07T12:00:00Z")),
+            "token and session records do not set the history start"
+        );
+
+        tiny.history
+            .append(&Sample {
+                t: utc("2026-11-04T09:00:00Z"),
+                account: tiny.lb_ref(),
+                src: crate::history::Source::Poll,
+                l: Vec::new(),
+            })
+            .expect("an earlier usage reading");
+        let frame_with_reading = frame(&tiny.history).expect("the frame");
+        assert_eq!(
+            frame_with_reading.history_start,
+            Some(utc("2026-11-04T09:00:00Z")),
+            "an earlier sample sets the start"
+        );
+
+        let expected_bytes: u64 = fs::read_dir(tiny.dir.path().join("atlas"))
+            .expect("LB's host folder")
+            .map(|entry| {
+                entry
+                    .expect("a history file")
+                    .metadata()
+                    .expect("the file's size")
+                    .len()
+            })
+            .sum();
+        assert_eq!(frame_with_reading.history_bytes, expected_bytes);
+        assert_eq!(frame_with_reading.hosts, vec!["atlas".to_string()]);
     }
 
     #[test]

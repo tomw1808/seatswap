@@ -512,33 +512,57 @@ impl HistoryDir {
             this_host: host == self.host(),
             first_record: firsts.into_iter().flatten().min(),
             last_record: lasts.into_iter().flatten().max(),
-            bytes: folder_bytes(&self.root().join(host))?,
+            bytes: self.host_bytes(host)?,
         })
     }
 
-    /// The first record that parses in the oldest month file of one kind. A
-    /// line that does not parse is skipped, as [`HistoryDir::read`] skips a torn
-    /// one: the table never fails on a record it does not need.
+    /// The earliest record of one kind, through [`HistoryDir::first_where`]:
+    /// the table never fails on a record it does not need.
     fn first_of_kind<R: Record>(&self, host: &str) -> Result<Option<DateTime<Utc>>, HistoryError> {
+        self.first_where::<R>(host, |_| true)
+    }
+
+    /// The time of the earliest record of one kind on `host` that `keep`
+    /// accepts: the month files are read oldest first, and the first month that
+    /// holds a match is read whole (a line may have been appended late), so a
+    /// long history is not read whole. A line that does not parse is skipped, as
+    /// [`HistoryDir::read`] skips a torn one.
+    pub fn first_where<R: Record>(
+        &self,
+        host: &str,
+        keep: impl Fn(&R) -> bool,
+    ) -> Result<Option<DateTime<Utc>>, HistoryError> {
         let dir = self.root().join(host);
-        let Some(month) = months_of_kind(&dir, R::KIND)?.last().copied() else {
-            return Ok(None);
-        };
-        let Some(path) = file_of_month(&dir, R::KIND, &month)? else {
-            return Ok(None);
-        };
-        let Some(bytes) = read_bytes(&path)? else {
-            return Ok(None);
-        };
-        for line in file_lines(&bytes) {
-            let Ok(text) = std::str::from_utf8(line) else {
+        for month in months_of_kind(&dir, R::KIND)?.iter().rev() {
+            let Some(path) = file_of_month(&dir, R::KIND, month)? else {
                 continue;
             };
-            if let Ok(record) = serde_json::from_str::<R>(text) {
-                return Ok(Some(record.at()));
+            let Some(bytes) = read_bytes(&path)? else {
+                continue;
+            };
+            let mut earliest: Option<DateTime<Utc>> = None;
+            for line in file_lines(&bytes) {
+                let Ok(text) = std::str::from_utf8(line) else {
+                    continue;
+                };
+                if let Ok(record) = serde_json::from_str::<R>(text) {
+                    if keep(&record) {
+                        let at = record.at();
+                        earliest = Some(earliest.map_or(at, |first| first.min(at)));
+                    }
+                }
+            }
+            if earliest.is_some() {
+                return Ok(earliest);
             }
         }
         Ok(None)
+    }
+
+    /// The size of one host folder, as [`HostInfo::bytes`] gives it: its
+    /// files, the live report left out.
+    pub fn host_bytes(&self, host: &str) -> Result<u64, HistoryError> {
+        folder_bytes(&self.root().join(host))
     }
 
     /// The newest record of one kind in its newest month file.

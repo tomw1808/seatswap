@@ -18,10 +18,10 @@ use crate::transcripts::Tokens;
 
 use super::{
     account_abbr, account_chosen, account_id, account_position, account_weeks_valued,
-    blocked_by_week, blocked_spans, hours_text, keep_warnings, lost_percent, money_of, money_text,
-    next_week_start, percent_text, previous_week_start, range_of, switch_counts, top_three,
-    week_columns, week_start, working_hours, working_rhythm, AccountWeek, Ctx, Query, RangeKey,
-    StatsError, SwitchCounts,
+    blocked_by_week, blocked_spans, hours_text, keep_warnings, lost_percent, money_at, money_of,
+    money_text, next_week_start, percent_text, previous_week_start, range_of, switch_counts,
+    top_three, week_columns, week_start, window_used, working_hours, working_rhythm, AccountWeek,
+    Ctx, Query, RangeKey, StatsError, SwitchCounts,
 };
 
 /// The Weeks page: the grid of account weeks and the curves of the last 14
@@ -302,10 +302,10 @@ fn week_cell(week: &AccountWeek) -> Result<WeekCell, StatsError> {
     let money = money_of(week);
     Ok(WeekCell {
         end: week.window.end,
-        used: week.window.final_percent,
+        used: week.used,
         expired: lost_percent(&week.window)?,
         expired_money: money.map(|money| money.expired),
-        full: week.window.final_percent >= 100.0,
+        full: week.used >= 100.0,
         uncertain: week.window.uncertain,
     })
 }
@@ -687,7 +687,12 @@ pub fn window_detail<Tz: TimeZone + Copy>(
         .iter()
         .find(|week| week.account == reference && same_reset(week.window.end, window.end))
         .ok_or_else(|| unknown_window(account_id, end, false))?;
-    let money = money_of(week);
+    // One window's own use: the money below counts that percent, not the sum of
+    // the calendar week's windows. A window that ends below its start is named
+    // in the page's warnings by `account_weeks_valued`; it adds no use.
+    let used = window_used(&window).max(0.0);
+    let expired = lost_percent(&window)?;
+    let money = week.price.map(|price| money_at(price, used, expired));
 
     let events = keep_warnings(ctx.warnings, || {
         ctx.history.read_claude::<Event>(&Range::ALL, &Hosts::All)
@@ -765,9 +770,9 @@ pub fn window_detail<Tz: TimeZone + Copy>(
     Ok(WindowDetail {
         id: super::account_id(ctx, &reference),
         end: window.end,
-        used: window.final_percent,
+        used,
         used_money: money.map(|money| money.used),
-        expired: lost_percent(&window)?,
+        expired,
         expired_money: money.map(|money| money.expired),
         reached_100_at,
         blocked_hours_after,
@@ -1367,8 +1372,9 @@ mod tests {
         assert_eq!(cell.end, utc("2026-11-05T12:00:00Z"));
     }
 
-    /// One window per account and week: the grid shows the later end, and the
-    /// summary of that week counts that window only.
+    /// Every window of an account and week is counted: the grid shows the
+    /// later end and the summed use, and the summary of that week counts both
+    /// windows' use.
     #[test]
     fn the_summary_counts_the_window_the_grid_shows() {
         let tiny = tiny();
@@ -1380,9 +1386,9 @@ mod tests {
             })
             .expect("LB's W1")
             .clone();
-        // The reset of LB moved five days earlier: the second window is short
-        // and its midpoint lies in the week of 2 Nov as well.
-        second.start = Some(utc("2026-11-09T17:00:00Z"));
+        // The reset of LB moved earlier: the second window is short, and both
+        // windows' midpoints lie in the week of 2 Nov.
+        second.start = Some(utc("2026-11-05T17:00:00Z"));
         second.end = utc("2026-11-10T12:00:00Z");
         second.final_percent = 60.0;
         second.lost = Some(40.0);
@@ -1392,16 +1398,16 @@ mod tests {
         let page = weeks_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
         let cell = page.rows[0].cells[0].as_ref().expect("LB's W1");
         assert_eq!(cell.end, utc("2026-11-10T12:00:00Z"), "the later end");
-        assert_eq!(cell.used, 60.0);
+        assert_eq!(cell.used, 160.0, "100 % and 60 % of the same week");
 
         let summary = week_summary(&tiny.ctx(), &all(), utc("2026-11-02T00:00:00Z")).unwrap();
         assert!(
-            close(summary.used.expect("a priced week"), 41.077),
-            "the money of the week counts one window of LB: {:?}",
+            close(summary.used.expect("a priced week"), 82.615),
+            "the money of the week counts both windows of LB: {:?}",
             summary.used
         );
         assert!(
-            close(summary.per_account[0].1, 24.923),
+            close(summary.per_account[0].1, 66.462),
             "LB's money of the week: {}",
             summary.per_account[0].1
         );
@@ -1430,6 +1436,117 @@ mod tests {
         assert!(
             summary.used.is_some(),
             "the week's windows are not a host's"
+        );
+    }
+
+    /// A window that ends below its start is named in the page's warnings and
+    /// adds no use; the week's used percent is the other window's 62 %.
+    #[test]
+    fn a_window_that_ends_below_its_start_is_named_and_adds_no_use() {
+        let tiny = tiny();
+        let dir = tempdir().expect("a temp history");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let window = |start: &str, end: &str, final_percent: f64, lost, reset, from| WindowRecord {
+            account: tiny.lb_ref(),
+            k: LimitKind::WeeklyAll,
+            m: None,
+            start: Some(utc(start)),
+            end: utc(end),
+            final_percent,
+            lost,
+            last_sample: utc(end) - Duration::minutes(2),
+            plan: Some("Max".to_string()),
+            uncertain: false,
+            reset,
+            from,
+        };
+        history
+            .append_many(&[
+                window(
+                    "2026-11-02T00:00:00Z",
+                    "2026-11-05T12:00:00Z",
+                    62.0,
+                    None,
+                    true,
+                    None,
+                ),
+                window(
+                    "2026-11-05T12:00:00Z",
+                    "2026-11-09T12:00:00Z",
+                    20.0,
+                    Some(80.0),
+                    false,
+                    Some(30.0),
+                ),
+            ])
+            .expect("the two windows");
+        let warnings = std::cell::RefCell::new(Vec::new());
+        let ctx = Ctx {
+            history: &history,
+            warnings: &warnings,
+            ..tiny.ctx()
+        };
+
+        let page = weeks_in(&ctx, &two_weeks(), &all()).unwrap();
+        let cell = page
+            .rows
+            .iter()
+            .find(|row| row.id == tiny.lb().id)
+            .expect("LB's row")
+            .cells[0]
+            .as_ref()
+            .expect("LB's unfinished week");
+        assert_eq!(
+            cell.used, 62.0,
+            "the window that ends below its start adds nothing"
+        );
+
+        let warnings = warnings.borrow();
+        assert_eq!(warnings.len(), 1, "one warning: {warnings:?}");
+        assert!(
+            warnings[0].contains(&tiny.lb_ref().acc)
+                && warnings[0].contains("2026-11-09 12:00:00 UTC"),
+            "the warning names the account and the window's end: {}",
+            warnings[0]
+        );
+    }
+
+    /// Review of T-1: the detail of a window that starts after a reset shows
+    /// one use: the percent and the money must agree.
+    #[test]
+    fn proof_a_window_detail_after_a_reset_agrees_with_its_money() {
+        let tiny = tiny();
+        let dir = tempdir().expect("a temp history");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        history
+            .append(&crate::history::WindowRecord {
+                account: tiny.lb_ref(),
+                k: crate::api::LimitKind::WeeklyAll,
+                m: None,
+                start: Some(utc("2026-11-05T12:00:00Z")),
+                end: utc("2026-11-09T12:00:00Z"),
+                final_percent: 60.0,
+                lost: Some(40.0),
+                last_sample: utc("2026-11-09T11:58:00Z"),
+                plan: Some("Max".to_string()),
+                uncertain: false,
+                reset: false,
+                from: Some(30.0),
+            })
+            .expect("a window that starts at 30 % after a reset");
+        let ctx = Ctx {
+            history: &history,
+            ..tiny.ctx()
+        };
+        let detail = window_detail(&ctx, &tiny.lb().id, utc("2026-11-09T12:00:00Z")).unwrap();
+        let paid = 180.0 * 12.0 / 52.0;
+        let money = detail.used_money.expect("LB's price is known");
+        assert!(
+            close(money, detail.used / 100.0 * paid),
+            "used {} % but used money {} of a week's {}: the money counts 60 - 30 = 30 %",
+            detail.used,
+            money,
+            paid
         );
     }
 

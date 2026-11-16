@@ -371,10 +371,7 @@ pub(crate) fn projects_page_in<Tz: TimeZone + Copy>(
             .iter()
             .filter(|week| week.account == reference)
             .collect();
-        let percent: f64 = account_weeks
-            .iter()
-            .map(|week| week.window.final_percent)
-            .sum();
+        let percent: f64 = account_weeks.iter().map(|week| week.used).sum();
         if account_weeks.is_empty() || percent <= 0.0 {
             continue;
         }
@@ -1073,6 +1070,9 @@ fn key_text(key: &ProjectKey) -> String {
 mod tests {
     use super::*;
 
+    use tempfile::tempdir;
+
+    use crate::history::{Event, EventKind, HistoryDir, WindowRecord};
     use crate::projects::{ProjectEdit, ProjectsLogRecord};
     use crate::stats::tests::{all, tiny, utc};
     use crate::stats::Range;
@@ -1651,9 +1651,95 @@ mod tests {
             .find(|(id, _)| id == &tiny.ac().id)
             .expect("AC's tokens per percent");
         assert!(
-            close(ac.1, 5_000_000.0 / 100.0),
-            "AC's 100 % window counts the 3 M of 14 Nov and the 2 M of 17 Nov: {}",
+            close(ac.1, 5_000_000.0 / 190.0),
+            "AC's two windows of the week use 90 % and 100 %: {}",
             ac.1
+        );
+    }
+
+    /// A record in the first window of a week that a reset split in two counts
+    /// for that week: the token of 3 Nov is in the 2 Nov .. 5 Nov 12:00 window,
+    /// while the week's used percent is the sum of both windows (92).
+    #[test]
+    fn a_token_in_the_first_window_of_a_reset_week_is_counted() {
+        let tiny = tiny();
+        let dir = tempdir().expect("a temp history");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        history
+            .append(&Event {
+                t: utc("2026-11-02T08:00:00Z"),
+                kind: EventKind::Live {
+                    account: Some(tiny.lb_ref()),
+                },
+            })
+            .expect("LB live");
+        history
+            .append_many(&[
+                WindowRecord {
+                    account: tiny.lb_ref(),
+                    k: crate::api::LimitKind::WeeklyAll,
+                    m: None,
+                    start: Some(utc("2026-11-02T00:00:00Z")),
+                    end: utc("2026-11-05T12:00:00Z"),
+                    final_percent: 62.0,
+                    lost: None,
+                    last_sample: utc("2026-11-05T11:58:00Z"),
+                    plan: Some("Max".to_string()),
+                    uncertain: false,
+                    reset: true,
+                    from: None,
+                },
+                WindowRecord {
+                    account: tiny.lb_ref(),
+                    k: crate::api::LimitKind::WeeklyAll,
+                    m: None,
+                    start: Some(utc("2026-11-05T12:00:00Z")),
+                    end: utc("2026-11-09T12:00:00Z"),
+                    final_percent: 30.0,
+                    lost: Some(70.0),
+                    last_sample: utc("2026-11-09T11:58:00Z"),
+                    plan: Some("Max".to_string()),
+                    uncertain: false,
+                    reset: false,
+                    from: Some(0.0),
+                },
+            ])
+            .expect("the two windows of the reset week");
+        history
+            .append(&record(
+                "2026-11-03T10:00:00Z",
+                "s0",
+                "/home/sam/ledger",
+                atlas(),
+                "claude-opus-5-5",
+                1_000_000,
+            ))
+            .expect("the token in the first window");
+        let ctx = Ctx {
+            history: &history,
+            ..tiny.ctx()
+        };
+
+        // The range starts after the token and before the first window's
+        // midpoint; the whole week counts, so the token counts too.
+        let page = projects_page_in(
+            &ctx,
+            &Range {
+                from: utc("2026-11-03T12:00:00Z"),
+                to: utc("2026-11-21T00:00:00Z"),
+            },
+            &all(),
+        )
+        .unwrap();
+        let lb = page
+            .tokens_per_percent
+            .iter()
+            .find(|(id, _)| id == &tiny.lb().id)
+            .expect("LB's tokens per percent");
+        assert!(
+            close(lb.1, 1_000_000.0 / 92.0),
+            "the token of 3 Nov lies in the first window and the week uses 92 %: {}",
+            lb.1
         );
     }
 

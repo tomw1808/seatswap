@@ -177,15 +177,17 @@ pub fn forecast<Tz: TimeZone + Copy>(
         host: None,
     };
     // Every finished window of the chosen accounts; the range holds all of them
-    // so the last eight are always found, however far apart the resets are.
+    // so the last eight are always found, however far apart the resets are. A
+    // week with a reset holds several windows and every one of them counts.
     let weeks = account_weeks_valued(ctx, &Range::ALL, &query, &valuer)?;
     let per_account: Vec<Vec<&WindowRecord>> = references
         .iter()
         .map(|reference| {
             let mut windows: Vec<&WindowRecord> = weeks
                 .iter()
-                .filter(|week| &week.account == reference && week.window.end <= inputs.now)
-                .map(|week| &week.window)
+                .filter(|week| &week.account == reference)
+                .flat_map(|week| week.windows.iter())
+                .filter(|window| window.end <= inputs.now)
                 .collect();
             windows.sort_by_key(|window| window.end);
             if windows.len() > LOW_WINDOWS {
@@ -938,6 +940,59 @@ mod tests {
             .find(|account| account.id == "PR")
             .expect("PR's row");
         assert!(close(row.low.expect("eight gains"), 52.0), "{:?}", row.low);
+    }
+
+    /// A week with a reset holds two windows, and the low forecast reads both:
+    /// the first window's 10 % gain is the lowest and the second-lowest gain is
+    /// therefore 50, not 55. Taking only the last window of the week would give
+    /// 55.
+    #[test]
+    fn a_week_with_a_reset_gives_the_forecast_both_windows() {
+        let tiny = tiny();
+        let accounts = stored_accounts(&tiny);
+        let pr = AccountRef::of(&accounts[0]);
+
+        let reset_week = [
+            ("2026-11-02T00:00:00Z", "2026-11-05T12:00:00Z", 10.0),
+            ("2026-11-05T12:00:00Z", "2026-11-09T12:00:00Z", 60.0),
+        ];
+        let ordinary = [
+            ("2026-10-31T19:00:00Z", 50.0),
+            ("2026-10-24T19:00:00Z", 55.0),
+            ("2026-10-17T19:00:00Z", 65.0),
+        ];
+        let mut windows = Vec::new();
+        let mut samples = Vec::new();
+        for (start, end, gain) in reset_week {
+            let (mut window, sample) = low_records(&pr, utc(end), gain);
+            window.start = Some(utc(start));
+            windows.push(window);
+            samples.push(sample);
+        }
+        windows[0].reset = true;
+        windows[0].lost = None;
+        windows[1].from = Some(0.0);
+        windows[1].lost = Some(40.0);
+        for (end, gain) in ordinary {
+            let (window, sample) = low_records(&pr, utc(end), gain);
+            windows.push(window);
+            samples.push(sample);
+        }
+        tiny.history.append_many(&windows).expect("five windows");
+        tiny.history.append_many(&samples).expect("five samples");
+
+        let ctx = context(&tiny, &accounts);
+        let page = forecast(&ctx, &inputs(), &regime(false)).expect("the forecast");
+        let row = page
+            .accounts
+            .iter()
+            .find(|account| account.id == "PR")
+            .expect("PR's row");
+        assert!(
+            close(row.low.expect("five gains"), 50.0),
+            "both windows of the reset week count, so the second-lowest gain is 50: {:?}",
+            row.low
+        );
     }
 
     #[test]

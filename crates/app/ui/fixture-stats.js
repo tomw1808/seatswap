@@ -3,7 +3,7 @@
 // The page may not add a number; this fixture may, and does: every answer is
 // built from the weeks the chosen range covers and the chosen accounts.
 
-import { answer, resolveIds, statsEmpty } from "./fixture/stats-frame.js";
+import { answer, resolveIds, statsEmpty, statsFrame } from "./fixture/stats-frame.js";
 import { activity } from "./fixture/stats-activity.js";
 import { FORECAST_NO_PLAN, forecastPage } from "./fixture/stats-forecast.js";
 import { overview } from "./fixture/stats-overview.js";
@@ -17,8 +17,8 @@ export function fixtureStats(command, args) {
   const params = args || {};
   const query = params.query;
   switch (command) {
-    case "stats_hosts":
-      return ["atlas", "vega"];
+    case "stats_frame":
+      return statsFrame();
     case "stats_overview":
       return answer(query, overview);
     case "stats_weeks":

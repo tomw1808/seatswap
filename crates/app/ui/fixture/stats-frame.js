@@ -10,6 +10,19 @@ export const HOUR = 3600000;
 // the pages see this order too.
 const VIEW_ABBRS = ["PR", "LB", "AC"];
 
+// The frame's made-up answer: the first day of the fixture's weeks (2 Nov) and
+// its history size in bytes (4.6 MB, one decimal).
+export const HISTORY_START = "2026-11-02T08:14:00Z";
+export const HISTORY_BYTES = 4_812_288;
+
+export function statsFrame() {
+  return {
+    hosts: ["atlas", "vega"],
+    historyStart: HISTORY_START,
+    historyBytes: HISTORY_BYTES,
+  };
+}
+
 export const WEEKS = [
   "2026-08-17",
   "2026-08-24",

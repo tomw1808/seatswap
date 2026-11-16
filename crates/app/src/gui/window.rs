@@ -816,8 +816,8 @@ pub(crate) fn stats_activity_at<Tz: TimeZone + Copy>(
 }
 
 #[cfg(feature = "gui")]
-pub(crate) fn stats_hosts_at(history: &HistoryDir) -> Result<Vec<String>, String> {
-    history.hosts().map_err(|error| error.to_string())
+pub(crate) fn stats_frame_at(history: &HistoryDir) -> Result<stats::StatsFrame, String> {
+    stats::frame(history).map_err(|error| error.to_string())
 }
 
 /// The one body of a statistics command: on the blocking thread it reads the
@@ -986,15 +986,17 @@ pub(crate) async fn stats_activity(
 
 #[cfg(feature = "gui")]
 #[tauri::command]
-pub(crate) async fn stats_hosts(state: State<'_, super::GuiState>) -> Result<Vec<String>, String> {
-    // The host list needs only the history, not the parts a page reads: a
-    // broken prices file must not hide the hosts.
+pub(crate) async fn stats_frame(
+    state: State<'_, super::GuiState>,
+) -> Result<stats::StatsFrame, String> {
+    // The frame needs only the history, not the parts a page reads: a broken
+    // prices file must not hide the hosts, the history's start or its size.
     let history = state
         .history
         .as_ref()
         .map_err(|error| error.clone())?
         .clone();
-    tauri::async_runtime::spawn_blocking(move || stats_hosts_at(&history))
+    tauri::async_runtime::spawn_blocking(move || stats_frame_at(&history))
         .await
         .map_err(|error| error.to_string())?
 }
@@ -2403,10 +2405,13 @@ mod tests {
         let now = tiny.now;
         let offset = tiny.offset;
 
+        let frame = stats_frame_at(&tiny.history).expect("the frame");
+        assert_eq!(frame.hosts, vec!["atlas".to_string()]);
         assert_eq!(
-            stats_hosts_at(&tiny.history).expect("the hosts"),
-            vec!["atlas".to_string()]
+            frame.history_start,
+            Some("2026-11-07T12:00:00Z".parse().expect("the first switch"))
         );
+        assert!(frame.history_bytes > 0, "the fixture history has files");
 
         let overview =
             stats_overview_at(&parts, &tiny.history, now, offset, &query).expect("the overview");
