@@ -55,7 +55,8 @@ code,
 }
 
 /* The mock-up's head: the area tabs top left, then the area's title and its
-   sub-line (spec §3; the generator's `nav()` and `settings()`). */
+   sub-line (spec §3; the generator's `nav()` and `settings()`). Settings has
+   no title: its sub-line sits directly under the tabs (decision 26). */
 .win-head {
   display: flex;
   flex-direction: column;

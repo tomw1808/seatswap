@@ -25,6 +25,9 @@ const AREAS = [
   {
     id: "settings",
     title: "Settings",
+    // The mock-up's Settings head has no h1: its sub-line sits directly under
+    // the tabs (decision 26). The tab still says "Settings".
+    noTitle: true,
     sub: "every setting of seatswap · the gear in the pop-up opens this",
   },
 ];
@@ -125,12 +128,14 @@ function renderHead() {
 
   const area = findArea(state.area);
   if (!area) {
+    title.hidden = false;
     title.textContent = "Unknown area";
     sub.textContent = "";
     sub.hidden = true;
     return;
   }
-  title.textContent = area.title;
+  title.hidden = area.noTitle === true;
+  title.textContent = title.hidden ? "" : area.title;
   if (area.sub) {
     sub.textContent = area.sub;
     sub.hidden = false;
