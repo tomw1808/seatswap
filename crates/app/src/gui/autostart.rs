@@ -207,19 +207,19 @@ const RUN_VALUE: &str = "seatswap";
 #[cfg(windows)]
 const RUN_COMMAND_LIMIT: usize = 260;
 
+/// The running program: the tray program's folder also holds the console one,
+/// and the console program's folder the tray one.
+pub(crate) fn running_program() -> Result<PathBuf, String> {
+    std::env::current_exe()
+        .map_err(|error| format!("cannot find the running seatswap program: {error}"))
+}
+
 /// The two seatswap programs beside the running one: the console program (the
-/// status line runs it) and the tray program (autostart runs it). The `.exe`
-/// suffix is the one difference between Windows and the other systems.
+/// status line runs it) and the tray program (autostart runs it). The suffix is
+/// [`std::env::consts::EXE_SUFFIX`], so this needs no `cfg`.
 fn program_beside(current_exe: &Path, console: bool) -> PathBuf {
-    #[cfg(windows)]
-    let name = if console {
-        "seatswap.exe"
-    } else {
-        "seatswap-tray.exe"
-    };
-    #[cfg(not(windows))]
-    let name = if console { "seatswap" } else { "seatswap-tray" };
-    current_exe.with_file_name(name)
+    let stem = if console { "seatswap" } else { "seatswap-tray" };
+    current_exe.with_file_name(format!("{stem}{}", std::env::consts::EXE_SUFFIX))
 }
 
 /// The program the entry starts: `seatswap-tray.exe` in the folder of
@@ -317,8 +317,7 @@ pub(crate) fn apply(
 
 /// Apply the `startAtLogin` setting with the executable and flags of this run.
 pub(crate) fn apply_autostart(enabled: bool, arguments: &[String]) -> Result<(), String> {
-    let exe = std::env::current_exe()
-        .map_err(|error| format!("cannot find the seatswap executable: {error}"))?;
+    let exe = running_program()?;
     #[cfg(not(windows))]
     {
         let config_home = config_home().map_err(|error| error.to_string())?;

@@ -8,6 +8,8 @@
 #[cfg(feature = "gui")]
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "gui")]
+use std::future::Future;
+#[cfg(feature = "gui")]
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "gui")]
@@ -1200,8 +1202,7 @@ struct RestoreDecision {
 /// program runs this command too, so `current_exe` may be `seatswap-tray.exe`.
 #[cfg(feature = "gui")]
 fn console_program() -> Result<PathBuf, String> {
-    let current = std::env::current_exe()
-        .map_err(|error| format!("cannot find the running seatswap program: {error}"))?;
+    let current = super::autostart::running_program()?;
     super::autostart::console_program(&current).map_err(|error| error.to_string())
 }
 
@@ -1216,29 +1217,57 @@ fn saved_install(state: &super::GuiState) -> Result<Option<StatuslineInstall>, S
     Ok(settings.statusline_install)
 }
 
-/// The install state for `claude` from `record`, without Tauri so the tests use
-/// plain paths. `restorable` is true exactly when the restore rule allows it: a
-/// record exists and the current line is seatswap's or the record's `installed`
-/// line.
+/// One reading of Claude Code's status line: seatswap's line, the line the file
+/// holds now, and the file's path as the page shows it.
 #[cfg(feature = "gui")]
-fn install_state_of(
-    claude: &ClaudePaths,
-    exe: &Path,
-    record: Option<StatuslineInstall>,
-) -> Result<InstallState, String> {
-    let ours = claude_settings::seatswap_status_line(exe).map_err(|error| error.to_string())?;
-    let current = claude_settings::status_line(claude).map_err(|error| error.to_string())?;
-    let installed = current.as_ref() == Some(&ours);
-    let restorable = restorable(record.as_ref(), current.as_ref(), &ours);
-    let previous = record.and_then(|record| record.previous);
-    Ok(InstallState {
-        current,
-        ours,
-        installed,
-        restorable,
-        previous,
+struct StatusLineReading {
+    ours: serde_json::Value,
+    current: Option<serde_json::Value>,
+    settings_file: String,
+}
+
+#[cfg(feature = "gui")]
+impl StatusLineReading {
+    /// The same reading with `current` set to the line a decision writes. The
+    /// install state after a change is built from it, so the state builder stays
+    /// the one place an [`InstallState`] is made.
+    fn with_current(&self, current: Option<serde_json::Value>) -> Self {
+        StatusLineReading {
+            ours: self.ours.clone(),
+            current,
+            settings_file: self.settings_file.clone(),
+        }
+    }
+}
+
+/// The one reading of Claude Code's file for the install and restore rules:
+/// seatswap's line for `exe`, the current line and the file name.
+#[cfg(feature = "gui")]
+fn read_status_lines(claude: &ClaudePaths, exe: &Path) -> Result<StatusLineReading, String> {
+    Ok(StatusLineReading {
+        ours: claude_settings::seatswap_status_line(exe).map_err(|error| error.to_string())?,
+        current: claude_settings::status_line(claude).map_err(|error| error.to_string())?,
         settings_file: claude.settings_file().display().to_string(),
     })
+}
+
+/// The one place an [`InstallState`] is built, from a reading and the record.
+/// `installed` compares the line with seatswap's; `restorable` is true exactly
+/// when the restore rule allows it: a record exists and the current line is
+/// seatswap's or the record's `installed` line.
+#[cfg(feature = "gui")]
+fn install_state_of(
+    reading: &StatusLineReading,
+    record: Option<&StatuslineInstall>,
+) -> InstallState {
+    InstallState {
+        current: reading.current.clone(),
+        ours: reading.ours.clone(),
+        installed: reading.current.as_ref() == Some(&reading.ours),
+        restorable: restorable(record, reading.current.as_ref(), &reading.ours),
+        previous: record.and_then(|record| record.previous.clone()),
+        settings_file: reading.settings_file.clone(),
+    }
 }
 
 /// The restore rule: a record exists and the current line is seatswap's or the
@@ -1265,44 +1294,32 @@ fn install_decision(
     exe: &Path,
     record: Option<StatuslineInstall>,
 ) -> Result<InstallDecision, String> {
-    let ours = claude_settings::seatswap_status_line(exe).map_err(|error| error.to_string())?;
-    let current = claude_settings::status_line(claude).map_err(|error| error.to_string())?;
-    let settings_file = claude.settings_file().display().to_string();
-    if current.as_ref() == Some(&ours) {
-        let previous = record.as_ref().and_then(|record| record.previous.clone());
-        let restorable = restorable(record.as_ref(), current.as_ref(), &ours);
+    let reading = read_status_lines(claude, exe)?;
+    if reading.current.as_ref() == Some(&reading.ours) {
         return Ok(InstallDecision {
             record: None,
             write: None,
-            state: InstallState {
-                current,
-                ours,
-                installed: true,
-                restorable,
-                previous,
-                settings_file,
-            },
+            state: install_state_of(&reading, record.as_ref()),
         });
     }
     let previous = match &record {
-        Some(record) if current.as_ref() == Some(&record.installed) => record.previous.clone(),
-        _ => current.clone(),
+        Some(record) if reading.current.as_ref() == Some(&record.installed) => {
+            record.previous.clone()
+        }
+        _ => reading.current.clone(),
     };
     let new_record = StatuslineInstall {
-        installed: ours.clone(),
+        installed: reading.ours.clone(),
         previous: previous.clone(),
     };
+    let state = install_state_of(
+        &reading.with_current(Some(reading.ours.clone())),
+        Some(&new_record),
+    );
     Ok(InstallDecision {
         record: Some(new_record),
-        write: Some(ours.clone()),
-        state: InstallState {
-            current: Some(ours.clone()),
-            ours,
-            installed: true,
-            restorable: true,
-            previous,
-            settings_file,
-        },
+        write: Some(reading.ours),
+        state,
     })
 }
 
@@ -1317,32 +1334,23 @@ fn restore_decision(
     exe: &Path,
     record: Option<StatuslineInstall>,
 ) -> Result<RestoreDecision, String> {
-    let ours = claude_settings::seatswap_status_line(exe).map_err(|error| error.to_string())?;
-    let current = claude_settings::status_line(claude).map_err(|error| error.to_string())?;
-    let settings_file = claude.settings_file().display().to_string();
+    let reading = read_status_lines(claude, exe)?;
     let Some(record) = record else {
         return Err(
             "seatswap has no record of the line before its own: nothing to restore".to_string(),
         );
     };
-    if !restorable(Some(&record), current.as_ref(), &ours) {
+    if !restorable(Some(&record), reading.current.as_ref(), &reading.ours) {
         return Err(
             "the status line in Claude Code is not seatswap's: nothing to restore".to_string(),
         );
     }
     let restored = record.previous;
-    let installed = restored.as_ref() == Some(&ours);
+    let state = install_state_of(&reading.with_current(restored.clone()), None);
     Ok(RestoreDecision {
-        restore: restored.clone(),
-        before: current,
-        state: InstallState {
-            current: restored,
-            ours,
-            installed,
-            restorable: false,
-            previous: None,
-            settings_file,
-        },
+        restore: restored,
+        before: reading.current,
+        state,
     })
 }
 
@@ -1355,14 +1363,37 @@ pub(crate) fn statusline_install_state(
 ) -> Result<InstallState, String> {
     let exe = console_program()?;
     let record = saved_install(&state)?;
-    install_state_of(&state.claude, &exe, record)
+    let reading = read_status_lines(&state.claude, &exe)?;
+    Ok(install_state_of(&reading, record.as_ref()))
 }
 
 /// Turn seatswap's status line on in Claude Code. [`install_decision`] reads the
-/// file once and decides the new record and the write; the record is saved
-/// through the settings page's one writer, `save_setting`, before seatswap's
-/// line is written. Installing again while ours is in place writes nothing and
-/// leaves the record unchanged.
+/// file once and decides the new record and the write; `save` stores the record
+/// before seatswap's line is written, so a refused save leaves Claude Code's
+/// file untouched. The command passes `save_setting` as `save`; the tests pass a
+/// fake. Installing again while ours is in place writes nothing and leaves the
+/// record unchanged.
+#[cfg(feature = "gui")]
+async fn install_status_line<F, Fut>(
+    claude: &ClaudePaths,
+    exe: &Path,
+    record: Option<StatuslineInstall>,
+    save: F,
+) -> Result<InstallState, String>
+where
+    F: FnOnce(StatuslineInstall) -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+{
+    let decision = install_decision(claude, exe, record)?;
+    if let Some(record) = decision.record {
+        save(record).await?;
+    }
+    if let Some(ours) = &decision.write {
+        claude_settings::set_status_line(claude, Some(ours)).map_err(|error| error.to_string())?;
+    }
+    Ok(decision.state)
+}
+
 #[cfg(feature = "gui")]
 #[tauri::command]
 pub(crate) async fn statusline_install(
@@ -1371,24 +1402,48 @@ pub(crate) async fn statusline_install(
     let exe = console_program()?;
     let record = saved_install(&state)?;
     let claude = state.claude.clone();
-    let decision = install_decision(&claude, &exe, record)?;
-    if let Some(record) = &decision.record {
+    install_status_line(&claude, &exe, record, |record| async move {
         let value =
-            serde_json::to_value(record).map_err(|error| format!("statuslineInstall: {error}"))?;
-        super::panel::save_setting(state, "statuslineInstall".to_string(), value).await?;
-    }
-    if let Some(ours) = &decision.write {
-        claude_settings::set_status_line(&claude, Some(ours)).map_err(|error| error.to_string())?;
+            serde_json::to_value(&record).map_err(|error| format!("statuslineInstall: {error}"))?;
+        super::panel::save_setting(state, "statuslineInstall".to_string(), value)
+            .await
+            .map(|_saved| ())
+    })
+    .await
+}
+
+/// Put the record's `previous` value back exactly (a present `null` is written
+/// as `null`, an absent one removes the key), then clear the record with
+/// `save`. It refuses without a record, and when the line in Claude Code is
+/// neither seatswap's nor the record's `installed` line, so a later hand-made
+/// line is never overwritten. If clearing the record fails, the line that was
+/// there before the restore is written back. The command passes `save_setting`
+/// as `save`; the tests pass a fake.
+#[cfg(feature = "gui")]
+async fn restore_status_line<F, Fut>(
+    claude: &ClaudePaths,
+    exe: &Path,
+    record: Option<StatuslineInstall>,
+    save: F,
+) -> Result<InstallState, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+{
+    let decision = restore_decision(claude, exe, record)?;
+    claude_settings::set_status_line(claude, decision.restore.as_ref())
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = save().await {
+        if let Err(rollback) = claude_settings::set_status_line(claude, decision.before.as_ref()) {
+            return Err(format!(
+                "{error}; the status line could not be put back: {rollback}"
+            ));
+        }
+        return Err(error);
     }
     Ok(decision.state)
 }
 
-/// Put the record's `previous` value back exactly (a present `null` is written
-/// as `null`, an absent one removes the key), then clear the record through
-/// `save_setting`. It refuses without a record, and when the line in Claude Code
-/// is neither seatswap's nor the record's `installed` line, so a later
-/// hand-made line is never overwritten. If clearing the record fails, the line
-/// that was there before the restore is written back.
 #[cfg(feature = "gui")]
 #[tauri::command]
 pub(crate) async fn statusline_restore(
@@ -1397,24 +1452,16 @@ pub(crate) async fn statusline_restore(
     let exe = console_program()?;
     let record = saved_install(&state)?;
     let claude = state.claude.clone();
-    let decision = restore_decision(&claude, &exe, record)?;
-    claude_settings::set_status_line(&claude, decision.restore.as_ref())
-        .map_err(|error| error.to_string())?;
-    if let Err(error) = super::panel::save_setting(
-        state,
-        "statuslineInstall".to_string(),
-        serde_json::Value::Null,
-    )
+    restore_status_line(&claude, &exe, record, || async move {
+        super::panel::save_setting(
+            state,
+            "statuslineInstall".to_string(),
+            serde_json::Value::Null,
+        )
+        .await
+        .map(|_saved| ())
+    })
     .await
-    {
-        if let Err(rollback) = claude_settings::set_status_line(&claude, decision.before.as_ref()) {
-            return Err(format!(
-                "{error}; the status line could not be put back: {rollback}"
-            ));
-        }
-        return Err(error);
-    }
-    Ok(decision.state)
 }
 
 #[cfg(test)]
@@ -2810,36 +2857,35 @@ mod tests {
         .expect("Claude Code's settings file");
     }
 
-    /// [`install_decision`] plus the write, without `save_setting`; the tests
-    /// hold the record in an in-memory `Settings` instead. The second value is
-    /// the record after the install: the new one, or the unchanged one.
+    /// The record the fake `save_setting` holds in an in-memory `Settings`.
     #[cfg(feature = "gui")]
-    fn install_line(
-        claude: &ClaudePaths,
-        exe: &Path,
-        record: Option<StatuslineInstall>,
-    ) -> Result<(InstallState, Option<StatuslineInstall>), String> {
-        let kept = record.clone();
-        let decision = install_decision(claude, exe, record)?;
-        if let Some(ours) = &decision.write {
-            claude_settings::set_status_line(claude, Some(ours))
-                .map_err(|error| error.to_string())?;
-        }
-        Ok((decision.state, decision.record.or(kept)))
+    type FakeRecord = std::rc::Rc<std::cell::RefCell<Option<StatuslineInstall>>>;
+
+    #[cfg(feature = "gui")]
+    fn fake_record() -> FakeRecord {
+        std::rc::Rc::new(std::cell::RefCell::new(None))
     }
 
-    /// [`restore_decision`] plus the write, without `save_setting`; the tests
-    /// hold the record in an in-memory `Settings` instead.
+    /// The install command's fake `save_setting`: the record is stored where
+    /// `save_setting` would have stored it.
     #[cfg(feature = "gui")]
-    fn restore_line(
-        claude: &ClaudePaths,
-        exe: &Path,
-        record: Option<StatuslineInstall>,
-    ) -> Result<(InstallState, Option<StatuslineInstall>), String> {
-        let decision = restore_decision(claude, exe, record)?;
-        claude_settings::set_status_line(claude, decision.restore.as_ref())
-            .map_err(|error| error.to_string())?;
-        Ok((decision.state, None))
+    fn save_into(
+        record: FakeRecord,
+    ) -> impl FnOnce(StatuslineInstall) -> std::future::Ready<Result<(), String>> {
+        move |saved| {
+            *record.borrow_mut() = Some(saved);
+            std::future::ready(Ok::<(), String>(()))
+        }
+    }
+
+    /// The restore command's fake `save_setting`: clearing the record stores
+    /// `None`, as `save_setting` does.
+    #[cfg(feature = "gui")]
+    fn clear_into(record: FakeRecord) -> impl FnOnce() -> std::future::Ready<Result<(), String>> {
+        move || {
+            *record.borrow_mut() = None;
+            std::future::ready(Ok::<(), String>(()))
+        }
     }
 
     #[cfg(feature = "gui")]
@@ -2847,7 +2893,8 @@ mod tests {
     fn the_install_state_names_claude_codes_settings_file() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let (claude, exe) = statusline_paths(&tmp);
-        let state = install_state_of(&claude, &exe, None).expect("the install state");
+        let reading = read_status_lines(&claude, &exe).expect("the reading");
+        let state = install_state_of(&reading, None);
         assert_eq!(
             state.settings_file,
             claude.settings_file().display().to_string()
@@ -2869,9 +2916,15 @@ mod tests {
         let ours = claude_settings::seatswap_status_line(&exe).expect("the status line");
         let mut settings = Settings::default();
 
-        let (installed, record) = install_line(&claude, &exe, settings.statusline_install.clone())
-            .expect("install seatswap's line");
-        settings.statusline_install = record;
+        let saved = fake_record();
+        let installed = tauri::async_runtime::block_on(install_status_line(
+            &claude,
+            &exe,
+            settings.statusline_install.clone(),
+            save_into(saved.clone()),
+        ))
+        .expect("install seatswap's line");
+        settings.statusline_install = saved.borrow().clone();
         assert!(installed.installed);
         assert!(installed.restorable);
         assert_eq!(installed.current.as_ref(), Some(&ours));
@@ -2889,9 +2942,16 @@ mod tests {
         );
 
         // A second install keeps the first previous value, not seatswap's own.
-        let (again, record) = install_line(&claude, &exe, settings.statusline_install.clone())
-            .expect("install again");
-        settings.statusline_install = record;
+        let saved = fake_record();
+        *saved.borrow_mut() = settings.statusline_install.clone();
+        let again = tauri::async_runtime::block_on(install_status_line(
+            &claude,
+            &exe,
+            settings.statusline_install.clone(),
+            save_into(saved.clone()),
+        ))
+        .expect("install again");
+        settings.statusline_install = saved.borrow().clone();
         assert!(again.installed);
         assert_eq!(
             settings
@@ -2901,9 +2961,15 @@ mod tests {
             Some(old.clone())
         );
 
-        let (restored, cleared) =
-            restore_line(&claude, &exe, settings.statusline_install.clone()).expect("restore");
-        settings.statusline_install = cleared;
+        let cleared = fake_record();
+        let restored = tauri::async_runtime::block_on(restore_status_line(
+            &claude,
+            &exe,
+            settings.statusline_install.clone(),
+            clear_into(cleared.clone()),
+        ))
+        .expect("restore");
+        settings.statusline_install = cleared.borrow().clone();
         assert!(!restored.installed);
         assert!(!restored.restorable);
         assert_eq!(restored.current, Some(old.clone()));
@@ -2922,9 +2988,15 @@ mod tests {
         write_claude_settings(&claude, &serde_json::json!({"model": "opus"}));
         let mut settings = Settings::default();
 
-        let (installed, record) = install_line(&claude, &exe, settings.statusline_install.clone())
-            .expect("install over no status line");
-        settings.statusline_install = record;
+        let saved = fake_record();
+        let installed = tauri::async_runtime::block_on(install_status_line(
+            &claude,
+            &exe,
+            settings.statusline_install.clone(),
+            save_into(saved.clone()),
+        ))
+        .expect("install over no status line");
+        settings.statusline_install = saved.borrow().clone();
         assert!(installed.installed);
         assert_eq!(
             settings
@@ -2935,9 +3007,15 @@ mod tests {
             "the file had no statusLine key"
         );
 
-        let (restored, cleared) =
-            restore_line(&claude, &exe, settings.statusline_install.clone()).expect("restore");
-        settings.statusline_install = cleared;
+        let cleared = fake_record();
+        let restored = tauri::async_runtime::block_on(restore_status_line(
+            &claude,
+            &exe,
+            settings.statusline_install.clone(),
+            clear_into(cleared.clone()),
+        ))
+        .expect("restore");
+        settings.statusline_install = cleared.borrow().clone();
         assert!(!restored.installed);
         assert_eq!(restored.current, None);
         assert_eq!(
@@ -2967,8 +3045,13 @@ mod tests {
             previous: Some(serde_json::json!({"type": "command", "command": "bash ~/x.sh"})),
         };
 
-        let error = restore_line(&claude, &exe, Some(record))
-            .expect_err("a line the user set afterwards is not restored over");
+        let error = tauri::async_runtime::block_on(restore_status_line(
+            &claude,
+            &exe,
+            Some(record),
+            || std::future::ready(Ok::<(), String>(())),
+        ))
+        .expect_err("a line the user set afterwards is not restored over");
 
         assert_eq!(
             error,
@@ -2994,12 +3077,25 @@ mod tests {
         write_claude_settings(&claude, &serde_json::json!({"statusLine": old}));
         let mut settings = Settings::default();
 
-        let (_, record) = install_line(&claude, &exe, settings.statusline_install.clone())
-            .expect("first install");
-        settings.statusline_install = record;
-        let (_, record) = install_line(&claude, &exe, settings.statusline_install.clone())
-            .expect("second install");
-        settings.statusline_install = record;
+        let saved = fake_record();
+        tauri::async_runtime::block_on(install_status_line(
+            &claude,
+            &exe,
+            settings.statusline_install.clone(),
+            save_into(saved.clone()),
+        ))
+        .expect("first install");
+        settings.statusline_install = saved.borrow().clone();
+        let saved = fake_record();
+        *saved.borrow_mut() = settings.statusline_install.clone();
+        tauri::async_runtime::block_on(install_status_line(
+            &claude,
+            &exe,
+            settings.statusline_install.clone(),
+            save_into(saved.clone()),
+        ))
+        .expect("second install");
+        settings.statusline_install = saved.borrow().clone();
 
         assert_eq!(
             settings
@@ -3022,7 +3118,10 @@ mod tests {
         );
         let original = std::fs::read(claude.settings_file()).expect("the file");
 
-        let error = restore_line(&claude, &exe, None)
+        let error =
+            tauri::async_runtime::block_on(restore_status_line(&claude, &exe, None, || {
+                std::future::ready(Ok::<(), String>(()))
+            }))
             .expect_err("without a record there is nothing to restore");
 
         assert_eq!(
@@ -3044,16 +3143,29 @@ mod tests {
         let old = serde_json::json!({"type": "command", "command": "bash ~/x.sh"});
         write_claude_settings(&claude, &serde_json::json!({"statusLine": old.clone()}));
         let mut settings = Settings::default();
-        let (_, record) = install_line(&claude, &exe, settings.statusline_install.clone())
-            .expect("first install");
-        settings.statusline_install = record;
+        let saved = fake_record();
+        tauri::async_runtime::block_on(install_status_line(
+            &claude,
+            &exe,
+            settings.statusline_install.clone(),
+            save_into(saved.clone()),
+        ))
+        .expect("first install");
+        settings.statusline_install = saved.borrow().clone();
 
         // The user sets a line by hand after seatswap's install.
         let hand = serde_json::json!({"type": "command", "command": "bash ~/mine.sh"});
         write_claude_settings(&claude, &serde_json::json!({"statusLine": hand.clone()}));
-        let (installed, record) = install_line(&claude, &exe, settings.statusline_install.clone())
-            .expect("install over the hand line");
-        settings.statusline_install = record;
+        let saved = fake_record();
+        *saved.borrow_mut() = settings.statusline_install.clone();
+        let installed = tauri::async_runtime::block_on(install_status_line(
+            &claude,
+            &exe,
+            settings.statusline_install.clone(),
+            save_into(saved.clone()),
+        ))
+        .expect("install over the hand line");
+        settings.statusline_install = saved.borrow().clone();
 
         assert!(installed.installed);
         assert_eq!(
@@ -3073,6 +3185,75 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "gui")]
+    #[test]
+    fn install_saves_the_record_before_it_writes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (claude, exe) = statusline_paths(&tmp);
+        let old = serde_json::json!({"type": "command", "command": "bash ~/x.sh"});
+        write_claude_settings(
+            &claude,
+            &serde_json::json!({"model": "opus", "statusLine": old.clone()}),
+        );
+        let original = std::fs::read(claude.settings_file()).expect("the file");
+
+        let error =
+            tauri::async_runtime::block_on(install_status_line(&claude, &exe, None, |_record| {
+                std::future::ready(Err::<(), String>(
+                    "accounts.json: the install record cannot be saved".to_string(),
+                ))
+            }))
+            .expect_err("a refused save stops the install");
+
+        assert_eq!(error, "accounts.json: the install record cannot be saved");
+        assert_eq!(
+            std::fs::read(claude.settings_file()).expect("the file"),
+            original,
+            "the record is saved first, so a refused save leaves Claude Code's file alone"
+        );
+        assert_eq!(
+            claude_settings::status_line(&claude).expect("read"),
+            Some(old)
+        );
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn restore_puts_the_line_back_when_the_record_cannot_be_cleared() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (claude, exe) = statusline_paths(&tmp);
+        let old = serde_json::json!({"type": "command", "command": "bash ~/x.sh"});
+        write_claude_settings(&claude, &serde_json::json!({"statusLine": old}));
+        let saved = fake_record();
+        tauri::async_runtime::block_on(install_status_line(
+            &claude,
+            &exe,
+            None,
+            save_into(saved.clone()),
+        ))
+        .expect("install");
+        let ours = claude_settings::seatswap_status_line(&exe).expect("the status line");
+
+        let error = tauri::async_runtime::block_on(restore_status_line(
+            &claude,
+            &exe,
+            saved.borrow().clone(),
+            || {
+                std::future::ready(Err::<(), String>(
+                    "accounts.json: the install record cannot be cleared".to_string(),
+                ))
+            },
+        ))
+        .expect_err("a refused clear stops the restore");
+
+        assert_eq!(error, "accounts.json: the install record cannot be cleared");
+        assert_eq!(
+            claude_settings::status_line(&claude).expect("read"),
+            Some(ours),
+            "the line seatswap had installed is put back after the failed clear"
+        );
+    }
+
     // ---- proof tests of the review ----
 
     #[cfg(feature = "gui")]
@@ -3087,13 +3268,30 @@ mod tests {
         let old = serde_json::json!({"type": "command", "command": "bash ~/x.sh"});
         write_claude_settings(&claude, &serde_json::json!({"statusLine": old}));
 
-        let (_, record) = install_line(&claude, &exe, None).expect("first install");
+        let saved = fake_record();
+        tauri::async_runtime::block_on(install_status_line(
+            &claude,
+            &exe,
+            None,
+            save_into(saved.clone()),
+        ))
+        .expect("first install");
+        let record = saved.borrow().clone();
         assert_eq!(
             record.as_ref().and_then(|record| record.previous.clone()),
             Some(old.clone())
         );
         // The program is installed somewhere else; the user presses the button again.
-        let (_, record) = install_line(&claude, &moved, record).expect("second install");
+        let saved = fake_record();
+        *saved.borrow_mut() = record.clone();
+        tauri::async_runtime::block_on(install_status_line(
+            &claude,
+            &moved,
+            record,
+            save_into(saved.clone()),
+        ))
+        .expect("second install");
+        let record = saved.borrow().clone();
 
         assert_eq!(
             record.as_ref().and_then(|record| record.previous.clone()),
@@ -3109,15 +3307,28 @@ mod tests {
         let (claude, exe) = statusline_paths(&tmp);
         write_claude_settings(&claude, &serde_json::json!({"statusLine": null}));
         let original = std::fs::read(claude.settings_file()).expect("file");
-        let (_, record) = install_line(&claude, &exe, None).expect("install");
+        let saved = fake_record();
+        tauri::async_runtime::block_on(install_status_line(
+            &claude,
+            &exe,
+            None,
+            save_into(saved.clone()),
+        ))
+        .expect("install");
         // The record goes through accounts.json (serde) like save_setting does.
         let settings = Settings {
-            statusline_install: record,
+            statusline_install: saved.borrow().clone(),
             ..Settings::default()
         };
         let settings: Settings =
             serde_json::from_value(serde_json::to_value(&settings).expect("to")).expect("from");
-        restore_line(&claude, &exe, settings.statusline_install).expect("restore");
+        tauri::async_runtime::block_on(restore_status_line(
+            &claude,
+            &exe,
+            settings.statusline_install,
+            || std::future::ready(Ok::<(), String>(())),
+        ))
+        .expect("restore");
         let after: serde_json::Value =
             serde_json::from_slice(&std::fs::read(claude.settings_file()).expect("file"))
                 .expect("JSON");

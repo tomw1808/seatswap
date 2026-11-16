@@ -400,34 +400,19 @@ function selectInput(options, value, onchange) {
   return select;
 }
 
-// A switch for a boolean setting. The caller saves and reverts the control when
-// the save is refused.
-function switchButton(checked, label, onchange) {
-  const control = h("button", {
-    type: "button",
-    class: "switch",
-    role: "switch",
-    "aria-checked": checked ? "true" : "false",
-    "aria-label": label,
-  });
-  control.addEventListener("click", () => {
-    const next = control.getAttribute("aria-checked") !== "true";
-    control.setAttribute("aria-checked", next ? "true" : "false");
-    onchange(next);
-  });
-  return control;
-}
-
-// The mock-up's `.sws` switch: a blue track with a knob and, where the page
-// asks for it, its On/Off word beside it. The caller gets the button so it can
+// The one switch for a boolean setting: the large window's `.sws` (a blue
+// track with a knob and, where the page asks for it, its On/Off word beside it)
+// and, with `{ popup: true }`, the pop-up's `.switch`. The caller saves and
+// reverts the control when the save is refused. It gets the button so it can
 // disable it while a save runs, and `set` to put the switch back when the save
-// is refused. The Settings area and the Status line area share this one switch.
+// is refused.
 function switchControl(checked, label, onchange, options) {
-  const words = !options || options.words !== false;
+  const popup = Boolean(options && options.popup);
+  const words = !popup && (!options || options.words !== false);
   let state = Boolean(checked);
   const button = h("button", {
     type: "button",
-    class: `sws${state ? " ison" : ""}`,
+    class: popup ? "switch" : `sws${state ? " ison" : ""}`,
     role: "switch",
     "aria-checked": state ? "true" : "false",
     "aria-label": label,
@@ -438,7 +423,7 @@ function switchControl(checked, label, onchange, options) {
   const set = (next) => {
     state = Boolean(next);
     button.setAttribute("aria-checked", state ? "true" : "false");
-    button.classList.toggle("ison", state);
+    if (!popup) button.classList.toggle("ison", state);
     if (word) word.textContent = state ? "On" : "Off";
   };
   button.addEventListener("click", () => {
@@ -1102,7 +1087,6 @@ export {
   accountName,
   textInput,
   selectInput,
-  switchButton,
   switchControl,
   sanitizeAbbrChar,
   abbrLetterBoxes,

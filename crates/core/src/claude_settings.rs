@@ -456,6 +456,37 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn the_quoted_command_reaches_the_program_through_bash() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let folder = tmp.path().join("a space $HOME's folder");
+        fs::create_dir(&folder).expect("the folder");
+        let exe = folder.join("seatswap");
+        fs::write(&exe, b"#!/bin/sh\nprintf '%s' \"$1\"\n").expect("the script");
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).expect("executable");
+
+        let line = seatswap_status_line(&exe).expect("the status line");
+        let command = line["command"].as_str().expect("the command text");
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(command)
+            .output()
+            .expect("bash runs the command");
+
+        assert!(
+            output.status.success(),
+            "bash failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("UTF-8 output"),
+            "statusline"
+        );
+    }
+
     // ---- proof tests of the review ----
 
     #[cfg(unix)]

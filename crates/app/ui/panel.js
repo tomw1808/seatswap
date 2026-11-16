@@ -23,7 +23,7 @@ import {
   mixHex,
   rgba,
   shortPercent,
-  switchButton,
+  switchControl,
   textInput,
 } from "./common.js";
 import { currentFixture, ensureFixture } from "./fixture.js";
@@ -301,7 +301,7 @@ function renderBurnStrip() {
   const row = h("div", { class: "burn-row" }, [
     h("b", { class: "burn-title", text: "Auto-burn" }),
     typeof burn.on === "boolean"
-      ? switchButton(on, "Auto-burn", setAutoBurn)
+      ? switchControl(on, "Auto-burn", setAutoBurn, { popup: true }).button
       : null,
     h("span", { class: "burn-state", text: on ? "On" : "Off" }),
     h("span", { class: "burn-spacer" }),
