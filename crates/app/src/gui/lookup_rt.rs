@@ -1,10 +1,13 @@
 //! The look-up thread (spec §1.4.1): the API prices from models.dev every hour
-//! and the dollar rate from Frankfurter once a day, both behind `lookUpPrices`.
+//! and the dollar rate from Frankfurter on its own schedule, both behind
+//! `lookUpPrices`. The rate is looked at every 30 minutes, so the 16:00–18:00
+//! retry runs and a failed ask is asked again; only an answer marks the day.
 //!
 //! The thread is the only writer of `prices.json` in the app; the commands read
 //! its [`MoneyView`] and send it over a channel. Every change of the view is a
 //! [`UiEvent::Money`] for the window.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -15,26 +18,37 @@ use chrono::{DateTime, Local, NaiveDate, Utc};
 use serde::Serialize;
 
 use seatswap_core::api::Api;
-use seatswap_core::locks;
 use seatswap_core::money::{self, Fx, ModelPrice, MoneyError, PriceChange, Prices, Rate};
 use seatswap_core::paths::AppPaths;
 use seatswap_core::store::{self, Settings};
-use seatswap_core::switcher::APP_LOCK_TIMEOUT;
 
 use super::worker::UiEvent;
 
 /// models.dev is checked every hour (spec §1.4.1).
 const PRICE_EVERY: Duration = Duration::from_secs(60 * 60);
 
+/// How often the thread looks at the rate: the 16:00–18:00 retry asks every 30
+/// minutes (spec §1.4), and a failed ask is asked again at the next look.
+const RATE_EVERY: Duration = Duration::from_secs(30 * 60);
+
+/// The sources the settings page names beside the rate and the price list
+/// (spec §1.4, §1.4.1).
+const RATE_SOURCE: &str = "European Central Bank via Frankfurter";
+const PRICES_SOURCE: &str = "models.dev";
+
 /// What the settings page shows about money. A missing value stays `None`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MoneyView {
     pub currency: Option<String>,
     pub rate: Option<Rate>,
+    /// When the looked-up point in effect was fetched; `None` for a point of
+    /// an old `fx.json` (the page says "fetched: not recorded").
+    pub rate_fetched_at: Option<DateTime<Utc>>,
+    pub rate_source: &'static str,
+    pub prices_source: &'static str,
     pub look_up: bool,
-    /// The providers a model key may name, from `money::PRICE_PROVIDERS`; the
-    /// "add a model" row builds its provider select from these.
+    /// The providers a model key may name, from `money::PRICE_PROVIDERS`.
     pub providers: Vec<String>,
     pub models_with_price: u32,
     pub prices_checked_at: Option<DateTime<Utc>>,
@@ -48,13 +62,32 @@ pub(crate) struct MoneyView {
     pub last_error: Option<String>,
 }
 
+impl Default for MoneyView {
+    fn default() -> Self {
+        MoneyView {
+            currency: None,
+            rate: None,
+            rate_fetched_at: None,
+            rate_source: RATE_SOURCE,
+            prices_source: PRICES_SOURCE,
+            look_up: false,
+            providers: Vec::new(),
+            models_with_price: 0,
+            prices_checked_at: None,
+            last_change: None,
+            left_out: Vec::new(),
+            rate_error: None,
+            last_error: None,
+        }
+    }
+}
+
 /// One model's effective price as the price list shows it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PriceRow {
     pub key: String,
     pub price: ModelPrice,
-    pub own: bool,
     pub tiered: bool,
     pub since: Option<DateTime<Utc>>,
 }
@@ -64,11 +97,9 @@ enum LookupCommand {
     Now {
         reply: Sender<Result<MoneyView, String>>,
     },
-    SetOverride {
-        key: String,
-        price: Option<ModelPrice>,
-        reply: Sender<Result<(), String>>,
-    },
+    /// A session met a model without a price (S-3 sends this; no caller yet).
+    #[allow(dead_code)]
+    PriceWanted(String),
     Stop,
 }
 
@@ -102,20 +133,14 @@ impl LookupClient {
             .map_err(|_| super::thread_stopped_message())?
     }
 
-    /// Set (`Some`) or remove (`None`) one model's own price. The thread writes
-    /// `prices.json`; no command writes it beside the thread.
-    pub(crate) fn set_override(
-        &self,
-        key: String,
-        price: Option<ModelPrice>,
-    ) -> Result<(), String> {
-        let (reply, received) = mpsc::channel();
-        self.commands
-            .send(LookupCommand::SetOverride { key, price, reply })
-            .map_err(|_| super::thread_stopped_message())?;
-        received
-            .recv()
-            .map_err(|_| super::thread_stopped_message())?
+    /// A session met `model` without a price: ask models.dev at once. The
+    /// thread answers at most once per model per hour. S-3 adds the call where
+    /// the sessions code meets an unknown model; nothing calls it yet.
+    #[allow(dead_code)]
+    pub(crate) fn want_price(&self, model: &str) {
+        let _ = self
+            .commands
+            .send(LookupCommand::PriceWanted(model.to_string()));
     }
 }
 
@@ -177,27 +202,57 @@ fn run(
 ) {
     let mut runtime = LookupRuntime::new(app.clone(), api, Some(ui), view);
     // The first round is at the start, before the first hour has passed.
-    let mut next = Instant::now();
+    let mut next_prices = Instant::now();
+    let mut next_rate = Instant::now();
     loop {
         if stop.load(Ordering::SeqCst) {
             return;
         }
-        let wait = next.saturating_duration_since(Instant::now());
+        let wait = next_prices
+            .min(next_rate)
+            .saturating_duration_since(Instant::now());
         match commands.recv_timeout(wait) {
             Ok(LookupCommand::Now { reply }) => {
                 let view = one_round(&mut runtime, &app, Utc::now());
                 let _ = reply.send(Ok(view));
-                next = Instant::now() + PRICE_EVERY;
+                next_prices = Instant::now() + PRICE_EVERY;
+                next_rate = Instant::now() + RATE_EVERY;
             }
-            Ok(LookupCommand::SetOverride { key, price, reply }) => {
-                let _ = reply.send(runtime.set_override(key, price));
+            Ok(LookupCommand::PriceWanted(model)) => {
+                runtime.price_wanted(&model, Utc::now());
             }
             Ok(LookupCommand::Stop) | Err(RecvTimeoutError::Disconnected) => return,
             Err(RecvTimeoutError::Timeout) => {
-                one_round(&mut runtime, &app, Utc::now());
-                next = Instant::now() + PRICE_EVERY;
+                let now = Instant::now();
+                let due = due_jobs(now, next_prices, next_rate);
+                if due.prices {
+                    // models.dev's round looks at the rate too, so the rate's
+                    // own deadline moves with it.
+                    one_round(&mut runtime, &app, Utc::now());
+                    next_prices = now + PRICE_EVERY;
+                    next_rate = now + RATE_EVERY;
+                } else if due.rate {
+                    // A wake for the rate runs only the rate part.
+                    one_rate_round(&mut runtime, &app, Utc::now());
+                    next_rate = now + RATE_EVERY;
+                }
             }
         }
+    }
+}
+
+/// Which jobs a timer wake runs: the one whose deadline passed. Both deadlines
+/// are checked, so a rate wake sends models.dev no request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DueJobs {
+    prices: bool,
+    rate: bool,
+}
+
+fn due_jobs(now: Instant, next_prices: Instant, next_rate: Instant) -> DueJobs {
+    DueJobs {
+        prices: now >= next_prices,
+        rate: now >= next_rate,
     }
 }
 
@@ -208,6 +263,19 @@ fn one_round(runtime: &mut LookupRuntime, app: &AppPaths, now: DateTime<Utc>) ->
     }
 }
 
+/// [`one_round`]'s rate part alone: a wake for the rate asks Frankfurter when
+/// the schedule says so and never models.dev.
+fn one_rate_round(
+    runtime: &mut LookupRuntime,
+    app: &AppPaths,
+    now: DateTime<Utc>,
+) -> Option<MoneyView> {
+    match store::load_accounts(app) {
+        Ok(file) => runtime.rate_round(&file.settings, now),
+        Err(error) => Some(runtime.settings_failed(error.to_string())),
+    }
+}
+
 /// One round over the files and the two look-ups. Tests drive it directly with
 /// settings and a fixed time, so no test waits for the thread's timer.
 pub(crate) struct LookupRuntime {
@@ -215,11 +283,16 @@ pub(crate) struct LookupRuntime {
     api: Api,
     ui: Option<Sender<UiEvent>>,
     view: Arc<Mutex<MoneyView>>,
-    settings: Option<Settings>,
-    /// The local day of the last Frankfurter request and the currency it was
-    /// for: a weekend has no new rate, so "older than today" alone would ask
-    /// every hour (lead decision 3).
-    last_rate_day: Option<(NaiveDate, String)>,
+    /// The last ask Frankfurter answered, with the currency it answered for:
+    /// [`money::rate_due`] decides from it. A failed ask leaves it as it was.
+    last_rate_answered: Option<(DateTime<Utc>, String)>,
+    /// The last time each model's price was asked for, by the model name the
+    /// session gives: at most once an hour per model.
+    wanted: HashMap<String, DateTime<Utc>>,
+    /// Why the last models.dev request failed; `None` after an answer. It stays
+    /// in the view until the next models.dev request replaces it, so a rate
+    /// wake in between does not hide it.
+    prices_error: Option<String>,
 }
 
 impl LookupRuntime {
@@ -238,8 +311,9 @@ impl LookupRuntime {
             api,
             ui,
             view,
-            settings: None,
-            last_rate_day: None,
+            last_rate_answered: None,
+            wanted: HashMap::new(),
+            prices_error: None,
         }
     }
 
@@ -251,57 +325,75 @@ impl LookupRuntime {
     /// request only when `lookUpPrices` is on; with it off the view still shows
     /// what is stored.
     pub(crate) fn round(&mut self, settings: &Settings, now: DateTime<Utc>) -> MoneyView {
-        let mut error: Option<String> = None;
-        let mut rate_error: Option<String> = None;
-        let mut left_out: Option<Vec<String>> = None;
-        let today = local_day(now);
-        if settings.look_up_prices {
-            match money::look_up_prices(&self.api, &self.app, now) {
-                Ok(money::Looked::Taken {
-                    left_out: names, ..
-                }) => left_out = Some(names),
-                Ok(money::Looked::NotModified) => {}
-                Err(failure) => error = combine(error, format!("API prices: {failure}")),
-            }
-            if let Some(currency) = settings.currency.clone() {
-                if currency != "USD" {
-                    let fx = match Fx::load(&self.app) {
-                        Ok(fx) => Some(fx),
-                        Err(failure) => {
-                            error = combine(error, format!("the dollar rate: {failure}"));
-                            None
-                        }
-                    };
-                    if let Some(fx) = fx {
-                        let newest = if fx.currency == currency {
-                            fx.points.last().map(|point| point.date)
-                        } else {
-                            None
-                        };
-                        let stale = newest.is_none_or(|date| date < today);
-                        let asked = self
-                            .last_rate_day
-                            .as_ref()
-                            .is_some_and(|(day, code)| *day == today && *code == currency);
-                        if stale && !asked {
-                            match money::look_up_rate(&self.api, &self.app, &currency) {
-                                // Only an answer that arrived marks the day: a
-                                // failure is asked again next round.
-                                Ok(_) => {
-                                    self.last_rate_day = Some((today, currency.clone()));
-                                }
-                                Err(failure) => {
-                                    rate_error =
-                                        combine(rate_error, format!("the dollar rate: {failure}"));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        let left_out = if settings.look_up_prices {
+            self.ask_prices(now)
+        } else {
+            // No request: an old failure is no longer the page's business.
+            self.prices_error = None;
+            None
+        };
+        let rate_error = self.ask_rate(settings, now).err();
+        let error = self.prices_error.clone();
+        self.build_view(settings, error, rate_error, local_day(now), left_out)
+    }
+
+    /// A wake for the rate only: it asks Frankfurter when [`money::rate_due`]
+    /// says so and sends models.dev no request. `None` when the schedule had
+    /// nothing to do, so the view is not rebuilt for nothing.
+    pub(crate) fn rate_round(
+        &mut self,
+        settings: &Settings,
+        now: DateTime<Utc>,
+    ) -> Option<MoneyView> {
+        let rate_error = match self.ask_rate(settings, now) {
+            Ok(false) => return None,
+            Ok(true) => None,
+            Err(failure) => Some(failure),
+        };
+        let error = self.prices_error.clone();
+        Some(self.build_view(settings, error, rate_error, local_day(now), None))
+    }
+
+    /// The rate part of a round: the one place the rate is asked for. `Ok(true)`
+    /// when it asked, `Ok(false)` when nothing was due; the error text is what
+    /// the rate row shows. Only an answer records the ask, so a failed request
+    /// makes the next rate wake ask again (spec §1.4: due once per Frankfurt
+    /// day as today).
+    fn ask_rate(&mut self, settings: &Settings, now: DateTime<Utc>) -> Result<bool, String> {
+        if !settings.look_up_prices {
+            return Ok(false);
         }
-        self.settings = Some(settings.clone());
-        self.build_view(settings, error, rate_error, today, left_out)
+        let Some(currency) = settings.currency.clone() else {
+            return Ok(false);
+        };
+        if currency == "USD" {
+            return Ok(false);
+        }
+        let fx = Fx::load(&self.app).map_err(|failure| format!("the dollar rate: {failure}"))?;
+        let stored = if fx.currency == currency {
+            fx.points.last().map(|point| point.date)
+        } else {
+            None
+        };
+        // The last answered ask belongs to a currency (fix round, point 3):
+        // for another currency it counts as no ask.
+        let last_ask = self
+            .last_rate_answered
+            .as_ref()
+            .filter(|(_, answered)| answered == &currency)
+            .map(|(at, _)| *at);
+        let due = money::rate_due(now, stored, last_ask)
+            .map_err(|failure| format!("the dollar rate: {failure}"))?;
+        if !due {
+            return Ok(false);
+        }
+        match money::look_up_rate(&self.api, &self.app, &currency, now) {
+            Ok(_) => {
+                self.last_rate_answered = Some((now, currency));
+                Ok(true)
+            }
+            Err(failure) => Err(format!("the dollar rate: {failure}")),
+        }
     }
 
     /// accounts.json could not be read: remember that and send no request.
@@ -312,29 +404,53 @@ impl LookupRuntime {
         self.store(view)
     }
 
-    fn set_override(&mut self, key: String, price: Option<ModelPrice>) -> Result<(), String> {
-        money::parse_price_key(&key)?;
-        if let Some(price) = &price {
-            price.validate()?;
-        }
-        // The same app lock the look-up takes: an own price written while a
-        // look-up runs is never lost, and a look-up never overwrites this save.
-        let _lock = locks::acquire_app_lock(&self.app, APP_LOCK_TIMEOUT)
-            .map_err(|error| format!("cannot take the app lock: {error}"))?;
-        let mut prices = Prices::load(&self.app).map_err(|error| error.to_string())?;
-        match price {
-            Some(price) => {
-                prices.overrides.insert(key, price);
+    /// A model without a price was met: ask models.dev at once, at most once
+    /// per model per hour. The settings are read the way the round reads them,
+    /// so a look-up switched off after the last round sends no request; the map
+    /// is keyed by the model name the session gives. Returns whether it asked;
+    /// the clock is passed in so tests never sleep.
+    fn price_wanted(&mut self, model: &str, now: DateTime<Utc>) -> bool {
+        let settings = match store::load_accounts(&self.app) {
+            Ok(file) => file.settings,
+            Err(error) => {
+                self.settings_failed(error.to_string());
+                return false;
             }
-            None => {
-                prices.overrides.remove(&key);
+        };
+        if !settings.look_up_prices {
+            return false;
+        }
+        if self.wanted.get(model).is_some_and(|last| {
+            now.signed_duration_since(*last).num_seconds() < PRICE_EVERY.as_secs() as i64
+        }) {
+            return false;
+        }
+        self.wanted.insert(model.to_string(), now);
+        let left_out = self.ask_prices(now);
+        let rate_error = self.view().rate_error;
+        let error = self.prices_error.clone();
+        self.build_view(&settings, error, rate_error, local_day(now), left_out);
+        true
+    }
+
+    /// One models.dev request: the one place the prices are asked for. Returns
+    /// the left-out models of a new list; records why it failed, or clears that
+    /// after an answer.
+    fn ask_prices(&mut self, now: DateTime<Utc>) -> Option<Vec<String>> {
+        match money::look_up_prices(&self.api, &self.app, now) {
+            Ok(money::Looked::Taken { left_out, .. }) => {
+                self.prices_error = None;
+                Some(left_out)
+            }
+            Ok(money::Looked::NotModified) => {
+                self.prices_error = None;
+                None
+            }
+            Err(failure) => {
+                self.prices_error = Some(format!("API prices: {failure}"));
+                None
             }
         }
-        prices.save(&self.app).map_err(|error| error.to_string())?;
-        if let Some(settings) = self.settings.clone() {
-            self.build_view(&settings, None, None, local_day(Utc::now()), None);
-        }
-        Ok(())
     }
 
     fn build_view(
@@ -362,11 +478,18 @@ impl LookupRuntime {
         };
         let currency = settings.currency.clone();
         let rate = money::usd_rate(settings, &fx, today);
+        let rate_fetched_at = match rate {
+            Some(Rate { date: Some(_), .. }) => fx.fetched_at(today),
+            _ => None,
+        };
         let models_with_price = prices.current().len() as u32;
         let left_out = left_out.unwrap_or_else(|| self.view().left_out);
         let view = MoneyView {
             currency,
             rate,
+            rate_fetched_at,
+            rate_source: RATE_SOURCE,
+            prices_source: PRICES_SOURCE,
             look_up: settings.look_up_prices,
             providers: providers(),
             models_with_price,
@@ -395,9 +518,6 @@ impl LookupRuntime {
     }
 }
 
-/// The view from what is stored, before the first round: no request is sent and
-/// nothing is invented. The currency and the switch are known only after the
-/// settings are read, so they stay missing here.
 /// The providers a model key may name, as the page lists them.
 fn providers() -> Vec<String> {
     money::PRICE_PROVIDERS
@@ -406,6 +526,9 @@ fn providers() -> Vec<String> {
         .collect()
 }
 
+/// The view from what is stored, before the first round: no request is sent and
+/// nothing is invented. The currency and the switch are known only after the
+/// settings are read, so they stay missing here.
 fn stored_view(app: &AppPaths) -> MoneyView {
     let mut error = None;
     let prices = match Prices::load(app) {
@@ -421,6 +544,9 @@ fn stored_view(app: &AppPaths) -> MoneyView {
     MoneyView {
         currency: None,
         rate: None,
+        rate_fetched_at: None,
+        rate_source: RATE_SOURCE,
+        prices_source: PRICES_SOURCE,
         look_up: false,
         providers: providers(),
         models_with_price: prices.current().len() as u32,
@@ -443,8 +569,7 @@ fn combine(first: Option<String>, second: String) -> Option<String> {
     })
 }
 
-/// Every model with a price: the looked-up one or the one entered by hand.
-/// `since` is when the looked-up price started; an own price has none.
+/// Every model with a looked-up price. `since` is when that price started.
 pub(crate) fn price_rows(app: &AppPaths) -> Result<Vec<PriceRow>, MoneyError> {
     Ok(Prices::load(app)?
         .current()
@@ -452,7 +577,6 @@ pub(crate) fn price_rows(app: &AppPaths) -> Result<Vec<PriceRow>, MoneyError> {
         .map(|current| PriceRow {
             key: current.key,
             price: current.price.clone(),
-            own: current.own,
             tiered: current.price.tiered,
             since: current.since,
         })
@@ -619,6 +743,13 @@ mod tests {
         LookupRuntime::new(app, api, None, Arc::new(Mutex::new(MoneyView::default())))
     }
 
+    /// A runtime whose accounts.json holds `settings`, without a round:
+    /// `price_wanted` reads the settings from the file the way the round does.
+    fn runtime_with(app: AppPaths, base: &str, settings: Settings) -> LookupRuntime {
+        write_settings(&app, &settings);
+        runtime(app, lookup_api(base))
+    }
+
     fn no_rate_settings() -> Settings {
         Settings {
             currency: None,
@@ -739,64 +870,20 @@ mod tests {
     }
 
     #[test]
-    fn price_rows_show_an_override_and_the_looked_up_price() {
+    fn price_rows_show_the_looked_up_price() {
         let dir = tempdir().expect("tempdir");
         let app = AppPaths::at(&dir.path().join("data"));
         let at = utc("2026-11-13T09:00:00Z");
-        let mut prices = stored_prices(at);
-        prices
-            .overrides
-            .insert("openai/gpt-6".to_string(), model_price(3.0));
-        prices.save(&app).expect("prices.json");
+        stored_prices(at).save(&app).expect("prices.json");
 
         let rows = price_rows(&app).expect("the rows");
         assert_eq!(rows.len(), 2);
-        let own = rows.iter().find(|row| row.key == "openai/gpt-6").unwrap();
-        assert!(own.own);
-        assert_eq!(own.price.input, 3.0);
-        assert_eq!(own.since, None);
         let looked = rows
             .iter()
             .find(|row| row.key == "anthropic/claude-opus-5-5")
-            .unwrap();
-        assert!(!looked.own);
+            .expect("opus");
         assert_eq!(looked.price.input, 4.0);
         assert_eq!(looked.since, Some(at));
-    }
-
-    #[test]
-    fn an_own_price_needs_a_known_provider() {
-        let dir = tempdir().expect("tempdir");
-        let app = AppPaths::at(&dir.path().join("data"));
-        let mut runtime = runtime(app.clone(), lookup_api("http://127.0.0.1:1"));
-
-        for key in [
-            "claude-opus-5-5",
-            "acme/claude-opus-5-5",
-            "anthropic/",
-            "/claude-opus-5-5",
-        ] {
-            let error = runtime
-                .set_override(key.to_string(), Some(model_price(1.0)))
-                .expect_err("a key without a known provider and a model id is refused");
-            assert!(
-                error.contains("anthropic"),
-                "the refusal names the providers of models.dev, got {error}"
-            );
-        }
-
-        runtime
-            .set_override(
-                "anthropic/claude-opus-5-5".to_string(),
-                Some(model_price(1.0)),
-            )
-            .expect("a known provider and a model id are accepted");
-        let rows = price_rows(&app).expect("the rows");
-        assert!(
-            rows.iter()
-                .any(|row| row.key == "anthropic/claude-opus-5-5" && row.own),
-            "an own price for a model no look-up listed is a row"
-        );
     }
 
     #[test]
@@ -806,8 +893,10 @@ mod tests {
             rate: Some(Rate {
                 value: 0.9048,
                 date: Some(NaiveDate::from_ymd_opt(2026, 11, 13).unwrap()),
-                own: false,
             }),
+            rate_fetched_at: Some(utc("2026-11-13T10:10:00Z")),
+            rate_source: RATE_SOURCE,
+            prices_source: PRICES_SOURCE,
             look_up: true,
             providers: money::PRICE_PROVIDERS
                 .iter()
@@ -833,6 +922,12 @@ mod tests {
         assert_eq!(json["modelsWithPrice"], json!(3));
         assert_eq!(json["rate"]["value"], json!(0.9048));
         assert_eq!(json["rate"]["date"], json!("2026-11-13"));
+        assert_eq!(json["rateFetchedAt"], json!("2026-11-13T10:10:00Z"));
+        assert_eq!(
+            json["rateSource"],
+            json!("European Central Bank via Frankfurter")
+        );
+        assert_eq!(json["pricesSource"], json!("models.dev"));
         assert_eq!(json["pricesCheckedAt"], json!("2026-11-14T09:00:00Z"));
         assert_eq!(
             json["leftOut"],
@@ -884,10 +979,16 @@ mod tests {
       }}
     }"#;
 
+    /// Frankfurter's answer for both currencies the tests ask for: Friday
+    /// 13 Nov 2026.
+    const RATE_BODY: &str =
+        r#"{"base":"USD","date":"2026-11-13","rates":{"EUR":0.90481,"CHF":0.93}}"#;
+
     /// A server that answers every request and reports the path of each one.
     fn path_server(
         prices_status: u16,
         rate_status: u16,
+        rate_body: &'static str,
     ) -> (String, Receiver<String>, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a local server");
         let base = format!("http://{}", listener.local_addr().expect("a local address"));
@@ -905,7 +1006,7 @@ mod tests {
                         let (status, answer) = if path.starts_with("/api.json") {
                             (prices_status, MODELS_DEV_BODY)
                         } else {
-                            (rate_status, "")
+                            (rate_status, rate_body)
                         };
                         // Report the path before the answer, so a test that
                         // waits for the round sees every request it made.
@@ -927,6 +1028,126 @@ mod tests {
         (base, receiver, handle)
     }
 
+    fn rate_asks(paths: &Receiver<String>) -> usize {
+        paths
+            .try_iter()
+            .filter(|path| path.starts_with("/v1/latest"))
+            .count()
+    }
+
+    /// accounts.json holding `settings`, the way the round and `price_wanted`
+    /// read them.
+    fn write_settings(app: &AppPaths, settings: &Settings) {
+        std::fs::create_dir_all(&app.data_dir).expect("the data folder");
+        let file = store::AccountsFile {
+            settings: settings.clone(),
+            ..store::AccountsFile::default()
+        };
+        std::fs::write(
+            app.accounts_file(),
+            serde_json::to_vec(&file).expect("accounts JSON"),
+        )
+        .expect("accounts.json");
+    }
+
+    #[test]
+    fn an_unknown_model_asks_models_dev_once_an_hour() {
+        let dir = tempdir().expect("tempdir");
+        let app = AppPaths::at(&dir.path().join("data"));
+        let (base, paths, _handle) = path_server(200, 200, "");
+        let settings = Settings {
+            look_up_prices: true,
+            ..Settings::default()
+        };
+        let mut runtime = runtime_with(app, &base, settings);
+        let start = utc("2026-11-13T09:00:00Z");
+
+        assert!(runtime.price_wanted("claude-x-9", start), "the first ask");
+        assert_eq!(
+            paths
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the fake server received no request"),
+            "/api.json"
+        );
+        assert!(
+            runtime.wanted.contains_key("claude-x-9"),
+            "the once-an-hour map is keyed by the model name the session gives"
+        );
+        assert!(
+            !runtime.wanted.contains_key("anthropic/claude-x-9"),
+            "not by price_key(\"anthropic\", …): the provider is not known here"
+        );
+        assert!(
+            !runtime.price_wanted("claude-x-9", start + chrono::Duration::minutes(59)),
+            "not twice within an hour"
+        );
+        assert!(paths.try_recv().is_err(), "the second call sent no request");
+        assert!(
+            runtime.price_wanted("claude-x-9", start + chrono::Duration::hours(1)),
+            "an hour later the same model is asked again"
+        );
+        assert_eq!(
+            paths
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the fake server received no request"),
+            "/api.json"
+        );
+    }
+
+    /// With the look-ups off neither host is contacted (spec §11.5); a model
+    /// met then falls back to the stored list, once the hourly round has it.
+    #[test]
+    fn no_model_asks_models_dev_with_look_ups_off() {
+        let dir = tempdir().expect("tempdir");
+        let app = AppPaths::at(&dir.path().join("data"));
+        let (base, paths, _handle) = path_server(200, 200, "");
+        let settings = Settings {
+            look_up_prices: false,
+            ..Settings::default()
+        };
+        let mut runtime = runtime_with(app, &base, settings);
+
+        assert!(
+            !runtime.price_wanted("claude-x-9", utc("2026-11-13T09:00:00Z")),
+            "no request is made with the look-ups off"
+        );
+        assert!(paths.try_recv().is_err(), "the fake server got no request");
+    }
+
+    /// The settings that count are the ones in effect now, not the copy the
+    /// last round read: look-ups switched off since then send no request.
+    #[test]
+    fn look_ups_off_after_the_last_round_sends_no_request() {
+        let dir = tempdir().expect("tempdir");
+        let app = AppPaths::at(&dir.path().join("data"));
+        let (base, paths, _handle) = path_server(200, 200, "");
+        let on = Settings {
+            look_up_prices: true,
+            ..Settings::default()
+        };
+        let mut runtime = runtime_with(app.clone(), &base, on.clone());
+        runtime.round(&on, utc("2026-11-13T09:00:00Z"));
+        paths
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the round asked models.dev");
+
+        write_settings(
+            &app,
+            &Settings {
+                look_up_prices: false,
+                ..Settings::default()
+            },
+        );
+        assert!(
+            !runtime.price_wanted("claude-x-9", utc("2026-11-13T09:01:00Z")),
+            "the last round's copy still had the look-ups on"
+        );
+        assert!(
+            paths.try_recv().is_err(),
+            "a request arrived with the look-ups off"
+        );
+    }
+
     /// The window reads the view before the thread's first round is done: it
     /// must not claim that there is no price at all.
     #[test]
@@ -944,13 +1165,119 @@ mod tests {
         );
     }
 
-    /// A rate request that failed taught nothing: the next round of the same
-    /// day must ask again.
+    /// The thread has a second deadline: a wake runs the job whose deadline
+    /// passed, and a rate wake is no models.dev round.
     #[test]
-    fn proof_a_failed_rate_is_asked_again_in_the_same_day() {
+    fn a_wake_runs_the_job_whose_deadline_passed() {
+        let now = Instant::now();
+        let half_hour = now + RATE_EVERY;
+        let hour = now + PRICE_EVERY;
+        let three_hours = now + Duration::from_secs(3 * 60 * 60);
+        let just_after = |deadline: Instant| deadline + Duration::from_secs(1);
+        assert_eq!(
+            due_jobs(just_after(half_hour), hour, half_hour),
+            DueJobs {
+                prices: false,
+                rate: true
+            },
+            "the rate's deadline passed, models.dev's did not"
+        );
+        assert_eq!(
+            due_jobs(just_after(hour), hour, three_hours),
+            DueJobs {
+                prices: true,
+                rate: false
+            },
+            "models.dev's deadline passed, the rate's did not"
+        );
+        assert_eq!(
+            due_jobs(just_after(hour), hour, hour),
+            DueJobs {
+                prices: true,
+                rate: true
+            },
+            "both passed"
+        );
+        assert_eq!(
+            due_jobs(now, hour, half_hour),
+            DueJobs {
+                prices: false,
+                rate: false
+            },
+            "waiting, not due"
+        );
+    }
+
+    /// The 16:00–18:00 retry runs every 30 minutes: a Monday whose 16:00 answer
+    /// carries Friday's date is asked again at 16:30 and 17:00, not at 18:00,
+    /// and the rate's own wakes send models.dev no request.
+    #[test]
+    fn the_afternoon_retry_asks_the_rate_without_models_dev() {
         let dir = tempdir().expect("tempdir");
         let app = AppPaths::at(&dir.path().join("data"));
-        let (base, paths, _handle) = path_server(200, 500);
+        let (base, paths, _handle) = path_server(200, 200, RATE_BODY);
+        let mut runtime = runtime(app.clone(), lookup_api(&base));
+        let settings = Settings {
+            currency: Some("EUR".to_string()),
+            look_up_prices: true,
+            ..Settings::default()
+        };
+
+        // Mon 16 Nov 2026: 15:00 UTC is 16:00 in Frankfurt. The round asks the
+        // price list and the rate; the answer carries Friday 13 Nov.
+        runtime.round(&settings, utc("2026-11-16T15:00:00Z"));
+        let stored = Fx::load(&app).expect("fx.json");
+        assert_eq!(
+            stored.points[0].fetched_at,
+            Some(utc("2026-11-16T15:00:00Z")),
+            "the look-up is stamped with the round's clock, not the wall clock"
+        );
+        let first: Vec<String> = paths.try_iter().collect();
+        assert!(
+            first.iter().any(|path| path == "/api.json"),
+            "the round asked models.dev: {first:?}"
+        );
+        assert_eq!(
+            first
+                .iter()
+                .filter(|path| path.starts_with("/v1/latest"))
+                .count(),
+            1,
+            "the round asked the rate once: {first:?}"
+        );
+
+        // 16:30 and 17:00 in Frankfurt: the rate alone is asked again.
+        for at in ["2026-11-16T15:30:00Z", "2026-11-16T16:00:00Z"] {
+            let view = runtime.rate_round(&settings, utc(at));
+            assert!(view.is_some(), "the rate wake at {at} did nothing");
+            let asked: Vec<String> = paths.try_iter().collect();
+            assert_eq!(
+                asked,
+                vec!["/v1/latest?base=USD&symbols=EUR".to_string()],
+                "the rate wake at {at} asked models.dev too"
+            );
+        }
+
+        // 18:00 in Frankfurt: the window has ended, nothing is due.
+        assert!(
+            runtime
+                .rate_round(&settings, utc("2026-11-16T17:00:00Z"))
+                .is_none(),
+            "18:00 is outside the retry's window"
+        );
+        assert!(
+            paths.try_recv().is_err(),
+            "the 18:00 wake asked for something"
+        );
+    }
+
+    /// An answered ask whose answer is older than today is asked again in the
+    /// afternoon: the 16:00–18:00 retry of the schedule.
+    #[test]
+    fn proof_an_answered_stale_rate_is_asked_again_from_four() {
+        let dir = tempdir().expect("tempdir");
+        let app = AppPaths::at(&dir.path().join("data"));
+        let (base, paths, _handle) = path_server(200, 200, RATE_BODY);
         let mut runtime = runtime(app, lookup_api(&base));
         let settings = Settings {
             currency: Some("EUR".to_string()),
@@ -958,23 +1285,104 @@ mod tests {
             ..Settings::default()
         };
 
-        let first = runtime.round(&settings, utc("2026-11-14T12:00:00Z"));
+        // Mon 16 Nov 2026, 09:00 in Frankfurt: the first ask, answered with
+        // Friday 13 Nov.
+        let first = runtime.round(&settings, utc("2026-11-16T08:00:00Z"));
+        assert_eq!(first.rate_error, None, "the rate was answered");
+        assert_eq!(rate_asks(&paths), 1);
+        // 10:00: the answer's date is still older than today, but the day's
+        // ask was answered, so nothing before the afternoon.
+        runtime.round(&settings, utc("2026-11-16T09:00:00Z"));
+        assert_eq!(rate_asks(&paths), 0, "one ask before the afternoon");
+        // 16:31 in Frankfurt (15:31 UTC): the afternoon retry asks again.
+        runtime.round(&settings, utc("2026-11-16T15:31:00Z"));
+        assert_eq!(rate_asks(&paths), 1, "the afternoon did not ask again");
+    }
+
+    /// The rate asked for today was answered for EUR; a new currency has no
+    /// answer and no stored rate, so it must be asked for at once, not after
+    /// the next Frankfurt day.
+    #[test]
+    fn proof_a_currency_change_the_same_day_asks_for_the_new_rate() {
+        let dir = tempdir().expect("tempdir");
+        let app = AppPaths::at(&dir.path().join("data"));
+        let (base, paths, _handle) = path_server(200, 200, RATE_BODY);
+        let mut runtime = runtime(app, lookup_api(&base));
+        let settings = |currency: &str| Settings {
+            currency: Some(currency.to_string()),
+            look_up_prices: true,
+            ..Settings::default()
+        };
+
+        // Sat 14 Nov 2026, 11:00 in Frankfurt: a weekend, outside the afternoon.
+        // The EUR ask is answered, so the day counts as asked for EUR.
+        let first = runtime.round(&settings("EUR"), utc("2026-11-14T10:00:00Z"));
+        assert_eq!(first.rate_error, None, "the EUR ask was answered");
+        assert_eq!(rate_asks(&paths), 1);
+
+        runtime.round(&settings("CHF"), utc("2026-11-14T10:05:00Z"));
+        assert_eq!(
+            rate_asks(&paths),
+            1,
+            "the new currency CHF has no stored rate and was not asked for"
+        );
+    }
+
+    /// Only an answer marks the day: after the 09:00 ask failed, the round at
+    /// 11:00 asks again ("due once per Frankfurt day as today").
+    #[test]
+    fn proof_a_failed_rate_is_asked_again_in_the_morning() {
+        let dir = tempdir().expect("tempdir");
+        let app = AppPaths::at(&dir.path().join("data"));
+        let (base, paths, _handle) = path_server(200, 500, "");
+        let mut runtime = runtime(app, lookup_api(&base));
+        let settings = Settings {
+            currency: Some("EUR".to_string()),
+            look_up_prices: true,
+            ..Settings::default()
+        };
+
+        // Fri 13 Nov 2026, 09:00 and 11:00 in Frankfurt.
+        let first = runtime.round(&settings, utc("2026-11-13T08:00:00Z"));
         assert!(
             first.rate_error.is_some(),
             "the failed rate is remembered at the rate"
         );
-        assert_eq!(first.last_error, None, "the price look-up did not fail");
-        // An hour later, the same local day.
-        runtime.round(&settings, utc("2026-11-14T13:00:00Z"));
+        runtime.round(&settings, utc("2026-11-13T10:00:00Z"));
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            rate_asks(&paths),
+            2,
+            "the failed ask of 09:00 was not repeated at 11:00"
+        );
+    }
 
-        let asked: Vec<String> = paths.try_iter().collect();
-        let rate_requests = asked
-            .iter()
-            .filter(|path| path.starts_with("/v1/latest"))
-            .count();
+    /// The rate wake rebuilds the view; the price look-up's error of the hourly
+    /// round is still the last word about models.dev and must stay on the page.
+    #[test]
+    fn proof_a_rate_wake_keeps_the_price_look_ups_error() {
+        let dir = tempdir().expect("tempdir");
+        let app = AppPaths::at(&dir.path().join("data"));
+        let (base, _paths, _handle) = path_server(500, 500, "");
+        let mut runtime = runtime(app, lookup_api(&base));
+        let settings = Settings {
+            currency: Some("EUR".to_string()),
+            look_up_prices: true,
+            ..Settings::default()
+        };
+
+        let hourly = runtime.round(&settings, utc("2026-11-16T08:00:00Z"));
         assert!(
-            rate_requests >= 2,
-            "the rate was asked once and never again after the failure: {asked:?}"
+            hourly.last_error.is_some(),
+            "models.dev failed in the round"
+        );
+        let wake = runtime
+            .rate_round(&settings, utc("2026-11-16T08:30:00Z"))
+            .expect("the failed rate is asked again");
+        assert!(wake.rate_error.is_some(), "the rate failed again");
+        assert!(
+            wake.last_error.is_some(),
+            "the rate wake wiped the models.dev error from the view"
         );
     }
 }

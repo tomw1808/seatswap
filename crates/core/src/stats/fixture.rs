@@ -6,7 +6,7 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Duration, FixedOffset, Utc};
+use chrono::{DateTime, Duration, FixedOffset, NaiveDate, Utc};
 
 use crate::api::LimitKind;
 use crate::history::{
@@ -16,7 +16,7 @@ use crate::history::{
 use crate::money::{price_key, Fx, ModelPrice, PricePoint, Prices};
 use crate::project::ProjectKey;
 use crate::projects::{self, Projects};
-use crate::store::{Account, AccountsFile, FileSecrets, LoginState, OwnRate, Settings, Store};
+use crate::store::{Account, AccountsFile, FileSecrets, LoginState, Settings, Store};
 use crate::types::OAuthAccount;
 
 #[cfg(test)]
@@ -348,16 +348,15 @@ pub fn write(root: &Path) -> Result<Tiny, String> {
             },
         }],
     );
-    let fx = Fx {
+    let mut fx = Fx {
         currency: "EUR".to_string(),
         ..Fx::default()
     };
+    let rate_day = NaiveDate::from_ymd_opt(2026, 1, 1)
+        .ok_or_else(|| "the fixture's rate day cannot be built".to_string())?;
+    fx.take(rate_day, 1.0);
     let settings = Settings {
         currency: Some("EUR".to_string()),
-        usd_rate: Some(OwnRate {
-            currency: "EUR".to_string(),
-            value: 1.0,
-        }),
         host_name: Some("atlas".to_string()),
         ..Settings::default()
     };

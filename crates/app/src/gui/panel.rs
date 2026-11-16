@@ -21,7 +21,6 @@ use seatswap_core::engine::PollReason;
 use seatswap_core::history::{
     export_csv, export_json, By, Event, EventKind, HistoryDir, HostConflict, HostInfo, Hosts, Range,
 };
-use seatswap_core::money::ModelPrice;
 use seatswap_core::projects::{self, ProjectEdit, Projects, ProjectsLogRecord};
 use seatswap_core::store::{self, Account, Settings};
 use seatswap_core::switcher::UnsavedPolicy;
@@ -720,20 +719,6 @@ pub(crate) async fn price_list(state: State<'_, GuiState>) -> Result<Vec<PriceRo
     })
     .await
     .map_err(|error| error.to_string())?
-}
-
-/// Set one model's own price, or remove it with `None` ("back to the
-/// looked-up price"). The look-up thread is the only writer of `prices.json`.
-#[tauri::command]
-pub(crate) async fn set_price_override(
-    state: State<'_, GuiState>,
-    key: String,
-    price: Option<ModelPrice>,
-) -> Result<(), String> {
-    let lookup = state.lookup.clone();
-    tauri::async_runtime::spawn_blocking(move || lookup.set_override(key, price))
-        .await
-        .map_err(|error| error.to_string())?
 }
 
 /// One look-up now, after a setting in the Money section changed.

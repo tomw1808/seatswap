@@ -11,6 +11,7 @@ import {
   clear,
   colorSwatches,
   contrastText,
+  dateText,
   errorMessage,
   focusInside,
   h,
@@ -83,18 +84,24 @@ const state = {
   callsError: null,
   callsLoaded: false,
   callsToken: 0,
-  // The money view from the look-up thread, the price list under API prices,
+  // The money view from the look-up thread, the price list under Providers,
   // and the request tokens that keep a slow reply from overwriting a newer one.
   money: null,
   moneyError: null,
   moneyLoaded: false,
   moneyToken: 0,
   moneyListening: false,
-  moneyOpen: false,
+  // The money rows and the price block are built again only when the view
+  // they show changed (decision 25: no flicker on a snapshot): the key is the
+  // JSON of that part of the view, and the node is the one kept while it holds.
+  moneyKey: null,
+  moneyNode: null,
   priceRows: null,
   priceError: null,
   priceLoaded: false,
   priceToken: 0,
+  priceKey: null,
+  priceNode: null,
   // Saves run one after another, each built from the settings as the one
   // before left them, so a quick second change never carries a stale copy.
   saving: Promise.resolve(),
@@ -184,10 +191,10 @@ export async function render(container, context) {
   state.group = group;
   state.accountIds = accountIdsOf(snapshot);
   listenMoney(context);
-  if (group === "general" && (groupChanged || !state.moneyLoaded)) {
+  if ((group === "general" || group === "providers") && (groupChanged || !state.moneyLoaded)) {
     await loadMoney(context);
   }
-  if (group === "general" && state.moneyOpen && !state.priceLoaded) {
+  if (group === "providers" && (groupChanged || !state.priceLoaded)) {
     await loadPriceList();
   }
   if ((group === "accounts" || group === "projects") && (groupChanged || !state.projectsLoaded)) {
@@ -551,7 +558,8 @@ function listenMoney(context) {
       state.moneyError = null;
       state.moneyLoaded = true;
       const draw = async () => {
-        if (state.moneyOpen) {
+        // Providers shows the model list: a new view may carry a new list.
+        if (state.group === "providers") {
           state.priceLoaded = false;
           await loadPriceList();
         }
@@ -565,16 +573,28 @@ function listenMoney(context) {
   });
 }
 
-// A change of the look-up thread's view redraws the General card, unless the
-// person is typing in a field right now.
+// A change of the look-up thread's view replaces only the rows it feeds; the
+// rest of the group keeps its controls and their focus (decision 25).
 function renderMoney() {
-  if (state.group !== "general" || !state.right) return;
+  if (!state.right) return;
   if (focusInside(state.container)) return;
-  renderGroup(state.right, "general");
+  if (state.group === "general") {
+    const current = state.right.querySelector(".money-rows");
+    if (!current) {
+      renderGroup(state.right, "general");
+      return;
+    }
+    current.replaceWith(moneyRows());
+    return;
+  }
+  if (state.group === "providers") {
+    const current = state.right.querySelector(".price-block");
+    if (current) current.replaceWith(priceBlock());
+  }
 }
 
-// After a save of currency, usdRate or lookUpPrices: one round now, so the rate
-// and the list are fresh at once.
+// After a save of currency or lookUpPrices: one round now, so the rate and the
+// list are fresh at once.
 async function refreshMoney() {
   if (!state.context) return;
   const token = ++state.moneyToken;
@@ -593,27 +613,11 @@ async function refreshMoney() {
   }
   if (token !== state.moneyToken) return;
   state.moneyLoaded = true;
-  if (state.moneyOpen) {
+  if (state.group === "providers") {
     state.priceLoaded = false;
     await loadPriceList();
   }
-  if (state.group === "general" && state.right && !focusInside(state.container)) {
-    renderGroup(state.right, "general");
-  }
-}
-
-// After an own price: read the view and the price list again, but do not ask
-// the internet.
-async function reloadMoney() {
-  if (!state.context) return;
-  await loadMoney(state.context);
-  if (state.moneyOpen) {
-    state.priceLoaded = false;
-    await loadPriceList();
-  }
-  if (state.group === "general" && state.right && !focusInside(state.container)) {
-    renderGroup(state.right, "general");
-  }
+  renderMoney();
 }
 
 // The page's times all come from `time_texts`; the Rust side formats them.
@@ -648,7 +652,13 @@ async function fillTimeNodes(requests) {
   for (let index = 0; index < requests.length; index += 1) {
     const request = requests[index];
     const value = error ? "?" : texts[index] || "";
-    const text = `${request.prefix || ""}${value}${request.suffix || ""}`;
+    // Most rows write `prefix + time + suffix`; a row whose words depend on the
+    // form the Rust side chose ("today 10:10", "Thu 10:10") shapes it itself.
+    const text = error
+      ? `${request.prefix || ""}${value}${request.suffix || ""}`
+      : request.text
+        ? request.text(value)
+        : `${request.prefix || ""}${value}${request.suffix || ""}`;
     if (request.attribute) request.node.setAttribute(request.attribute, text);
     else request.node.textContent = text;
   }
@@ -772,26 +782,50 @@ function rateText(view, code) {
   return `${value.toFixed(4)} ${code}`;
 }
 
+// "fetched today 10:10": the Rust side's `dayClock` is "10:10" today and names
+// the weekday or the date otherwise, so the word "today" follows that form.
+function fetchedPart(times, fetchedAt) {
+  const node = h("span");
+  if (typeof fetchedAt === "string" && fetchedAt !== "") {
+    times.push({
+      node,
+      style: "dayClock",
+      at: fetchedAt,
+      text: (value) => `fetched ${value.includes(" ") ? value : `today ${value}`}`,
+    });
+  } else {
+    // An old fx.json keeps no fetch time (the documented rule, decision 4).
+    node.textContent = "fetched: not recorded";
+  }
+  return node;
+}
+
+// "ECB rate of Fri 13 Nov · European Central Bank via Frankfurter · fetched
+// today 10:10" for every currency (decision 4). USD itself needs no look-up;
+// with the look-ups off the API value is in US dollars (decision 3).
 function rateRow(times) {
   const code = currencyCode();
   const view = isObject(state.money) ? state.money : null;
   const control = h("span", { class: "money-rate", text: rateText(view, code) });
-  let note = h("span", { class: "mf" });
-  if (code && view && isObject(view.rate)) {
-    if (view.rate.own) {
-      note.textContent = "your own rate";
-    } else if (typeof view.rate.date === "string" && view.rate.date !== "") {
-      const node = h("span");
-      note.appendChild(node);
-      times.push({
-        node,
-        style: "date",
-        at: `${view.rate.date}T00:00:00Z`,
-        prefix: "looked up ",
-      });
-    } else if (code === "USD") {
-      note.textContent = "USD itself";
+  const note = h("span", { class: "mf money-rate-note" });
+  const rate = view && isObject(view.rate) ? view.rate : null;
+  if (!code) {
+    note.textContent = "set a currency first";
+  } else if (!rate || !Number.isFinite(Number(rate.value))) {
+    note.textContent = "no rate yet: API values are shown in USD";
+  } else if (code === "USD") {
+    note.textContent = "USD itself";
+  } else {
+    if (typeof rate.date === "string" && rate.date !== "") {
+      addNotePart(
+        note,
+        h("span", { text: `ECB rate of ${dateText(`${rate.date}T00:00:00`)}` })
+      );
     }
+    if (typeof view.rateSource === "string" && view.rateSource !== "") {
+      addNotePart(note, h("span", { text: view.rateSource }));
+    }
+    addNotePart(note, fetchedPart(times, view.rateFetchedAt));
   }
   const row = setting("1 US dollar is", control, note, "rate");
   const problem =
@@ -804,60 +838,6 @@ function rateRow(times) {
     error.textContent = problem;
   }
   return row;
-}
-
-function ownRateRow() {
-  const code = currencyCode();
-  const stored = savedValue("usdRate");
-  const own = isObject(stored) ? stored : null;
-  const ownValue =
-    own && typeof own.currency === "string" && own.currency === code
-      ? own.value
-      : null;
-  const input = h("input", {
-    type: "number",
-    class: "inp num",
-    value: typeof ownValue === "number" ? String(ownValue) : "",
-    step: "0.0001",
-    "aria-label": "Use my own rate",
-    disabled: !code || code === "USD",
-  });
-  const reset = () => {
-    const value = savedValue("usdRate");
-    const current =
-      isObject(value) &&
-      typeof value.currency === "string" &&
-      value.currency === code &&
-      typeof value.value === "number"
-        ? value.value
-        : null;
-    input.value = current === null ? "" : String(current);
-  };
-  input.addEventListener("change", async () => {
-    if (!code || code === "USD") {
-      reset();
-      return;
-    }
-    const value = typedNumber(input.value);
-    const next = value === null ? null : { currency: code, value };
-    const ok = await saveField("usdRate", next);
-    if (!ok) {
-      reset();
-      return;
-    }
-    await refreshMoney();
-  });
-  const control = h("span", { class: "number-control" }, [
-    input,
-    code ? h("span", { class: "mf", text: `${code} per USD` }) : null,
-  ]);
-  let note = "empty: the looked-up rate is used";
-  if (!code) note = "set a currency first";
-  else if (code === "USD") note = "USD needs no rate";
-  else if (own && own.currency !== code) {
-    note = `your rate ${own.value} was for ${own.currency} and is not used for ${code}`;
-  }
-  return setting("Use my own rate", control, note, "usdRate");
 }
 
 function countText(count, singular, plural) {
@@ -876,25 +856,9 @@ function apiPricesRow(times) {
         ? "prices: not read"
         : "no prices yet"
       : `${count} models with a price`;
-  const show = h("button", {
-    type: "button",
-    class: "hbtn xs",
-    text: state.moneyOpen ? "Hide" : "Show…",
-    "aria-expanded": state.moneyOpen ? "true" : "false",
-  });
-  show.addEventListener("click", async () => {
-    state.moneyOpen = !state.moneyOpen;
-    if (state.moneyOpen && !state.priceLoaded) {
-      // Show the old card at once, then replace the list when it is read.
-      renderGroup(state.right, "general");
-      await loadPriceList();
-    }
-    if (state.group === "general" && state.right) renderGroup(state.right, "general");
-  });
-  const control = h("span", { class: "money-prices-head" }, [
-    h("span", { text }),
-    show,
-  ]);
+  // The model list itself is read-only and lives under Providers (decision 7);
+  // this row is the look-up's state only.
+  const control = h("span", { class: "money-prices-head" }, [h("span", { text })]);
 
   const note = h("span", { class: "mf money-api-note" });
   if (view) {
@@ -966,6 +930,32 @@ function apiPricesRow(times) {
   return row;
 }
 
+// The General group's money rows, kept while the view they show is unchanged:
+// the key is the JSON of the money part, so a snapshot that changes nothing
+// else never refills their times (decision 25). The cached node is moved into
+// the new card by its caller.
+function moneyRows() {
+  const key = JSON.stringify({
+    view: isObject(state.money) ? state.money : null,
+    error: state.moneyError,
+    loaded: state.moneyLoaded,
+    currency: currencyCode(),
+  });
+  if (state.moneyNode && state.moneyKey === key) return state.moneyNode;
+  const times = [];
+  const node = h("div", { class: "col money-rows" }, [
+    section("Money"),
+    currencyRow(),
+    lookUpRow(),
+    rateRow(times),
+    apiPricesRow(times),
+  ]);
+  state.moneyNode = node;
+  state.moneyKey = key;
+  fillTimeNodes(times);
+  return node;
+}
+
 // Read the price list once per opening or change; the card draws it from the
 // stored rows, so a snapshot never asks for it again.
 async function loadPriceList() {
@@ -985,81 +975,139 @@ async function loadPriceList() {
   if (token === state.priceToken) state.priceLoaded = true;
 }
 
-function drawPriceList(container) {
-  clear(container);
-  if (state.priceError) {
-    container.appendChild(
-      h("div", { class: "row-error price-list-error", text: state.priceError })
-    );
-  } else if (!state.priceLoaded || state.priceRows === null) {
-    container.appendChild(h("div", { class: "lr mf", text: "loading the price list…" }));
-    return;
+// models.dev is the list's only source; the view names it (`pricesSource`).
+const MODELS_DEV_URL = "https://models.dev";
+
+// "API prices from models.dev · checked 11:11" (decision 7): the list's source
+// as a link, and when the look-up last answered.
+function pricesLine(times) {
+  const view = isObject(state.money) ? state.money : null;
+  const source =
+    view && typeof view.pricesSource === "string" && view.pricesSource !== ""
+      ? view.pricesSource
+      : "models.dev";
+  const line = h("div", { class: "price-line" }, [
+    h("span", { text: "API prices from " }),
+    h("a", {
+      class: "link",
+      href: MODELS_DEV_URL,
+      target: "_blank",
+      rel: "noreferrer noopener",
+      text: source,
+    }),
+  ]);
+  const checked = h("span", { class: "mf" });
+  if (view && typeof view.pricesCheckedAt === "string" && view.pricesCheckedAt !== "") {
+    line.appendChild(middotSeparator());
+    addNotePart(checked, h("span", { text: "checked " }));
+    const node = h("span");
+    checked.appendChild(node);
+    times.push({ node, style: "clock", at: view.pricesCheckedAt });
   } else {
-    const rows = state.priceRows;
-    if (rows.length === 0) {
-      container.appendChild(
-        h("div", {
-          class: "lr mf",
-          text: "no prices yet: run a look-up with the switch on, or add a model below",
-        })
-      );
-    } else {
-      container.appendChild(
-        h("div", { class: "lr hd price-grid" }, [
-          h("span", { text: "Model" }),
-          h("span", { text: "Input" }),
-          h("span", { text: "Output" }),
-          h("span", { text: "Cache write" }),
-          h("span", { text: "Cache read" }),
-          h("span", { text: "" }),
-        ])
-      );
-      const times = [];
-      for (const row of rows) container.appendChild(priceRow(row, times));
-      container.appendChild(
-        h("div", {
-          class: "note price-list-note",
-          text: "USD per million tokens. A field saves that model's own price; a tiered model uses its base price.",
-        })
-      );
-      fillTimeNodes(times);
-    }
+    line.appendChild(middotSeparator());
+    checked.textContent = "not looked up yet";
   }
-  container.appendChild(addModelRow());
+  line.appendChild(checked);
+  return line;
 }
 
-function priceInputValue(row, property) {
-  const value = row.price && Number(row.price[property]);
-  return Number.isFinite(value) ? String(value) : "0";
+// The price block under Providers: the source line, the read-only list and the
+// look-up's state. Built again only when the part of the view it shows changed
+// (decision 25), so a snapshot never refills its times.
+function priceBlock() {
+  const view = isObject(state.money) ? state.money : null;
+  const key = JSON.stringify({
+    source: view && view.pricesSource,
+    checkedAt: view && view.pricesCheckedAt,
+    pricesError: view && view.lastError,
+    leftOut: view && view.leftOut,
+    moneyError: state.moneyError,
+    rows: state.priceRows,
+    listError: state.priceError,
+    loaded: state.priceLoaded,
+  });
+  if (state.priceNode && state.priceKey === key) return state.priceNode;
+  const times = [];
+  const node = h("div", { class: "price-block" }, [pricesLine(times), priceList()]);
+  const problem =
+    view && typeof view.lastError === "string" && view.lastError !== ""
+      ? view.lastError
+      : state.moneyError;
+  if (problem) {
+    node.appendChild(h("div", { class: "row-error price-list-error", text: problem }));
+  }
+  const leftOut =
+    view && Array.isArray(view.leftOut)
+      ? view.leftOut.filter((entry) => typeof entry === "string" && entry !== "")
+      : [];
+  if (leftOut.length > 0) {
+    node.appendChild(
+      h("div", {
+        class: "lr mf price-left-out",
+        text: `${countText(leftOut.length, "model", "models")} of models.dev's list ${leftOut.length === 1 ? "was" : "were"} left out`,
+        title: leftOut.join("\n"),
+      })
+    );
+  }
+  state.priceNode = node;
+  state.priceKey = key;
+  fillTimeNodes(times);
+  return node;
 }
 
-function resetPriceInputs(row, inputs) {
-  for (const [property, input] of Object.entries(inputs)) {
-    input.value = priceInputValue(row, property);
+// The rows themselves, read-only: every price is a value, never a field.
+function priceList() {
+  if (state.priceError) {
+    return h("div", { class: "row-error price-list-error", text: state.priceError });
   }
+  if (!state.priceLoaded || state.priceRows === null) {
+    return h("div", { class: "lr mf", text: "loading the price list…" });
+  }
+  const rows = state.priceRows;
+  if (rows.length === 0) {
+    return h("div", {
+      class: "lr mf",
+      text: "no prices yet: run a look-up with the switch on",
+    });
+  }
+  const list = h("div", { class: "price-list" });
+  list.appendChild(
+    h("div", { class: "lr hd price-grid" }, [
+      h("span", { text: "Model" }),
+      h("span", { text: "Input" }),
+      h("span", { text: "Output" }),
+      h("span", { text: "Cache write" }),
+      h("span", { text: "Cache read" }),
+      h("span", { text: "" }),
+    ])
+  );
+  const times = [];
+  for (const row of rows) list.appendChild(priceRow(row, times));
+  list.appendChild(
+    h("div", {
+      class: "note price-list-note",
+      text: "USD per million tokens. A tiered model uses its base price.",
+    })
+  );
+  fillTimeNodes(times);
+  return list;
 }
 
-async function savePrice(row, inputs) {
-  const field = `price:${row.key}`;
-  const price = { tiered: Boolean(row.tiered) };
-  for (const [property, input] of Object.entries(inputs)) {
-    price[property] = typedNumber(input.value);
+// One price as written; a value that is not a number is an error the page
+// shows, never a made-up 0.
+function priceText(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    throw new Error(`a price is not a number: ${JSON.stringify(value)}`);
   }
-  try {
-    await state.context.invoke("set_price_override", { key: row.key, price });
-    row.price = price;
-    row.own = true;
-    await reloadMoney();
-  } catch (error) {
-    fieldError(field, errorMessage(error));
-    resetPriceInputs(row, inputs);
-  }
+  return String(number);
 }
 
+// One model's four looked-up prices; `since` says when the price in effect
+// started, as a tip on the row.
 function priceRow(row, times) {
-  const field = `price:${row.key}`;
-  const wrap = h("div", { class: "price-wrap", dataset: { field } });
-  if (!row.own && typeof row.since === "string" && row.since !== "") {
+  const wrap = h("div", { class: "price-wrap" });
+  if (typeof row.since === "string" && row.since !== "") {
     times.push({
       node: wrap,
       style: "day",
@@ -1069,133 +1117,20 @@ function priceRow(row, times) {
     });
   }
   const grid = h("div", { class: "lr price-grid" });
-  grid.appendChild(
-    h("span", { class: "mono x11", title: row.key, text: row.key })
-  );
-  const inputs = {};
-  const labels = {
-    input: "input",
-    output: "output",
-    cacheWrite: "cache write",
-    cacheRead: "cache read",
-  };
-  for (const [property, label] of Object.entries(labels)) {
-    const input = h("input", {
-      type: "number",
-      class: "inp num price-field",
-      value: priceInputValue(row, property),
-      step: "any",
-      "aria-label": `${label} price for ${row.key}`,
-    });
-    input.addEventListener("change", () => savePrice(row, inputs));
-    inputs[property] = input;
-    grid.appendChild(h("span", { class: "price-value" }, [input]));
+  grid.appendChild(h("span", { class: "mono x11", title: row.key, text: row.key }));
+  for (const property of ["input", "output", "cacheWrite", "cacheRead"]) {
+    grid.appendChild(
+      h("span", {
+        class: "price-value mono x11",
+        text: priceText(row.price ? row.price[property] : undefined),
+      })
+    );
   }
   const marks = h("span", { class: "price-marks" });
   if (row.tiered) marks.appendChild(h("span", { class: "sw warn", text: "tiered" }));
-  if (row.own) marks.appendChild(h("span", { class: "sw ok", text: "own" }));
   grid.appendChild(marks);
   wrap.appendChild(grid);
-  if (row.own) {
-    const back = h("button", {
-      type: "button",
-      class: "hbtn xs ghost",
-      text: "back to the looked-up price",
-    });
-    back.addEventListener("click", async () => {
-      back.disabled = true;
-      try {
-        await state.context.invoke("set_price_override", {
-          key: row.key,
-          price: null,
-        });
-        await reloadMoney();
-      } catch (error) {
-        fieldError(field, errorMessage(error));
-        back.disabled = false;
-      }
-    });
-    wrap.appendChild(h("div", { class: "price-own-line" }, [back]));
-  }
-  wrap.appendChild(h("div", { class: "row-error", hidden: true }));
   return wrap;
-}
-
-// An own price for any model (spec §1.4.1), including one models.dev does not
-// list: the key is `<provider>/<model id>`. The providers come from the money
-// view (`money::PRICE_PROVIDERS`); the server refuses a bad key or price.
-function addModelRow() {
-  const field = "price:new";
-  const money = isObject(state.money) ? state.money : null;
-  const providers =
-    money && Array.isArray(money.providers)
-      ? money.providers.filter((name) => typeof name === "string" && name !== "")
-      : [];
-  const provider = selectInput(
-    providers.map((name) => [name, name]),
-    providers[0],
-    () => {}
-  );
-  provider.setAttribute("aria-label", "Model provider");
-  selectWidth(provider);
-  const model = textInput({
-    class: "inp tall price-add-model",
-    placeholder: "claude-opus-5-5",
-    "aria-label": "Model id",
-  });
-  const grid = h("div", { class: "lr price-grid price-add-grid" }, [
-    h("span", { class: "mf", text: "add a model" }),
-  ]);
-  const labels = {
-    input: "input",
-    output: "output",
-    cacheWrite: "cache write",
-    cacheRead: "cache read",
-  };
-  const inputs = {};
-  for (const [property, table] of Object.entries(labels)) {
-    const input = h("input", {
-      type: "number",
-      class: "inp num price-field",
-      value: "0",
-      step: "any",
-      "aria-label": `${table} price for the new model`,
-    });
-    inputs[property] = input;
-    grid.appendChild(h("span", { class: "price-value" }, [input]));
-  }
-  const add = h("button", { type: "button", class: "hbtn xs", text: "Add" });
-  grid.appendChild(h("span", { class: "price-marks" }, [add]));
-  add.addEventListener("click", async () => {
-    const modelId = model.value.trim();
-    const price = { tiered: false };
-    for (const [property, input] of Object.entries(inputs)) {
-      price[property] = typedNumber(input.value);
-    }
-    const key = `${provider.value}/${modelId}`;
-    add.disabled = true;
-    try {
-      await state.context.invoke("set_price_override", { key, price });
-      fieldError(field, null);
-      model.value = "";
-      for (const input of Object.values(inputs)) input.value = "0";
-      await reloadMoney();
-    } catch (error) {
-      fieldError(field, errorMessage(error));
-    } finally {
-      add.disabled = false;
-    }
-  });
-  return h("div", { class: "price-add", dataset: { field } }, [
-    h("div", { class: "price-add-key" }, [
-      h("span", { class: "mf", text: "own price for" }),
-      provider,
-      h("span", { class: "mf", text: "/" }),
-      model,
-    ]),
-    grid,
-    h("div", { class: "row-error", hidden: true }),
-  ]);
 }
 
 // ---------------------------------------------------------------------------
@@ -2038,20 +1973,10 @@ function generalCard() {
     ]),
   ]);
   const body = card.querySelector(".settings-body");
-  const times = [];
 
-  // Money is the first section, as in the mock-up.
-  body.appendChild(section("Money"));
-  body.appendChild(currencyRow());
-  body.appendChild(lookUpRow());
-  body.appendChild(rateRow(times));
-  body.appendChild(ownRateRow());
-  body.appendChild(apiPricesRow(times));
-  if (state.moneyOpen) {
-    const list = h("div", { class: "price-list" });
-    body.appendChild(list);
-    drawPriceList(list);
-  }
+  // Money is the first section, as in the mock-up. Its rows are built (and
+  // their times filled) only when the money view changed (decision 25).
+  body.appendChild(moneyRows());
 
   body.appendChild(section("Look"));
   body.appendChild(setting("Theme", themeControl(savedValue("theme") || "system"), "", "theme"));
@@ -2145,7 +2070,6 @@ function generalCard() {
     )
   );
 
-  fillTimeNodes(times);
   return card;
 }
 
@@ -2537,7 +2461,7 @@ function renderCalls(container) {
 function providersCard() {
   return panel(
     "Providers",
-    "read-only cards for Codex and Ollama's cloud plan",
+    "read-only cards for Codex, Ollama's cloud plan and the API prices",
     [
       section("Codex"),
       setting(
@@ -2560,6 +2484,9 @@ function providersCard() {
         "ollamaCard"
       ),
       textField("ollamaUrl", "Ollama server"),
+      // The model list moved here from General (decision 7): read-only.
+      section("API prices"),
+      priceBlock(),
     ]
   );
 }

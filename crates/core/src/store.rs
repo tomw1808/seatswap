@@ -806,15 +806,6 @@ fn default_color_rule() -> ColorRule {
     ColorRule::None
 }
 
-/// A dollar rate entered by hand, together with the currency it is for
-/// (spec §1.4). A rate for another currency than the settings' is not used.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OwnRate {
-    pub currency: String,
-    pub value: f64,
-}
-
 /// What seatswap remembers about the `statusLine` it wrote in Claude Code's
 /// settings (spec §5.4).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -922,11 +913,6 @@ pub struct Settings {
     /// §1.4); `None` until it is set, and never assumed.
     #[serde(default)]
     pub currency: Option<String>,
-    /// A dollar rate entered by hand: units of its own currency per 1 USD,
-    /// above 0 (spec §1.4). It is used only while its currency equals
-    /// [`Settings::currency`]; `None` means the looked-up rate is used.
-    #[serde(default)]
-    pub usd_rate: Option<OwnRate>,
     /// When on, seatswap looks up API prices and the dollar rate (spec §1.4.1);
     /// default on.
     #[serde(default = "default_look_up_prices")]
@@ -979,7 +965,6 @@ impl Default for Settings {
             statusline_record_until: None,
             statusline_install: None,
             currency: None,
-            usd_rate: None,
             look_up_prices: default_look_up_prices(),
             codex_card: default_codex_card(),
             codex_home: None,
@@ -991,7 +976,7 @@ impl Default for Settings {
 
 impl Settings {
     /// Check the ranges the spec fixes: poll intervals >= 30 s, a currency of
-    /// three capital letters, a positive `usdRate`, and the status line's rules.
+    /// three capital letters, and the status line's rules.
     pub fn validate(&self) -> Result<(), StoreError> {
         if self.poll_active_secs < 30 {
             return Err(StoreError::InvalidSetting(format!(
@@ -1031,15 +1016,6 @@ impl Settings {
         }
         if let Some(currency) = &self.currency {
             validate_currency(currency)?;
-        }
-        if let Some(rate) = &self.usd_rate {
-            validate_currency(&rate.currency)?;
-            if !(rate.value.is_finite() && rate.value > 0.0) {
-                return Err(StoreError::InvalidSetting(format!(
-                    "usdRate must be above 0, got {}",
-                    rate.value
-                )));
-            }
         }
         validate_ollama_url(&self.ollama_url)?;
         validate_statusline(&self.statusline)?;
@@ -1137,7 +1113,7 @@ fn is_host_name(host: &str) -> bool {
 }
 
 /// The one currency rule (spec §1.4): three capital letters. Used by
-/// [`Settings::currency`] and by an [`OwnRate`]'s currency.
+/// [`Settings::currency`].
 fn validate_currency(currency: &str) -> Result<(), StoreError> {
     let letters = currency.len() == 3 && currency.bytes().all(|byte| byte.is_ascii_uppercase());
     if !letters {
@@ -2988,12 +2964,11 @@ mod tests {
         assert_eq!(file.settings.notify_waiting_hosts, WaitingHosts::ThisHost);
         assert_eq!(file.settings.history_dir, None);
         assert_eq!(file.settings.currency, None);
-        assert_eq!(file.settings.usd_rate, None);
         assert!(file.settings.look_up_prices);
     }
 
     #[test]
-    fn validate_rejects_a_bad_currency_or_rate() {
+    fn validate_rejects_a_bad_currency() {
         for currency in ["eur", "EURO", "EU1", "E U"] {
             let settings = Settings {
                 currency: Some(currency.to_string()),
@@ -3004,62 +2979,34 @@ mod tests {
                 Err(StoreError::InvalidSetting(_))
             ));
         }
-        for rate in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-            let settings = Settings {
-                usd_rate: Some(OwnRate {
-                    currency: "EUR".to_string(),
-                    value: rate,
-                }),
-                ..Settings::default()
-            };
-            assert!(matches!(
-                settings.validate(),
-                Err(StoreError::InvalidSetting(_))
-            ));
-        }
-        for currency in ["eur", "EURO", "EU1", "E U"] {
-            let settings = Settings {
-                usd_rate: Some(OwnRate {
-                    currency: currency.to_string(),
-                    value: 0.90481,
-                }),
-                ..Settings::default()
-            };
-            assert!(
-                matches!(settings.validate(), Err(StoreError::InvalidSetting(_))),
-                "a rate's currency follows the currency rule: {currency:?}"
-            );
-        }
         let good = Settings {
             currency: Some("EUR".to_string()),
-            usd_rate: Some(OwnRate {
-                currency: "EUR".to_string(),
-                value: 0.90481,
-            }),
             look_up_prices: false,
             ..Settings::default()
         };
         assert!(good.validate().is_ok());
     }
 
+    /// A file written by 1.1.0 has `usdRate`; it is no longer a setting, so it
+    /// must not stop the file from loading (Andreas: silently).
     #[test]
-    fn an_own_rate_is_stored_with_its_currency() {
-        let settings = Settings {
-            currency: Some("EUR".to_string()),
-            usd_rate: Some(OwnRate {
-                currency: "EUR".to_string(),
-                value: 0.95,
-            }),
-            ..Settings::default()
-        };
-        let json = serde_json::to_value(&settings).expect("settings JSON");
-        assert_eq!(
-            json["usdRate"],
-            json!({"currency": "EUR", "value": 0.95}),
-            "usdRate is the rate and the currency it was entered in"
+    fn an_old_settings_file_with_usd_rate_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(&tmp.path().join("app"));
+        fs::create_dir_all(store.app_paths().data_dir.clone()).unwrap();
+        fs::write(
+            store.app_paths().accounts_file(),
+            br#"{"version":1,"accounts":[],"settings":{"currency":"EUR","usdRate":{"currency":"EUR","value":0.95},"lookUpPrices":true}}"#,
+        )
+        .unwrap();
+        let file = store.load().unwrap();
+        assert_eq!(file.settings.currency.as_deref(), Some("EUR"));
+        assert!(file.settings.look_up_prices);
+        let json = serde_json::to_value(&file.settings).expect("settings JSON");
+        assert!(
+            json.get("usdRate").is_none(),
+            "the removed setting is not written back: {json}"
         );
-        let back: Settings = serde_json::from_value(json).expect("settings back");
-        assert_eq!(back.usd_rate, settings.usd_rate);
     }
 
     #[test]

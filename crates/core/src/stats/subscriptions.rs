@@ -1427,7 +1427,6 @@ mod tests {
     #[test]
     fn without_a_rate_times_paid_is_missing_with_its_reason() {
         let mut tiny = tiny();
-        tiny.settings.usd_rate = None;
         tiny.fx = crate::money::Fx::default();
 
         let page = subscriptions_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();

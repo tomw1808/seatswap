@@ -688,9 +688,11 @@ pub fn window_detail<Tz: TimeZone + Copy>(
         .find(|week| week.account == reference && same_reset(week.window.end, window.end))
         .ok_or_else(|| unknown_window(account_id, end, false))?;
     // One window's own use: the money below counts that percent, not the sum of
-    // the calendar week's windows. A window that ends below its start is named
-    // in the page's warnings by `account_weeks_valued`; it adds no use.
-    let used = window_used(&window).max(0.0);
+    // the calendar week's windows. A window that ends below its start has no use
+    // (`stats::window_used` says `None`): it adds nothing, and the valuer built
+    // above names it in the page's warnings (once: `account_weeks_valued` adds
+    // the same text only when it is not there yet).
+    let used = window_used(&window).unwrap_or(0.0);
     let expired = lost_percent(&window)?;
     let money = week.price.map(|price| money_at(price, used, expired));
 
@@ -1511,6 +1513,62 @@ mod tests {
         );
     }
 
+    /// The page names a window that ends below its start; a detail page of
+    /// another week must not carry a warning about a window it does not show
+    /// (the valuer reads the neighbouring weeks too).
+    #[test]
+    fn proof_a_window_detail_does_not_warn_about_another_weeks_window() {
+        let tiny = tiny();
+        let dir = tempdir().expect("a temp history");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let window = |start: &str, end: &str, final_percent: f64, lost, from| WindowRecord {
+            account: tiny.lb_ref(),
+            k: LimitKind::WeeklyAll,
+            m: None,
+            start: Some(utc(start)),
+            end: utc(end),
+            final_percent,
+            lost,
+            last_sample: utc(end) - Duration::minutes(2),
+            plan: Some("Max".to_string()),
+            uncertain: false,
+            reset: false,
+            from,
+        };
+        history
+            .append_many(&[
+                window(
+                    "2026-11-02T12:00:00Z",
+                    "2026-11-09T12:00:00Z",
+                    20.0,
+                    Some(80.0),
+                    Some(30.0),
+                ),
+                window(
+                    "2026-11-09T12:00:00Z",
+                    "2026-11-16T12:00:00Z",
+                    50.0,
+                    Some(50.0),
+                    None,
+                ),
+            ])
+            .expect("the two windows");
+        let warnings = std::cell::RefCell::new(Vec::new());
+        let ctx = Ctx {
+            history: &history,
+            warnings: &warnings,
+            ..tiny.ctx()
+        };
+
+        window_detail(&ctx, &tiny.lb().id, utc("2026-11-16T12:00:00Z")).unwrap();
+
+        assert!(
+            warnings.borrow().is_empty(),
+            "the detail of the week ending 16 Nov names the window of 9 Nov: {:?}",
+            warnings.borrow()
+        );
+    }
+
     /// Review of T-1: the detail of a window that starts after a reset shows
     /// one use: the percent and the money must agree.
     #[test]
@@ -1585,7 +1643,6 @@ mod tests {
     #[test]
     fn without_a_rate_the_summary_api_value_is_in_usd() {
         let mut tiny = tiny();
-        tiny.settings.usd_rate = None;
         tiny.fx = crate::money::Fx::default();
 
         let summary = week_summary(&tiny.ctx(), &all(), utc("2026-11-09T00:00:00Z")).unwrap();

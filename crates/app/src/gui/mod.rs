@@ -261,7 +261,6 @@ pub(crate) fn run(
             panel::pause_burn,
             panel::money_view,
             panel::price_list,
-            panel::set_price_override,
             panel::lookup_now,
             panel::icon_preview,
             panel::time_texts,

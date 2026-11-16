@@ -500,21 +500,14 @@ fn round_rate(value: f64) -> f64 {
 }
 
 /// Whether the rate of the range's days is not one value all along. It asks the
-/// same `usd_rate` source the valuer asks: a rate entered by hand is one value
-/// for every day; a looked-up rate changes when the range's days do not all fall
-/// on the same `fx` point. Days are `range.from` .. `range.to` (the range's end
-/// is exclusive), so a point on the end's midnight is not in the range.
+/// same `usd_rate` source the valuer asks: a looked-up rate changes when the
+/// range's days do not all fall on the same `fx` point. Days are `range.from` ..
+/// `range.to` (the range's end is exclusive), so a point on the end's midnight is
+/// not in the range.
 fn rate_varies(settings: &Settings, fx: &Fx, range: &Range) -> bool {
     let Some(currency) = settings.currency.as_deref() else {
         return false;
     };
-    if settings
-        .usd_rate
-        .as_ref()
-        .is_some_and(|own| own.currency == currency)
-    {
-        return false;
-    }
     if fx.currency != currency {
         return false;
     }
@@ -1349,7 +1342,6 @@ mod tests {
     #[test]
     fn the_usd_rate_is_the_pages_rate_with_its_date() {
         let mut tiny = tiny();
-        tiny.settings.usd_rate = None;
         let date = NaiveDate::from_ymd_opt(2026, 11, 13).expect("the rate's date");
         tiny.fx.take(date, 0.9048);
 
@@ -1360,7 +1352,8 @@ mod tests {
                 value: 0.9048,
                 date: Some(date),
                 currency: "EUR".to_string(),
-                varies: false,
+                // The fixture's 1:1 point of 1 Jan is another rate in this range.
+                varies: true,
             })
         );
         // The page reads `usdRate.value`, `usdRate.date`, `usdRate.currency` and
@@ -1372,7 +1365,8 @@ mod tests {
                 "value": 0.9048,
                 "date": "2026-11-13",
                 "currency": "EUR",
-                "varies": false,
+                // The fixture's 1:1 point of 1 Jan is another rate in this range.
+                "varies": true,
             })
         );
     }
@@ -1961,7 +1955,6 @@ mod tests {
     #[test]
     fn the_usd_rate_carries_its_currency() {
         let mut tiny = tiny();
-        tiny.settings.usd_rate = None;
         tiny.fx.take(
             NaiveDate::from_ymd_opt(2026, 11, 13).expect("the rate's date"),
             0.9048,
@@ -1980,7 +1973,6 @@ mod tests {
     #[test]
     fn the_usd_rate_value_is_rounded_to_four_decimals() {
         let mut tiny = tiny();
-        tiny.settings.usd_rate = None;
         tiny.fx.take(
             NaiveDate::from_ymd_opt(2026, 11, 13).expect("the rate's date"),
             0.90486,
@@ -1999,7 +1991,6 @@ mod tests {
     #[test]
     fn the_rate_varies_across_a_rate_change() {
         let mut tiny = tiny();
-        tiny.settings.usd_rate = None;
         tiny.fx.take(
             NaiveDate::from_ymd_opt(2026, 11, 5).expect("the first rate's date"),
             0.9000,
@@ -2022,7 +2013,6 @@ mod tests {
     #[test]
     fn the_rate_does_not_vary_inside_one_rate() {
         let mut tiny = tiny();
-        tiny.settings.usd_rate = None;
         tiny.fx.take(
             NaiveDate::from_ymd_opt(2026, 11, 5).expect("the first rate's date"),
             0.9000,

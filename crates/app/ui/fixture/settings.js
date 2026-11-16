@@ -29,7 +29,9 @@ export function fixtureExpand(path) {
 }
 
 // The money view with the fixture's current settings, as the Rust thread would
-// compute it from the stored files.
+// compute it from the stored files. `rateFetchedAt` stays on the same minute
+// for the whole day, so a snapshot tick never changes the view's JSON (the
+// page compares that JSON to keep the money rows still, decision 25).
 export function fixtureMoneyView(fixture) {
   const view = Object.assign({}, clone(fixture.money));
   const currency =
@@ -37,18 +39,30 @@ export function fixtureMoneyView(fixture) {
   view.currency = currency;
   view.lookUp = Boolean(fixture.settings.lookUpPrices);
   view.modelsWithPrice = Array.isArray(fixture.priceList) ? fixture.priceList.length : 0;
-  const own = isObject(fixture.settings.usdRate) ? fixture.settings.usdRate : null;
+  view.rateSource = "European Central Bank via Frankfurter";
+  view.pricesSource = "models.dev";
+  view.rateFetchedAt = null;
   if (!currency) {
     view.rate = null;
   } else if (currency === "USD") {
-    view.rate = { value: 1, date: null, own: false };
-  } else if (own && own.currency === currency) {
-    view.rate = { value: own.value, date: null, own: true };
-  } else if (currency !== "EUR") {
-    // The fixture's stored looked-up rate is in EUR.
+    view.rate = { value: 1, date: null };
+  } else if (!view.lookUp || currency !== "EUR") {
+    // The fixture's stored looked-up point is in EUR; with the look-ups off no
+    // rate is applied and the API value is in US dollars (decision 3).
     view.rate = null;
+  } else {
+    view.rate = { value: 0.9048, date: "2026-11-13" };
+    view.rateFetchedAt = fixtureRateFetchedAt();
   }
   return view;
+}
+
+// Today at 10:10 in this computer's local time: the fixture's rate was fetched
+// that morning, as the page's line reads ("fetched today 10:10").
+function fixtureRateFetchedAt() {
+  const at = new Date();
+  at.setHours(10, 10, 0, 0);
+  return at.toISOString();
 }
 
 // ---------------------------------------------------------------------------
@@ -284,18 +298,6 @@ export function validateFixtureSettings(settings) {
     throw new Error(
       `currency must be three capital letters, got ${JSON.stringify(merged.currency)}`
     );
-  }
-  if (merged.usdRate !== null && merged.usdRate !== undefined) {
-    const rate = merged.usdRate;
-    if (
-      !isObject(rate) ||
-      !/^[A-Z]{3}$/.test(String(rate.currency)) ||
-      !(Number.isFinite(rate.value) && rate.value > 0)
-    ) {
-      throw new Error(
-        `usdRate must be {currency: three capital letters, value: above 0}, got ${JSON.stringify(rate)}`
-      );
-    }
   }
   if (typeof merged.lookUpPrices !== "boolean") {
     throw new Error(`lookUpPrices must be true or false, got ${merged.lookUpPrices}`);

@@ -1288,7 +1288,7 @@ mod tests {
     use crate::api::LimitKind;
     use crate::history::{AccountRef, Event, EventKind, WindowRecord};
     use crate::money::{Fx, ModelPrice, Prices};
-    use crate::store::{Account, OwnRate};
+    use crate::store::{Account, Settings};
     use crate::transcripts::SessionSeen;
 
     const SESSION: &str = "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34";
@@ -1341,10 +1341,6 @@ mod tests {
     fn settings_eur() -> Settings {
         Settings {
             currency: Some("EUR".to_string()),
-            usd_rate: Some(OwnRate {
-                currency: "EUR".to_string(),
-                value: 1.0,
-            }),
             ..Settings::default()
         }
     }
@@ -1358,18 +1354,22 @@ mod tests {
 
     fn prices() -> Prices {
         let mut prices = Prices::default();
-        for model in ["claude-opus-5-5", "claude-fable-5-2"] {
-            prices.overrides.insert(
-                format!("anthropic/{model}"),
-                ModelPrice {
-                    input: 4.0,
-                    output: 20.0,
-                    cache_write: 5.0,
-                    cache_read: 0.2,
-                    tiered: false,
-                },
-            );
-        }
+        let list = ["claude-opus-5-5", "claude-fable-5-2"]
+            .into_iter()
+            .map(|model| {
+                (
+                    format!("anthropic/{model}"),
+                    ModelPrice {
+                        input: 4.0,
+                        output: 20.0,
+                        cache_write: 5.0,
+                        cache_read: 0.2,
+                        tiered: false,
+                    },
+                )
+            })
+            .collect();
+        prices.take(list, utc("2026-01-01T00:00:00Z"));
         prices
     }
 
@@ -1502,6 +1502,16 @@ mod tests {
         valuer_with(history, settings, accounts, &prices())
     }
 
+    /// A looked-up EUR rate of 1 so the fixture's EUR values stay EUR.
+    fn fx_eur() -> Fx {
+        let mut fx = Fx {
+            currency: "EUR".to_string(),
+            ..Fx::default()
+        };
+        fx.take(utc("2026-01-01T00:00:00Z").date_naive(), 1.0);
+        fx
+    }
+
     fn valuer_with(
         history: &HistoryDir,
         settings: &Settings,
@@ -1517,7 +1527,7 @@ mod tests {
             history,
             &range,
             prices,
-            &Fx::default(),
+            &fx_eur(),
             settings,
             accounts,
             &std::cell::RefCell::new(Vec::new()),
@@ -1629,9 +1639,11 @@ mod tests {
         // Two prices, so a sum of both models cannot be mistaken for one model's.
         let mut prices = prices();
         prices
-            .overrides
+            .models
             .get_mut("anthropic/claude-fable-5-2")
+            .and_then(|points| points.last_mut())
             .expect("the fable price")
+            .price
             .output = 40.0;
         let valuer = valuer_with(&history, &settings, &[], &prices);
         let minute = utc("2026-11-14T18:30:00Z");

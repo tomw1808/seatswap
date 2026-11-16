@@ -9,7 +9,7 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-use chrono::{DateTime, Duration, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, Timelike, Utc, Weekday};
 use serde::{Deserialize, Serialize};
 
 use crate::api::{Api, ApiError, Fetched};
@@ -21,6 +21,7 @@ use crate::history::{
 };
 use crate::locks::{self, LockError};
 use crate::paths::AppPaths;
+use crate::stats::{warn_window_below_start, window_midpoint, window_used};
 use crate::store::{Account, Settings};
 use crate::switcher::APP_LOCK_TIMEOUT;
 
@@ -120,18 +121,17 @@ pub struct PriceChange {
     pub removed: Vec<String>,
 }
 
-/// The price of one key in effect now: its own price, else its last looked-up
-/// point (spec §1.4). `since` is when that point started; an own price has none.
+/// The price of one key in effect now: its last looked-up point (spec §1.4).
+/// `since` is when that point started.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CurrentPrice {
     pub key: String,
     pub price: ModelPrice,
-    pub own: bool,
     pub since: Option<DateTime<Utc>>,
 }
 
-/// `prices.json`: the looked-up prices with their dates, the last look-up's
-/// state, and the prices entered by hand.
+/// `prices.json`: the looked-up prices with their dates and the last look-up's
+/// state.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Prices {
@@ -145,9 +145,6 @@ pub struct Prices {
     /// Key [`price_key`], points in time order.
     #[serde(default)]
     pub models: BTreeMap<String, Vec<PricePoint>>,
-    /// Key [`price_key`], a price entered by hand that wins over the points.
-    #[serde(default)]
-    pub overrides: BTreeMap<String, ModelPrice>,
     /// The keys whose last looked-up list did not have them. A key is reported
     /// as removed once, not on every later list that still lacks it; an older
     /// `prices.json` loads with this empty.
@@ -163,7 +160,6 @@ impl Default for Prices {
             etag: None,
             last_change: None,
             models: BTreeMap::new(),
-            overrides: BTreeMap::new(),
             missing: BTreeSet::new(),
         }
     }
@@ -198,12 +194,9 @@ impl Prices {
         save_json(app, &path, self.version, self)
     }
 
-    /// The price of `key` at `at`: its override, else the last point at or
-    /// before `at`, else the first point. `None` when there is no price at all.
+    /// The price of `key` at `at`: the last point at or before `at`, else the
+    /// first point. `None` when there is no price at all.
     pub fn at(&self, key: &str, at: DateTime<Utc>) -> Option<&ModelPrice> {
-        if let Some(price) = self.overrides.get(key) {
-            return Some(price);
-        }
         let points = self.models.get(key)?;
         let after = points.partition_point(|point| point.from <= at);
         if after == 0 {
@@ -213,31 +206,18 @@ impl Prices {
         }
     }
 
-    /// The current price of every key: its own price when it has one, else its
-    /// last looked-up point, sorted by key. The one place the CLI table, the
-    /// price list and the count get "the price of every model" from.
+    /// The current price of every key: its last looked-up point, sorted by key.
+    /// The one place the CLI table, the price list and the count get "the price
+    /// of every model" from.
     pub fn current(&self) -> Vec<CurrentPrice> {
-        let mut keys: BTreeSet<&String> = self.models.keys().collect();
-        keys.extend(self.overrides.keys());
-        keys.into_iter()
-            .filter_map(|key| {
-                if let Some(price) = self.overrides.get(key) {
-                    return Some(CurrentPrice {
-                        key: key.clone(),
-                        price: price.clone(),
-                        own: true,
-                        since: None,
-                    });
-                }
-                self.models
-                    .get(key)
-                    .and_then(|points| points.last())
-                    .map(|point| CurrentPrice {
-                        key: key.clone(),
-                        price: point.price.clone(),
-                        own: false,
-                        since: Some(point.from),
-                    })
+        self.models
+            .iter()
+            .filter_map(|(key, points)| {
+                points.last().map(|point| CurrentPrice {
+                    key: key.clone(),
+                    price: point.price.clone(),
+                    since: Some(point.from),
+                })
             })
             .collect()
     }
@@ -321,6 +301,10 @@ fn insert_point(points: &mut Vec<PricePoint>, point: PricePoint) {
 pub struct FxPoint {
     pub date: NaiveDate,
     pub rate: f64,
+    /// When the point was fetched. An old `fx.json` has no such field, so its
+    /// points keep `None` and the page says "fetched: not recorded".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetched_at: Option<DateTime<Utc>>,
 }
 
 /// `fx.json`: one currency and its rates with their dates.
@@ -375,16 +359,39 @@ impl Fx {
     }
 
     /// Replace the point of `date`, or add one, keeping the points in date order.
+    /// The point keeps no fetch time; [`Fx::take_fetched`] records one.
     pub fn take(&mut self, date: NaiveDate, rate: f64) {
+        self.take_fetched(date, rate, None);
+    }
+
+    /// [`Fx::take`] with the time the rate was fetched; a looked-up point has
+    /// one, so the page can say when it arrived.
+    pub fn take_fetched(&mut self, date: NaiveDate, rate: f64, fetched_at: Option<DateTime<Utc>>) {
         match self.points.binary_search_by_key(&date, |point| point.date) {
-            Ok(index) => self.points[index].rate = rate,
-            Err(index) => self.points.insert(index, FxPoint { date, rate }),
+            Ok(index) => {
+                self.points[index].rate = rate;
+                self.points[index].fetched_at = fetched_at;
+            }
+            Err(index) => self.points.insert(
+                index,
+                FxPoint {
+                    date,
+                    rate,
+                    fetched_at,
+                },
+            ),
         }
     }
 
     /// The rate at `date`: the point at or before it, else the first point.
     pub fn at(&self, date: NaiveDate) -> Option<f64> {
         self.point_at(date).map(|point| point.rate)
+    }
+
+    /// When the point in effect at `date` was fetched; `None` for a point
+    /// written by an older build (the documented "fetched: not recorded").
+    pub fn fetched_at(&self, date: NaiveDate) -> Option<DateTime<Utc>> {
+        self.point_at(date).and_then(|point| point.fetched_at)
     }
 
     fn point_at(&self, date: NaiveDate) -> Option<&FxPoint> {
@@ -507,26 +514,13 @@ pub fn price_key(provider: &str, model_id: &str) -> String {
     format!("{provider}/{model_id}")
 }
 
-/// Split an own price's key into its provider and model id. A key is
-/// `"<provider>/<model id>"`, the provider one of [`PRICE_PROVIDERS`] and the
-/// model id not empty; anything else is an error with the text a page shows.
-pub fn parse_price_key(key: &str) -> Result<(&str, &str), String> {
-    let (provider, model_id) = key.split_once('/').ok_or_else(|| {
-        "a model key is provider/model, e.g. anthropic/claude-opus-5-5".to_string()
-    })?;
-    if !PRICE_PROVIDERS.contains(&provider) {
-        return Err(format!(
-            "a model key is provider/model with a provider from {}, e.g. anthropic/claude-opus-5-5",
-            PRICE_PROVIDERS.join(", ")
-        ));
-    }
-    if model_id.is_empty() {
-        return Err(
-            "a model key is provider/model with a model id after the provider, e.g. anthropic/claude-opus-5-5"
-                .to_string(),
-        );
-    }
-    Ok((provider, model_id))
+/// The value of a token or session cost: the provider's own number when it
+/// gives one, else models.dev's price. `None` when neither has one: there is
+/// never a guessed or zero API value (spec §1.4).
+///
+/// No caller yet: S-3 uses it for Claude Code's session cost (item 6).
+pub fn api_value(provider_usd: Option<f64>, models_dev_usd: Option<f64>) -> Option<f64> {
+    provider_usd.or(models_dev_usd)
 }
 
 /// The dollar rate used at a date (spec §1.4).
@@ -535,46 +529,96 @@ pub fn parse_price_key(key: &str) -> Result<(&str, &str), String> {
 pub struct Rate {
     /// Units of the settings' currency per 1 USD.
     pub value: f64,
-    /// The day the looked-up rate is from; `None` for a rate entered by hand
-    /// and for USD.
+    /// The day the looked-up rate is from; `None` for USD.
     pub date: Option<NaiveDate>,
-    /// Whether the rate comes from the settings (`usdRate`), not a look-up.
-    pub own: bool,
 }
 
-/// The rate to use at `date`: `settings.usdRate` when it was entered for the
-/// settings' currency (own), else a point of `fx` looked up for that same
+/// The rate to use at `date`: a point of `fx` looked up for the settings'
 /// currency. A rate of another currency is never used. Currency "USD" is always
-/// 1.0; without a currency there is no rate at all.
+/// 1.0; without a currency, or with `lookUpPrices` off, there is no rate (the
+/// API values are then in USD).
 pub fn usd_rate(settings: &Settings, fx: &Fx, date: NaiveDate) -> Option<Rate> {
     let currency = settings.currency.as_deref()?;
     if currency == "USD" {
         return Some(Rate {
             value: 1.0,
             date: None,
-            own: false,
         });
     }
-    if let Some(own) = settings
-        .usd_rate
-        .as_ref()
-        .filter(|own| own.currency == currency)
-    {
-        return Some(Rate {
-            value: own.value,
-            date: None,
-            own: true,
-        });
-    }
-    if fx.currency != currency {
+    if !settings.look_up_prices || fx.currency != currency {
         return None;
     }
     let point = fx.point_at(date)?;
     Some(Rate {
         value: point.rate,
         date: Some(point.date),
-        own: false,
     })
+}
+
+/// The European Central Bank's day and the hour in Frankfurt, from UTC with the
+/// EU's summer-time rule: UTC+2 from the last Sunday of March 01:00 UTC to the
+/// last Sunday of October 01:00 UTC, UTC+1 otherwise. No time-zone crate: the
+/// rule is two lines of arithmetic. `None` when chrono cannot build the date
+/// [`rate_due`] needs: that is an error there, never a silent hour.
+fn frankfurt_time(utc: DateTime<Utc>) -> Option<NaiveDateTime> {
+    let naive = utc.naive_utc();
+    let start = last_sunday(naive.year(), 3)?.and_hms_opt(1, 0, 0)?;
+    let end = last_sunday(naive.year(), 10)?.and_hms_opt(1, 0, 0)?;
+    let hours = if start <= naive && naive < end { 2 } else { 1 };
+    naive.checked_add_signed(Duration::hours(hours))
+}
+
+/// The last Sunday of `month` in `year`; March and October always have 31 days.
+/// `None` only when chrono has no such date.
+fn last_sunday(year: i32, month: u32) -> Option<NaiveDate> {
+    let last = NaiveDate::from_ymd_opt(year, month, 31)?;
+    last.checked_sub_days(chrono::Days::new(u64::from(
+        last.weekday().num_days_from_sunday(),
+    )))
+}
+
+/// The text [`rate_due`] reports for a time chrono cannot place in Frankfurt.
+fn frankfurt_error(at: DateTime<Utc>) -> String {
+    format!(
+        "the Frankfurt time of {at} cannot be built: it lies outside the dates this build knows"
+    )
+}
+
+/// Whether the dollar rate is due at `now` (spec §1.4, lead decision 4): once
+/// per Frankfurt day while the stored point is older than today's Frankfurt
+/// date, and on Mon–Fri from 16:00 to 18:00 Frankfurt time every 30 minutes
+/// after the last ask until an answer carries today's date.
+///
+/// `last_ask` is the last ask Frankfurter answered, for the stored currency: a
+/// failed ask leaves it as it was, so the next check asks again. A time chrono
+/// cannot place in Frankfurt is an error with a clear text, never a guessed
+/// hour.
+pub fn rate_due(
+    now: DateTime<Utc>,
+    stored: Option<NaiveDate>,
+    last_ask: Option<DateTime<Utc>>,
+) -> Result<bool, String> {
+    let local = frankfurt_time(now).ok_or_else(|| frankfurt_error(now))?;
+    let today = local.date();
+    if stored.is_some_and(|date| date >= today) {
+        return Ok(false);
+    }
+    let last_answered = match last_ask {
+        Some(at) => Some((at, frankfurt_time(at).ok_or_else(|| frankfurt_error(at))?)),
+        None => None,
+    };
+    let Some((last, answered_at)) = last_answered else {
+        return Ok(true);
+    };
+    if answered_at.date() != today {
+        return Ok(true);
+    }
+    let workday = !matches!(today.weekday(), Weekday::Sat | Weekday::Sun);
+    let minute = local.hour() * 60 + local.minute();
+    if !(workday && (16 * 60..18 * 60).contains(&minute)) {
+        return Ok(false);
+    }
+    Ok(now.signed_duration_since(last) >= Duration::minutes(30))
 }
 
 /// What one look-up did.
@@ -589,9 +633,9 @@ pub enum Looked {
 
 /// One look-up of models.dev's list (spec §1.4.1): load `prices.json` for its
 /// ETag, ask models.dev, then take the app lock and load `prices.json` again so
-/// an own price written while the request ran is kept. Take the new list and
-/// store the new ETag and `checkedAt`. "Not modified" only moves `checkedAt`.
-/// On any error nothing is saved.
+/// a concurrent write is kept. Take the new list and store the new ETag and
+/// `checkedAt`. "Not modified" only moves `checkedAt`. On any error nothing is
+/// saved.
 pub fn look_up_prices(api: &Api, app: &AppPaths, now: DateTime<Utc>) -> Result<Looked, MoneyError> {
     let etag = Prices::load(app)?.etag;
     let fetched = api.models_dev(etag.as_deref())?;
@@ -621,10 +665,13 @@ pub fn look_up_prices(api: &Api, app: &AppPaths, now: DateTime<Utc>) -> Result<L
 /// and sends no request. A rate of an earlier currency in `fx.json` is replaced
 /// by a new [`Fx`] for `currency`; a rate that is not finite or not above 0 is an
 /// error, and nothing is saved. The file is read and written under the app lock.
+/// The point is stamped with `now`, the round's clock, as [`look_up_prices`]
+/// stamps its own.
 pub fn look_up_rate(
     api: &Api,
     app: &AppPaths,
     currency: &str,
+    now: DateTime<Utc>,
 ) -> Result<Option<FxPoint>, MoneyError> {
     if currency == "USD" {
         return Ok(None);
@@ -645,9 +692,14 @@ pub fn look_up_rate(
             points: Vec::new(),
         };
     }
-    fx.take(date, rate);
+    let fetched_at = Some(now);
+    fx.take_fetched(date, rate, fetched_at);
     fx.save(app)?;
-    Ok(Some(FxPoint { date, rate }))
+    Ok(Some(FxPoint {
+        date,
+        rate,
+        fetched_at,
+    }))
 }
 
 /// What one token record costs at API prices, in USD. `None` when the record's
@@ -845,6 +897,18 @@ impl Valuer {
             settings: settings.clone(),
         };
         for hosted in &windows.records {
+            // Only a window of the page's own range is named (its midpoint in
+            // `range`, as the weeks list places it), not one of the neighbouring
+            // weeks the widened read takes in for valuing.
+            if hosted.record.k == crate::api::LimitKind::WeeklyAll
+                && window_used(&hosted.record).is_none()
+                && window_midpoint(&hosted.record)
+                    .is_some_and(|midpoint| range.from <= midpoint && midpoint < range.to)
+            {
+                // The window adds nothing to the week's use; the weeks list
+                // names it with the same text, so the page shows it once.
+                warn_window_below_start(warnings, &hosted.record);
+            }
             valuer.finished_window(&hosted.record);
         }
         for hosted in &samples.records {
@@ -906,7 +970,10 @@ impl Valuer {
         let start = record.weekly_start();
         let index = self.window_index(&record.account, start, end);
         let window = &mut self.windows[index];
-        window.used = Some(record.final_percent);
+        // A window that ends below its start has no use (`stats::window_used`
+        // says `None`): it adds nothing to the week's use, and `Valuer::build`
+        // has already named it in the warnings.
+        window.used = Some(window_used(record).unwrap_or(0.0));
         window.finished = true;
         window.last_sample = Some(record.last_sample);
     }
@@ -980,6 +1047,11 @@ impl Valuer {
                     model: record.model.clone(),
                 }),
             ),
+            // With the look-ups off, money is shown in US dollars: no stored
+            // rate is applied, whatever currency the settings keep.
+            (Some(usd), _) if !self.settings.look_up_prices => {
+                (Some(usd), Some("USD".to_string()), None)
+            }
             (Some(_), None) if self.settings.currency.is_none() => {
                 (None, None, Some(Missing::NoCurrency))
             }
@@ -1117,7 +1189,6 @@ mod tests {
     use crate::history::{Source, WindowRecord};
     use crate::project::ProjectKey;
     use crate::stats::tests::{append_codex_records, tiny};
-    use crate::store::OwnRate;
 
     const AC_ACC: &str = "6f1c2a9e-1d4b-4c7f-9a3e-8b5d2e6f1c04";
     const AC_ORG: &str = "a92d7b31-5c8e-4f2a-9d6b-1e3c5a7f9b20";
@@ -1167,16 +1238,23 @@ mod tests {
     fn settings_eur() -> Settings {
         Settings {
             currency: Some("EUR".to_string()),
-            usd_rate: Some(OwnRate {
-                currency: "EUR".to_string(),
-                value: 1.0,
-            }),
             ..Settings::default()
         }
     }
 
     fn empty_fx() -> Fx {
         Fx::default()
+    }
+
+    /// A looked-up EUR rate of 1 so API values and subscription money agree.
+    fn fx_eur() -> Fx {
+        let mut fx = Fx {
+            version: 1,
+            currency: "EUR".to_string(),
+            points: Vec::new(),
+        };
+        fx.take(date("2026-01-01"), 1.0);
+        fx
     }
 
     fn account_with_price(price: Option<f64>) -> Account {
@@ -1426,20 +1504,9 @@ mod tests {
     }
 
     #[test]
-    fn current_lists_own_prices_first_and_looked_up_ones() {
+    fn current_lists_every_looked_up_price() {
         let at = utc("2026-11-02T00:00:00Z");
-        let mut prices = priced_prices(at);
-        let own = "anthropic/claude-haiku-5-5";
-        prices.overrides.insert(
-            own.to_string(),
-            ModelPrice {
-                input: 7.0,
-                output: 8.0,
-                cache_write: 9.0,
-                cache_read: 10.0,
-                tiered: false,
-            },
-        );
+        let prices = priced_prices(at);
 
         let current = prices.current();
         let keys: Vec<&str> = current.iter().map(|row| row.key.as_str()).collect();
@@ -1452,34 +1519,9 @@ mod tests {
             ],
             "sorted by key"
         );
-        let own_row = &current[0];
-        assert!(own_row.own);
-        assert_eq!(own_row.price.input, 7.0);
-        assert_eq!(own_row.since, None, "an own price has no looked-up time");
-        let looked_up = &current[1];
-        assert!(!looked_up.own);
-        assert_eq!(looked_up.price.input, 4.0);
-        assert_eq!(looked_up.since, Some(at));
-    }
-
-    #[test]
-    fn an_override_wins() {
-        let t1 = utc("2026-11-01T00:00:00Z");
-        let t3 = utc("2026-11-03T00:00:00Z");
-        let mut prices = priced_prices(t1);
-        let key = "anthropic/claude-opus-5-5";
-        prices.overrides.insert(
-            key.to_string(),
-            ModelPrice {
-                input: 1.0,
-                output: 99.0,
-                cache_write: 0.0,
-                cache_read: 0.0,
-                tiered: false,
-            },
-        );
-        assert_eq!(prices.at(key, t3).expect("opus").output, 99.0);
-        assert_eq!(prices.at(key, t1).expect("opus").output, 99.0);
+        let opus = &current[1];
+        assert_eq!(opus.price.input, 4.0);
+        assert_eq!(opus.since, Some(at));
     }
 
     #[test]
@@ -1531,25 +1573,12 @@ mod tests {
     }
 
     #[test]
-    fn the_rate_is_own_then_looked_up_then_missing() {
+    fn the_rate_is_looked_up_then_missing() {
         let mut settings = Settings {
             currency: Some("EUR".to_string()),
-            usd_rate: Some(OwnRate {
-                currency: "EUR".to_string(),
-                value: 0.95,
-            }),
+            look_up_prices: true,
             ..Settings::default()
         };
-        assert_eq!(
-            usd_rate(&settings, &empty_fx(), date("2026-11-14")),
-            Some(Rate {
-                value: 0.95,
-                date: None,
-                own: true,
-            })
-        );
-
-        settings.usd_rate = None;
         let mut fx = Fx {
             version: 1,
             currency: "EUR".to_string(),
@@ -1561,7 +1590,6 @@ mod tests {
             Some(Rate {
                 value: 0.90481,
                 date: Some(date("2026-11-13")),
-                own: false,
             })
         );
 
@@ -1571,14 +1599,178 @@ mod tests {
             "no rate is no rate"
         );
 
+        settings.look_up_prices = false;
+        assert_eq!(
+            usd_rate(&settings, &fx, date("2026-11-14")),
+            None,
+            "with the look-ups off, no stored rate is applied: the API value is in USD"
+        );
+        settings.look_up_prices = true;
+
         settings.currency = Some("USD".to_string());
         assert_eq!(
             usd_rate(&settings, &empty_fx(), date("2026-11-14")),
             Some(Rate {
                 value: 1.0,
                 date: None,
-                own: false,
             })
+        );
+    }
+
+    #[test]
+    fn provider_cost_beats_models_dev() {
+        assert_eq!(api_value(Some(0.42), Some(0.9)), Some(0.42));
+        assert_eq!(
+            api_value(Some(0.0), Some(0.9)),
+            Some(0.0),
+            "a provider's own 0 is a number it gave, not a missing price"
+        );
+    }
+
+    #[test]
+    fn no_price_is_no_value() {
+        assert_eq!(api_value(None, Some(0.9)), Some(0.9));
+        assert_eq!(api_value(None, None), None, "never a guessed 0");
+    }
+
+    /// [`rate_due`] with a time it can place; a test of the error branch calls
+    /// `rate_due` itself.
+    fn due(now: DateTime<Utc>, stored: Option<NaiveDate>, last_ask: Option<DateTime<Utc>>) -> bool {
+        rate_due(now, stored, last_ask).expect("a Frankfurt time")
+    }
+
+    #[test]
+    fn rate_is_asked_again_after_four_until_todays_date_arrives() {
+        // Fri 13 Nov 2026, 15:00 UTC = 16:00 in Frankfurt.
+        let four = utc("2026-11-13T15:00:00Z");
+        let stored = Some(date("2026-11-12"));
+        assert!(due(four, stored, None), "the first round asks");
+        assert!(
+            due(four + Duration::minutes(30), stored, Some(four)),
+            "half an hour after the last ask it asks again"
+        );
+        assert!(
+            !due(four + Duration::minutes(29), stored, Some(four)),
+            "not after 29 minutes"
+        );
+        assert!(
+            !due(
+                four,
+                Some(date("2026-11-13")),
+                Some(four - Duration::hours(2))
+            ),
+            "today's date arrived: no more asks that day"
+        );
+        assert!(
+            due(utc("2026-11-16T08:00:00Z"), stored, Some(four)),
+            "the next Frankfurt day asks once, outside the afternoon too"
+        );
+    }
+
+    /// The afternoon retry runs every 30 minutes after the last answered ask,
+    /// not once an hour: a Monday with a stored Friday point is asked at 16:30
+    /// and at 17:00 and not at 18:00.
+    #[test]
+    fn the_afternoon_retry_asks_at_half_past_and_at_five() {
+        // Mon 16 Nov 2026; 15:00, 15:30, 16:00 and 17:00 UTC are 16:00, 16:30,
+        // 17:00 and 18:00 in Frankfurt (winter time).
+        let stored = Some(date("2026-11-13"));
+        let answered_at_four = utc("2026-11-16T15:00:00Z");
+        assert!(
+            !due(answered_at_four, stored, Some(answered_at_four)),
+            "16:00 has just been answered with Friday's date: not due again at once"
+        );
+        assert!(
+            due(utc("2026-11-16T15:30:00Z"), stored, Some(answered_at_four)),
+            "16:30 is due half an hour after the 16:00 ask"
+        );
+        assert!(
+            due(
+                utc("2026-11-16T16:00:00Z"),
+                stored,
+                Some(utc("2026-11-16T15:30:00Z"))
+            ),
+            "17:00 is due half an hour after the 16:30 ask"
+        );
+        assert!(
+            !due(
+                utc("2026-11-16T17:00:00Z"),
+                stored,
+                Some(utc("2026-11-16T16:00:00Z"))
+            ),
+            "18:00 is past the retry's window"
+        );
+    }
+
+    #[test]
+    fn rate_stops_at_six() {
+        // 18:00 in Frankfurt is 17:00 UTC in winter.
+        let six = utc("2026-11-13T17:00:00Z");
+        assert!(
+            !due(
+                six,
+                Some(date("2026-11-12")),
+                Some(six - Duration::minutes(31))
+            ),
+            "the 16:00–18:00 window has ended"
+        );
+        assert!(
+            due(
+                six - Duration::minutes(1),
+                Some(date("2026-11-12")),
+                Some(six - Duration::minutes(31))
+            ),
+            "17:59 is still inside"
+        );
+    }
+
+    #[test]
+    fn no_second_ask_on_a_weekend() {
+        // Sat 14 Nov 2026, 16:30 in Frankfurt (15:30 UTC).
+        let afternoon = utc("2026-11-14T15:30:00Z");
+        assert!(
+            !due(
+                afternoon,
+                Some(date("2026-11-13")),
+                Some(afternoon - Duration::hours(1)),
+            ),
+            "the afternoon retry is for working days only"
+        );
+        assert!(
+            due(
+                afternoon,
+                Some(date("2026-11-13")),
+                Some(utc("2026-11-13T15:30:00Z"))
+            ),
+            "the weekend still asks once per Frankfurt day"
+        );
+    }
+
+    #[test]
+    fn frankfurt_time_follows_summer_time() {
+        let at = |text: &str| {
+            frankfurt_time(utc(text))
+                .expect("a Frankfurt time")
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        };
+        assert_eq!(at("2026-03-29T00:59:00Z"), "2026-03-29 01:59");
+        assert_eq!(at("2026-03-29T01:00:00Z"), "2026-03-29 03:00");
+        assert_eq!(at("2026-03-28T12:00:00Z"), "2026-03-28 13:00");
+        assert_eq!(at("2026-10-25T00:59:00Z"), "2026-10-25 02:59");
+        assert_eq!(at("2026-10-25T01:00:00Z"), "2026-10-25 02:00");
+        assert_eq!(at("2026-10-26T12:00:00Z"), "2026-10-26 13:00");
+    }
+
+    /// The last instant chrono knows lies past Frankfurt's last buildable hour:
+    /// `rate_due` says so with a text instead of guessing the hour.
+    #[test]
+    fn a_time_chrono_cannot_place_in_frankfurt_is_an_error() {
+        let error = rate_due(DateTime::<Utc>::MAX_UTC, None, None)
+            .expect_err("a time past the range this build knows");
+        assert!(
+            error.contains("Frankfurt") && error.contains("cannot be built"),
+            "the error says what could not be built: {error}"
         );
     }
 
@@ -1603,26 +1795,32 @@ mod tests {
             .append(&live(utc("2026-11-06T00:00:00Z"), Some(ac())))
             .expect("a live event");
         let mut prices = Prices::default();
-        prices.overrides.insert(
-            "anthropic/claude-opus-5-5".to_string(),
-            ModelPrice {
-                input: 30.0,
-                output: 0.0,
-                cache_write: 0.0,
-                cache_read: 0.0,
-                tiered: false,
-            },
-        );
-        prices.overrides.insert(
-            "anthropic/claude-haiku-5-5".to_string(),
-            ModelPrice {
-                input: 10.0,
-                output: 0.0,
-                cache_write: 0.0,
-                cache_read: 0.0,
-                tiered: false,
-            },
-        );
+        let list = [
+            (
+                "anthropic/claude-opus-5-5",
+                ModelPrice {
+                    input: 30.0,
+                    output: 0.0,
+                    cache_write: 0.0,
+                    cache_read: 0.0,
+                    tiered: false,
+                },
+            ),
+            (
+                "anthropic/claude-haiku-5-5",
+                ModelPrice {
+                    input: 10.0,
+                    output: 0.0,
+                    cache_write: 0.0,
+                    cache_read: 0.0,
+                    tiered: false,
+                },
+            ),
+        ]
+        .into_iter()
+        .map(|(key, price)| (key.to_string(), price))
+        .collect();
+        prices.take(list, utc("2026-11-01T00:00:00Z"));
         let opus = token(
             utc("2026-11-10T10:00:00Z"),
             "claude-opus-5-5",
@@ -1685,6 +1883,81 @@ mod tests {
         assert!(
             (one.subscription.expect("a value") + two.subscription.expect("a value") - week).abs()
                 < 1e-9
+        );
+    }
+
+    #[test]
+    fn a_window_after_a_reset_is_valued_from_its_first_percent() {
+        let (history, _dir, opus, haiku, prices) = two_records();
+        history
+            .append(&price_changed(
+                utc("2026-11-06T00:00:00Z"),
+                Some(140.0),
+                Some("EUR"),
+            ))
+            .expect("the account's price");
+        let mut window = weekly_window(
+            utc("2026-11-07T00:00:00Z"),
+            utc("2026-11-14T00:00:00Z"),
+            80.0,
+        );
+        window.from = Some(45.0);
+        history.append(&window).expect("a window after a reset");
+        let valuer = Valuer::build(
+            &history,
+            &range("2026-11-10T00:00:00Z", "2026-11-11T00:00:00Z"),
+            &prices,
+            &empty_fx(),
+            &settings_eur(),
+            &[account_with_price(Some(140.0))],
+            &RefCell::new(Vec::new()),
+        )
+        .expect("a valuer");
+
+        let one = valuer.value("atlas", &opus);
+        let two = valuer.value("atlas", &haiku);
+        let used = 35.0 * percent_value(140.0);
+        assert!((one.subscription.expect("a value") - 0.75 * used).abs() < 1e-9);
+        assert!((two.subscription.expect("a value") - 0.25 * used).abs() < 1e-9);
+    }
+
+    /// The weeks list counts a window that ends below its start as 0 and warns
+    /// (T-1); the valuer must follow the same rule, not turn it into a negative
+    /// subscription value.
+    #[test]
+    fn proof_a_window_ending_below_its_start_adds_nothing_to_the_valuer() {
+        let (history, _dir, opus, _haiku, prices) = two_records();
+        history
+            .append(&price_changed(
+                utc("2026-11-06T00:00:00Z"),
+                Some(140.0),
+                Some("EUR"),
+            ))
+            .expect("the account's price");
+        let mut window = weekly_window(
+            utc("2026-11-07T00:00:00Z"),
+            utc("2026-11-14T00:00:00Z"),
+            20.0,
+        );
+        window.from = Some(45.0);
+        history.append(&window).expect("a window below its start");
+        let warnings = RefCell::new(Vec::new());
+        let valuer = Valuer::build(
+            &history,
+            &range("2026-11-10T00:00:00Z", "2026-11-11T00:00:00Z"),
+            &prices,
+            &empty_fx(),
+            &settings_eur(),
+            &[account_with_price(Some(140.0))],
+            &warnings,
+        )
+        .expect("a valuer");
+
+        let value = valuer.value("atlas", &opus).subscription.expect("a value");
+        assert!(value >= 0.0, "a negative subscription value: {value}");
+        assert!(
+            !warnings.borrow().is_empty(),
+            "the weeks list warns about such a window; the valuer said nothing"
         );
     }
 
@@ -1924,16 +2197,6 @@ mod tests {
         let mut prices = priced_prices(t1);
         prices.checked_at = Some(utc("2026-11-14T09:00:00Z"));
         prices.etag = Some("W/\"abc\"".to_string());
-        prices.overrides.insert(
-            "anthropic/claude-opus-5-5".to_string(),
-            ModelPrice {
-                input: 4.0,
-                output: 99.0,
-                cache_write: 5.0,
-                cache_read: 0.2,
-                tiered: false,
-            },
-        );
         prices.save(&app).expect("saved");
         assert_eq!(Prices::load(&app).expect("loaded"), prices);
         #[cfg(unix)]
@@ -1953,15 +2216,48 @@ mod tests {
             Prices::default()
         );
 
-        fs::write(
-            app.prices_file(),
-            br#"{"version":2,"models":{},"overrides":{}}"#,
-        )
-        .expect("another version");
+        fs::write(app.prices_file(), br#"{"version":2,"models":{}}"#).expect("another version");
         assert!(matches!(
             Prices::load(&app),
             Err(MoneyError::UnsupportedVersion { .. })
         ));
+    }
+
+    #[test]
+    fn an_old_prices_file_with_own_prices_reads_and_ignores_them() {
+        let dir = tempdir().expect("tempdir");
+        let app = AppPaths::at(&dir.path().join("data"));
+        std::fs::create_dir_all(&app.data_dir).expect("the data folder");
+        fs::write(
+            app.prices_file(),
+            br#"{
+              "version": 1,
+              "models": {
+                "anthropic/claude-opus-5-5": [{
+                  "from": "2026-11-01T00:00:00Z",
+                  "price": {"input": 4, "output": 20, "cacheWrite": 5, "cacheRead": 0.2, "tiered": false}
+                }]
+              },
+              "overrides": {
+                "anthropic/claude-opus-5-5": {"input": 1, "output": 1, "cacheWrite": 0, "cacheRead": 0, "tiered": false}
+              }
+            }"#,
+        )
+        .expect("an old prices.json");
+        let prices = Prices::load(&app).expect("an older file still loads");
+        assert_eq!(
+            prices.at("anthropic/claude-opus-5-5", utc("2026-11-10T00:00:00Z")),
+            Some(&ModelPrice {
+                input: 4.0,
+                output: 20.0,
+                cache_write: 5.0,
+                cache_read: 0.2,
+                tiered: false,
+            }),
+            "the own price in an old file is ignored, not used"
+        );
+        let saved = serde_json::to_value(&prices).expect("prices JSON");
+        assert!(saved.get("overrides").is_none(), "it is not written back");
     }
 
     #[test]
@@ -2005,6 +2301,26 @@ mod tests {
             Err(MoneyError::UnsupportedVersion { .. })
         ));
     }
+
+    #[test]
+    fn an_old_fx_file_has_no_fetch_time() {
+        let dir = tempdir().expect("tempdir");
+        let app = AppPaths::at(&dir.path().join("data"));
+        std::fs::create_dir_all(&app.data_dir).expect("the data folder");
+        fs::write(
+            app.fx_file(),
+            br#"{"version":1,"currency":"EUR","points":[{"date":"2026-11-13","rate":0.9048}]}"#,
+        )
+        .expect("an old fx.json");
+        let fx = Fx::load(&app).expect("an older file still loads");
+        assert_eq!(fx.at(date("2026-11-14")), Some(0.9048));
+        assert_eq!(
+            fx.fetched_at(date("2026-11-14")),
+            None,
+            "an old point keeps no fetch time; the page says it was not recorded"
+        );
+    }
+
     #[test]
     fn proof_a_second_identical_list_without_a_model_is_no_change() {
         let t1 = utc("2026-11-01T00:00:00Z");
@@ -2338,38 +2654,6 @@ mod tests {
     }
 
     #[test]
-    fn an_own_rate_belongs_to_its_currency() {
-        let settings = Settings {
-            currency: Some("CHF".to_string()),
-            usd_rate: Some(OwnRate {
-                currency: "EUR".to_string(),
-                value: 0.95,
-            }),
-            ..Settings::default()
-        };
-        let mut fx = Fx {
-            version: 1,
-            currency: "CHF".to_string(),
-            points: Vec::new(),
-        };
-        fx.take(date("2026-11-13"), 0.90);
-        assert_eq!(
-            usd_rate(&settings, &fx, date("2026-11-14")),
-            Some(Rate {
-                value: 0.90,
-                date: Some(date("2026-11-13")),
-                own: false,
-            }),
-            "the own rate for EUR is not used for CHF"
-        );
-        assert_eq!(
-            usd_rate(&settings, &empty_fx(), date("2026-11-14")),
-            None,
-            "without a CHF rate there is no CHF rate, not the EUR one"
-        );
-    }
-
-    #[test]
     fn a_rate_of_another_currency_is_not_used() {
         let settings = Settings {
             currency: Some("CHF".to_string()),
@@ -2453,10 +2737,6 @@ mod tests {
         let value_in = |currency: &str| {
             let settings = Settings {
                 currency: Some(currency.to_string()),
-                usd_rate: Some(OwnRate {
-                    currency: currency.to_string(),
-                    value: 1.0,
-                }),
                 ..Settings::default()
             };
             Valuer::build(
@@ -2620,7 +2900,7 @@ mod tests {
                 &history,
                 &range("2026-11-10T00:00:00Z", "2026-11-11T00:00:00Z"),
                 &prices,
-                &empty_fx(),
+                &fx_eur(),
                 settings,
                 &[],
                 &RefCell::new(Vec::new()),
@@ -2858,7 +3138,7 @@ mod tests {
         drop(listener);
         let api = lookup_api(&format!("http://{address}"));
 
-        assert!(look_up_rate(&api, &app, "USD")
+        assert!(look_up_rate(&api, &app, "USD", utc("2026-11-13T10:10:00Z"))
             .expect("USD needs no request")
             .is_none());
         assert!(!app.fx_file().exists(), "USD writes no fx.json");
@@ -2878,23 +3158,29 @@ mod tests {
 
         let body = r#"{"base":"USD","date":"2026-11-13","rates":{"EUR":0.90481}}"#;
         let (base, receiver, handle) = start_server(Reply::ok(body));
-        let point = look_up_rate(&lookup_api(&base), &app, "EUR")
+        let now = utc("2026-11-13T10:10:00Z");
+        let point = look_up_rate(&lookup_api(&base), &app, "EUR", now)
             .expect("the rate")
             .expect("a point");
         assert_eq!(point.date, date("2026-11-13"));
         assert_eq!(point.rate, 0.90481);
+        assert_eq!(
+            point.fetched_at,
+            Some(now),
+            "the point is stamped with the round's clock, not the wall clock"
+        );
         let request = captured(&receiver, handle);
         assert_eq!(request.path, "/v1/latest?base=USD&symbols=EUR");
 
         let stored = Fx::load(&app).expect("fx.json");
         assert_eq!(stored.currency, "EUR");
+        assert_eq!(stored.points.len(), 1, "the old currency's point is gone");
+        assert_eq!(stored.points[0].date, date("2026-11-13"));
+        assert_eq!(stored.points[0].rate, 0.90481);
         assert_eq!(
-            stored.points,
-            vec![FxPoint {
-                date: date("2026-11-13"),
-                rate: 0.90481,
-            }],
-            "the GBP point is gone"
+            stored.points[0].fetched_at,
+            Some(now),
+            "a looked-up point records when the round fetched it"
         );
     }
 
@@ -2904,92 +3190,14 @@ mod tests {
         let app = AppPaths::at(&dir.path().join("data"));
         let body = r#"{"base":"USD","date":"2026-11-13","rates":{"EUR":0}}"#;
         let (base, receiver, handle) = start_server(Reply::ok(body));
-        let error = look_up_rate(&lookup_api(&base), &app, "EUR").expect_err("a bad rate");
+        let error = look_up_rate(&lookup_api(&base), &app, "EUR", utc("2026-11-13T10:10:00Z"))
+            .expect_err("a bad rate");
         assert!(
             error.to_string().contains("EUR") && error.to_string().contains('0'),
             "the error names the rate, got {error}"
         );
         let _ = captured(&receiver, handle);
         assert!(!app.fx_file().exists(), "a bad rate is not saved");
-    }
-
-    /// A look-up and the window's own price must not overwrite each other: the
-    /// look-up loads `prices.json`, waits for the server and saves the file it
-    /// loaded. An own price written in between is lost.
-    #[test]
-    fn proof_a_refresh_does_not_lose_an_own_price_written_while_it_runs() {
-        use std::sync::mpsc;
-        use std::thread;
-        use std::time::Duration;
-
-        use tiny_http::{Response, Server, StatusCode};
-
-        let dir = tempdir().expect("tempdir");
-        let app = AppPaths::at(&dir.path().join("data"));
-        let prices = priced_prices(utc("2026-11-13T09:00:00Z"));
-        prices.save(&app).expect("the stored prices");
-
-        // A server that answers only when the test says so.
-        let server = Server::http("127.0.0.1:0").expect("a local server");
-        let address = server.server_addr().to_ip().expect("a local address");
-        let base = format!("http://{address}");
-        let (arrived_tx, arrived_rx) = mpsc::channel();
-        let (go_tx, go_rx) = mpsc::channel();
-        let server_thread = thread::spawn(move || {
-            let mut request = server.recv().expect("one request");
-            let mut body = String::new();
-            let _ = request.as_reader().read_to_string(&mut body);
-            let _ = arrived_tx.send(());
-            let _ = go_rx.recv();
-            let _ = request
-                .respond(Response::from_string(MODELS_DEV).with_status_code(StatusCode(200)));
-        });
-
-        // The look-up runs in its own thread: it has read `prices.json` already.
-        let (done_tx, done_rx) = mpsc::channel();
-        let app_for_thread = app.clone();
-        let base_for_thread = base.clone();
-        let worker = thread::spawn(move || {
-            let result = look_up_prices(
-                &lookup_api(&base_for_thread),
-                &app_for_thread,
-                utc("2026-11-14T09:00:00Z"),
-            );
-            let _ = done_tx.send(result.is_ok());
-        });
-
-        arrived_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the fake server received no request");
-        // The window's thread writes an own price while the look-up waits.
-        let mut during = Prices::load(&app).expect("prices.json");
-        during.overrides.insert(
-            "anthropic/claude-opus-5-5".to_string(),
-            ModelPrice {
-                input: 99.0,
-                output: 99.0,
-                cache_write: 0.0,
-                cache_read: 0.0,
-                tiered: false,
-            },
-        );
-        during.save(&app).expect("the own price");
-        let _ = go_tx.send(());
-        assert!(
-            done_rx
-                .recv_timeout(Duration::from_secs(10))
-                .expect("the look-up did not finish"),
-            "the look-up failed"
-        );
-        let _ = worker.join();
-        let _ = server_thread.join();
-
-        let after = Prices::load(&app).expect("prices.json");
-        assert!(
-            after.overrides.contains_key("anthropic/claude-opus-5-5"),
-            "the look-up overwrote the own price: {:?}",
-            after.overrides
-        );
     }
 
     #[test]

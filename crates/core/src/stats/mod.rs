@@ -330,9 +330,41 @@ pub struct AccountWeek {
 }
 
 /// The use of one window: its `final` percent minus its `from` (absent = 0).
-/// A reset window starts at 0, so its use is its final percent.
-pub(crate) fn window_used(window: &WindowRecord) -> f64 {
-    window.final_percent - window.from.unwrap_or(0.0)
+/// A reset window starts at 0, so its use is its final percent. `None` when the
+/// window ends below its start: such a window adds nothing to the week's use,
+/// and every caller counts no use for it (the page names it with the warning
+/// [`account_weeks_valued`] adds).
+pub(crate) fn window_used(window: &WindowRecord) -> Option<f64> {
+    let from = window.from.unwrap_or(0.0);
+    if window.final_percent < from {
+        return None;
+    }
+    Some(window.final_percent - from)
+}
+
+/// The middle of a weekly window, which names the calendar week it belongs to;
+/// `None` only when chrono cannot place it.
+pub(crate) fn window_midpoint(window: &WindowRecord) -> Option<DateTime<Utc>> {
+    let start = window.weekly_start();
+    start.checked_add_signed((window.end - start) / 2)
+}
+
+/// Name a window that ends below its start in the page's warnings: the one text
+/// both the weeks list and the valuer push, added once, so a page that runs both
+/// shows it once.
+pub(crate) fn warn_window_below_start(warnings: &RefCell<Vec<String>>, window: &WindowRecord) {
+    let warning = format!(
+        "the weekly window of {} ending {} ends at {} % below its start at {} %; \
+         it adds nothing to the week's use",
+        window.account.acc,
+        window.end,
+        window.final_percent,
+        window.from.unwrap_or(0.0),
+    );
+    let mut shown = warnings.borrow_mut();
+    if !shown.contains(&warning) {
+        shown.push(warning);
+    }
 }
 
 /// Every finished weekly_all window whose midpoint lies in the range, of the chosen accounts, any host; if several
@@ -376,8 +408,7 @@ pub(crate) fn account_weeks_valued<Tz: TimeZone + Copy>(
         if window.k != LimitKind::WeeklyAll {
             continue;
         }
-        let start = window.weekly_start();
-        let Some(midpoint) = start.checked_add_signed((window.end - start) / 2) else {
+        let Some(midpoint) = window_midpoint(&window) else {
             continue;
         };
         if midpoint < range.from || midpoint >= range.to {
@@ -387,19 +418,15 @@ pub(crate) fn account_weeks_valued<Tz: TimeZone + Copy>(
             continue;
         }
         let week = week_start(midpoint, &ctx.zone);
-        let use_of = window_used(&window);
-        let used = if use_of < 0.0 {
-            ctx.warnings.borrow_mut().push(format!(
-                "the weekly window of {} ending {} ends at {} % below its start at {} %; \
-                 it adds nothing to the week's use",
-                window.account.acc,
-                window.end,
-                window.final_percent,
-                window.from.unwrap_or(0.0),
-            ));
-            0.0
-        } else {
-            use_of
+        let used = match window_used(&window) {
+            Some(used) => used,
+            None => {
+                // A window that ends below its start adds nothing. The text is
+                // the one `Valuer::build` uses for the same window: a page that
+                // runs both shows it once.
+                warn_window_below_start(ctx.warnings, &window);
+                0.0
+            }
         };
         match weeks
             .iter_mut()

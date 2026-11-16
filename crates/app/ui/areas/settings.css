@@ -573,21 +573,9 @@ button.link {
 
 .price-value {
   display: flex;
+  justify-content: flex-end;
   min-width: 0;
-}
-
-.price-field {
-  width: 100%;
-  min-width: 0;
-  text-align: right;
   font-variant-numeric: tabular-nums;
-}
-
-.price-add-key {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 12px 0;
 }
 
 .price-marks {
@@ -597,13 +585,6 @@ button.link {
   gap: 6px;
 }
 
-.price-own-line {
-  display: flex;
-  justify-content: flex-end;
-  padding: 0 12px 4px;
-}
-
-.price-wrap .row-error,
 .price-list-error {
   padding: 2px 12px 6px;
   color: var(--danger);
@@ -614,6 +595,50 @@ button.link {
 
 .price-list-note {
   padding-top: 6px;
+}
+
+/* ---------- the Providers group's API price list (spec §1.4.1) ---------- */
+
+/* The General group's money rows are one kept block (decision 25): the page
+   rebuilds it only when the money part of the view changed. */
+.money-rows {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+/* The price block under Providers: the source line, the read-only list and the
+   look-up's state. */
+.price-block {
+  display: flex;
+  flex-direction: column;
+  padding-bottom: 8px;
+}
+
+.price-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  min-height: 28px;
+  padding: 4px 12px;
+  border-top: 1px solid var(--border);
+  font-size: 13px;
+  line-height: 18px;
+}
+
+a.link {
+  color: var(--focus);
+  font: inherit;
+  text-decoration: none;
+}
+
+a.link:hover {
+  text-decoration: underline;
+}
+
+a.link:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
 }
 
 /* ---------- the History and hosts group (spec §1.5, §3.7) ---------- */

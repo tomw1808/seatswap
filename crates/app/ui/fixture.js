@@ -71,7 +71,6 @@ export const DEFAULT_SETTINGS = {
   statuslineRecordUntil: null,
   statuslineInstall: null,
   currency: "EUR",
-  usdRate: null,
   lookUpPrices: true,
   statusline: {
     left: [
@@ -121,10 +120,6 @@ export function ensureFixture() {
   if (!fixture) {
     fixture = makeFixture();
     fixture.providers = fixtureOpenProviders(fixture);
-    fixture.priceLookedUp = Object.create(null);
-    for (const row of fixture.priceList) {
-      fixture.priceLookedUp[row.key] = clone(row.price);
-    }
     exposeFixtureHooks();
     console.info("[fixture] no window.__TAURI__; using the built-in snapshot");
   }
@@ -610,7 +605,7 @@ function makeFixture() {
     providers: [],
     money: {
       currency: "EUR",
-      rate: { value: 0.9048, date: "2026-11-13", own: false },
+      rate: { value: 0.9048, date: "2026-11-13" },
       lookUp: true,
       providers: ["anthropic", "openai", "ollama-cloud"],
       modelsWithPrice: 4,
@@ -629,28 +624,24 @@ function makeFixture() {
       {
         key: "anthropic/claude-opus-5-5",
         price: { input: 4, output: 20, cacheWrite: 5, cacheRead: 0.2, tiered: false },
-        own: false,
         tiered: false,
         since: isoIn(-30 * 86400000),
       },
       {
         key: "anthropic/claude-haiku-5-5",
         price: { input: 0.1, output: 0.5, cacheWrite: 0.125, cacheRead: 0.01, tiered: true },
-        own: false,
         tiered: true,
         since: isoIn(-30 * 86400000),
       },
       {
         key: "openai/gpt-6",
         price: { input: 2, output: 10, cacheWrite: 2.5, cacheRead: 0.2, tiered: false },
-        own: false,
         tiered: false,
         since: isoIn(-12 * 86400000),
       },
       {
         key: "ollama-cloud/deepseek-v4.1-flash",
         price: { input: 0.3, output: 1.2, cacheWrite: 0, cacheRead: 0, tiered: false },
-        own: false,
         tiered: false,
         since: isoIn(-5 * 86400000),
       },
@@ -1260,62 +1251,6 @@ export async function fixtureInvoke(command, args) {
 
     case "price_list":
       return clone(fixture.priceList);
-
-    case "set_price_override": {
-      const key = String(args.key || "");
-      const PROVIDERS = ["anthropic", "openai", "ollama-cloud"];
-      const mark = key.indexOf("/");
-      const provider = mark < 0 ? "" : key.slice(0, mark);
-      const modelId = mark < 0 ? "" : key.slice(mark + 1);
-      if (!PROVIDERS.includes(provider) || modelId === "") {
-        throw new Error(
-          "a model key is provider/model with a provider from anthropic, openai, ollama-cloud and a model id, e.g. anthropic/claude-opus-5-5"
-        );
-      }
-      let row = fixture.priceList.find((entry) => entry.key === key);
-      if (args.price === null || args.price === undefined) {
-        if (!row) throw new Error(`no own price for ${key}`);
-        const original = fixture.priceLookedUp && fixture.priceLookedUp[key];
-        if (!original) {
-          fixture.priceList = fixture.priceList.filter((entry) => entry.key !== key);
-        } else {
-          row.price = clone(original);
-          row.own = false;
-          row.tiered = Boolean(original.tiered);
-        }
-      } else {
-        const source = args.price;
-        const price = {
-          input: Number(source.input),
-          output: Number(source.output),
-          cacheWrite: Number(source.cacheWrite),
-          cacheRead: Number(source.cacheRead),
-          tiered: Boolean(source.tiered),
-        };
-        for (const [name, value] of Object.entries(price)) {
-          if (name === "tiered") continue;
-          if (!Number.isFinite(value) || value < 0) {
-            throw new Error(`the ${name} price must be a number of 0 or more`);
-          }
-        }
-        if (!row) {
-          row = {
-            key,
-            price,
-            own: true,
-            tiered: price.tiered,
-            since: null,
-          };
-          fixture.priceList.push(row);
-        } else {
-          row.price = price;
-          row.own = true;
-          row.tiered = price.tiered;
-        }
-      }
-      fixture.money.modelsWithPrice = fixture.priceList.length;
-      return null;
-    }
 
     case "lookup_now":
       fixture.money.pricesCheckedAt = new Date().toISOString();
