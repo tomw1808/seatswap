@@ -117,6 +117,10 @@ pub fn replay(
         // The walk carries the recorded work and its typical hour; a replay
         // never reads the learned rhythm.
         rhythm: Rhythm { wu: [0.0; 168] },
+        // A replay plays its range from the start, as auto-burn would have
+        // from no switch and no hold.
+        last_switch_at: None,
+        manual_hold_until: None,
     };
     inputs.check()?;
     let typical_wu = mean_over_hours(hours.values().copied());

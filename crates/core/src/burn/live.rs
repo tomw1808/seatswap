@@ -220,10 +220,10 @@ pub fn situation(
             accounts: states,
             active: active.map(str::to_string),
             rhythm: learned.rhythm.clone(),
+            last_switch_at,
+            manual_hold_until,
         },
         cost: learned.cost,
-        last_switch_at,
-        manual_hold_until,
         tied_busy,
         oldest_reading,
         sessions_off: learned.sessions_off,
@@ -468,6 +468,7 @@ mod tests {
         Usage {
             limits,
             extra_usage_enabled: false,
+            warnings: Vec::new(),
         }
     }
 
@@ -694,10 +695,13 @@ mod tests {
         ];
         let situation = ready(&learned, &views, &[pr, ac], Some("ac"), now);
         assert_eq!(
-            situation.manual_hold_until, None,
+            situation.inputs.manual_hold_until, None,
             "the blocked account ends the hold early"
         );
-        assert_eq!(situation.last_switch_at, Some(now - Duration::hours(1)));
+        assert_eq!(
+            situation.inputs.last_switch_at,
+            Some(now - Duration::hours(1))
+        );
     }
 
     /// AC's per-model Sonnet week crosses 100 % while all work runs on Opus: the
@@ -728,7 +732,7 @@ mod tests {
         ];
         let situation = ready(&learned, &views, &[pr, ac], Some("ac"), now);
         assert_eq!(
-            situation.manual_hold_until,
+            situation.inputs.manual_hold_until,
             Some(now + Duration::hours(3)),
             "a per-model weekly limit is not an account block"
         );
@@ -761,7 +765,7 @@ mod tests {
         ];
         let situation = ready(&learned, &views, &[pr, ac], Some("ac"), now);
         assert_eq!(
-            situation.manual_hold_until, None,
+            situation.inputs.manual_hold_until, None,
             "a full session ends the hold"
         );
     }
@@ -794,7 +798,7 @@ mod tests {
         ];
         let situation = ready(&learned, &views, &[pr, ac], Some("ac"), now);
         assert_eq!(
-            situation.manual_hold_until, None,
+            situation.inputs.manual_hold_until, None,
             "the hold ended at the blocked event and stays ended"
         );
     }
@@ -817,7 +821,7 @@ mod tests {
         ];
         let situation = ready(&learned, &views, &[pr, ac], Some("ac"), now);
         assert_eq!(
-            situation.manual_hold_until,
+            situation.inputs.manual_hold_until,
             Some(now + Duration::hours(3)),
             "a /login outside seatswap holds the early rule back"
         );
@@ -935,7 +939,10 @@ mod tests {
             view("ac", "AC", 10.0, Some(10.0), now - Duration::minutes(1)),
         ];
         let situation = ready(&learned, &views, &[pr, ac], Some("ac"), now);
-        assert_eq!(situation.manual_hold_until, Some(now + Duration::hours(3)));
+        assert_eq!(
+            situation.inputs.manual_hold_until,
+            Some(now + Duration::hours(3))
+        );
     }
 
     #[test]
@@ -1068,7 +1075,7 @@ mod tests {
             view("ac", "AC", 10.0, None, now - Duration::minutes(1)),
         ];
         let situation = ready(&learned, &views, &[pr, ac], Some("ac"), now);
-        assert_eq!(situation.manual_hold_until, None);
+        assert_eq!(situation.inputs.manual_hold_until, None);
     }
 
     #[test]
@@ -1102,7 +1109,7 @@ mod tests {
             now,
         );
         assert_eq!(
-            situation.manual_hold_until,
+            situation.inputs.manual_hold_until,
             Some(now + Duration::hours(3)),
             "a settings toggle is not a resume of the manual switch's hold"
         );
@@ -1127,7 +1134,7 @@ mod tests {
         let learned = learned("atlas", vec![pause, toggle]);
         let situation = ready(&learned, &views, &[pr, ac], Some("ac"), now);
         assert_eq!(
-            situation.manual_hold_until,
+            situation.inputs.manual_hold_until,
             Some(now + Duration::hours(2)),
             "a settings toggle is not a resume of the explicit pause"
         );
@@ -1207,7 +1214,7 @@ mod tests {
         ];
         let situation = ready(&learned, &views, &[pr, ac], Some("ac"), now);
         assert_eq!(
-            situation.manual_hold_until,
+            situation.inputs.manual_hold_until,
             Some(now + Duration::hours(3)),
             "a CLI switch one hour ago holds for four hours"
         );
@@ -1233,8 +1240,6 @@ mod tests {
             oldest_reading: inputs.now - Duration::minutes(1),
             inputs,
             cost: None,
-            last_switch_at: None,
-            manual_hold_until: None,
             tied_busy: 0,
             sessions_off: false,
         }

@@ -368,6 +368,7 @@ impl BurnRuntime {
         next: Option<&str>,
     ) -> Option<String> {
         let paused = situation
+            .inputs
             .manual_hold_until
             .is_some_and(|until| until > tick.now);
         let desired = if tick.settings.auto_burn && !paused {
@@ -560,7 +561,10 @@ impl BurnRuntime {
         };
         let mut view = BurnView {
             on: settings.auto_burn,
-            paused_until: situation.manual_hold_until.filter(|until| *until > now),
+            paused_until: situation
+                .inputs
+                .manual_hold_until
+                .filter(|until| *until > now),
             early: regime.early,
             why: burn_text::why(regime.why).to_string(),
             learning: learning.clone(),
@@ -881,6 +885,7 @@ mod tests {
         Usage {
             limits,
             extra_usage_enabled: false,
+            warnings: Vec::new(),
         }
     }
 
@@ -951,13 +956,13 @@ mod tests {
                 ],
                 active: active.map(str::to_string),
                 rhythm: Rhythm { wu: [1.0; 168] },
+                last_switch_at: None,
+                manual_hold_until: None,
             },
             cost: Some(SwitchCost {
                 wu: 0.05,
                 samples: 3,
             }),
-            last_switch_at: None,
-            manual_hold_until: None,
             tied_busy: 0,
             oldest_reading: now - Duration::minutes(1),
             sessions_off: false,
@@ -1691,7 +1696,7 @@ mod tests {
         // The same reading without the hold would switch to PR: the input
         // above would therefore fail if the hold rule were missing.
         let mut without_hold = situation;
-        without_hold.manual_hold_until = None;
+        without_hold.inputs.manual_hold_until = None;
         let (mut fresh, action, _engine) = runtime();
         fresh.decision_report(
             &without_hold,

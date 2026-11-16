@@ -234,6 +234,7 @@ mod tests {
                 is_active: true,
             }],
             extra_usage_enabled: false,
+            warnings: Vec::new(),
         }
     }
 
@@ -376,6 +377,7 @@ mod tests {
                 },
             ],
             extra_usage_enabled: true,
+            warnings: Vec::new(),
         };
         let numbers = feed(
             Some(FeedLimit {
@@ -425,6 +427,7 @@ mod tests {
                 },
             ],
             extra_usage_enabled: false,
+            warnings: Vec::new(),
         };
         let numbers = feed(
             Some(FeedLimit {
@@ -466,6 +469,7 @@ mod tests {
                 },
             ],
             extra_usage_enabled: false,
+            warnings: Vec::new(),
         };
         let numbers = Feed {
             at: at("2026-11-14T14:41:00Z"),

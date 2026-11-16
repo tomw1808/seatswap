@@ -693,6 +693,11 @@ impl Limit {
 pub struct Usage {
     pub limits: Vec<Limit>,
     pub extra_usage_enabled: bool,
+    /// What the reply held that seatswap could not read and left out, one
+    /// sentence each (a reset time that is not a date). The engine shows them
+    /// as the account's note; they are never stored with the usage.
+    #[serde(skip)]
+    pub warnings: Vec<String>,
 }
 
 /// The index of the limit with the highest percent, the first of equals.
@@ -728,12 +733,13 @@ impl Usage {
             .and_then(|extra| extra.get("is_enabled"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let mut warnings = Vec::new();
         let limits = match object.get("limits") {
             Some(Value::Array(items)) => items
                 .iter()
-                .map(limit_from_json)
+                .map(|item| limit_from_json(item, &mut warnings))
                 .collect::<Result<Vec<_>, ApiError>>()?,
-            None | Some(Value::Null) => fallback_limits(object)?,
+            None | Some(Value::Null) => fallback_limits(object, &mut warnings)?,
             Some(_) => {
                 return Err(ApiError::Decode(
                     "usage reply's limits is not an array".to_string(),
@@ -743,6 +749,7 @@ impl Usage {
         Ok(Usage {
             limits,
             extra_usage_enabled,
+            warnings,
         })
     }
 
@@ -774,7 +781,7 @@ impl Usage {
     }
 }
 
-fn limit_from_json(value: &Value) -> Result<Limit, ApiError> {
+fn limit_from_json(value: &Value, warnings: &mut Vec<String>) -> Result<Limit, ApiError> {
     let object = value
         .as_object()
         .ok_or_else(|| ApiError::Decode("usage limit is not a JSON object".to_string()))?;
@@ -795,7 +802,7 @@ fn limit_from_json(value: &Value) -> Result<Limit, ApiError> {
         kind: LimitKind::from_api(kind),
         percent,
         severity,
-        resets_at: resets_at(object.get("resets_at")),
+        resets_at: resets_at(object.get("resets_at"), kind, warnings),
         model: model_name(object.get("scope")),
         is_active: object
             .get("is_active")
@@ -804,13 +811,18 @@ fn limit_from_json(value: &Value) -> Result<Limit, ApiError> {
     })
 }
 
-fn fallback_limits(object: &Map<String, Value>) -> Result<Vec<Limit>, ApiError> {
+fn fallback_limits(
+    object: &Map<String, Value>,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<Limit>, ApiError> {
     let mut limits = Vec::new();
-    if let Some(window) = window_object(object, "five_hour")? {
-        limits.push(fallback_limit(LimitKind::Session, window)?);
-    }
-    if let Some(window) = window_object(object, "seven_day")? {
-        limits.push(fallback_limit(LimitKind::WeeklyAll, window)?);
+    for (name, kind) in [
+        ("five_hour", LimitKind::Session),
+        ("seven_day", LimitKind::WeeklyAll),
+    ] {
+        if let Some(window) = window_object(object, name)? {
+            limits.push(fallback_limit(kind, name, window, warnings)?);
+        }
     }
     Ok(limits)
 }
@@ -828,7 +840,12 @@ fn window_object<'a>(
     }
 }
 
-fn fallback_limit(kind: LimitKind, window: &Map<String, Value>) -> Result<Limit, ApiError> {
+fn fallback_limit(
+    kind: LimitKind,
+    name: &str,
+    window: &Map<String, Value>,
+    warnings: &mut Vec<String>,
+) -> Result<Limit, ApiError> {
     let percent = window
         .get("utilization")
         .and_then(Value::as_f64)
@@ -837,17 +854,39 @@ fn fallback_limit(kind: LimitKind, window: &Map<String, Value>) -> Result<Limit,
         kind,
         percent,
         severity: Severity::Normal,
-        resets_at: resets_at(window.get("resets_at")),
+        resets_at: resets_at(window.get("resets_at"), name, warnings),
         model: None,
         is_active: false,
     })
 }
 
-fn resets_at(value: Option<&Value>) -> Option<DateTime<Utc>> {
-    value
-        .and_then(Value::as_str)
+/// The longest part of an unreadable value a warning quotes.
+const QUOTED_CHARS: usize = 40;
+
+/// A limit's reset time. A missing or null one is `None` (no window runs). A
+/// value that is not an RFC 3339 date is `None` too, and says so in `warnings`
+/// with the limit's name and the value, so the limit is shown without its
+/// reset and the user sees why.
+fn resets_at(
+    value: Option<&Value>,
+    limit: &str,
+    warnings: &mut Vec<String>,
+) -> Option<DateTime<Utc>> {
+    let value = match value {
+        None | Some(Value::Null) => return None,
+        Some(value) => value,
+    };
+    if let Some(time) = value
+        .as_str()
         .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
-        .map(|time| time.with_timezone(&Utc))
+    {
+        return Some(time.with_timezone(&Utc));
+    }
+    let quoted: String = value.to_string().chars().take(QUOTED_CHARS).collect();
+    warnings.push(format!(
+        "Claude's usage reply has a reset time seatswap cannot read for the {limit} limit ({quoted}); it is shown without one"
+    ));
+    None
 }
 
 fn model_name(scope: Option<&Value>) -> Option<String> {
@@ -1547,6 +1586,7 @@ mod tests {
                 },
             ],
             extra_usage_enabled: true,
+            warnings: Vec::new(),
         };
         let encoded = serde_json::to_string(&usage).unwrap();
         assert!(encoded.contains("\"weekly_all\""));
@@ -1583,17 +1623,56 @@ mod tests {
     }
 
     #[test]
-    fn an_unparsable_reset_date_is_none() {
+    fn an_unparsable_reset_date_is_none_with_a_warning() {
         let body = r#"{
           "limits": [
             { "kind": "session", "percent": 10, "severity": "normal",
-              "resets_at": "not a date", "is_active": true }
+              "resets_at": "not a date", "is_active": true },
+            { "kind": "weekly_all", "percent": 48, "severity": "normal",
+              "resets_at": null, "is_active": false }
           ]
         }"#;
         let (base, receiver, handle) = start_server(Reply::ok(body));
         let usage = api_for(&base).usage(&usage_token()).unwrap();
         let _ = captured(&receiver, handle);
         assert_eq!(usage.limits[0].resets_at, None);
+        assert_eq!(usage.limits[0].percent, 10.0, "the limit itself stays");
+        assert_eq!(usage.limits[1].resets_at, None);
+        assert_eq!(
+            usage.warnings,
+            vec![
+                "Claude's usage reply has a reset time seatswap cannot read for the session limit (\"not a date\"); it is shown without one"
+                    .to_string()
+            ],
+            "a null reset is no warning; an unreadable one is"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_fallback_reset_names_its_window() {
+        let usage = Usage::from_json(&serde_json::json!({
+            "five_hour": { "utilization": 97.0, "resets_at": 1794697457 },
+            "seven_day": { "utilization": 48.0, "resets_at": "2026-11-16T01:00:00+00:00" }
+        }))
+        .unwrap();
+        assert_eq!(usage.limits[0].resets_at, None);
+        assert!(usage.limits[1].resets_at.is_some());
+        assert_eq!(
+            usage.warnings,
+            vec![
+                "Claude's usage reply has a reset time seatswap cannot read for the five_hour limit (1794697457); it is shown without one"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_readable_reply_has_no_warnings() {
+        let usage = Usage::from_json(&serde_json::json!({
+            "seven_day": { "utilization": 48.0, "resets_at": "2026-11-16T01:00:00+00:00" }
+        }))
+        .unwrap();
+        assert!(usage.warnings.is_empty());
     }
 
     // -----------------------------------------------------------------------

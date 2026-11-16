@@ -57,6 +57,13 @@ pub struct Inputs {
     pub accounts: Vec<AccountState>,
     pub active: Option<String>,
     pub rhythm: Rhythm,
+    /// The last switch of any kind on this host. No early move (S2) comes
+    /// within [`MIN_DWELL_MIN`] of it, in [`crate::burn::decide::decide`] and in
+    /// the eager plan alike; `None` counts as long ago.
+    pub last_switch_at: Option<DateTime<Utc>>,
+    /// The end of the hold a switch not made by auto-burn starts (spec §2.5):
+    /// no early move before it.
+    pub manual_hold_until: Option<DateTime<Utc>>,
 }
 
 /// A value [`Inputs::check`] rejects, because no plan can be computed from it.
@@ -95,7 +102,8 @@ impl Inputs {
     /// the account it concerns: a percent that is NaN, infinite or negative, a
     /// session percent above 0 without a reset time (spec §2.1: a window has a
     /// reset time only while it runs), an `active` id that is not in
-    /// `accounts`, or two accounts with the same id.
+    /// `accounts`, two accounts with the same id, or a last switch after `now`
+    /// (a clock that went back, not a value to hold or pass).
     pub fn check(&self) -> Result<(), PlanError> {
         for (index, account) in self.accounts.iter().enumerate() {
             if self.accounts[..index]
@@ -134,6 +142,11 @@ impl Inputs {
         if let Some(active) = &self.active {
             if !self.accounts.iter().any(|account| &account.id == active) {
                 return Err(PlanError::UnknownActive { id: active.clone() });
+            }
+        }
+        if let Some(at) = self.last_switch_at {
+            if at > self.now {
+                return Err(PlanError::LastSwitchAfterNow { at, now: self.now });
             }
         }
         Ok(())
@@ -364,8 +377,10 @@ pub fn choose(inputs: &Inputs, at: DateTime<Utc>) -> Option<String> {
 /// step has the work of its rhythm hour divided by four. Lazy stays on the
 /// current account until it is not usable and then calls [`choose`]. Eager also
 /// moves when [`choose`] names another account whose slack is at least
-/// [`SLACK_MARGIN_H`] × [`Rhythm::typical_hour`] below the current one's and the
-/// last switch is at least [`MIN_DWELL_MIN`] ago.
+/// [`SLACK_MARGIN_H`] × [`Rhythm::typical_hour`] below the current one's and
+/// [`early_move_allowed`] says yes: the plan starts from
+/// [`Inputs::last_switch_at`] and [`Inputs::manual_hold_until`], so its first
+/// early move is the one [`crate::burn::decide::decide`] will make.
 ///
 /// An account without rates is played with `c = 0` and `s = 0`: it never fills
 /// in the plan and it is never the reason for an eager move, because its slack
@@ -438,7 +453,7 @@ pub(super) fn play(inputs: &Inputs, policy: Policy, walk: &Walk<'_>, typical: f6
         .as_ref()
         .and_then(|id| views.iter().position(|view| &view.account.id == id))
         .filter(|&index| !views[index].blocked(inputs.now));
-    let mut last_switch: Option<DateTime<Utc>> = None;
+    let mut last_switch = inputs.last_switch_at;
     let mut worked_wu = 0.0;
     let mut blocked_wu = 0.0;
     let mut switches = 0u32;
@@ -452,7 +467,16 @@ pub(super) fn play(inputs: &Inputs, policy: Policy, walk: &Walk<'_>, typical: f6
         let choice = match current {
             Some(index) if !views[index].blocked(t) => {
                 if policy == Policy::Eager && typical > 0.0 && views[index].usable(t) {
-                    eager_move(&views, t, index, typical, last_switch, walk).or(Some(index))
+                    eager_move(
+                        &views,
+                        t,
+                        index,
+                        typical,
+                        last_switch,
+                        inputs.manual_hold_until,
+                        walk,
+                    )
+                    .or(Some(index))
                 } else {
                     Some(index)
                 }
@@ -797,19 +821,33 @@ fn pick(views: &[View<'_>], at: DateTime<Utc>, walk: &Walk<'_>, typical: f64) ->
     best.map(|(_, _, _, index)| index)
 }
 
+/// Whether an early move (S2) may come at `at` (spec §2.5): the last switch is
+/// at least [`MIN_DWELL_MIN`] before it (no known switch counts as long ago)
+/// and no manual hold runs past it. The one copy of the rule:
+/// [`crate::burn::decide::decide`] and the eager plan both use it.
+pub(super) fn early_move_allowed(
+    last_switch: Option<DateTime<Utc>>,
+    manual_hold_until: Option<DateTime<Utc>>,
+    at: DateTime<Utc>,
+) -> bool {
+    last_switch.is_none_or(|last| at - last >= Duration::minutes(MIN_DWELL_MIN))
+        && manual_hold_until.is_none_or(|until| until <= at)
+}
+
 /// The early move of the eager plan (spec §2.5, S2): the account [`choose`]
 /// names, when it is another one, its slack is at least the margin below the
-/// current account's, and the last switch is at least [`MIN_DWELL_MIN`] ago.
-/// A target without known rates is never a reason to move.
+/// current account's, and [`early_move_allowed`] says yes. A target without
+/// known rates is never a reason to move.
 fn eager_move(
     views: &[View<'_>],
     at: DateTime<Utc>,
     current: usize,
     typical: f64,
     last_switch: Option<DateTime<Utc>>,
+    manual_hold_until: Option<DateTime<Utc>>,
     walk: &Walk<'_>,
 ) -> Option<usize> {
-    if last_switch.is_some_and(|last| at - last < Duration::minutes(MIN_DWELL_MIN)) {
+    if !early_move_allowed(last_switch, manual_hold_until, at) {
         return None;
     }
     let target = pick(views, at, walk, typical)?;
@@ -938,6 +976,8 @@ pub(crate) mod testkit {
             ],
             active: Some("PR".to_string()),
             rhythm: week(15),
+            last_switch_at: None,
+            manual_hold_until: None,
         }
     }
 }
@@ -1037,6 +1077,8 @@ mod tests {
             accounts: vec![x1, x2],
             active: None,
             rhythm: week(15),
+            last_switch_at: None,
+            manual_hold_until: None,
         };
         let x1_slack = slack(&inputs.accounts[0], &inputs).expect("X1 has rates");
         let x2_slack = slack(&inputs.accounts[1], &inputs).expect("X2 has rates");
@@ -1065,6 +1107,8 @@ mod tests {
             accounts: vec![x1, x2],
             active: None,
             rhythm: week(15),
+            last_switch_at: None,
+            manual_hold_until: None,
         };
         let x1_slack = slack(&inputs.accounts[0], &inputs).expect("X1 has rates");
         let x2_slack = slack(&inputs.accounts[1], &inputs).expect("X2 has rates");
@@ -1089,6 +1133,8 @@ mod tests {
             accounts: vec![x1, x2],
             active: None,
             rhythm: week(15),
+            last_switch_at: None,
+            manual_hold_until: None,
         };
 
         let with_thinking = choose(&inputs, now());
@@ -1113,6 +1159,8 @@ mod tests {
             accounts: vec![z, x1, x2],
             active: Some("Z".to_string()),
             rhythm: week(15),
+            last_switch_at: None,
+            manual_hold_until: None,
         };
         let x1_slack = slack(&inputs.accounts[1], &inputs).expect("X1 has rates");
         let x2_slack = slack(&inputs.accounts[2], &inputs).expect("X2 has rates");
@@ -1197,8 +1245,63 @@ mod tests {
             0, // PR
             inputs.rhythm.typical_hour(),
             Some(now() - Duration::minutes(minutes)),
+            None,
             &rhythm_walk(&inputs),
         )
+    }
+
+    /// The account and the start of the eager plan's first segment that is
+    /// not on PR, the active account of `inputs()`.
+    fn first_move(inputs: &Inputs) -> (String, DateTime<Utc>) {
+        let plan = follow(inputs, Policy::Eager);
+        let segment = plan
+            .segments
+            .iter()
+            .find(|segment| segment.account.as_deref() != Some("PR"))
+            .expect("the eager plan leaves PR");
+        (
+            segment.account.clone().expect("a usable account"),
+            segment.from,
+        )
+    }
+
+    #[test]
+    fn the_eager_plan_waits_out_the_last_switch_and_the_manual_hold() {
+        // Without a switch or a hold, the eager plan leaves PR for AC at once.
+        let mut inputs = inputs();
+        assert_eq!(first_move(&inputs), ("AC".to_string(), now()));
+
+        // A switch 10 minutes ago: the first step at least 30 minutes after it
+        // (steps are 15 minutes) is now + 30 min, so the plan does not name
+        // "now" while decide stays for the dwell.
+        inputs.last_switch_at = Some(now() - Duration::minutes(10));
+        assert!(!early_move_allowed(
+            inputs.last_switch_at,
+            None,
+            now() + Duration::minutes(15)
+        ));
+        assert_eq!(
+            first_move(&inputs),
+            ("AC".to_string(), now() + Duration::minutes(30))
+        );
+
+        // A manual hold for 2 hours: the first early move is at its end.
+        inputs.last_switch_at = Some(now() - Duration::hours(1));
+        inputs.manual_hold_until = Some(now() + Duration::hours(2));
+        assert_eq!(
+            first_move(&inputs),
+            ("AC".to_string(), now() + Duration::hours(2))
+        );
+    }
+
+    #[test]
+    fn a_last_switch_after_now_is_refused() {
+        let mut inputs = inputs();
+        inputs.last_switch_at = Some(now() + Duration::minutes(1));
+        assert!(matches!(
+            inputs.check(),
+            Err(PlanError::LastSwitchAfterNow { .. })
+        ));
     }
 
     #[test]

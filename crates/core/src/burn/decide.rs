@@ -5,12 +5,12 @@
 use chrono::{DateTime, Duration, Utc};
 
 use super::plan::{
-    blocked, choose, follow, rates_known, rhythm_walk, slack, usable_again, Inputs, PlanError,
-    Policy,
+    blocked, choose, early_move_allowed, follow, rates_known, rhythm_walk, slack, usable_again,
+    Inputs, PlanError, Policy,
 };
 use super::{
-    wu_hours, FRESH_MIN, GAIN_FACTOR, HORIZON_H, MIN_COST_SAMPLES, MIN_DWELL_MIN, MIN_GAIN_H,
-    SLACK_MARGIN_H, STEP_MIN,
+    wu_hours, FRESH_MIN, GAIN_FACTOR, HORIZON_H, MIN_COST_SAMPLES, MIN_GAIN_H, SLACK_MARGIN_H,
+    STEP_MIN,
 };
 
 /// The measured cost of one switch (spec §2.13): the extra work units and the
@@ -28,8 +28,6 @@ pub struct SwitchCost {
 pub struct Situation {
     pub inputs: Inputs,
     pub cost: Option<SwitchCost>,
-    pub last_switch_at: Option<DateTime<Utc>>,
-    pub manual_hold_until: Option<DateTime<Utc>>,
     pub tied_busy: u32,
     pub oldest_reading: DateTime<Utc>,
     /// `readSessions` is off, so no rates were learned (spec §2.3).
@@ -38,17 +36,11 @@ pub struct Situation {
 
 impl Situation {
     /// Checks the values [`decide`] and [`regime`] take: [`Inputs::check`] must
-    /// pass, and neither the last switch nor the oldest reading may lie after
-    /// `inputs.now` — that is a clock that went back, not a value to hold or
-    /// pass.
+    /// pass, and the oldest reading may not lie after `inputs.now` — that is a
+    /// clock that went back, not a value to hold or pass.
     pub fn check(&self) -> Result<(), PlanError> {
         self.inputs.check()?;
         let now = self.inputs.now;
-        if let Some(at) = self.last_switch_at {
-            if at > now {
-                return Err(PlanError::LastSwitchAfterNow { at, now });
-            }
-        }
         if self.oldest_reading > now {
             return Err(PlanError::OldestReadingAfterNow {
                 at: self.oldest_reading,
@@ -183,10 +175,12 @@ pub fn regime(situation: &Situation) -> Regime {
 ///    a target → [`Decision::Switch`] with [`Reason::ActiveFull`] (or
 ///    [`Reason::NoneActive`] when there is no active account), else
 ///    [`Decision::AllFull`];
-/// 4. a manual hold in the future → [`Decision::Stay`];
+/// 4. a manual hold in the future, or the last switch less than
+///    [`MIN_DWELL_MIN`] ago ([`early_move_allowed`], the rule the eager plan
+///    plays) → [`Decision::Stay`];
 /// 5. early switching ([`Regime::early`]) and [`choose`] names another account
 ///    whose slack is at least [`SLACK_MARGIN_H`] × the typical hour below the
-///    active one's, at least [`MIN_DWELL_MIN`] after the last switch: with no
+///    active one's: with no
 ///    busy tied session → [`Decision::Switch`] (`WindowOpen` when the target has
 ///    a 5 h limit, else `ResetNear`); with one → [`Decision::Wait`] until the
 ///    rhythm's work from now reaches the target's slack. A slack of 0 or less
@@ -237,7 +231,7 @@ pub fn decide(situation: &Situation, regime: &Regime) -> Decision {
         };
     }
 
-    if situation.manual_hold_until.is_some_and(|until| until > now) {
+    if !early_move_allowed(inputs.last_switch_at, inputs.manual_hold_until, now) {
         return Decision::Stay;
     }
 
@@ -247,7 +241,7 @@ pub fn decide(situation: &Situation, regime: &Regime) -> Decision {
     let Some(to) = choose(inputs, now) else {
         return Decision::Stay;
     };
-    if to == active.id || !at_least_a_dwell_ago(situation.last_switch_at, now) {
+    if to == active.id {
         return Decision::Stay;
     }
     let Some(target) = inputs.accounts.iter().find(|account| account.id == to) else {
@@ -275,15 +269,6 @@ pub fn decide(situation: &Situation, regime: &Regime) -> Decision {
             tied_busy: situation.tied_busy,
             reason,
         }
-    }
-}
-
-/// Whether the last switch is at least [`MIN_DWELL_MIN`] ago; no known switch
-/// counts as long ago.
-fn at_least_a_dwell_ago(last_switch_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
-    match last_switch_at {
-        None => true,
-        Some(last) => now.signed_duration_since(last) >= Duration::minutes(MIN_DWELL_MIN),
     }
 }
 
@@ -338,8 +323,6 @@ mod tests {
                 wu: 0.05,
                 samples: 3,
             }),
-            last_switch_at: None,
-            manual_hold_until: None,
             tied_busy: 0,
             oldest_reading: now() - Duration::minutes(1),
             sessions_off: false,
@@ -384,7 +367,7 @@ mod tests {
 
         // Neither a busy tied session nor a manual hold holds S1 back.
         situation.tied_busy = 3;
-        situation.manual_hold_until = Some(now() + Duration::hours(3));
+        situation.inputs.manual_hold_until = Some(now() + Duration::hours(3));
         let state = regime(&situation);
         assert_eq!(
             decide(&situation, &state),
@@ -550,11 +533,11 @@ mod tests {
     #[test]
     fn a_manual_switch_holds_for_four_hours() {
         let mut situation = situation(inputs());
-        situation.manual_hold_until = Some(now() + Duration::hours(3));
+        situation.inputs.manual_hold_until = Some(now() + Duration::hours(3));
         let state = regime(&situation);
         assert_eq!(decide(&situation, &state), Decision::Stay);
 
-        situation.manual_hold_until = Some(now() - Duration::minutes(1));
+        situation.inputs.manual_hold_until = Some(now() - Duration::minutes(1));
         let state = regime(&situation);
         assert_eq!(
             decide(&situation, &state),
@@ -568,11 +551,11 @@ mod tests {
     #[test]
     fn a_recent_switch_holds_for_thirty_minutes() {
         let mut situation = situation(inputs());
-        situation.last_switch_at = Some(now() - Duration::minutes(29));
+        situation.inputs.last_switch_at = Some(now() - Duration::minutes(29));
         let state = regime(&situation);
         assert_eq!(decide(&situation, &state), Decision::Stay);
 
-        situation.last_switch_at = Some(now() - Duration::minutes(30));
+        situation.inputs.last_switch_at = Some(now() - Duration::minutes(30));
         let state = regime(&situation);
         assert_eq!(
             decide(&situation, &state),
@@ -721,7 +704,7 @@ mod tests {
         assert!(good.check().is_ok());
 
         let mut future_switch = good.clone();
-        future_switch.last_switch_at = Some(now() + Duration::minutes(1));
+        future_switch.inputs.last_switch_at = Some(now() + Duration::minutes(1));
         let err = future_switch
             .check()
             .expect_err("a last switch after now is rejected");
@@ -861,7 +844,7 @@ mod tests {
     #[test]
     fn a_manual_hold_that_ends_now_is_no_hold() {
         let mut situation = situation(inputs());
-        situation.manual_hold_until = Some(now());
+        situation.inputs.manual_hold_until = Some(now());
         let state = regime(&situation);
         assert_eq!(
             decide(&situation, &state),
@@ -887,6 +870,8 @@ mod tests {
             accounts: vec![z, x1, x2],
             active: Some("Z".to_string()),
             rhythm: week(15),
+            last_switch_at: None,
+            manual_hold_until: None,
         };
         let situation = situation(inputs);
         let state = regime(&situation);
@@ -927,6 +912,8 @@ mod tests {
             accounts: vec![z, x1, x2],
             active: Some("Z".to_string()),
             rhythm: week(15),
+            last_switch_at: None,
+            manual_hold_until: None,
         };
         let situation = situation(inputs);
         let state = regime(&situation);
@@ -959,6 +946,8 @@ mod tests {
             accounts: vec![z, x1, x2],
             active: Some("Z".to_string()),
             rhythm: week(15),
+            last_switch_at: None,
+            manual_hold_until: None,
         };
         let z_slack = slack(&inputs.accounts[0], &inputs).expect("Z has rates");
         let x1_slack = slack(&inputs.accounts[1], &inputs).expect("X1 has rates");

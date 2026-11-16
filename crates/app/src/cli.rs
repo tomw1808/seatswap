@@ -1553,6 +1553,7 @@ fn burn_status(
     let assessment = live::assess(situation, None);
     status.paused_until = assessment
         .situation
+        .inputs
         .manual_hold_until
         .filter(|until| *until > now);
     status.next = assessment.next.clone();
@@ -2342,6 +2343,7 @@ pub(crate) mod tests {
                     usage: Some(Usage {
                         limits,
                         extra_usage_enabled: false,
+                        warnings: Vec::new(),
                     }),
                     fetched_at: Some(now),
                     ..CacheEntry::default()
@@ -3678,6 +3680,7 @@ pub(crate) mod tests {
             usage: Some(Usage {
                 limits,
                 extra_usage_enabled: false,
+                warnings: Vec::new(),
             }),
             usable: true,
             blocked_until: None,
@@ -3716,6 +3719,8 @@ pub(crate) mod tests {
             ],
             active: Some("pr".to_string()),
             rhythm: Rhythm { wu: [1.0; 168] },
+            last_switch_at: None,
+            manual_hold_until: None,
         }
     }
 

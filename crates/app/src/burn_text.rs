@@ -441,6 +441,7 @@ mod tests {
             usage: Some(Usage {
                 limits,
                 extra_usage_enabled: false,
+                warnings: Vec::new(),
             }),
             usable: true,
             blocked_until: None,
@@ -507,6 +508,8 @@ mod tests {
             ],
             active: Some("pr".to_string()),
             rhythm: Rhythm { wu: [1.0; 168] },
+            last_switch_at: None,
+            manual_hold_until: None,
         }
     }
 
@@ -523,6 +526,8 @@ mod tests {
             ],
             active: Some("pr".to_string()),
             rhythm: Rhythm { wu: [1.0; 168] },
+            last_switch_at: None,
+            manual_hold_until: None,
         }
     }
 
@@ -542,8 +547,6 @@ mod tests {
             oldest_reading: inputs.now - Duration::minutes(1),
             inputs,
             cost: None,
-            last_switch_at: None,
-            manual_hold_until: None,
             tied_busy: 0,
             sessions_off: false,
         }

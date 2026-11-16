@@ -407,6 +407,7 @@ mod tests {
         Usage {
             limits,
             extra_usage_enabled: false,
+            warnings: Vec::new(),
         }
     }
 

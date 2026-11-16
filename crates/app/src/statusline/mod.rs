@@ -778,6 +778,7 @@ mod tests {
                 },
             ],
             extra_usage_enabled: false,
+            warnings: Vec::new(),
         }
     }
 

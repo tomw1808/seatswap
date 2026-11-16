@@ -177,6 +177,7 @@ pub fn usage_from(answer: &Value) -> Result<(Usage, Option<String>, AccountRef),
         Usage {
             limits,
             extra_usage_enabled: false,
+            warnings: Vec::new(),
         },
         plan,
         AccountRef {

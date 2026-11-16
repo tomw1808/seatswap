@@ -373,7 +373,8 @@ impl Api {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Usage { pub limits: Vec<Limit>, pub extra_usage_enabled: bool }
+pub struct Usage { pub limits: Vec<Limit>, pub extra_usage_enabled: bool,
+    #[serde(skip)] pub warnings: Vec<String> }   // one sentence per unreadable reset time; the engine puts them in last_error
 pub struct Limit {
     pub kind: LimitKind,             // Session | WeeklyAll | WeeklyScoped | Other(String)
     pub percent: f64,
@@ -1366,8 +1367,11 @@ earlier sample is at 100 % is left out; a rate at or below 0 is unknown (`None`)
     pub week_percent: f64, pub week_resets_at: DateTime<Utc>, pub session: Option<SessionState>,
     pub model_blocked: bool, pub rates: Option<Rates>, pub thinking_held: u32 }
 #[derive(Clone)] pub struct Inputs { pub now: DateTime<Utc>, pub offset: FixedOffset,
-    pub accounts: Vec<AccountState>, pub active: Option<String>, pub rhythm: Rhythm }
-impl Inputs { pub fn check(&self) -> Result<(), PlanError>; }
+    pub accounts: Vec<AccountState>, pub active: Option<String>, pub rhythm: Rhythm,
+    pub last_switch_at: Option<DateTime<Utc>>, pub manual_hold_until: Option<DateTime<Utc>> }
+impl Inputs { pub fn check(&self) -> Result<(), PlanError>; }   // also LastSwitchAfterNow
+pub(super) fn early_move_allowed(last_switch: Option<DateTime<Utc>>,
+    manual_hold_until: Option<DateTime<Utc>>, at: DateTime<Utc>) -> bool; // decide and the eager plan
 pub enum PlanError { InvalidPercent{account,limit,percent}, SessionWithoutReset{account,percent},
     UnknownActive{id}, DuplicateAccount{id}, LastSwitchAfterNow{at,now}, OldestReadingAfterNow{at,now} }
 pub fn blocked(account: &AccountState, at: DateTime<Utc>) -> bool;
@@ -1390,8 +1394,10 @@ pub(super) fn rhythm_walk(inputs: &Inputs) -> Walk<'_>; // the plan and `decide:
 
 `follow` plays 168 h in 15-minute steps. Lazy stays on the current account until it is not usable,
 then calls `choose`; eager also moves when `choose` names another usable account whose slack is at
-least `SLACK_MARGIN_H` × the typical hour below the current one's and the last switch is at least
-`MIN_DWELL_MIN` ago. An account without rates is played with `c = 0` and `s = 0`: it never fills
+least `SLACK_MARGIN_H` × the typical hour below the current one's and `early_move_allowed` says
+yes: the last switch at least `MIN_DWELL_MIN` ago and no manual hold running. The walk starts from
+`Inputs::last_switch_at` and `Inputs::manual_hold_until`, so the plan's first early move is the one
+`decide` will make; a replay passes `None` for both. An account without rates is played with `c = 0` and `s = 0`: it never fills
 and never causes an eager move. An active account with `may_use` false stays until it is blocked.
 `choose` is the usable account with the least slack, ties by the earlier weekly reset and then id;
 when any usable account has no rates it uses the fixed order instead (capped accounts with an open
@@ -1408,7 +1414,6 @@ Forecast's planned plan, `live::assess` and everything that reads its plan take 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq)] pub struct SwitchCost { pub wu: f64, pub samples: u32 }
 #[derive(Clone)] pub struct Situation { pub inputs: Inputs, pub cost: Option<SwitchCost>,
-    pub last_switch_at: Option<DateTime<Utc>>, pub manual_hold_until: Option<DateTime<Utc>>,
     pub tied_busy: u32, pub oldest_reading: DateTime<Utc>, pub sessions_off: bool }
 impl Situation { pub fn check(&self) -> Result<(), PlanError>; }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum RegimeWhy { Learning, SessionsOff, NoCostYet, NotWorthIt, Pays }
@@ -1426,9 +1431,9 @@ pub fn decide(situation: &Situation, regime: &Regime) -> Decision;
 
 `decide` in this order: a reading older than `FRESH_MIN` → `Stale`; the active account blocked or no
 active account → `choose` names a target → `Switch` (`NoneActive` when there was none, otherwise
-`ActiveFull`), else `AllFull`; a manual hold in the future → `Stay`; early switching on, an active
-account auto-burn may use, `choose` names another account with enough less slack, and the dwell has
-passed → `Switch` (`WindowOpen` when the target has a 5 h limit, else `ResetNear`), or `Wait` when
+`ActiveFull`), else `AllFull`; `early_move_allowed` false (a manual hold in the future, or the last
+switch less than `MIN_DWELL_MIN` ago) → `Stay`; early switching on, an active account auto-burn may
+use, and `choose` names another account with enough less slack → `Switch` (`WindowOpen` when the target has a 5 h limit, else `ResetNear`), or `Wait` when
 a thinking-tied session is busy and the target still has slack; otherwise `Stay`. A target slack of
 0 or less switches at once. `regime.early` is `why == Pays`; it needs rates for every account
 auto-burn may use, a typical hour, at least `MIN_COST_SAMPLES`, and both gain rules of

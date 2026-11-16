@@ -1940,6 +1940,7 @@ mod tests {
                 },
             ],
             extra_usage_enabled: false,
+            warnings: Vec::new(),
         }
     }
 
@@ -3125,6 +3126,8 @@ mod tests {
                 accounts: Vec::new(),
                 active: None,
                 rhythm: seatswap_core::burn::Rhythm { wu: [0.0; 168] },
+                last_switch_at: None,
+                manual_hold_until: None,
             },
             Regime {
                 early: false,

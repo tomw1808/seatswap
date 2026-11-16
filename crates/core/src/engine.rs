@@ -880,7 +880,9 @@ impl<R: Remote> Engine<R> {
         let entry = self.cache.entries.entry(id.to_string()).or_default();
         entry.usage = Some(usage.clone());
         entry.fetched_at = Some(now);
-        entry.last_error = None;
+        // A reading with parts seatswap could not read is still a reading; its
+        // warnings are the account's note until a reading without them.
+        entry.last_error = (!usage.warnings.is_empty()).then(|| usage.warnings.join("; "));
         entry.failures = 0;
         entry.backoff_until = None;
         if let Some(recorder) = self.recorder.as_mut() {
@@ -1427,6 +1429,7 @@ mod tests {
                 is_active: true,
             }],
             extra_usage_enabled: false,
+            warnings: Vec::new(),
         }
     }
 
@@ -2296,6 +2299,39 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_with_an_unreadable_reset_is_kept_and_its_warning_shown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fixture = Fixture::new(&tmp);
+        fixture.file.accounts[1].login_state = LoginState::LoggedOut;
+        fixture.save_file();
+        let fake = fixture.fake.clone();
+        let warning = "Claude's usage reply has a reset time seatswap cannot read for the session limit (\"soon\"); it is shown without one";
+        let mut odd = usage_with(97.0, None);
+        odd.warnings = vec![warning.to_string()];
+        fake.script_usage(&live_access(), Ok(odd));
+        fake.script_usage_ok(&live_access(), 98.0);
+        let (_app, _fake, mut engine) = fixture.into_engine();
+        let entry = |engine: &Engine<FakeRemote>| engine.cache.entries.get(A_ID).unwrap().clone();
+
+        engine.poll(PollReason::Timer, t0()).unwrap();
+        let first = entry(&engine);
+        assert_eq!(first.last_error.as_deref(), Some(warning));
+        assert_eq!(first.failures, 0, "a warning is no failure");
+        assert_eq!(
+            first
+                .usage
+                .as_ref()
+                .and_then(Usage::session)
+                .map(|limit| limit.percent),
+            Some(97.0),
+            "the reading is kept"
+        );
+
+        engine.poll(PollReason::PanelOpened, at(600)).unwrap();
+        assert_eq!(entry(&engine).last_error, None, "a clean reading clears it");
+    }
+
+    #[test]
     fn transient_failures_back_off_one_two_four_minutes_and_a_success_resets() {
         let tmp = tempfile::tempdir().unwrap();
         let mut fixture = Fixture::new(&tmp);
@@ -2741,6 +2777,7 @@ mod tests {
         Usage {
             limits,
             extra_usage_enabled: false,
+            warnings: Vec::new(),
         }
     }
 

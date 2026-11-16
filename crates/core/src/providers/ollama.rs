@@ -159,6 +159,7 @@ fn new_plan(
                     is_active: true,
                 }],
                 extra_usage_enabled: false,
+                warnings: Vec::new(),
             })
         }
         _ => None,
@@ -198,6 +199,7 @@ fn old_plan(
         Some(Usage {
             limits,
             extra_usage_enabled: false,
+            warnings: Vec::new(),
         }),
         None,
     ))

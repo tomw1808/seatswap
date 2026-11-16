@@ -477,6 +477,7 @@ mod tests {
         Usage {
             limits: vec![limit(LimitKind::WeeklyAll, percent, resets_at)],
             extra_usage_enabled: false,
+            warnings: Vec::new(),
         }
     }
 
@@ -486,6 +487,7 @@ mod tests {
         Usage {
             limits: vec![scoped],
             extra_usage_enabled: false,
+            warnings: Vec::new(),
         }
     }
 
@@ -501,6 +503,7 @@ mod tests {
         Usage {
             limits: vec![limit(LimitKind::WeeklyAll, all, all_reset), model_limit],
             extra_usage_enabled: false,
+            warnings: Vec::new(),
         }
     }
 
@@ -1043,6 +1046,7 @@ mod tests {
                 Some(utc("2026-11-14T14:00:00Z")),
             )],
             extra_usage_enabled: false,
+            warnings: Vec::new(),
         };
         recorder
             .reading(
@@ -1121,6 +1125,7 @@ mod tests {
         let no_limits = Usage {
             limits: vec![],
             extra_usage_enabled: false,
+            warnings: Vec::new(),
         };
         let nothing = recorder
             .reading(

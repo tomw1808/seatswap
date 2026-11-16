@@ -171,6 +171,7 @@ Rules for reading it:
 - **A limit can be missing.** The private account's reply had `five_hour: null` and no `session` entry in `limits[]`, only weekly limits *(tested)*. Show only the limits the reply holds.
 - Ignore unknown keys. The response carries many code-named null fields that change between releases.
 - Show `extra_usage` / `spend` only when `enabled` is true.
+- **A reset time seatswap cannot read** (not an RFC 3339 date) leaves that limit without a reset, and the account's card says so: `Claude's usage reply has a reset time seatswap cannot read for the session limit ("…"); it is shown without one.` The reading itself is kept. A missing or `null` reset time is normal (no window runs) and says nothing.
 
 ---
 
@@ -489,7 +490,11 @@ The suggestion's "Staying on …" sentence is the lazy plan's — the plan that 
 Once an hour seatswap plans the next 7 days twice: the **lazy** plan stays on an account until it
 is blocked and then takes the one with the least slack; the **eager** plan also takes the usable
 account with the least slack when it has at least 2 typical working hours less slack, with at most
-one switch per 30 minutes. Early switching (S2) is on only when all of these hold:
+one switch per 30 minutes. The eager plan starts from the real last switch and the manual hold or
+pause (§7.4.3): its first early move comes no sooner than 30 minutes after that switch and not
+before the hold ends, exactly when S2 may switch. So the pop-up, `burn-next.json` and the status
+line never name a switch for "now" that auto-burn will not make yet. Early switching (S2) is on
+only when all of these hold:
 
 - every account auto-burn may use has learned rates, and the rhythm has a typical working hour;
 - the measured cost of a switch has at least 3 samples;

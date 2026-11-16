@@ -585,6 +585,7 @@ mod tests {
         let empty = Usage {
             limits: Vec::new(),
             extra_usage_enabled: false,
+            warnings: Vec::new(),
         };
         assert_eq!(
             tooltip(&view, &empty, utc("2026-11-10T12:00:00Z")),
@@ -626,6 +627,7 @@ mod tests {
                 is_active: true,
             }],
             extra_usage_enabled: false,
+            warnings: Vec::new(),
         };
         assert_eq!(
             tooltip(&view, &usage, utc("2026-11-10T12:00:00Z")),
