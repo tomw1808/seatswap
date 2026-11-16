@@ -633,13 +633,13 @@ where
     Ok(lines)
 }
 
-/// What a preview says about the segments the fitting dropped, one name per
-/// kind.
+/// What a preview says about the segments the fitting dropped, one label per
+/// kind, from the store's one kind table.
 #[cfg_attr(not(test), allow(dead_code))]
 fn dropped_note(dropped: &[SegmentKind]) -> String {
     let mut names: Vec<&'static str> = Vec::new();
     for kind in dropped {
-        let name = kind_name(*kind);
+        let name = kind.spec().label;
         if !names.contains(&name) {
             names.push(name);
         }
@@ -654,32 +654,6 @@ fn dropped_note(dropped: &[SegmentKind]) -> String {
     };
     let is = if names.len() == 1 { "is" } else { "are" };
     format!("{list} {is} dropped")
-}
-
-/// The name a dropped segment is called in the preview's note.
-#[cfg_attr(not(test), allow(dead_code))]
-fn kind_name(kind: SegmentKind) -> &'static str {
-    match kind {
-        SegmentKind::Account => "account",
-        SegmentKind::Plan => "plan",
-        SegmentKind::FiveHourPercent => "5 h percent",
-        SegmentKind::FiveHourReset => "5 h reset",
-        SegmentKind::WeekPercent => "week percent",
-        SegmentKind::WeekReset => "week reset",
-        SegmentKind::ModelPercent => "per-model percent",
-        SegmentKind::AutoBurn => "auto-burn",
-        SegmentKind::Model => "model",
-        SegmentKind::Effort => "effort",
-        SegmentKind::Folder => "folder",
-        SegmentKind::GitBranch => "branch",
-        SegmentKind::UserHost => "user@host",
-        SegmentKind::Clock => "clock",
-        SegmentKind::Text => "text",
-        SegmentKind::Separator => "separator",
-        SegmentKind::ContextUsed => "context used",
-        SegmentKind::SessionCost => "session cost",
-        SegmentKind::LinesChanged => "lines changed",
-    }
 }
 
 #[cfg(test)]
@@ -1287,6 +1261,67 @@ mod tests {
         assert!(text.contains("main"), "{text}");
         assert!(text.contains("~/projects/atlas"), "{text}");
         assert_eq!(preview[0].note, "everything fits");
+    }
+
+    /// The preview's note calls a dropped kind by the table's label, so the page
+    /// and the note use the same word (`git branch`, not `branch`).
+    #[test]
+    fn the_preview_note_names_a_dropped_git_branch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        let payload = preview_payload(home);
+        let facts = render::Facts {
+            user: "sam".to_string(),
+            host: "atlas".to_string(),
+            home: home.display().to_string(),
+            now: at("2026-11-14T14:00:00.336716Z"),
+            account: None,
+            five_hour: None,
+            week: None,
+            model_limits: Vec::new(),
+            burn_next: None,
+            git_branch: None,
+        };
+        let config = StatuslineConfig {
+            left: vec![Segment {
+                kind: SegmentKind::GitBranch,
+                color: ColorRule::None,
+                prefix: String::new(),
+                suffix: String::new(),
+                drop: Some(1),
+                time_format: None,
+                text: None,
+            }],
+            right: Vec::new(),
+            margin: 0,
+        };
+
+        let preview = preview_lines(&config, &payload, &facts, &[1], Scenario::Live, &Utc)
+            .expect("a preview at one column");
+
+        assert_eq!(preview[0].note, "git branch is dropped");
+    }
+
+    /// The browser's table is the one `statusline_kinds` sends: every kind, in
+    /// the same order, with the same labels, groups and options.
+    #[test]
+    fn the_statusline_fixture_has_the_kinds_table() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/ui/fixture.js");
+        let source = fs::read_to_string(path).expect("the page fixture");
+        let start = source
+            .find("const FIXTURE_KINDS =")
+            .expect("the fixture has a kinds table");
+        let rest = &source[start..];
+        let open = rest.find('[').expect("the table starts with a bracket");
+        let close = rest.find("\n];").expect("the table ends on its own line");
+        let table = &rest[open..close + 2];
+        let fixture: serde_json::Value =
+            serde_json::from_str(table).expect("the fixture table is JSON-shaped");
+        let expected: Vec<serde_json::Value> = SegmentKind::ALL
+            .iter()
+            .map(|kind| serde_json::to_value(kind.spec()).expect("a kind spec as JSON"))
+            .collect();
+        assert_eq!(fixture, serde_json::Value::Array(expected));
     }
 
     // ---- proof tests of the review ----

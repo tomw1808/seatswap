@@ -45,7 +45,9 @@ use seatswap_core::stats::{
     Empty, Query,
 };
 #[cfg(feature = "gui")]
-use seatswap_core::store::{self, Account, Settings, StatuslineConfig, StatuslineInstall};
+use seatswap_core::store::{
+    self, Account, KindSpec, SegmentKind, Settings, StatuslineConfig, StatuslineInstall,
+};
 #[cfg(feature = "gui")]
 use seatswap_core::switcher::LiveState;
 #[cfg(feature = "gui")]
@@ -1109,6 +1111,14 @@ pub(crate) fn statusline_preview(
 #[tauri::command]
 pub(crate) fn statusline_presets() -> Vec<(String, StatuslineConfig)> {
     StatuslineConfig::presets()
+}
+
+/// The builder's one kind table, in the palette's order: each kind's label,
+/// group, colour rules, and whether it takes a time format, text or repeats.
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub(crate) fn statusline_kinds() -> Vec<KindSpec> {
+    SegmentKind::ALL.iter().map(|kind| kind.spec()).collect()
 }
 
 /// Start a recording for `minutes` by changing the one setting through the
@@ -2769,6 +2779,14 @@ mod tests {
     }
 
     // ---- turning the status line on in Claude Code (spec §5.4) ----
+
+    /// The command sends the store's whole table, in the palette's order.
+    #[cfg(feature = "gui")]
+    #[test]
+    fn statusline_kinds_are_the_table_in_palette_order() {
+        let expected: Vec<KindSpec> = SegmentKind::ALL.iter().map(|kind| kind.spec()).collect();
+        assert_eq!(statusline_kinds(), expected);
+    }
 
     #[cfg(feature = "gui")]
     fn statusline_paths(tmp: &tempfile::TempDir) -> (ClaudePaths, PathBuf) {

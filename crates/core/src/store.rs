@@ -218,6 +218,240 @@ pub enum SegmentKind {
     LinesChanged,
 }
 
+/// The palette group a kind is shown under (spec §5.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PaletteGroup {
+    Seatswap,
+    ClaudeCode,
+    System,
+}
+
+/// What the builder's palette knows about one kind (spec §5.4): its page label,
+/// its group, the colour rules it takes in the page's order, and whether it
+/// takes a time format, takes text, or may be added more than once. This is the
+/// one table: Rust's validation and the page both read it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KindSpec {
+    pub kind: SegmentKind,
+    pub label: &'static str,
+    pub group: PaletteGroup,
+    pub colors: &'static [&'static str],
+    pub time: bool,
+    pub text: bool,
+    pub repeatable: bool,
+}
+
+impl SegmentKind {
+    /// Every kind in the palette's order, group by group.
+    pub const ALL: [SegmentKind; 19] = [
+        SegmentKind::Account,
+        SegmentKind::Plan,
+        SegmentKind::FiveHourPercent,
+        SegmentKind::FiveHourReset,
+        SegmentKind::WeekPercent,
+        SegmentKind::WeekReset,
+        SegmentKind::ModelPercent,
+        SegmentKind::AutoBurn,
+        SegmentKind::Model,
+        SegmentKind::Effort,
+        SegmentKind::Folder,
+        SegmentKind::GitBranch,
+        SegmentKind::ContextUsed,
+        SegmentKind::SessionCost,
+        SegmentKind::LinesChanged,
+        SegmentKind::UserHost,
+        SegmentKind::Clock,
+        SegmentKind::Text,
+        SegmentKind::Separator,
+    ];
+
+    /// The one table of the builder's kinds.
+    pub fn spec(self) -> KindSpec {
+        match self {
+            SegmentKind::Account => KindSpec {
+                kind: self,
+                label: "account",
+                group: PaletteGroup::Seatswap,
+                colors: &[COLOR_NONE, COLOR_ACCOUNT, COLOR_FIXED],
+                time: false,
+                text: false,
+                repeatable: false,
+            },
+            SegmentKind::Plan => KindSpec {
+                kind: self,
+                label: "plan",
+                group: PaletteGroup::Seatswap,
+                colors: &[COLOR_NONE, COLOR_FIXED],
+                time: false,
+                text: false,
+                repeatable: false,
+            },
+            SegmentKind::FiveHourPercent => KindSpec {
+                kind: self,
+                label: "5 h percent",
+                group: PaletteGroup::Seatswap,
+                colors: &[COLOR_NONE, COLOR_BY_LOAD, COLOR_FIXED],
+                time: false,
+                text: false,
+                repeatable: false,
+            },
+            SegmentKind::FiveHourReset => KindSpec {
+                kind: self,
+                label: "5 h reset",
+                group: PaletteGroup::Seatswap,
+                colors: &[COLOR_NONE, COLOR_FIXED],
+                time: true,
+                text: false,
+                repeatable: false,
+            },
+            SegmentKind::WeekPercent => KindSpec {
+                kind: self,
+                label: "week percent",
+                group: PaletteGroup::Seatswap,
+                colors: &[COLOR_NONE, COLOR_BY_LOAD, COLOR_FIXED],
+                time: false,
+                text: false,
+                repeatable: false,
+            },
+            SegmentKind::WeekReset => KindSpec {
+                kind: self,
+                label: "week reset",
+                group: PaletteGroup::Seatswap,
+                colors: &[COLOR_NONE, COLOR_FIXED],
+                time: true,
+                text: false,
+                repeatable: false,
+            },
+            SegmentKind::ModelPercent => KindSpec {
+                kind: self,
+                label: "per-model %",
+                group: PaletteGroup::Seatswap,
+                colors: &[COLOR_NONE, COLOR_BY_LOAD, COLOR_FIXED],
+                time: false,
+                text: false,
+                repeatable: false,
+            },
+            SegmentKind::AutoBurn => KindSpec {
+                kind: self,
+                label: "auto-burn: next",
+                group: PaletteGroup::Seatswap,
+                colors: &[COLOR_NONE, COLOR_FIXED],
+                time: false,
+                text: false,
+                repeatable: false,
+            },
+            SegmentKind::Model => KindSpec {
+                kind: self,
+                label: "model",
+                group: PaletteGroup::ClaudeCode,
+                colors: &[COLOR_NONE, COLOR_BY_MODEL_FAMILY, COLOR_FIXED],
+                time: false,
+                text: false,
+                repeatable: false,
+            },
+            SegmentKind::Effort => KindSpec {
+                kind: self,
+                label: "effort",
+                group: PaletteGroup::ClaudeCode,
+                colors: &[COLOR_NONE, COLOR_BY_EFFORT, COLOR_FIXED],
+                time: false,
+                text: false,
+                repeatable: false,
+            },
+            SegmentKind::Folder => KindSpec {
+                kind: self,
+                label: "folder",
+                group: PaletteGroup::ClaudeCode,
+                colors: &[COLOR_NONE, COLOR_FIXED],
+                time: false,
+                text: false,
+                repeatable: false,
+            },
+            SegmentKind::GitBranch => KindSpec {
+                kind: self,
+                label: "git branch",
+                group: PaletteGroup::ClaudeCode,
+                colors: &[COLOR_NONE, COLOR_FIXED],
+                time: false,
+                text: false,
+                repeatable: false,
+            },
+            SegmentKind::ContextUsed => KindSpec {
+                kind: self,
+                label: "context used",
+                group: PaletteGroup::ClaudeCode,
+                colors: &[COLOR_NONE, COLOR_FIXED],
+                time: false,
+                text: false,
+                repeatable: false,
+            },
+            SegmentKind::SessionCost => KindSpec {
+                kind: self,
+                label: "session cost",
+                group: PaletteGroup::ClaudeCode,
+                colors: &[COLOR_NONE, COLOR_FIXED],
+                time: false,
+                text: false,
+                repeatable: false,
+            },
+            SegmentKind::LinesChanged => KindSpec {
+                kind: self,
+                label: "lines changed",
+                group: PaletteGroup::ClaudeCode,
+                colors: &[COLOR_NONE, COLOR_FIXED],
+                time: false,
+                text: false,
+                repeatable: false,
+            },
+            SegmentKind::UserHost => KindSpec {
+                kind: self,
+                label: "user@host",
+                group: PaletteGroup::System,
+                colors: &[COLOR_NONE, COLOR_FIXED],
+                time: false,
+                text: false,
+                repeatable: false,
+            },
+            SegmentKind::Clock => KindSpec {
+                kind: self,
+                label: "clock",
+                group: PaletteGroup::System,
+                colors: &[COLOR_NONE, COLOR_FIXED],
+                time: false,
+                text: false,
+                repeatable: false,
+            },
+            SegmentKind::Text => KindSpec {
+                kind: self,
+                label: "free text",
+                group: PaletteGroup::System,
+                colors: &[COLOR_NONE, COLOR_FIXED],
+                time: false,
+                text: true,
+                repeatable: true,
+            },
+            SegmentKind::Separator => KindSpec {
+                kind: self,
+                label: "separator",
+                group: PaletteGroup::System,
+                colors: &[COLOR_NONE, COLOR_FIXED],
+                time: false,
+                text: false,
+                repeatable: true,
+            },
+        }
+    }
+}
+
+const COLOR_NONE: &str = "none";
+const COLOR_FIXED: &str = "fixed";
+const COLOR_BY_LOAD: &str = "byLoad";
+const COLOR_BY_MODEL_FAMILY: &str = "byModelFamily";
+const COLOR_BY_EFFORT: &str = "byEffort";
+const COLOR_ACCOUNT: &str = "account";
+
 /// How a segment is coloured (spec §5.4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "rule", rename_all = "camelCase")]
@@ -228,6 +462,20 @@ pub enum ColorRule {
     ByModelFamily,
     ByEffort,
     Account,
+}
+
+impl ColorRule {
+    /// The rule's serde tag, which is also the name the table and the page use.
+    pub fn name(&self) -> &'static str {
+        match self {
+            ColorRule::None => COLOR_NONE,
+            ColorRule::Fixed { .. } => COLOR_FIXED,
+            ColorRule::ByLoad { .. } => COLOR_BY_LOAD,
+            ColorRule::ByModelFamily => COLOR_BY_MODEL_FAMILY,
+            ColorRule::ByEffort => COLOR_BY_EFFORT,
+            ColorRule::Account => COLOR_ACCOUNT,
+        }
+    }
 }
 
 /// How a reset segment shows its time (spec §5.4).
@@ -846,13 +1094,23 @@ fn validate_currency(currency: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// The status line's four rules (spec §5.4): a `Fixed` colour is `#rrggbb`, a
-/// `ByLoad` pair is ordered and inside 0..=100, `drop` is never 0, and a `Text`
-/// segment has its text. The first bad value wins, named by side and position.
+/// The status line's rules (spec §5.4): a `Fixed` colour is `#rrggbb`, a
+/// `ByLoad` pair is ordered and inside 0..=100, `drop` is never 0, a kind takes
+/// only the colour rules, time format and text the kind's spec names, and a
+/// `Text` segment has its text. The first bad value wins, named by side and
+/// position.
 fn validate_statusline(config: &StatuslineConfig) -> Result<(), StoreError> {
     for (side, segments) in [("left", &config.left), ("right", &config.right)] {
         for (index, segment) in segments.iter().enumerate() {
             let at = format!("statusline.{side}[{index}]");
+            let spec = segment.kind.spec();
+            let rule = segment.color.name();
+            if !spec.colors.contains(&rule) {
+                return Err(StoreError::InvalidSetting(format!(
+                    "{at}.color: {} does not take {rule}",
+                    spec.label
+                )));
+            }
             match &segment.color {
                 ColorRule::Fixed { color } => {
                     validate_color(color).map_err(|error| {
@@ -879,6 +1137,18 @@ fn validate_statusline(config: &StatuslineConfig) -> Result<(), StoreError> {
             if segment.drop == Some(0) {
                 return Err(StoreError::InvalidSetting(format!(
                     "{at}.drop: must be at least 1, got 0"
+                )));
+            }
+            if segment.time_format.is_some() && !spec.time {
+                return Err(StoreError::InvalidSetting(format!(
+                    "{at}.timeFormat: {} does not take a time format",
+                    spec.label
+                )));
+            }
+            if segment.text.is_some() && !spec.text {
+                return Err(StoreError::InvalidSetting(format!(
+                    "{at}.text: {} does not take text",
+                    spec.label
                 )));
             }
             if segment.kind == SegmentKind::Text && segment.text.is_none() {
@@ -2245,6 +2515,97 @@ mod tests {
         assert_eq!(
             statusline_error(config),
             "invalid setting: statusline.left[1].text: a Text segment needs text"
+        );
+    }
+
+    /// The palette's one table lists every kind once, in the page's order, and
+    /// no two kinds share a label.
+    #[test]
+    fn every_kind_has_one_spec() {
+        let all = [
+            SegmentKind::Account,
+            SegmentKind::Plan,
+            SegmentKind::FiveHourPercent,
+            SegmentKind::FiveHourReset,
+            SegmentKind::WeekPercent,
+            SegmentKind::WeekReset,
+            SegmentKind::ModelPercent,
+            SegmentKind::AutoBurn,
+            SegmentKind::Model,
+            SegmentKind::Effort,
+            SegmentKind::Folder,
+            SegmentKind::GitBranch,
+            SegmentKind::ContextUsed,
+            SegmentKind::SessionCost,
+            SegmentKind::LinesChanged,
+            SegmentKind::UserHost,
+            SegmentKind::Clock,
+            SegmentKind::Text,
+            SegmentKind::Separator,
+        ];
+        assert_eq!(SegmentKind::ALL, all);
+        let mut labels = HashSet::new();
+        for kind in SegmentKind::ALL {
+            let spec = kind.spec();
+            assert_eq!(spec.kind, kind);
+            assert!(
+                labels.insert(spec.label),
+                "the label {:?} is used by two kinds",
+                spec.label
+            );
+        }
+    }
+
+    /// A kind refuses a colour rule its spec does not name, with the place and
+    /// the kind in the message; every preset stays valid.
+    #[test]
+    fn validate_refuses_a_colour_rule_the_kind_does_not_take() {
+        let mut config = StatuslineConfig::current_line();
+        config.left[2].color = ColorRule::ByLoad { warn: 50, bad: 80 };
+        assert_eq!(
+            statusline_error(config),
+            "invalid setting: statusline.left[2].color: folder does not take byLoad"
+        );
+
+        let mut config = StatuslineConfig::current_line();
+        config.left[0].kind = SegmentKind::Clock;
+        config.left[0].color = ColorRule::ByEffort;
+        assert_eq!(
+            statusline_error(config),
+            "invalid setting: statusline.left[0].color: clock does not take byEffort"
+        );
+
+        let mut config = StatuslineConfig::current_line();
+        config.left[3].color = ColorRule::Account;
+        assert_eq!(
+            statusline_error(config),
+            "invalid setting: statusline.left[3].color: model does not take account"
+        );
+
+        for (name, preset) in StatuslineConfig::presets() {
+            assert!(
+                settings_with_statusline(preset).validate().is_ok(),
+                "the preset {name:?} must pass"
+            );
+        }
+    }
+
+    /// A time format belongs to the two reset segments and text to the Text
+    /// segment; another kind refuses both.
+    #[test]
+    fn validate_refuses_a_time_format_or_text_on_the_wrong_kind() {
+        let mut config = StatuslineConfig::current_line();
+        config.left[0].time_format = Some(TimeFormat::Seatswap);
+        assert_eq!(
+            statusline_error(config),
+            "invalid setting: statusline.left[0].timeFormat: user@host does not take a time format"
+        );
+
+        let mut config = StatuslineConfig::current_line();
+        config.left[2].text = Some("atlas".to_string());
+        assert_eq!(
+            statusline_error(config),
+            "invalid setting: statusline.left[2].text: folder does not take text"
         );
     }
 

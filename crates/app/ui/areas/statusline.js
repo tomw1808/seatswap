@@ -21,68 +21,9 @@ import {
   switchControl,
 } from "../common.js";
 
-// One table for the segment kinds: the groups, the names the page uses, and
-// the options that apply to each kind. It is read from the Rust types
-// (`SegmentKind`, `TimeFormat`, `ColorRule` and `render.rs`): only a kind with a
-// percentage can use "by load", only the model can use "by model family", only
-// the effort can use "by effort", only the account can use its own colour, and
-// only the two reset segments use a time format and only Text uses its text.
-const KINDS = [
-  { id: "account", label: "account", group: "seatswap", colors: ["none", "account", "fixed"] },
-  { id: "plan", label: "plan", group: "seatswap", colors: ["none", "fixed"] },
-  {
-    id: "fiveHourPercent",
-    label: "5 h percent",
-    group: "seatswap",
-    colors: ["none", "byLoad", "fixed"],
-  },
-  {
-    id: "fiveHourReset",
-    label: "5 h reset",
-    group: "seatswap",
-    colors: ["none", "fixed"],
-    time: true,
-  },
-  { id: "weekPercent", label: "week percent", group: "seatswap", colors: ["none", "byLoad", "fixed"] },
-  { id: "weekReset", label: "week reset", group: "seatswap", colors: ["none", "fixed"], time: true },
-  {
-    id: "modelPercent",
-    label: "per-model %",
-    group: "seatswap",
-    colors: ["none", "byLoad", "fixed"],
-  },
-  { id: "autoBurn", label: "auto-burn: next", group: "seatswap", colors: ["none", "fixed"] },
-  {
-    id: "model",
-    label: "model",
-    group: "claudeCode",
-    colors: ["none", "byModelFamily", "fixed"],
-  },
-  { id: "effort", label: "effort", group: "claudeCode", colors: ["none", "byEffort", "fixed"] },
-  { id: "folder", label: "folder", group: "claudeCode", colors: ["none", "fixed"] },
-  { id: "gitBranch", label: "git branch", group: "claudeCode", colors: ["none", "fixed"] },
-  { id: "contextUsed", label: "context used", group: "claudeCode", colors: ["none", "fixed"] },
-  { id: "sessionCost", label: "session cost", group: "claudeCode", colors: ["none", "fixed"] },
-  { id: "linesChanged", label: "lines changed", group: "claudeCode", colors: ["none", "fixed"] },
-  { id: "userHost", label: "user@host", group: "system", colors: ["none", "fixed"] },
-  { id: "clock", label: "clock", group: "system", colors: ["none", "fixed"] },
-  {
-    id: "text",
-    label: "free text",
-    group: "system",
-    colors: ["none", "fixed"],
-    text: true,
-    repeatable: true,
-  },
-  {
-    id: "separator",
-    label: "separator",
-    group: "system",
-    colors: ["none", "fixed"],
-    repeatable: true,
-  },
-];
-
+// The group headings the palette shows. The kinds themselves, their labels,
+// groups, colour rules and options come from `statusline_kinds` (the one table
+// in `store.rs`), so the page and the stored layout cannot drift apart.
 const GROUPS = [
   { id: "seatswap", label: "seatswap" },
   { id: "claudeCode", label: "Claude Code" },
@@ -136,13 +77,15 @@ const state = {
   dragError: null,
   installError: null,
   presetError: null,
+  kindsError: null,
   keysError: null,
   fieldsError: null,
   notice: null,
-  // The install state, the three presets and the optional segments' field
-  // paths, read once when the area opens.
+  // The install state, the three presets, the kinds table and the optional
+  // segments' field paths, read once when the area opens.
   install: null,
   presets: null,
+  kinds: null,
   fields: null,
   // The chosen segment, by zone and position. The positions are rebuilt on
   // every redraw, so the selection is kept as a pair and never as a node.
@@ -188,11 +131,13 @@ const state = {
 };
 
 function kindOf(id) {
-  return KINDS.find((kind) => kind.id === id) || null;
+  if (!Array.isArray(state.kinds)) return null;
+  return state.kinds.find((kind) => kind.kind === id) || null;
 }
 
 function groupKinds(group) {
-  return KINDS.filter((kind) => kind.group === group);
+  if (!Array.isArray(state.kinds)) return [];
+  return state.kinds.filter((kind) => kind.group === group);
 }
 
 function selectedSegment() {
@@ -252,14 +197,14 @@ function readZone(list, side, errors) {
       errors.push(`${at}.kind is missing`);
       return;
     }
-    if (!kindOf(segment.kind)) {
+    if (Array.isArray(state.kinds) && !kindOf(segment.kind)) {
       errors.push(`${at}.kind: unknown segment kind ${JSON.stringify(segment.kind)}`);
     }
   });
 }
 
 // The stored layout and what the page cannot draw: the two zones must be lists
-// and every segment's kind must be in the KINDS table. Every other value is
+// and every segment's kind must be in the kinds table. Every other value is
 // Rust's to check when the layout is saved; the page shows what it was sent.
 function readConfig(raw) {
   const errors = [];
@@ -408,6 +353,38 @@ function readPresets(reply) {
       throw new Error(`statusline_presets returned a bad preset at position ${index + 1}`);
     }
     return [entry[0], entry[1]];
+  });
+}
+
+function readKinds(reply) {
+  if (!Array.isArray(reply)) throw new Error("statusline_kinds returned an unexpected reply");
+  return reply.map((entry, index) => {
+    if (
+      !isObject(entry) ||
+      typeof entry.kind !== "string" ||
+      entry.kind === "" ||
+      typeof entry.label !== "string" ||
+      entry.label === "" ||
+      typeof entry.group !== "string" ||
+      entry.group === "" ||
+      !Array.isArray(entry.colors) ||
+      entry.colors.length === 0 ||
+      entry.colors.some((color) => typeof color !== "string" || color === "") ||
+      typeof entry.time !== "boolean" ||
+      typeof entry.text !== "boolean" ||
+      typeof entry.repeatable !== "boolean"
+    ) {
+      throw new Error(`statusline_kinds returned a bad kind at position ${index + 1}`);
+    }
+    return {
+      kind: entry.kind,
+      label: entry.label,
+      group: entry.group,
+      colors: entry.colors.slice(),
+      time: entry.time,
+      text: entry.text,
+      repeatable: entry.repeatable,
+    };
   });
 }
 
@@ -605,7 +582,7 @@ function renderErrors() {
   for (const text of state.errors) {
     state.errorHost.appendChild(banner("error", "⚠", text));
   }
-  for (const text of [state.saveError, state.dragError, state.installError, state.presetError, state.keysError, state.fieldsError]) {
+  for (const text of [state.saveError, state.dragError, state.installError, state.presetError, state.kindsError, state.keysError, state.fieldsError]) {
     if (typeof text === "string" && text !== "") {
       state.errorHost.appendChild(banner("error", "⚠", text));
     }
@@ -914,7 +891,7 @@ function paletteCard() {
   const groups = GROUPS.map((group) => {
     const zone = h("div", { class: "sl-zone sl-zone-palette", role: "list" });
     for (const kind of groupKinds(group.id)) {
-      if (!kind.repeatable && used.has(kind.id)) continue;
+      if (!kind.repeatable && used.has(kind.kind)) continue;
       zone.appendChild(paletteChip(kind));
     }
     return h("div", { class: "sl-group" }, [
@@ -937,31 +914,31 @@ function paletteChip(kind) {
       tabindex: "0",
       draggable: "true",
       text: kind.label,
-      dataset: { palette: kind.id },
+      dataset: { palette: kind.kind },
       title: kind.repeatable
         ? `${kind.label} can be added more than once`
         : `Add ${kind.label} to the line`,
     }
   );
-  chip.addEventListener("click", () => addSegment(kind.id, state.lastZone, null));
+  chip.addEventListener("click", () => addSegment(kind.kind, state.lastZone, null));
   chip.addEventListener("keydown", (event) => {
     if (event.key === "Enter" || event.key === " ") {
       event.preventDefault();
-      addSegment(kind.id, state.lastZone, null);
+      addSegment(kind.kind, state.lastZone, null);
       return;
     }
     if (event.key === "l" || event.key === "L") {
       event.preventDefault();
-      addSegment(kind.id, "left", null);
+      addSegment(kind.kind, "left", null);
       return;
     }
     if (event.key === "r" || event.key === "R") {
       event.preventDefault();
-      addSegment(kind.id, "right", null);
+      addSegment(kind.kind, "right", null);
     }
   });
   chip.addEventListener("dragstart", (event) => {
-    const payload = { from: "palette", kind: kind.id };
+    const payload = { from: "palette", kind: kind.kind };
     state.dragging = payload;
     event.dataTransfer.setData("text/plain", JSON.stringify(payload));
     event.dataTransfer.effectAllowed = "move";
@@ -1102,7 +1079,7 @@ function segmentChip(zoneId, index, segment) {
     tabindex: "0",
     draggable: "true",
     text: segmentLabel(segment),
-    dataset: { zone: zoneId, index: String(index), kind: spec ? spec.id : String(segment.kind) },
+    dataset: { zone: zoneId, index: String(index), kind: spec ? spec.kind : String(segment.kind) },
     title: missing
       ? `${spec ? spec.label : segment.kind} · ${missing}`
       : spec
@@ -1995,6 +1972,16 @@ async function loadPresets() {
   }
 }
 
+async function loadKinds() {
+  try {
+    state.kinds = readKinds(await state.context.invoke("statusline_kinds", {}));
+    state.kindsError = null;
+  } catch (error) {
+    state.kinds = null;
+    state.kindsError = errorMessage(error);
+  }
+}
+
 async function loadInstall() {
   try {
     state.install = readInstall(await state.context.invoke("statusline_install_state", {}));
@@ -2036,12 +2023,15 @@ export async function render(container, context) {
     state.previewTimer = null;
   }
   state.previewToken += 1;
-  takeSettings(state.snapshot);
   clear(container);
   const root = h("div", { class: "sl" });
   state.root = root;
   container.appendChild(root);
+  // The kinds table is needed to read the stored layout (`takeSettings` names
+  // an unknown kind) and to build the palette; both tables are read once.
+  if (!state.kinds) await loadKinds();
   if (!state.presets) await loadPresets();
+  takeSettings(state.snapshot);
   state.presetName = presetNameOf(state.config);
   state.dirty = state.presetName === null;
   await loadInstall();
@@ -2112,11 +2102,13 @@ export function unmount() {
   state.dragError = null;
   state.installError = null;
   state.presetError = null;
+  state.kindsError = null;
   state.keysError = null;
   state.fieldsError = null;
   state.notice = null;
   state.install = null;
   state.presets = null;
+  state.kinds = null;
   state.fields = null;
   state.selected = null;
   state.focusTarget = null;

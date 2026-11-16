@@ -251,6 +251,7 @@ pub(crate) fn run(
             window::stats_hosts,
             window::statusline_preview,
             window::statusline_presets,
+            window::statusline_kinds,
             window::statusline_record,
             window::statusline_keys,
             window::statusline_fields,

@@ -1402,27 +1402,35 @@ function fixtureSessionsView(args) {
 // which runs the same `render_spans` as the installed command.
 // ---------------------------------------------------------------------------
 
-const FIXTURE_KIND_NAMES = {
-  account: "account",
-  plan: "plan",
-  fiveHourPercent: "5 h percent",
-  fiveHourReset: "5 h reset",
-  weekPercent: "week percent",
-  weekReset: "week reset",
-  modelPercent: "per-model percent",
-  autoBurn: "auto-burn",
-  model: "model",
-  effort: "effort",
-  folder: "folder",
-  gitBranch: "branch",
-  userHost: "user@host",
-  clock: "clock",
-  text: "text",
-  separator: "separator",
-  contextUsed: "context used",
-  sessionCost: "session cost",
-  linesChanged: "lines changed",
-};
+// The one kind table `statusline_kinds` sends, in the palette's order. It is
+// written the way `store.rs`'s `KindSpec` serialises, so the Rust test that
+// reads this file can compare it with `SegmentKind::ALL`.
+const FIXTURE_KINDS = [
+  { "kind": "account", "label": "account", "group": "seatswap", "colors": ["none", "account", "fixed"], "time": false, "text": false, "repeatable": false },
+  { "kind": "plan", "label": "plan", "group": "seatswap", "colors": ["none", "fixed"], "time": false, "text": false, "repeatable": false },
+  { "kind": "fiveHourPercent", "label": "5 h percent", "group": "seatswap", "colors": ["none", "byLoad", "fixed"], "time": false, "text": false, "repeatable": false },
+  { "kind": "fiveHourReset", "label": "5 h reset", "group": "seatswap", "colors": ["none", "fixed"], "time": true, "text": false, "repeatable": false },
+  { "kind": "weekPercent", "label": "week percent", "group": "seatswap", "colors": ["none", "byLoad", "fixed"], "time": false, "text": false, "repeatable": false },
+  { "kind": "weekReset", "label": "week reset", "group": "seatswap", "colors": ["none", "fixed"], "time": true, "text": false, "repeatable": false },
+  { "kind": "modelPercent", "label": "per-model %", "group": "seatswap", "colors": ["none", "byLoad", "fixed"], "time": false, "text": false, "repeatable": false },
+  { "kind": "autoBurn", "label": "auto-burn: next", "group": "seatswap", "colors": ["none", "fixed"], "time": false, "text": false, "repeatable": false },
+  { "kind": "model", "label": "model", "group": "claudeCode", "colors": ["none", "byModelFamily", "fixed"], "time": false, "text": false, "repeatable": false },
+  { "kind": "effort", "label": "effort", "group": "claudeCode", "colors": ["none", "byEffort", "fixed"], "time": false, "text": false, "repeatable": false },
+  { "kind": "folder", "label": "folder", "group": "claudeCode", "colors": ["none", "fixed"], "time": false, "text": false, "repeatable": false },
+  { "kind": "gitBranch", "label": "git branch", "group": "claudeCode", "colors": ["none", "fixed"], "time": false, "text": false, "repeatable": false },
+  { "kind": "contextUsed", "label": "context used", "group": "claudeCode", "colors": ["none", "fixed"], "time": false, "text": false, "repeatable": false },
+  { "kind": "sessionCost", "label": "session cost", "group": "claudeCode", "colors": ["none", "fixed"], "time": false, "text": false, "repeatable": false },
+  { "kind": "linesChanged", "label": "lines changed", "group": "claudeCode", "colors": ["none", "fixed"], "time": false, "text": false, "repeatable": false },
+  { "kind": "userHost", "label": "user@host", "group": "system", "colors": ["none", "fixed"], "time": false, "text": false, "repeatable": false },
+  { "kind": "clock", "label": "clock", "group": "system", "colors": ["none", "fixed"], "time": false, "text": false, "repeatable": false },
+  { "kind": "text", "label": "free text", "group": "system", "colors": ["none", "fixed"], "time": false, "text": true, "repeatable": true },
+  { "kind": "separator", "label": "separator", "group": "system", "colors": ["none", "fixed"], "time": false, "text": false, "repeatable": true }
+];
+
+function fixtureKindLabel(kind) {
+  const spec = FIXTURE_KINDS.find((entry) => entry.kind === kind);
+  return spec ? spec.label : kind;
+}
 
 function fixtureCurrentLine() {
   return clone(DEFAULT_SETTINGS.statusline);
@@ -1627,7 +1635,7 @@ function fixtureStatuslinePreview(config, widths, scenario) {
     const dropped = [];
     for (const piece of leftPieces.concat(rightPieces)) {
       if (!piece || piece.drop === null || piece.drop > level) continue;
-      const name = FIXTURE_KIND_NAMES[piece.kind] || piece.kind;
+      const name = fixtureKindLabel(piece.kind);
       if (!droppedNames.includes(name)) droppedNames.push(name);
       if (!dropped.includes(piece.drop)) dropped.push(piece.drop);
     }
@@ -1932,6 +1940,9 @@ export async function fixtureInvoke(command, args) {
     // second renderer; the commands' answers have the Rust types' shapes.
     case "statusline_presets":
       return clone(fixturePresets());
+
+    case "statusline_kinds":
+      return clone(FIXTURE_KINDS);
 
     case "statusline_preview":
       return fixtureStatuslinePreview(args.config, args.widths, args.scenario);
