@@ -24,7 +24,7 @@ use seatswap_core::store::{Account, Settings};
 use seatswap_core::switcher::UnsavedPolicy;
 
 use super::worker::{ActionCommand, ActionReply, EngineCommand};
-use crate::burn_text::{self, SwitchSuggestion};
+use crate::burn_text::{self, BurnPart, SwitchSuggestion};
 
 /// A switch that is waiting for a quiet moment; the panel shows its latest
 /// time (spec §2.12).
@@ -45,7 +45,7 @@ pub(crate) struct BurnView {
     pub early: bool,
     pub why: String,
     pub learning: Vec<String>,
-    pub line: Option<String>,
+    pub line: Option<Vec<BurnPart>>,
     /// The first future use of each account auto-burn may switch to.
     pub planned: BTreeMap<String, DateTime<Utc>>,
     pub waiting: Option<WaitingSwitch>,
@@ -293,7 +293,7 @@ impl BurnRuntime {
             }
             Readiness::NoAccounts => {
                 let mut view = waiting_view(tick.settings, Vec::new());
-                view.line = Some(burn_text::no_accounts_line().to_string());
+                view.line = Some(burn_text::no_accounts_line());
                 self.view = Some(view.clone());
                 report.view = Some(view);
                 if let Some(error) = self.clear_next(tick.app) {
@@ -1420,8 +1420,8 @@ mod tests {
         let first_report = runtime.after_snapshot(&first_tick);
         let burn_view = first_report.view.expect("unread keeps the strip");
         assert_eq!(
-            burn_view.line.as_deref(),
-            Some("Waiting for a first reading of AC."),
+            burn_text::plain(burn_view.line.as_deref().expect("a line")),
+            "Waiting for a first reading of AC.",
             "the strip says which account is unread"
         );
         assert!(burn_view.on, "the switch stays usable");
@@ -1744,7 +1744,10 @@ mod tests {
         let line = burn_text::line(&plan(now), Some("pr"), &views, &[], now)
             .expect("a line")
             .expect("a next account");
-        assert_eq!(line, "On PR until its week is full, about 2h. Then AC.");
+        assert_eq!(
+            burn_text::plain(&line),
+            "On PR until its week is full, about 2h. Then AC."
+        );
     }
 
     #[test]
@@ -2089,8 +2092,8 @@ mod tests {
         let view = report.view.expect("the strip stays for an unread account");
         assert!(view.on, "the auto-burn switch still works");
         assert_eq!(
-            view.line.as_deref(),
-            Some("Waiting for a first reading of LB, AC."),
+            burn_text::plain(view.line.as_deref().expect("a line")),
+            "Waiting for a first reading of LB, AC.",
             "the strip names the unread accounts in account order"
         );
     }

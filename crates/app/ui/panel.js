@@ -166,6 +166,17 @@ function accountLabel(view) {
   return view.abbr || view.label || "?";
 }
 
+// The one account chip of the pop-up: the account cards' `badge`, coloured in
+// the account's colour. The cards put it on their edit button; the auto-burn
+// line puts the same element and class on a span.
+function styleChip(node, abbr, color) {
+  const accent = isColor(color) ? color : TRAY_GREY;
+  node.textContent = abbr;
+  node.style.background = accent;
+  node.style.color = contrastText(accent);
+  return node;
+}
+
 function loginWarningText(warning) {
   if (!isObject(warning)) return "";
   const account = findView(warning.id);
@@ -255,22 +266,52 @@ function renderMain() {
   }
 }
 
+// A page link: the pop-up's text-link style, carrying the target it opens so
+// the page's own DOM says where it goes (spec §3.5, item 19).
+function linkButton(text, target, className) {
+  const node = h("button", {
+    type: "button",
+    class: className ? `link ${className}` : "link",
+    text,
+    dataset: { openTarget: target },
+  });
+  node.addEventListener("click", (event) => {
+    event.preventDefault();
+    openWindowTarget(target);
+  });
+  return node;
+}
+
+// The target of the waiting link: that session's `sessions?<id>`, or Sessions
+// itself when the pop-up has no session id for it. The window checks the id
+// (`parse_target`) and a refused one shows as the banner's error.
+function waitingTarget(sessions) {
+  const first = Array.isArray(sessions.waiting) ? sessions.waiting[0] : null;
+  const id = isObject(first) ? first.session : null;
+  return typeof id === "string" && id !== "" ? `sessions?${id}` : "sessions";
+}
+
 // The running sessions and the number that wait for you (spec §4.1). The strip
 // carries the same line while auto-burn has a view; the footer keeps it
-// otherwise.
+// otherwise. "N sessions" opens Sessions, "N waiting for you" Sessions at that
+// session, and "see the plan" Statistics' Forecast.
 function sessionsLineNode(sessions, className) {
   if (sessions.unavailable != null) {
     return h("span", { class: className, text: String(sessions.unavailable) });
   }
   const waiting = Array.isArray(sessions.waiting) ? sessions.waiting.length : 0;
   const line = h("span", { class: className }, [
-    `${sessions.running} sessions · ${sessions.busy} busy`,
+    linkButton(`${sessions.running} sessions`, "sessions"),
+    ` · ${sessions.busy} busy`,
   ]);
   if (waiting > 0) {
+    line.appendChild(document.createTextNode(" · "));
     line.appendChild(
-      h("span", { class: "footer-waiting", text: ` · ${waiting} waiting for you` })
+      linkButton(`${waiting} waiting for you`, waitingTarget(sessions), "footer-waiting")
     );
   }
+  line.appendChild(document.createTextNode(" · "));
+  line.appendChild(linkButton("see the plan", "statistics/forecast"));
   return line;
 }
 
@@ -285,12 +326,17 @@ function renderFooter() {
   const snapshot = state.snapshot;
   if (!snapshot || snapshot.sessions == null) return;
   const sessions = snapshot.sessions;
+  const statistics = footer.querySelector(".footer-statistics");
+  const insert = (node) => {
+    if (statistics) footer.insertBefore(node, statistics);
+    else footer.appendChild(node);
+  };
   // The strip above the cards shows this line whenever auto-burn has a view.
   if (!isObject(snapshot.burn)) {
-    footer.appendChild(sessionsLineNode(sessions, "footer-sessions"));
+    insert(sessionsLineNode(sessions, "footer-sessions"));
   }
   if (sessions.warning != null) {
-    footer.appendChild(
+    insert(
       h("span", {
         class: "footer-warning",
         title: String(sessions.warning),
@@ -298,6 +344,45 @@ function renderFooter() {
       })
     );
   }
+}
+
+// The auto-burn line as `burn_text::line` sends it: texts and account parts.
+// Every account part is the pop-up's chip, coloured from the snapshot's view
+// of that id; a part that is neither is an error, never a guessed word.
+function burnLineNode(parts, errors) {
+  const line = h("p", { class: "burn-line" });
+  if (!Array.isArray(parts)) {
+    errors.push("The auto-burn line is not a list of parts.");
+    return line;
+  }
+  for (const part of parts) {
+    if (isObject(part) && typeof part.text === "string") {
+      line.appendChild(document.createTextNode(part.text));
+      continue;
+    }
+    if (isObject(part) && typeof part.account === "string" && part.account !== "") {
+      if (typeof part.abbr !== "string" || part.abbr === "") {
+        errors.push("The auto-burn line names an account without an abbreviation.");
+        continue;
+      }
+      const view = findView(part.account);
+      if (!view) {
+        errors.push("The auto-burn line names an account that is not in the list.");
+        line.appendChild(document.createTextNode(part.abbr));
+        continue;
+      }
+      line.appendChild(
+        styleChip(
+          h("span", { class: "badge", title: view.label || part.abbr }),
+          part.abbr,
+          view.color
+        )
+      );
+      continue;
+    }
+    errors.push("The auto-burn line has a part that is neither a text nor an account.");
+  }
+  return line;
 }
 
 // The strip above the cards: the auto-burn switch, Pause/Resume, the plan's
@@ -349,7 +434,7 @@ function renderBurnStrip() {
   strip.appendChild(row);
 
   if (burn.line != null) {
-    strip.appendChild(h("p", { class: "burn-line", text: String(burn.line) }));
+    strip.appendChild(burnLineNode(burn.line, errors));
   }
 
   if (burn.waiting != null) {
@@ -706,18 +791,16 @@ function renderCard(view, index) {
 
   const main = h("div", { class: "card-main" });
 
-  const badge = h(
-    "button",
-    {
+  const badge = styleChip(
+    h("button", {
       type: "button",
       class: "badge",
       title: `Edit ${view.label || "account"}`,
       "aria-label": `Edit account ${view.abbr || ""}`,
-    },
-    [view.abbr || "?"]
+    }),
+    view.abbr || "?",
+    accent
   );
-  badge.style.background = accent;
-  badge.style.color = contrastText(accent);
   // The badge and the pencil open the large window on this account's row.
   const edit = (event) => {
     event.stopPropagation();
@@ -1493,15 +1576,21 @@ function viewFromHash() {
   return "main";
 }
 
-// The pop-up has no settings view (spec §3.7): its gear and the comma open the
-// large window at Settings instead.
-async function openSettings() {
+// The one way from the pop-up to the large window (spec §3.5): its gear, the
+// sessions and plan links and "Statistics ↗" all use it.
+async function openWindowTarget(target) {
   try {
-    await invoke("open_window", { target: "settings" });
+    await invoke("open_window", { target });
   } catch (error) {
     state.errors.banner = errorMessage(error);
     if (state.view === "main") renderMain();
   }
+}
+
+// The pop-up has no settings view (spec §3.7): its gear and the comma open the
+// large window at Settings instead.
+async function openSettings() {
+  await openWindowTarget("settings");
 }
 
 function setView(view, options) {
@@ -1629,6 +1718,8 @@ function wireStatic() {
   if (close) close.addEventListener("click", hidePanel);
   const add = document.getElementById("add-btn");
   if (add) add.addEventListener("click", () => setView("add"));
+  const statistics = document.getElementById("statistics-btn");
+  if (statistics) statistics.addEventListener("click", () => openWindowTarget("statistics"));
 
   document.addEventListener("keydown", onKeyDown);
   window.addEventListener("hashchange", () => {

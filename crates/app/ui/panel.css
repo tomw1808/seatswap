@@ -196,6 +196,7 @@ code {
   font-size: 11px;
 }
 
+
 input[type="text"],
 input[type="number"],
 select {
@@ -369,6 +370,17 @@ input[type="checkbox"] {
   font-size: 12px;
   line-height: 1.4;
   overflow-wrap: anywhere;
+}
+
+/* The account cards' chip, at the auto-burn line's size (same class). */
+.burn-line .badge {
+  min-width: 20px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 5px;
+  font-size: 10px;
+  vertical-align: 1px;
+  margin: 0 1px;
 }
 
 .burn-waiting {
@@ -948,6 +960,16 @@ text.lv-locked {
 .footer-waiting {
   color: var(--warn);
   font-weight: 600;
+}
+
+button.link.footer-waiting {
+  color: var(--warn);
+}
+
+.footer-statistics {
+  flex: 0 0 auto;
+  margin-left: auto;
+  font-size: 10.5px;
 }
 
 .footer-warning {

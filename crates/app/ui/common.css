@@ -109,3 +109,22 @@ html[data-theme="light"] {
 .banner-text {
   min-width: 0;
 }
+
+/* The app's text link: a button that reads as a link, in the pop-up and the
+   large window. */
+button.link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--focus);
+  font: inherit;
+}
+
+button.link:hover {
+  text-decoration: underline;
+}
+
+button.link:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}

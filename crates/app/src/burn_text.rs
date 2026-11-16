@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, FixedOffset, Utc};
 use serde::Serialize;
+#[cfg(feature = "gui")]
+use serde::Serializer;
 
 use seatswap_core::burn::decide::RegimeWhy;
 use seatswap_core::burn::decide::{Decision, Reason};
@@ -38,6 +40,55 @@ pub enum TextError {
     NoActive,
 }
 
+/// One piece of the auto-burn line: a text, or an account named by its id and
+/// drawn by the pop-up as a chip in the account's colour (spec §2.5).
+#[cfg(feature = "gui")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BurnPart {
+    Text(String),
+    Account { id: String, abbr: String },
+}
+
+#[cfg(feature = "gui")]
+impl Serialize for BurnPart {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // The page reads `{"text":"…"}` or `{"account":"<id>","abbr":"AC"}`;
+        // an externally tagged enum would nest the account's fields.
+        #[derive(Serialize)]
+        #[serde(untagged)]
+        enum Wire<'a> {
+            Text { text: &'a str },
+            Account { account: &'a str, abbr: &'a str },
+        }
+        let wire = match self {
+            BurnPart::Text(text) => Wire::Text { text },
+            BurnPart::Account { id, abbr } => Wire::Account { account: id, abbr },
+        };
+        wire.serialize(serializer)
+    }
+}
+
+/// The whole line as plain text: every account is its abbreviation, so the
+/// text is the sentence the line said before it had parts.
+// No front end shows the line as text today (the pop-up draws the parts, the
+// tray menu, notifications and the CLI have texts of their own); the tests
+// use it to compare the sentence.
+#[cfg(feature = "gui")]
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn plain(parts: &[BurnPart]) -> String {
+    let mut text = String::new();
+    for part in parts {
+        match part {
+            BurnPart::Text(piece) => text.push_str(piece),
+            BurnPart::Account { abbr, .. } => text.push_str(abbr),
+        }
+    }
+    text
+}
+
 /// A suggested switch: the account to switch to and the whole sentence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -60,24 +111,41 @@ fn view<'a>(views: &'a [AccountView], id: &str) -> Option<&'a AccountView> {
     views.iter().find(|view| view.id == id)
 }
 
+/// The account as the pop-up draws it: its id and its abbreviation. An id
+/// without a view is an error, never the id guessed as its name.
+#[cfg(feature = "gui")]
+fn account_part(views: &[AccountView], id: &str) -> Result<BurnPart, TextError> {
+    Ok(BurnPart::Account {
+        id: id.to_string(),
+        abbr: abbr(views, id)?,
+    })
+}
+
 /// The line while an account auto-burn may use, or the active one, has a login
 /// and no reading yet: its abbreviation, in the order `accounts` gives.
 #[cfg(feature = "gui")]
-pub fn unread_line(views: &[AccountView], accounts: &[String]) -> Result<String, TextError> {
-    let names = accounts
-        .iter()
-        .map(|id| abbr(views, id))
-        .collect::<Result<Vec<_>, _>>()?
-        .join(", ");
-    Ok(format!("Waiting for a first reading of {names}."))
+pub fn unread_line(views: &[AccountView], accounts: &[String]) -> Result<Vec<BurnPart>, TextError> {
+    let mut parts = vec![BurnPart::Text(
+        "Waiting for a first reading of ".to_string(),
+    )];
+    for (index, id) in accounts.iter().enumerate() {
+        if index > 0 {
+            parts.push(BurnPart::Text(", ".to_string()));
+        }
+        parts.push(account_part(views, id)?);
+    }
+    parts.push(BurnPart::Text(".".to_string()));
+    Ok(parts)
 }
 
 /// The line when no account auto-burn may use (nor the active one) has a
 /// working login and a reading: every such login ended, or auto-burn may use
 /// no account.
 #[cfg(feature = "gui")]
-pub fn no_accounts_line() -> &'static str {
-    "No account auto-burn may use has a working login."
+pub fn no_accounts_line() -> Vec<BurnPart> {
+    vec![BurnPart::Text(
+        "No account auto-burn may use has a working login.".to_string(),
+    )]
 }
 
 /// The target's weekly reset, in the words a reason needs.
@@ -218,16 +286,19 @@ pub fn line(
     views: &[AccountView],
     learning: &[String],
     now: DateTime<Utc>,
-) -> Result<Option<String>, TextError> {
+) -> Result<Option<Vec<BurnPart>>, TextError> {
     if !learning.is_empty() {
-        let names = learning
-            .iter()
-            .map(|id| abbr(views, id))
-            .collect::<Result<Vec<_>, _>>()?
-            .join(", ");
-        return Ok(Some(format!(
-            "Learning how fast {names} are used. Until then: switch only when full."
-        )));
+        let mut parts = vec![BurnPart::Text("Learning how fast ".to_string())];
+        for (index, id) in learning.iter().enumerate() {
+            if index > 0 {
+                parts.push(BurnPart::Text(", ".to_string()));
+            }
+            parts.push(account_part(views, id)?);
+        }
+        parts.push(BurnPart::Text(
+            " are used. Until then: switch only when full.".to_string(),
+        ));
+        return Ok(Some(parts));
     }
     let current = active
         .filter(|id| {
@@ -261,13 +332,18 @@ pub fn line(
                 .get(current)
                 .is_some_and(|full_at| *full_at <= next.from);
             if !fills_before_switch {
-                return Ok(Some(format!(
-                    "On {} for about {}. Then {}, before {} is full.",
-                    abbr(views, current)?,
-                    format::compact_left(seconds, seconds >= 24 * 60 * 60),
-                    abbr(views, next_id)?,
-                    abbr(views, current)?
-                )));
+                return Ok(Some(vec![
+                    BurnPart::Text("On ".to_string()),
+                    account_part(views, current)?,
+                    BurnPart::Text(format!(
+                        " for about {}. Then ",
+                        format::compact_left(seconds, seconds >= 24 * 60 * 60)
+                    )),
+                    account_part(views, next_id)?,
+                    BurnPart::Text(", before ".to_string()),
+                    account_part(views, current)?,
+                    BurnPart::Text(" is full.".to_string()),
+                ]));
             }
             let fill = plan
                 .full_by
@@ -279,17 +355,22 @@ pub fn line(
                 Fill::Week => "week",
                 Fill::Window => "5 h window",
             };
-            Ok(Some(format!(
-                "On {} until its {limit} is full, about {}. Then {}.",
-                abbr(views, current)?,
-                format::compact_left(seconds, seconds >= 24 * 60 * 60),
-                abbr(views, next_id)?
-            )))
+            Ok(Some(vec![
+                BurnPart::Text("On ".to_string()),
+                account_part(views, current)?,
+                BurnPart::Text(format!(
+                    " until its {limit} is full, about {}. Then ",
+                    format::compact_left(seconds, seconds >= 24 * 60 * 60)
+                )),
+                account_part(views, next_id)?,
+                BurnPart::Text(".".to_string()),
+            ]))
         }
-        None => Ok(Some(format!(
-            "On {}. No switch planned this week.",
-            abbr(views, current)?
-        ))),
+        None => Ok(Some(vec![
+            BurnPart::Text("On ".to_string()),
+            account_part(views, current)?,
+            BurnPart::Text(". No switch planned this week.".to_string()),
+        ])),
     }
 }
 
@@ -565,7 +646,10 @@ mod tests {
         )
         .expect("a line")
         .expect("the plan has a next account");
-        assert_eq!(line, "On PR until its week is full, about 2h. Then AC.");
+        assert_eq!(
+            plain(&line),
+            "On PR until its week is full, about 2h. Then AC."
+        );
     }
 
     #[cfg(feature = "gui")]
@@ -582,7 +666,8 @@ mod tests {
         .expect("a line")
         .expect("the plan has a next account");
         assert_eq!(
-            line, "On PR until its week is full, about 2h. Then AC.",
+            plain(&line),
+            "On PR until its week is full, about 2h. Then AC.",
             "PR has a 5 h limit, but the plan records its week as what fills first"
         );
     }
@@ -599,7 +684,8 @@ mod tests {
             .expect("a line")
             .expect("the plan has a next account");
         assert_eq!(
-            line, "On PR for about 2h. Then AC, before PR is full.",
+            plain(&line),
+            "On PR for about 2h. Then AC, before PR is full.",
             "the eager plan leaves PR before its week fills"
         );
     }
@@ -668,7 +754,78 @@ mod tests {
         let views = vec![view("lb", "LB", 20.0, false), view("ac", "AC", 10.0, true)];
         let line = unread_line(&views, &["lb".to_string(), "ac".to_string()])
             .expect("both accounts have a view");
-        assert_eq!(line, "Waiting for a first reading of LB, AC.");
+        assert_eq!(plain(&line), "Waiting for a first reading of LB, AC.");
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn parts_name_every_account_by_id() {
+        fn accounts(parts: &[BurnPart]) -> Vec<(&str, &str)> {
+            parts
+                .iter()
+                .filter_map(|part| match part {
+                    BurnPart::Account { id, abbr } => Some((id.as_str(), abbr.as_str())),
+                    BurnPart::Text(_) => None,
+                })
+                .collect()
+        }
+
+        let views = vec![
+            view("pr", "PR", 20.0, false),
+            view("ac", "AC", 10.0, true),
+            view("lb", "LB", 30.0, false),
+        ];
+        let now = utc("2026-11-10T12:00:00Z");
+
+        let plan_line = line(&plan(), Some("pr"), &views, &[], now)
+            .expect("a line")
+            .expect("a next account");
+        assert_eq!(
+            accounts(&plan_line),
+            vec![("pr", "PR"), ("ac", "AC")],
+            "each account part carries the account's id, never a guessed name"
+        );
+        assert_eq!(
+            plain(&plan_line),
+            "On PR until its week is full, about 2h. Then AC."
+        );
+
+        let learning = line(
+            &plan(),
+            Some("pr"),
+            &views,
+            &["lb".to_string(), "ac".to_string()],
+            now,
+        )
+        .expect("a line")
+        .expect("a learning line");
+        assert_eq!(accounts(&learning), vec![("lb", "LB"), ("ac", "AC")]);
+        assert_eq!(
+            plain(&learning),
+            "Learning how fast LB, AC are used. Until then: switch only when full."
+        );
+
+        let unread = unread_line(&views, &["ac".to_string(), "lb".to_string()])
+            .expect("both accounts have a view");
+        assert_eq!(accounts(&unread), vec![("ac", "AC"), ("lb", "LB")]);
+        assert_eq!(plain(&unread), "Waiting for a first reading of AC, LB.");
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn a_part_serializes_as_text_or_an_account() {
+        assert_eq!(
+            serde_json::to_value(BurnPart::Text("On ".to_string())).expect("a text part"),
+            serde_json::json!({ "text": "On " })
+        );
+        assert_eq!(
+            serde_json::to_value(BurnPart::Account {
+                id: "ac".to_string(),
+                abbr: "AC".to_string(),
+            })
+            .expect("an account part"),
+            serde_json::json!({ "account": "ac", "abbr": "AC" })
+        );
     }
 
     #[cfg(feature = "gui")]

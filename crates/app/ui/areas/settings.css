@@ -526,16 +526,7 @@ select.inp {
 }
 
 button.link {
-  padding: 0;
-  border: 0;
-  background: none;
-  color: var(--focus);
-  font: inherit;
   font-size: 12px;
-}
-
-button.link:hover {
-  text-decoration: underline;
 }
 
 /* ---------- the General group's Money section (spec §1.4, §1.4.1) ---------- */
