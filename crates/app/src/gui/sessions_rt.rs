@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 
-use seatswap_core::history::{EventKind, HistoryDir, Range, Recorder, SessionRecord};
+use seatswap_core::harness::{self, HarnessPaths, HarnessSession};
+use seatswap_core::history::{EventKind, HistoryDir, Range, Recorder, SessionRecord, TokenRecord};
 use seatswap_core::live_sessions::{self, LiveSession, LiveStatus, OtherHost, Rows};
 use seatswap_core::money::Valuer;
 use seatswap_core::paths::{AppPaths, ClaudePaths};
@@ -25,7 +26,7 @@ use seatswap_core::project::{self, ProjectKey};
 use seatswap_core::projects;
 use seatswap_core::sessions::{self, Liveness, SessionFile, SessionStatus, SystemProbe};
 use seatswap_core::store::{self, Settings};
-use seatswap_core::transcripts::{self, RecordedSession, ScanState, SessionSeen};
+use seatswap_core::transcripts::{self, HarnessRecorded, RecordedSession, ScanState, SessionSeen};
 use seatswap_core::watcher::{watch_folder, FolderWatch, WatchError};
 
 use super::window::{view_of, ClosedSince, SessionsOptions, SessionsView};
@@ -63,6 +64,13 @@ const ROWS_CONTEXT_RETRY_SECS: i64 = 60;
 /// This host reports even when nothing changed after this many seconds, so
 /// another host does not take a quiet host for a stale one.
 const REPORT_HEARTBEAT_SECS: i64 = 300;
+/// A Harness session whose file was not written for this long is not part of
+/// the live rows: a running job writes its file while it works, so a job that
+/// has been quiet for a day is no longer shown. This window does not drop a
+/// recorded token total (a total goes only when its session file leaves the
+/// store), and a closed Claude session's job links are kept this long after
+/// that session's last answer.
+const HARNESS_SINCE_HOURS: i64 = 24;
 
 /// What one pass found, for the thread and the tests.
 #[derive(Debug, Clone)]
@@ -230,6 +238,11 @@ pub(crate) struct SessionMemory {
     /// Why there is no history, when the thread started without one: the rows
     /// then say why their values are missing.
     history_error: Option<String>,
+    /// DeepSeek Harness and flash-agents' folders; `None` when they cannot be
+    /// found, or in a test that does not build a store.
+    harness_paths: Option<HarnessPaths>,
+    /// Why the Harness folders cannot be found, said in the view's warnings.
+    harness_error: Option<String>,
     /// The rows of the last pass, which the view is built from.
     rows: Option<Rows>,
     /// Each running session's answers with thinking since the user's last turn.
@@ -276,6 +289,8 @@ impl SessionMemory {
             other_hosts: None,
             last_other_hosts_at: None,
             history_error: None,
+            harness_paths: None,
+            harness_error: None,
             rows: None,
             thinking: BTreeMap::new(),
             unavailable: None,
@@ -585,6 +600,7 @@ pub(crate) fn spawn(
     app: AppPaths,
     claude: ClaudePaths,
     history: Result<HistoryDir, String>,
+    harness: Result<HarnessPaths, String>,
     ui: Sender<UiEvent>,
     engine: Sender<EngineCommand>,
 ) -> Result<SessionsHandle, String> {
@@ -604,6 +620,7 @@ pub(crate) fn spawn(
                 app,
                 claude,
                 history,
+                harness,
                 ui,
                 engine,
                 thread_stop,
@@ -627,6 +644,7 @@ fn run(
     app: AppPaths,
     claude: ClaudePaths,
     history: Result<HistoryDir, String>,
+    harness: Result<HarnessPaths, String>,
     ui: Sender<UiEvent>,
     engine: Sender<EngineCommand>,
     stop: Arc<AtomicBool>,
@@ -641,6 +659,10 @@ fn run(
     let (mut state, state_error) = load_state(&app);
     let mut memory = SessionMemory::new(claude.home().to_path_buf());
     memory.history_error = history_error.clone();
+    match harness {
+        Ok(paths) => memory.harness_paths = Some(paths),
+        Err(error) => memory.harness_error = Some(error),
+    }
     memory.ui = Some(ui.clone());
     let mut watch: Option<FolderWatch> = None;
     let mut last_watch_error: Option<String> = None;
@@ -677,6 +699,7 @@ fn run(
                 &app,
                 &claude,
                 &probe,
+                &harness::RealProc,
                 recorder.as_ref(),
                 &mut state,
                 &mut memory,
@@ -875,6 +898,7 @@ fn one_pass(
     app: &AppPaths,
     claude: &ClaudePaths,
     probe: &dyn Liveness,
+    procs: &dyn harness::ProcSource,
     recorder: Option<&Recorder>,
     state: &mut ScanState,
     memory: &mut SessionMemory,
@@ -886,6 +910,7 @@ fn one_pass(
         app,
         claude,
         probe,
+        procs,
         recorder,
         state,
         memory,
@@ -908,6 +933,7 @@ pub(crate) fn run_pass(
     app: &AppPaths,
     claude: &ClaudePaths,
     probe: &dyn Liveness,
+    procs: &dyn harness::ProcSource,
     recorder: Option<&Recorder>,
     state: &mut ScanState,
     memory: &mut SessionMemory,
@@ -1303,6 +1329,8 @@ pub(crate) fn run_pass(
     if running.skipped.is_empty() {
         state.forget_closed(&running_ids, now);
     }
+    // The links of a closed session are kept for the Harness window, then go.
+    state.prune_closed_flash_jobs(now, HARNESS_SINCE_HOURS);
 
     // A session that left the list is reported at once and its closed rows
     // are read again; otherwise both follow their own "is it time" rules.
@@ -1312,15 +1340,103 @@ pub(crate) fn run_pass(
             .iter()
             .any(|session| !running_ids.contains(session));
 
+    // The Harness sessions of the range and the Claude Code sessions they hang
+    // under: named in a transcript, or (on Linux) through a running job's lock.
+    if let Some(error) = &memory.harness_error {
+        add_warning(&mut summary, error.clone());
+    }
+    let (harness_sessions, harness_owners, claude_cwd, harness_locks, harness_recorded) =
+        match &memory.harness_paths {
+            Some(paths) => {
+                let read =
+                    harness::sessions(paths, now - ChronoDuration::hours(HARNESS_SINCE_HOURS));
+                for warning in &read.warnings {
+                    add_warning(&mut summary, warning.clone());
+                }
+                let mut links = harness::links(paths, &state.sessions, &state.closed_flash_jobs);
+                for warning in &links.warnings {
+                    add_warning(&mut summary, warning.clone());
+                }
+                let read_by_id: BTreeMap<&str, &HarnessSession> = read
+                    .sessions
+                    .iter()
+                    .map(|session| (session.id.as_str(), session))
+                    .collect();
+                // The process table is walked only when the running rule needs
+                // it: an unfinished session is unlinked (to find its owner) or
+                // quiet for the whole quiet window (to find its lock). A
+                // finished session needs neither.
+                let unlinked = |session: &HarnessSession| {
+                    let mut seen = BTreeSet::new();
+                    let mut current = Some(session.id.as_str());
+                    while let Some(id) = current {
+                        if !seen.insert(id) {
+                            break;
+                        }
+                        if links.owners.contains_key(id) {
+                            return false;
+                        }
+                        current = match read_by_id.get(id) {
+                            Some(session) => session.parent.as_deref(),
+                            None => break,
+                        };
+                    }
+                    true
+                };
+                let needs_walk = read.sessions.iter().any(|session| {
+                    !session.finished
+                        && (now.signed_duration_since(session.last)
+                            >= ChronoDuration::minutes(harness::HARNESS_QUIET_MINUTES)
+                            || unlinked(session))
+                });
+                let mut locks = BTreeSet::new();
+                if needs_walk {
+                    let claude_pids: BTreeMap<u32, String> = running
+                        .sessions
+                        .iter()
+                        .map(|session| (session.pid, session.session_id.clone()))
+                        .collect();
+                    let found = harness::proc_links(paths, procs, &claude_pids);
+                    for (id, owner) in found.owners {
+                        // A transcript's owner wins over the process link.
+                        links.owners.entry(id).or_insert(owner);
+                    }
+                    locks = found.locks;
+                }
+                if paths.sessions.exists() {
+                    // A recorded total goes only when its session's file has
+                    // left the store; the window and a failed read keep it.
+                    state.prune_harness_recorded(&paths.sessions);
+                }
+                let recorded = state.harness_recorded.clone();
+                let mut claude_cwd: BTreeMap<String, String> = state
+                    .sessions
+                    .iter()
+                    .map(|(session, seen)| (session.clone(), seen.cwd.clone()))
+                    .collect();
+                for session in &running.sessions {
+                    claude_cwd.insert(session.session_id.clone(), session.cwd.clone());
+                }
+                (read.sessions, links.owners, claude_cwd, locks, recorded)
+            }
+            None => (
+                Vec::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeSet::new(),
+                BTreeMap::new(),
+            ),
+        };
+
     // The rows of this host, and the report the other hosts read. The session
     // files alone are enough to build them: a history that cannot be read gives
     // the projects' default names and says why the values are missing, so a
     // waiting session still notifies.
     let mut currency = None;
-    let rows = match recorder {
+    let (rows, (harness_tokens, harness_recorded)) = match recorder {
         Some(recorder) => {
             let mut context = memory.rows_context.take().unwrap_or_default();
-            let rows = {
+            let (rows, tokens, recorded) = {
                 let (projects, pricing, settings_currency) =
                     prepare_rows_context(&mut context, app, recorder.dir(), now, &mut summary);
                 currency = settings_currency;
@@ -1333,10 +1449,15 @@ pub(crate) fn run_pass(
                     &pricing,
                     recorder.dir().host(),
                     now,
+                    &harness_sessions,
+                    &harness_owners,
+                    &claude_cwd,
+                    &harness_locks,
+                    &harness_recorded,
                 )
             };
             memory.rows_context = Some(context);
-            Some(rows)
+            (Some(rows), (tokens, recorded))
         }
         None => {
             let pricing = live_sessions::Pricing::Unknown {
@@ -1344,7 +1465,7 @@ pub(crate) fn run_pass(
                     "the history is not open, so the values are not known".to_string()
                 }),
             };
-            Some(live_rows(
+            let (rows, tokens, recorded) = live_rows(
                 &running.sessions,
                 state,
                 memory,
@@ -1353,9 +1474,54 @@ pub(crate) fn run_pass(
                 &pricing,
                 "",
                 now,
-            ))
+                &harness_sessions,
+                &harness_owners,
+                &claude_cwd,
+                &harness_locks,
+                &harness_recorded,
+            );
+            (Some(rows), (tokens, recorded))
         }
     };
+    // The Harness tokens reach the history like an agent's: only what grew.
+    // The totals are saved before the lines are written, as S-1 saves its scan
+    // state before writing: a crash between the two loses a delta, never counts
+    // it twice. A state that could not be loaded keeps every Harness line back,
+    // so nothing is counted and forgotten.
+    if state_error.is_none() {
+        if harness_tokens.is_empty() {
+            state.set_harness_recorded(&harness_recorded);
+        } else if let Some(recorder) = recorder {
+            let previous = state.harness_recorded.clone();
+            state.set_harness_recorded(&harness_recorded);
+            match state.save(claude, app, now) {
+                Ok(_) => {
+                    if let Err(error) = recorder.tokens(&harness_tokens) {
+                        add_history_error(&mut summary, error);
+                        // The lines are not written: put the old totals back on
+                        // disk, as the transcript scan puts its offsets back, so
+                        // the next pass writes this delta and none is lost.
+                        state.set_harness_recorded(&previous);
+                        if let Err(error) = state.save(claude, app, now) {
+                            add_warning(
+                                &mut summary,
+                                format!("the Harness token totals cannot be written back: {error}"),
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    // Nothing was written: put the old totals back, so this
+                    // pass writes no line and the next one tries again.
+                    state.set_harness_recorded(&previous);
+                    add_warning(
+                        &mut summary,
+                        format!("the Harness token totals cannot be written: {error}"),
+                    );
+                }
+            }
+        }
+    }
     if let Some(rows) = &rows {
         for warning in &rows.warnings {
             add_warning(&mut summary, warning.clone());
@@ -1786,13 +1952,22 @@ fn live_rows(
     pricing: &live_sessions::Pricing,
     host: &str,
     now: DateTime<Utc>,
-) -> live_sessions::Rows {
+    harness_sessions: &[HarnessSession],
+    harness_owners: &BTreeMap<String, String>,
+    claude_cwd: &BTreeMap<String, String>,
+    harness_locks: &BTreeSet<String>,
+    harness_recorded: &BTreeMap<String, HarnessRecorded>,
+) -> (
+    live_sessions::Rows,
+    Vec<TokenRecord>,
+    BTreeMap<String, HarnessRecorded>,
+) {
     let metas = |session: &str| agents.get(session).cloned().unwrap_or_default();
     let project_of = {
         let memory = RefCell::new(memory);
         move |cwd: &str| memory.borrow_mut().project_for(cwd)
     };
-    live_sessions::running(
+    let mut rows = live_sessions::running(
         files,
         state,
         &metas,
@@ -1801,7 +1976,30 @@ fn live_rows(
         host,
         now,
         &project_of,
-    )
+    );
+    if harness_sessions.is_empty() {
+        return (rows, Vec::new(), harness_recorded.clone());
+    }
+    let harness = live_sessions::harness_rows(
+        harness_sessions,
+        harness_owners,
+        claude_cwd,
+        harness_recorded,
+        harness_locks,
+        projects,
+        pricing,
+        host,
+        now,
+        &project_of,
+    );
+    for (session, agents) in harness.agents {
+        if let Some(row) = rows.sessions.iter_mut().find(|row| row.session == session) {
+            live_sessions::add_agents(row, agents);
+        }
+    }
+    rows.warnings.extend(harness.rows.warnings);
+    rows.sessions.extend(harness.rows.sessions);
+    (rows, harness.tokens, harness.recorded)
 }
 
 fn session_record(
@@ -1973,7 +2171,9 @@ fn add_history_error(summary: &mut SessionsSummary, error: seatswap_core::histor
 mod tests {
     use super::*;
 
+    use std::cell::Cell;
     use std::fs;
+    use std::time::UNIX_EPOCH;
 
     use seatswap_core::history::{Event, Hosts, Range};
     use seatswap_core::store::Settings;
@@ -1986,6 +2186,24 @@ mod tests {
     impl Liveness for FakeProbe {
         fn alive(&self, file: &SessionFile) -> bool {
             self.0.get(&file.pid) == Some(&file.proc_start)
+        }
+    }
+
+    /// A process table with no processes: the tests that do not link a Harness
+    /// job keep production code free of a test-only branch.
+    struct NoProc;
+
+    impl harness::ProcSource for NoProc {
+        fn pids(&self) -> Vec<u32> {
+            Vec::new()
+        }
+
+        fn open_files(&self, _pid: u32) -> Vec<PathBuf> {
+            Vec::new()
+        }
+
+        fn parent(&self, _pid: u32) -> Option<u32> {
+            None
         }
     }
 
@@ -2146,6 +2364,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[100, 101, 102]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -2183,6 +2402,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[200]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -2221,6 +2441,7 @@ mod tests {
             &_app,
             &claude,
             &probe(&[300]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -2245,6 +2466,7 @@ mod tests {
             &_app,
             &claude,
             &probe(&[300]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -2315,6 +2537,7 @@ mod tests {
                 spawns: Default::default(),
                 recent: Default::default(),
                 recorded: None,
+                flash_jobs: BTreeSet::new(),
             },
         );
         let mut memory = SessionMemory::new(tmp.path().to_path_buf());
@@ -2322,6 +2545,7 @@ mod tests {
             &_app,
             &claude,
             &probe(&[500]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -2336,6 +2560,7 @@ mod tests {
             &_app,
             &claude,
             &probe(&[500]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -2387,6 +2612,7 @@ mod tests {
             &_app,
             &claude,
             &probe(&[600]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -2412,6 +2638,7 @@ mod tests {
             &_app,
             &claude,
             &probe(&[600]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -2476,6 +2703,7 @@ mod tests {
                 spawns: Default::default(),
                 recent: Default::default(),
                 recorded: None,
+                flash_jobs: BTreeSet::new(),
             },
         );
         let mut memory = SessionMemory::new(tmp.path().to_path_buf());
@@ -2483,6 +2711,7 @@ mod tests {
             &_app,
             &claude,
             &probe(&[400]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -2496,6 +2725,7 @@ mod tests {
             &_app,
             &claude,
             &probe(&[400]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -2507,6 +2737,7 @@ mod tests {
             &_app,
             &claude,
             &probe(&[400]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -2574,6 +2805,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[]),
+            &NoProc,
             recorder.as_ref(),
             &mut state,
             &mut memory,
@@ -2764,6 +2996,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -2824,6 +3057,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -2868,6 +3102,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[]),
+            &NoProc,
             None,
             &mut state,
             &mut memory,
@@ -2884,6 +3119,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -2931,6 +3167,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[100]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -2974,6 +3211,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[100]),
+            &NoProc,
             None,
             &mut state,
             &mut memory,
@@ -3061,6 +3299,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -3105,6 +3344,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[100]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -3135,6 +3375,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -3207,6 +3448,7 @@ mod tests {
                 spawns: Default::default(),
                 recent: Default::default(),
                 recorded: None,
+                flash_jobs: BTreeSet::new(),
             },
         );
         let mut memory = SessionMemory::new(claude.home().to_path_buf());
@@ -3214,6 +3456,7 @@ mod tests {
             &_app,
             &claude,
             &probe(&[700, 701]),
+            &NoProc,
             None,
             &mut state,
             &mut memory,
@@ -3277,6 +3520,7 @@ mod tests {
                 spawns: Default::default(),
                 recent: Default::default(),
                 recorded: None,
+                flash_jobs: BTreeSet::new(),
             },
         );
         state.sessions.insert(
@@ -3295,6 +3539,7 @@ mod tests {
                 spawns: Default::default(),
                 recent: Default::default(),
                 recorded: None,
+                flash_jobs: BTreeSet::new(),
             },
         );
         let mut memory = SessionMemory::new(claude.home().to_path_buf());
@@ -3303,6 +3548,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[800, 801]),
+            &NoProc,
             None,
             &mut state,
             &mut memory,
@@ -3355,6 +3601,7 @@ mod tests {
                 spawns: Default::default(),
                 recent: Default::default(),
                 recorded: None,
+                flash_jobs: BTreeSet::new(),
             },
         );
 
@@ -3363,6 +3610,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[900]),
+            &NoProc,
             None,
             &mut state,
             &mut memory,
@@ -3424,6 +3672,7 @@ mod tests {
                 spawns: Default::default(),
                 recent: Default::default(),
                 recorded: None,
+                flash_jobs: BTreeSet::new(),
             },
         );
         state.sessions.insert(
@@ -3442,6 +3691,7 @@ mod tests {
                 spawns: Default::default(),
                 recent: Default::default(),
                 recorded: None,
+                flash_jobs: BTreeSet::new(),
             },
         );
 
@@ -3450,6 +3700,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[910, 911]),
+            &NoProc,
             None,
             &mut state,
             &mut memory,
@@ -3491,6 +3742,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -3518,6 +3770,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -3533,6 +3786,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -3606,6 +3860,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[100]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -3622,6 +3877,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -3638,6 +3894,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -3700,6 +3957,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -3719,6 +3977,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -3771,6 +4030,7 @@ mod tests {
                 spawns: Default::default(),
                 recent: Default::default(),
                 recorded: None,
+                flash_jobs: BTreeSet::new(),
             },
         );
         let mut memory = SessionMemory::new(tmp.path().to_path_buf());
@@ -3778,6 +4038,7 @@ mod tests {
             &_app,
             &claude,
             &probe(&[]),
+            &NoProc,
             None,
             &mut state,
             &mut memory,
@@ -3825,6 +4086,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[400]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -3853,6 +4115,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[400]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -3867,6 +4130,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[400]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -3891,6 +4155,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -3905,6 +4170,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -3919,6 +4185,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -3954,6 +4221,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[500]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -3968,6 +4236,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -4039,6 +4308,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -4054,6 +4324,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -4089,6 +4360,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[600]),
+            &NoProc,
             None,
             &mut state,
             &mut memory,
@@ -4127,6 +4399,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[601]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -4164,6 +4437,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[700]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -4177,6 +4451,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[700]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -4255,6 +4530,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[800]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -4306,6 +4582,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[801]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -4334,6 +4611,7 @@ mod tests {
                 &app,
                 &claude,
                 &probe(&[801]),
+                &NoProc,
                 Some(&recorder),
                 &mut state,
                 &mut memory,
@@ -4356,6 +4634,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[801]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -4388,6 +4667,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -4458,6 +4738,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -4483,6 +4764,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -4506,6 +4788,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -4576,6 +4859,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[900]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -4607,6 +4891,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[900]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -4645,6 +4930,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -4700,6 +4986,7 @@ mod tests {
             &app,
             &claude,
             &probe(&[]),
+            &NoProc,
             Some(&recorder),
             &mut state,
             &mut memory,
@@ -4731,6 +5018,10 @@ mod tests {
             app,
             claude,
             Ok(history(&tmp.path().join("history"))),
+            Ok(harness::HarnessPaths::at(
+                tmp.path().join("sessions"),
+                tmp.path().join("reports"),
+            )),
             ui,
             engine,
         )
@@ -4800,5 +5091,774 @@ mod tests {
         )
         .unwrap();
         assert_eq!(record.agents_finished, 1);
+    }
+
+    const HARNESS_JOB: &str = "flash-task-5c974a53-178a-4254-93b2-b804a111414a";
+    const HARNESS_UNLINKED: &str = "flash-task-8d2f0e7c-6b1a-4c3d-9e0f-1a2b3c4d5e6f";
+    const HARNESS_OTHER: &str = "8d2f0e7c-6b1a-4c3d-9e0f-1a2b3c4d5e6f";
+    const HARNESS_KEY: &str = "--home-sam-projects-atlas--";
+    const HARNESS_MODEL: &str = "deepseek-v4.1-flash:cloud";
+
+    fn harness_paths(tmp: &TempDir) -> seatswap_core::harness::HarnessPaths {
+        seatswap_core::harness::HarnessPaths::at(
+            tmp.path().join("harness-sessions"),
+            tmp.path().join("flash-agents"),
+        )
+    }
+
+    /// A zstd frame with one raw block. The app does not depend on the zstd
+    /// crate, so its tests build the frame themselves; the bytes are a normal
+    /// frame that `zstd::stream::read::Decoder` reads.
+    fn zstd_frame(text: &[u8]) -> Vec<u8> {
+        let size = u32::try_from(text.len()).expect("a short test file");
+        let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd];
+        if size <= 255 {
+            frame.push(0x20);
+            frame.push(u8::try_from(size).expect("one byte"));
+        } else {
+            frame.push(0x60);
+            let stored = u16::try_from(size - 256).expect("two bytes");
+            frame.extend_from_slice(&stored.to_le_bytes());
+        }
+        let block = (size << 3) | 1;
+        frame.extend_from_slice(&block.to_le_bytes()[..3]);
+        frame.extend_from_slice(text);
+        frame
+    }
+
+    /// Write one Harness session with `messages` assistant events; each message
+    /// is 100 input and 50 output. The last event is at `last`.
+    fn write_harness(
+        paths: &seatswap_core::harness::HarnessPaths,
+        id: &str,
+        parent: Option<&str>,
+        depth: u32,
+        messages: u32,
+        last: DateTime<Utc>,
+        finished: bool,
+    ) -> std::path::PathBuf {
+        let dir = paths.sessions.join(HARNESS_KEY).join(id);
+        fs::create_dir_all(&dir).expect("a session folder");
+        let millis = last.timestamp_millis();
+        let mut header = serde_json::json!({
+            "type": "session",
+            "version": 4,
+            "id": id,
+            "createdAt": millis - 3_600_000,
+            "cwd": "/home/sam/projects/atlas",
+            "isSeeded": false,
+            "delegationDepth": depth,
+        });
+        if let Some(parent) = parent {
+            header["parentSession"] = serde_json::json!(parent);
+            header["origin"] = serde_json::json!("subagent");
+        }
+        let mut text = format!("{header}\n");
+        text.push_str(&format!(
+            "{}\n",
+            serde_json::json!({"type": "turn/start", "seq": 1, "time": millis - 60_000, "data": {"turn": 1}})
+        ));
+        for number in 0..messages {
+            text.push_str(&format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "assistant/message",
+                    "seq": number + 2,
+                    "time": millis - 2_000 + i64::from(number) * 1_000,
+                    "data": {
+                        "turn": 1,
+                        "step": 1,
+                        "message": {
+                            "role": "assistant",
+                            "source": {"kind": "model", "provider": "ollama", "model": HARNESS_MODEL},
+                            "id": format!("m{number}")
+                        },
+                        "usage": {
+                            "inputTokens": 100,
+                            "outputTokens": 50,
+                            "totalTokens": 150
+                        }
+                    }
+                })
+            ));
+        }
+        if finished {
+            text.push_str(&format!(
+                "{}\n",
+                serde_json::json!({"type": "turn/end", "seq": 20, "time": millis, "data": {"turn": 1, "reason": {"kind": "completed"}}})
+            ));
+        }
+        let file = dir.join("session.v4.jsonl.zstd");
+        fs::write(&file, zstd_frame(text.as_bytes())).expect("a session file");
+        fs::write(dir.join("session.lock"), []).expect("a lock");
+        file
+    }
+
+    fn set_mtime(path: &Path, at: DateTime<Utc>) {
+        let when = UNIX_EPOCH
+            + std::time::Duration::from_secs(u64::try_from(at.timestamp()).expect("a time"));
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("the session file")
+            .set_modified(when)
+            .expect("a modification time");
+    }
+
+    #[derive(Default)]
+    struct FakeProc {
+        processes: BTreeMap<u32, (Vec<PathBuf>, Option<u32>)>,
+        walks: Cell<usize>,
+    }
+
+    impl harness::ProcSource for FakeProc {
+        fn pids(&self) -> Vec<u32> {
+            self.walks.set(self.walks.get() + 1);
+            self.processes.keys().copied().collect()
+        }
+
+        fn open_files(&self, pid: u32) -> Vec<PathBuf> {
+            self.processes
+                .get(&pid)
+                .map(|(files, _)| files.clone())
+                .unwrap_or_default()
+        }
+
+        fn parent(&self, pid: u32) -> Option<u32> {
+            self.processes.get(&pid).and_then(|(_, parent)| *parent)
+        }
+    }
+
+    fn seen_with_jobs(
+        _session: &str,
+        cwd: &str,
+        last: DateTime<Utc>,
+        jobs: BTreeSet<String>,
+    ) -> SessionSeen {
+        SessionSeen {
+            folder: "-home-sam-projects-atlas".to_string(),
+            cwd: cwd.to_string(),
+            first: last,
+            last,
+            last_model: Some("claude-opus-5-5".to_string()),
+            last_user_turn: None,
+            thinking: Vec::new(),
+            totals: Default::default(),
+            by_model: Default::default(),
+            agents: Default::default(),
+            spawns: Default::default(),
+            recent: Default::default(),
+            recorded: None,
+            flash_jobs: jobs,
+        }
+    }
+
+    fn harness_row<'a>(memory: &'a SessionMemory, session: &str) -> &'a LiveSession {
+        memory
+            .rows
+            .as_ref()
+            .expect("rows after the pass")
+            .sessions
+            .iter()
+            .find(|row| row.session == session)
+            .expect("the session's row")
+    }
+
+    #[test]
+    fn run_pass_links_a_running_job_through_its_lock_holder() {
+        let (tmp, claude, app) = fixture();
+        let recorder = Recorder::new(history(&tmp.path().join("history")));
+        let now = time("2026-11-16T14:00:00Z");
+        write_session(
+            &claude,
+            400,
+            &session_json(
+                400,
+                SESSION,
+                "/home/sam/projects/atlas",
+                Some("atlas-7c"),
+                "busy",
+                now.timestamp_millis(),
+            ),
+        );
+        let paths = harness_paths(&tmp);
+        let file = write_harness(&paths, HARNESS_JOB, None, 0, 1, now, false);
+        let lock = file
+            .parent()
+            .expect("a session folder")
+            .join("session.lock");
+        let procs = FakeProc {
+            processes: BTreeMap::from([
+                (500, (vec![lock], Some(400))),
+                (400, (Vec::new(), Some(1))),
+                (1, (Vec::new(), None)),
+            ]),
+            walks: Cell::new(0),
+        };
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        memory.harness_paths = Some(paths.clone());
+
+        let outcome = run_pass(
+            &app,
+            &claude,
+            &probe(&[400]),
+            &procs,
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            now,
+            None,
+        );
+
+        assert_eq!(outcome.summary.running, 1);
+        assert!(procs.walks.get() > 0, "the process table is walked");
+        let row = harness_row(&memory, SESSION);
+        let job = row
+            .agents
+            .iter()
+            .find(|agent| agent.agent == HARNESS_JOB)
+            .expect("the linked job is a flash agent");
+        assert_eq!(job.kind.as_deref(), Some("flash"));
+        assert!(job.running);
+        assert_eq!(job.model.as_deref(), Some(HARNESS_MODEL));
+    }
+
+    #[test]
+    fn a_transcript_owner_wins_over_a_process_owner() {
+        let (tmp, claude, app) = fixture();
+        let now = time("2026-11-16T14:00:00Z");
+        for (pid, session) in [(400, SESSION), (401, HARNESS_OTHER)] {
+            write_session(
+                &claude,
+                pid,
+                &session_json(
+                    pid,
+                    session,
+                    "/home/sam/projects/atlas",
+                    None,
+                    "busy",
+                    now.timestamp_millis(),
+                ),
+            );
+        }
+        let paths = harness_paths(&tmp);
+        // Both jobs are still working, so the process table is walked and the
+        // two owners can meet.
+        let linked = write_harness(&paths, HARNESS_JOB, None, 0, 1, now, false);
+        let unlinked = write_harness(&paths, HARNESS_UNLINKED, None, 0, 1, now, false);
+        let lock = |file: &std::path::Path| file.parent().expect("a folder").join("session.lock");
+        let procs = FakeProc {
+            processes: BTreeMap::from([
+                (500, (vec![lock(&linked)], Some(401))),
+                (501, (vec![lock(&unlinked)], Some(401))),
+                (401, (Vec::new(), Some(1))),
+                (1, (Vec::new(), None)),
+            ]),
+            walks: Cell::new(0),
+        };
+        let mut state = ScanState::default();
+        state.sessions.insert(
+            SESSION.to_string(),
+            seen_with_jobs(
+                SESSION,
+                "/home/sam/projects/atlas",
+                now,
+                BTreeSet::from([HARNESS_JOB.to_string()]),
+            ),
+        );
+        state.sessions.insert(
+            HARNESS_OTHER.to_string(),
+            seen_with_jobs(
+                HARNESS_OTHER,
+                "/home/sam/projects/atlas",
+                now,
+                BTreeSet::new(),
+            ),
+        );
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        memory.harness_paths = Some(paths.clone());
+
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[400, 401]),
+            &procs,
+            None,
+            &mut state,
+            &mut memory,
+            now,
+            None,
+        );
+
+        assert!(procs.walks.get() > 0, "the unlinked job needs the walk");
+        let transcript_row = harness_row(&memory, SESSION);
+        assert!(transcript_row
+            .agents
+            .iter()
+            .any(|agent| agent.agent == HARNESS_JOB));
+        let process_row = harness_row(&memory, HARNESS_OTHER);
+        assert!(
+            !process_row
+                .agents
+                .iter()
+                .any(|agent| agent.agent == HARNESS_JOB),
+            "the process link must not take the job from the transcript"
+        );
+        assert!(process_row
+            .agents
+            .iter()
+            .any(|agent| agent.agent == HARNESS_UNLINKED));
+    }
+
+    #[test]
+    fn an_already_linked_job_does_not_walk_the_process_table() {
+        let (tmp, claude, app) = fixture();
+        let now = time("2026-11-16T14:00:00Z");
+        let paths = harness_paths(&tmp);
+        write_harness(&paths, HARNESS_JOB, None, 0, 1, now, true);
+        let procs = FakeProc::default();
+        let mut state = ScanState::default();
+        state.sessions.insert(
+            SESSION.to_string(),
+            seen_with_jobs(
+                SESSION,
+                "/home/sam/projects/atlas",
+                now,
+                BTreeSet::from([HARNESS_JOB.to_string()]),
+            ),
+        );
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        memory.harness_paths = Some(paths.clone());
+
+        // The process table is not needed to link a job its transcript names.
+        // The walk is only for a Harness session still unlinked.
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            &procs,
+            None,
+            &mut state,
+            &mut memory,
+            now,
+            None,
+        );
+
+        assert_eq!(procs.walks.get(), 0, "no walk when every job is linked");
+    }
+
+    #[test]
+    fn a_quiet_unfinished_job_is_done_unless_its_lock_is_held() {
+        let (tmp, claude, app) = fixture();
+        let now = time("2026-11-16T14:00:00Z");
+        let last = now - ChronoDuration::minutes(31);
+        let paths = harness_paths(&tmp);
+        let file = write_harness(&paths, HARNESS_JOB, None, 0, 1, last, false);
+        let lock = file
+            .parent()
+            .expect("a session folder")
+            .join("session.lock");
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        memory.harness_paths = Some(paths.clone());
+
+        let no_lock = FakeProc::default();
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            &no_lock,
+            None,
+            &mut state,
+            &mut memory,
+            now,
+            None,
+        );
+        assert_eq!(harness_row(&memory, HARNESS_JOB).status, LiveStatus::Idle);
+
+        let held = FakeProc {
+            processes: BTreeMap::from([(500, (vec![lock], Some(1))), (1, (Vec::new(), None))]),
+            walks: Cell::new(0),
+        };
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            &held,
+            None,
+            &mut state,
+            &mut memory,
+            now,
+            None,
+        );
+        assert_eq!(harness_row(&memory, HARNESS_JOB).status, LiveStatus::Busy);
+    }
+
+    /// The Harness totals follow the transcript scan's rule: saved before the
+    /// lines, put back when the lines cannot be written, so a delta is written
+    /// once — never twice, and not lost when the history was briefly blocked.
+    #[test]
+    fn a_harness_delta_that_cannot_be_written_is_written_once_later() {
+        let (tmp, claude, app) = fixture();
+        let now = time("2026-11-16T14:00:00Z");
+        let paths = harness_paths(&tmp);
+        write_harness(&paths, HARNESS_JOB, None, 0, 2, now, true);
+        let history_root = tmp.path().join("history");
+        // A file where the history folder belongs: the token line cannot be
+        // written, but the state save can.
+        fs::write(&history_root, "not a folder").expect("a blocking file");
+        let recorder = Recorder::new(history(&history_root));
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        memory.harness_paths = Some(paths.clone());
+        let pass = |state: &mut ScanState, memory: &mut SessionMemory, recorder: &Recorder| {
+            run_pass(
+                &app,
+                &claude,
+                &probe(&[]),
+                &NoProc,
+                Some(recorder),
+                state,
+                memory,
+                now,
+                None,
+            );
+        };
+
+        pass(&mut state, &mut memory, &recorder);
+        assert!(
+            !state.harness_recorded.contains_key(HARNESS_JOB),
+            "a delta whose line was not written is not recorded"
+        );
+        let on_disk = ScanState::load(&app).expect("the saved state");
+        assert!(
+            !on_disk.harness_recorded.contains_key(HARNESS_JOB),
+            "the old totals were put back on disk"
+        );
+
+        fs::remove_file(&history_root).expect("the blocking file");
+        fs::create_dir_all(&history_root).expect("the history folder");
+        let recorder = Recorder::new(history(&history_root));
+        pass(&mut state, &mut memory, &recorder);
+        pass(&mut state, &mut memory, &recorder);
+        let lines = fs::read_to_string(history_root.join("atlas").join("tokens-2026-11.jsonl"))
+            .expect("the token file");
+        assert_eq!(lines.lines().count(), 1, "written once: {lines}");
+        let recorded = state.harness_recorded.get(HARNESS_JOB).expect("the totals");
+        assert_eq!(recorded.tokens.input, 200);
+        assert_eq!(recorded.messages, 2);
+        assert_eq!(
+            ScanState::load(&app)
+                .expect("the saved state")
+                .harness_recorded
+                .get(HARNESS_JOB)
+                .map(|recorded| recorded.messages),
+            Some(2),
+            "the totals are on disk before the next pass"
+        );
+    }
+
+    #[test]
+    fn a_state_error_writes_no_harness_token_line() {
+        let (tmp, claude, app) = fixture();
+        let now = time("2026-11-16T14:00:00Z");
+        let paths = harness_paths(&tmp);
+        write_harness(&paths, HARNESS_JOB, None, 0, 2, now, true);
+        let history_root = tmp.path().join("history");
+        let recorder = Recorder::new(history(&history_root));
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        memory.harness_paths = Some(paths);
+
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            &NoProc,
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            now,
+            Some("the transcript state cannot be read"),
+        );
+
+        assert!(state.harness_recorded.is_empty());
+        assert!(
+            !history_root
+                .join("atlas")
+                .join("tokens-2026-11.jsonl")
+                .exists(),
+            "a state that could not be loaded writes no Harness line"
+        );
+    }
+
+    /// The 24 h window only decides which sessions are read: a total whose
+    /// file still exists is kept, even when the file is older than the window.
+    #[test]
+    fn an_old_harness_total_is_kept_while_its_file_exists() {
+        let (tmp, claude, app) = fixture();
+        let now = time("2026-11-16T14:00:00Z");
+        let paths = harness_paths(&tmp);
+        let file = write_harness(&paths, HARNESS_JOB, None, 0, 2, now, true);
+        set_mtime(&file, now - ChronoDuration::hours(25));
+        let mut state = ScanState::default();
+        state.harness_recorded.insert(
+            HARNESS_JOB.to_string(),
+            HarnessRecorded {
+                tokens: transcripts::Tokens {
+                    input: 200,
+                    out: 100,
+                    cw: 0,
+                    cr: 0,
+                },
+                messages: 2,
+                file: Some(
+                    file.strip_prefix(&paths.sessions)
+                        .expect("a file below the store")
+                        .to_path_buf(),
+                ),
+            },
+        );
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        memory.harness_paths = Some(paths);
+
+        one_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            &NoProc,
+            None,
+            &mut state,
+            &mut memory,
+            now,
+            None,
+            None,
+        );
+
+        assert!(
+            state.harness_recorded.contains_key(HARNESS_JOB),
+            "a total outside the 24 h window is kept while its file exists"
+        );
+    }
+
+    /// A total goes only when its session's file has left the store; a deleted
+    /// file drops it at the next save.
+    #[test]
+    fn a_recorded_total_is_dropped_when_its_file_is_deleted() {
+        let (tmp, claude, app) = fixture();
+        let now = time("2026-11-16T14:00:00Z");
+        let paths = harness_paths(&tmp);
+        let file = write_harness(&paths, HARNESS_JOB, None, 0, 2, now, true);
+        let recorder = Recorder::new(history(&tmp.path().join("history")));
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        memory.harness_paths = Some(paths);
+
+        one_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            &NoProc,
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            now,
+            None,
+            None,
+        );
+        assert!(state.harness_recorded.contains_key(HARNESS_JOB));
+        assert!(
+            ScanState::load(&app)
+                .expect("the saved state")
+                .harness_recorded
+                .contains_key(HARNESS_JOB),
+            "the total is on disk while its file exists"
+        );
+
+        fs::remove_file(&file).expect("the session file is gone");
+        one_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            &NoProc,
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            now,
+            None,
+            None,
+        );
+
+        assert!(
+            !state.harness_recorded.contains_key(HARNESS_JOB),
+            "a deleted session file drops its recorded total"
+        );
+        assert!(
+            !ScanState::load(&app)
+                .expect("the saved state")
+                .harness_recorded
+                .contains_key(HARNESS_JOB),
+            "the deleted total is not on disk either"
+        );
+    }
+
+    /// A session file that cannot be read in one pass must not lose its totals:
+    /// when it reads again, its tokens would be written a second time.
+    #[test]
+    fn proof_a_session_file_that_fails_once_keeps_its_totals() {
+        let (tmp, claude, app) = fixture();
+        let now = time("2026-11-16T14:00:00Z");
+        let paths = harness_paths(&tmp);
+        let file = write_harness(&paths, HARNESS_JOB, None, 0, 2, now, true);
+        let history_root = tmp.path().join("history");
+        let recorder = Recorder::new(history(&history_root));
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        memory.harness_paths = Some(paths.clone());
+        let pass = |state: &mut ScanState, memory: &mut SessionMemory| {
+            run_pass(
+                &app,
+                &claude,
+                &probe(&[]),
+                &NoProc,
+                Some(&recorder),
+                state,
+                memory,
+                now,
+                None,
+            );
+        };
+
+        pass(&mut state, &mut memory);
+        assert!(state.harness_recorded.contains_key(HARNESS_JOB));
+        fs::write(&file, b"not a zstd stream").expect("a broken file");
+        pass(&mut state, &mut memory);
+        assert!(
+            state.harness_recorded.contains_key(HARNESS_JOB),
+            "a session whose file failed to read is not out of range: its totals stay"
+        );
+        write_harness(&paths, HARNESS_JOB, None, 0, 2, now, true);
+        pass(&mut state, &mut memory);
+        let lines = fs::read_to_string(history_root.join("atlas").join("tokens-2026-11.jsonl"))
+            .expect("the token file");
+        assert_eq!(lines.lines().count(), 1, "written once: {lines}");
+    }
+
+    /// A job a transcript names, quiet for 45 minutes, whose lock a process
+    /// holds, is running; the lock set must not depend on another job being
+    /// unlinked.
+    #[test]
+    fn proof_a_linked_quiet_job_with_a_held_lock_is_running() {
+        let (tmp, claude, app) = fixture();
+        let now = time("2026-11-16T14:00:00Z");
+        write_session(
+            &claude,
+            400,
+            &session_json(
+                400,
+                SESSION,
+                "/home/sam/projects/atlas",
+                None,
+                "busy",
+                now.timestamp_millis(),
+            ),
+        );
+        let paths = harness_paths(&tmp);
+        let file = write_harness(
+            &paths,
+            HARNESS_JOB,
+            None,
+            0,
+            1,
+            now - ChronoDuration::minutes(45),
+            false,
+        );
+        let lock = file.parent().expect("a folder").join("session.lock");
+        let procs = FakeProc {
+            processes: BTreeMap::from([(500, (vec![lock], Some(400))), (400, (Vec::new(), None))]),
+            walks: Cell::new(0),
+        };
+        let mut state = ScanState::default();
+        state.sessions.insert(
+            SESSION.to_string(),
+            seen_with_jobs(
+                SESSION,
+                "/home/sam/projects/atlas",
+                now,
+                BTreeSet::from([HARNESS_JOB.to_string()]),
+            ),
+        );
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        memory.harness_paths = Some(paths);
+
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[400]),
+            &procs,
+            None,
+            &mut state,
+            &mut memory,
+            now,
+            None,
+        );
+
+        let job = harness_row(&memory, SESSION)
+            .agents
+            .iter()
+            .find(|agent| agent.agent == HARNESS_JOB)
+            .expect("the job");
+        assert!(job.running, "its lock is held");
+    }
+
+    /// A Claude Code session that closed more than an hour ago leaves the scan
+    /// state (`forget_closed`), but its `flash_jobs` move into the kept closed
+    /// links. A job of that session, still inside the 24 h Harness window, keeps
+    /// its owner instead of becoming its own "DeepSeek Harness" row.
+    #[test]
+    fn proof_a_job_of_a_closed_session_does_not_become_its_own_row() {
+        let (tmp, claude, app) = fixture();
+        let now = time("2026-11-16T14:00:00Z");
+        let paths = harness_paths(&tmp);
+        write_harness(
+            &paths,
+            HARNESS_JOB,
+            None,
+            0,
+            1,
+            now - ChronoDuration::hours(3),
+            true,
+        );
+        let mut state = ScanState::default();
+        state.sessions.insert(
+            SESSION.to_string(),
+            seen_with_jobs(
+                SESSION,
+                "/home/sam/projects/atlas",
+                now - ChronoDuration::hours(2),
+                BTreeSet::from([HARNESS_JOB.to_string()]),
+            ),
+        );
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        memory.harness_paths = Some(paths);
+
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            &NoProc,
+            None,
+            &mut state,
+            &mut memory,
+            now,
+            None,
+        );
+
+        let rows = memory.rows.as_ref().expect("rows");
+        assert!(
+            !rows.sessions.iter().any(|row| row.session == HARNESS_JOB),
+            "the job's owner was forgotten after an hour, so the job is its own row"
+        );
     }
 }

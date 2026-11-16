@@ -246,15 +246,33 @@ impl Liveness for SystemProbe {
     }
 }
 
-/// Field 3 (state) and field 22 (start time) of `/proc/<pid>/stat`. The text
-/// after the last `)` starts at field 3, so the start time is the 19th field
-/// after the state; the command name in `(…)` may itself contain spaces and `)`.
+/// Fields 3 (state), 4 (parent pid) and 22 (start time) of `/proc/<pid>/stat`.
+/// The text after the last `)` starts at field 3, so the start time is the 19th
+/// field after the state; the command name in `(…)` may itself contain spaces
+/// and `)`.
 #[cfg(target_os = "linux")]
-fn state_and_start_time(stat: &str) -> Option<(&str, &str)> {
+fn state_start_and_parent(stat: &str) -> Option<(&str, &str, u32)> {
     let mut fields = stat.rsplit_once(')')?.1.split_whitespace();
     let state = fields.next()?;
-    let start_time = fields.nth(18)?;
-    Some((state, start_time))
+    let parent = fields.next()?.parse().ok()?;
+    let start_time = fields.nth(17)?;
+    Some((state, start_time, parent))
+}
+
+/// Field 3 (state) and field 22 (start time) of `/proc/<pid>/stat`, through
+/// [`state_start_and_parent`].
+#[cfg(target_os = "linux")]
+fn state_and_start_time(stat: &str) -> Option<(&str, &str)> {
+    state_start_and_parent(stat).map(|(state, start_time, _)| (state, start_time))
+}
+
+/// The parent pid of a live process, from the same `/proc/<pid>/stat` reader
+/// [`SystemProbe`] uses. `None` when the file cannot be read or has no parent
+/// field.
+#[cfg(target_os = "linux")]
+pub(crate) fn proc_parent(pid: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    state_start_and_parent(&stat).map(|(_, _, parent)| parent)
 }
 
 /// A `Z` (zombie) is a killed process its parent has not reaped yet; `X` is
@@ -551,6 +569,19 @@ mod tests {
         let dead = stat.replacen(") S ", ") X ", 1);
         assert_eq!(state_and_start_time(&dead), Some(("X", "19664719")));
         assert!(!stat_is_alive(&dead, "19664719"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_stat_line_gives_the_parent_too() {
+        // Fields 4..=21 hold 1..=18; field 4 is the parent pid and field 22 the
+        // start time.
+        let before_start: Vec<String> = (1..=18).map(|value| value.to_string()).collect();
+        let stat = format!(
+            "41822 (claude (x) y) S {} 19664719 1 1 0 -1 123 0 0 0 0 0 0 0 0 0 0 0 0 0",
+            before_start.join(" ")
+        );
+        assert_eq!(state_start_and_parent(&stat), Some(("S", "19664719", 1)));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! and the closed ones from the history, with their agents, tokens and the two
 //! values of those tokens.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 
@@ -11,13 +11,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::atomic::{self, Access};
 use crate::burn::tied::thinking_tied;
+use crate::harness::{self, HarnessSession};
 use crate::history::{HistoryDir, HistoryError, Hosted, Hosts, Range, SessionRecord, TokenRecord};
 use crate::money::{Valued, Valuer};
 use crate::project::ProjectKey;
 use crate::projects::{ProjectId, Projects};
 use crate::sessions::{SessionFile, SessionStatus};
 use crate::store::Settings;
-use crate::transcripts::{self, AgentMeta, AgentSeen, ScanState, Tokens};
+use crate::transcripts::{self, AgentMeta, AgentSeen, HarnessRecorded, ScanState, Tokens};
 
 /// A session idle longer than this pays nothing extra for a switch (spec V11).
 pub const CACHE_LIFE_MIN: i64 = 60;
@@ -549,6 +550,431 @@ pub fn running(
     Rows { sessions, warnings }
 }
 
+/// The rows and agents one Harness read adds, and the token lines its tokens
+/// produce.
+#[derive(Debug, Clone)]
+pub struct HarnessRows {
+    /// The Harness sessions that are their own row: no linked top-level job.
+    pub rows: Rows,
+    /// The flash agents of each Claude Code session, keyed by that session's id.
+    pub agents: BTreeMap<String, Vec<LiveAgent>>,
+    /// The token lines this pass must write, and the totals after writing them.
+    pub tokens: Vec<TokenRecord>,
+    /// `ScanState::harness_recorded` after this pass.
+    pub recorded: BTreeMap<String, HarnessRecorded>,
+}
+
+/// The provider of a Harness session that is its own row (spec §3.8).
+const HARNESS_PROVIDER: &str = "DeepSeek Harness";
+
+/// Put the Harness sessions into the Sessions area: a job named in a Claude
+/// Code transcript becomes a `"flash"` agent of that session, with its workers
+/// below it; every other top-level session is its own row. The tokens of every
+/// session become token lines for what grew since `recorded`; the returned
+/// `recorded` is the total after this pass, and a line is written only when a
+/// total grew (a total that went down is a warning, never a negative line).
+#[allow(clippy::too_many_arguments)]
+pub fn harness_rows(
+    sessions: &[HarnessSession],
+    owners: &BTreeMap<String, String>,
+    claude_cwd: &BTreeMap<String, String>,
+    recorded: &BTreeMap<String, HarnessRecorded>,
+    locks: &BTreeSet<String>,
+    projects: Option<&Projects>,
+    pricing: &Pricing,
+    host: &str,
+    now: DateTime<Utc>,
+    project_of: &dyn Fn(&str) -> ProjectKey,
+) -> HarnessRows {
+    let by_id: BTreeMap<&str, &HarnessSession> = sessions
+        .iter()
+        .map(|session| (session.id.as_str(), session))
+        .collect();
+    let mut components: BTreeMap<&str, Vec<&HarnessSession>> = BTreeMap::new();
+    for session in sessions {
+        components
+            .entry(top_known_ancestor(session, &by_id))
+            .or_default()
+            .push(session);
+    }
+
+    let mut out = HarnessRows {
+        rows: Rows {
+            sessions: Vec::new(),
+            warnings: Vec::new(),
+        },
+        agents: BTreeMap::new(),
+        tokens: Vec::new(),
+        recorded: recorded.clone(),
+    };
+    for (root_id, mut component) in components {
+        component.sort_by(|a, b| a.created.cmp(&b.created).then_with(|| a.id.cmp(&b.id)));
+        let root = by_id[root_id];
+        // The owner of the tree: its own id first, then the ids of its sessions
+        // and their parent chains as far as they are known.
+        let owner = owner_of(root, &component, &by_id, owners);
+        match owner {
+            Some(owner) => {
+                let claude_cwd = claude_cwd.get(&owner).cloned();
+                if claude_cwd.is_none() {
+                    out.rows.warnings.push(format!(
+                        "the Claude Code session {owner} of Harness job {root_id} is not known yet; its folder is not known"
+                    ));
+                }
+                for session in component {
+                    let Some((cwd, project)) = harness_location(
+                        session,
+                        claude_cwd.as_deref(),
+                        project_of,
+                        &mut out.rows.warnings,
+                    ) else {
+                        continue;
+                    };
+                    let is_root = session.id.as_str() == root_id;
+                    // A worker whose job is out of the slice still hangs under
+                    // the job's owner; only a depth-0 job is the flash agent.
+                    let (parent, kind) = if is_root && session.depth == 0 {
+                        (None, Some("flash"))
+                    } else {
+                        (session.parent.clone(), None)
+                    };
+                    let running = harness::is_running(session, locks.contains(&session.id), now);
+                    let agent = harness_agent(
+                        session, parent, kind, running, &cwd, &project, pricing, host,
+                    );
+                    out.agents.entry(owner.clone()).or_default().push(agent);
+                    harness_token_line(
+                        session,
+                        &owner,
+                        &cwd,
+                        &project,
+                        &mut out.recorded,
+                        &mut out.tokens,
+                        &mut out.rows.warnings,
+                    );
+                }
+            }
+            None => {
+                let cwd = match root.cwd.to_str() {
+                    Some(cwd) => cwd.to_string(),
+                    None => {
+                        out.rows.warnings.push(format!(
+                            "Harness session {} has a folder that is not text; it is not shown",
+                            root.id
+                        ));
+                        continue;
+                    }
+                };
+                let project = project_of(&cwd);
+                let id = ProjectId::of(&project, host);
+                let (project_id, project_name, org) = named_project(projects, &id);
+                let mut agents = Vec::new();
+                let mut running = 0u32;
+                let mut done = 0u32;
+                for session in component.iter().filter(|session| session.id != root_id) {
+                    let is_running = harness::is_running(session, locks.contains(&session.id), now);
+                    let agent = harness_agent(
+                        session,
+                        session.parent.clone(),
+                        None,
+                        is_running,
+                        &cwd,
+                        &project,
+                        pricing,
+                        host,
+                    );
+                    if agent.running {
+                        running += 1;
+                    } else {
+                        done += 1;
+                    }
+                    agents.push(agent);
+                }
+                let agents_done_values = {
+                    let done_values: Vec<&Values> = agents
+                        .iter()
+                        .filter(|agent| !agent.running)
+                        .map(|agent| &agent.values)
+                        .collect();
+                    Values::sum(&done_values)
+                };
+                let values = harness_values(root, &cwd, &project, pricing, host);
+                let root_running = harness::is_running(root, locks.contains(&root.id), now);
+                out.rows.sessions.push(LiveSession {
+                    session: root.id.clone(),
+                    host: host.to_string(),
+                    label: session_label(&project_name, &root.id),
+                    project_id,
+                    project: project_name,
+                    org,
+                    cwd: cwd.clone(),
+                    provider: HARNESS_PROVIDER.to_string(),
+                    model: root.model.clone(),
+                    tied: root.model.as_deref().map(thinking_tied).unwrap_or(false),
+                    status: if root_running {
+                        LiveStatus::Busy
+                    } else {
+                        LiveStatus::Idle
+                    },
+                    since: root.last,
+                    started: root.created,
+                    agents_running: running,
+                    agents_done: done,
+                    agents,
+                    tokens: root.tokens,
+                    last_hour: Tokens::default(),
+                    last_hour_values: pricing.of(&[]),
+                    agents_done_values,
+                    values,
+                });
+                for session in component {
+                    harness_token_line(
+                        session,
+                        &session.id,
+                        &cwd,
+                        &project,
+                        &mut out.recorded,
+                        &mut out.tokens,
+                        &mut out.rows.warnings,
+                    );
+                }
+            }
+        }
+    }
+    out.tokens
+        .sort_by(|a, b| a.session.cmp(&b.session).then_with(|| a.t.cmp(&b.t)));
+    out
+}
+
+/// The top known ancestor of a session: a parent that is not in the slice stops
+/// the walk but its id is still looked at for an owner.
+fn top_known_ancestor<'a>(
+    session: &'a HarnessSession,
+    by_id: &BTreeMap<&'a str, &'a HarnessSession>,
+) -> &'a str {
+    let mut root = session.id.as_str();
+    let mut seen = BTreeSet::new();
+    let mut parent = session.parent.as_deref();
+    while let Some(id) = parent {
+        if !seen.insert(id) {
+            break;
+        }
+        let Some(next) = by_id.get(id) else {
+            break;
+        };
+        root = next.id.as_str();
+        parent = next.parent.as_deref();
+    }
+    root
+}
+
+/// The owner of a tree: the root's own id, then every session's own id and
+/// parent chain as far as it is known. A parent outside the slice is still
+/// looked at for an owner.
+fn owner_of(
+    root: &HarnessSession,
+    component: &[&HarnessSession],
+    by_id: &BTreeMap<&str, &HarnessSession>,
+    owners: &BTreeMap<String, String>,
+) -> Option<String> {
+    if let Some(owner) = owners.get(&root.id) {
+        return Some(owner.clone());
+    }
+    for session in component {
+        let mut seen = BTreeSet::new();
+        let mut current = Some(session.id.as_str());
+        while let Some(id) = current {
+            if !seen.insert(id) {
+                break;
+            }
+            if let Some(owner) = owners.get(id) {
+                return Some(owner.clone());
+            }
+            current = match by_id.get(id) {
+                Some(session) => session.parent.as_deref(),
+                None => break,
+            };
+        }
+    }
+    None
+}
+
+/// Add agents to a running row and recount its done totals and their values.
+pub fn add_agents(session: &mut LiveSession, agents: Vec<LiveAgent>) {
+    for agent in agents {
+        if agent.running {
+            session.agents_running += 1;
+        } else {
+            session.agents_done += 1;
+        }
+        session.agents.push(agent);
+    }
+    let done: Vec<&Values> = session
+        .agents
+        .iter()
+        .filter(|agent| !agent.running)
+        .map(|agent| &agent.values)
+        .collect();
+    session.agents_done_values = Values::sum(&done);
+}
+
+/// The folder and project of a Harness session: the Claude Code session's for a
+/// linked job, else its own. A folder that is not text leaves the session out
+/// with a warning.
+fn harness_location(
+    session: &HarnessSession,
+    claude_cwd: Option<&str>,
+    project_of: &dyn Fn(&str) -> ProjectKey,
+    warnings: &mut Vec<String>,
+) -> Option<(String, ProjectKey)> {
+    let cwd = match claude_cwd {
+        Some(cwd) => cwd,
+        None => match session.cwd.to_str() {
+            Some(cwd) => cwd,
+            None => {
+                warnings.push(format!(
+                    "Harness session {} has a folder that is not text; it is not shown",
+                    session.id
+                ));
+                return None;
+            }
+        },
+    };
+    Some((cwd.to_string(), project_of(cwd)))
+}
+
+/// One Harness session as a live agent; `kind` is `"flash"` for a linked job.
+#[allow(clippy::too_many_arguments)]
+fn harness_agent(
+    session: &HarnessSession,
+    parent: Option<String>,
+    kind: Option<&str>,
+    running: bool,
+    cwd: &str,
+    project: &ProjectKey,
+    pricing: &Pricing,
+    host: &str,
+) -> LiveAgent {
+    LiveAgent {
+        agent: session.id.clone(),
+        parent,
+        kind: kind.map(str::to_string),
+        task: session.title.clone(),
+        model: session.model.clone(),
+        running,
+        first: Some(session.created),
+        last: Some(session.last),
+        tokens: session.tokens,
+        values: harness_values(session, cwd, project, pricing, host),
+    }
+}
+
+/// The values of a Harness session's tokens at its reported model.
+fn harness_values(
+    session: &HarnessSession,
+    cwd: &str,
+    project: &ProjectKey,
+    pricing: &Pricing,
+    host: &str,
+) -> Values {
+    let Some(model) = session.model.as_deref() else {
+        return pricing.missing(NO_AGENT_MODEL);
+    };
+    let record = token_record(
+        &session.id,
+        cwd,
+        project,
+        model,
+        session.last,
+        session.tokens,
+    );
+    match pricing {
+        Pricing::Known { valuer, .. } => pricing.of(&[valuer.value(host, &record)]),
+        Pricing::Unknown { .. } => pricing.of(&[]),
+    }
+}
+
+/// One token line for what a Harness session gained since `recorded`, or a
+/// warning when its totals went down or its model or folder is not known. The
+/// growth is split by the hour and model of each new assistant message, exactly
+/// as S-1's `token_records` groups its answers.
+#[allow(clippy::too_many_arguments)]
+fn harness_token_line(
+    session: &HarnessSession,
+    history_session: &str,
+    cwd: &str,
+    project: &ProjectKey,
+    recorded: &mut BTreeMap<String, HarnessRecorded>,
+    lines: &mut Vec<TokenRecord>,
+    warnings: &mut Vec<String>,
+) {
+    let previous = recorded.get(&session.id).cloned().unwrap_or_default();
+    let current = HarnessRecorded {
+        tokens: session.tokens,
+        messages: session.messages,
+        file: Some(session.file.clone()),
+    };
+    if current == previous {
+        return;
+    }
+    let grew = current.tokens.input >= previous.tokens.input
+        && current.tokens.out >= previous.tokens.out
+        && current.tokens.cw >= previous.tokens.cw
+        && current.tokens.cr >= previous.tokens.cr
+        && current.messages >= previous.messages;
+    if !grew {
+        warnings.push(format!(
+            "Harness session {} has fewer tokens or messages than already recorded; the old totals are kept",
+            session.id
+        ));
+        return;
+    }
+    // The answers since the recorded message count: each has its own time,
+    // model and usage. A message without usage adds an answer with no tokens.
+    let new_count = (current.messages - previous.messages) as usize;
+    let Some(messages) = session
+        .messages_detail
+        .get(previous.messages as usize..)
+        .map(|messages| &messages[..messages.len().min(new_count)])
+    else {
+        warnings.push(format!(
+            "Harness session {} counts {} answers but its file holds fewer; the old totals are kept",
+            session.id, current.messages
+        ));
+        return;
+    };
+    let mut groups: BTreeMap<(DateTime<Utc>, String), (Tokens, u32)> = BTreeMap::new();
+    for message in messages {
+        let Some(model) = message.model.clone().or_else(|| session.model.clone()) else {
+            warnings.push(format!(
+                "Harness session {} has an answer without a model; its tokens are not recorded yet",
+                session.id
+            ));
+            return;
+        };
+        let group = groups
+            .entry((transcripts::hour_start(message.at), model))
+            .or_default();
+        if let Some(usage) = message.usage {
+            group.0 += usage;
+        }
+        group.1 = group.1.saturating_add(1);
+    }
+    if groups.is_empty() && current.tokens != previous.tokens {
+        warnings.push(format!(
+            "Harness session {} has more tokens than recorded but no new answer; the old totals are kept",
+            session.id
+        ));
+        return;
+    }
+    for ((hour, model), (tokens, answers)) in groups {
+        let mut record = token_record(history_session, cwd, project, &model, hour, tokens);
+        record.agent_answers = answers;
+        lines.push(record);
+    }
+    recorded.insert(session.id.clone(), current);
+}
+
 /// The sessions of every host that closed in `[since, now)` (spec §3.8). A row
 /// is a session whose last `SessionRecord` has `closed: true` and whose `last`
 /// is in the range; its tokens are the sum of every `TokenRecord` of the
@@ -1003,6 +1429,7 @@ mod tests {
             spawns: BTreeMap::new(),
             recent: Vec::new(),
             recorded: None,
+            flash_jobs: BTreeSet::new(),
         }
     }
 
@@ -2817,5 +3244,713 @@ mod tests {
             "the warning names the reason: {}",
             other.warnings[0]
         );
+    }
+
+    const JOB_A: &str = "flash-task-5c974a53-178a-4254-93b2-b804a111414a";
+    const JOB_B: &str = "flash-task-8d2f0e7c-6b1a-4c3d-9e0f-1a2b3c4d5e6f";
+    const WORKER_A: &str = "a25abffd-ed93-4296-868f-dbd77aca32ac";
+    const HARNESS_KEY: &str = "--home-sam-projects-atlas--";
+    const FLASH_MODEL: &str = "deepseek-v4.1-flash:cloud";
+
+    fn harness_store() -> (tempfile::TempDir, crate::harness::HarnessPaths) {
+        let tmp = tempdir().expect("tempdir");
+        let paths = crate::harness::HarnessPaths::at(
+            tmp.path().join("sessions"),
+            tmp.path().join("flash-agents"),
+        );
+        (tmp, paths)
+    }
+
+    fn harness_event(kind: &str, time: i64, data: serde_json::Value) -> String {
+        serde_json::json!({"type": kind, "seq": 1, "time": time, "data": data}).to_string()
+    }
+
+    /// Write one Harness session file; the times are 2026-11-14 09:40 UTC and
+    /// later.
+    #[allow(clippy::too_many_arguments)]
+    fn write_harness_session(
+        paths: &crate::harness::HarnessPaths,
+        id: &str,
+        parent: Option<&str>,
+        depth: u32,
+        finished: bool,
+        input: u64,
+        out: u64,
+        title: Option<&str>,
+    ) {
+        let dir = paths.sessions.join(HARNESS_KEY).join(id);
+        std::fs::create_dir_all(&dir).expect("a session folder");
+        let mut header = serde_json::json!({
+            "type": "session",
+            "version": 4,
+            "id": id,
+            "createdAt": 1794696000000_i64,
+            "cwd": ATLAS_CWD,
+            "isSeeded": false,
+            "delegationDepth": depth,
+        });
+        if let Some(parent) = parent {
+            header["parentSession"] = serde_json::json!(parent);
+            header["origin"] = serde_json::json!("subagent");
+        }
+        let mut lines = vec![
+            header.to_string(),
+            harness_event("turn/start", 1794696001000, serde_json::json!({"turn": 1})),
+            harness_event(
+                "assistant/message",
+                1794696002000,
+                serde_json::json!({
+                    "turn": 1,
+                    "step": 1,
+                    "message": {
+                        "role": "assistant",
+                        "source": {"kind": "model", "provider": "ollama", "model": FLASH_MODEL},
+                        "id": "m1"
+                    },
+                    "usage": {
+                        "inputTokens": input,
+                        "outputTokens": out,
+                        "totalTokens": input + out
+                    }
+                }),
+            ),
+        ];
+        if let Some(title) = title {
+            lines.push(harness_event(
+                "session/title",
+                1794696003000,
+                serde_json::json!({"title": title}),
+            ));
+        }
+        if finished {
+            lines.push(harness_event(
+                "turn/end",
+                1794696004000,
+                serde_json::json!({"turn": 1, "reason": {"kind": "completed"}}),
+            ));
+        }
+        let mut text = String::new();
+        for line in lines {
+            text.push_str(&line);
+            text.push('\n');
+        }
+        std::fs::write(
+            dir.join("session.v4.jsonl.zstd"),
+            zstd::encode_all(text.as_bytes(), 3).expect("zstd"),
+        )
+        .expect("a session file");
+        std::fs::write(dir.join("session.lock"), []).expect("a lock");
+    }
+
+    /// Write a Harness session with `messages` assistant events and a final
+    /// `turn/end` when `finished`; every message is 100 input and 50 output.
+    fn write_harness_messages(
+        paths: &crate::harness::HarnessPaths,
+        id: &str,
+        parent: Option<&str>,
+        depth: u32,
+        messages: u32,
+        finished: bool,
+        last: i64,
+    ) {
+        let dir = paths.sessions.join(HARNESS_KEY).join(id);
+        std::fs::create_dir_all(&dir).expect("a session folder");
+        let mut header = serde_json::json!({
+            "type": "session",
+            "version": 4,
+            "id": id,
+            "createdAt": last - 3_600_000,
+            "cwd": ATLAS_CWD,
+            "isSeeded": false,
+            "delegationDepth": depth,
+        });
+        if let Some(parent) = parent {
+            header["parentSession"] = serde_json::json!(parent);
+            header["origin"] = serde_json::json!("subagent");
+        }
+        let mut lines = vec![
+            header.to_string(),
+            harness_event("turn/start", last - 60_000, serde_json::json!({"turn": 1})),
+        ];
+        for number in 0..messages {
+            lines.push(harness_event(
+                "assistant/message",
+                last - 3_600_000 + i64::from(number) * 1_000,
+                serde_json::json!({
+                    "turn": 1,
+                    "step": 1,
+                    "message": {
+                        "role": "assistant",
+                        "source": {"kind": "model", "provider": "ollama", "model": FLASH_MODEL},
+                        "id": format!("m{number}")
+                    },
+                    "usage": {
+                        "inputTokens": 100,
+                        "outputTokens": 50,
+                        "totalTokens": 150
+                    }
+                }),
+            ));
+        }
+        if finished {
+            lines.push(harness_event(
+                "turn/end",
+                last,
+                serde_json::json!({"turn": 1, "reason": {"kind": "completed"}}),
+            ));
+        }
+        let mut text = String::new();
+        for line in lines {
+            text.push_str(&line);
+            text.push('\n');
+        }
+        std::fs::write(
+            dir.join("session.v4.jsonl.zstd"),
+            zstd::encode_all(text.as_bytes(), 3).expect("zstd"),
+        )
+        .expect("a session file");
+        std::fs::write(dir.join("session.lock"), []).expect("a lock");
+    }
+
+    fn unknown_pricing() -> Pricing<'static> {
+        Pricing::Unknown {
+            reason: "no prices in the test".to_string(),
+        }
+    }
+
+    fn harness_links(
+        paths: &crate::harness::HarnessPaths,
+        state: &ScanState,
+    ) -> BTreeMap<String, String> {
+        crate::harness::links(paths, &state.sessions, &state.closed_flash_jobs).owners
+    }
+
+    #[test]
+    fn a_job_named_in_a_transcript_hangs_under_its_session() {
+        let (_dir, paths) = harness_store();
+        write_harness_session(&paths, JOB_A, None, 0, false, 10516, 3585, None);
+        write_harness_session(&paths, WORKER_A, Some(JOB_A), 1, false, 2200, 1100, None);
+        let report = serde_json::json!({"sessionId": JOB_A});
+        std::fs::create_dir_all(paths.reports.join("acme").join("patches")).expect("reports");
+        std::fs::write(
+            paths
+                .reports
+                .join("acme")
+                .join("patches")
+                .join("job-3e32c2fc.report.json"),
+            report.to_string(),
+        )
+        .expect("a report");
+        let mut state = state_with(seen(FLASH_MODEL, 3585));
+        state
+            .sessions
+            .get_mut(SESSION)
+            .expect("the session")
+            .flash_jobs = BTreeSet::from(["job-3e32c2fc".to_string()]);
+        let now = utc("2026-11-14T19:00:00Z");
+        let harness = crate::harness::sessions(&paths, utc("2026-11-01T00:00:00Z"));
+        let claude_cwd = BTreeMap::from([(SESSION.to_string(), ATLAS_CWD.to_string())]);
+
+        let mut rows = running(
+            &[session_file()],
+            &state,
+            &|_| Vec::new(),
+            Some(&projects()),
+            &unknown_pricing(),
+            "atlas",
+            now,
+            &|_| project_key(),
+        );
+        let out = harness_rows(
+            &harness.sessions,
+            &harness_links(&paths, &state),
+            &claude_cwd,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &unknown_pricing(),
+            "atlas",
+            utc("2026-11-14T19:00:00Z"),
+            &|_| project_key(),
+        );
+        let agents = out.agents.get(SESSION).expect("the session's flash agents");
+        assert_eq!(agents.len(), 2);
+        let job = agents
+            .iter()
+            .find(|agent| agent.agent == JOB_A)
+            .expect("the job");
+        assert_eq!(job.kind.as_deref(), Some("flash"));
+        assert_eq!(job.parent, None);
+        assert!(job.running);
+        assert_eq!(job.model.as_deref(), Some(FLASH_MODEL));
+        let worker = agents
+            .iter()
+            .find(|agent| agent.agent == WORKER_A)
+            .expect("the worker");
+        assert_eq!(worker.parent.as_deref(), Some(JOB_A));
+        add_agents(
+            rows.sessions
+                .iter_mut()
+                .find(|row| row.session == SESSION)
+                .expect("the Claude row"),
+            agents.clone(),
+        );
+        let row = rows
+            .sessions
+            .iter()
+            .find(|row| row.session == SESSION)
+            .expect("the Claude row");
+        assert_eq!(row.agents_running, 2);
+        assert_eq!(row.agents_done, 0);
+    }
+
+    #[test]
+    fn two_sessions_in_one_repository_keep_their_own_jobs() {
+        let (_dir, paths) = harness_store();
+        write_harness_session(&paths, JOB_A, None, 0, true, 100, 50, None);
+        write_harness_session(&paths, JOB_B, None, 0, true, 200, 70, None);
+        let mut state = state_with(seen(FLASH_MODEL, 3585));
+        state
+            .sessions
+            .get_mut(SESSION)
+            .expect("the session")
+            .flash_jobs = BTreeSet::from([JOB_A.to_string()]);
+        let mut other = seen(FLASH_MODEL, 3585);
+        other.flash_jobs = BTreeSet::from([JOB_B.to_string()]);
+        state.sessions.insert(SESSION_11.to_string(), other);
+        let mut other_file = session_file();
+        other_file.pid = 41823;
+        other_file.session_id = SESSION_11.to_string();
+        let now = utc("2026-11-14T19:00:00Z");
+        let harness = crate::harness::sessions(&paths, utc("2026-11-01T00:00:00Z"));
+        let claude_cwd = BTreeMap::from([
+            (SESSION.to_string(), ATLAS_CWD.to_string()),
+            (SESSION_11.to_string(), ATLAS_CWD.to_string()),
+        ]);
+        let mut rows = running(
+            &[session_file(), other_file],
+            &state,
+            &|_| Vec::new(),
+            Some(&projects()),
+            &unknown_pricing(),
+            "atlas",
+            now,
+            &|_| project_key(),
+        );
+
+        let out = harness_rows(
+            &harness.sessions,
+            &harness_links(&paths, &state),
+            &claude_cwd,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &unknown_pricing(),
+            "atlas",
+            utc("2026-11-14T19:00:00Z"),
+            &|_| project_key(),
+        );
+        for (session, agents) in &out.agents {
+            add_agents(
+                rows.sessions
+                    .iter_mut()
+                    .find(|row| &row.session == session)
+                    .expect("the session's row"),
+                agents.clone(),
+            );
+        }
+
+        assert_eq!(rows.sessions.len(), 2);
+        let first = rows
+            .sessions
+            .iter()
+            .find(|row| row.session == SESSION)
+            .expect("the first row");
+        let second = rows
+            .sessions
+            .iter()
+            .find(|row| row.session == SESSION_11)
+            .expect("the second row");
+        assert_eq!(
+            first
+                .agents
+                .iter()
+                .map(|agent| agent.agent.as_str())
+                .collect::<Vec<_>>(),
+            vec![JOB_A]
+        );
+        assert_eq!(
+            second
+                .agents
+                .iter()
+                .map(|agent| agent.agent.as_str())
+                .collect::<Vec<_>>(),
+            vec![JOB_B]
+        );
+    }
+
+    #[test]
+    fn a_session_without_a_parent_is_its_own_row() {
+        let (_dir, paths) = harness_store();
+        write_harness_session(
+            &paths,
+            JOB_A,
+            None,
+            0,
+            false,
+            10516,
+            3585,
+            Some("atlas link test"),
+        );
+        write_harness_session(&paths, WORKER_A, Some(JOB_A), 1, true, 2200, 1100, None);
+        let harness = crate::harness::sessions(&paths, utc("2026-11-01T00:00:00Z"));
+
+        let out = harness_rows(
+            &harness.sessions,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &unknown_pricing(),
+            "atlas",
+            utc("2026-11-14T19:00:00Z"),
+            &|_| project_key(),
+        );
+
+        assert!(out.agents.is_empty());
+        assert_eq!(out.rows.sessions.len(), 1);
+        let row = &out.rows.sessions[0];
+        assert_eq!(row.session, JOB_A);
+        assert_eq!(row.provider, "DeepSeek Harness");
+        assert_eq!(row.model.as_deref(), Some(FLASH_MODEL));
+        assert_eq!(row.tokens.input, 10516);
+        assert_eq!(row.tokens.out, 3585);
+        assert_eq!(row.agents.len(), 1);
+        assert_eq!(row.agents[0].agent, WORKER_A);
+        assert_eq!(row.agents[0].parent.as_deref(), Some(JOB_A));
+        assert_eq!(row.agents_running, 0);
+        assert_eq!(row.agents_done, 1);
+    }
+
+    #[test]
+    fn no_title_reaches_the_history() {
+        let (dir, paths) = harness_store();
+        let title = "atlas link test";
+        write_harness_session(&paths, JOB_A, None, 0, true, 10516, 3585, None);
+        write_harness_session(
+            &paths,
+            WORKER_A,
+            Some(JOB_A),
+            1,
+            false,
+            2200,
+            1100,
+            Some(title),
+        );
+        let harness = crate::harness::sessions(&paths, utc("2026-11-01T00:00:00Z"));
+
+        let out = harness_rows(
+            &harness.sessions,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &unknown_pricing(),
+            "atlas",
+            utc("2026-11-14T19:00:00Z"),
+            &|_| project_key(),
+        );
+
+        assert_eq!(
+            out.rows.sessions[0].agents[0].task.as_deref(),
+            Some(title),
+            "the title is shown live"
+        );
+        let history = HistoryDir::at(&dir.path().join("history"), "atlas");
+        write_report(&history, &out.rows.sessions, utc("2026-11-14T19:00:00Z"))
+            .expect("the sessions report");
+        let recorder =
+            crate::history::Recorder::new(HistoryDir::at(&dir.path().join("history"), "atlas"));
+        recorder.tokens(&out.tokens).expect("the token lines");
+
+        let mut found = String::new();
+        let mut files = 0;
+        collect_text(&dir.path().join("history"), &mut found, &mut files);
+        assert!(files > 0, "a token line was written");
+        assert!(!found.contains(title), "no history file holds the title");
+    }
+
+    fn collect_text(dir: &std::path::Path, text: &mut String, files: &mut usize) {
+        for entry in std::fs::read_dir(dir).expect("a folder") {
+            let path = entry.expect("an entry").path();
+            if path.is_dir() {
+                collect_text(&path, text, files);
+            } else {
+                *files += 1;
+                text.push_str(&std::fs::read_to_string(&path).expect("a history file"));
+            }
+        }
+    }
+
+    #[test]
+    fn proof_a_worker_whose_job_is_out_of_range_still_hangs_under_the_owner() {
+        let (_dir, paths) = harness_store();
+        // Only the worker is in the range (its job's file is older than `since`).
+        write_harness_session(&paths, WORKER_A, Some(JOB_A), 1, false, 2200, 1100, None);
+        let harness = crate::harness::sessions(&paths, utc("2026-11-01T00:00:00Z"));
+        let owners = BTreeMap::from([(JOB_A.to_string(), SESSION.to_string())]);
+        let claude_cwd = BTreeMap::from([(SESSION.to_string(), ATLAS_CWD.to_string())]);
+
+        let out = harness_rows(
+            &harness.sessions,
+            &owners,
+            &claude_cwd,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &unknown_pricing(),
+            "atlas",
+            utc("2026-11-14T19:00:00Z"),
+            &|_| project_key(),
+        );
+
+        assert!(
+            out.rows.sessions.is_empty(),
+            "the worker became its own DeepSeek Harness row"
+        );
+        assert_eq!(out.agents.get(SESSION).map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn a_worker_without_its_job_and_owner_is_its_own_row() {
+        let (_dir, paths) = harness_store();
+        write_harness_session(&paths, WORKER_A, Some(JOB_A), 1, true, 2200, 1100, None);
+        let harness = crate::harness::sessions(&paths, utc("2026-11-01T00:00:00Z"));
+
+        let out = harness_rows(
+            &harness.sessions,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &unknown_pricing(),
+            "atlas",
+            utc("2026-11-14T19:00:00Z"),
+            &|_| project_key(),
+        );
+
+        assert!(out.agents.is_empty());
+        assert_eq!(out.rows.sessions.len(), 1);
+        let row = &out.rows.sessions[0];
+        assert_eq!(row.session, WORKER_A);
+        assert_eq!(row.provider, "DeepSeek Harness");
+    }
+
+    /// Write a Harness session whose assistant messages are `(time, usage)`;
+    /// `None` is a message without `usage`, an answer with no tokens.
+    fn write_harness_answers(
+        paths: &crate::harness::HarnessPaths,
+        id: &str,
+        answers: &[(i64, Option<(u64, u64)>)],
+    ) {
+        let dir = paths.sessions.join(HARNESS_KEY).join(id);
+        std::fs::create_dir_all(&dir).expect("a session folder");
+        let first = answers.first().map(|(at, _)| *at).unwrap_or(0);
+        let header = serde_json::json!({
+            "type": "session",
+            "version": 4,
+            "id": id,
+            "createdAt": first - 3_600_000,
+            "cwd": ATLAS_CWD,
+            "isSeeded": false,
+            "delegationDepth": 0,
+        });
+        let mut lines = vec![
+            header.to_string(),
+            harness_event("turn/start", first - 60_000, serde_json::json!({"turn": 1})),
+        ];
+        for (number, (at, usage)) in answers.iter().enumerate() {
+            let mut data = serde_json::json!({
+                "turn": 1,
+                "step": 1,
+                "message": {
+                    "role": "assistant",
+                    "source": {"kind": "model", "provider": "ollama", "model": FLASH_MODEL},
+                    "id": format!("m{number}")
+                },
+            });
+            if let Some((input, out)) = usage {
+                data["usage"] = serde_json::json!({
+                    "inputTokens": input,
+                    "outputTokens": out,
+                    "totalTokens": input + out
+                });
+            }
+            lines.push(harness_event("assistant/message", *at, data));
+        }
+        let last = answers.last().map(|(at, _)| *at).unwrap_or(first);
+        lines.push(harness_event(
+            "turn/end",
+            last + 1_000,
+            serde_json::json!({"turn": 1, "reason": {"kind": "completed"}}),
+        ));
+        let mut text = String::new();
+        for line in lines {
+            text.push_str(&line);
+            text.push('\n');
+        }
+        std::fs::write(
+            dir.join("session.v4.jsonl.zstd"),
+            zstd::encode_all(text.as_bytes(), 3).expect("zstd"),
+        )
+        .expect("a session file");
+        std::fs::write(dir.join("session.lock"), []).expect("a lock");
+    }
+
+    #[test]
+    fn harness_token_lines_are_per_hour_of_the_answers() {
+        let (_dir, paths) = harness_store();
+        let first = 1_794_696_000_000_i64;
+        let second = first + 3_600_000;
+        write_harness_answers(
+            &paths,
+            JOB_A,
+            &[(first, Some((100, 50))), (second, Some((200, 70)))],
+        );
+        let harness = crate::harness::sessions(&paths, utc("2026-11-01T00:00:00Z"));
+        let session = &harness.sessions[0];
+
+        let out = harness_rows(
+            &harness.sessions,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &unknown_pricing(),
+            "atlas",
+            utc("2026-11-14T19:00:00Z"),
+            &|_| project_key(),
+        );
+
+        let hour_of = |ms: i64| {
+            transcripts::hour_start(Utc.timestamp_millis_opt(ms).single().expect("a time"))
+        };
+        assert_eq!(
+            out.tokens.len(),
+            2,
+            "one line per hour of the new answers: {:?}",
+            out.tokens
+        );
+        let mut lines: Vec<(DateTime<Utc>, u64, u64, u32)> = out
+            .tokens
+            .iter()
+            .map(|record| (record.t, record.input, record.out, record.agent_answers))
+            .collect();
+        lines.sort();
+        assert_eq!(
+            lines,
+            vec![(hour_of(first), 100, 50, 1), (hour_of(second), 200, 70, 1),]
+        );
+        assert_eq!(
+            out.tokens.iter().map(|record| record.input).sum::<u64>(),
+            session.tokens.input,
+            "the lines' sums are the delta since the recorded total"
+        );
+        assert_eq!(
+            out.tokens.iter().map(|record| record.out).sum::<u64>(),
+            session.tokens.out
+        );
+    }
+
+    #[test]
+    fn an_answer_without_usage_adds_a_line_with_no_tokens() {
+        let (_dir, paths) = harness_store();
+        let first = 1_794_696_000_000_i64;
+        write_harness_answers(
+            &paths,
+            JOB_A,
+            &[(first, Some((100, 50))), (first + 1_000, None)],
+        );
+        let harness = crate::harness::sessions(&paths, utc("2026-11-01T00:00:00Z"));
+
+        let out = harness_rows(
+            &harness.sessions,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &unknown_pricing(),
+            "atlas",
+            utc("2026-11-14T19:00:00Z"),
+            &|_| project_key(),
+        );
+
+        assert_eq!(out.tokens.len(), 1, "the two answers share their hour");
+        assert_eq!(out.tokens[0].input, 100);
+        assert_eq!(out.tokens[0].out, 50);
+        assert_eq!(
+            out.tokens[0].agent_answers, 2,
+            "a message without usage is still an answer"
+        );
+    }
+
+    #[test]
+    fn harness_agent_answers_count_the_new_messages() {
+        let (_dir, paths) = harness_store();
+        // Two assistant messages, then a third one in a later pass.
+        write_harness_messages(&paths, JOB_A, None, 0, 2, true, 1_794_696_004_000);
+        let harness = crate::harness::sessions(&paths, utc("2026-11-01T00:00:00Z"));
+        let session = &harness.sessions[0];
+
+        let first = harness_rows(
+            &harness.sessions,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &unknown_pricing(),
+            "atlas",
+            utc("2026-11-14T19:00:00Z"),
+            &|_| project_key(),
+        );
+
+        assert_eq!(first.tokens.len(), 1);
+        assert_eq!(first.tokens[0].agent_answers, 2);
+        assert_eq!(first.tokens[0].input, 200);
+        assert_eq!(
+            first.tokens[0].t,
+            transcripts::hour_start(session.last_message),
+            "the line is dated at the hour of the last answer S-1 uses"
+        );
+        assert_ne!(
+            first.tokens[0].t,
+            transcripts::hour_start(session.last),
+            "the last event (turn/end) is not the answer's hour"
+        );
+
+        write_harness_messages(&paths, JOB_A, None, 0, 3, true, 1_794_696_005_000);
+        let harness = crate::harness::sessions(&paths, utc("2026-11-01T00:00:00Z"));
+        let second = harness_rows(
+            &harness.sessions,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &first.recorded,
+            &BTreeSet::new(),
+            None,
+            &unknown_pricing(),
+            "atlas",
+            utc("2026-11-14T19:00:00Z"),
+            &|_| project_key(),
+        );
+
+        assert_eq!(second.tokens.len(), 1);
+        assert_eq!(second.tokens[0].agent_answers, 1);
+        assert_eq!(second.tokens[0].input, 100);
     }
 }

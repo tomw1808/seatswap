@@ -453,6 +453,8 @@ pub(crate) fn spawn(
             app.clone(),
             claude.clone(),
             history.clone(),
+            seatswap_core::harness::HarnessPaths::resolve()
+                .map_err(|error| format!("the Harness folders cannot be found: {error}")),
             ui,
             engine_tx.clone(),
         )?),

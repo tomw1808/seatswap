@@ -46,6 +46,16 @@ const CHUNK_BYTES: usize = 64 * 1024;
 const BYTE_ORDER_MARK: [u8; 3] = [0xEF, 0xBB, 0xBF];
 /// The two block kinds that mean the answer thought before it spoke.
 const THINKING_BLOCKS: [&str; 2] = ["thinking", "redacted_thinking"];
+/// The `flash-agents` MCP tools whose tool results name flash jobs.
+const FLASH_TOOLS: [&str; 4] = [
+    "mcp__plugin_flash-agents_flash__flash_task",
+    "mcp__plugin_flash-agents_flash__flash_result",
+    "mcp__plugin_flash-agents_flash__flash_batch",
+    "mcp__plugin_flash-agents_flash__flash_status",
+];
+/// The state file that remembers which Harness session tokens were already
+/// written to the history, beside the per-folder state files.
+const HARNESS_STATE_FILE: &str = "harness.json";
 
 #[derive(Debug, thiserror::Error)]
 pub enum TranscriptError {
@@ -105,6 +115,30 @@ impl std::ops::AddAssign for Tokens {
     }
 }
 
+/// What one Harness session already has in the history: its token totals and
+/// the number of assistant messages those totals cover. Both advance together,
+/// so a later pass writes only the growth.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessRecorded {
+    pub tokens: Tokens,
+    pub messages: u32,
+    /// The session's file below the Harness sessions folder. A later save drops
+    /// the total only when this file no longer exists; absent in an old state
+    /// file means the file is not known, so the total is kept.
+    #[serde(default)]
+    pub file: Option<PathBuf>,
+}
+
+/// A flash job link kept after its Claude Code session left the scan state: the
+/// job id, the session that named it and that session's `last`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClosedJob {
+    pub session: String,
+    pub last: DateTime<Utc>,
+}
+
 /// The four counts a history [`TokenRecord`] holds.
 impl From<&TokenRecord> for Tokens {
     fn from(record: &TokenRecord) -> Tokens {
@@ -162,6 +196,11 @@ pub struct FileState {
     /// The time of the newest answer this file has given; absent in a state file
     /// written before this field means `None`.
     pub last_answer: Option<DateTime<Utc>>,
+    /// The `tool_use` ids of flash-agents calls in this file, so their tool
+    /// results are recognised also when they arrive in a later scan. Absent in
+    /// an old state file means none.
+    #[serde(default)]
+    pub flash_tools: BTreeSet<String>,
 }
 
 /// What a main transcript says about its session.
@@ -205,6 +244,12 @@ pub struct SessionSeen {
     /// write the same record again. Absent in an old state file means none.
     #[serde(default)]
     pub recorded: Option<RecordedSession>,
+    /// The flash job ids named in this session's tool results: every
+    /// `flash-task-<uuid>` and every `job-<8 hex>` id. A `job-…` id is resolved
+    /// through the job reports when the rows are built. Absent in an old state
+    /// file means none.
+    #[serde(default)]
+    pub flash_jobs: BTreeSet<String>,
 }
 
 impl SessionSeen {
@@ -250,9 +295,24 @@ pub struct ScanState {
     /// or `<folder>/<session>/subagents/agent-<id>.jsonl`.
     pub files: BTreeMap<String, FileState>,
     pub sessions: BTreeMap<String, SessionSeen>,
+    /// The tokens and assistant messages of each Harness session already
+    /// written to the history, so a pass writes only what grew. Kept in its own
+    /// `harness.json` beside the project folder files; absent in an old state
+    /// folder means none.
+    #[serde(default)]
+    pub harness_recorded: BTreeMap<String, HarnessRecorded>,
+    /// The job links of Claude Code sessions that left `sessions`, kept until
+    /// the Harness window has passed after the session's `last`. Saved in
+    /// `harness.json` with the Harness totals; absent in an old state file
+    /// means none.
+    #[serde(default)]
+    pub closed_flash_jobs: BTreeMap<String, ClosedJob>,
     /// The project folders whose state changed since the last save.
     #[serde(skip)]
     changed: BTreeSet<String>,
+    /// Whether `harness_recorded` changed since the last save.
+    #[serde(skip)]
+    harness_changed: bool,
     /// Whether the last load discarded state files of another version. Not
     /// saved: it only tells the caller to say so once.
     #[serde(skip)]
@@ -286,6 +346,11 @@ impl ScanState {
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                 continue;
             }
+            if path.file_name().and_then(|name| name.to_str()) == Some(HARNESS_STATE_FILE) {
+                // The Harness token memory is read on its own, and a transcript
+                // rebuild must not delete it.
+                continue;
+            }
             let kind = entry.file_type().map_err(|source| TranscriptError::Io {
                 path: path.clone(),
                 source,
@@ -295,6 +360,54 @@ impl ScanState {
             }
         }
         paths.sort();
+        let harness_path = dir.join(HARNESS_STATE_FILE);
+        if harness_path.exists() {
+            let bytes = fs::read(&harness_path).map_err(|source| TranscriptError::Io {
+                path: harness_path.clone(),
+                source,
+            })?;
+            let header: StateVersion =
+                serde_json::from_slice(&bytes).map_err(|source| TranscriptError::State {
+                    path: harness_path.clone(),
+                    source,
+                })?;
+            if header.version != STATE_VERSION {
+                // This file is a cache of its own: an old one is removed without
+                // touching the transcript state or the transcript rebuild.
+                match fs::remove_file(&harness_path) {
+                    Ok(()) => {}
+                    Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+                    Err(source) => {
+                        return Err(TranscriptError::Io {
+                            path: harness_path,
+                            source,
+                        })
+                    }
+                }
+            } else {
+                let file: HarnessState =
+                    serde_json::from_slice(&bytes).map_err(|source| TranscriptError::State {
+                        path: harness_path.clone(),
+                        source,
+                    })?;
+                if file.version != STATE_VERSION {
+                    match fs::remove_file(&harness_path) {
+                        Ok(()) => {}
+                        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+                        Err(source) => {
+                            return Err(TranscriptError::Io {
+                                path: harness_path,
+                                source,
+                            })
+                        }
+                    }
+                } else {
+                    state.harness_recorded = file.recorded;
+                    state.closed_flash_jobs = file.closed_flash_jobs;
+                }
+            }
+        }
+
         for path in &paths {
             let bytes = fs::read(path).map_err(|source| TranscriptError::Io {
                 path: path.clone(),
@@ -308,7 +421,7 @@ impl ScanState {
                     source,
                 })?;
             if header.version != STATE_VERSION {
-                return discard_state(&paths);
+                return discard_state(&paths, &state.harness_recorded, &state.closed_flash_jobs);
             }
             let file: StateFile =
                 serde_json::from_slice(&bytes).map_err(|source| TranscriptError::State {
@@ -317,7 +430,7 @@ impl ScanState {
                 })?;
             if file.version != STATE_VERSION {
                 // The file changed between the two reads: it is still a cache.
-                return discard_state(&paths);
+                return discard_state(&paths, &state.harness_recorded, &state.closed_flash_jobs);
             }
             state.files.extend(file.files);
             state.sessions.extend(file.sessions);
@@ -344,6 +457,58 @@ impl ScanState {
         self.mark_changed(&folder);
     }
 
+    /// Remember which Harness session tokens were written to the history, so the
+    /// next pass writes only what grew. The state is saved with the next
+    /// [`save`](Self::save).
+    pub fn set_harness_recorded(&mut self, recorded: &BTreeMap<String, HarnessRecorded>) {
+        if &self.harness_recorded != recorded {
+            self.harness_recorded = recorded.clone();
+            self.harness_changed = true;
+        }
+    }
+
+    /// Drop a recorded Harness total when its session's file no longer exists
+    /// below `sessions`. One metadata call per recorded id whose file is known;
+    /// a file that cannot be read is still there, so a failed read never drops
+    /// a total. A total without a known file (an old state file) is kept.
+    pub fn prune_harness_recorded(&mut self, sessions: &Path) {
+        let mut dropped = false;
+        self.harness_recorded.retain(|_, recorded| {
+            let Some(file) = &recorded.file else {
+                return true;
+            };
+            let path = if file.is_absolute() {
+                file.clone()
+            } else {
+                sessions.join(file)
+            };
+            match fs::metadata(&path) {
+                Ok(_) => true,
+                Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                    dropped = true;
+                    false
+                }
+                // The file cannot be checked (a permission or an I/O error):
+                // it is not known to be gone, so its total stays.
+                Err(_) => true,
+            }
+        });
+        if dropped {
+            self.harness_changed = true;
+        }
+    }
+
+    /// Drop the job links of Claude Code sessions that last answered more than
+    /// `hours` before `now`: the Harness window has passed.
+    pub fn prune_closed_flash_jobs(&mut self, now: DateTime<Utc>, hours: i64) {
+        let before = self.closed_flash_jobs.len();
+        self.closed_flash_jobs
+            .retain(|_, link| now.signed_duration_since(link.last) <= Duration::hours(hours));
+        if self.closed_flash_jobs.len() != before {
+            self.harness_changed = true;
+        }
+    }
+
     /// Mark one project folder for the next [`save`](Self::save).
     pub fn mark_changed(&mut self, folder: &str) {
         self.changed.insert(folder.to_string());
@@ -352,9 +517,10 @@ impl ScanState {
     /// Forget a session that is not running and whose last answer (its own or an
     /// agent's) is more than
     /// one hour before `now`: its sums leave `sessions`, while its files'
-    /// offsets stay, so its transcript is not read again. Its folder is marked
-    /// changed, so the next [`save`](Self::save) writes it. Returns how many
-    /// sessions left.
+    /// offsets stay, so its transcript is not read again. Its `flash_jobs` move
+    /// into [`Self::closed_flash_jobs`], so a Harness job of the closed session
+    /// keeps its owner for the Harness window. Its folder is marked changed, so
+    /// the next [`save`](Self::save) writes it. Returns how many sessions left.
     pub fn forget_closed(&mut self, running: &BTreeSet<String>, now: DateTime<Utc>) -> usize {
         let closed: Vec<String> = self
             .sessions
@@ -372,11 +538,28 @@ impl ScanState {
             .map(|(session, _)| session.clone())
             .collect();
         let mut forgotten = 0;
+        let mut links_moved = false;
         for session in closed {
             if let Some(seen) = self.sessions.remove(&session) {
+                for job in seen.flash_jobs {
+                    let link = ClosedJob {
+                        session: session.clone(),
+                        last: seen.last,
+                    };
+                    match self.closed_flash_jobs.get(&job) {
+                        Some(previous) if previous.last >= link.last => {}
+                        _ => {
+                            self.closed_flash_jobs.insert(job, link);
+                            links_moved = true;
+                        }
+                    }
+                }
                 self.mark_changed(&seen.folder);
                 forgotten += 1;
             }
+        }
+        if links_moved {
+            self.harness_changed = true;
         }
         forgotten
     }
@@ -454,7 +637,7 @@ impl ScanState {
         }
 
         let dir = app.transcripts_state_dir();
-        if !self.changed.is_empty() {
+        if !self.changed.is_empty() || self.harness_changed {
             atomic::ensure_private_dir(&dir).map_err(|source| TranscriptError::Io {
                 path: dir.clone(),
                 source,
@@ -485,8 +668,37 @@ impl ScanState {
                 written += 1;
             }
         }
+        if self.harness_changed {
+            let path = dir.join(HARNESS_STATE_FILE);
+            if self.harness_recorded.is_empty() && self.closed_flash_jobs.is_empty() {
+                match fs::remove_file(&path) {
+                    Ok(()) => written += 1,
+                    Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+                    Err(source) => return Err(TranscriptError::Io { path, source }),
+                }
+            } else {
+                let state = HarnessState {
+                    version: STATE_VERSION,
+                    recorded: self.harness_recorded.clone(),
+                    closed_flash_jobs: self.closed_flash_jobs.clone(),
+                };
+                let bytes =
+                    serde_json::to_vec(&state).map_err(|source| TranscriptError::State {
+                        path: path.clone(),
+                        source,
+                    })?;
+                atomic::write_atomic(&path, &bytes, Access::Private).map_err(|source| {
+                    TranscriptError::Io {
+                        path: path.clone(),
+                        source,
+                    }
+                })?;
+                written += 1;
+            }
+        }
         self.version = STATE_VERSION;
         self.changed.clear();
+        self.harness_changed = false;
         Ok(written)
     }
 
@@ -515,7 +727,14 @@ impl ScanState {
 /// is a cache, so a file of another version is rebuilt from the transcripts
 /// instead of being an error. Removing every file leaves no old-version file
 /// behind to rebuild from on the next start.
-fn discard_state(paths: &[PathBuf]) -> Result<ScanState, TranscriptError> {
+fn discard_state(
+    paths: &[PathBuf],
+    harness_recorded: &BTreeMap<String, HarnessRecorded>,
+    closed_flash_jobs: &BTreeMap<String, ClosedJob>,
+) -> Result<ScanState, TranscriptError> {
+    // The Harness totals and the closed sessions' job links live in
+    // `harness.json`, which `paths` does not list: rebuilding the transcript
+    // state must not forget what was already counted.
     for path in paths {
         match fs::remove_file(path) {
             Ok(()) => {}
@@ -530,6 +749,8 @@ fn discard_state(paths: &[PathBuf]) -> Result<ScanState, TranscriptError> {
     }
     Ok(ScanState {
         version: STATE_VERSION,
+        harness_recorded: harness_recorded.clone(),
+        closed_flash_jobs: closed_flash_jobs.clone(),
         rebuilt: true,
         ..ScanState::default()
     })
@@ -622,6 +843,7 @@ pub fn scan(
         answers: Vec::new(),
         user_turns: Vec::new(),
         spawns: Vec::new(),
+        flash_jobs: BTreeMap::new(),
         warnings: Vec::new(),
     };
     let mut complete = true;
@@ -643,10 +865,12 @@ pub fn scan(
         answers,
         user_turns,
         spawns,
+        flash_jobs,
         warnings,
         ..
     } = run;
     remember_spawns(&mut next, &spawns);
+    remember_flash_jobs(&mut next, &flash_jobs);
     sum_answers(&mut next, &answers);
     Ok(Scan {
         answers,
@@ -663,6 +887,23 @@ fn remember_spawns(state: &mut ScanState, spawns: &[Spawn]) {
         if let Some(seen) = state.sessions.get_mut(&spawn.session) {
             seen.spawns
                 .insert(spawn.tool_use_id.clone(), spawn.agent.clone());
+        }
+    }
+}
+
+/// Put this scan's flash job ids into their sessions' `flash_jobs`. The ids
+/// outlive the state files as long as their session is in the state; the
+/// sessions thread resolves them with the job reports.
+fn remember_flash_jobs(state: &mut ScanState, jobs: &BTreeMap<String, BTreeSet<String>>) {
+    for (session, ids) in jobs {
+        let Some(seen) = state.sessions.get_mut(session) else {
+            continue;
+        };
+        let before = seen.flash_jobs.len();
+        seen.flash_jobs.extend(ids.iter().cloned());
+        if seen.flash_jobs.len() != before {
+            let folder = seen.folder.clone();
+            state.mark_changed(&folder);
         }
     }
 }
@@ -1121,6 +1362,17 @@ struct StateFile {
     sessions: BTreeMap<String, SessionSeen>,
 }
 
+/// `harness.json`: the Harness sessions' tokens already in the history, and the
+/// job links of Claude Code sessions that left the scan state.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HarnessState {
+    version: u32,
+    recorded: BTreeMap<String, HarnessRecorded>,
+    #[serde(default)]
+    closed_flash_jobs: BTreeMap<String, ClosedJob>,
+}
+
 /// A transcript that may have new bytes.
 struct Candidate {
     key: String,
@@ -1187,6 +1439,8 @@ struct ScanRun<'a> {
     answers: Vec<Answer>,
     user_turns: Vec<UserTurn>,
     spawns: Vec<Spawn>,
+    /// The flash job ids each session's tool results named.
+    flash_jobs: BTreeMap<String, BTreeSet<String>>,
     warnings: Vec<String>,
 }
 
@@ -1199,6 +1453,7 @@ impl ScanRun<'_> {
                 grew: candidate.mtime,
                 recent: Vec::new(),
                 last_answer: None,
+                flash_tools: BTreeSet::new(),
             },
         };
         let mut file = match File::open(&candidate.path) {
@@ -1410,7 +1665,7 @@ impl ScanRun<'_> {
             file.unreadable += 1;
             return;
         };
-        self.record_spawns(reading, message);
+        self.record_spawns(reading, message, file);
         let (Some(id), Some(model), Some(usage)) = (
             message.id.as_deref(),
             message.model.as_deref(),
@@ -1474,8 +1729,9 @@ impl ScanRun<'_> {
 
     /// The `Agent` and `Task` calls of an assistant line, also when the line
     /// repeats an answer already counted: only the block's `type`, `id` and
-    /// `name` are read.
-    fn record_spawns(&mut self, reading: &Reading, message: &Message) {
+    /// `name` are read. A `flash-agents` call's id is remembered with the file,
+    /// so its tool result is recognised in a later scan.
+    fn record_spawns(&mut self, reading: &Reading, message: &Message, file: &mut FileScan) {
         let Some(content) = message.content.as_ref() else {
             return;
         };
@@ -1483,12 +1739,17 @@ impl ScanRun<'_> {
             if block.kind.as_deref() != Some("tool_use") {
                 continue;
             }
-            if !matches!(block.name.as_deref(), Some("Agent") | Some("Task")) {
-                continue;
-            }
             let Some(id) = block.id.as_deref() else {
                 continue;
             };
+            if let Some(name) = block.name.as_deref() {
+                if FLASH_TOOLS.contains(&name) {
+                    file.state.flash_tools.insert(id.to_string());
+                }
+            }
+            if !matches!(block.name.as_deref(), Some("Agent") | Some("Task")) {
+                continue;
+            }
             self.spawns.push(Spawn {
                 session: reading.session.to_string(),
                 agent: reading.agent.map(str::to_string),
@@ -1497,11 +1758,42 @@ impl ScanRun<'_> {
         }
     }
 
+    /// The flash job ids of a user line's tool results: only a result whose
+    /// `tool_use` id belongs to one of [`FLASH_TOOLS`] is read, and only the ids
+    /// its content holds leave this function.
+    fn record_flash_results(&mut self, reading: &Reading, line: &Line, file: &FileScan) {
+        let Some(content) = line
+            .message
+            .as_ref()
+            .and_then(|message| message.content.as_ref())
+        else {
+            return;
+        };
+        for block in &content.blocks {
+            if block.kind.as_deref() != Some("tool_result") {
+                continue;
+            }
+            let Some(tool) = block.tool_use_id.as_deref() else {
+                continue;
+            };
+            if !file.state.flash_tools.contains(tool) || block.content.0.is_empty() {
+                continue;
+            }
+            self.flash_jobs
+                .entry(reading.session.to_string())
+                .or_default()
+                .extend(block.content.0.iter().cloned());
+        }
+    }
+
     fn user(&mut self, reading: &Reading, line: &Line, file: &mut FileScan) {
         let Some(at) = line.timestamp else {
             file.unreadable += 1;
             return;
         };
+        // A flash result can be in a worker's transcript too; the job still
+        // hangs under the session that started the worker.
+        self.record_flash_results(reading, line, file);
         if reading.agent.is_some() {
             // A user turn comes from a main transcript only.
             return;
@@ -1562,6 +1854,7 @@ impl ScanRun<'_> {
                 spawns: BTreeMap::new(),
                 recent: Vec::new(),
                 recorded: None,
+                flash_jobs: BTreeSet::new(),
             });
         if at >= seen.last {
             if let Some(cwd) = cwd {
@@ -1988,14 +2281,22 @@ struct Usage {
     cache_read_input_tokens: Option<u64>,
 }
 
-/// A content block, as far as seatswap looks at it: its `type`, and for a
-/// `tool_use` block its `id` and `name`. Its text and its input are not kept.
+/// A content block, as far as seatswap looks at it: its `type`, for a
+/// `tool_use` block its `id` and `name`, and for a `tool_result` block its
+/// `tool_use_id` and the flash job ids in its content. Its text and its input
+/// are never kept.
 #[derive(Deserialize)]
 struct Block {
     #[serde(rename = "type")]
     kind: Option<String>,
     id: Option<String>,
     name: Option<String>,
+    #[serde(default)]
+    tool_use_id: Option<String>,
+    /// The flash job ids of a tool result's `content`; every other text is
+    /// dropped by [`FlashIds`] as it is read.
+    #[serde(default)]
+    content: FlashIds,
 }
 
 /// `message.content` as far as seatswap looks at it: whether it is a string,
@@ -2024,6 +2325,169 @@ impl Content {
 
 fn block_kind(block: &Block) -> Option<&str> {
     block.kind.as_deref()
+}
+
+/// The flash job ids in a tool result's content. Deserialization visits the
+/// content's strings and keeps only ids matching `flash-task-<uuid>` or
+/// `job-<8 hex>`: the text itself is never stored.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct FlashIds(BTreeSet<String>);
+
+impl<'de> Deserialize<'de> for FlashIds {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<FlashIds, D::Error> {
+        struct FlashVisitor;
+
+        impl<'de> Visitor<'de> for FlashVisitor {
+            type Value = FlashIds;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a tool result: a string, a list or an object")
+            }
+
+            fn visit_str<E>(self, text: &str) -> Result<FlashIds, E> {
+                Ok(FlashIds(flash_ids_in(text)))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<FlashIds, A::Error> {
+                let mut ids = BTreeSet::new();
+                while let Some(part) = seq.next_element::<FlashIds>()? {
+                    ids.extend(part.0);
+                }
+                Ok(FlashIds(ids))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<FlashIds, A::Error> {
+                let mut ids = BTreeSet::new();
+                while let Some((key, value)) = map.next_entry::<String, FlashIds>()? {
+                    ids.extend(flash_ids_in(&key));
+                    ids.extend(value.0);
+                }
+                Ok(FlashIds(ids))
+            }
+
+            fn visit_bool<E>(self, _value: bool) -> Result<FlashIds, E> {
+                Ok(FlashIds::default())
+            }
+
+            fn visit_i64<E>(self, _value: i64) -> Result<FlashIds, E> {
+                Ok(FlashIds::default())
+            }
+
+            fn visit_u64<E>(self, _value: u64) -> Result<FlashIds, E> {
+                Ok(FlashIds::default())
+            }
+
+            fn visit_f64<E>(self, _value: f64) -> Result<FlashIds, E> {
+                Ok(FlashIds::default())
+            }
+
+            fn visit_none<E>(self) -> Result<FlashIds, E> {
+                Ok(FlashIds::default())
+            }
+
+            fn visit_unit<E>(self) -> Result<FlashIds, E> {
+                Ok(FlashIds::default())
+            }
+        }
+
+        deserializer.deserialize_any(FlashVisitor)
+    }
+}
+
+/// The `flash-task-<uuid>` and `job-<8 hex>` ids in `text`, with the boundaries
+/// the shapes imply: a UUID is exactly 36 characters, a job id exactly 8 hex
+/// characters, and neither starts inside a longer word.
+fn flash_ids_in(text: &str) -> BTreeSet<String> {
+    let bytes = text.as_bytes();
+    let mut ids = BTreeSet::new();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if let Some(id) = pattern_at(bytes, index, b"flash-task-", |bytes, start| {
+            uuid_at(bytes, start)
+        }) {
+            ids.insert(id);
+            index += "flash-task-".len() + 36;
+            continue;
+        }
+        if let Some(id) = pattern_at(bytes, index, b"job-", |bytes, start| {
+            job_id_at(bytes, start)
+        }) {
+            ids.insert(id);
+            index += "job-".len() + 8;
+            continue;
+        }
+        index += 1;
+    }
+    ids
+}
+
+/// Whether a word boundary is before `index`: the start of the text or a
+/// character that cannot be part of a longer id.
+fn is_boundary_before(bytes: &[u8], index: usize) -> bool {
+    match index.checked_sub(1).and_then(|before| bytes.get(before)) {
+        None => true,
+        Some(byte) => !byte.is_ascii_alphanumeric() && *byte != b'_' && *byte != b'-',
+    }
+}
+
+/// The id beginning at `index` if `prefix` is there, `tail` accepts what follows
+/// it, and a word boundary is before it.
+fn pattern_at(
+    bytes: &[u8],
+    index: usize,
+    prefix: &[u8],
+    tail: impl Fn(&[u8], usize) -> Option<usize>,
+) -> Option<String> {
+    if !is_boundary_before(bytes, index) || !bytes[index..].starts_with(prefix) {
+        return None;
+    }
+    let start = index + prefix.len();
+    let end = tail(bytes, start)?;
+    std::str::from_utf8(&bytes[index..end])
+        .ok()
+        .map(str::to_string)
+}
+
+/// The end of a 36-character UUID at `start`, when its shape is exact.
+fn uuid_at(bytes: &[u8], start: usize) -> Option<usize> {
+    const DASHES: [usize; 4] = [8, 13, 18, 23];
+    let end = start.checked_add(36)?;
+    if end > bytes.len() {
+        return None;
+    }
+    for (offset, byte) in bytes[start..end].iter().enumerate() {
+        let is_dash = DASHES.contains(&offset);
+        if is_dash {
+            if *byte != b'-' {
+                return None;
+            }
+        } else if !byte.is_ascii_hexdigit() {
+            return None;
+        }
+    }
+    // A longer hex run after the UUID is not this UUID.
+    if bytes
+        .get(end)
+        .is_some_and(|byte| byte.is_ascii_hexdigit() || *byte == b'-')
+    {
+        return None;
+    }
+    Some(end)
+}
+
+/// The end of an 8-hex-digit job id at `start`, when its shape is exact.
+fn job_id_at(bytes: &[u8], start: usize) -> Option<usize> {
+    let end = start.checked_add(8)?;
+    if end > bytes.len() || !bytes[start..end].iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    if bytes.get(end).is_some_and(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    Some(end)
 }
 
 impl<'de> Deserialize<'de> for Content {
@@ -2241,6 +2705,20 @@ mod tests {
             "sourceToolAssistantUUID": "0b6f4c1a-2d3e-4f50-8a9b-0c1d2e3f4a5b",
             "message": {"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": "toolu_01", "content": "ok"}
+            ]}
+        })
+        .to_string()
+    }
+
+    fn user_tool_result_with(tool_use_id: &str, content: &str, at: &str) -> String {
+        serde_json::json!({
+            "type": "user",
+            "timestamp": at,
+            "sessionId": SESSION,
+            "isSidechain": false,
+            "toolUseResult": {},
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": tool_use_id, "content": content}
             ]}
         })
         .to_string()
@@ -2494,6 +2972,42 @@ mod tests {
         assert_eq!(scan.user_turns[0].at, at("2026-11-12T09:40:58.101Z"));
         assert_eq!(scan.user_turns[0].session, SESSION);
         assert!(scan.answers.is_empty());
+        assert!(scan.warnings.is_empty(), "{:?}", scan.warnings);
+    }
+
+    #[test]
+    fn flash_job_ids_are_collected_from_their_tool_results() {
+        let (_tmp, claude, _app) = fixture();
+        let flash_tool = "mcp__plugin_flash-agents_flash__flash_task";
+        let job = "flash-task-5c974a53-178a-4254-93b2-b804a111414a";
+        write_lines(
+            &folder(&claude, FOLDER),
+            &format!("{SESSION}.jsonl"),
+            &[
+                agent_call("msg_flash", AT, "toolu_flash", flash_tool),
+                agent_call("msg_other", AT, "toolu_other", "Bash"),
+                user_tool_result_with(
+                    "toolu_flash",
+                    &format!(
+                        r#"{{"sessionId":"{job}","jobId":"job-3e32c2fc","childSessionId":"a25abffd-ed93-4296-868f-dbd77aca32ac"}}"#
+                    ),
+                    "2026-11-12T09:41:09.730Z",
+                ),
+                user_tool_result_with(
+                    "toolu_other",
+                    r#"{"sessionId":"flash-task-00000000-0000-4000-8000-000000000000"}"#,
+                    "2026-11-12T09:41:10.730Z",
+                ),
+            ],
+        );
+
+        let (state, scan) = scan_run(&claude);
+
+        let seen = state.sessions.get(SESSION).expect("the session");
+        assert_eq!(
+            seen.flash_jobs,
+            BTreeSet::from([job.to_string(), "job-3e32c2fc".to_string()])
+        );
         assert!(scan.warnings.is_empty(), "{:?}", scan.warnings);
     }
 
@@ -4099,6 +4613,52 @@ mod tests {
     }
 
     #[test]
+    fn a_closed_sessions_flash_jobs_are_kept_for_the_harness_window() {
+        let (_tmp, claude, _app) = fixture();
+        write_lines(
+            &folder(&claude, FOLDER),
+            &format!("{SESSION}.jsonl"),
+            &[assistant_line(
+                "msg_a",
+                AT,
+                ENGINE,
+                OPUS,
+                &["text"],
+                (0, 100, 0, 0),
+            )],
+        );
+        let (mut state, _scan) = scan_run(&claude);
+        let last = state.sessions[SESSION].last;
+        let job = "flash-task-5c974a53-178a-4254-93b2-b804a111414a";
+        state
+            .sessions
+            .get_mut(SESSION)
+            .expect("the session")
+            .flash_jobs
+            .insert(job.to_string());
+
+        assert_eq!(
+            state.forget_closed(&BTreeSet::new(), last + Duration::hours(2)),
+            1
+        );
+
+        let link = state.closed_flash_jobs.get(job).expect("the kept job link");
+        assert_eq!(link.session, SESSION);
+        assert_eq!(link.last, last);
+
+        state.prune_closed_flash_jobs(last + Duration::hours(24), 24);
+        assert!(
+            state.closed_flash_jobs.contains_key(job),
+            "the link is kept for the whole Harness window"
+        );
+        state.prune_closed_flash_jobs(last + Duration::hours(24) + Duration::seconds(1), 24);
+        assert!(
+            !state.closed_flash_jobs.contains_key(job),
+            "the link goes after the Harness window"
+        );
+    }
+
+    #[test]
     fn an_old_state_file_without_the_sums_loads() {
         let (_tmp, _claude, app) = fixture();
         let dir = app.transcripts_state_dir();
@@ -4159,6 +4719,43 @@ mod tests {
         let state = ScanState::load(&app).expect("an old version is a cache, not an error");
 
         assert!(state.was_rebuilt());
+    }
+
+    #[test]
+    fn a_transcript_state_rebuild_keeps_the_harness_totals() {
+        let (_tmp, _claude, app) = fixture();
+        let dir = app.transcripts_state_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let old = serde_json::json!({
+            "version": 1,
+            "files": {},
+            "sessions": {},
+        });
+        fs::write(dir.join(format!("{FOLDER}.json")), old.to_string()).unwrap();
+        let harness = serde_json::json!({
+            "version": 2,
+            "recorded": {
+                SESSION: {
+                    "tokens": {"input": 10, "out": 5, "cw": 0, "cr": 0},
+                    "messages": 2
+                }
+            }
+        });
+        fs::write(dir.join("harness.json"), harness.to_string()).unwrap();
+
+        let state = ScanState::load(&app).expect("an old transcript state is a cache");
+
+        assert!(state.was_rebuilt());
+        let recorded = state
+            .harness_recorded
+            .get(SESSION)
+            .expect("the Harness totals survive the rebuild");
+        assert_eq!(recorded.messages, 2);
+        assert_eq!(recorded.tokens.input, 10);
+        assert!(
+            dir.join("harness.json").exists(),
+            "the rebuild must not delete the Harness totals"
+        );
     }
 
     #[test]
@@ -4288,5 +4885,57 @@ mod tests {
             state.sessions.contains_key(SESSION),
             "a session whose agent answers stays in the state"
         );
+    }
+
+    #[test]
+    fn proof_flash_batch_and_status_results_name_their_jobs() {
+        let (_tmp, claude, _app) = fixture();
+        let jobs = [
+            (
+                "toolu_task",
+                "mcp__plugin_flash-agents_flash__flash_task",
+                "flash-task-11111111-1111-4111-8111-111111111111",
+            ),
+            (
+                "toolu_result",
+                "mcp__plugin_flash-agents_flash__flash_result",
+                "flash-task-22222222-2222-4222-8222-222222222222",
+            ),
+            (
+                "toolu_batch",
+                "mcp__plugin_flash-agents_flash__flash_batch",
+                "flash-task-33333333-3333-4333-8333-333333333333",
+            ),
+            (
+                "toolu_status",
+                "mcp__plugin_flash-agents_flash__flash_status",
+                "flash-task-44444444-4444-4444-8444-444444444444",
+            ),
+        ];
+        let mut lines = Vec::new();
+        for (tool, name, job) in jobs {
+            lines.push(agent_call(&format!("msg_{tool}"), AT, tool, name));
+            lines.push(user_tool_result_with(
+                tool,
+                &format!(r#"{{"sessionId":"{job}"}}"#),
+                "2026-11-12T09:41:09.730Z",
+            ));
+        }
+        write_lines(
+            &folder(&claude, FOLDER),
+            &format!("{SESSION}.jsonl"),
+            &lines,
+        );
+
+        let (state, _scan) = scan_run(&claude);
+
+        let seen = state.sessions.get(SESSION).expect("the session");
+        for (_, _, job) in jobs {
+            assert!(
+                seen.flash_jobs.contains(job),
+                "{job}: {:?}",
+                seen.flash_jobs
+            );
+        }
     }
 }
