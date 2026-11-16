@@ -6,15 +6,15 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use serde::Serialize;
 
-use crate::history::{AccountRef, Hosts, Range, TokenRecord};
+use crate::history::{AccountRef, Hosted, Hosts, Range, TokenRecord};
 use crate::live_sessions::Values;
-use crate::money::{Missing, Valuer};
+use crate::money::{usd_rate, Fx, Missing, Valuer};
 use crate::project::ProjectKey;
 use crate::projects::{Project, ProjectId};
-use crate::store::Account;
+use crate::store::{Account, Settings};
 use crate::transcripts::Tokens;
 
 use super::{
@@ -45,9 +45,10 @@ pub struct Node {
     /// The organization's account ids on organization rows; empty otherwise.
     pub org_accounts: Vec<String>,
     pub tokens: Tokens,
-    /// This node's API value as a share of the page's API value, in %; 0 when
-    /// the page has no API value.
-    pub share: f64,
+    /// This node's API value as a share of the page's API value, in %; `None`
+    /// when the node's own value or the page's total is missing (an unknown
+    /// share is not a measured zero), or when the page's total is zero.
+    pub share: Option<f64>,
     /// The two values of the node's records, built with [`Values::of`]: a
     /// missing half names its reason, and the API half names its currency.
     pub values: Values,
@@ -76,6 +77,29 @@ pub struct ProjectsPage {
     pub without_price: Vec<String>,
     /// What the page says is not in the tree, in the order the plan gives it.
     pub notes: Vec<String>,
+    /// The dollar rate the page's API values are converted with, as
+    /// `{ "value": 0.9048, "date": "2026-11-13", "currency": "EUR",
+    /// "varies": false }`; `null` when the API values are already in USD or no
+    /// rate of the settings' currency exists.
+    pub usd_rate: Option<UsdRate>,
+}
+
+/// The dollar rate of the page's API values: units of the rate's currency per
+/// 1 USD, with the day the looked-up rate is from.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsdRate {
+    /// Units of [`UsdRate::currency`] per 1 USD, rounded to four decimals.
+    pub value: f64,
+    /// The day the looked-up rate is from; `None` for a rate entered by hand.
+    pub date: Option<NaiveDate>,
+    /// The currency the rate converts into: the settings' currency the rate is
+    /// for. The page writes this one, never another view's currency.
+    pub currency: String,
+    /// Whether the rate of the range's days is not one value all along: the
+    /// valuer converts each record at its own day's rate, so the page says
+    /// "each day's rate" when this is true.
+    pub varies: bool,
 }
 
 /// The organization × account matrix.
@@ -89,6 +113,13 @@ pub struct Matrix {
     /// The subscription value per organization and account:
     /// `cells[org][account]`; `None` when a record has no subscription value.
     pub cells: Vec<Vec<Option<f64>>>,
+    /// Each organization's cells added up over the accounts: `row_totals[org]`.
+    pub row_totals: Vec<Option<f64>>,
+    /// Each account's cells added up over the organizations:
+    /// `column_totals[account]`.
+    pub column_totals: Vec<Option<f64>>,
+    /// Every cell added up.
+    pub total: Option<f64>,
     pub sentences: Vec<String>,
 }
 
@@ -105,6 +136,10 @@ pub struct ProjectDetail {
     pub hosts: Vec<(String, f64)>,
     /// The two values of the project's records, built with [`Values::of`].
     pub values: Values,
+    /// The project's API value as a share of the page's API value, in %; `None`
+    /// when the project's own value or the page's total is missing (an unknown
+    /// share is not a measured zero), or when the page's total is zero.
+    pub share: Option<f64>,
     /// The output tokens per calendar week and model, weeks oldest first and
     /// models by tokens.
     pub weekly_by_model: WeeklyByModel,
@@ -410,6 +445,14 @@ pub(crate) fn projects_page_in<Tz: TimeZone + Copy>(
                 .iter()
                 .map(|account| account.id.clone())
                 .collect(),
+            row_totals: cells
+                .iter()
+                .map(|row| sum_cells(row.iter().copied()))
+                .collect(),
+            column_totals: (0..chosen_accounts.len())
+                .map(|column| sum_cells(cells.iter().map(|row| row[column])))
+                .collect(),
+            total: sum_cells(cells.iter().flatten().copied()),
             cells,
             sentences,
         },
@@ -417,7 +460,87 @@ pub(crate) fn projects_page_in<Tz: TimeZone + Copy>(
         unknown_account_tokens,
         without_price: without_price.into_iter().collect(),
         notes,
+        usd_rate: page_usd_rate(ctx, range),
     })
+}
+
+/// The sum of some amounts: unknown as soon as one part is unknown, because a
+/// missing subscription value must not be counted as a measured zero.
+fn sum_cells(parts: impl Iterator<Item = Option<f64>>) -> Option<f64> {
+    let mut total: Option<f64> = Some(0.0);
+    for part in parts {
+        total = match (total, part) {
+            (Some(sum), Some(value)) => Some(sum + value),
+            _ => return None,
+        };
+    }
+    total
+}
+
+/// The dollar rate the page's API values are in, at the range's end: from the
+/// same `settings` and `fx` the page's [`Valuer`] is built from, through
+/// [`crate::money::usd_rate`] — the function that turns every record's USD value
+/// into the settings' currency. `None` when the API values are already in USD,
+/// or when the settings name no currency or no rate of it.
+fn page_usd_rate<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, range: &Range) -> Option<UsdRate> {
+    let currency = ctx.settings.currency.as_deref()?;
+    if currency == "USD" {
+        return None;
+    }
+    let rate = usd_rate(ctx.settings, ctx.fx, last_day(range))?;
+    Some(UsdRate {
+        value: round_rate(rate.value),
+        date: rate.date,
+        currency: currency.to_string(),
+        varies: rate_varies(ctx.settings, ctx.fx, range),
+    })
+}
+
+/// A rate as the page writes it: four decimals, rounded in Rust so the page
+/// never adds a rounding of its own.
+fn round_rate(value: f64) -> f64 {
+    (value * 10_000.0).round() / 10_000.0
+}
+
+/// Whether the rate of the range's days is not one value all along. It asks the
+/// same `usd_rate` source the valuer asks: a rate entered by hand is one value
+/// for every day; a looked-up rate changes when the range's days do not all fall
+/// on the same `fx` point. Days are `range.from` .. `range.to` (the range's end
+/// is exclusive), so a point on the end's midnight is not in the range.
+fn rate_varies(settings: &Settings, fx: &Fx, range: &Range) -> bool {
+    let Some(currency) = settings.currency.as_deref() else {
+        return false;
+    };
+    if settings
+        .usd_rate
+        .as_ref()
+        .is_some_and(|own| own.currency == currency)
+    {
+        return false;
+    }
+    if fx.currency != currency {
+        return false;
+    }
+    let from = range.from.date_naive();
+    let to = last_day(range);
+    let Some(first) = fx.at(from) else {
+        return false;
+    };
+    fx.points
+        .iter()
+        .filter(|point| point.date > from && point.date <= to)
+        .any(|point| point.rate != first)
+}
+
+/// The last calendar day a record of `range` can have: `to` itself, or the day
+/// before it when `to` is its midnight (the range's end is exclusive).
+fn last_day(range: &Range) -> NaiveDate {
+    let day = range.to.date_naive();
+    if range.to.time() == chrono::NaiveTime::MIN {
+        day.pred_opt().unwrap_or(day)
+    } else {
+        day
+    }
 }
 
 /// The detail of the project `key`, over all hosts: a folder key is per host,
@@ -451,17 +574,21 @@ pub(crate) fn project_detail_in<Tz: TimeZone + Copy>(
     let read = keep_warnings(ctx.warnings, || {
         ctx.history.read::<TokenRecord>(range, &Hosts::All)
     })?;
+    // The records of the chosen host, and among them the project's own.
+    let in_host =
+        |hosted: &&Hosted<TokenRecord>| q.host.as_ref().is_none_or(|host| host == &hosted.host);
+    let in_project = |hosted: &&Hosted<TokenRecord>| {
+        let detail = ctx.projects.of(&ProjectId::of(key, &hosted.host));
+        let record = ctx
+            .projects
+            .of(&ProjectId::of(&hosted.record.project, &hosted.host));
+        record.key == detail.key
+    };
     let matching: Vec<_> = read
         .records
         .iter()
-        .filter(|hosted| q.host.as_ref().is_none_or(|host| host == &hosted.host))
-        .filter(|hosted| {
-            let detail = ctx.projects.of(&ProjectId::of(key, &hosted.host));
-            let record = ctx
-                .projects
-                .of(&ProjectId::of(&hosted.record.project, &hosted.host));
-            record.key == detail.key
-        })
+        .filter(in_host)
+        .filter(in_project)
         .collect();
     let known = ctx.projects.projects.iter().any(|project| {
         &project.key.key == key || project.joined.iter().any(|joined| &joined.key.key == key)
@@ -492,16 +619,23 @@ pub(crate) fn project_detail_in<Tz: TimeZone + Copy>(
     };
 
     let mut sums = Sums::default();
+    // The page's whole API value, over the same host and account choice, so the
+    // project's share is its part of all use and not of another span.
+    let mut page_values: Option<Values> = None;
     let mut answers = 0u64;
     let mut agent_answers = 0u64;
     let mut hosts: BTreeMap<String, Values> = BTreeMap::new();
     let mut weekly: BTreeMap<DateTime<Utc>, BTreeMap<String, u64>> = BTreeMap::new();
-    for hosted in matching {
+    for hosted in read.records.iter().filter(in_host) {
         let value = valuer.value(&hosted.host, &hosted.record);
         if !account_chosen(ctx, q, value.account.as_ref()) {
             continue;
         }
         let values = Values::of(std::slice::from_ref(&value), ctx.settings);
+        add_opt_value(&mut page_values, &values);
+        if !in_project(&hosted) {
+            continue;
+        }
         let entry = Entry {
             host: &hosted.host,
             record: &hosted.record,
@@ -519,6 +653,8 @@ pub(crate) fn project_detail_in<Tz: TimeZone + Copy>(
             .entry(hosted.record.model.clone())
             .or_insert(0) += hosted.record.out;
     }
+
+    let page_api = page_values.as_ref().and_then(|values| values.api);
 
     let host_values = {
         let parts: Vec<&Values> = hosts.values().collect();
@@ -552,6 +688,7 @@ pub(crate) fn project_detail_in<Tz: TimeZone + Copy>(
         },
         hosts: host_shares,
         values: sums.values(),
+        share: share_of(sums.api(), page_api),
         weekly_by_model,
         sessions: sums.sessions.len() as u32,
     })
@@ -694,10 +831,12 @@ fn by_account<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, sums: &Sums) -> Vec<(Option<St
     shares
 }
 
-fn share_of(api: Option<f64>, page_api: Option<f64>) -> f64 {
+/// A value as a share of the page's total, in %: unknown when either value is
+/// missing or the total is zero, never a made-up 0 %.
+fn share_of(api: Option<f64>, page_api: Option<f64>) -> Option<f64> {
     match (api, page_api) {
-        (Some(api), Some(total)) if total > 0.0 => api / total * 100.0,
-        _ => 0.0,
+        (Some(api), Some(total)) if total > 0.0 => Some(api / total * 100.0),
+        _ => None,
     }
 }
 
@@ -1024,7 +1163,7 @@ mod tests {
         assert_eq!(atlas.key, Some(self::atlas()));
         assert_eq!(atlas.values.api, Some(120.0));
         assert!(close(atlas.values.subscription.unwrap(), 103.846));
-        assert!(close(atlas.share, 85.714));
+        assert!(close(atlas.share.unwrap(), 85.714));
         assert_eq!(atlas.sessions, 3);
 
         let engine = node(&page, "engine");
@@ -1108,6 +1247,74 @@ mod tests {
     }
 
     #[test]
+    fn the_matrix_totals_are_the_sums_of_its_cells() {
+        let tiny = tiny();
+        let projects = with_acme_account(&tiny);
+        let ctx = Ctx {
+            projects: &projects,
+            ..tiny.ctx()
+        };
+        let page = projects_page_in(&ctx, &two_weeks(), &all()).unwrap();
+        let matrix = &page.matrix;
+
+        let total_of = |cells: &[Option<f64>]| -> Option<f64> {
+            cells
+                .iter()
+                .try_fold(0.0, |sum, cell| cell.map(|cell| sum + cell))
+        };
+        let org = |name: &str| {
+            matrix
+                .orgs
+                .iter()
+                .position(|org| org == name)
+                .expect("the organization")
+        };
+        let account = |id: &str| {
+            matrix
+                .accounts
+                .iter()
+                .position(|account| account == id)
+                .expect("the account")
+        };
+
+        for (row, total) in matrix.cells.iter().zip(&matrix.row_totals) {
+            assert!(close(total.unwrap(), total_of(row).unwrap()));
+        }
+        for column in 0..matrix.accounts.len() {
+            let cells: Vec<Option<f64>> = matrix.cells.iter().map(|row| row[column]).collect();
+            assert!(close(
+                matrix.column_totals[column].unwrap(),
+                total_of(&cells).unwrap()
+            ));
+        }
+        let all: Vec<Option<f64>> = matrix.cells.iter().flatten().copied().collect();
+        assert!(close(matrix.total.unwrap(), total_of(&all).unwrap()));
+
+        // The fixture's values: sam 74.769 + 29.077, acme 16.154; LB 74.769,
+        // AC 29.077 + 16.154, and every cell 120 EUR together.
+        assert!(close(
+            matrix.row_totals[org("sam")].unwrap(),
+            74.769 + 29.077
+        ));
+        assert!(close(matrix.row_totals[org("acme")].unwrap(), 16.154));
+        assert!(close(
+            matrix.column_totals[account(&tiny.lb().id)].unwrap(),
+            74.769
+        ));
+        assert!(close(
+            matrix.column_totals[account(&tiny.ac().id)].unwrap(),
+            29.077 + 16.154
+        ));
+        assert!(close(matrix.total.unwrap(), 120.0));
+
+        // The page reads these keys: `rowTotals`, `columnTotals` and `total`.
+        let json = serde_json::to_value(&page).expect("the page's JSON shape");
+        assert!(json["matrix"]["rowTotals"].is_array());
+        assert!(json["matrix"]["columnTotals"].is_array());
+        assert!(json["matrix"]["total"].is_number());
+    }
+
+    #[test]
     fn the_matrix_sentences() {
         let tiny = tiny();
         let projects = with_acme_account(&tiny);
@@ -1137,6 +1344,37 @@ mod tests {
             .find(|(id, _)| id == &tiny.lb().id)
             .expect("LB's tokens per percent");
         assert!(close(lb.1, 3_000_000.0 / 180.0), "LB {}", lb.1);
+    }
+
+    #[test]
+    fn the_usd_rate_is_the_pages_rate_with_its_date() {
+        let mut tiny = tiny();
+        tiny.settings.usd_rate = None;
+        let date = NaiveDate::from_ymd_opt(2026, 11, 13).expect("the rate's date");
+        tiny.fx.take(date, 0.9048);
+
+        let page = projects_page_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        assert_eq!(
+            page.usd_rate,
+            Some(UsdRate {
+                value: 0.9048,
+                date: Some(date),
+                currency: "EUR".to_string(),
+                varies: false,
+            })
+        );
+        // The page reads `usdRate.value`, `usdRate.date`, `usdRate.currency` and
+        // `usdRate.varies`.
+        let json = serde_json::to_value(&page).expect("the page's JSON shape");
+        assert_eq!(
+            json["usdRate"],
+            serde_json::json!({
+                "value": 0.9048,
+                "date": "2026-11-13",
+                "currency": "EUR",
+                "varies": false,
+            })
+        );
     }
 
     #[test]
@@ -1245,6 +1483,39 @@ mod tests {
                 vec![("claude-opus-5-5".to_string(), 4_000_000)]
             )
         );
+    }
+
+    #[test]
+    fn a_projects_share_is_its_part_of_all_use() {
+        let tiny = tiny();
+        let page = projects_page_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        let all_use: f64 = page
+            .nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::Project)
+            .filter_map(|node| node.values.api)
+            .sum();
+
+        let atlas_detail = project_detail_in(&tiny.ctx(), &two_weeks(), &all(), &atlas()).unwrap();
+        let atlas_share = atlas_detail.values.api.unwrap() / all_use * 100.0;
+        assert!(
+            close(atlas_detail.share.unwrap(), atlas_share),
+            "atlas {:?} is not {} of all use",
+            atlas_detail.share,
+            atlas_share
+        );
+        assert!(close(atlas_detail.share.unwrap(), 120.0 / 140.0 * 100.0));
+        assert_eq!(
+            atlas_detail.share,
+            node(&page, "atlas").share,
+            "the detail shows the tree's share of all use"
+        );
+
+        let acme_kb = ProjectKey::Repo("github.com/acme/acme-kb".to_string());
+        let kb_detail = project_detail_in(&tiny.ctx(), &two_weeks(), &all(), &acme_kb).unwrap();
+        let kb_share = kb_detail.values.api.unwrap() / all_use * 100.0;
+        assert!(close(kb_detail.share.unwrap(), kb_share));
+        assert!(close(kb_detail.share.unwrap(), 20.0 / 140.0 * 100.0));
     }
 
     #[test]
@@ -1384,5 +1655,307 @@ mod tests {
             "AC's 100 % window counts the 3 M of 14 Nov and the 2 M of 17 Nov: {}",
             ac.1
         );
+    }
+
+    // ---- proof tests of the review of T-5 ----
+
+    /// A total of parts where one part is missing says so: it is unknown, not
+    /// a measured zero. A record of a model without a price leaves its account's
+    /// cell without a subscription value, so the row, the column and the total
+    /// that hold it are unknown too.
+    #[test]
+    fn a_missing_cell_makes_the_totals_unknown() {
+        let tiny = tiny();
+        let projects = with_acme_account(&tiny);
+        let ctx = Ctx {
+            projects: &projects,
+            ..tiny.ctx()
+        };
+        // The record is of 15 Nov, when AC was the live account.
+        tiny.history
+            .append(&record(
+                "2026-11-15T09:00:00Z",
+                "s5",
+                "/home/sam/projects/atlas/engine",
+                atlas(),
+                "claude-x",
+                1_000_000,
+            ))
+            .expect("a record without a price");
+
+        let page = projects_page_in(&ctx, &two_weeks(), &all()).unwrap();
+        let matrix = &page.matrix;
+        let org = |name: &str| {
+            matrix
+                .orgs
+                .iter()
+                .position(|org| org == name)
+                .expect("the organization")
+        };
+        let account = |id: &str| {
+            matrix
+                .accounts
+                .iter()
+                .position(|account| account == id)
+                .expect("the account")
+        };
+        let sam = org("sam");
+        let acme = org("acme");
+        let ac = account(&tiny.ac().id);
+        let lb = account(&tiny.lb().id);
+
+        assert_eq!(
+            matrix.cells[sam][ac], None,
+            "the cell of the account whose week has no value is unknown"
+        );
+        assert_eq!(
+            matrix.row_totals[sam], None,
+            "the row total of a row with an unknown cell is unknown, not 0"
+        );
+        assert_eq!(
+            matrix.column_totals[ac], None,
+            "the column total of a column with an unknown cell is unknown, not 0"
+        );
+        assert_eq!(
+            matrix.total, None,
+            "the total of a matrix with an unknown cell is unknown, not 0"
+        );
+        // The parts that are known keep their measured values.
+        assert!(close(matrix.row_totals[acme].unwrap(), 16.154));
+        assert!(close(matrix.column_totals[lb].unwrap(), 74.769));
+    }
+
+    /// The matrix's row total is the organization's subscription value: the same
+    /// number the tree shows on the organization's row.
+    #[test]
+    fn the_matrix_row_total_is_the_organizations_subscription_value() {
+        let tiny = tiny();
+        let projects = with_acme_account(&tiny);
+        let ctx = Ctx {
+            projects: &projects,
+            ..tiny.ctx()
+        };
+
+        let page = projects_page_in(&ctx, &two_weeks(), &all()).unwrap();
+        assert!(!page.matrix.orgs.is_empty(), "the matrix has organizations");
+        for (index, org) in page.matrix.orgs.iter().enumerate() {
+            let row = node(&page, org);
+            assert_eq!(row.kind, NodeKind::Org, "{org} is an organization");
+            // The two are added up in another order (by account and by record),
+            // so they can differ in the last bit; the page writes the same money.
+            assert!(
+                close(
+                    page.matrix.row_totals[index].unwrap(),
+                    row.values.subscription.unwrap()
+                ),
+                "the matrix's row total of {org} is the value the tree shows for it"
+            );
+        }
+    }
+
+    /// A range with no record has no organization, no cell and no money: the
+    /// matrix is empty and a project's share of all use is nothing.
+    #[test]
+    fn an_empty_range_has_no_organizations_and_no_share() {
+        let tiny = tiny();
+        let empty = Range {
+            from: utc("2026-12-01T00:00:00Z"),
+            to: utc("2026-12-15T00:00:00Z"),
+        };
+
+        let page = projects_page_in(&tiny.ctx(), &empty, &all()).unwrap();
+        assert!(page.nodes.is_empty(), "no record, no node");
+        assert!(page.matrix.orgs.is_empty(), "no record, no organization");
+        assert!(page.matrix.row_totals.is_empty(), "no row, no row total");
+        assert!(
+            page.matrix
+                .column_totals
+                .iter()
+                .all(|total| *total == Some(0.0)),
+            "no cell, no money: a measured zero"
+        );
+        assert_eq!(page.matrix.total, Some(0.0), "no cell, no money");
+
+        let detail = project_detail_in(&tiny.ctx(), &empty, &all(), &atlas()).unwrap();
+        assert_eq!(detail.values.api, None, "no record, no value");
+        assert_eq!(detail.share, None, "no record, no share");
+        assert_eq!(detail.sessions, 0);
+    }
+
+    /// The only project of a range is all of its use: its share is 100 %.
+    #[test]
+    fn one_project_is_the_whole_use() {
+        let tiny = tiny();
+        // Only the record of 8 Nov is in this range; it is of acme-kb.
+        let day = Range {
+            from: utc("2026-11-08T00:00:00Z"),
+            to: utc("2026-11-09T00:00:00Z"),
+        };
+        let acme_kb = ProjectKey::Repo("github.com/acme/acme-kb".to_string());
+
+        let page = projects_page_in(&tiny.ctx(), &day, &all()).unwrap();
+        assert_eq!(page.nodes.len(), 2, "the organization and its project");
+        assert!(
+            close(node(&page, "acme-kb").share.unwrap(), 100.0),
+            "the only project is all the use: {:?}",
+            node(&page, "acme-kb").share
+        );
+
+        let detail = project_detail_in(&tiny.ctx(), &day, &all(), &acme_kb).unwrap();
+        assert!(
+            close(detail.share.unwrap(), 100.0),
+            "the only project is all the use: {:?}",
+            detail.share
+        );
+        assert_eq!(detail.sessions, 1);
+    }
+
+    /// A project with no record in the range has no value and no share of the
+    /// use that is there.
+    #[test]
+    fn a_project_without_use_in_the_range_has_no_share() {
+        let tiny = tiny();
+        // Only the record of 8 Nov is in this range; it is of acme-kb.
+        let day = Range {
+            from: utc("2026-11-08T00:00:00Z"),
+            to: utc("2026-11-09T00:00:00Z"),
+        };
+
+        let detail = project_detail_in(&tiny.ctx(), &day, &all(), &atlas()).unwrap();
+        assert_eq!(detail.values.api, None, "no record, no value");
+        assert_eq!(detail.share, None, "no record, no share");
+        assert_eq!(detail.sessions, 0);
+    }
+
+    // ---- proof tests of the fix of T-5 ----
+
+    /// A project whose model has no price has no API value, so its share of all
+    /// use is unknown, never a made-up 0 %: the page writes "—".
+    #[test]
+    fn a_project_without_a_price_has_no_share() {
+        let tiny = tiny();
+        tiny.history
+            .append(&record(
+                "2026-11-15T09:00:00Z",
+                "s5",
+                "/home/sam/projects/atlas/engine",
+                atlas(),
+                "claude-x",
+                1_000_000,
+            ))
+            .expect("a record without a price");
+
+        let page = projects_page_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        let atlas_row = node(&page, "atlas");
+        assert_eq!(atlas_row.values.api, None, "one part without a price");
+        assert_eq!(
+            atlas_row.share, None,
+            "an unknown share is unknown, not 0 %"
+        );
+
+        let detail = project_detail_in(&tiny.ctx(), &two_weeks(), &all(), &atlas()).unwrap();
+        assert_eq!(detail.values.api, None, "one part without a price");
+        assert_eq!(detail.share, None, "an unknown share is unknown, not 0 %");
+
+        // The page reads the JSON `null`: a tree row's `share` and the detail's.
+        let json = serde_json::to_value(&page).expect("the page's JSON shape");
+        let atlas_json = json["nodes"]
+            .as_array()
+            .expect("the nodes")
+            .iter()
+            .find(|node| node["name"] == "atlas")
+            .expect("atlas's row");
+        assert!(atlas_json["share"].is_null());
+        let detail_json = serde_json::to_value(&detail).expect("the detail's JSON shape");
+        assert!(detail_json["share"].is_null());
+    }
+
+    /// The rate says which currency it converts into, so the page does not take
+    /// it from another view's settings.
+    #[test]
+    fn the_usd_rate_carries_its_currency() {
+        let mut tiny = tiny();
+        tiny.settings.usd_rate = None;
+        tiny.fx.take(
+            NaiveDate::from_ymd_opt(2026, 11, 13).expect("the rate's date"),
+            0.9048,
+        );
+
+        let page = projects_page_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        let rate = page.usd_rate.as_ref().expect("the page's rate");
+        assert_eq!(rate.currency, "EUR", "the settings' currency");
+
+        let json = serde_json::to_value(&page).expect("the page's JSON shape");
+        assert_eq!(json["usdRate"]["currency"], "EUR");
+    }
+
+    /// Rust rounds the rate to four decimals before sending it; the page writes
+    /// that value and adds no rounding of its own.
+    #[test]
+    fn the_usd_rate_value_is_rounded_to_four_decimals() {
+        let mut tiny = tiny();
+        tiny.settings.usd_rate = None;
+        tiny.fx.take(
+            NaiveDate::from_ymd_opt(2026, 11, 13).expect("the rate's date"),
+            0.90486,
+        );
+
+        let page = projects_page_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        let rate = page.usd_rate.as_ref().expect("the page's rate");
+        assert_eq!(rate.value, 0.9049, "the rate is rounded to four decimals");
+
+        let json = serde_json::to_value(&page).expect("the page's JSON shape");
+        assert_eq!(json["usdRate"]["value"], 0.9049);
+    }
+
+    /// A range that crosses a change of the looked-up rate says so: the valuer
+    /// converted each record at its own day's rate.
+    #[test]
+    fn the_rate_varies_across_a_rate_change() {
+        let mut tiny = tiny();
+        tiny.settings.usd_rate = None;
+        tiny.fx.take(
+            NaiveDate::from_ymd_opt(2026, 11, 5).expect("the first rate's date"),
+            0.9000,
+        );
+        tiny.fx.take(
+            NaiveDate::from_ymd_opt(2026, 11, 10).expect("the second rate's date"),
+            0.9500,
+        );
+
+        let page = projects_page_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        let rate = page.usd_rate.as_ref().expect("the page's rate");
+        assert!(rate.varies, "the range has two rates: {:?}", rate);
+        assert_eq!(rate.value, 0.95, "the latest rate of the range");
+
+        let json = serde_json::to_value(&page).expect("the page's JSON shape");
+        assert_eq!(json["usdRate"]["varies"], true);
+    }
+
+    /// A range inside one stored rate uses that one rate all along.
+    #[test]
+    fn the_rate_does_not_vary_inside_one_rate() {
+        let mut tiny = tiny();
+        tiny.settings.usd_rate = None;
+        tiny.fx.take(
+            NaiveDate::from_ymd_opt(2026, 11, 5).expect("the first rate's date"),
+            0.9000,
+        );
+        tiny.fx.take(
+            NaiveDate::from_ymd_opt(2026, 11, 10).expect("the second rate's date"),
+            0.9500,
+        );
+        let week = Range {
+            from: utc("2026-11-05T00:00:00Z"),
+            to: utc("2026-11-10T00:00:00Z"),
+        };
+
+        let page = projects_page_in(&tiny.ctx(), &week, &all()).unwrap();
+        let rate = page.usd_rate.as_ref().expect("the page's rate");
+        assert!(!rate.varies, "one rate for every day: {:?}", rate);
+        assert_eq!(rate.value, 0.9, "that one rate");
+
+        let json = serde_json::to_value(&page).expect("the page's JSON shape");
+        assert_eq!(json["usdRate"]["varies"], false);
     }
 }

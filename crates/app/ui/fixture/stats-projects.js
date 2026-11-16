@@ -53,26 +53,67 @@ function accountUsedTotal(account, indexes) {
   return sum(indexes.map((index) => usedMoney(account, index)));
 }
 
-function accountOrgTotal(abbr) {
-  return sum(Object.values(ORG_ACC).map((org) => org[abbr] ?? 0));
+// A sum of matrix cells: unknown as soon as one cell is, as projects.rs sums
+// them, so a missing cell is never counted as a measured zero.
+function addCells(cells) {
+  let total = 0;
+  for (const cell of cells) {
+    if (typeof cell !== "number" || !Number.isFinite(cell)) return null;
+    total += cell;
+  }
+  return total;
 }
 
-function matrixCell(org, account, indexes) {
-  const values = ORG_ACC[org];
-  if (!values) return 0;
-  const total = accountOrgTotal(account.abbr);
-  if (total <= 0) return 0;
-  return accountUsedTotal(account, indexes) * ((values[account.abbr] ?? 0) / total);
+// The mock-up's dollar rate: 1 USD = 0.9048 EUR, looked up on 13 Nov
+// (projects.rs answers the rate its API values are converted with, with the
+// currency it converts into and whether the range's days had more than one).
+const USD_RATE = {
+  value: 0.9048,
+  date: "2026-11-13",
+  currency: "EUR",
+  varies: false,
+};
+
+// One project's model has no price: its API value is unknown while its tokens
+// and sessions are there, so projects.rs sends `null` for its share.
+const UNPRICED_PROJECT = "notes";
+const UNPRICED_MODEL = "claude-fable-5-2";
+
+function unpricedValues(subscription) {
+  const values = fixtureValues(null, subscription);
+  values.apiMissing = `no price for ${UNPRICED_MODEL}`;
+  return values;
 }
 
-function matrixSentences(orgs, chosen, cells, indexes) {
+// An organization's money: its tree share of the chosen accounts' used money.
+// The matrix cells split this one number by the organization's account weights,
+// so an organization's matrix row total is exactly its tree row's value.
+function orgMoney(org, usedTotal) {
+  const entry = TREE.find(
+    (candidate) => candidate.level === 0 && candidate.name === org
+  );
+  if (!entry) throw new Error(`unknown organization ${JSON.stringify(org)}`);
+  return (entry.share / 100) * usedTotal;
+}
+
+function matrixCell(org, account, usedTotal) {
+  const weights = ORG_ACC[org];
+  if (!weights) throw new Error(`unknown organization ${JSON.stringify(org)}`);
+  const total = sum(Object.values(weights));
+  if (total <= 0) {
+    throw new Error(`organization ${JSON.stringify(org)} has no account weights`);
+  }
+  return orgMoney(org, usedTotal) * ((weights[account.abbr] ?? 0) / total);
+}
+
+function matrixSentences(orgs, chosen, cells, usedTotal) {
   const sentences = [];
   for (const [orgIndex, org] of orgs.entries()) {
     const ownAbbrs = ORG_ACCOUNTS[org] || [];
     const own = chosen.filter((account) => ownAbbrs.includes(account.abbr));
     if (own.length === 0) continue;
     const total = sum(cells[orgIndex]);
-    const ownSub = sum(own.map((account) => matrixCell(org, account, indexes)));
+    const ownSub = sum(own.map((account) => matrixCell(org, account, usedTotal)));
     if (total <= 0 || ownSub <= 0) continue;
     const names = joinNames(own.map((account) => account.abbr));
     const noun = own.length === 1 ? "subscription" : "subscriptions";
@@ -83,9 +124,12 @@ function matrixSentences(orgs, chosen, cells, indexes) {
     )} of the work for ${org}.`;
     if (share < 100) {
       const others = chosen.filter(
-        (account) => !own.includes(account) && matrixCell(org, account, indexes) > 0
+        (account) =>
+          !own.includes(account) && matrixCell(org, account, usedTotal) > 0
       );
-      const amount = sum(others.map((account) => matrixCell(org, account, indexes)));
+      const amount = sum(
+        others.map((account) => matrixCell(org, account, usedTotal))
+      );
       if (others.length > 0 && amount > 0) {
         sentence += ` The rest ran on ${joinNames(
           others.map((account) => account.abbr)
@@ -98,7 +142,9 @@ function matrixSentences(orgs, chosen, cells, indexes) {
     const otherOrgs = [];
     for (const [otherIndex, other] of orgs.entries()) {
       if (other === org) continue;
-      const value = sum(own.map((account) => matrixCell(other, account, indexes)));
+      const value = sum(
+        own.map((account) => matrixCell(other, account, usedTotal))
+      );
       if (value > 0) {
         carried += value;
         otherOrgs.push(other);
@@ -124,10 +170,15 @@ export function projects(query) {
   const apiTotal = (outTotal / 1000000) * API_PER_M;
   const nodes = TREE.map((entry) => {
     const out = (entry.share / 100) * outTotal;
+    const unpriced = entry.name === UNPRICED_PROJECT;
     const orgAccounts = (ORG_ACCOUNTS[entry.name] || [])
       .map((abbr) => byAbbr(abbr))
       .filter(Boolean)
       .map((account) => account.id);
+    const subscription =
+      entry.level === 0
+        ? orgMoney(entry.name, usedTotal)
+        : (entry.share / 100) * usedTotal;
     return {
       kind: entry.level === 0 ? "org" : entry.level === 1 ? "project" : "folder",
       level: entry.level,
@@ -135,21 +186,30 @@ export function projects(query) {
       key: keyOf(entry),
       orgAccounts,
       tokens: tokenCounts(out),
-      share: entry.share,
-      values: fixtureValues((entry.share / 100) * apiTotal, (entry.share / 100) * usedTotal),
+      share: unpriced ? null : entry.share,
+      values: unpriced
+        ? unpricedValues(subscription)
+        : fixtureValues((entry.share / 100) * apiTotal, subscription),
       byAccount: chosenSplit(entry, chosen),
       sessions: Math.round(entry.sessions * keptFraction),
     };
   });
   const orgs = TREE.filter((entry) => entry.level === 0).map((entry) => entry.name);
-  const cells = orgs.map((org) => chosen.map((account) => matrixCell(org, account, indexes)));
+  const cells = orgs.map((org) =>
+    chosen.map((account) => matrixCell(org, account, usedTotal))
+  );
   return {
     nodes,
     matrix: {
       orgs,
       accounts: chosen.map((account) => account.id),
       cells,
-      sentences: matrixSentences(orgs, chosen, cells, indexes),
+      rowTotals: cells.map(addCells),
+      columnTotals: chosen.map((account, column) =>
+        addCells(cells.map((row) => row[column]))
+      ),
+      total: addCells(cells.flat()),
+      sentences: matrixSentences(orgs, chosen, cells, usedTotal),
     },
     tokensPerPercent: chosen.flatMap((account) => {
       const percent = usedPercentTotal(account, indexes);
@@ -159,6 +219,7 @@ export function projects(query) {
     }),
     unknownAccountTokens: { input: 0, out: 0, cw: 0, cr: 0 },
     withoutPrice: [],
+    usdRate: USD_RATE,
     notes: [
       "Not in any project: use of these accounts without a session file on a host with seatswap (claude.ai in the browser, the phone).",
     ],
@@ -194,15 +255,22 @@ export function projectDetail(query, key) {
       : entry.name === "ledger"
         ? [["atlas", 38], ["vega", 62]]
         : [["atlas", 100]];
+  const unpriced = entry.name === UNPRICED_PROJECT;
+  const subscription =
+    (entry.share / 100) *
+    sum(chosen.map((account) => accountUsedTotal(account, indexes)));
   return {
     name: entry.name,
     tokens: tokenCounts(out),
     agentShare: entry.name === "ledger" ? 44 : 58,
     hosts,
-    values: fixtureValues(
-      (entry.share / 100) * ((keptOutTotal / 1000000) * API_PER_M),
-      (entry.share / 100) * sum(chosen.map((account) => accountUsedTotal(account, indexes)))
-    ),
+    values: unpriced
+      ? unpricedValues(subscription)
+      : fixtureValues(
+          (entry.share / 100) * ((keptOutTotal / 1000000) * API_PER_M),
+          subscription
+        ),
+    share: unpriced ? null : entry.share,
     weeklyByModel,
     sessions: Math.round(entry.sessions * (indexes.length / WEEKS.length)),
   };

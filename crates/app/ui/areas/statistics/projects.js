@@ -16,9 +16,11 @@ import {
   errorMessage,
   h,
   isColor,
+  isObject,
   modelColor,
   modelName,
   percentText,
+  shortDate,
   tokens,
   valueTip,
 } from "../../common.js";
@@ -56,6 +58,9 @@ function visibleRows(nodes, mode, collapsed) {
   return rows;
 }
 
+// The tree's by-account bar. Every part is in its account's own colour from the
+// snapshot, through the helper the other statistics pages use (`accountView`
+// and `isColor`); an account the snapshot does not know is the muted colour.
 function splitBar(node, env) {
   const bar = h("span", { class: "stats-split" });
   for (const [id, percent] of node.byAccount) {
@@ -70,6 +75,48 @@ function splitBar(node, env) {
     bar.appendChild(part);
   }
   return bar;
+}
+
+// The reason a share is unknown: projects.rs sends `null` when the project's
+// own API value or the page's total is missing.
+const NO_SHARE = "no API value for some of this project's use";
+
+// A share of all use: "21.9 %", or "—" with the reason when projects.rs has no
+// value for one of its two parts (it never sends a made-up 0 %).
+function shareText(share) {
+  if (share === null || share === undefined) return { text: "—", title: NO_SHARE };
+  return { text: percentText(share), title: "" };
+}
+
+// "API values at 1 USD = 0.9048 EUR (13 Nov)." — the rate projects.rs converted
+// the page's API values with. Its currency is the rate's own, and it writes the
+// value exactly as sent (Rust rounded it to four decimals). A rate entered by
+// hand has no date. When the range's days had more than one rate, the line says
+// so and names the latest: "API values at each day's rate; latest 1 USD = …".
+function usdRateLine(rate) {
+  if (
+    !isObject(rate) ||
+    typeof rate.value !== "number" ||
+    !Number.isFinite(rate.value) ||
+    rate.value <= 0
+  ) {
+    throw new Error(`the page's dollar rate is not a positive number: ${JSON.stringify(rate)}`);
+  }
+  if (typeof rate.currency !== "string" || !/^[A-Z]{3}$/.test(rate.currency)) {
+    throw new Error(`the dollar rate's currency is missing: ${JSON.stringify(rate.currency)}`);
+  }
+  if (typeof rate.varies !== "boolean") {
+    throw new Error(`the dollar rate's varies is missing: ${JSON.stringify(rate.varies)}`);
+  }
+  const value = String(rate.value);
+  const date =
+    rate.date === null || rate.date === undefined
+      ? ""
+      : ` (${shortDate(`${rate.date}T00:00:00`)})`;
+  const latest = `1 USD = ${value} ${rate.currency}${date}`;
+  return rate.varies
+    ? `API values at each day's rate; latest ${latest}.`
+    : `API values at ${latest}.`;
 }
 
 export async function show(container, env) {
@@ -173,10 +220,20 @@ export async function show(container, env) {
       row.appendChild(nameCell);
 
       row.appendChild(h("span", { class: "n", text: tokens(node.tokens.out) }));
-      row.appendChild(h("span", { class: "n mf", text: percentText(node.share) }));
+      const share = shareText(node.share);
+      row.appendChild(
+        h("span", { class: "n mf", text: share.text, title: share.title || undefined })
+      );
       const usage = h("span", { class: "stats-ubar" });
       usage.appendChild(
-        h("i", { style: { width: `${Math.min(100, Math.max(0, node.share))}%` } })
+        h("i", {
+          style: {
+            width:
+              typeof node.share === "number"
+                ? `${Math.min(100, Math.max(0, node.share))}%`
+                : "0%",
+          },
+        })
       );
       row.appendChild(usage);
       const subscription = amountNode(node.values.subscription, node.values.currency);
@@ -228,10 +285,16 @@ export async function show(container, env) {
         })
       );
     }
+    if (data.usdRate !== null && data.usdRate !== undefined) {
+      notes.appendChild(
+        h("p", { class: "stats-note", text: usdRateLine(data.usdRate) })
+      );
+    }
     if (
       data.notes.length === 0 &&
       data.tokensPerPercent.length === 0 &&
-      data.withoutPrice.length === 0
+      data.withoutPrice.length === 0 &&
+      (data.usdRate === null || data.usdRate === undefined)
     ) {
       notes.appendChild(emptyLine("no note for this range"));
     }
@@ -269,17 +332,19 @@ export async function show(container, env) {
       return;
     }
     const table = h("div", { class: "stats-matrix" });
-    const width = `minmax(84px, 1fr)${
-      data.matrix.accounts.length > 0
-        ? ` repeat(${data.matrix.accounts.length}, minmax(0, 1fr))`
-        : ""
-    }`;
+    const width = `minmax(84px, 1fr) repeat(${data.matrix.accounts.length}, minmax(0, 1fr)) minmax(46px, auto)`;
     table.style.setProperty("--stats-matrix-columns", width);
     const head = h("div", { class: "stats-matrix-row stats-matrix-row-head" });
     head.appendChild(h("span", { text: "Organization" }));
     for (const id of data.matrix.accounts) {
       head.appendChild(h("span", { class: "stats-matrix-head-cell" }, [accountName(env.accounts, id)]));
     }
+    head.appendChild(
+      h("span", {
+        class: "stats-matrix-head-total",
+        text: typeof env.currency === "string" ? env.currency : "",
+      })
+    );
     table.appendChild(head);
     for (const [rowIndex, org] of data.matrix.orgs.entries()) {
       const row = h("div", { class: "stats-matrix-row" });
@@ -298,7 +363,35 @@ export async function show(container, env) {
         }, [amountNode(value, env.currency)]);
         row.appendChild(cell);
       }
+      row.appendChild(
+        h("span", {
+          class: "stats-matrix-total",
+          title: `${org}: ${amountTip(data.matrix.rowTotals[rowIndex], env.currency)}`,
+        }, [amountNode(data.matrix.rowTotals[rowIndex], env.currency)])
+      );
       table.appendChild(row);
+    }
+    if (data.matrix.orgs.length > 0) {
+      const foot = h("div", { class: "stats-matrix-row stats-matrix-row-foot" });
+      foot.appendChild(h("span", { class: "stats-matrix-org", text: "Used" }));
+      for (const [column, id] of data.matrix.accounts.entries()) {
+        foot.appendChild(
+          h("span", {
+            class: "stats-matrix-foot-cell",
+            title: `${accountNameText(env.accounts, id)}: used ${amountTip(
+              data.matrix.columnTotals[column],
+              env.currency
+            )}`,
+          }, [amountNode(data.matrix.columnTotals[column], env.currency)])
+        );
+      }
+      foot.appendChild(
+        h("span", {
+          class: "stats-matrix-foot-total",
+          title: `every organization: used ${amountTip(data.matrix.total, env.currency)}`,
+        }, [amountNode(data.matrix.total, env.currency)])
+      );
+      table.appendChild(foot);
     }
     body.appendChild(table);
     if (data.matrix.sentences.length === 0) {
@@ -404,8 +497,13 @@ export async function show(container, env) {
       head.appendChild(
         h("span", { class: "t", text: state.detail.name, title: state.detail.name })
       );
+      const share = shareText(state.detail.share);
       head.appendChild(
-        h("span", { class: "s", text: `${state.detail.sessions} sessions` })
+        h("span", {
+          class: "s",
+          text: `${share.text} of all use · ${state.detail.sessions} sessions`,
+          title: share.title || undefined,
+        })
       );
     } else {
       head.appendChild(h("span", { class: "t", text: "Project" }));
