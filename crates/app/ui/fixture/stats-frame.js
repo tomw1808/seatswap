@@ -167,7 +167,7 @@ export function fixtureHours(value) {
   return Number.isInteger(rounded) ? `${rounded} h` : `${rounded.toFixed(1)} h`;
 }
 
-function joinNames(names) {
+export function joinNames(names) {
   if (names.length === 0) return "";
   if (names.length === 1) return names[0];
   if (names.length === 2) return `${names[0]} and ${names[1]}`;

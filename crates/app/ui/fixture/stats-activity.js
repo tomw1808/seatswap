@@ -10,8 +10,10 @@ import {
   chosenHosts,
   round2,
   tokenCounts,
+  weekIso,
   weekTime,
 } from "./stats-frame.js";
+import { ACT_PATTERN } from "./stats-rhythm.js";
 
 // ---------------------------------------------------------------------------
 // Activity (spec §3.9; mock_activity.py)

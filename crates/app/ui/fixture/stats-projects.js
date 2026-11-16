@@ -13,9 +13,13 @@ import {
   accountOut,
   byAbbr,
   chosenAccounts,
+  fixtureMoney,
   fixtureValues,
+  fixtureWholePercent,
+  joinNames,
   sum,
   tokenCounts,
+  usedMoney,
   weekIso,
 } from "./stats-frame.js";
 import { usedPercentTotal } from "./stats-weeks.js";
