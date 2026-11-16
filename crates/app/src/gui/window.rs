@@ -55,7 +55,7 @@ use seatswap_core::transcripts::Tokens;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 #[cfg(feature = "gui")]
-use crate::statusline::render::AccountFacts;
+use crate::statusline::render::{all_field_paths, AccountFacts, FieldPaths};
 #[cfg(feature = "gui")]
 use crate::statusline::{self, FactsSource, PreviewLine, RecordedKeys, Scenario};
 
@@ -1140,6 +1140,14 @@ pub(crate) fn statusline_keys(
     statusline::read_recorded_keys(&state.app)
 }
 
+/// The payload field paths of the optional segments, from render.rs's one
+/// table; the page marks a segment whose path a recording did not see.
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub(crate) fn statusline_fields() -> Vec<FieldPaths> {
+    all_field_paths()
+}
+
 /// What Claude Code's status line is now, what seatswap would install, and the
 /// record of seatswap's install (spec §5.4). `restorable` follows the restore
 /// rule: a record exists and the current line is seatswap's or the record's
@@ -1154,6 +1162,8 @@ pub(crate) struct InstallState {
     pub installed: bool,
     pub restorable: bool,
     pub previous: Option<serde_json::Value>,
+    /// Claude Code's settings file, as the page shows it.
+    pub settings_file: String,
 }
 
 /// The install rule's decision, taken from one reading of Claude Code's file.
@@ -1220,6 +1230,7 @@ fn install_state_of(
         installed,
         restorable,
         previous,
+        settings_file: claude.settings_file().display().to_string(),
     })
 }
 
@@ -1249,6 +1260,7 @@ fn install_decision(
 ) -> Result<InstallDecision, String> {
     let ours = claude_settings::seatswap_status_line(exe).map_err(|error| error.to_string())?;
     let current = claude_settings::status_line(claude).map_err(|error| error.to_string())?;
+    let settings_file = claude.settings_file().display().to_string();
     if current.as_ref() == Some(&ours) {
         let previous = record.as_ref().and_then(|record| record.previous.clone());
         let restorable = restorable(record.as_ref(), current.as_ref(), &ours);
@@ -1261,6 +1273,7 @@ fn install_decision(
                 installed: true,
                 restorable,
                 previous,
+                settings_file,
             },
         });
     }
@@ -1281,6 +1294,7 @@ fn install_decision(
             installed: true,
             restorable: true,
             previous,
+            settings_file,
         },
     })
 }
@@ -1298,6 +1312,7 @@ fn restore_decision(
 ) -> Result<RestoreDecision, String> {
     let ours = claude_settings::seatswap_status_line(exe).map_err(|error| error.to_string())?;
     let current = claude_settings::status_line(claude).map_err(|error| error.to_string())?;
+    let settings_file = claude.settings_file().display().to_string();
     let Some(record) = record else {
         return Err(
             "seatswap has no record of the line before its own: nothing to restore".to_string(),
@@ -1319,6 +1334,7 @@ fn restore_decision(
             installed,
             restorable: false,
             previous: None,
+            settings_file,
         },
     })
 }
@@ -2809,6 +2825,20 @@ mod tests {
         claude_settings::set_status_line(claude, decision.restore.as_ref())
             .map_err(|error| error.to_string())?;
         Ok((decision.state, None))
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn the_install_state_names_claude_codes_settings_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (claude, exe) = statusline_paths(&tmp);
+        let state = install_state_of(&claude, &exe, None).expect("the install state");
+        assert_eq!(
+            state.settings_file,
+            claude.settings_file().display().to_string()
+        );
+        assert!(!state.installed);
+        assert!(!state.restorable);
     }
 
     #[cfg(feature = "gui")]

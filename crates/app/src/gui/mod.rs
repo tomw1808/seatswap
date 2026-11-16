@@ -253,6 +253,7 @@ pub(crate) fn run(
             window::statusline_presets,
             window::statusline_record,
             window::statusline_keys,
+            window::statusline_fields,
             window::statusline_install_state,
             window::statusline_install,
             window::statusline_restore,

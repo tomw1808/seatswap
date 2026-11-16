@@ -348,6 +348,39 @@ function banner(kind, icon, text, extraChildren) {
   );
 }
 
+// The one card of the large window: an `hcard` with its heading and body, and
+// an optional footer. The Settings area keeps its `settings-card` and
+// `settings-body`, the Status line area passes `sl-card …` and `sl-card-body`
+// through `options`; both pages build their cards with this one helper.
+function panel(title, sub, children, foot, options) {
+  const config = isObject(options) ? options : {};
+  const cardClass =
+    typeof config.cardClass === "string" ? config.cardClass : "settings-card";
+  const bodyClass =
+    typeof config.bodyClass === "string" ? config.bodyClass : "settings-body";
+  return h("div", { class: `hcard ${cardClass}` }, [
+    h("div", { class: "ch" }, [
+      h("span", { class: "t", text: title }),
+      sub ? h("span", { class: "s", text: sub }) : null,
+    ]),
+    h("div", { class: bodyClass }, children),
+    foot ? h("div", { class: "cfoot" }, foot) : null,
+  ]);
+}
+
+// The one "area message" of the large window's pages.
+function message(text, className) {
+  return h("p", { class: className ? `area-message ${className}` : "area-message", text });
+}
+
+// True while the person types in `container`: a redraw then would take the
+// field (and what was typed) away. Both pages ask this one rule.
+function focusInside(container) {
+  const active = document.activeElement;
+  if (!active || !container || !container.contains(active)) return false;
+  return active.tagName === "INPUT" || active.tagName === "SELECT" || active.tagName === "TEXTAREA";
+}
+
 // The settings controls shared by the pop-up and the large window: one text
 // input, one select and one switch, so both pages build them the same way.
 function textInput(props) {
@@ -383,6 +416,41 @@ function switchButton(checked, label, onchange) {
     onchange(next);
   });
   return control;
+}
+
+// The mock-up's `.sws` switch: a blue track with a knob and, where the page
+// asks for it, its On/Off word beside it. The caller gets the button so it can
+// disable it while a save runs, and `set` to put the switch back when the save
+// is refused. The Settings area and the Status line area share this one switch.
+function switchControl(checked, label, onchange, options) {
+  const words = !options || options.words !== false;
+  let state = Boolean(checked);
+  const button = h("button", {
+    type: "button",
+    class: `sws${state ? " ison" : ""}`,
+    role: "switch",
+    "aria-checked": state ? "true" : "false",
+    "aria-label": label,
+  });
+  const word = words
+    ? h("span", { class: "sws-word", text: state ? "On" : "Off" })
+    : null;
+  const set = (next) => {
+    state = Boolean(next);
+    button.setAttribute("aria-checked", state ? "true" : "false");
+    button.classList.toggle("ison", state);
+    if (word) word.textContent = state ? "On" : "Off";
+  };
+  button.addEventListener("click", () => {
+    const next = !state;
+    set(next);
+    onchange(next);
+  });
+  return {
+    button,
+    set,
+    node: word ? h("span", { class: "sws-line" }, [button, word]) : button,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1006,6 +1074,9 @@ export {
   appendChildren,
   h,
   banner,
+  panel,
+  message,
+  focusInside,
   applyTheme,
   followTheme,
   invoke,
@@ -1032,6 +1103,7 @@ export {
   textInput,
   selectInput,
   switchButton,
+  switchControl,
   sanitizeAbbrChar,
   abbrLetterBoxes,
   colorSwatches,

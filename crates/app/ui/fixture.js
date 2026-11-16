@@ -2,8 +2,20 @@
 // what the pop-up and the large window show without the tray app.
 // Moved out of panel.js unchanged; its state lives here, not in either page.
 
-import { PALETTE, clone, contrastText, hexToRgb, isObject } from "./common.js";
+import { PALETTE, clone, contrastText, hexToRgb, isColor, isObject } from "./common.js";
 import { fixtureStats } from "./fixture-stats.js";
+
+// The bench's one-shot refusal. The pages reach `fixtureInvoke` directly, so a
+// browser step arms one command to be refused before it changes a control; it
+// is test data for the bench, not a second behaviour of the app.
+let pendingRefusal = null;
+
+export function refuseNextFixtureCall(command, text) {
+  pendingRefusal = {
+    command: String(command),
+    text: typeof text === "string" && text !== "" ? text : null,
+  };
+}
 
 const DEFAULT_SETTINGS = {
   trayText: "percent",
@@ -29,6 +41,8 @@ const DEFAULT_SETTINGS = {
   agentsRead: true,
   agentsSwitch: false,
   statuslineFeed: true,
+  statuslineRecordUntil: null,
+  statuslineInstall: null,
   currency: "EUR",
   usdRate: null,
   lookUpPrices: true,
@@ -526,6 +540,19 @@ function makeFixture() {
       bytes: 4299161,
     },
     exports: [],
+    // The status line builder's browser state: what Claude Code's settings
+    // would hold, and the field names a recording found. The fixture starts
+    // with another line installed, as the task's bench does.
+    statuslineKeys: null,
+    statuslineClaude: {
+      current: { type: "command", command: "bash ~/x.sh", refreshInterval: 2 },
+      ours: {
+        type: "command",
+        command: '"/home/sam/apps/seatswap" statusline',
+        refreshInterval: 2,
+      },
+      settingsFile: "~/.claude/settings.json",
+    },
     settings: Object.assign({}, DEFAULT_SETTINGS, {
       autoBurn: true,
       suggestSwitches: true,
@@ -1368,7 +1395,326 @@ function fixtureSessionsView(args) {
   };
 }
 
+
+// ---------------------------------------------------------------------------
+// the status line builder (spec §5.4). This is fixture data for the browser,
+// not a second renderer: the real preview comes from `statusline_preview`,
+// which runs the same `render_spans` as the installed command.
+// ---------------------------------------------------------------------------
+
+const FIXTURE_KIND_NAMES = {
+  account: "account",
+  plan: "plan",
+  fiveHourPercent: "5 h percent",
+  fiveHourReset: "5 h reset",
+  weekPercent: "week percent",
+  weekReset: "week reset",
+  modelPercent: "per-model percent",
+  autoBurn: "auto-burn",
+  model: "model",
+  effort: "effort",
+  folder: "folder",
+  gitBranch: "branch",
+  userHost: "user@host",
+  clock: "clock",
+  text: "text",
+  separator: "separator",
+  contextUsed: "context used",
+  sessionCost: "session cost",
+  linesChanged: "lines changed",
+};
+
+function fixtureCurrentLine() {
+  return clone(DEFAULT_SETTINGS.statusline);
+}
+
+// The three `StatuslineConfig::presets()`, as data: the preset "My current
+// line", "Limits only" and "Everything".
+function fixturePresets() {
+  const current = fixtureCurrentLine();
+  const limits = { left: [], right: clone(current.right), margin: current.margin };
+  const left = [
+    { kind: "userHost", color: { rule: "fixed", color: "#22c55e" } },
+    { kind: "text", color: { rule: "none" }, text: ":" },
+    { kind: "folder", color: { rule: "fixed", color: "#3b82f6" } },
+    { kind: "gitBranch", color: { rule: "fixed", color: "#22c55e" }, prefix: " ", drop: 3 },
+    { kind: "model", color: { rule: "byModelFamily" }, prefix: " " },
+    { kind: "effort", color: { rule: "byEffort" }, prefix: " " },
+    { kind: "plan", color: { rule: "none" }, prefix: " " },
+    { kind: "modelPercent", color: { rule: "none" }, prefix: " " },
+    { kind: "autoBurn", color: { rule: "none" }, prefix: " " },
+    { kind: "contextUsed", color: { rule: "none" }, prefix: " " },
+    { kind: "sessionCost", color: { rule: "none" }, prefix: " " },
+    { kind: "linesChanged", color: { rule: "none" }, prefix: " " },
+    { kind: "clock", color: { rule: "none" }, prefix: " " },
+    { kind: "separator", color: { rule: "none" }, prefix: " ", suffix: " " },
+  ];
+  return [
+    ["My current line", current],
+    ["Limits only", limits],
+    ["Everything", { left, right: clone(current.right), margin: current.margin }],
+  ];
+}
+
+function fixtureResetText(kind, segment) {
+  const format =
+    isObject(segment) && typeof segment.timeFormat === "string"
+      ? segment.timeFormat
+      : "seatswap";
+  if (kind === "fiveHourReset") {
+    return format === "clock" ? "19:30" : "4h45m";
+  }
+  if (format === "clock") return "Mon 02:00";
+  if (format === "compactLeft") return "3d16h";
+  return "1d18h";
+}
+
+// One segment's made-up text for the browser preview. The shapes follow the
+// renderer's values; the numbers are the README §5 payload's.
+function fixtureSampleValue(kind, segment, scenario) {
+  switch (kind) {
+    case "account":
+      return "AC";
+    case "plan":
+      return "Team 5x";
+    case "fiveHourPercent":
+      return scenario === "noSessionLimit" ? null : "12";
+    case "fiveHourReset":
+      return scenario === "noSessionLimit" ? null : fixtureResetText(kind, segment);
+    case "weekPercent":
+      if (scenario === "nearFull") return "97";
+      if (scenario === "blocked") return "100";
+      return "48";
+    case "weekReset":
+      return fixtureResetText(kind, segment);
+    case "modelPercent":
+      return "Fable 21%";
+    case "autoBurn":
+      return "LB 12:00";
+    case "model":
+      return "Fable 5.2";
+    case "effort":
+      return "high";
+    case "folder":
+      return "~/projects/atlas";
+    case "gitBranch":
+      return "main";
+    case "userHost":
+      return "sam@atlas";
+    case "clock":
+      return "14:32";
+    case "text":
+      return typeof segment.text === "string" && segment.text !== "" ? segment.text : null;
+    case "separator":
+      return "|";
+    case "contextUsed":
+      return "41%";
+    case "sessionCost":
+      return "$3.20";
+    case "linesChanged":
+      return "+120 -8";
+    default:
+      return null;
+  }
+}
+
+function fixtureSamplePercent(kind, scenario) {
+  if (kind === "fiveHourPercent") return scenario === "noSessionLimit" ? null : 12;
+  if (kind === "weekPercent") {
+    if (scenario === "nearFull") return 97;
+    if (scenario === "blocked") return 100;
+    return 48;
+  }
+  if (kind === "modelPercent") return 21;
+  return null;
+}
+
+function fixtureSpanColour(kind, segment, scenario) {
+  const rule =
+    isObject(segment.color) && typeof segment.color.rule === "string"
+      ? segment.color.rule
+      : "none";
+  if (rule === "fixed" && isColor(segment.color.color)) {
+    return { fg: segment.color.color };
+  }
+  if (rule === "account") {
+    return { fg: "#dbeafe", bg: "#3b82f6" };
+  }
+  if (rule === "byModelFamily") return { fg: "#c084fc" };
+  if (rule === "byEffort") return { fg: "#fbbf24" };
+  if (rule === "byLoad") {
+    const percent = fixtureSamplePercent(kind, scenario);
+    if (percent === null) return {};
+    const warn = Number(segment.color.warn);
+    const bad = Number(segment.color.bad);
+    if (percent >= bad) return { fg: "#ef4444" };
+    if (percent >= warn) return { fg: "#eab308" };
+    return { fg: "#22c55e" };
+  }
+  return {};
+}
+
+function fixturePiece(segment, scenario) {
+  if (!isObject(segment) || typeof segment.kind !== "string") {
+    throw new Error("a statusline preview segment needs a kind");
+  }
+  const value = fixtureSampleValue(segment.kind, segment, scenario);
+  if (value === null) return null;
+  const prefix = typeof segment.prefix === "string" ? segment.prefix : "";
+  const suffix = typeof segment.suffix === "string" ? segment.suffix : "";
+  return {
+    kind: segment.kind,
+    drop:
+      Number.isInteger(segment.drop) && segment.drop >= 1 ? segment.drop : null,
+    text: `${prefix}${value}${suffix}`,
+    colour: fixtureSpanColour(segment.kind, segment, scenario),
+  };
+}
+
+function fixtureDroppedNote(names) {
+  if (names.length === 0) return "everything fits";
+  if (names.length === 1) return `${names[0]} is dropped`;
+  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]} are dropped`;
+}
+
+// The browser's stand-in for `statusline_preview`: the same shape, one made-up
+// line per width, cut by the segments' drop numbers. It is deliberately not a
+// copy of the Rust renderer; it only gives the page something to draw.
+function fixtureStatuslinePreview(config, widths, scenario) {
+  if (!isObject(config) || !Array.isArray(config.left) || !Array.isArray(config.right)) {
+    throw new Error("statusline_preview needs config.left and config.right");
+  }
+  if (!Number.isInteger(config.margin) || config.margin < 0) {
+    throw new Error(`statusline.margin must be a whole number of columns, got ${JSON.stringify(config.margin)}`);
+  }
+  if (!Array.isArray(widths) || widths.length === 0) {
+    throw new Error("the preview needs at least one width");
+  }
+  for (const width of widths) {
+    if (!Number.isInteger(width) || width < 1) {
+      throw new Error(`a preview width must be at least 1 column, got ${JSON.stringify(width)}`);
+    }
+  }
+  if (!["live", "nearFull", "blocked", "noSessionLimit"].includes(scenario)) {
+    throw new Error(`unknown preview scenario ${JSON.stringify(scenario)}`);
+  }
+  const leftPieces = config.left.map((segment) => fixturePiece(segment, scenario));
+  const rightPieces = config.right.map((segment) => fixturePiece(segment, scenario));
+  return widths.map((width) => {
+    let level = 0;
+    let chosen = null;
+    while (true) {
+      const left = leftPieces.filter((piece) => piece === null || piece.drop === null || piece.drop > level);
+      const right = rightPieces.filter((piece) => piece === null || piece.drop === null || piece.drop > level);
+      const leftLength = left.reduce((sum, piece) => sum + (piece ? piece.text.length : 0), 0);
+      const rightLength = right.reduce((sum, piece) => sum + (piece ? piece.text.length : 0), 0);
+      const gap = Math.max(2, width - config.margin - leftLength - rightLength);
+      const fits = leftLength + gap + rightLength <= width - config.margin;
+      chosen = { left, right, gap, fits };
+      if (fits || level >= 3) break;
+      level += 1;
+    }
+    const droppedNames = [];
+    const dropped = [];
+    for (const piece of leftPieces.concat(rightPieces)) {
+      if (!piece || piece.drop === null || piece.drop > level) continue;
+      const name = FIXTURE_KIND_NAMES[piece.kind] || piece.kind;
+      if (!droppedNames.includes(name)) droppedNames.push(name);
+      if (!dropped.includes(piece.drop)) dropped.push(piece.drop);
+    }
+    dropped.sort((one, other) => one - other);
+    const spans = [];
+    for (const piece of chosen.left) {
+      if (!piece) continue;
+      spans.push({
+        text: piece.text,
+        fg: piece.colour.fg || null,
+        bg: piece.colour.bg || null,
+        bold: false,
+      });
+    }
+    spans.push({ text: " ".repeat(chosen.gap), fg: null, bg: null, bold: false });
+    for (const piece of chosen.right) {
+      if (!piece) continue;
+      spans.push({
+        text: piece.text,
+        fg: piece.colour.fg || null,
+        bg: piece.colour.bg || null,
+        bold: false,
+      });
+    }
+    return { width, spans, dropped, note: fixtureDroppedNote(droppedNames) };
+  });
+}
+
+// Most, but not all, of the optional segments' paths: `cost.total_lines_removed`
+// is left out, so an optional segment's missing field is visible in the browser.
+function fixtureRecordedKeys() {
+  return {
+    at: new Date().toISOString(),
+    keys: [
+      { path: "context_window.context_window_size", kind: "number" },
+      { path: "context_window.used_percentage", kind: "number" },
+      { path: "cost.total_cost_usd", kind: "number" },
+      { path: "cost.total_duration_ms", kind: "number" },
+      { path: "cost.total_lines_added", kind: "number" },
+      { path: "cwd", kind: "string" },
+      { path: "effort.level", kind: "string" },
+      { path: "model.display_name", kind: "string" },
+      { path: "model.id", kind: "string" },
+      { path: "rate_limits.five_hour.resets_at", kind: "number" },
+      { path: "rate_limits.five_hour.used_percentage", kind: "number" },
+      { path: "rate_limits.seven_day.resets_at", kind: "number" },
+      { path: "rate_limits.seven_day.used_percentage", kind: "number" },
+      { path: "session_id", kind: "string" },
+      { path: "version", kind: "string" },
+      { path: "workspace.current_dir", kind: "string" },
+    ],
+  };
+}
+
+// The payload fields the optional segments read, as `statusline_fields`
+// returns them: the same three kinds and paths as render.rs's one table.
+function fixtureFields() {
+  return [
+    { kind: "contextUsed", paths: ["context_window.used_percentage"] },
+    { kind: "sessionCost", paths: ["cost.total_cost_usd"] },
+    { kind: "linesChanged", paths: ["cost.total_lines_added", "cost.total_lines_removed"] },
+  ];
+}
+
+function sameFixtureValue(one, other) {
+  return JSON.stringify(one) === JSON.stringify(other);
+}
+
+// window.rs's `install_state_of`: `restorable` is the record's own rule, and
+// `previous` is what the record holds (absent means there is no record).
+function fixtureInstallState(fixture) {
+  const record = isObject(fixture.settings) ? fixture.settings.statuslineInstall : null;
+  const claude = fixture.statuslineClaude;
+  const current = claude.current === undefined ? null : claude.current;
+  const installed = current !== null && sameFixtureValue(current, claude.ours);
+  const restorable =
+    isObject(record) &&
+    (installed || (current !== null && sameFixtureValue(current, record.installed)));
+  const previous =
+    isObject(record) && record.previous !== undefined ? clone(record.previous) : null;
+  return {
+    current: clone(current),
+    ours: clone(claude.ours),
+    installed,
+    restorable,
+    previous,
+    settingsFile: claude.settingsFile,
+  };
+}
+
 export async function fixtureInvoke(command, args) {
+  if (pendingRefusal && pendingRefusal.command === command) {
+    const refusal = pendingRefusal;
+    pendingRefusal = null;
+    throw new Error(refusal.text || `${command} refused by the bench step`);
+  }
   console.log(`[fixture] ${command}`, args);
   if (String(command).startsWith("stats_")) return fixtureStats(command, args);
   const fixture = currentFixture();
@@ -1569,6 +1915,76 @@ export async function fixtureInvoke(command, args) {
 
     case "save_setting":
       return fixtureSaveSetting(fixture, String(args.field || ""), args.value);
+
+    // The status line builder (spec §5.4). The preview is fixture data, not a
+    // second renderer; the commands' answers have the Rust types' shapes.
+    case "statusline_presets":
+      return clone(fixturePresets());
+
+    case "statusline_preview":
+      return fixtureStatuslinePreview(args.config, args.widths, args.scenario);
+
+    case "statusline_record": {
+      const minutes = Number(args.minutes);
+      if (!Number.isInteger(minutes) || minutes < 1 || minutes > 60) {
+        throw new Error(`a recording lasts 1 to 60 minutes, got ${args.minutes}`);
+      }
+      fixtureSaveSetting(fixture, "statuslineRecordUntil", isoIn(minutes * 60000));
+      // The real recorder fills the file when Claude Code next calls the
+      // status line; the browser gets a finished list at once.
+      fixture.statuslineKeys = fixtureRecordedKeys();
+      return null;
+    }
+
+    case "statusline_keys":
+      return fixture.statuslineKeys === null ? null : clone(fixture.statuslineKeys);
+
+    case "statusline_fields":
+      return clone(fixtureFields());
+
+    case "statusline_install_state":
+      return clone(fixtureInstallState(fixture));
+
+    case "statusline_install": {
+      const state = fixtureInstallState(fixture);
+      if (!state.installed) {
+        const record = isObject(fixture.settings.statuslineInstall)
+          ? fixture.settings.statuslineInstall
+          : null;
+        const previous =
+          record !== null && sameFixtureValue(state.current, record.installed)
+            ? clone(record.previous)
+            : clone(state.current);
+        fixture.statuslineClaude.current = clone(state.ours);
+        fixture.settings = validateFixtureSettings(
+          Object.assign({}, fixture.settings, {
+            statuslineInstall: {
+              installed: clone(state.ours),
+              previous,
+            },
+          })
+        );
+      }
+      return clone(fixtureInstallState(fixture));
+    }
+
+    case "statusline_restore": {
+      const state = fixtureInstallState(fixture);
+      if (!isObject(fixture.settings.statuslineInstall)) {
+        throw new Error(
+          "seatswap has no record of the line before its own: nothing to restore"
+        );
+      }
+      if (!state.restorable) {
+        throw new Error("the status line in Claude Code is not seatswap's: nothing to restore");
+      }
+      const restored = state.previous;
+      fixture.statuslineClaude.current = restored;
+      fixture.settings = validateFixtureSettings(
+        Object.assign({}, fixture.settings, { statuslineInstall: null })
+      );
+      return clone(fixtureInstallState(fixture));
+    }
 
     case "sessions_view":
       return clone(fixtureSessionsView(args));

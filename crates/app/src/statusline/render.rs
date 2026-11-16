@@ -120,11 +120,48 @@ pub(crate) struct Span {
     pub bold: bool,
 }
 
-/// The status line payload's fields that have no typed field in [`Payload`].
-pub(crate) const PATH_CONTEXT_USED: &str = "context_window.used_percentage";
-pub(crate) const PATH_SESSION_COST: &str = "cost.total_cost_usd";
-pub(crate) const PATH_LINES_ADDED: &str = "cost.total_lines_added";
-pub(crate) const PATH_LINES_REMOVED: &str = "cost.total_lines_removed";
+/// The payload field paths of the optional segments: the one table the renderer
+/// and the window's `statusline_fields` command both read. A kind that reads no
+/// payload field has no row.
+const FIELD_PATHS: [(SegmentKind, &[&str]); 3] = [
+    (
+        SegmentKind::ContextUsed,
+        &["context_window.used_percentage"],
+    ),
+    (SegmentKind::SessionCost, &["cost.total_cost_usd"]),
+    (
+        SegmentKind::LinesChanged,
+        &["cost.total_lines_added", "cost.total_lines_removed"],
+    ),
+];
+
+/// One optional segment and the payload paths it reads, for the page.
+#[cfg(any(feature = "gui", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FieldPaths {
+    pub kind: SegmentKind,
+    pub paths: &'static [&'static str],
+}
+
+/// The field paths `kind` reads; empty for a kind that reads no payload field.
+pub(crate) fn field_paths(kind: SegmentKind) -> &'static [&'static str] {
+    for (entry, paths) in FIELD_PATHS {
+        if entry == kind {
+            return paths;
+        }
+    }
+    &[]
+}
+
+/// Every kind that reads a payload field, in the table's order.
+#[cfg(any(feature = "gui", test))]
+pub(crate) fn all_field_paths() -> Vec<FieldPaths> {
+    FIELD_PATHS
+        .iter()
+        .map(|(kind, paths)| FieldPaths { kind: *kind, paths })
+        .collect()
+}
 
 /// The value at a dot-separated path of the raw payload, or `None` when a
 /// parent is absent or not an object.
@@ -568,15 +605,18 @@ where
         SegmentKind::Clock => Some(facts.now.with_timezone(tz).format("%H:%M").to_string()),
         SegmentKind::Text => segment.text.clone(),
         SegmentKind::Separator => Some("|".to_string()),
-        SegmentKind::ContextUsed => {
-            number_at(payload, PATH_CONTEXT_USED).map(|value| format!("{}%", whole(value)))
-        }
-        SegmentKind::SessionCost => {
-            number_at(payload, PATH_SESSION_COST).map(|value| format!("${value:.2}"))
-        }
+        SegmentKind::ContextUsed => field_paths(SegmentKind::ContextUsed)
+            .first()
+            .and_then(|path| number_at(payload, path))
+            .map(|value| format!("{}%", whole(value))),
+        SegmentKind::SessionCost => field_paths(SegmentKind::SessionCost)
+            .first()
+            .and_then(|path| number_at(payload, path))
+            .map(|value| format!("${value:.2}")),
         SegmentKind::LinesChanged => {
-            let added = number_at(payload, PATH_LINES_ADDED)?;
-            let removed = number_at(payload, PATH_LINES_REMOVED)?;
+            let paths = field_paths(SegmentKind::LinesChanged);
+            let added = number_at(payload, paths.first()?)?;
+            let removed = number_at(payload, paths.get(1)?)?;
             Some(format!("+{} -{}", whole(added), whole(removed)))
         }
     }
@@ -1027,6 +1067,31 @@ mod tests {
             time_format: None,
             text: None,
         }
+    }
+
+    #[test]
+    fn the_optional_segments_paths_are_one_table() {
+        assert_eq!(
+            field_paths(SegmentKind::ContextUsed),
+            &["context_window.used_percentage"][..]
+        );
+        assert_eq!(
+            field_paths(SegmentKind::SessionCost),
+            &["cost.total_cost_usd"][..]
+        );
+        assert_eq!(
+            field_paths(SegmentKind::LinesChanged),
+            &["cost.total_lines_added", "cost.total_lines_removed"][..]
+        );
+        assert!(field_paths(SegmentKind::Account).is_empty());
+        assert_eq!(
+            serde_json::to_value(all_field_paths()).expect("the table as JSON"),
+            serde_json::json!([
+                {"kind": "contextUsed", "paths": ["context_window.used_percentage"]},
+                {"kind": "sessionCost", "paths": ["cost.total_cost_usd"]},
+                {"kind": "linesChanged", "paths": ["cost.total_lines_added", "cost.total_lines_removed"]}
+            ])
+        );
     }
 
     #[test]

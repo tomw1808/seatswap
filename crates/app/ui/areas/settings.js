@@ -12,13 +12,17 @@ import {
   colorSwatches,
   contrastText,
   errorMessage,
+  focusInside,
   h,
   hexField,
   iconPreview,
   isColor,
   isObject,
+  message,
+  panel,
   selectInput,
   shortPercent,
+  switchControl,
   textInput,
 } from "../common.js";
 
@@ -151,14 +155,6 @@ function accountIdsOf(snapshot) {
     .join("\u0000");
 }
 
-// True while the person types in the area: a redraw then would take the field
-// away. The next snapshot after it lost focus may draw.
-function focusInside() {
-  const active = document.activeElement;
-  if (!active || !state.container || !state.container.contains(active)) return false;
-  return active.tagName === "INPUT" || active.tagName === "SELECT" || active.tagName === "TEXTAREA";
-}
-
 // Open a group: replace the old content only once the views it needs are
 // stored, so the old group stays visible while it loads.
 export async function render(container, context) {
@@ -173,7 +169,7 @@ export async function render(container, context) {
     state.selectedId = parsed.item;
     state.openEditorId = parsed.item;
   }
-  if (focusInside() && group === state.group && state.container === container && !openRequest) {
+  if (focusInside(state.container) && group === state.group && state.container === container && !openRequest) {
     // Keep the control (and what was typed) until it is saved on change.
     state.snapshot = snapshot;
     takeSettings(snapshot);
@@ -229,14 +225,14 @@ export async function update(snapshot) {
   state.snapshot = next;
   takeSettings(next);
   if (!state.container || !state.right) return;
-  if (focusInside()) return;
+  if (focusInside(state.container)) return;
   const group = state.group;
   const right = state.right;
   const ids = accountIdsOf(next);
   const accountsChanged = state.accountIds !== null && ids !== state.accountIds;
   state.accountIds = ids;
   if (accountsChanged && group === "accounts") await loadProjects();
-  if (state.right !== right || state.group !== group || focusInside()) return;
+  if (state.right !== right || state.group !== group || focusInside(state.container)) return;
   renderGroup(right, group);
 }
 
@@ -297,21 +293,6 @@ function renderGroup(right, id) {
   else if (id === "projects") right.appendChild(projectsCard());
   else if (id === "history") right.appendChild(historyCard());
   else right.appendChild(agentsCard());
-}
-
-function panel(title, sub, children, foot) {
-  return h("div", { class: "hcard settings-card" }, [
-    h("div", { class: "ch" }, [
-      h("span", { class: "t", text: title }),
-      sub ? h("span", { class: "s", text: sub }) : null,
-    ]),
-    h("div", { class: "settings-body" }, children),
-    foot ? h("div", { class: "cfoot" }, foot) : null,
-  ]);
-}
-
-function message(text) {
-  return h("p", { class: "area-message", text });
 }
 
 function section(text) {
@@ -458,41 +439,6 @@ function selectSetting(field, options, label, width) {
   return selectWidth(select, width);
 }
 
-// The mock-up's `.sws` switch: a blue track with a knob, and its On/Off word
-// beside it where the mock-up has one (`settings()` uses `words=False` only
-// in the Accounts row). The caller gets the button so it can disable it while
-// a save runs, and `set` to put the switch back when the save is refused.
-function switchControl(checked, label, onchange, options) {
-  const words = !options || options.words !== false;
-  let state = Boolean(checked);
-  const button = h("button", {
-    type: "button",
-    class: `sws${state ? " ison" : ""}`,
-    role: "switch",
-    "aria-checked": state ? "true" : "false",
-    "aria-label": label,
-  });
-  const word = words
-    ? h("span", { class: "sws-word", text: state ? "On" : "Off" })
-    : null;
-  const set = (next) => {
-    state = Boolean(next);
-    button.setAttribute("aria-checked", state ? "true" : "false");
-    button.classList.toggle("ison", state);
-    if (word) word.textContent = state ? "On" : "Off";
-  };
-  button.addEventListener("click", () => {
-    const next = !state;
-    set(next);
-    onchange(next);
-  });
-  return {
-    button,
-    set,
-    node: word ? h("span", { class: "sws-line" }, [button, word]) : button,
-  };
-}
-
 function toggle(field, label, words = true) {
   const control = switchControl(
     Boolean(savedValue(field)),
@@ -635,7 +581,7 @@ function listenMoney(context) {
 // person is typing in a field right now.
 function renderMoney() {
   if (state.group !== "general" || !state.right) return;
-  if (focusInside()) return;
+  if (focusInside(state.container)) return;
   renderGroup(state.right, "general");
 }
 
@@ -663,7 +609,7 @@ async function refreshMoney() {
     state.priceLoaded = false;
     await loadPriceList();
   }
-  if (state.group === "general" && state.right && !focusInside()) {
+  if (state.group === "general" && state.right && !focusInside(state.container)) {
     renderGroup(state.right, "general");
   }
 }
@@ -677,7 +623,7 @@ async function reloadMoney() {
     state.priceLoaded = false;
     await loadPriceList();
   }
-  if (state.group === "general" && state.right && !focusInside()) {
+  if (state.group === "general" && state.right && !focusInside(state.container)) {
     renderGroup(state.right, "general");
   }
 }

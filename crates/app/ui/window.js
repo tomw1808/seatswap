@@ -13,6 +13,7 @@ import {
   invoke,
   isObject,
   listen,
+  message,
 } from "./common.js";
 import { currentFixture, ensureFixture } from "./fixture.js";
 
@@ -161,10 +162,6 @@ async function loadArea(id) {
     );
   }
   return modules.get(id);
-}
-
-function message(text, className) {
-  return h("p", { class: className ? `area-message ${className}` : "area-message" }, text);
 }
 
 // The snapshot's error, in the pop-up's banner above the area. The host sits
