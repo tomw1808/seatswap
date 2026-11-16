@@ -96,7 +96,7 @@ mod limit_kind {
     }
 }
 
-/// The seven kinds of history line, each with its own file per month.
+/// The eight kinds of history line, each with its own file per month.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Kind {
     Samples,
@@ -106,6 +106,7 @@ pub enum Kind {
     Sessions,
     Up,
     Projects,
+    Ollama,
 }
 
 impl Kind {
@@ -118,6 +119,7 @@ impl Kind {
             Kind::Sessions => "sessions",
             Kind::Up => "up",
             Kind::Projects => "projects",
+            Kind::Ollama => "ollama",
         }
     }
 }
@@ -487,6 +489,41 @@ impl Record for UpRecord {
 
     fn at(&self) -> DateTime<Utc> {
         self.t
+    }
+}
+
+/// One hour of Ollama's own usage, made from one bucket of `/api/usage?range=24h`.
+///
+/// A running hour's bucket only grows: a later answer for the same hour has no
+/// count ([`requests`](Self::requests), [`input`](Self::input),
+/// [`cached_input`](Self::cached_input), [`output`](Self::output),
+/// [`usd`](Self::usd)) smaller than the hour's last line and at least one
+/// larger. A line is written only when that holds, so an older or overlapping
+/// answer with smaller numbers never replaces a newer one. Readers take the
+/// **largest line per hour across hosts** (or the last line per hour in file
+/// order within one host): that is the newest answer's numbers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OllamaHourRecord {
+    /// The bucket's `from`; a bucket always runs exactly one hour.
+    pub hour: DateTime<Utc>,
+    pub requests: u64,
+    pub input: u64,
+    pub cached_input: u64,
+    pub output: u64,
+    pub usd: f64,
+}
+
+impl Record for OllamaHourRecord {
+    const KIND: Kind = Kind::Ollama;
+
+    fn at(&self) -> DateTime<Utc> {
+        self.hour
+    }
+
+    /// Ollama's own use is no Claude account's.
+    fn is_claude(&self) -> bool {
+        false
     }
 }
 

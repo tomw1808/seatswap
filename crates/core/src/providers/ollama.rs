@@ -1,13 +1,14 @@
 //! The Ollama reader (spec §7.1): the local server's balance and its usage over
-//! the last 24 h into a [`ProviderReading`]. A new plan is a monthly dollar
-//! allowance, an older one keeps a session and a weekly percent. Nothing of
-//! Ollama is ever written and no request generates text.
+//! the last 24 h into a [`ProviderReading`], hourly buckets included. A new plan
+//! is a monthly dollar allowance, an older one keeps a session and a weekly
+//! percent. Nothing of Ollama is written here and no request generates text; the
+//! app may write the buckets this reader returns to the history.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use serde_json::{Map, Value};
 
 use crate::api::{mark_highest_active, Api, ApiError, Limit, LimitKind, Severity, Usage};
-use crate::history::AccountRef;
+use crate::history::{AccountRef, OllamaHourRecord};
 
 use super::{Credits, ProviderError, ProviderReading, OLLAMA_ORG};
 
@@ -16,7 +17,13 @@ use super::{Credits, ProviderError, ProviderReading, OLLAMA_ORG};
 /// The configured base URL is checked first: a URL the settings refuse never
 /// reaches the server. The balance is what the card needs: a failed or
 /// incomplete usage answer is recorded in [`ProviderReading::spend_24h`] as an
-/// `Err` with its reason, and the reading is still `Ok`.
+/// `Err` with its reason, and the reading is still `Ok`. A usage call that
+/// itself failed leaves [`ProviderReading::hours`] `None`: there is no answer
+/// to read buckets from, and the card's spend error already shows it. The same
+/// answer's `buckets` become [`ProviderReading::hours`] one record per hour; an
+/// answer whose buckets cannot be read (a bucket not on a whole hour, not
+/// exactly one hour long, or carrying no whole number) is an `Err` whose text
+/// names the bucket, never a skipped hour and never a 0.
 pub fn read(base_url: &str, api: &Api) -> Result<ProviderReading, ProviderError> {
     crate::store::validate_ollama_url(base_url)
         .map_err(|error| ProviderError::Setting(error.to_string()))?;
@@ -35,16 +42,22 @@ pub fn read(base_url: &str, api: &Api) -> Result<ProviderReading, ProviderError>
         other => ProviderError::Api(other),
     })?;
     let (usage, credits) = balance_reading(&balance)?;
-    let spend_24h = match api.ollama_usage_24h(base_url) {
-        Ok(answer) => match answer
-            .get("totals")
-            .and_then(|totals| totals.get("usage_usd"))
-            .and_then(amount)
-        {
-            Some(value) => Ok(value),
-            None => Err("the usage answer has no number at totals.usage_usd".to_string()),
-        },
-        Err(error) => Err(error.to_string()),
+    let usage_answer = api.ollama_usage_24h(base_url);
+    let (spend_24h, hours) = match &usage_answer {
+        Ok(answer) => {
+            let spend = match answer
+                .get("totals")
+                .and_then(|totals| totals.get("usage_usd"))
+                .and_then(amount)
+            {
+                Some(value) => Ok(value),
+                None => Err("the usage answer has no number at totals.usage_usd".to_string()),
+            };
+            let hours =
+                hour_records(answer).map_err(|reason| format!("Ollama's usage answer: {reason}"));
+            (Some(spend), Some(hours))
+        }
+        Err(error) => (Some(Err(error.to_string())), None),
     };
     Ok(ProviderReading {
         account: AccountRef {
@@ -54,8 +67,102 @@ pub fn read(base_url: &str, api: &Api) -> Result<ProviderReading, ProviderError>
         plan: None,
         usage,
         credits,
-        spend_24h: Some(spend_24h),
+        spend_24h,
+        hours,
     })
+}
+
+/// The usage answer's `buckets` as one record per hour, in the answer's order.
+/// One bucket is one hour; anything else is an error naming the bucket.
+fn hour_records(answer: &Value) -> Result<Vec<OllamaHourRecord>, String> {
+    let buckets = match answer.get("buckets") {
+        Some(Value::Array(buckets)) => buckets,
+        None => return Err("the usage answer has no buckets".to_string()),
+        Some(_) => return Err("the usage answer's buckets is not an array".to_string()),
+    };
+    buckets
+        .iter()
+        .enumerate()
+        .map(|(index, bucket)| hour_record(bucket, index))
+        .collect()
+}
+
+fn hour_record(bucket: &Value, index: usize) -> Result<OllamaHourRecord, String> {
+    let object = bucket
+        .as_object()
+        .ok_or_else(|| format!("the usage answer's buckets[{index}] is not an object"))?;
+    let hour = bucket_time(object.get("from"), "from", index)?;
+    if hour.minute() != 0 || hour.second() != 0 || hour.nanosecond() != 0 {
+        return Err(format!(
+            "the usage answer's buckets[{index}] starts at {}, not on a whole hour",
+            hour.to_rfc3339()
+        ));
+    }
+    let until = bucket_time(object.get("until"), "until", index)?;
+    let span = until - hour;
+    if span != chrono::Duration::hours(1) {
+        return Err(format!(
+            "the usage answer's buckets[{index}] runs from {} to {}, not exactly one hour",
+            hour.to_rfc3339(),
+            until.to_rfc3339()
+        ));
+    }
+    Ok(OllamaHourRecord {
+        hour,
+        requests: whole_number(object, "request_count", index)?,
+        input: whole_number(object, "input_tokens", index)?,
+        cached_input: whole_number(object, "cached_input_tokens", index)?,
+        output: whole_number(object, "output_tokens", index)?,
+        usd: bucket_usd(object.get("usage_usd"), index)?,
+    })
+}
+
+/// One of a bucket's bounds as an RFC 3339 time.
+fn bucket_time(value: Option<&Value>, field: &str, index: usize) -> Result<DateTime<Utc>, String> {
+    match value {
+        None | Some(Value::Null) => Err(format!(
+            "the usage answer's buckets[{index}].{field} is missing"
+        )),
+        Some(Value::String(text)) => DateTime::parse_from_rfc3339(text)
+            .map(|time| time.with_timezone(&Utc))
+            .map_err(|error| {
+                format!(
+                    "the usage answer's buckets[{index}].{field} is not an RFC 3339 time: {error}"
+                )
+            }),
+        Some(_) => Err(format!(
+            "the usage answer's buckets[{index}].{field} is not a string"
+        )),
+    }
+}
+
+/// A whole, non-negative count, or an error naming the bucket's field.
+fn whole_number(object: &Map<String, Value>, field: &str, index: usize) -> Result<u64, String> {
+    match object.get(field) {
+        None | Some(Value::Null) => Err(format!(
+            "the usage answer's buckets[{index}].{field} is missing"
+        )),
+        Some(value) => value.as_u64().ok_or_else(|| {
+            format!(
+                "the usage answer's buckets[{index}].{field} is not a whole non-negative number"
+            )
+        }),
+    }
+}
+
+/// A bucket's dollars: a finite number of at least 0, or an error naming it.
+fn bucket_usd(value: Option<&Value>, index: usize) -> Result<f64, String> {
+    match value {
+        None | Some(Value::Null) => Err(format!(
+            "the usage answer's buckets[{index}].usage_usd is missing"
+        )),
+        Some(value) => match amount(value) {
+            Some(usd) if usd.is_finite() && usd >= 0.0 => Ok(usd),
+            _ => Err(format!(
+                "the usage answer's buckets[{index}].usage_usd is not a finite number of at least 0"
+            )),
+        },
+    }
 }
 
 /// A JSON number, whole or fractional; anything else is `None`.
@@ -278,7 +385,10 @@ mod tests {
     use std::thread::{self, JoinHandle};
 
     use serde_json::json;
+    use tempfile::tempdir;
     use tiny_http::{Response, Server, StatusCode};
+
+    use crate::history::{HistoryDir, Recorder};
 
     const NEW_PLAN_BALANCE: &str = r#"{
       "included": {
@@ -481,6 +591,191 @@ mod tests {
                 org: "ollama".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn buckets_become_hour_records() {
+        let (base, receiver, handle) =
+            start_ollama(Reply::ok(NEW_PLAN_BALANCE), Reply::ok(USAGE_ANSWER));
+        let reading = read(&base, &Api::new()).unwrap();
+        let _ = captured(&receiver, handle);
+
+        assert_eq!(
+            reading.hours,
+            Some(Ok(vec![OllamaHourRecord {
+                hour: at("2026-11-13T00:00:00Z"),
+                requests: 17,
+                input: 210000,
+                cached_input: 160000,
+                output: 26000,
+                usd: 0.12,
+            }]))
+        );
+    }
+
+    /// A bucket that runs longer than one hour is not an hour's record: the
+    /// reading keeps its balance and spend, and the error names the bucket.
+    #[test]
+    fn a_bucket_longer_than_an_hour_is_an_error_naming_it() {
+        let body = r#"{
+          "totals": {"request_count": 17, "usage_usd": 0.12},
+          "buckets": [
+            {"from": "2026-11-13T00:00:00Z", "until": "2026-11-13T02:00:00Z",
+             "request_count": 17, "usage_usd": 0.12, "input_tokens": 210000,
+             "cached_input_tokens": 160000, "output_tokens": 26000}
+          ]
+        }"#;
+        let (base, receiver, handle) = start_ollama(Reply::ok(NEW_PLAN_BALANCE), Reply::ok(body));
+        let reading = read(&base, &Api::new()).unwrap();
+        let _ = captured(&receiver, handle);
+
+        assert_eq!(reading.spend_24h, Some(Ok(0.12)));
+        assert!(reading.credits.is_some(), "the balance is still read");
+        match reading.hours {
+            Some(Err(text)) => {
+                assert!(text.contains("buckets[0]"), "{text}");
+                assert!(text.contains("not exactly one hour"), "{text}");
+            }
+            other => panic!("expected an error naming the bucket, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failed_usage_call_reads_no_hours() {
+        let (base, receiver, handle) = start_ollama(
+            Reply::ok(NEW_PLAN_BALANCE),
+            Reply::status(500, "internal error"),
+        );
+        let reading = read(&base, &Api::new()).unwrap();
+        let _ = captured(&receiver, handle);
+
+        assert_eq!(reading.spend_24h, Some(Err("server error 500".to_string())));
+        assert_eq!(
+            reading.hours, None,
+            "there is no answer to read buckets from"
+        );
+    }
+
+    #[test]
+    fn a_usage_answer_without_buckets_is_an_error() {
+        let (base, receiver, handle) = start_ollama(
+            Reply::ok(NEW_PLAN_BALANCE),
+            Reply::ok(r#"{"totals":{"usage_usd":0.12}}"#),
+        );
+        let reading = read(&base, &Api::new()).unwrap();
+        let _ = captured(&receiver, handle);
+
+        assert_eq!(reading.spend_24h, Some(Ok(0.12)));
+        match reading.hours {
+            Some(Err(text)) => {
+                assert!(text.contains("Ollama's usage answer"), "{text}");
+                assert!(text.contains("no buckets"), "{text}");
+            }
+            other => panic!("expected an error naming the buckets, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn buckets_that_are_not_an_array_are_an_error() {
+        let (base, receiver, handle) = start_ollama(
+            Reply::ok(NEW_PLAN_BALANCE),
+            Reply::ok(r#"{"totals":{"usage_usd":0.12},"buckets":{}}"#),
+        );
+        let reading = read(&base, &Api::new()).unwrap();
+        let _ = captured(&receiver, handle);
+
+        match reading.hours {
+            Some(Err(text)) => {
+                assert!(text.contains("Ollama's usage answer"), "{text}");
+                assert!(text.contains("not an array"), "{text}");
+            }
+            other => panic!("expected an error naming the buckets, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_buckets_is_an_empty_list_and_writes_nothing() {
+        let (base, receiver, handle) = start_ollama(
+            Reply::ok(NEW_PLAN_BALANCE),
+            Reply::ok(r#"{"totals":{"usage_usd":0.12},"buckets":[]}"#),
+        );
+        let reading = read(&base, &Api::new()).unwrap();
+        let _ = captured(&receiver, handle);
+
+        assert_eq!(reading.hours, Some(Ok(Vec::new())));
+        let dir = tempdir().expect("tempdir");
+        let mut recorder = Recorder::new(HistoryDir::at(dir.path(), "atlas"));
+        assert_eq!(recorder.ollama_hours(&[]).unwrap(), 0);
+        assert!(!dir.path().join("atlas/ollama-2026-11.jsonl").exists());
+    }
+
+    #[test]
+    fn a_fractional_count_is_an_error_naming_the_bucket() {
+        let body = r#"{
+          "totals": {"usage_usd": 0.12},
+          "buckets": [
+            {"from": "2026-11-13T00:00:00Z", "until": "2026-11-13T01:00:00Z",
+             "request_count": 17.5, "usage_usd": 0.12, "input_tokens": 210000,
+             "cached_input_tokens": 160000, "output_tokens": 26000}
+          ]
+        }"#;
+        let (base, receiver, handle) = start_ollama(Reply::ok(NEW_PLAN_BALANCE), Reply::ok(body));
+        let reading = read(&base, &Api::new()).unwrap();
+        let _ = captured(&receiver, handle);
+
+        match reading.hours {
+            Some(Err(text)) => {
+                assert!(text.contains("buckets[0]"), "{text}");
+                assert!(text.contains("request_count"), "{text}");
+            }
+            other => panic!("expected an error naming the bucket, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_negative_usage_usd_is_an_error_naming_the_bucket() {
+        let body = r#"{
+          "totals": {"usage_usd": 0.12},
+          "buckets": [
+            {"from": "2026-11-13T00:00:00Z", "until": "2026-11-13T01:00:00Z",
+             "request_count": 17, "usage_usd": -0.01, "input_tokens": 210000,
+             "cached_input_tokens": 160000, "output_tokens": 26000}
+          ]
+        }"#;
+        let (base, receiver, handle) = start_ollama(Reply::ok(NEW_PLAN_BALANCE), Reply::ok(body));
+        let reading = read(&base, &Api::new()).unwrap();
+        let _ = captured(&receiver, handle);
+
+        match reading.hours {
+            Some(Err(text)) => {
+                assert!(text.contains("buckets[0]"), "{text}");
+                assert!(text.contains("usage_usd"), "{text}");
+            }
+            other => panic!("expected an error naming the bucket, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bucket_not_on_a_whole_hour_is_an_error_naming_it() {
+        let body = r#"{
+          "totals": {"usage_usd": 0.12},
+          "buckets": [
+            {"from": "2026-11-13T00:30:00Z", "until": "2026-11-13T01:30:00Z",
+             "request_count": 17, "usage_usd": 0.12, "input_tokens": 210000,
+             "cached_input_tokens": 160000, "output_tokens": 26000}
+          ]
+        }"#;
+        let (base, receiver, handle) = start_ollama(Reply::ok(NEW_PLAN_BALANCE), Reply::ok(body));
+        let reading = read(&base, &Api::new()).unwrap();
+        let _ = captured(&receiver, handle);
+
+        match reading.hours {
+            Some(Err(text)) => {
+                assert!(text.contains("buckets[0]"), "{text}");
+                assert!(text.contains("not on a whole hour"), "{text}");
+            }
+            other => panic!("expected an error naming the bucket, got {other:?}"),
+        }
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! answers into samples, finished windows and blocked events, plus the
 //! heartbeat, token and session lines.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 
@@ -13,8 +13,8 @@ use crate::api::{LimitKind, Usage};
 use super::read::{month_start, months_of_kind};
 use super::{
     reset_minute, same_reset, AccountRef, Event, EventKind, HistoryDir, HistoryError, Hosts, Kind,
-    LimitSample, Range, Sample, SessionRecord, Source, TokenRecord, UpRecord, WindowRecord,
-    RESET_DROP_POINTS, RESET_JITTER,
+    LimitSample, OllamaHourRecord, Range, Sample, SessionRecord, Source, TokenRecord, UpRecord,
+    WindowRecord, RESET_DROP_POINTS, RESET_JITTER,
 };
 
 /// Turns usage answers into history lines. Per account it keeps the last written
@@ -36,6 +36,14 @@ pub struct Recorder {
     /// The windows (account, limit, reset time) whose small drop was already
     /// named in a warning: one warning per window.
     small_drops: HashSet<(AccountRef, LimitKey, DateTime<Utc>)>,
+    /// The last Ollama line per hour this recorder has read back or written.
+    ollama_hours: HashMap<DateTime<Utc>, OllamaHourRecord>,
+    /// The months of this host's `ollama` lines already read into
+    /// [`ollama_hours`](Self::ollama_hours).
+    ollama_months: HashSet<DateTime<Utc>>,
+    /// The Ollama hours whose answer was older (a smaller count) and already
+    /// named in a warning: one warning per hour.
+    ollama_older: HashSet<DateTime<Utc>>,
 }
 
 /// What one account's readings have shown so far.
@@ -148,6 +156,9 @@ impl Recorder {
             last_up: None,
             warnings: Vec::new(),
             small_drops: HashSet::new(),
+            ollama_hours: HashMap::new(),
+            ollama_months: HashSet::new(),
+            ollama_older: HashSet::new(),
         }
     }
 
@@ -381,6 +392,100 @@ impl Recorder {
 
     pub fn session(&self, record: &SessionRecord) -> Result<(), HistoryError> {
         self.dir.append(record)
+    }
+
+    /// Ollama's hourly buckets into this host's `ollama` month files: one line
+    /// for an hour whose numbers grew, and none for the same answer again or an
+    /// older answer. A line is written only when none of the record's counts
+    /// (`requests`, `input`, `cached_input`, `output`, `usd`) is smaller than
+    /// the hour's remembered line and at least one is larger. A record with any
+    /// smaller count is an older answer: it is not written, and it is named
+    /// once through [`take_warnings`](Self::take_warnings). Returns how many
+    /// lines it appended.
+    ///
+    /// The first use reads this host's `ollama` lines of the months the buckets
+    /// fall in and remembers the last line per hour, so an old bucket already
+    /// written is not written again. Each month file is written on its own and
+    /// its records are remembered as soon as it is written, so a later month
+    /// that fails is retried without writing an earlier month's lines again.
+    pub fn ollama_hours(&mut self, records: &[OllamaHourRecord]) -> Result<usize, HistoryError> {
+        self.load_ollama_months(records)?;
+        let mut latest: BTreeMap<DateTime<Utc>, &OllamaHourRecord> = BTreeMap::new();
+        for record in records {
+            let later = match latest.get(&record.hour) {
+                Some(before) => grows(before, record),
+                None => true,
+            };
+            if later {
+                latest.insert(record.hour, record);
+            }
+        }
+        let mut by_month: BTreeMap<(i32, u32), Vec<OllamaHourRecord>> = BTreeMap::new();
+        for record in latest.values().copied() {
+            let Some(remembered) = self.ollama_hours.get(&record.hour) else {
+                by_month
+                    .entry((record.hour.year(), record.hour.month()))
+                    .or_default()
+                    .push((*record).clone());
+                continue;
+            };
+            if grows(remembered, record) {
+                by_month
+                    .entry((record.hour.year(), record.hour.month()))
+                    .or_default()
+                    .push((*record).clone());
+            } else if is_older(remembered, record) && self.ollama_older.insert(record.hour) {
+                self.warnings.push(format!(
+                    "Ollama's hour {} came back with smaller numbers than the hour's last line; the newer line is kept",
+                    record.hour.to_rfc3339()
+                ));
+            }
+        }
+        let mut appended = 0;
+        for records in by_month.into_values() {
+            self.dir.append_many(&records)?;
+            for record in &records {
+                self.ollama_hours.insert(record.hour, record.clone());
+            }
+            appended += records.len();
+        }
+        Ok(appended)
+    }
+
+    /// Read this host's `ollama` lines of the months `records` fall in that no
+    /// earlier call read, keeping the last line per hour. A month without a
+    /// file yet is remembered too, so its file is read only once.
+    fn load_ollama_months(&mut self, records: &[OllamaHourRecord]) -> Result<(), HistoryError> {
+        let mut asked = Vec::new();
+        for record in records {
+            let Some(month) = month_start(record.hour.year(), record.hour.month()) else {
+                continue;
+            };
+            if !asked.contains(&month) {
+                asked.push(month);
+            }
+        }
+        if asked.is_empty() {
+            return Ok(());
+        }
+        let host_dir = self.dir.root().join(self.dir.host());
+        for range in months_of_kind(&host_dir, Kind::Ollama)? {
+            if !asked.contains(&range.from) || self.ollama_months.contains(&range.from) {
+                continue;
+            }
+            let read = self
+                .dir
+                .read::<OllamaHourRecord>(&range, &Hosts::One(self.dir.host().to_string()))?;
+            self.warnings.extend(read.warnings);
+            for hosted in read.records {
+                self.ollama_hours.insert(hosted.record.hour, hosted.record);
+            }
+            self.ollama_months.insert(range.from);
+        }
+        for month in asked {
+            self.ollama_months.insert(month);
+        }
+        Ok(())
     }
 
     /// On first use of an account: the account's lines on this host, walked
@@ -640,6 +745,27 @@ fn reset_window(prev: &Sample, next: &Sample, plan: Option<&str>) -> Option<Wind
 /// Whether `current` is at least [`RESET_DROP_POINTS`] below `previous`.
 fn dropped(previous: &LimitSample, current: &LimitSample) -> bool {
     previous.p - current.p >= RESET_DROP_POINTS
+}
+
+/// Whether `next` is a later answer for its hour: no count smaller than the
+/// hour's remembered line and at least one larger.
+fn grows(previous: &OllamaHourRecord, next: &OllamaHourRecord) -> bool {
+    !is_older(previous, next)
+        && (next.requests > previous.requests
+            || next.input > previous.input
+            || next.cached_input > previous.cached_input
+            || next.output > previous.output
+            || next.usd > previous.usd)
+}
+
+/// Whether any count of `next` is smaller than the hour's remembered line:
+/// an older answer, which must not replace a newer one.
+fn is_older(previous: &OllamaHourRecord, next: &OllamaHourRecord) -> bool {
+    next.requests < previous.requests
+        || next.input < previous.input
+        || next.cached_input < previous.cached_input
+        || next.output < previous.output
+        || next.usd < previous.usd
 }
 
 fn find_limit<'a>(sample: &'a Sample, limit: &LimitSample) -> Option<&'a LimitSample> {
@@ -1228,6 +1354,161 @@ mod tests {
         recorder.up(utc("2026-11-14T10:05:00Z")).unwrap();
 
         assert_eq!(line_count(&dir.path().join("atlas/up-2026-11.jsonl")), 2);
+    }
+
+    fn an_ollama_hour(hour: &str, requests: u64, usd: f64) -> OllamaHourRecord {
+        OllamaHourRecord {
+            hour: utc(hour),
+            requests,
+            input: requests * 10,
+            cached_input: requests * 6,
+            output: requests * 2,
+            usd,
+        }
+    }
+
+    #[test]
+    fn a_running_hour_is_replaced_by_its_later_bucket() {
+        let dir = tempdir().unwrap();
+        let mut recorder = Recorder::new(history(dir.path()));
+        let first = an_ollama_hour("2026-11-14T09:00:00Z", 3, 0.02);
+        let later = an_ollama_hour("2026-11-14T09:00:00Z", 9, 0.06);
+
+        assert_eq!(
+            recorder.ollama_hours(std::slice::from_ref(&first)).unwrap(),
+            1
+        );
+        assert_eq!(
+            recorder.ollama_hours(std::slice::from_ref(&later)).unwrap(),
+            1
+        );
+
+        let read = history(dir.path())
+            .read::<OllamaHourRecord>(&Range::ALL, &Hosts::All)
+            .unwrap();
+        assert_eq!(read.records.len(), 2, "the hour's first and later line");
+        assert_eq!(read.records[0].record, first);
+        assert_eq!(
+            read.records[1].record, later,
+            "the last line in file order is the later bucket"
+        );
+
+        // A later answer for the hour adds nothing.
+        assert_eq!(
+            recorder.ollama_hours(std::slice::from_ref(&later)).unwrap(),
+            0
+        );
+        // A recorder that starts again reads the later line back as the hour's.
+        let mut restarted = Recorder::new(history(dir.path()));
+        assert_eq!(restarted.ollama_hours(&[later]).unwrap(), 0);
+    }
+
+    /// PROOF (review O-1): the plan says an hour is replaced only by a later
+    /// answer; an answer with smaller numbers for a written hour (late or from
+    /// a stale poll) must not become the hour's last line.
+    #[test]
+    fn proof_a_smaller_bucket_does_not_replace_a_bigger_one() {
+        let dir = tempdir().unwrap();
+        let mut recorder = Recorder::new(history(dir.path()));
+        let big = an_ollama_hour("2026-11-14T09:00:00Z", 9, 0.06);
+        let small = an_ollama_hour("2026-11-14T09:00:00Z", 3, 0.02);
+        assert_eq!(
+            recorder.ollama_hours(std::slice::from_ref(&big)).unwrap(),
+            1
+        );
+        assert_eq!(
+            recorder.ollama_hours(std::slice::from_ref(&small)).unwrap(),
+            0,
+            "the smaller bucket was appended after the bigger one"
+        );
+    }
+
+    #[test]
+    fn an_older_bucket_is_named_in_one_warning() {
+        let dir = tempdir().unwrap();
+        let mut recorder = Recorder::new(history(dir.path()));
+        let big = an_ollama_hour("2026-11-14T09:00:00Z", 9, 0.06);
+        let small = an_ollama_hour("2026-11-14T09:00:00Z", 3, 0.02);
+
+        recorder.ollama_hours(&[big]).unwrap();
+        assert!(
+            recorder.take_warnings().is_empty(),
+            "the first line of an hour warns about nothing"
+        );
+
+        recorder.ollama_hours(std::slice::from_ref(&small)).unwrap();
+        let warnings = recorder.take_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("2026-11-14T09:00:00"),
+            "the warning names the hour: {warnings:?}"
+        );
+
+        recorder.ollama_hours(&[small]).unwrap();
+        assert!(
+            recorder.take_warnings().is_empty(),
+            "the same older answer is named once"
+        );
+    }
+
+    #[test]
+    fn a_failed_month_file_leaves_the_written_month_remembered() {
+        let dir = tempdir().unwrap();
+        let mut recorder = Recorder::new(history(dir.path()));
+        let november = an_ollama_hour("2026-11-14T09:00:00Z", 3, 0.02);
+        let december = an_ollama_hour("2026-12-01T10:00:00Z", 4, 0.03);
+        let november_file = dir.path().join("atlas/ollama-2026-11.jsonl");
+        let december_file = dir.path().join("atlas/ollama-2026-12.jsonl");
+        // A folder where December's file belongs makes that one write fail.
+        fs::create_dir_all(&december_file).unwrap();
+
+        recorder
+            .ollama_hours(&[november.clone(), december.clone()])
+            .expect_err("the December file cannot be written");
+        assert_eq!(line_count(&november_file), 1, "November's line was written");
+
+        fs::remove_dir(&december_file).unwrap();
+        assert_eq!(
+            recorder.ollama_hours(&[november, december]).unwrap(),
+            1,
+            "only December is still to write"
+        );
+        assert_eq!(
+            line_count(&november_file),
+            1,
+            "November's line was written a second time"
+        );
+        assert_eq!(line_count(&december_file), 1);
+    }
+
+    #[test]
+    fn an_old_bucket_already_written_is_not_duplicated() {
+        let dir = tempdir().unwrap();
+        let mut recorder = Recorder::new(history(dir.path()));
+        let bucket = an_ollama_hour("2026-11-13T22:00:00Z", 17, 0.12);
+
+        assert_eq!(
+            recorder
+                .ollama_hours(std::slice::from_ref(&bucket))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            recorder
+                .ollama_hours(std::slice::from_ref(&bucket))
+                .unwrap(),
+            0,
+            "the same 24 h answer came again"
+        );
+
+        // A new recorder reads the line from this host's month file: still no
+        // second line.
+        let mut restarted = Recorder::new(history(dir.path()));
+        assert_eq!(restarted.ollama_hours(&[bucket]).unwrap(), 0);
+        assert_eq!(
+            line_count(&dir.path().join("atlas/ollama-2026-11.jsonl")),
+            1
+        );
     }
 
     #[test]

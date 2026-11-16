@@ -444,6 +444,7 @@ pub(crate) fn spawn(
         Api::new(),
         ui.clone(),
         Arc::clone(&reported_errors),
+        Arc::clone(&printed_warnings),
     )?);
     let providers_client = providers.as_ref().map(ProvidersHandle::client);
 

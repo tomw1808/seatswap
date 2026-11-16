@@ -9,7 +9,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -24,7 +24,7 @@ use seatswap_core::store::{self, Settings};
 
 use crate::ops;
 
-use super::worker::UiEvent;
+use super::worker::{PrintedWarnings, UiEvent};
 use super::ReportedErrors;
 
 /// The provider cards are polled every five minutes (step-d.md Task 4).
@@ -200,6 +200,7 @@ pub(crate) fn spawn(
     api: Api,
     ui: Sender<UiEvent>,
     reported_errors: Arc<ReportedErrors>,
+    printed_warnings: Arc<Mutex<PrintedWarnings>>,
 ) -> Result<ProvidersHandle, String> {
     let (commands, received) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
@@ -215,6 +216,7 @@ pub(crate) fn spawn(
                 thread_stop,
                 received,
                 reported_errors,
+                printed_warnings,
             )
         })
         .map_err(|error| format!("cannot start the provider thread: {error}"))?;
@@ -225,6 +227,7 @@ pub(crate) fn spawn(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     app: AppPaths,
     history: Result<HistoryDir, String>,
@@ -233,6 +236,7 @@ fn run(
     stop: Arc<AtomicBool>,
     commands: Receiver<ProvidersCommand>,
     reported_errors: Arc<ReportedErrors>,
+    printed_warnings: Arc<Mutex<PrintedWarnings>>,
 ) {
     let app_for_lookup = app.clone();
     let mut runtime = ProvidersRuntime::new(
@@ -246,6 +250,7 @@ fn run(
                 .map_err(|error| error.to_string())
         }),
         Box::new(move |text: &str| reported_errors.report(text)),
+        printed_warnings,
     );
     // The first round is at the start, before the first five minutes passed.
     let mut next = Instant::now();
@@ -301,6 +306,10 @@ pub(crate) struct ProvidersRuntime {
     /// The way a history write failure is reported. The app passes the one
     /// reporter, which prints and notifies once per text for the whole run.
     report: ReportError,
+    /// The app's one list of printed history warnings, shared with the engine:
+    /// the recorder's warnings (a torn line, an Ollama hour that came back
+    /// smaller) are printed through it once per text.
+    printed_warnings: Arc<Mutex<PrintedWarnings>>,
     /// The settings of the last round or save; the save compares against it.
     settings: Option<Settings>,
     codex: Option<ProviderView>,
@@ -319,6 +328,7 @@ impl ProvidersRuntime {
         codex_paths: CodexPathsLookup,
         settings_lookup: SettingsLookup,
         report: ReportError,
+        printed_warnings: Arc<Mutex<PrintedWarnings>>,
     ) -> ProvidersRuntime {
         ProvidersRuntime {
             api,
@@ -327,6 +337,7 @@ impl ProvidersRuntime {
             settings_lookup,
             recorder: history.map(Recorder::new),
             report,
+            printed_warnings,
             settings: None,
             codex: None,
             ollama: None,
@@ -488,30 +499,55 @@ impl ProvidersRuntime {
         provider.view(&self.codex, &self.ollama)
     }
 
-    /// Record a reading that carries a usage; one without a usage records
-    /// nothing. A recording error is reported the one way the app reports a
-    /// history write, and never changes the card. A history that could not be
-    /// opened at start is already in the snapshot's error and was notified
-    /// there, so this thread records nothing and reports nothing for it.
+    /// Record a reading that carries a usage and Ollama's hourly buckets; one
+    /// without a usage records no sample. A recording error is reported the one
+    /// way the app reports a history write, and never changes the card. An answer
+    /// whose buckets cannot be read is reported too, without failing the card; a
+    /// usage call that itself failed has no buckets (`hours` is `None`) and is
+    /// only the card's spend error, as before O-1. A history that could not be
+    /// opened at start is already in the snapshot's error and was notified there,
+    /// so this thread records nothing and reports nothing for it.
     fn record(&mut self, reading: &ProviderReading, now: DateTime<Utc>) {
-        let Some(usage) = &reading.usage else {
-            return;
-        };
-        let Ok(recorder) = &mut self.recorder else {
-            return;
-        };
-        let failure = recorder
-            .reading(
-                &reading.account,
-                reading.plan.as_deref(),
-                usage,
-                now,
-                Source::Poll,
-            )
-            .err()
-            .map(|error| ops::history_unwritable(&error));
-        if let Some(text) = failure {
-            self.report_error(&text);
+        let mut failures = Vec::new();
+        if let Some(usage) = &reading.usage {
+            if let Ok(recorder) = &mut self.recorder {
+                if let Err(error) = recorder.reading(
+                    &reading.account,
+                    reading.plan.as_deref(),
+                    usage,
+                    now,
+                    Source::Poll,
+                ) {
+                    failures.push(ops::history_unwritable(&error));
+                }
+            }
+        }
+        if let Some(hours) = &reading.hours {
+            match hours {
+                Ok(hours) => {
+                    if let Ok(recorder) = &mut self.recorder {
+                        if let Err(error) = recorder.ollama_hours(hours) {
+                            failures.push(ops::history_unwritable(&error));
+                        }
+                    }
+                }
+                Err(reason) => failures.push(reason.clone()),
+            }
+        }
+        for text in &failures {
+            self.report_error(text);
+        }
+        self.print_history_warnings();
+    }
+
+    /// The recorder's warnings (spec §1.2), printed the one way the engine
+    /// prints its own: once per text for the whole run. Core never prints.
+    fn print_history_warnings(&mut self) {
+        if let Ok(recorder) = &mut self.recorder {
+            let warnings = recorder.take_warnings();
+            if !warnings.is_empty() {
+                super::lock(&self.printed_warnings).print(&warnings);
+            }
         }
     }
 
@@ -581,7 +617,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use seatswap_core::history::{Hosts, Range, Sample};
+    use seatswap_core::history::{Hosts, OllamaHourRecord, Range, Sample};
 
     use crate::gui::ReportedErrors;
 
@@ -598,6 +634,7 @@ mod tests {
     const BALANCE_ZERO: &str = r#"{"included":{"balance_usd":0,"allowance_usd":0}}"#;
     const BALANCE: &str = r#"{"included":{"balance_usd":212.4,"allowance_usd":300,"period":{"until":"2026-12-03T00:00:00Z"}},"purchased":{"balance_usd":0}}"#;
     const USAGE_ANSWER: &str = r#"{"totals":{"request_count":412,"usage_usd":3.18,"input_tokens":5120000,"cached_input_tokens":3900000,"output_tokens":640000}}"#;
+    const USAGE_WITH_HOURS: &str = r#"{"totals":{"request_count":17,"usage_usd":0.12,"input_tokens":210000,"cached_input_tokens":160000,"output_tokens":26000},"buckets":[{"from":"2026-11-14T08:00:00Z","until":"2026-11-14T09:00:00Z","request_count":17,"usage_usd":0.12,"input_tokens":210000,"cached_input_tokens":160000,"output_tokens":26000}]}"#;
 
     fn utc(text: &str) -> DateTime<Utc> {
         text.parse().expect("a test date")
@@ -662,6 +699,7 @@ mod tests {
             codex_paths,
             settings_lookup,
             report,
+            Arc::new(Mutex::new(PrintedWarnings::new())),
         )
     }
 
@@ -1107,6 +1145,143 @@ mod tests {
         );
     }
 
+    /// A reading's hourly buckets go into the history once; the same 24 h
+    /// answer polled again appends nothing.
+    #[test]
+    fn a_reading_writes_the_ollama_hours_once() {
+        let dir = tempdir().expect("tempdir");
+        let server = Fake::start(vec![
+            (200, BALANCE.to_string()),
+            (200, USAGE_WITH_HOURS.to_string()),
+            (200, BALANCE.to_string()),
+            (200, USAGE_WITH_HOURS.to_string()),
+        ]);
+        let mut runtime = test_runtime(
+            dir.path(),
+            codex_api(&server.base),
+            &dir.path().join("codex"),
+        );
+
+        let view =
+            only_view(runtime.poll_round(&ollama_on(&server.base), utc("2026-11-14T09:00:00Z")));
+        assert_eq!(view.spend_24h, Some(0.12));
+        runtime.poll_round(&ollama_on(&server.base), utc("2026-11-14T09:05:00Z"));
+        let _ = server.finish();
+
+        let read = history(dir.path())
+            .read::<OllamaHourRecord>(&Range::ALL, &Hosts::All)
+            .expect("the Ollama hours");
+        assert_eq!(
+            read.records.len(),
+            1,
+            "the same bucket was written a second time"
+        );
+        assert_eq!(
+            read.records[0].record,
+            OllamaHourRecord {
+                hour: utc("2026-11-14T08:00:00Z"),
+                requests: 17,
+                input: 210000,
+                cached_input: 160000,
+                output: 26000,
+                usd: 0.12,
+            }
+        );
+    }
+
+    /// A bucket that cannot be read is reported, not dropped, and the card
+    /// itself stays a successful reading with its balance.
+    #[test]
+    fn a_bucket_error_is_reported_without_failing_the_card() {
+        let dir = tempdir().expect("tempdir");
+        let broken = r#"{"totals":{"usage_usd":0.12},"buckets":[{"from":"2026-11-14T08:00:00Z","until":"2026-11-14T10:00:00Z","request_count":17,"usage_usd":0.12,"input_tokens":210000,"cached_input_tokens":160000,"output_tokens":26000}]}"#;
+        let server = Fake::start(vec![(200, BALANCE.to_string()), (200, broken.to_string())]);
+        let (sender, reports) = mpsc::channel();
+        let errors = ReportedErrors::new(Box::new(move |text: &str| {
+            let _ = sender.send(text.to_string());
+        }));
+        let report: ReportError = Box::new(move |text: &str| errors.report(text));
+        let mut runtime = test_runtime_with(
+            dir.path(),
+            codex_api(&server.base),
+            Box::new(|_| Ok(CodexPaths::at(Path::new("unused-codex-home")))),
+            same_settings(),
+            report,
+        );
+
+        let view =
+            only_view(runtime.poll_round(&ollama_on(&server.base), utc("2026-11-14T09:00:00Z")));
+        let _ = server.finish();
+
+        assert_eq!(view.error, None, "the reading itself is Ok");
+        assert!(view.credits.is_some(), "the balance is still the card's");
+        let texts: Vec<String> = reports.try_iter().collect();
+        assert!(
+            texts.iter().any(|text| text.contains("buckets[0]")),
+            "the bucket error was not reported: {texts:?}"
+        );
+    }
+
+    /// PROOF (review O-1, fix 1): the recorder's warnings (an older Ollama answer
+    /// named once per hour) are never taken by this runtime, so they never reach
+    /// the app's printed warnings and the list stays in the recorder.
+    #[test]
+    fn proof_an_older_hour_warning_is_not_left_in_the_recorder() {
+        let dir = tempdir().expect("tempdir");
+        let smaller = USAGE_WITH_HOURS.replace("\"request_count\":17,\"usage_usd\":0.12,\"input_tokens\":210000,\"cached_input_tokens\":160000,\"output_tokens\":26000}]", "\"request_count\":3,\"usage_usd\":0.02,\"input_tokens\":1000,\"cached_input_tokens\":100,\"output_tokens\":200}]");
+        assert_ne!(smaller, USAGE_WITH_HOURS);
+        let server = Fake::start(vec![
+            (200, BALANCE.to_string()),
+            (200, USAGE_WITH_HOURS.to_string()),
+            (200, BALANCE.to_string()),
+            (200, smaller),
+        ]);
+        let mut runtime = test_runtime(
+            dir.path(),
+            codex_api(&server.base),
+            &dir.path().join("codex"),
+        );
+        runtime.poll_round(&ollama_on(&server.base), utc("2026-11-14T09:00:00Z"));
+        runtime.poll_round(&ollama_on(&server.base), utc("2026-11-14T09:05:00Z"));
+        let _ = server.finish();
+        let left = runtime
+            .recorder
+            .as_mut()
+            .expect("a recorder")
+            .take_warnings();
+        assert!(left.is_empty(), "warnings nobody printed: {left:?}");
+        assert_eq!(
+            super::super::lock(&runtime.printed_warnings).len(),
+            1,
+            "the older hour's warning was not printed once"
+        );
+    }
+
+    /// PROOF (review O-1): a failed 24 h usage call raised no notification
+    /// before O-1 (the card showed `spend_24h_error`); it must not now.
+    #[test]
+    fn proof_a_failed_usage_call_raises_no_notification() {
+        let dir = tempdir().expect("tempdir");
+        let server = Fake::start(vec![(200, BALANCE.to_string()), (500, String::new())]);
+        let (sender, reports) = mpsc::channel();
+        let errors = ReportedErrors::new(Box::new(move |text: &str| {
+            let _ = sender.send(text.to_string());
+        }));
+        let report: ReportError = Box::new(move |text: &str| errors.report(text));
+        let mut runtime = test_runtime_with(
+            dir.path(),
+            codex_api(&server.base),
+            Box::new(|_| Ok(CodexPaths::at(Path::new("unused-codex-home")))),
+            same_settings(),
+            report,
+        );
+        let _ =
+            only_view(runtime.poll_round(&ollama_on(&server.base), utc("2026-11-14T09:00:00Z")));
+        let _ = server.finish();
+        let texts: Vec<String> = reports.try_iter().collect();
+        assert!(texts.is_empty(), "a notification was raised: {texts:?}");
+    }
+
     /// A history folder that cannot be written is reported once for the same
     /// text, however many readings fail the same way.
     #[test]
@@ -1130,6 +1305,7 @@ mod tests {
             Box::new(move |_| Ok(CodexPaths::at(&codex_home))),
             same_settings(),
             report,
+            Arc::new(Mutex::new(PrintedWarnings::new())),
         );
 
         runtime.poll_round(&codex_on(), utc("2026-11-14T09:00:00Z"));
@@ -1330,6 +1506,7 @@ mod tests {
             Box::new(move |_| Ok(CodexPaths::at(&folder))),
             same_settings(),
             report,
+            Arc::new(Mutex::new(PrintedWarnings::new())),
         );
 
         let first = only_view(runtime.poll_round(&codex_on(), utc("2026-11-14T09:00:00Z")));

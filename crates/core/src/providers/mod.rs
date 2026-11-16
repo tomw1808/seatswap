@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::api::{ApiError, Usage};
-use crate::history::AccountRef;
+use crate::history::{AccountRef, OllamaHourRecord};
 
 pub mod codex;
 pub mod ollama;
@@ -68,4 +68,8 @@ pub struct ProviderReading {
     /// `None` for Codex, `Some(Err)` when Ollama's usage answer could not be
     /// read (the balance is still in the reading).
     pub spend_24h: Option<Result<f64, String>>,
+    /// Ollama's hourly buckets of the same usage answer: `None` for a provider
+    /// without hourly buckets (Codex), `Some(Err)` when the buckets could not be
+    /// read (the balance and the 24 h spend are still in the reading).
+    pub hours: Option<Result<Vec<OllamaHourRecord>, String>>,
 }

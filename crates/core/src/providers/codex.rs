@@ -67,6 +67,7 @@ pub fn read(paths: &CodexPaths, api: &Api) -> Result<ProviderReading, ProviderEr
         usage: Some(usage),
         credits: None,
         spend_24h: None,
+        hours: None,
     })
 }
 
