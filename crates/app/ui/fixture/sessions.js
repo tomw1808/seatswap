@@ -486,6 +486,7 @@ function fixtureSessionRows() {
     make("ledger-9e", "ledger", "vega", "closed", "claude-opus-5-5", fixtureDaysAgoAt(3, 22, 5), 1.6, 0, 0, 3, []),
     make("ledger-c1", "ledger", "atlas", "idle", "gpt-6-astra", isoIn(-35 * 60000), 0.4, 0, 0, 0, [], {
       provider: "Codex",
+      title: "Identify the ledger rounding",
       lastHourMissing: CODEX_LAST_HOUR_UNKNOWN,
     }),
     make("dsh-b7", "atlas", "atlas", "busy", DEEPSEEK_MODEL, isoIn(-11 * 60000), 0.7, 0.6, 2, 1, harnessAgents, {

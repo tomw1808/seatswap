@@ -2698,7 +2698,7 @@ impl Values { pub fn of(valued: &[Valued], settings: &Settings, fx: &Fx, at: Dat
     pub model: Option<String>, pub running: bool, pub first: Option<DateTime<Utc>>,
     pub last: Option<DateTime<Utc>>, pub tokens: Tokens, pub values: Values }
 #[serde(rename_all = "camelCase")] pub struct LiveSession { pub session: String, pub host: String,
-    pub label: String, #[serde(default)] pub title: Option<String> /* None for Codex */,
+    pub label: String, #[serde(default)] pub title: Option<String>,
     pub project_id: ProjectId, pub project: String, pub org: Option<String>,
     pub cwd: String, pub provider: String, pub model: Option<String>, pub tied: bool,
     pub status: LiveStatus, pub since: DateTime<Utc>, pub started: DateTime<Utc>,
@@ -4645,6 +4645,7 @@ once its result is in a transcript.
 pub struct CodexSession { pub id: String, pub cwd: PathBuf, pub model: Option<String>,
     pub started: DateTime<Utc>, pub last: DateTime<Utc>, pub tokens: Tokens,
     pub last_hour: Option<Tokens>, pub busy: bool,
+    pub title: Option<String>,   // newest `thread_name` for the id in `session_index.jsonl`
     pub(crate) file: PathBuf }                          // not part of the page's shape
 pub struct CodexRead { pub sessions: Vec<CodexSession>, pub warnings: Vec<String> }
 /// Every Codex session whose rollout file was last written at or after `since`.

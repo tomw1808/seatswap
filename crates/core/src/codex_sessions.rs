@@ -16,6 +16,13 @@
 //! `token_count` in time is taken as it is, never added up, so a later line
 //! replaces the tokens a session reports, while a line without a total
 //! replaces nothing.
+//!
+//! A session's title is not in its rollout: Codex keeps it in
+//! `<codex home>/session_index.jsonl`, an append-only file of
+//! `{"id", "thread_name", "updated_at"}` lines. Codex names a thread after its
+//! first answer and appends another line on `/rename`; for each id the line
+//! with the latest `updated_at` wins. Only those three fields are read, and the
+//! file is never written.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -52,6 +59,9 @@ pub struct CodexSession {
     pub last_hour: Option<Tokens>,
     /// A `task_started` without a later `task_complete`.
     pub busy: bool,
+    /// The `thread_name` of the session's newest line in `session_index.jsonl`;
+    /// `None` without one, or when it is empty or all-space.
+    pub title: Option<String>,
     /// The rollout file this session came from, so the process walk's open
     /// files can be matched to it. Not part of the page's shape.
     pub(crate) file: PathBuf,
@@ -149,9 +159,72 @@ pub fn sessions(codex_home: &Path, since: DateTime<Utc>, now: DateTime<Utc>) -> 
         }
     }
     read.sessions = merge_rollouts(rollouts, now, &mut read.warnings);
+    if !read.sessions.is_empty() {
+        let titles = titles(codex_home, &mut read.warnings);
+        for session in &mut read.sessions {
+            session.title = titles
+                .get(&session.id)
+                .and_then(|(_, name)| crate::transcripts::session_title(name.clone()));
+        }
+    }
     read.sessions
         .sort_by(|a, b| a.started.cmp(&b.started).then_with(|| a.id.cmp(&b.id)));
     read
+}
+
+/// The file in which Codex keeps its threads' names.
+const SESSION_INDEX: &str = "session_index.jsonl";
+
+/// One line of `session_index.jsonl`: only these three fields are read.
+#[derive(Deserialize)]
+struct IndexLine {
+    id: String,
+    thread_name: String,
+    updated_at: DateTime<Utc>,
+}
+
+/// Each thread's newest name in `<codex home>/session_index.jsonl`, by id, with
+/// the `updated_at` that made it the newest. A missing file is no name and no
+/// warning; a file that cannot be read, or a whole line that is not such a
+/// line, is a warning naming the file (and the line), and the other lines are
+/// still read. A torn last line (no newline) is not read.
+fn titles(
+    codex_home: &Path,
+    warnings: &mut Vec<String>,
+) -> BTreeMap<String, (DateTime<Utc>, String)> {
+    let file = codex_home.join(SESSION_INDEX);
+    let mut names: BTreeMap<String, (DateTime<Utc>, String)> = BTreeMap::new();
+    let bytes = match fs::read(&file) {
+        Ok(bytes) => bytes,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return names,
+        Err(source) => {
+            warnings.push(format!("{}: {source}", file.display()));
+            return names;
+        }
+    };
+    let Some(end) = bytes.iter().rposition(|byte| *byte == b'\n') else {
+        return names;
+    };
+    for (index, raw) in bytes[..end].split(|byte| *byte == b'\n').enumerate() {
+        if raw.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let Ok(line) = serde_json::from_slice::<IndexLine>(raw) else {
+            warnings.push(format!(
+                "{}: line {} is not a thread name line",
+                file.display(),
+                index + 1
+            ));
+            continue;
+        };
+        let newer = names
+            .get(&line.id)
+            .is_none_or(|(updated, _)| line.updated_at >= *updated);
+        if newer {
+            names.insert(line.id, (line.updated_at, line.thread_name));
+        }
+    }
+    names
 }
 
 /// The `YYYY/MM/DD` folders of the store. Every day folder is listed, whatever
@@ -534,6 +607,7 @@ fn merge_rollouts(
             tokens,
             last_hour,
             busy: giver.busy,
+            title: None,
             file: giver.file.clone(),
         });
     }
@@ -830,6 +904,136 @@ mod tests {
             "input_tokens includes the cached part; out includes reasoning"
         );
         assert!(!session.busy);
+    }
+
+    fn index_line(id: &str, name: &str, updated_at: &str) -> String {
+        serde_json::json!({"id": id, "thread_name": name, "updated_at": updated_at}).to_string()
+    }
+
+    fn write_index(paths: &CodexPaths, lines: &[String]) {
+        let mut text = String::new();
+        for line in lines {
+            text.push_str(line);
+            text.push('\n');
+        }
+        fs::write(paths.home.join(SESSION_INDEX), text).expect("the session index");
+    }
+
+    fn two_sessions(paths: &CodexPaths) {
+        for (id, start) in [
+            (ATLAS, "2026-11-14T17-53-10"),
+            (NOTES, "2026-11-14T17-58-00"),
+        ] {
+            write(
+                paths,
+                ["2026", "11", "14"],
+                start,
+                id,
+                &[meta("2026-11-14T17:53:10.250Z", id)],
+                "2026-11-14T18:00:00Z",
+            );
+        }
+    }
+
+    fn read_two(paths: &CodexPaths) -> CodexRead {
+        sessions(
+            &paths.home,
+            utc("2026-11-14T00:00:00Z"),
+            utc("2026-11-14T19:00:00Z"),
+        )
+    }
+
+    fn title_of<'a>(read: &'a CodexRead, id: &str) -> Option<&'a str> {
+        read.sessions
+            .iter()
+            .find(|session| session.id == id)
+            .expect("the session")
+            .title
+            .as_deref()
+    }
+
+    /// Codex names a thread after its first answer, and `/rename` appends a
+    /// line for the same id: the line with the latest `updated_at` wins.
+    #[test]
+    fn a_codex_thread_is_named_by_its_newest_index_line() {
+        let (_tmp, paths) = store();
+        two_sessions(&paths);
+        write_index(
+            &paths,
+            &[
+                index_line(
+                    ATLAS,
+                    "Identify raspberry color",
+                    "2026-11-14T17:54:32.413727648Z",
+                ),
+                index_line(
+                    NOTES,
+                    "Ledger import speed-up",
+                    "2026-11-14T17:59:01.000000000Z",
+                ),
+                index_line(ATLAS, "raspberry", "2026-11-14T17:55:40.120000000Z"),
+            ],
+        );
+
+        let read = read_two(&paths);
+
+        assert!(read.warnings.is_empty(), "{:?}", read.warnings);
+        assert_eq!(title_of(&read, ATLAS), Some("raspberry"));
+        assert_eq!(title_of(&read, NOTES), Some("Ledger import speed-up"));
+    }
+
+    /// The newest `updated_at` wins, not the last line of the file, and an
+    /// all-space name is no name.
+    #[test]
+    fn the_newest_name_wins_in_any_order_and_a_blank_name_is_none() {
+        let (_tmp, paths) = store();
+        two_sessions(&paths);
+        write_index(
+            &paths,
+            &[
+                index_line(ATLAS, "raspberry", "2026-11-14T17:55:40.120000000Z"),
+                index_line(
+                    ATLAS,
+                    "Identify raspberry color",
+                    "2026-11-14T17:54:32.413727648Z",
+                ),
+                index_line(NOTES, "   ", "2026-11-14T17:59:01.000000000Z"),
+            ],
+        );
+
+        let read = read_two(&paths);
+
+        assert_eq!(title_of(&read, ATLAS), Some("raspberry"));
+        assert_eq!(title_of(&read, NOTES), None);
+    }
+
+    /// No index file is no name and no warning; a broken whole line is a
+    /// warning naming the file and line, and the other lines are still read.
+    #[test]
+    fn a_missing_index_is_no_name_and_a_broken_line_is_a_warning() {
+        let (_tmp, paths) = store();
+        two_sessions(&paths);
+        let read = read_two(&paths);
+        assert!(read.warnings.is_empty(), "{:?}", read.warnings);
+        assert_eq!(title_of(&read, ATLAS), None);
+
+        write_index(
+            &paths,
+            &[
+                "{\"id\":\"broken".to_string(),
+                index_line(ATLAS, "raspberry", "2026-11-14T17:55:40.120000000Z"),
+            ],
+        );
+        let read = read_two(&paths);
+
+        assert_eq!(title_of(&read, ATLAS), Some("raspberry"));
+        assert_eq!(read.warnings.len(), 1, "{:?}", read.warnings);
+        assert!(
+            read.warnings[0].contains(SESSION_INDEX),
+            "{}",
+            read.warnings[0]
+        );
+        assert!(read.warnings[0].contains("line 1"), "{}", read.warnings[0]);
     }
 
     #[test]

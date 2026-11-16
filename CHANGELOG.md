@@ -33,7 +33,9 @@ All notable changes to this project are documented here. The format follows
   is read from the transcript's `ai-title` lines and stored in the session records, so it travels
   with a shared history folder; a session closed before this version keeps its label until its next
   title line. A DeepSeek Harness session that is a row of its own is named by its last
-  `session/title` the same way; a flash job's title stays its task text and names no row.
+  `session/title` the same way; a flash job's title stays its task text and names no row. A Codex
+  session is named by its thread name, read from Codex's `session_index.jsonl` (the newest line for
+  its id, so a `/rename` wins).
 - Codex sessions (provider "Codex") beside Claude Code's, read from Codex's rollout files: their
   session id, folder, model, token counts and times. A Codex session counts as running while a
   process holds its file open or its last event is younger than 30 minutes. A token total that went

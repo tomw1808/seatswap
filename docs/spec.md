@@ -994,7 +994,7 @@ They give real click handling and exact placement on those desktops. They're not
 | `claudeConfigDir` | `$CLAUDE_CONFIG_DIR` or `~/.claude` | |
 | `historyDir` | `null` (`<data folder>/history`) | text, an absolute folder; point it at a synced folder to share the history with other hosts |
 | `hostName` | `null` (the machine's host name) | text, 1–63 characters of `A–Z a–z 0–9 . _ -` that must start with a letter or a digit, stored in lower case; the name this host writes its history under |
-| `readSessions` | on | read the session files and transcripts of Claude Code, DeepSeek Harness and flash agents, and Codex's rollout files: model, busy or idle, waits, tokens per folder, agents and their thinking. The Sessions area needs it; turning it on takes effect after a restart. A session's title is read from its `ai-title` lines and stored in the history; message text and worker task texts are never stored |
+| `readSessions` | on | read the session files and transcripts of Claude Code, DeepSeek Harness and flash agents, and Codex's rollout files and thread names (`session_index.jsonl`): model, busy or idle, waits, tokens per folder, agents and their thinking. The Sessions area needs it; turning it on takes effect after a restart. A session's title is read from its `ai-title` lines and stored in the history; message text and worker task texts are never stored |
 | `notifyUsableAgain` | on | the "usable again" notification (§7.5) |
 | `notifyWaiting` | on | the "waiting for you" notification (§7.5); a click opens the Sessions area at that session |
 | `notifyWaitingHosts` | `thisHost` | `thisHost` · `allHosts`: whose waiting sessions notify. Other hosts report through the shared history folder, so their notifications come with the delay of the sync (§4.1, §11.4) |
@@ -1225,7 +1225,7 @@ provider do not repeat it; a model total row carries the `tied` bubble, and a to
 
 | Column | Content |
 |---|---|
-| Name | Claude Code's own title of the session (the one VS Code and `/resume` show), with the session's label (`atlas-a6`) as a small grey tag after it; a DeepSeek Harness row likewise by the title of its last `session/title` event, except a flash job's row, whose title is a worker's task text; the label alone when the session has no title, and always for a Codex row. A long title is cut with `…` and its whole text is the hover text. Opens to its agents |
+| Name | Claude Code's own title of the session (the one VS Code and `/resume` show), with the session's label (`atlas-a6`) as a small grey tag after it; a DeepSeek Harness row likewise by the title of its last `session/title` event, except a flash job's row, whose title is a worker's task text; a Codex row by its thread name, the newest line for its id in Codex's `session_index.jsonl`; the label alone when the session has no title. A long title is cut with `…` and its whole text is the hover text. Opens to its agents |
 | Model | the model of its last answer, with the `tied` bubble when its thinking is tied to the account |
 | Status | busy · idle · waiting for you, with how long; for a closed session, when it closed |
 | Agents | running · completed, the running number in the busy colour (grey at zero), completed always grey; `—` when a session has no agent data |
@@ -1259,6 +1259,10 @@ nothing jumps when it closes.
   in time over all of them, and its last hour is that total minus the newest total at or before an
   hour ago. A total that went down makes the last hour `—` with that reason. Only the
   `event_msg`/`token_count` lines are token records; a `token_usage_record` line is not read. A
+  rollout has no name: a Codex row's title is the `thread_name` of the newest line (by
+  `updated_at`) for its id in `<codex folder>/session_index.jsonl`, which Codex appends to when it
+  names a thread after its first answer and on `/rename`; an empty or all-space name is no title. It
+  is read with the rollouts, never written; a missing file is no title, a broken line a warning. A
   rollout is listed as running while any process holds the file open, or while its last event is
   younger than 30 minutes. Only a running rollout becomes a row. A `token_count` line without an
   `info` key is a warning; `info: null` is Codex's normal early line.
@@ -2044,11 +2048,13 @@ the past too, because the history stores the repository's identity, not the show
   files (`$DSH_HOME/sessions` or `~/.dsh/sessions`: job id, folder, model, tokens, state) and
   flash-agents' state (`$XDG_STATE_HOME/flash-agents` or `~/.local/state/flash-agents`: the report
   that links a short job id to its flash task); and Codex's rollout files under the Codex folder
-  (`$CODEX_HOME` or `~/.codex`: session id, model, token totals, event times). None of these files is
+  (`$CODEX_HOME` or `~/.codex`: session id, model, token totals, event times) and its
+  `session_index.jsonl` beside them (only each thread's `id`, `thread_name` and `updated_at`). None of these files is
   written or created. A Claude Code session's title (the `aiTitle` of its transcript's `ai-title`
   lines, the one VS Code and `/resume` show) is stored in its session records and the live report, so
   it travels with a shared history folder; a DeepSeek Harness session that is a row of its own, not
-  a flash job, carries its title (its last `session/title` event) in the live report too. A flash worker's task
+  a flash job, carries its title (its last `session/title` event) in the live report too, and a
+  Codex row its thread name. A flash worker's task
   text and all message text are never stored; a worker's title, shown in the window as a linked
   agent's task, is cleared before the report other hosts read is written. None of what is read is sent anywhere.
 - **The history folder suggestion.** Only while the saved settings name no history folder, seatswap

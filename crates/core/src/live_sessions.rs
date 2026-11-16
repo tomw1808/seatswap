@@ -1173,8 +1173,8 @@ pub fn codex_rows(
             session: session.id.clone(),
             host: host.to_string(),
             label: session_label(&project_name, &session.id),
-            // A Codex rollout file has no Claude Code `ai-title` line.
-            title: None,
+            // Codex's own name of the thread, from its session index.
+            title: session.title.clone(),
             project_id,
             project: project_name,
             org,
@@ -3090,6 +3090,7 @@ mod tests {
             },
             last_hour: Some(Tokens::default()),
             busy: false,
+            title: Some("raspberry".to_string()),
             file: PathBuf::from("/home/sam/.codex/sessions/2026/11/14/rollout-now.jsonl"),
         };
         let codex = codex_rows(
@@ -3102,6 +3103,11 @@ mod tests {
             &|_| project_key(),
         );
         let codex = &codex.sessions[0];
+        assert_eq!(
+            codex.title.as_deref(),
+            Some("raspberry"),
+            "Codex's thread name names the row"
+        );
         assert_eq!(
             codex.values.subscription,
             Some(0.0),
@@ -4394,6 +4400,7 @@ mod tests {
                 cr: 800,
             }),
             busy: true,
+            title: None,
             file: PathBuf::from("/home/sam/.codex/sessions/2026/11/14/rollout-old.jsonl"),
         };
 
@@ -4489,6 +4496,7 @@ mod tests {
                 cr: 200,
             }),
             busy: false,
+            title: None,
             file: PathBuf::from("/home/sam/.codex/sessions/2026/11/14/rollout-now.jsonl"),
         };
 

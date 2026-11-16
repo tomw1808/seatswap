@@ -342,8 +342,9 @@ the tray app, and `seatswap.exe` for everything you want to read in a terminal.
   the balance and the last 24 h's spend. Both cards are off by default, and neither card sends a
   request that generates text.
 - **Sessions and the files behind them:** with *Read Claude Code's session files* on, seatswap also
-  reads Codex's rollout files (`<codex folder>/sessions/YYYY/MM/DD/rollout-*.jsonl`; the folder is
-  the *Codex folder* setting, `$CODEX_HOME` or `~/.codex`), DeepSeek Harness's sessions
+  reads Codex's rollout files (`<codex folder>/sessions/YYYY/MM/DD/rollout-*.jsonl`) and thread
+  names (`<codex folder>/session_index.jsonl`; the folder is the *Codex folder* setting,
+  `$CODEX_HOME` or `~/.codex`), DeepSeek Harness's sessions
   (`$DSH_HOME/sessions` or `~/.dsh/sessions`) and flash-agents' job reports
   (`$XDG_STATE_HOME/flash-agents` or `~/.local/state/flash-agents`). While the saved settings name
   no history folder, it reads Dropbox's `info.json` (macOS and Linux `~/.dropbox/info.json`; Windows
@@ -351,7 +352,7 @@ the tray app, and `seatswap.exe` for everything you want to read in a terminal.
   `<Dropbox>/seatswap` as the history folder; a file it cannot read is shown with its path and why.
   All of these are read only and never written. seatswap keeps ids, folders, model names, token counts,
   times, a Claude Code session's title (the one VS Code and `/resume` show) and a DeepSeek Harness
-  session's own title; message text is never stored, and neither are a flash job's or worker's
+  session's or Codex thread's own title; message text is never stored, and neither are a flash job's or worker's
   title or task text (shown in the window and cleared before the report other hosts read).
 - **Network:** the usage endpoint (`api.anthropic.com/api/oauth/usage`) and Claude Code's token
   endpoint (`platform.claude.com/v1/oauth/token`, with Claude Code's own client id) to refresh

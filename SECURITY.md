@@ -37,13 +37,15 @@ seatswap handles Claude login tokens, so it is built to keep them where they bel
   files* turns it off). It also reads DeepSeek Harness's session files (`$DSH_HOME/sessions` or
   `~/.dsh/sessions`), flash-agents' job reports (`$XDG_STATE_HOME/flash-agents` or
   `~/.local/state/flash-agents`) and Codex's rollout files
-  (`<codex folder>/sessions/YYYY/MM/DD/rollout-*.jsonl`). From a Harness session it takes the
+  (`<codex folder>/sessions/YYYY/MM/DD/rollout-*.jsonl`) and thread names
+  (`<codex folder>/session_index.jsonl`). From a Harness session it takes the
   session id, its parent, folder, model, token counts and times; from a job report only the job's
   `sessionId`, to link the job to its Claude Code session; from a Codex rollout the session id,
-  folder, model, token counts and times. A Claude Code session's title (the `aiTitle` of its
+  folder, model, token counts and times; from Codex's thread index only each thread's id, name and
+  time. A Claude Code session's title (the `aiTitle` of its
   transcript's `ai-title` lines) is stored in the history and the live report; a DeepSeek Harness
-  session that is a row of its own (not a flash job) carries its last `session/title` in the live
-  report. Message text and a
+  session that is a row of its own (not a flash job) carries its last `session/title`, and a Codex
+  row its thread name, in the live report. Message text and a
   worker's title or task text are never
   stored, logged or sent; a worker's title is shown in the window and cleared before
   the report other hosts read. No file among them is ever written. It never opens the secret `.key`
