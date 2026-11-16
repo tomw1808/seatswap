@@ -22,7 +22,8 @@ use notify_rust::NotificationResponse;
 #[cfg(all(unix, not(target_os = "macos")))]
 use notify_rust::Timeout;
 
-use seatswap_core::engine::{all_blocked, Blocker, LoginWarning};
+use seatswap_core::engine::{all_blocked, AccountView, Blocker, LoginWarning};
+use seatswap_core::history::RESET_DROP_POINTS;
 use seatswap_core::store::{LoginState, Settings, WaitingHosts};
 use seatswap_core::switcher::UnsavedPolicy;
 
@@ -78,6 +79,9 @@ struct PreviousView {
     /// The engine's reason a limit blocked the account; `None` when no limit
     /// blocked it (no usage yet, a login problem, or usable).
     blocker: Option<Blocker>,
+    /// The percent of the limit `blocker` names in this snapshot, so the next
+    /// one can tell a reset before its time by its drop (decision 12).
+    blocker_percent: Option<f64>,
 }
 
 /// The rules of docs/implementation.md and spec §4:
@@ -180,6 +184,10 @@ impl Deduper {
                         usable: view.usable,
                         blocked_until: view.blocked_until,
                         blocker: view.blocker.clone(),
+                        blocker_percent: view
+                            .blocker
+                            .as_ref()
+                            .and_then(|blocker| blocker_percent(view, blocker)),
                     },
                 )
             })
@@ -244,18 +252,27 @@ impl Deduper {
             if previous.usable {
                 continue;
             }
-            // Only a reset that has passed ends a block. A per-model block whose
-            // last session closed, or one the server lifted early, is no reset:
-            // it sends nothing and leaves the (account, reset minute) key free
-            // for the real reset (spec §4).
-            let Some(reset) = previous.blocked_until.filter(|reset| *reset <= now) else {
+            // A reset that has passed ends a block, as it always has. Before
+            // its time, only a drop of the blocking limit's percent by at
+            // least RESET_DROP_POINTS is a reset (decision 12): a per-model
+            // block whose last session closed, or one the server lifted early,
+            // keeps the limit's percent and sends nothing (spec §4).
+            let Some(reset) = previous.blocked_until else {
                 continue;
             };
+            let early = reset > now && is_reset_drop(previous.blocker_percent, view, blocker);
+            if reset > now && !early {
+                continue;
+            }
             let key = (view.id.clone(), Some(reset.timestamp() / 60));
             if self.usable_again.insert(key) {
                 due.push(Notification::UsableAgain {
                     id: view.id.clone(),
-                    reason: blocker_reason(blocker),
+                    reason: if early {
+                        early_reset_reason(blocker)
+                    } else {
+                        blocker_reason(blocker)
+                    },
                 });
             }
         }
@@ -338,13 +355,43 @@ impl Deduper {
     }
 }
 
-/// What the engine's [`Blocker`] says in "usable again" (spec §4).
-fn blocker_reason(blocker: &Blocker) -> String {
+/// The percent of the limit `blocker` names in `view`'s usage, when this
+/// snapshot has that limit.
+fn blocker_percent(view: &AccountView, blocker: &Blocker) -> Option<f64> {
+    let usage = view.usage.as_ref()?;
+    blocker.limit_in(usage).map(|limit| limit.percent)
+}
+
+/// Whether `view`'s limit that `blocker` names is at least
+/// [`RESET_DROP_POINTS`] below `previous_percent`: a reset before the reset
+/// time (decision 12, the history's rule).
+fn is_reset_drop(previous_percent: Option<f64>, view: &AccountView, blocker: &Blocker) -> bool {
+    let Some(previous_percent) = previous_percent else {
+        return false;
+    };
+    blocker_percent(view, blocker)
+        .is_some_and(|current| previous_percent - current >= RESET_DROP_POINTS)
+}
+
+/// The limit a [`Blocker`] names, worded as "usable again" uses it.
+fn limit_name(blocker: &Blocker) -> String {
     match blocker {
-        Blocker::Week => "its week reset".to_string(),
-        Blocker::Session => "its 5 h window reset".to_string(),
-        Blocker::Model(model) => format!("its {model} week reset"),
+        Blocker::Week => "its week".to_string(),
+        Blocker::Session => "its 5 h window".to_string(),
+        Blocker::Model(model) => format!("its {model} week"),
     }
+}
+
+/// What the engine's [`Blocker`] says in "usable again" when its reset time
+/// has passed (spec §4).
+fn blocker_reason(blocker: &Blocker) -> String {
+    format!("{} reset", limit_name(blocker))
+}
+
+/// The same limit wording for a reset seen before its reset time, as a drop of
+/// the limit's percent (decision 12).
+fn early_reset_reason(blocker: &Blocker) -> String {
+    format!("{} was reset early", limit_name(blocker))
 }
 
 /// The account id a login warning is about. One definition, used by the
@@ -769,7 +816,7 @@ mod tests {
     use super::*;
 
     use chrono::DateTime;
-    use seatswap_core::engine::AccountView;
+    use seatswap_core::api::{Limit, LimitKind, Severity, Usage};
     use seatswap_core::store::{LoginState, Settings, WaitingHosts};
 
     use crate::format;
@@ -852,6 +899,38 @@ mod tests {
     ) -> AccountView {
         let mut view = view(id, abbr, false, blocked_until, is_active);
         view.blocker = Some(blocker);
+        view
+    }
+
+    /// A usage answer with `limits`, as the engine's views carry it.
+    fn usage_of(limits: Vec<Limit>) -> Usage {
+        Usage {
+            limits,
+            extra_usage_enabled: false,
+            warnings: Vec::new(),
+        }
+    }
+
+    fn limit(
+        kind: LimitKind,
+        percent: f64,
+        resets_at: Option<DateTime<Utc>>,
+        model: Option<&str>,
+        is_active: bool,
+    ) -> Limit {
+        Limit {
+            kind,
+            percent,
+            severity: Severity::Normal,
+            resets_at,
+            model: model.map(str::to_string),
+            is_active,
+        }
+    }
+
+    /// `view` with `limits` as the usage the engine read.
+    fn with_usage(mut view: AccountView, limits: Vec<Limit>) -> AccountView {
+        view.usage = Some(usage_of(limits));
         view
     }
 
@@ -1246,6 +1325,169 @@ mod tests {
                 "{reason}"
             );
         }
+    }
+
+    #[test]
+    fn a_reset_before_its_time_is_usable_again_at_once() {
+        let mut deduper = Deduper::new();
+        let reset = utc("2026-11-14T18:59:00Z");
+        let limits = |percent: f64| {
+            vec![limit(
+                LimitKind::WeeklyAll,
+                percent,
+                Some(reset),
+                None,
+                true,
+            )]
+        };
+        let blocked = with_usage(
+            blocked_view("AC", "AC", Some(reset), false, Blocker::Week),
+            limits(100.0),
+        );
+        let usable = with_usage(view("AC", "AC", true, None, false), limits(0.0));
+
+        assert!(deduper
+            .due(&snapshot_of(vec![blocked]), utc("2026-11-10T09:55:00Z"))
+            .is_empty());
+        assert_eq!(
+            deduper.due(&snapshot_of(vec![usable]), utc("2026-11-10T10:00:00Z")),
+            vec![Notification::UsableAgain {
+                id: "AC".to_string(),
+                reason: "its week was reset early".to_string(),
+            }],
+            "the week dropped to 0 % before Sat 18:59"
+        );
+    }
+
+    #[test]
+    fn a_model_reset_is_usable_again_at_once() {
+        let mut deduper = Deduper::new();
+        let reset = utc("2026-11-16T16:00:00Z");
+        let limits = |week: f64, fable: f64, active: bool| {
+            vec![
+                limit(LimitKind::WeeklyAll, week, Some(reset), None, false),
+                limit(
+                    LimitKind::WeeklyScoped,
+                    fable,
+                    Some(reset),
+                    Some("Fable"),
+                    active,
+                ),
+            ]
+        };
+        let blocked = with_usage(
+            blocked_view(
+                "AC",
+                "AC",
+                Some(reset),
+                false,
+                Blocker::Model("Fable".to_string()),
+            ),
+            limits(70.0, 100.0, true),
+        );
+        let usable = with_usage(
+            view("AC", "AC", true, None, false),
+            limits(45.0, 0.0, false),
+        );
+
+        assert!(deduper
+            .due(&snapshot_of(vec![blocked]), utc("2026-11-14T09:55:00Z"))
+            .is_empty());
+        assert_eq!(
+            deduper.due(&snapshot_of(vec![usable]), utc("2026-11-14T10:00:00Z")),
+            vec![Notification::UsableAgain {
+                id: "AC".to_string(),
+                reason: "its Fable week was reset early".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_block_lifted_without_a_drop_is_still_silent() {
+        let mut deduper = Deduper::new();
+        let reset = utc("2026-11-16T16:00:00Z");
+        let limits = |active: bool| {
+            vec![limit(
+                LimitKind::WeeklyScoped,
+                100.0,
+                Some(reset),
+                Some("Fable"),
+                active,
+            )]
+        };
+        let blocked = with_usage(
+            blocked_view(
+                "AC",
+                "AC",
+                Some(reset),
+                false,
+                Blocker::Model("Fable".to_string()),
+            ),
+            limits(true),
+        );
+        let usable = with_usage(view("AC", "AC", true, None, false), limits(false));
+
+        assert!(deduper
+            .due(&snapshot_of(vec![blocked]), utc("2026-11-14T09:55:00Z"))
+            .is_empty());
+        assert!(
+            deduper
+                .due(&snapshot_of(vec![usable]), utc("2026-11-14T10:00:00Z"))
+                .is_empty(),
+            "the Fable limit stayed at 100 %: the block was lifted, not reset"
+        );
+    }
+
+    #[test]
+    fn an_early_reset_is_not_announced_twice() {
+        let mut deduper = Deduper::new();
+        let reset = utc("2026-11-14T18:59:00Z");
+        let limits = |percent: f64| {
+            vec![limit(
+                LimitKind::WeeklyAll,
+                percent,
+                Some(reset),
+                None,
+                true,
+            )]
+        };
+        let active = view("lb-id", "LB", true, None, true);
+        let blocked = || {
+            snapshot_of(vec![
+                active.clone(),
+                with_usage(
+                    blocked_view("AC", "AC", Some(reset), false, Blocker::Week),
+                    limits(100.0),
+                ),
+            ])
+        };
+        let usable = || {
+            snapshot_of(vec![
+                active.clone(),
+                with_usage(view("AC", "AC", true, None, false), limits(0.0)),
+            ])
+        };
+
+        assert!(deduper
+            .due(&blocked(), utc("2026-11-10T09:55:00Z"))
+            .is_empty());
+        assert_eq!(
+            deduper.due(&usable(), utc("2026-11-10T10:00:00Z")),
+            vec![Notification::UsableAgain {
+                id: "AC".to_string(),
+                reason: "its week was reset early".to_string(),
+            }]
+        );
+        // The week fills again before the old reset time, which does not move.
+        assert!(deduper
+            .due(&blocked(), utc("2026-11-13T09:00:00Z"))
+            .is_empty());
+        assert!(
+            deduper
+                .due(&usable(), utc("2026-11-14T19:00:00Z"))
+                .is_empty(),
+            "the reset at the old time is the one already announced early"
+        );
     }
 
     #[test]

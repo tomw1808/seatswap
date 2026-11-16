@@ -252,6 +252,35 @@ pub enum Blocker {
     Model(String),
 }
 
+/// The model a [`Blocker::Model`] names for a full per-model limit the server
+/// gives no model for.
+pub const UNKNOWN_MODEL: &str = "unknown model";
+
+impl Blocker {
+    /// The limit of `usage` this blocker names: the week, the five hours, or the
+    /// per-model week of its model ([`UNKNOWN_MODEL`]: the one without a model).
+    pub fn limit_in<'a>(&self, usage: &'a Usage) -> Option<&'a Limit> {
+        usage.limits.iter().find(|limit| match (self, &limit.kind) {
+            (Blocker::Week, LimitKind::WeeklyAll) => true,
+            (Blocker::Session, LimitKind::Session) => true,
+            (Blocker::Model(model), LimitKind::WeeklyScoped) => match scoped_model(limit) {
+                Some(name) => name == model,
+                None => model == UNKNOWN_MODEL,
+            },
+            _ => false,
+        })
+    }
+}
+
+/// A per-model limit's model, trimmed; `None` when the server names none.
+fn scoped_model(limit: &Limit) -> Option<&str> {
+    limit
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+}
+
 /// One account as the CLI and the GUI show it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1143,12 +1172,7 @@ fn blocking_limit<'a>(
         let blocker = match &limit.kind {
             LimitKind::WeeklyAll => Blocker::Week,
             LimitKind::Session => Blocker::Session,
-            LimitKind::WeeklyScoped => match limit
-                .model
-                .as_deref()
-                .map(str::trim)
-                .filter(|model| !model.is_empty())
-            {
+            LimitKind::WeeklyScoped => match scoped_model(limit) {
                 Some(model) => {
                     let model_lower = model.to_lowercase();
                     let blocks = match models_in_use {
@@ -1168,7 +1192,7 @@ fn blocking_limit<'a>(
                     if !limit.is_active {
                         continue;
                     }
-                    Blocker::Model("unknown model".to_string())
+                    Blocker::Model(UNKNOWN_MODEL.to_string())
                 }
             },
             LimitKind::Other(_) => continue,
@@ -3269,10 +3293,46 @@ mod tests {
             active.limits[0].is_active = true;
             assert_eq!(
                 blocker(&active, Some(&opus), t0()),
-                Some(Blocker::Model("unknown model".to_string())),
+                Some(Blocker::Model(UNKNOWN_MODEL.to_string())),
                 "model {missing:?} is active"
             );
         }
+    }
+
+    #[test]
+    fn a_blocker_names_its_own_limit_in_a_later_answer() {
+        let usage = usage_of(vec![
+            limit_of(LimitKind::Session, 12.0, Some(at(3600)), None, false),
+            limit_of(LimitKind::WeeklyAll, 40.0, Some(at(7200)), None, false),
+            limit_of(
+                LimitKind::WeeklyScoped,
+                3.0,
+                Some(at(7200)),
+                Some(" Fable "),
+                false,
+            ),
+            limit_of(
+                LimitKind::WeeklyScoped,
+                7.0,
+                Some(at(7200)),
+                Some("  "),
+                false,
+            ),
+        ]);
+        let percent = |blocker: Blocker| blocker.limit_in(&usage).map(|limit| limit.percent);
+        assert_eq!(percent(Blocker::Week), Some(40.0));
+        assert_eq!(percent(Blocker::Session), Some(12.0));
+        assert_eq!(
+            percent(Blocker::Model("Fable".to_string())),
+            Some(3.0),
+            "trimmed as the blocker is"
+        );
+        assert_eq!(
+            percent(Blocker::Model(UNKNOWN_MODEL.to_string())),
+            Some(7.0),
+            "the limit without a model, whether active or not"
+        );
+        assert_eq!(percent(Blocker::Model("Opus".to_string())), None);
     }
 
     #[test]
