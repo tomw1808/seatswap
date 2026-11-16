@@ -907,7 +907,8 @@ fn load_state(app: &AppPaths) -> (ScanState, Option<String>) {
         Err(error) => (
             ScanState::default(),
             Some(format!(
-                "the transcript state cannot be read: {error}; delete {} to read the transcripts again",
+                "the transcript state cannot be read: {error}; no transcript is read until it can be. \
+                 Deleting {} reads every transcript again and writes its tokens to the history a second time",
                 app.transcripts_state_dir().display()
             )),
         ),
@@ -1773,6 +1774,7 @@ pub(crate) fn run_pass(
             summary.waiting.push(Waiting {
                 session: session.session.clone(),
                 label: session.label.clone(),
+                title: session.title.clone(),
                 project: session.project.clone(),
                 since: session.since,
                 host: None,
@@ -1882,6 +1884,7 @@ fn read_other_hosts(
             summary.waiting.push(Waiting {
                 session: session.session.clone(),
                 label: session.label.clone(),
+                title: session.title.clone(),
                 project: session.project.clone(),
                 since: session.since,
                 host: Some(host.host.clone()),
@@ -2312,6 +2315,7 @@ fn session_record(
         cwd: seen.cwd.clone(),
         project: memory.project_for(&seen.cwd),
         entrypoint,
+        title: seen.title.clone(),
         first: seen.first,
         last: seen.last,
         agents_started: started,
@@ -2344,6 +2348,7 @@ fn same_summary(first: &SessionRecord, second: &SessionRecord) -> bool {
         && first.cwd == second.cwd
         && first.project == second.project
         && first.entrypoint == second.entrypoint
+        && first.title == second.title
         && first.first == second.first
         && first.last == second.last
         && first.agents_started == second.agents_started
@@ -2825,6 +2830,7 @@ mod tests {
                 recent: Default::default(),
                 recorded: None,
                 flash_jobs: BTreeSet::new(),
+                title: None,
             },
         );
         let mut memory = SessionMemory::new(tmp.path().to_path_buf());
@@ -2991,6 +2997,7 @@ mod tests {
                 recent: Default::default(),
                 recorded: None,
                 flash_jobs: BTreeSet::new(),
+                title: None,
             },
         );
         let mut memory = SessionMemory::new(tmp.path().to_path_buf());
@@ -3514,6 +3521,89 @@ mod tests {
         assert_eq!(outcome.summary.warning.as_deref(), Some(state_error));
     }
 
+    /// A changed title alone makes the session record due again, like a
+    /// changed `last`.
+    #[test]
+    fn a_new_title_makes_the_session_record_due() {
+        let (_tmp, claude, _app) = fixture();
+        let now = time("2026-11-16T10:00:00Z");
+        let at = time("2026-11-16T09:00:00Z");
+        let record = |title: Option<&str>| SessionRecord {
+            t: at,
+            session: SESSION.to_string(),
+            cwd: "/home/sam/projects/atlas".to_string(),
+            project: ProjectKey::Folder("atlas".to_string()),
+            entrypoint: Some("cli".to_string()),
+            title: title.map(str::to_string),
+            first: at,
+            last: at,
+            agents_started: 0,
+            agents_finished: 0,
+            closed: false,
+        };
+        let mut memory = SessionMemory::new(claude.home().to_path_buf());
+        memory.records.insert(SESSION.to_string(), record(None));
+
+        assert!(
+            !record_is_due(&memory, &record(None), now),
+            "an unchanged summary is not written again"
+        );
+        let mut titled = record(Some("Fix the invoice export"));
+        titled.t = now;
+        assert!(
+            record_is_due(&memory, &titled, now),
+            "a changed title is a changed summary"
+        );
+    }
+
+    /// The title a scan reads from a transcript reaches the session record the
+    /// app writes.
+    #[test]
+    fn a_session_record_carries_the_transcripts_title() {
+        let (_tmp, claude, _app) = fixture();
+        let now = time("2026-11-16T10:00:00Z");
+        let folder = claude.projects_dir().join("-home-sam-projects-atlas");
+        fs::create_dir_all(&folder).unwrap();
+        let transcript = folder.join(format!("{SESSION}.jsonl"));
+        let first = transcript_line(
+            SESSION,
+            "msg_01QmB7xT",
+            now - ChronoDuration::minutes(5),
+            "/home/sam/projects/atlas",
+            "claude-opus-5-5",
+            (2, 166, 26_173, 28_126),
+        );
+        let title = serde_json::json!({
+            "type": "ai-title",
+            "aiTitle": "Fix the invoice export",
+            "sessionId": SESSION,
+        })
+        .to_string();
+        fs::write(&transcript, format!("{first}\n{title}\n")).unwrap();
+        let mut state = ScanState::default();
+        let mut scan = transcripts::scan(&claude, &state, 64 * 1024 * 1024).unwrap();
+        assert_eq!(scan.answers.len(), 1);
+        scan.commit(&mut state);
+
+        let seen = &state.sessions[SESSION];
+        let mut memory = SessionMemory::new(claude.home().to_path_buf());
+        let record = session_record(
+            SessionAgents {
+                metas: &[],
+                linked: Default::default(),
+            },
+            SESSION,
+            seen,
+            Some("cli".to_string()),
+            false,
+            &mut memory,
+            now,
+        )
+        .unwrap();
+
+        assert_eq!(record.title.as_deref(), Some("Fix the invoice export"));
+    }
+
     /// Review finding 1: upgrading from 1.1.0 must migrate its version-1 scan
     /// state, not rebuild it. The test keeps its old name because
     /// `specs/plan-1.2/PLAN.md` and `specs/plan/tests_audit.py` still list it;
@@ -3563,6 +3653,7 @@ mod tests {
             cwd: "/home/sam/projects/atlas".to_string(),
             project,
             entrypoint: Some("cli".to_string()),
+            title: None,
             first: first_at,
             last: first_at,
             agents_started: 0,
@@ -3966,6 +4057,7 @@ mod tests {
                 recent: Default::default(),
                 recorded: None,
                 flash_jobs: BTreeSet::new(),
+                title: None,
             },
         );
         let mut memory = SessionMemory::new(claude.home().to_path_buf());
@@ -4038,6 +4130,7 @@ mod tests {
                 recent: Default::default(),
                 recorded: None,
                 flash_jobs: BTreeSet::new(),
+                title: None,
             },
         );
         state.sessions.insert(
@@ -4057,6 +4150,7 @@ mod tests {
                 recent: Default::default(),
                 recorded: None,
                 flash_jobs: BTreeSet::new(),
+                title: None,
             },
         );
         let mut memory = SessionMemory::new(claude.home().to_path_buf());
@@ -4119,6 +4213,7 @@ mod tests {
                 recent: Default::default(),
                 recorded: None,
                 flash_jobs: BTreeSet::new(),
+                title: None,
             },
         );
 
@@ -4190,6 +4285,7 @@ mod tests {
                 recent: Default::default(),
                 recorded: None,
                 flash_jobs: BTreeSet::new(),
+                title: None,
             },
         );
         state.sessions.insert(
@@ -4209,6 +4305,7 @@ mod tests {
                 recent: Default::default(),
                 recorded: None,
                 flash_jobs: BTreeSet::new(),
+                title: None,
             },
         );
 
@@ -4548,6 +4645,7 @@ mod tests {
                 recent: Default::default(),
                 recorded: None,
                 flash_jobs: BTreeSet::new(),
+                title: None,
             },
         );
         let mut memory = SessionMemory::new(tmp.path().to_path_buf());
@@ -4772,6 +4870,7 @@ mod tests {
             session: "dd5e0c1a-3b7f-4c2d-9e8a-6f1b2c3d4e5f".to_string(),
             host: "vega".to_string(),
             label: "acme-kb-dd".to_string(),
+            title: None,
             project_id: seatswap_core::projects::ProjectId::of(
                 &seatswap_core::project::ProjectKey::Repo("github.com/acme/acme-kb".to_string()),
                 "vega",
@@ -5220,6 +5319,7 @@ mod tests {
                 cwd: "/home/sam/projects/acme-kb".to_string(),
                 project: ProjectKey::Repo("github.com/sam/acme-kb".to_string()),
                 entrypoint: Some("cli".to_string()),
+                title: None,
                 first: closed_at - chrono::Duration::hours(1),
                 last: closed_at,
                 agents_started: 0,
@@ -5347,6 +5447,7 @@ mod tests {
                 cwd: "/home/sam/projects/acme-kb".to_string(),
                 project: ProjectKey::Repo("github.com/sam/acme-kb".to_string()),
                 entrypoint: Some("cli".to_string()),
+                title: None,
                 first: closed_at - chrono::Duration::hours(1),
                 last: closed_at,
                 agents_started: 0,
@@ -6354,6 +6455,7 @@ mod tests {
             recent: Default::default(),
             recorded: None,
             flash_jobs: jobs,
+            title: None,
         }
     }
 

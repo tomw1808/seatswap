@@ -357,7 +357,19 @@
 }
 
 .sess-session-name {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
   font-weight: 500;
+}
+
+.sess-name-project {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .sess-model {

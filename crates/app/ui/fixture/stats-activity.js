@@ -214,15 +214,16 @@ function activityWeek(index, hosts) {
 function activityLargest() {
   // mock_activity.py's five largest sessions, largest by output tokens first.
   const rows = [
-    ["atlas-a6", "atlas", "atlas", "claude-opus-5-5", 11, 12.4, 41],
-    ["atlas-11", "atlas", "atlas", "claude-opus-5-5", 5, 7.9, null],
-    ["acme-kb-3c", "acme-kb", "atlas", "claude-opus-5-5", 2, 4.4, 9],
-    ["notes-47", "notes", "atlas", "claude-fable-5-2", 6, 5.3, 2],
-    ["atlas-b3", "atlas", "vega", "claude-fable-5-2", 4, 3.9, 4],
+    ["atlas-a6", "Fix the invoice export", "atlas", "atlas", "claude-opus-5-5", 11, 12.4, 41],
+    ["atlas-11", null, "atlas", "atlas", "claude-opus-5-5", 5, 7.9, null],
+    ["acme-kb-3c", "Trim the release notes", "acme-kb", "atlas", "claude-opus-5-5", 2, 4.4, 9],
+    ["notes-47", "Research a usage endpoint", "notes", "atlas", "claude-fable-5-2", 6, 5.3, 2],
+    ["atlas-b3", "Retry the failed sync", "atlas", "vega", "claude-fable-5-2", 4, 3.9, 4],
   ];
   return rows
-    .map(([label, project, host, model, workedHours, millions, agents]) => ({
+    .map(([label, title, project, host, model, workedHours, millions, agents]) => ({
       label,
+      title,
       project,
       host,
       model,

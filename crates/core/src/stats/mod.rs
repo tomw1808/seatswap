@@ -1876,6 +1876,7 @@ pub(crate) mod tests {
                 cwd: "/home/sam/ledger".to_string(),
                 project: ProjectKey::Folder("/home/sam/ledger".to_string()),
                 entrypoint: Some("cli".to_string()),
+                title: None,
                 first: utc("2026-10-02T08:00:00Z"),
                 last: utc("2026-10-02T09:00:00Z"),
                 agents_started: 0,

@@ -508,6 +508,7 @@ fn session(
         cwd: cwd.to_string(),
         project: project.clone(),
         entrypoint: Some("cli".to_string()),
+        title: None,
         first: utc(first)?,
         last: utc(last)?,
         agents_started: 0,

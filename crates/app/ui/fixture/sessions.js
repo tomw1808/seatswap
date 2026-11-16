@@ -421,6 +421,7 @@ function fixtureSessionRows() {
     session: name,
     host,
     label: name,
+    title: options.title === undefined ? null : options.title,
     projectId: { kind: "repo", id: SESSION_PROJECTS[project] },
     project,
     org: null,
@@ -444,17 +445,44 @@ function fixtureSessionRows() {
   });
 
   const rows = [
-    make("atlas-a6", "atlas", "atlas", "busy", "claude-opus-5-5", isoIn(-(2 * 60 + 31) * 60000), 12.4, 1.9, 3, 38, a6Agents),
-    make("atlas-56", "atlas", "atlas", "idle", "claude-opus-5-5", isoIn(-6 * 3600000), 8.1, 0, 0, 12, s56Agents),
-    make("atlas-11", "atlas", "atlas", "closed", "claude-opus-5-5", fixtureTodayAt(9, 12), 7.9, 0, 0, 17, []),
-    make("atlas-b3", "atlas", "vega", "idle", "claude-fable-5-2", isoIn(-100 * 60000), 3.9, 0.5, 0, 4, b3Agents, { tied: true, currency: "USD" }),
-    make("acme-kb-dd", "acme-kb", "atlas", "waiting", "claude-opus-5-5", isoIn(-4 * 60000), 2.2, 0.8, 1, 6, ddAgents),
-    make("acme-kb-3c", "acme-kb", "atlas", "closed", "claude-opus-5-5", fixtureTodayAt(8, 40), 4.4, 0, 0, 9, []),
-    make("atlas-c4", "atlas", "atlas", "closed", "claude-mythos-5-2", fixtureTodayAt(7, 30), 1.1, 0, 0, 5, [], { tied: true }),
-    make("acme-kb-74", "acme-kb", "atlas", "idle", "claude-sonnet-5-5", isoIn(-10 * 3600000), 0.3, 0, 0, 0, [], { tied: true }),
-    make("acme-kb-91", "acme-kb", "ledger", { other: "no report" }, "claude-fable-5-2", isoIn(-3 * 3600000), 1.2, 0, 2, 3, staleFableAgents, { tied: true }),
-    make("acme-kb-a2", "acme-kb", "ledger", { other: "no report" }, "claude-sonnet-5-5", isoIn(-3 * 3600000), 0.9, 0, 1, 2, staleSonnetAgents),
-    make("ledger-02", "ledger", "vega", "idle", "claude-opus-5-5", isoIn(-17 * 3600000), 0.1, 0, 0, 1, ledgerAgents),
+    make("atlas-a6", "atlas", "atlas", "busy", "claude-opus-5-5", isoIn(-(2 * 60 + 31) * 60000), 12.4, 1.9, 3, 38, a6Agents, {
+      title: "Fix the invoice export",
+    }),
+    make("atlas-56", "atlas", "atlas", "idle", "claude-opus-5-5", isoIn(-6 * 3600000), 8.1, 0, 0, 12, s56Agents, {
+      title: "Ledger import speed-up",
+    }),
+    make("atlas-11", "atlas", "atlas", "closed", "claude-opus-5-5", fixtureTodayAt(9, 12), 7.9, 0, 0, 17, [], {
+      title: "Weekly rings in the pop-up",
+    }),
+    make("atlas-b3", "atlas", "vega", "idle", "claude-fable-5-2", isoIn(-100 * 60000), 3.9, 0.5, 0, 4, b3Agents, {
+      title: "Retry the failed sync",
+      tied: true,
+      currency: "USD",
+    }),
+    make("acme-kb-dd", "acme-kb", "atlas", "waiting", "claude-opus-5-5", isoIn(-4 * 60000), 2.2, 0.8, 1, 6, ddAgents, {
+      title: "Rebuild the Acme knowledge-base index after the schema change",
+    }),
+    make("acme-kb-3c", "acme-kb", "atlas", "closed", "claude-opus-5-5", fixtureTodayAt(8, 40), 4.4, 0, 0, 9, [], {
+      title: "Trim the release notes",
+    }),
+    make("atlas-c4", "atlas", "atlas", "closed", "claude-mythos-5-2", fixtureTodayAt(7, 30), 1.1, 0, 0, 5, [], {
+      title: "Audit the retry logic",
+      tied: true,
+    }),
+    make("acme-kb-74", "acme-kb", "atlas", "idle", "claude-sonnet-5-5", isoIn(-10 * 3600000), 0.3, 0, 0, 0, [], {
+      title: "Map the order engine",
+      tied: true,
+    }),
+    make("acme-kb-91", "acme-kb", "ledger", { other: "no report" }, "claude-fable-5-2", isoIn(-3 * 3600000), 1.2, 0, 2, 3, staleFableAgents, {
+      title: "Check the stale report",
+      tied: true,
+    }),
+    make("acme-kb-a2", "acme-kb", "ledger", { other: "no report" }, "claude-sonnet-5-5", isoIn(-3 * 3600000), 0.9, 0, 1, 2, staleSonnetAgents, {
+      title: "Read the ingest sources",
+    }),
+    make("ledger-02", "ledger", "vega", "idle", "claude-opus-5-5", isoIn(-17 * 3600000), 0.1, 0, 0, 1, ledgerAgents, {
+      title: "Speed up the ledger export",
+    }),
     make("ledger-9e", "ledger", "vega", "closed", "claude-opus-5-5", fixtureDaysAgoAt(3, 22, 5), 1.6, 0, 0, 3, []),
     make("ledger-c1", "ledger", "atlas", "idle", "gpt-6-astra", isoIn(-35 * 60000), 0.4, 0, 0, 0, [], {
       provider: "Codex",
@@ -463,8 +491,13 @@ function fixtureSessionRows() {
     make("dsh-b7", "atlas", "atlas", "busy", DEEPSEEK_MODEL, isoIn(-11 * 60000), 0.7, 0.6, 2, 1, harnessAgents, {
       provider: "DeepSeek Harness",
     }),
-    make("notes-62", "notes", "atlas", "busy", "claude-fable-5-2", isoIn(-20 * 1000), 1.8, 0.5, 3, 0, flashAgents),
-    make("notes-47", "notes", "atlas", "busy", "claude-fable-5-2", isoIn(-6 * 60000), 5.3, 1.2, 0, 2, s47Agents, { tied: true }),
+    make("notes-62", "notes", "atlas", "busy", "claude-fable-5-2", isoIn(-20 * 1000), 1.8, 0.5, 3, 0, flashAgents, {
+      title: "Patch the release notes",
+    }),
+    make("notes-47", "notes", "atlas", "busy", "claude-fable-5-2", isoIn(-6 * 60000), 5.3, 1.2, 0, 2, s47Agents, {
+      title: "Research a usage endpoint",
+      tied: true,
+    }),
     make("notes-b9", "notes", "atlas", "idle", null, isoIn(-19 * 3600000), 0, 0, 0, 0, []),
   ];
   if (fixtureWantsAgents400()) {

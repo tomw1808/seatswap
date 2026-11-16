@@ -329,7 +329,8 @@ the tray app, and `seatswap.exe` for everything you want to read in a terminal.
   says so. On Linux those files have mode `0600`; on Windows they are protected only by the
   permissions of your user folder.
 - **What else it writes:** its own data folder (including `feed.json`, the status line's live
-  numbers), the one key `statusLine` of Claude Code's `settings.json` when you press *Use in Claude
+  numbers, `burn-next.json` and `notification-icon.png`, the picture its notifications show), the
+  one key `statusLine` of Claude Code's `settings.json` when you press *Use in Claude
   Code*, and the entry that starts it at login
   (`~/.config/autostart/seatswap.desktop` on Linux, the value `seatswap` under
   `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` on Windows). On Windows it also registers
@@ -348,8 +349,10 @@ the tray app, and `seatswap.exe` for everything you want to read in a terminal.
   no history folder, it reads Dropbox's `info.json` (macOS and Linux `~/.dropbox/info.json`; Windows
   `%APPDATA%\Dropbox\info.json`, then `%LOCALAPPDATA%\Dropbox\info.json`) only to suggest
   `<Dropbox>/seatswap` as the history folder; a file it cannot read is shown with its path and why.
-  All of these are read only and never written. seatswap keeps ids, folders, model names, token counts
-  and times; message text is never stored, and neither is a worker's title or task text.
+  All of these are read only and never written. seatswap keeps ids, folders, model names, token counts,
+  times and a Claude Code session's title (the one VS Code and `/resume` show); message text is never
+  stored, and neither are a worker's title or task text (the worker's title is shown in the window and
+  cleared before the report other hosts read).
 - **Network:** the usage endpoint (`api.anthropic.com/api/oauth/usage`) and Claude Code's token
   endpoint (`platform.claude.com/v1/oauth/token`, with Claude Code's own client id) to refresh
   stored logins. While the Codex card is on, `chatgpt.com/backend-api/wham/usage` with Codex's own
@@ -362,7 +365,7 @@ the tray app, and `seatswap.exe` for everything you want to read in a terminal.
 - **What it records:** the history (every usage reading, finished window, switch and agent call,
   the tokens each session used per project folder, hour and model, and Ollama's hourly usage) and,
   for your other hosts, a live report of this host's running sessions (`sessions-now.json`: session
-  names, folders, models and token counts, never an agent's task text or a worker's title). Both go
+  names and titles, folders, models and token counts, never an agent's task text or a worker's title). Both go
   into the history folder: by default `history` in the data folder; the setting `historyDir` can
   point it at a synced folder so several hosts share it, and then these records travel with that
   service. From the session files and transcripts seatswap keeps only numbers and names; it never

@@ -1118,6 +1118,7 @@ mod tests {
                 cwd: cwd.to_string(),
                 project: project.key,
                 entrypoint: Some("cli".to_string()),
+                title: None,
                 first: utc(at),
                 last: utc(at),
                 agents_started: 0,

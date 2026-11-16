@@ -17,7 +17,9 @@ seatswap handles Claude login tokens, so it is built to keep them where they bel
 - **Each token goes only to its own provider, over HTTPS.** Claude logins go only to the usage
   endpoint (`api.anthropic.com`) and Claude Code's token endpoint (`platform.claude.com`). With
   the Codex card on, Codex's own access token goes only to `chatgpt.com`, read from Codex's
-  `auth.json`, which seatswap never writes or refreshes. The Ollama card asks the Ollama server
+  `auth.json`, which seatswap never writes or refreshes. The Codex card itself reads nothing and
+  sends nothing while it is off. The Sessions area is separate: with *Read Claude Code's session files*
+  on, it reads Codex's rollout files whatever the card says. The Ollama card asks the Ollama server
   (by default the local one) with no secret.
 - **The other network calls carry nothing about you.** While *Look up prices and the dollar rate*
   is on, seatswap fetches API prices from `models.dev` and the dollar rate from
@@ -38,12 +40,16 @@ seatswap handles Claude login tokens, so it is built to keep them where they bel
   (`<codex folder>/sessions/YYYY/MM/DD/rollout-*.jsonl`). From a Harness session it takes the
   session id, its parent, folder, model, token counts and times; from a job report only the job's
   `sessionId`, to link the job to its Claude Code session; from a Codex rollout the session id,
-  folder, model, token counts and times. Message text and a worker's title or task text are never
-  stored, logged or sent, and no file among them is ever written. It never opens the secret `.key`
+  folder, model, token counts and times. A Claude Code session's title (the `aiTitle` of its
+  transcript's `ai-title` lines) is stored in the history and the live report. Message text and a
+  worker's title or task text are never
+  stored, logged or sent; a worker's title is shown in the window and cleared before
+  the report other hosts read. No file among them is ever written. It never opens the secret `.key`
   files that sit next to Claude Code's session files.
 - **What a shared history folder holds.** The history (usage readings, switches, tokens per
-  project and hour) and the live report other hosts read (`sessions-now.json`: session names,
-  folders, models and token counts, never an agent's task text) are written to the history folder.
+  project and hour, session records with their titles) and the live report other hosts read
+  (`sessions-now.json`: session names and titles, folders, models and token counts, never an agent's
+  task text) are written to the history folder.
   If you point that folder at a synced service, those records travel with it. No token and no
   message text is ever written there.
 - **Locks.** A switch holds Claude Code's own lock files and its own app lock, so it never

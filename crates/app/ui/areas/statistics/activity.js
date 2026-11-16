@@ -20,6 +20,7 @@ import {
   modelName,
   pad,
   readChoice,
+  sessionName,
   shortDate,
   tokens,
   valueTip,
@@ -732,7 +733,7 @@ export async function show(container, env) {
     for (const session of data.largest) {
       const row = h("div", { class: "stats-act-row" });
       const name = h("span", { class: "stats-act-session" });
-      name.appendChild(h("span", { class: "stats-act-session-label", text: session.label }));
+      name.appendChild(h("span", { class: "stats-act-session-label" }, sessionName(session)));
       name.appendChild(
         h("span", {
           class: "stats-act-session-sub",

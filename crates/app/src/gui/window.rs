@@ -1599,6 +1599,7 @@ mod tests {
             session: session.to_string(),
             host: host.to_string(),
             label: format!("acme-kb-{}", session.chars().take(2).collect::<String>()),
+            title: None,
             project_id: ProjectId::of(
                 &seatswap_core::project::ProjectKey::Repo("github.com/acme/acme-kb".to_string()),
                 host,

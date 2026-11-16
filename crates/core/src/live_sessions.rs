@@ -287,7 +287,16 @@ pub struct LiveAgent {
 pub struct LiveSession {
     pub session: String,
     pub host: String,
+    /// `atlas-a6`: the session's own label, shown as a small grey tag after
+    /// its title.
     pub label: String,
+    /// Claude Code's own session title, when it has one; the page names the
+    /// row by it and shows the label as a tag. `None` for a Harness or Codex
+    /// row, and for a Claude Code row without an `ai-title` line. Absent in a
+    /// report from a version before this field means none, so a shared
+    /// history stays readable.
+    #[serde(default)]
+    pub title: Option<String>,
     /// The project the row is counted under after joins (spec §3.6). Its name
     /// is `project`; two projects with the same name have different ids.
     pub project_id: ProjectId,
@@ -546,6 +555,7 @@ pub fn running(
             session: file.session_id.clone(),
             host: host.to_string(),
             label,
+            title: seen.and_then(|seen| seen.title.clone()),
             project_id,
             project: project_name,
             org,
@@ -722,6 +732,10 @@ pub fn harness_rows(
                     session: root.id.clone(),
                     host: host.to_string(),
                     label: session_label(&project_name, &root.id),
+                    // A Harness session's own title is an agent task, not
+                    // Claude Code's `ai-title`: it is shown on the agent, never
+                    // as the row's title.
+                    title: None,
                     project_id,
                     project: project_name,
                     org,
@@ -1154,6 +1168,8 @@ pub fn codex_rows(
             session: session.id.clone(),
             host: host.to_string(),
             label: session_label(&project_name, &session.id),
+            // A Codex rollout file has no Claude Code `ai-title` line.
+            title: None,
             project_id,
             project: project_name,
             org,
@@ -1347,6 +1363,7 @@ pub fn closed(
             session: record.session.clone(),
             host: hosted.host.clone(),
             label,
+            title: record.title.clone(),
             project_id,
             project: project_name,
             org,
@@ -1734,6 +1751,7 @@ mod tests {
             recent: Vec::new(),
             recorded: None,
             flash_jobs: BTreeSet::new(),
+            title: None,
         }
     }
 
@@ -1757,6 +1775,7 @@ mod tests {
             cwd: ATLAS_CWD.to_string(),
             project: project_key(),
             entrypoint: Some("cli".to_string()),
+            title: None,
             first,
             last,
             agents_started: agents_finished,
@@ -1844,6 +1863,7 @@ mod tests {
             session: SESSION.to_string(),
             host: "atlas".to_string(),
             label: "atlas-7c".to_string(),
+            title: None,
             project_id: ProjectId::of(&project_key(), "atlas"),
             project: "atlas".to_string(),
             org: Some("acme".to_string()),
@@ -1895,6 +1915,54 @@ mod tests {
         assert_eq!(row.org.as_deref(), Some("acme"));
         assert_eq!(row.started, utc("2026-11-13T23:36:00.232Z"));
         assert_eq!(row.since, utc("2026-11-14T18:34:55.320Z"));
+    }
+
+    #[test]
+    fn a_live_row_carries_its_transcripts_title() {
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let settings = settings_eur();
+        let valuer = valuer(&history, &settings, &[]);
+        let mut seen = seen("claude-opus-5-5", 12_400_000);
+        seen.title = Some("Fix the invoice export".to_string());
+        let state = state_with(seen);
+        let rows = running(
+            &[session_file()],
+            &state,
+            &|_: &str| Vec::new(),
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
+            "atlas",
+            utc("2026-11-14T19:00:00Z"),
+            &|_: &str| project_key(),
+        );
+
+        let row = &rows.sessions[0];
+        assert_eq!(row.title.as_deref(), Some("Fix the invoice export"));
+        assert_eq!(row.label, "atlas-a6", "the label keeps its meaning");
+    }
+
+    #[test]
+    fn without_a_title_the_row_has_only_its_label() {
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let settings = settings_eur();
+        let valuer = valuer(&history, &settings, &[]);
+        let state = state_with(seen("claude-opus-5-5", 12_400_000));
+        let rows = running(
+            &[session_file()],
+            &state,
+            &|_: &str| Vec::new(),
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
+            "atlas",
+            utc("2026-11-14T19:00:00Z"),
+            &|_: &str| project_key(),
+        );
+
+        let row = &rows.sessions[0];
+        assert_eq!(row.title, None);
+        assert_eq!(row.label, "atlas-a6");
     }
 
     #[test]
@@ -2508,6 +2576,36 @@ mod tests {
         assert_eq!(row.label, "atlas-11");
         assert_eq!(row.project, "atlas");
         assert_eq!(row.tokens.out, 7_900_000);
+    }
+
+    #[test]
+    fn a_closed_row_carries_its_records_title() {
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let mut record = session_record(
+            SESSION_11,
+            utc("2026-11-14T09:12:00Z"),
+            utc("2026-11-14T08:00:00Z"),
+            utc("2026-11-14T09:12:00Z"),
+            true,
+            0,
+        );
+        record.title = Some("Fix the invoice export".to_string());
+        history.append(&record).expect("a session record");
+        let settings = settings_eur();
+        let valuer = valuer(&history, &settings, &[]);
+        let rows = closed(
+            &history,
+            utc("2026-11-14T09:00:00Z"),
+            utc("2026-11-14T10:00:00Z"),
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
+        )
+        .expect("rows");
+
+        let row = &rows.sessions[0];
+        assert_eq!(row.title.as_deref(), Some("Fix the invoice export"));
+        assert_eq!(row.label, "atlas-11");
     }
 
     #[test]

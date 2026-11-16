@@ -17,6 +17,7 @@ import {
   kpi,
   modelName,
   readChoice,
+  sessionName,
   tokens,
   valueSummary,
   valueText,
@@ -1410,18 +1411,17 @@ function tiedNode(row) {
 function sessionCells(row, options, now) {
   const view = state.view;
   const currency = view.currency;
-  const name = row.label || row.session;
   const car = h("span", { class: options.details ? "sess-car" : "sess-car0" });
   const nameParts = [car];
   if (options.wide) {
     nameParts.push(
       h("span", { class: "sess-session-name" }, [
-        name,
-        h("span", { class: "mf" }, ` · ${row.project}`),
+        ...sessionName(row),
+        h("span", { class: "sess-name-project mf" }, ` · ${row.project}`),
       ])
     );
   } else {
-    nameParts.push(h("span", { class: "sess-session-name" }, name));
+    nameParts.push(h("span", { class: "sess-session-name" }, sessionName(row)));
   }
   const model = options.wide
     ? h("span", { class: "sess-model" }, [tiedNode(row)])
@@ -1474,6 +1474,7 @@ function statusDurationText(row, now) {
 function sessionSignature(row, options, now) {
   return JSON.stringify([
     row.label,
+    row.title,
     row.session,
     row.project,
     row.model,

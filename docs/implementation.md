@@ -126,7 +126,8 @@ per line with `timestamp`, `ordinal`, `type` and `payload`. Values are made up:
 ```
 
 `token_usage_record` lines carry `payload.usage`, `payload.turn_token_usage` and
-`payload.thread_token_usage` with the same token fields; they are read as another running total.
+`payload.thread_token_usage` with the same token fields; they are not read. Only the `event_msg`
+line whose `payload.type` is `token_count` is a token record.
 
 **Ollama's `/api/usage?range=24h`** answer: `totals.{request_count, usage_usd, input_tokens,
 cached_input_tokens, output_tokens}`, and one bucket per whole UTC hour in
@@ -710,7 +711,18 @@ impl AppPaths {
     pub fn history_dir(&self) -> PathBuf;          // <data_dir>/history
     pub fn machine_id_file(&self) -> PathBuf;      // <data_dir>/machine-id
     pub fn transcripts_state_dir(&self) -> PathBuf; // <data_dir>/transcripts-state
+    pub fn notification_icon(&self) -> PathBuf;    // <data_dir>/notification-icon.png
 }
+/// The one resolver for the Codex folder, the Harness sessions folder and the flash-agents state
+/// folder: a named folder (Codex's setting, or an environment variable) must be absolute;
+/// a relative one is an error naming the variable and its value, never resolved against the
+/// current folder. Codex: `codexHome` or `$CODEX_HOME`, else `~/.codex`. Harness:
+/// `$DSH_HOME/sessions`, else `~/.dsh/sessions`; flash-agents: `$XDG_STATE_HOME/flash-agents`,
+/// else `~/.local/state/flash-agents`.
+pub fn harness_folders(env_dsh_home: Option<OsString>, env_xdg_state_home: Option<OsString>,
+    home: &Path) -> Result<(PathBuf, PathBuf), PathsError>;
+// PathsError gains RelativeHarnessFolder { variable, value }: "${variable} must be an absolute
+// path, got {value}". Codex keeps RelativeCodexHome for codexHome and $CODEX_HOME.
 /// A `historyDir` must be absolute; a relative one is PathsError::HistoryDir, never resolved
 /// against the current folder.
 pub fn check_history_dir(path: &Path) -> Result<(), PathsError>;
@@ -769,8 +781,12 @@ pub struct TokenRecord { pub t: DateTime<Utc>, pub session: String, pub cwd: Str
     pub answers: u32, pub agent_answers: u32 }                // agentAnswers in the file
 #[serde(rename_all = "camelCase")]
 pub struct SessionRecord { pub t: DateTime<Utc>, pub session: String, pub cwd: String, pub project: ProjectKey,
-    pub entrypoint: Option<String>, pub first: DateTime<Utc>, pub last: DateTime<Utc>,
+    pub entrypoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub title: Option<String>,
+    pub first: DateTime<Utc>, pub last: DateTime<Utc>,
     pub agents_started: u32, pub agents_finished: u32, pub closed: bool }  // agentsStarted, agentsFinished
+// `title` is Claude Code's own title of the session (`SessionSeen.title`); absent in a 1.1.0 record
+// means none. A changed title makes the record due like a changed `last` (`same_summary`).
 pub struct UpRecord { pub t: DateTime<Utc> }
 /// One hour of Ollama's own usage, one record per `/api/usage?range=24h` bucket. `hour` is the
 /// bucket's `from`, always on a whole UTC hour one hour before its `until`.
@@ -848,10 +864,15 @@ pub fn sample_of(account: &AccountRef, usage: &Usage, at: DateTime<Utc>, src: So
 /// the limit with next.r > end + RESET_JITTER. A limit missing from next, or with r None, ends nothing.
 /// end = prev.r, final = prev.p, lastSample = prev.t, uncertain = end - prev.t > 1 h;
 /// start = end - 7 d for weekly kinds, end - 5 h for session, None otherwise;
-/// lost = max(0, 100 - final) for weekly kinds, None otherwise.
-/// A reset before the reset time is checked first: end = next.t, reset = true, lost = None,
-/// start from prev.r; the next window then begins at next.t with from = its percent.
+/// lost = max(0, 100 - final) for weekly kinds, None otherwise. The drop at the reset time is
+/// measured against the limit's last poll reading when the recorder has one.
 pub fn closed_windows(prev: &Sample, next: &Sample, plan: Option<&str>) -> Vec<WindowRecord>;
+/// The one early-reset rule, used by the recorder, the "usable again" notification and
+/// auto-burn's learned rates: `previous - current >= RESET_DROP_POINTS` (1) and `at` is more than
+/// `RESET_JITTER` (60 s) before `reset_at`. Only a poll's reading is the recorder's `previous`; a
+/// status-line reading never moves a percent down. `reset_at` None is never a reset.
+pub fn is_early_reset(previous: f64, current: f64, reset_at: Option<DateTime<Utc>>,
+                      at: DateTime<Utc>) -> bool;
 /// The one reset-jitter rule: |a - b| <= RESET_JITTER (60 s). The two one-sided comparisons in
 /// `write.rs` use RESET_JITTER directly to keep their one-sided meaning.
 pub const RESET_JITTER: i64;
@@ -859,14 +880,18 @@ pub fn same_reset(a: DateTime<Utc>, b: DateTime<Utc>) -> bool;
 ```
 
 **A week with a reset.** A weekly window normally runs seven days from its reset time. When a reading
-drops by at least `RESET_DROP_POINTS` (1) more than `RESET_JITTER` before that reset time, the window
-ended early: its record has `reset: true`, `end` at the lower reading, and `lost: None`, because a
-reset gave the quota back and nothing expired. The next window begins at that reading: its record has
-`start` at the reading and `from` = the reading's percent (absent when a restart could not find that
-sample on this host, which makes the record `uncertain`). A window's own use is `final − from`, with
-`from` 0 when absent; a week that holds two windows sums both, so its use can pass 100 % and its
-expired money can be more than one week's price. A window that ends below its start has no use, adds
-0 to a week's total and is named once in the read's warnings.
+drops by the one rule `history::is_early_reset` — at least `RESET_DROP_POINTS` (1) more than
+`RESET_JITTER` before that reset time — the window ended early: its record has `reset: true`, `end`
+at the lower reading, and `lost: None`, because a reset gave the quota back and nothing expired. The
+drop is measured against the newest **poll** reading of the limit, never a status-line reading: the
+feed's merged percent only moves up, so it cannot show a reset. The next window begins at that
+reading: its record has `start` at the reading and `from` = the reading's percent (absent when a
+restart could not find that sample on this host, which makes the record `uncertain`). A window's own
+use is `final − from`, with `from` 0 when absent; a week that holds two windows sums both, so its use
+can pass 100 % and its expired money can be more than one week's price. A window that ends below its
+start has no use, adds 0 to a week's total and is named once in the read's warnings. A pair of
+readings that `is_early_reset` calls a reset is left out of `burn::rates`' gains and session gains:
+the drop is not use.
 
 **Ollama's hours.** An hour's bucket only grows while the hour runs, so one line per hour is enough:
 every count (`requests`, `input`, `cached_input`, `output`, `usd`) of a later answer is at least the
@@ -946,7 +971,14 @@ pub struct FileState { pub offset: u64, pub grew: DateTime<Utc>, pub recent: Vec
     pub last_answer: Option<DateTime<Utc>> }
 pub struct SessionSeen { pub folder: String, pub cwd: String, pub first: DateTime<Utc>,
     pub last: DateTime<Utc>, pub last_model: Option<String>, pub last_user_turn: Option<DateTime<Utc>>,
-    pub thinking: Vec<(DateTime<Utc>, u32)>, pub recorded: Option<RecordedSession> }
+    pub thinking: Vec<(DateTime<Utc>, u32)>, pub recorded: Option<RecordedSession>,
+    #[serde(default)] pub title: Option<String> }
+// `title` is the `aiTitle` of the last `ai-title` line of the session's own transcript (never of an
+// agent's), stored as written; an empty or all-space one is no title, a line without a string
+// `aiTitle` is an unreadable line. It is applied after the file's other lines, so a title line before
+// the first answer still names the session. No other text of the line is read. Absent in a state
+// file written before it means none: no transcript is read again for it, so an older session gets a
+// title only from its next `ai-title` line. The state version stays 2.
 impl SessionSeen { pub fn thinking_since_user(&self) -> u32; }  // the sum of `thinking`
 // `thinking` is the answers with thinking since the last user turn: one entry per minute (its start
 // in UTC) and oldest first. A user turn empties it; every reader of the old number calls the sum.
@@ -1181,11 +1213,11 @@ Event `navigate` (payload `"main"|"add"`) when the panel is shown for a menu ite
 settings view; its gear, `,` and the CLI's `panel settings` open the large window at Settings.
 
 **Tray** (`tray.rs`, redrawn on every snapshot): icon from `icon::render` at 22 px ×2 (44 px image) for the active account — ring = `settings.iconLimit` limit (binding/session/week) with its `LoadLevel` colour, `locked` at ≥ 100 %, grey ring while the usage is unknown, a grey "?" disc when no account is live; tooltip as §8.1; tray label (`set_title`) per `trayText`. Linux backend: tray-icon's `ksni` (StatusNotifierItem over D-Bus), switched on in `crates/app/Cargo.toml` next to Tauri's libappindicator, because libappindicator reports no clicks and drops the tooltip; with ksni the item has `ItemIsMenu = false`, a left click arrives as `TrayIconEvent::Click(Left)` (opens the panel), a right click shows the menu, and the tooltip is published (checked on the session bus, 2026-11-10). Without a StatusNotifierWatcher on the bus (plain GNOME without the AppIndicator extension, or a desktop panel that starts after seatswap at login) tray-icon cannot create the item and has no option to wait; `tray::start` then keeps the app running without an icon, says so on stderr at once and in a notification only if no tray has appeared after 30 s (`TRAY_GRACE`: at login Cinnamon starts its tray in the same second as seatswap, so the first try often comes too early) (`seatswap panel` still opens the pop-up), and creates the icon when the name `org.kde.StatusNotifierWatcher` appears (`gio::bus_watch_name`, GTK's own gio). Once the item exists, ksni registers it again whenever the watcher restarts. Menu as §8.3: one item per account (`AC  Acme   97 % · 1h 12min` + "✓" for the live one, "logged out" when so), clicking switches with `refuse`; then "Save current login (…)…" when live is unknown; "Open panel…", "Add account…", "Sessions…",
-"Statistics…", "Settings…", "Quit seatswap". Number formatting is shared with the CLI (one module, `crates/app/src/format.rs`).
+"Statistics…", "Settings…", "Quit seatswap". Number formatting is shared with the CLI (one module, `crates/app/src/format.rs`); durations are `seatswap_core::duration`, and `format::login_ends_text(days_left)` is the one "login ends" phrase for the CLI and notifications.
 
 **Panel** (`panel.rs`): one window label `panel`, created on first open (`index.html#<view>`), kept and hidden afterwards. 380 px wide, height from `fit_panel`, no decorations, always on top, skip taskbar. Placement §9.2: X11 at the mouse, inside the monitor that holds it, above the mouse when the mouse is in the lower half, else below; Wayland (`XDG_SESSION_TYPE=wayland`) centred. `show` takes an `Anchor { cursor, monitor, scale }` once per opening and keeps it with the last requested logical height in `GuiState.panel: Mutex<Placement>`; `fit_panel` resizes and re-places from that anchor (`anchored_position(anchor, height, wayland)` → `place_panel`), so the panel keeps its bottom edge above the mouse, its top edge below it, and stays inside the monitor. Never read the window's position or size back to place it: on X11 they report the old values until the window system has applied a change (the headless run of 2026-11-10 drifted the panel to y = 836 and y = −386 that way). The window is built `resizable(true)`: GTK ignores `set_size` on a non-resizable window. Closes on Esc and the header's × (panel.js → `hide_panel`), on focus loss, and on a left click on the tray icon while open (`panel::toggle`, decision in the pure `tray_click(visible, focus_hidden_ago)`; a click within `REOPEN_GUARD` = 400 ms after a focus-loss hide is the click that caused it and does not reopen). Focus loss hides only if the panel is still unfocused `FOCUS_RECHECK` = 150 ms later and no pop-up of the process holds a GTK grab (`own_popup_open` → `gtk::grab_get_current`): WebKitGTK shows a `<select>` list as its own window with a grab, so the panel is unfocused for as long as the list is open; the list closes on the next click outside and hands the focus back. Focus on X11 (`take_focus`, `focus_x11`): `present_with_time` + `gdk_window.focus` with the X server's current time (`gdkx11::x11_get_server_time`) — Cinnamon's window manager refuses `set_focus`, which asks without a timestamp; and on every map the request is repeated up to `FOCUS_RETRIES` = 5 times, `FOCUS_RETRY_GAP` = 80 ms apart, until the window is active, because a freshly mapped window is not yet managed and the first request is ignored (both seen on Cinnamon 2026-11-10). Built hidden at startup (`panel::preload` in `setup`) so the page has loaded and measured itself before the first opening. A hidden panel does not appear when `show` is called: `show` stores the anchor, sets `PanelState.pending_show` and sends `navigate`; the page answers every navigation with `fit_panel` (setView), and that call sizes, places and only then shows it (`reveal`: move, then `show`), so the window manager maps it once, at its final size and place. If no height arrives within `SHOW_DEADLINE` = 300 ms it appears anyway with a log line. On Linux, nothing may map the window before the move is applied (`present_with_time` maps through GTK at once, and the panel flashed at its old place); focus is asked from the map handler instead. `.panel` has `flex-shrink: 0`: before the first showing the viewport has no width and a shrinking panel measured 2698 px tall. Opening it sends `Poll(PanelOpened)`.
 
-**Notifications** (`notify.rs`, notify-rust): every notification is built from `base()` (summary "seatswap"; on Windows `.app_id("dev.seatswap.app")`), the only caller of `Notification::new()`. On Windows `register_app_id()` writes the display name "seatswap" under `HKCU\Software\Classes\AppUserModelId\dev.seatswap.app` once at startup, before the single-instance listener; a failure is a startup error `notification name: …`. After a switch when `notifyOnSwitch` ("Switched to P — Private"); auto-burn's suggestion (§7.4) once per target and hour, with a "Switch" action (`wait_for_response` on its own thread; click on the body opens the panel); login warnings once per account and level per run; an unknown live login once per identity per run ("New login found: <email>. Save it as an account?" → a click on its button or body opens the add view). What counts as a click is decided in one pure function, `click(response, button)`: the offered button (`NotificationResponse::Action`) or the body (`Default`); a notification that timed out, was dismissed or closed (`Closed`) does nothing. On Linux the body click only arrives when the notification announces the action `default` (`clickable()`); the notification service shows no button for it. Windows reports a body click by itself, so `default` is announced on Linux only.
+**Notifications** (`notify.rs`, notify-rust): every notification is built from `base()` (summary "seatswap"; on Windows `.app_id("dev.seatswap.app")`), the only caller of `Notification::new()`. It shows the picture at `<data folder>/notification-icon.png` (`AppPaths::notification_icon`), written from the embedded icon when the file is missing or holds different bytes; a failed write is a warning on stderr and the notification still goes out. On Windows `register_app_id()` writes the display name "seatswap" under `HKCU\Software\Classes\AppUserModelId\dev.seatswap.app` once at startup, before the single-instance listener; a failure is a startup error `notification name: …`. After a switch when `notifyOnSwitch` ("Switched to P — Private"); auto-burn's suggestion (§7.4) once per target and hour, with a "Switch" action (`wait_for_response` on its own thread; click on the body opens the panel); login warnings once per account and level per run; an unknown live login once per identity per run ("New login found: <email>. Save it as an account?" → a click on its button or body opens the add view). What counts as a click is decided in one pure function, `click(response, button)`: the offered button (`NotificationResponse::Action`) or the body (`Default`); a notification that timed out, was dismissed or closed (`Closed`) does nothing. On Linux the body click only arrives when the notification announces the action `default` (`clickable()`); the notification service shows no button for it. Windows reports a body click by itself, so `default` is announced on Linux only.
 
 **Single instance and `seatswap panel`** (`ipc.rs`): the tray app takes `acquire_file_lock(gui_lock, 0)`. Busy → another instance runs: send `open-panel main` to `gui_socket` and exit 0. Held → name the socket only now (the lock created the data folder on first start, and the name needs its real path), remove a leftover socket, listen on it (mode 0600 on Unix; on Windows the file has the data folder's permissions). Windows uses the same Unix socket through `uds_windows` (`std::os::windows::net` is not stable yet); there is no runtime folder, so the socket is `<data>\gui.sock`. One line per connection: `open-panel <view>` → `ok`, anything else → `error unknown command`.
 
@@ -1219,8 +1251,9 @@ pub(crate) fn spawn(app: AppPaths, claude: ClaudePaths, history: Result<HistoryD
 
 /// One wake, without the thread: the sessions, new transcript answers, token lines, session lines
 /// and waits, then the Harness and Codex rows. `procs` is the process table (`harness::RealProc`
-/// in the app; a fake in tests). `state_error` is the load error that keeps this pass from saving
-/// the state; it is shown in the summary. A pass that did not finish asks for a wake in one second.
+/// in the app; a fake in tests). `state_error` is the load error that keeps this pass from reading
+/// a transcript, writing a token or session record, or saving the state; it is shown in the summary.
+/// A pass that did not finish asks for a wake in one second.
 pub(crate) fn run_pass(app: &AppPaths, claude: &ClaudePaths, probe: &dyn Liveness,
                        procs: &dyn harness::ProcSource, recorder: Option<&Recorder>,
                        state: &mut ScanState, memory: &mut SessionMemory, now: DateTime<Utc>,
@@ -1260,7 +1293,9 @@ warnings of the month file `record_external_switch` reads.
 // worker.rs
 pub(crate) struct SessionsSummary { pub running: u32, pub busy: u32, pub tied: u32, pub tied_busy: u32,
     pub waiting: Vec<Waiting>, pub unavailable: Option<String>, pub warning: Option<String> }
-pub(crate) struct Waiting { pub session: String, pub label: String, pub project: String,
+pub(crate) struct Waiting { pub session: String, pub label: String,
+    pub title: Option<String> /* the waiting notification names the session by it, else by label */,
+    pub project: String,
     pub since: DateTime<Utc>, pub host: Option<String> /* None = this host */ }
 pub(crate) struct Snapshot { … pub burn: Option<BurnView>, pub sessions: Option<SessionsSummary> /* None = readSessions off */ … }
 pub(crate) enum EngineCommand { Poll(PollReason), Publish,
@@ -1320,15 +1355,19 @@ impl WaitingHandle { pub(crate) fn withdraw(self); }
 
 `Notification::UsableAgain` needs `notifyUsableAgain` on, the account now usable, not active, and
 the previous snapshot naming a blocker whose `blocked_until` is at or before `now` (the block ended
-because its reset passed); it is remembered by (account id, previous reset minute), so one per
-account and reset. A block that ends earlier sends nothing and does not use that key. `AllFull` only
+because its reset passed), or whose blocking limit fell early by `history::is_early_reset` (the
+blocker's percent in the previous snapshot is at least 1 point above its percent now, and now is more
+than 60 s before its reset time). It is remembered by (account id, previous reset minute), so one per
+account and reset. A block that ends earlier without that drop sends nothing and does not use that key. `AllFull` only
 when the previous snapshot had a usable account and `engine::all_blocked` says every account whose
 login still works is now blocked; the next is the earliest `blocked_until`. `Waiting`
 only after 15 s (`waiting.since` to `now`), once per session and wait; turning `notifyWaiting` off
 withdraws the shown ones and sends nothing new; a session that stops waiting gets `WaitingOver`,
 which withdraws its notification. The texts come from one place each: `usable_again_text` =
-`{abbr} is usable again: {reason}.`, with reason `its 5h window reset`, `its week reset` or
-`its {model} week reset`; `all_full_text` = `All accounts are full. Next: {abbr} at {time}.` or
+`{abbr} is usable again: {reason}.`, with reason `its 5h window reset`, `its week reset`,
+`its {model} week reset`, or the early-reset forms `its 5h window was reset early`,
+`its week was reset early` and `its {model} week was reset early`; `all_full_text` =
+`All accounts are full. Next: {abbr} at {time}.` or
 `All accounts are full.`; `waiting_text` = `{label} is waiting for you ({project}, on {host}).` or,
 without a host name, `{label} is waiting for you ({project}).` (the host is `waiting.host` when set,
 this host's history name otherwise; a click opens the large window at `sessions?<session id>`).
@@ -1373,8 +1412,8 @@ pub struct Segment {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub separator: Option<SeparatorChar>,
 }
-/// A separator segment's character. Every choice prints with one space after it, and its `text()` is
-/// "│ ", "· ", "• ", "/ ", "› " or " " (blank).
+/// A separator segment's character. `text()` is the character alone: `│`, `·`, `•`, `/`, `›` or one
+/// space (blank); the spaces around it come from the segment's prefix and suffix.
 #[serde(rename_all = "camelCase")]
 pub enum SeparatorChar { Pipe, Dot, Bullet, Slash, Chevron, Blank }
 #[serde(rename_all = "camelCase")]
@@ -1389,7 +1428,7 @@ impl StatuslineConfig { pub fn current_line() -> StatuslineConfig; } // the pres
 fn validate_statusline(config: &StatuslineConfig) -> Result<(), StoreError>;
 // Fixed colour is #rrggbb; ByLoad needs warn < bad <= 100; drop is never 0; a Text segment has text;
 // a SeparatorChar is allowed on a Separator segment only, and a 1.1.0 saved segment without the key
-// is the pipe, so an old file prints as it did.
+// is the pipe; 1.1.0 printed ASCII `|` there, this version prints `│`.
 ```
 
 ## feed.rs — the status line's live numbers (step B)
@@ -1406,8 +1445,9 @@ pub struct Feed { pub at: DateTime<Utc>, pub five_hour: Option<FeedLimit>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub cost_usd: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub cost_problem: Option<String> }
 
-/// Write <data>/feed.json when its numbers differ from the file's or the file is at least
-/// 10 s older than feed.at. A file that does not parse is overwritten by this call.
+/// Write <data>/feed.json when its numbers differ from the file's — the 5 h and week limits, the
+/// session, the cost or the cost problem — or the file is at least 10 s older than feed.at. A file
+/// that does not parse is overwritten by this call.
 pub fn write_if_due(app: &AppPaths, feed: &Feed) -> io::Result<bool>;
 /// Missing file → None; a file that does not parse → InvalidData.
 pub fn read(app: &AppPaths) -> io::Result<Option<Feed>>;
@@ -1431,7 +1471,8 @@ line itself is never broken by it. Both keys are absent from a feed written by 1
 while they are `None`. The sessions thread keeps the last cost it read per session while that session
 is a row, because the feed holds only its last writer; `cost_problem` is a warning on every pass while
 it lasts. A converted cost that is not finite is not used: the row keeps the valuer's API value and
-the thread names the session.
+the thread names the session. With a currency and no stored rate the cost is not converted: it stays
+in USD and is labelled USD, and `take_provider_cost` returns no warning for that.
 
 ## burn/mod.rs — constants and shared types (step B)
 
@@ -2043,7 +2084,11 @@ page in place, keeping open details and the scroll. `sessions?<session-id>` open
 session, and an id that is not listed says "that session is no longer listed". A running row that
 leaves the live list is held grey for 60 s, then removed; closed rows are not held. Numbers come
 from `SessionsView.sums` by key, values follow `values`' missing reasons and currency, and times and
-ages come from `time_texts`; the page never adds values.
+ages come from `time_texts`; the page never adds values. One function, common.js's `sessionName(item)`, names a
+session wherever a page names one (the Sessions rows, Activity's largest sessions): its `title` with
+the `label` as a grey tag (`.session-label-tag`, window.css) after it, or the label alone; the title's
+text is cut by CSS and is the hover text in full. An item without a label is an error. The row signature holds the
+title, so a new title redraws the row.
 
 ## The Settings page and its save queue (step C1)
 
@@ -2124,12 +2169,10 @@ pub struct Account {
     #[serde(default)]
     pub price_currency: Option<String>, // the currency `price` was entered in; missing = None
 }
-pub struct OwnRate { pub currency: String, pub value: f64 }
 pub struct Settings {
     // …
     #[serde(default = "default_notify_login_ends")] pub notify_login_ends: bool, // true
     #[serde(default)] pub currency: Option<String>,                             // None
-    #[serde(default)] pub usd_rate: Option<OwnRate>,                            // None
     #[serde(default = "default_look_up_prices")] pub look_up_prices: bool,      // true
 }
 
@@ -2144,10 +2187,11 @@ pub fn plan_label(login: &Login, identity: &OAuthAccount) -> Option<String>;
 pub fn validate_price(price: Option<f64>) -> Result<Option<f64>, StoreError>;
 ```
 
-`Settings::validate` refuses a currency that is not three capital letters, an `OwnRate.currency`
-that is not three capital letters, and an `OwnRate.value` that is not finite and above 0. An older
-`accounts.json` without `price`, `priceCurrency`, `notifyLoginEnds`, `currency`, `usdRate` or
-`lookUpPrices` loads with `None`, `None`, `true`, `None`, `None`, `true`.
+`Settings::validate` refuses a currency that is not three capital letters; there is no own rate and
+no stored dollar rate in the settings. An older `accounts.json` without `price`, `priceCurrency`,
+`notifyLoginEnds`, `currency` or `lookUpPrices` loads with `None`, `None`, `true`, `None`, `true`;
+the removed `usdRate` key in `accounts.json` and `overrides` key in `prices.json` are ignored
+silently, and the next write leaves them out.
 
 `switcher::edit_account` takes the price as `Option<Option<f64>>` (`None` keeps it, `Some(None)`
 clears it, `Some(Some(v))` sets it after `validate_price`) and returns
@@ -2279,6 +2323,11 @@ pub fn look_up_rate(api: &Api, app: &AppPaths, currency: &str, now: DateTime<Utc
 pub fn prices_from_models_dev(body: &serde_json::Value) -> Result<ModelsDevList, MoneyError>;
 pub fn price_key(provider: &str, model_id: &str) -> String; // "<provider>/<model id>"
 
+/// The one plan-model rule: a model whose id starts with `claude-`. Only such a record enters a
+/// Claude account's week; any other model id (Codex's, Harness's, flash's, a non-Claude model) gets
+/// the subscription value 0, adds nothing to the week's split and never makes the week's
+/// subscription value unknown. Its API value still follows the price rule.
+pub fn is_plan_model(model: &str) -> bool;
 /// One record at API prices, in USD; None when its model has no price. Of_model, so the model is
 /// priced as an Anthropic model. A record with four zero counts costs 0 even with no price.
 pub fn api_usd(record: &TokenRecord, prices: &Prices) -> Option<f64>;
@@ -2287,7 +2336,7 @@ pub fn percent_value(monthly_price: f64) -> f64; // monthly × 12 / 52 / 100
 /// One weekly window's money in the display currency.
 pub(crate) struct WindowMoney { pub(crate) used: f64, pub(crate) paid: f64, pub(crate) expired: f64 }
 /// The money of a weekly window from its price and the percent it used (a finished window's final
-/// percent, or a running window's latest sample): paid = 100 × pv, expired = max(0, 100 −
+/// percent, or a running window's latest percent − `from`): paid = 100 × pv, expired = max(0, 100 −
 /// percent) × pv, used = paid − expired.
 pub(crate) fn window_money(price: f64, percent: f64) -> WindowMoney;
 
@@ -2312,8 +2361,11 @@ impl Valuer {
     /// api = api_usd × rate of the record's day (USD, labelled, when there is no rate; None with
     /// its reason when the model has no price or no currency is set);
     /// subscription = usd / the week's api_sum × the window's used money (at most what was paid)
-    /// at the window's price, None with its reason when the account or its price is missing, the
-    /// week has no reading, an unpriced model is in the week, or the week has no API value to split.
+    /// at the window's price, a known 0 for a model outside the Claude plan (`is_plan_model`), and
+    /// None with its reason when the account or its price is missing, the week has no reading, an
+    /// unpriced plan model is in the week, or the week has no API value to split. A running
+    /// window's use is its latest reading's percent − `from` (`from` 0 when absent), never the
+    /// latest percent alone.
     pub fn value(&self, host: &str, record: &TokenRecord) -> Valued;
 }
 ```
@@ -2337,7 +2389,6 @@ const RATE_EVERY: Duration = Duration::from_secs(30 * 60);    // a failed rate a
     pub currency: Option<String>, pub rate: Option<Rate>,
     pub rate_fetched_at: Option<DateTime<Utc>>, pub rate_source: &'static str,
     pub prices_source: &'static str, pub look_up: bool,
-    pub providers: Vec<String>, // money::PRICE_PROVIDERS for the price list
     pub models_with_price: u32, pub prices_checked_at: Option<DateTime<Utc>>,
     pub last_change: Option<PriceChange>, pub left_out: Vec<String>,
     pub rate_error: Option<String>, pub last_error: Option<String> }
@@ -2350,15 +2401,18 @@ pub(crate) struct LookupClient { … }
 impl LookupClient {
     pub(crate) fn view(&self) -> Result<MoneyView, String>;   // the last round's view
     pub(crate) fn now(&self) -> Result<MoneyView, String>;    // one round now, answered by the thread
-    /// A session met `model` without a price: ask models.dev at once. At most one ask per model
-    /// per hour; the sessions thread calls it for every listed model without a price.
+    /// A session met a Claude plan model (its id starts with `claude-`) without a price: ask
+    /// models.dev at once. A model outside the plan is never asked for. At most one ask per model
+    /// per hour; the sessions thread calls it only for a listed row or agent on an unpriced plan
+    /// model.
     pub(crate) fn want_price(&self, model: &str);
 }
 pub(crate) fn spawn(app: AppPaths, api: Api, ui: Sender<UiEvent>) -> Result<LookupHandle, String>;
 pub(crate) struct LookupRuntime { … }
 impl LookupRuntime {
     pub(crate) fn round(&mut self, settings: &Settings, now: DateTime<Utc>) -> MoneyView;
-    pub(crate) fn rate_round(&mut self, settings: &Settings, now: DateTime<Utc>) -> MoneyView;
+    pub(crate) fn rate_round(&mut self, settings: &Settings, now: DateTime<Utc>)
+        -> Option<MoneyView>;   // None when no rate was asked for
     pub(crate) fn settings_failed(&mut self, error: String) -> MoneyView; // no request
     pub(crate) fn view(&self) -> MoneyView;
 }
@@ -2373,8 +2427,9 @@ failure is tried again at the next look. With `lookUpPrices` off no request is m
 still shows what is stored; the API column then stays in US dollars and its header says so. The
 runtime's constructor fills the view from the files before the first round, so the page never shows
 zero prices while `prices.json` holds some. Every changed view is sent as `UiEvent::Money(view)`;
-the main thread emits it to both windows. A model with no price is asked for at once through
-`want_price`, at most once per model per hour, when the sessions thread lists it. A failed rate
+the main thread emits it to both windows. An unpriced model on the Claude plan (its id starts with `claude-`)
+is asked for at once through `want_price`, at most once per model per hour, when the sessions thread
+lists a row or agent that uses it; a model outside the plan is never asked for. A failed rate
 look-up goes into `rate_error`, so the rate row shows it; `last_error` keeps the price look-up's
 errors and the `prices.json` / `fx.json` read errors. `left_out` is the last list's skipped models
 and is kept until a later list names others. There is no own price and no own rate: no command sets
@@ -2391,14 +2446,20 @@ pub enum ProjectEdit {
     Assign { key: ProjectId, org: Option<String> },
     OrgRename { org: String, name: String },
     OrgJoin { org: String, into: String },
+    OrgAdd { name: String },
+    OrgRemove { org: String },
     AccountOrg { account: AccountRef, org: Option<String> },
 }
 impl ProjectEdit { pub fn validate(&self) -> Result<(), ProjectsError>; }
-// project and organization shown names: 1..=40 characters, not only spaces;
-// an organization identity (Assign.org, AccountOrg.org, OrgJoin.org/into) only non-empty,
-// because it comes from a login's orgName or a repository owner, not from typing;
-// a project or organization cannot be joined into itself; a folder id names its host,
-// a repository id does not.
+impl Projects { pub fn validate_edit(&self, edit: &ProjectEdit) -> Result<(), ProjectsError>; }
+// project and organization shown names: 1..=40 characters, not only spaces, no leading or trailing
+// space for a new organization; an organization identity (Assign.org, AccountOrg.org,
+// OrgJoin.org/into, OrgRemove.org) only non-empty, because it comes from a login's orgName or a
+// repository owner, not from typing; a project or organization cannot be joined into itself; a
+// folder id names its host, a repository id does not. `validate_edit` runs `validate` first, then
+// refuses `OrgAdd` for an existing name (`OrganizationExists`) and `OrgRemove` for an unknown
+// organization (`UnknownOrganization`) or one whose `owner_repositories` is not empty
+// (`OwnerOrganization`, naming the first repository).
 
 #[serde(rename_all = "camelCase")]
 pub struct ProjectId {
@@ -2408,7 +2469,9 @@ pub struct ProjectId {
 impl ProjectId { pub fn of(key: &ProjectKey, host: &str) -> ProjectId; } // host kept for a folder key only
 
 pub enum ProjectsError { NameLength { what, length }, NameBlank { what }, EmptyOrg,
-    FolderWithoutHost, RepoHasHost { host }, JoinIntoItself { what }, History(HistoryError) }
+    FolderWithoutHost, RepoHasHost { host }, JoinIntoItself { what },
+    OrganizationExists { name }, UnknownOrganization { org },
+    OwnerOrganization { name, repository }, OrganizationNameSpace, History(HistoryError) }
 
 pub struct ProjectsLogRecord { pub t: DateTime<Utc>, #[serde(flatten)] pub edit: ProjectEdit }
 impl Record for ProjectsLogRecord { const KIND: Kind = Kind::Projects; } // "projects"
@@ -2417,7 +2480,8 @@ pub struct Project { pub key: ProjectId, pub name: String, pub repo: Option<Stri
     pub org: Option<String>, pub joined: Vec<JoinedKey>, pub folders: BTreeMap<String, Vec<String>>,
     pub sessions: u32 }
 pub struct JoinedKey { pub key: ProjectId, pub name: String } // the key's default name
-pub struct Org { pub id: String, pub name: String, pub accounts: Vec<AccountRef>, pub projects: u32 }
+pub struct Org { pub id: String, pub name: String, pub accounts: Vec<AccountRef>, pub projects: u32,
+    pub owner_repositories: Vec<String> } // sorted; a non-empty list is why Remove is refused
 pub struct AccountEntry { pub id: String, pub account: AccountRef } // the store's id and its AccountRef
 pub struct Projects { pub projects: Vec<Project>, pub orgs: Vec<Org>,
     pub account_refs: Vec<AccountEntry>, /* names, assigned, joins, org_join: private */ }
@@ -2463,9 +2527,13 @@ impl HistoryDir {
     /// `last_record` the newest `up` or `samples` line; `bytes` the size of the history files in
     /// the folder (`sessions-now.json` is live state, not history, and does not count).
     pub fn host_infos(&self) -> Result<Vec<HostInfo>, HistoryError>;
-    /// The window records of the range, one per (account, kind, end within `same_reset`): the
-    /// record with the latest `lastSample` counts (spec §1.5), a tie goes to the host name that
-    /// sorts first, so read order does not decide. Sorted by end, then account.
+    /// The window records of the range, one per window: `read::same_window` decides, not just
+    /// the end — two ordinary records' ends are within `same_reset`; two hosts' reset records
+    /// are one when their spans `(lastSample, end]` overlap; a reset and an ordinary record are
+    /// one when the ordinary end is the reset's start + 7 days and the ordinary began before the
+    /// reset's end. The reset record wins; otherwise the record with the latest `lastSample`
+    /// counts, a tie goes to the host name that sorts first, so read order does not decide.
+    /// Sorted by end, then account.
     pub fn finished_windows(&self, range: &Range, hosts: &Hosts)
         -> Result<Read<WindowRecord>, HistoryError>;
     /// Copy every file of `from`'s host folders that is missing here or longer there; keep a
@@ -2622,18 +2690,20 @@ pub const REPORT_STALE_MIN: i64 = 15;
     pub api_currency: Option<String>, pub api_missing: Option<String>,
     pub subscription: Option<f64>, pub currency: Option<String>,
     pub subscription_missing: Option<String> }
-impl Values { pub fn of(valued: &[Valued], settings: &Settings) -> Values;
+impl Values { pub fn of(valued: &[Valued], settings: &Settings, fx: &Fx, at: DateTime<Utc>,
+                        ) -> Values;
               pub fn sum(parts: &[&Values]) -> Values; }
 #[serde(rename_all = "camelCase")] pub struct LiveAgent { pub agent: String,
     pub parent: Option<String>, pub kind: Option<String>, pub task: Option<String>,
     pub model: Option<String>, pub running: bool, pub first: Option<DateTime<Utc>>,
     pub last: Option<DateTime<Utc>>, pub tokens: Tokens, pub values: Values }
 #[serde(rename_all = "camelCase")] pub struct LiveSession { pub session: String, pub host: String,
-    pub label: String, pub project_id: ProjectId, pub project: String, pub org: Option<String>,
+    pub label: String, #[serde(default)] pub title: Option<String> /* None for Codex and Harness */,
+    pub project_id: ProjectId, pub project: String, pub org: Option<String>,
     pub cwd: String, pub provider: String, pub model: Option<String>, pub tied: bool,
     pub status: LiveStatus, pub since: DateTime<Utc>, pub started: DateTime<Utc>,
     pub agents_running: u32, pub agents_done: u32, pub agents: Vec<LiveAgent>,
-    pub tokens: Tokens, pub last_hour: Tokens,
+    pub tokens: Tokens, pub last_hour: Option<Tokens>,
     #[serde(default = "no_values")] pub last_hour_values: Values,
     #[serde(default = "no_values")] pub agents_done_values: Values,
     pub values: Values }
@@ -2669,8 +2739,10 @@ pub fn codex_rows(sessions: &[CodexSession], open_files: &BTreeSet<PathBuf>,
 /// recent.
 pub fn codex_needs_process_walk(sessions: &[CodexSession], now: DateTime<Utc>) -> bool;
 /// Claude Code's own cost from the status line's feed becomes the API value, converted once with
-/// `money::api_in_currency`; returns the warning when the currency has no rate or the converted
-/// number is not finite. `None` when the cost is used.
+/// `money::api_in_currency`; returns the warning when the converted number is not finite and the
+/// row keeps the valuer's value. With a currency and no stored rate the cost stays in USD, labelled
+/// USD, and this returns `None`: that is not a problem. Without a currency the cost has no value
+/// (`api_missing`), also without a warning. `None` when the cost is used.
 pub fn take_provider_cost(values: &mut Values, cost_usd: Option<f64>, settings: &Settings,
     fx: &Fx, at: DateTime<Utc>) -> Option<String>;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)] #[serde(rename_all = "camelCase")]
@@ -2714,12 +2786,14 @@ an empty list is a known 0 in both halves with no currency of its own. API parts
 `api_currency` values say `TWO_CURRENCIES`, and both `api` and `api_currency` are then `None`;
 subscription parts in two `currency` values say "these sessions are valued in two currencies", and
 both `subscription` and `currency` are then `None` (each host can set its own settings' currency).
-`Values::of` over no records is a known 0 too: the API currency is the settings' currency with
-look-ups on and `USD` with them off.
-`Values::of` builds one `Values` per record with the settings' currency and calls `Values::sum`; a
-group in the Sessions view uses the same function, never a second addition. `LiveSession` carries
-`project_id: ProjectId` after the project joins, so the shown `project` name and the grouping key
-stay apart.
+`Values::of` over no records is a known 0 too: the API 0 has the settings' currency when a rate is
+stored, `USD` when the currency is set without a rate or look-ups are off, and no currency when no
+currency is set; the subscription 0 is in the settings' currency.
+`Values::of(valued, settings, fx, at)` builds one `Values` per record with the settings' currency and
+calls `Values::sum`; a group in the Sessions view uses the same function, never a second addition.
+`LiveSession` carries `project_id: ProjectId` after the project joins, so the shown `project` name
+and the grouping key stay apart. `last_hour` is `Option<Tokens>`: `None` when the row's total went
+down (Codex), and the reason is the row's warning; a known 0 is an empty last hour, not `—`.
 
 **The Harness and Codex rows.** `harness_rows` adds the DeepSeek Harness's sessions (spec §3.8): a
 flash job named in a Claude Code transcript — its `flash-task-…` id or its `job-<8hex>` report id —
@@ -2728,15 +2802,18 @@ the Claude Code session in the history. A job first seen unlinked is recorded un
 id and folder; once it is linked its tokens go under the Claude Code session, and the total recorded
 so far is kept while its session file exists (`transcripts::prune_harness_recorded` drops it only
 when the file is gone). Another top-level Harness session is a row of its own, with the provider
-`DeepSeek Harness` and the status Busy or Idle; its agents are its workers. A worker's title and task
-are never stored: the title is not kept, and `task` is `None`. A session, agent or hour without any
+`DeepSeek Harness` and the status Busy or Idle; its agents are its workers. A worker's title is shown
+live as that agent's `task`; it is never written to the history, and `write_report` sets every
+agent's `task` to `None` before the host report is written, so other hosts never see it. A session, agent or hour without any
 token line is a known 0; a sum is unknown only when a part of it is unknown, and a missing value is
 shown as "—" with its reason in the tooltip. A model that runs under two providers is one sum per
 provider, never one mixed sum.
 
 `codex_rows` adds Codex's running sessions with the provider `Codex`: a session is running when its
-rollout file is held open or its last event is younger than `harness::HARNESS_QUIET_MINUTES` (30 min),
-and only running sessions are rows. Codex writes no history records of its own, so a Codex row lives
+rollout file is held open by any process or its last event is younger than
+`harness::HARNESS_QUIET_MINUTES` (30 min), and only running sessions are rows. A session id whose
+canonical path is in `open_files` counts, whatever the process is called. Codex writes no history
+records of its own, so a Codex row lives
 while it runs and leaves the list afterwards. Several rollout files of one session id are one
 session: its newest total in time over all the files counts. Its last hour is the newest total minus
 the newest total at or before `now - 60 min`, or the whole newest total when there is none; when any
@@ -2747,7 +2824,8 @@ without `total_token_usage` is a warning. A missing `cache_write_input_tokens` c
 **The process link.** `harness::RealProc` reads `/proc` on Linux (pids, open files, parent) and is
 empty on every other system, so `proc_links` and `proc_links_in` return no owner there and
 `codex_needs_process_walk` still decides whether the walk is worth it. `ProcLinks { owners, locks,
-files }` matches a job's process to a session through its parent chain and its open session file; a
+files, warnings }` matches a job's process to a session through its parent chain and its open session
+file; `warnings` carries the per-process read failures, which the caller shows once. A
 job whose result is in a transcript is linked by the transcript alone, on every system. A Codex
 session is running through its open rollout file only where the link exists; elsewhere its last event
 decides. `harness::is_running(session, lock_held, now)` is `!finished` and either the lock is held or
@@ -2864,7 +2942,7 @@ pub(crate) enum SumOf { All, Provider(String), Project(ProjectId),
     ProjectModel(ProjectId, String, Option<String>), ProviderModel(String, Option<String>),
     Model(Option<String>) }
 pub(crate) struct Sum { pub of: SumOf, pub sessions: u32, pub agents_running: u32,
-    pub agents_done: u32, pub tokens: Tokens, pub last_hour: Tokens,
+    pub agents_done: u32, pub tokens: Tokens, pub last_hour: Option<Tokens>,
     pub last_hour_values: Values, pub values: Values }
 pub(crate) struct SessionsView { pub at: DateTime<Utc>, pub this_host: Option<String>,
     pub hosts: Vec<HostState>, pub sessions: Vec<LiveSession>, pub sums: Vec<Sum>,
@@ -2883,17 +2961,24 @@ host that is not in
 stale) when there is a history, then the other hosts by name. `switch_effect` counts this host's
 running rows only, whatever `options.host` and `closed` say; `loses_thinking_busy` is the busy part
 of `loses_thinking`, and `loses_thinking_models` holds the distinct model ids of those sessions in
-the order their first session is listed. The account in use is not part of the view: the page reads
-it from the snapshot, like the pop-up does.
+the order their first session is listed. `add_agents` is the one rule that puts a session's linked
+flash/Harness workers on a row: it runs for a running row and the closed record counts the same
+workers, so Agents, Tokens and both values do not change when the session closes. The account in use
+is not part of the view: the page reads it from the snapshot, like the pop-up does.
 
 `sums` is built over exactly the sessions the view lists, by `sums_of`, so a group's total and the
 rows agree and the page never adds values. It has `All` (even for an empty list) and one key for
 each provider, project, project's provider and model, provider's model and model that has a session.
 `ProjectModel` is one project's provider and model (the project's model row); `ProviderModel` is one
 provider's model (the "By model" total row), while `Model` is the Models card's total over every
-provider. `Sum.tokens` and `Sum.last_hour` add the token counts; `Sum.last_hour_values` and
-`Sum.values` are `Values::sum` over the group's row values, so each half is all or nothing and two
-API currencies are not added; `agents_running` and `agents_done` add the row counts.
+provider. `Sum.tokens` adds the token counts; `Sum.last_hour` is `None` when any row of the group has
+an unknown last hour, never a sum over the rest; `Sum.last_hour_values` and `Sum.values` are
+`Values::sum` over the group's row values, so each half is all or nothing and two API currencies are
+not added; `agents_running` and `agents_done` add the row counts, and a total row with no agent data
+shows `—`. A model total row carries the `tied` bubble when its thinking is tied to the account.
+`switch_effect` counts only rows whose provider is `Claude Code` and whose model is absent or a plan
+model (`money::is_plan_model`, the id starts with `claude-`); Codex, Harness, flash and other models
+are left out.
 `LiveSession` carries `project_id: ProjectId` beside `project`: the post-join key groups two
 projects with the same name apart, while `project` is only the shown name.
 
@@ -2950,10 +3035,15 @@ client call on `tauri::async_runtime::spawn_blocking`. The large window's `Destr
   totals kept while a session file exists), `flash_jobs` (the job ids a transcript names) and
   `FileState.flash_tools` (the tool-result ids already read). All are `#[serde(default)]`. The state
   is a cache, and its version is `STATE_VERSION = 2`: version 2 keeps the last hour's tokens per
-  model. A state file of another version is discarded whole, and the transcripts are read again;
-  the sessions thread says so once, on stderr, with
-  `seatswap: the transcript state was written by an older version; reading the transcripts again`.
-  Nothing is lost: the history records were already written from the first read.
+  model. `ScanState::load` migrates a version 1 (1.1.0) file to version 2, keeping every offset, and
+  marks it changed so the next save writes it back, so no transcript is read again. A file of any
+  other version is an error, never a rebuild: `<path>: state version <found> is not supported; this seatswap reads
+  version 1 and version 2` (a higher version adds ` (the file was written by a newer seatswap)`).
+  The pass then reads no transcript and writes no token or session line; the window shows `the
+  transcript state cannot be read: <error>; no transcript is read until it can be. Deleting
+  <folder> reads every transcript again and writes its tokens to the history a second time`.
+  Deleting the folder makes the next pass read the transcripts from the start, and the records
+  already written are written again (the history appends without a dedupe).
 - `<data folder>/transcripts-state/harness.json` — the Harness half of the scan state: the recorded
   totals per Harness id and file (`HarnessRecorded { tokens, messages, file }`), the closed flash
   jobs (`ClosedJob { session, last }`) and the flags that say whether either changed. It sits beside
@@ -3068,8 +3158,8 @@ The shared helpers, used by more than one page:
 | Helper | Job |
 |---|---|
 | `accounts_without_price` | the account ids with at least one account week that has no price: stored accounts in `Ctx::accounts` order, then removed accounts by id |
-| `money_of` | the week's `money::window_money(price, final percent)`: `paid = 100 × pv`, `expired = max(0, 100 − final) × pv`, `used = paid − expired`; `None` without a price |
-| `lost_percent` | the window's `lost`; an error when the history lacks it, because seatswap always writes it |
+| `money_of` | the week's money: `paid = 100 × pv` for one week, `expired = the sum of every window's lost × pv`, `used = the week's summed use × pv`; `None` without a price. `offered_money` is `paid × the number of windows`, and `percent_of_offered` is the one Used/Expired share denominator |
+| `lost_percent` | the window's `lost`; a reset window's absent `lost` is 0, and any other window without it is an error, because seatswap always writes it |
 | `SwitchCounts`, `switch_counts` | `Switch` events of a range and host by `By::{User, Cli, Auto, Agent, External}` |
 | `week_columns` | Monday 00:00 local of the week holding `range.from`, then each following Monday 00:00 local while the start is before `range.to` |
 | `blocked_by_week`, `blocked_by_weekday` | spans split at every week start or local midnight; each part counts its working hours |
@@ -3112,14 +3202,20 @@ pub struct WeeksRow { pub id: String, pub plan: Option<String>, pub cells: Vec<O
     pub now_percent: Option<f64> }
 pub struct WeekCell { pub end: DateTime<Utc>, pub used: f64,
     /// One part per window of the account week, oldest first; their sum is `used`, and the page
-    /// draws one stack per part (a reset week has two).
-    pub parts: Vec<f64>, pub expired: f64,
+    /// draws one stack per part (a reset week has two). A part that ended below its start is 0.
+    pub parts: Vec<f64>,
+    /// The end of each window of `parts`, in the same order: a click on a part opens that
+    /// window's detail, also when the part shares its week.
+    pub window_ends: Vec<DateTime<Utc>>, pub expired: f64,
     pub expired_money: Option<f64>, pub full: bool, pub uncertain: bool }
 pub struct Curve { pub id: String, pub points: Vec<(DateTime<Utc>, f64)> }
 pub struct WeekSummary { pub week: DateTime<Utc>,
+    /// `used / offered × 100`, where the week offered one week's price per window (so a reset
+    /// week offers two); never divided by the one-week `paid`.
     pub used_percent_of_paid: Option<f64>, pub used: Option<f64>, pub expired: Option<f64>,
     pub money_missing: Option<String>, pub blocked_hours: f64, pub switches: SwitchCounts,
     pub switches_total: u64, pub per_account_percent: Vec<(String, f64)>,
+    /// `expired / offered × 100`, the same offered denominator as `used_percent_of_paid`.
     pub expired_percent_of_paid: Option<f64>,
     pub top_projects: Vec<(String, f64)>, pub tokens: Tokens, pub values: Values,
     pub used_change_percent: Option<f64>, pub conclusion: Vec<String> }
@@ -3189,6 +3285,13 @@ pub struct Lane { pub id: String, pub blocks: Vec<(DateTime<Utc>, DateTime<Utc>)
     pub resets: Vec<DateTime<Utc>> }
 pub fn forecast(ctx: &Ctx<Tz>, inputs: &Inputs, regime: &Regime) -> Result<Forecast, StatsError>;
 
+`ForecastAccount.low` is this week's percent now plus the second-lowest gain of the last 8 finished
+windows, at most 100, or `None` with fewer than four gains. A window's gain is its final percent
+minus the newest weekly reading at or before `end − d` that names its reset (`d` is the time from
+now to the reset the plan plays the account to). A reset window names its reset by its start + 7
+days, an ordinary window by its end. A week with a reset counts every one of its windows; a window
+without such a reading and a negative gain (a model reset's drop is not use) are left out.
+
 // activity.rs
 pub struct RhythmPage { pub heat: Vec<f64>, pub per_day: Vec<DayRow> }
 pub struct DayRow { pub weekday: u8, pub working_hours: f64, pub blocked_hours: f64 }
@@ -3203,7 +3306,7 @@ pub struct DayTokens { pub date: NaiveDate, pub out: Vec<(String, u64)> }
 pub struct ActivityWeek { pub week: DateTime<Utc>, pub working_hours: Vec<(String, u32)>,
     pub tokens: Tokens, pub values: Values, pub sessions: u32,
     pub top: Option<(String, String)> }
-pub struct BigSession { pub label: String, pub project: String, pub host: String,
+pub struct BigSession { pub label: String, pub title: Option<String>, pub project: String, pub host: String,
     pub model: Option<String>, pub worked_hours: u32, pub tokens: Tokens,
     pub values: Values, pub agents: Option<u32> }
 pub struct ActivityPage { pub lanes: Vec<HostLane>, pub days: Vec<DayTokens>,
@@ -3266,7 +3369,7 @@ Page details that are easy to miss:
   the day chart the 14 local dates ending with the date holding `range.to`, and the largest sessions
   are the 20 with the most output tokens. `HostLane::per_working_hour` is the lane's own output
   tokens over its working hours (`None` without one); `BigSession::agents` is `None` while the
-  session has no `SessionRecord`. The "What it shows" sentence says "night(s) with work on <host>";
+  session has no `SessionRecord`; `BigSession::title` is the newest record's title. The "What it shows" sentence says "night(s) with work on <host>";
   the hour lanes carry no agent data.
 - `ActivityPage::ollama` is Ollama's own use: Ollama's hourly line (input + output) minus the tokens
   of every known session on an Ollama model in that UTC hour, over every host whatever the page's
@@ -3625,10 +3728,10 @@ dependency, so a code point outside those tables counts as one column; an East A
 character counts one column even where a terminal draws it two.
 
 A `Separator` segment prints its own `separator.unwrap_or(Pipe).text()`; it has no payload value and
-never goes missing. Its prefix and suffix are printed like any other segment's. A suffix keeps the
-value's foreground when the colour rule paints no background (so a unit stays the value's colour and
-`ansi` writes it as one run with the value); when the rule paints a background the suffix is plain,
-so the colour stops at the value.
+never goes missing. Its prefix and suffix are printed like any other segment's. The one `edge_fg`
+rule gives the prefix and the suffix the value's foreground when the colour rule paints no
+background (so a unit or a bracket stays the value's colour and `ansi` writes it as one run with the
+value); when the rule paints a background both are plain, so the colour stops at the value.
 
 ## the field path table and the three new segments (step C4)
 
@@ -4484,6 +4587,9 @@ pub struct HarnessPaths { pub sessions: PathBuf,   // $DSH_HOME/sessions, else ~
                                                    // ~/.local/state/flash-agents
 impl HarnessPaths {
     pub fn resolve() -> Result<HarnessPaths, PathsError>;           // the app only
+    pub fn resolve_with(env_dsh_home: Option<OsString>,
+                        env_xdg_state_home: Option<OsString>,
+                        home: &Path) -> Result<HarnessPaths, PathsError>; // tests, one resolver
     pub fn at(sessions: PathBuf, reports: PathBuf) -> HarnessPaths; // tests
 }
 pub struct HarnessSession { pub id: String, pub file: PathBuf, pub parent: Option<String>,
@@ -4500,17 +4606,16 @@ pub fn sessions(paths: &HarnessPaths, since: DateTime<Utc>) -> HarnessRead;
 pub fn links(paths: &HarnessPaths, seen: &BTreeMap<String, SessionSeen>,
     closed: &BTreeMap<String, ClosedJob>) -> HarnessLinks;
 
-pub trait ProcSource { fn pids(&self) -> Vec<u32>; fn open_files(&self, pid: u32) -> Vec<PathBuf>;
+pub trait ProcSource { fn pids(&self) -> io::Result<Vec<u32>>;
+                       fn open_files(&self, pid: u32) -> io::Result<Vec<PathBuf>>;
                        fn parent(&self, pid: u32) -> Option<u32>; }
 pub struct RealProc;                                    // /proc on Linux; empty elsewhere
 pub struct ProcLinks { pub owners: BTreeMap<String, String>,
-    pub locks: BTreeSet<String>, pub files: BTreeSet<PathBuf> }
+    pub locks: BTreeSet<String>, pub files: BTreeSet<PathBuf>, pub warnings: Vec<String> }
 pub fn proc_links(paths: &HarnessPaths, procs: &dyn ProcSource,
     claude_pids: &BTreeMap<u32, String>) -> ProcLinks;
 pub fn proc_links_in(sessions: Option<&Path>, procs: &dyn ProcSource,
     claude_pids: &BTreeMap<u32, String>) -> ProcLinks;   // Linux only; default elsewhere
-pub fn running_owners(paths: &HarnessPaths, procs: &dyn ProcSource,
-    claude_pids: &BTreeMap<u32, String>) -> BTreeMap<String, String>;
 pub fn is_running(session: &HarnessSession, lock_held: bool, now: DateTime<Utc>) -> bool;
 ```
 
@@ -4552,7 +4657,8 @@ and the line, and the rest is still read; a file without `session_meta` is a war
 
 A `token_count` with `info: null` is Codex's normal line before the first answer: it changes nothing
 and is no warning. One whose `info` is an object without `total_token_usage`, and one with no `info`
-key, are warnings. `cache_write_input_tokens` missing counts as 0. Two rollout files with the same
+key, are warnings. `token_usage_record` lines are not read at all. `cache_write_input_tokens`
+missing counts as 0. Two rollout files with the same
 session id are one session: the file whose last event is newer gives the model, `busy` and `last`,
 `started` is the earlier, and `tokens` is the newest total in time over all files, so a newer file
 without a total changes no token. `last_hour` is the newest total minus the newest total at or before

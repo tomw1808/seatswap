@@ -1151,11 +1151,9 @@ function priceBlock() {
   paintToggle();
   const line = pricesLine(times);
   line.appendChild(toggle);
+  // The look-up's error and the models it left out are shown once, under
+  // the General group's API prices row (spec §11.5), not again here.
   const node = h("div", { class: "price-block" }, [line, body]);
-  const problem = priceProblemNode(view, times);
-  if (problem) node.appendChild(problem);
-  const leftOut = leftOutLine(view);
-  if (leftOut) node.appendChild(leftOut);
   state.priceNode = node;
   state.priceKey = key;
   fillTimeNodes(times);

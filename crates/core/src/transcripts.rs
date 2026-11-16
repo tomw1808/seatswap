@@ -216,6 +216,11 @@ pub struct FileState {
     /// an old state file means none.
     #[serde(default)]
     pub flash_tools: BTreeSet<String>,
+    /// A title this file's `ai-title` line gave while its session had no
+    /// answer or user turn yet; it reaches the session in the scan that first
+    /// sees one. Absent means none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// What a main transcript says about its session.
@@ -265,6 +270,11 @@ pub struct SessionSeen {
     /// file means none.
     #[serde(default)]
     pub flash_jobs: BTreeSet<String>,
+    /// The `aiTitle` of the last `ai-title` line of the session's own
+    /// transcript, as Claude Code wrote it; absent in a state file written
+    /// before this field means none, and no transcript is read again for it.
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 impl SessionSeen {
@@ -1428,6 +1438,7 @@ impl From<StateFileV1> for StateFile {
                             recent: file.recent,
                             last_answer: file.last_answer,
                             flash_tools: BTreeSet::new(),
+                            title: None,
                         },
                     )
                 })
@@ -1456,6 +1467,7 @@ impl From<StateFileV1> for StateFile {
                             recent: Vec::new(),
                             recorded: seen.recorded,
                             flash_jobs: BTreeSet::new(),
+                            title: None,
                         },
                     )
                 })
@@ -1523,6 +1535,10 @@ struct FileScan {
     /// The message ids of this scan, with the index of their answer.
     ids: HashMap<String, usize>,
     unreadable: usize,
+    /// The `ai-title` of this scan: `Some` when the file had such a line, and
+    /// its `None` when that title was empty. Applied after the lines, so a
+    /// title line before the session's first answer still reaches it.
+    title: Option<Option<String>>,
 }
 
 /// An `Agent` or `Task` call of a `tool_use` block: the id its meta file names,
@@ -1556,6 +1572,7 @@ impl ScanRun<'_> {
                 recent: Vec::new(),
                 last_answer: None,
                 flash_tools: BTreeSet::new(),
+                title: None,
             },
         };
         let mut file = match File::open(&candidate.path) {
@@ -1626,6 +1643,7 @@ impl ScanRun<'_> {
             events: Vec::new(),
             ids: HashMap::new(),
             unreadable: 0,
+            title: None,
         };
         let mut pending: Vec<u8> = Vec::new();
         // The file offset of pending[0].
@@ -1695,7 +1713,23 @@ impl ScanRun<'_> {
                 candidate.key, file_scan.unreadable
             ));
         }
+        let title = file_scan.title.take();
         self.apply_events(&candidate.session, file_scan.events);
+        // This scan's title, else one that waited in the file's state for its
+        // session to appear.
+        let title = title.or_else(|| file_state.title.take().map(Some));
+        if let Some(title) = title {
+            match self.state.sessions.get_mut(&candidate.session) {
+                Some(seen) => {
+                    file_state.title = None;
+                    if seen.title != title {
+                        seen.title = title;
+                        self.state.mark_changed(&candidate.folder);
+                    }
+                }
+                None => file_state.title = title,
+            }
+        }
         if self.state.files.get(&candidate.key) != Some(&file_state) {
             self.state.files.insert(candidate.key.clone(), file_state);
             self.state.mark_changed(&candidate.folder);
@@ -1745,6 +1779,10 @@ impl ScanRun<'_> {
             file.unreadable += 1;
             return;
         };
+        if head.kind == "ai-title" {
+            self.title(reading, text, file);
+            return;
+        }
         if head.kind != "assistant" && head.kind != "user" {
             // attachment, system, api-request, queue-operation, …: skipped quietly.
             return;
@@ -1758,6 +1796,29 @@ impl ScanRun<'_> {
         } else {
             self.user(reading, &line, file);
         }
+    }
+
+    /// An `ai-title` line: Claude Code's own title of the session, as written.
+    /// An agent's transcript never names its session; a line of this type
+    /// without a string `aiTitle` is unreadable like a broken answer. An empty
+    /// or all-space title is no title. No other text of the line is kept.
+    fn title(&mut self, reading: &Reading, text: &str, file: &mut FileScan) {
+        if reading.agent.is_some() {
+            return;
+        }
+        let Ok(line) = serde_json::from_str::<TitleLine>(text) else {
+            file.unreadable += 1;
+            return;
+        };
+        let Some(title) = line.ai_title else {
+            file.unreadable += 1;
+            return;
+        };
+        file.title = Some(if title.trim().is_empty() {
+            None
+        } else {
+            Some(title)
+        });
     }
 
     fn assistant(&mut self, reading: &Reading, line: &Line, file: &mut FileScan) {
@@ -1957,6 +2018,7 @@ impl ScanRun<'_> {
                 recent: Vec::new(),
                 recorded: None,
                 flash_jobs: BTreeSet::new(),
+                title: None,
             });
         if at >= seen.last {
             if let Some(cwd) = cwd {
@@ -2346,6 +2408,14 @@ fn answer_cwd(answer: &Answer, state: &ScanState) -> String {
 struct LineType {
     #[serde(rename = "type")]
     kind: String,
+}
+
+/// An `ai-title` line: only its `aiTitle` is read; every other field and text
+/// of the line is dropped as it is read.
+#[derive(Deserialize)]
+struct TitleLine {
+    #[serde(rename = "aiTitle")]
+    ai_title: Option<String>,
 }
 
 /// A transcript line, as far as seatswap looks at it: never a message text.
@@ -2848,6 +2918,15 @@ mod tests {
         .to_string()
     }
 
+    fn ai_title(title: &str) -> String {
+        serde_json::json!({
+            "type": "ai-title",
+            "aiTitle": title,
+            "sessionId": SESSION,
+        })
+        .to_string()
+    }
+
     fn meta_of(finished: Option<bool>, tool_use_id: &str, spawn_depth: u32) -> String {
         let mut value = serde_json::json!({
             "agentType": "general-purpose",
@@ -3154,6 +3233,128 @@ mod tests {
         assert!(scan.user_turns.is_empty());
         assert!(scan.warnings.is_empty(), "{:?}", scan.warnings);
         assert!(scan.complete);
+    }
+
+    #[test]
+    fn the_last_ai_title_names_the_session() {
+        let (_tmp, claude, _app) = fixture();
+        write_lines(
+            &folder(&claude, FOLDER),
+            &format!("{SESSION}.jsonl"),
+            &[
+                // A title line before the session's first user turn in the same
+                // scan is applied after the scan's lines; the last title wins.
+                ai_title("Fix the invoice export"),
+                user_string("fix the failing tests", "2026-11-12T09:40:58.101Z"),
+                ai_title("Ledger import speed-up"),
+            ],
+        );
+
+        let (state, scan) = scan_run(&claude);
+
+        assert!(scan.warnings.is_empty(), "{:?}", scan.warnings);
+        assert_eq!(
+            state.sessions[SESSION].title.as_deref(),
+            Some("Ledger import speed-up")
+        );
+    }
+
+    /// Review S-4: a title line read before the session has any answer or user
+    /// line waits in the file's state, so the title is not lost when the file
+    /// offset moves past it.
+    #[test]
+    fn a_title_before_the_first_answer_is_kept_after_a_later_scan() {
+        let (_tmp, claude, _app) = fixture();
+        let path = write_lines(
+            &folder(&claude, FOLDER),
+            &format!("{SESSION}.jsonl"),
+            &[ai_title("Fix the invoice export")],
+        );
+        let mut state = ScanState::default();
+        scan_commit(&claude, &mut state, BUDGET);
+        append(
+            &path,
+            &user_string("fix the failing tests", "2026-11-12T09:40:58.101Z"),
+        );
+        append(&path, &answer("msg_a", AT));
+        scan_commit(&claude, &mut state, BUDGET);
+
+        assert_eq!(
+            state.sessions[SESSION].title.as_deref(),
+            Some("Fix the invoice export")
+        );
+    }
+
+    #[test]
+    fn an_ai_title_without_a_title_is_unreadable() {
+        let (_tmp, claude, _app) = fixture();
+        write_lines(
+            &folder(&claude, FOLDER),
+            &format!("{SESSION}.jsonl"),
+            &[
+                user_string("fix the failing tests", "2026-11-12T09:40:58.101Z"),
+                serde_json::json!({"type": "ai-title", "sessionId": SESSION}).to_string(),
+            ],
+        );
+
+        let (state, scan) = scan_run(&claude);
+
+        assert_eq!(state.sessions[SESSION].title, None);
+        assert_eq!(
+            scan.warnings,
+            vec![format!("{KEY}: 1 lines could not be read")]
+        );
+    }
+
+    #[test]
+    fn a_title_is_stored_as_written_and_an_empty_one_is_no_title() {
+        let (_tmp, claude, _app) = fixture();
+        let path = write_lines(
+            &folder(&claude, FOLDER),
+            &format!("{SESSION}.jsonl"),
+            &[
+                user_string("fix the failing tests", "2026-11-12T09:40:58.101Z"),
+                ai_title("  Fix the invoice export  "),
+            ],
+        );
+        let (mut state, scan) = scan_run(&claude);
+        assert!(scan.warnings.is_empty(), "{:?}", scan.warnings);
+        assert_eq!(
+            state.sessions[SESSION].title.as_deref(),
+            Some("  Fix the invoice export  "),
+            "the title is stored as written"
+        );
+
+        append(&path, &ai_title("   "));
+        let scan = scan_commit(&claude, &mut state, BUDGET);
+        assert!(scan.warnings.is_empty(), "{:?}", scan.warnings);
+        assert_eq!(
+            state.sessions[SESSION].title, None,
+            "an all-space title is no title"
+        );
+    }
+
+    #[test]
+    fn an_agents_transcript_does_not_set_the_title() {
+        let (_tmp, claude, _app) = fixture();
+        write_lines(
+            &folder(&claude, FOLDER),
+            &format!("{SESSION}.jsonl"),
+            &[
+                user_string("fix the failing tests", "2026-11-12T09:40:58.101Z"),
+                answer("msg_a", AT),
+            ],
+        );
+        write_lines(
+            &folder(&claude, FOLDER).join(SESSION).join("subagents"),
+            "agent-a875.jsonl",
+            &[ai_title("Fix the invoice export")],
+        );
+
+        let (state, scan) = scan_run(&claude);
+
+        assert_eq!(state.sessions[SESSION].title, None);
+        assert!(scan.warnings.is_empty(), "{:?}", scan.warnings);
     }
 
     #[test]

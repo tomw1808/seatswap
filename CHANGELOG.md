@@ -22,11 +22,16 @@ All notable changes to this project are documented here. The format follows
   from Dropbox's own `info.json`; Use saves it as the history folder. A file that cannot be read is
   shown with its path and why.
 - The tray menu has *Sessions…* and *Statistics…*, each opening the large window at that area; they
-  sit between *Add account…* and *Settings…*. *Open seatswap…* is gone.
+  sit between *Add account…* and *Settings…*.
 - The Settings area has no second heading under its tab.
 - The Settings menu stays on screen while the content pane scrolls.
 
 **Sessions**
+- A Claude Code session is named by its own title, the one VS Code and `/resume` show, with its
+  label (`atlas-a6`) as a small grey tag after it; a long title is cut and shown whole on hover. The
+  waiting notification and Activity's largest sessions name the session by its title too. The title is read from the transcript's
+  `ai-title` lines and stored in the session records, so it travels with a shared history folder; a
+  session closed before this version keeps its label until its next title line.
 - Codex sessions (provider "Codex") beside Claude Code's, read from Codex's rollout files: their
   session id, folder, model, token counts and times. A Codex session counts as running while a
   process holds its file open or its last event is younger than 30 minutes. A token total that went
@@ -36,24 +41,31 @@ All notable changes to this project are documented here. The format follows
   named in a transcript is linked there; on Windows a running job appears once its result is
   collected.
 - Every total row shows the same numbers as a session row: Agents, Tokens, Last hour, value and API
-  value. A model under two providers has one sum per provider.
+  value. A model under two providers has one sum per provider; a model total row carries the
+  "thinking tied" bubble, and a total's Agents shows "—" when every row it sums has no agent data.
 - The "thinking tied to the account" bubble replaces the brown dot in the Models card and the words
   on a tied model's row in the By model tree; it also marks each session row that has it.
 - The last hour has its EUR and API EUR values, the "N completed" agents line has its total, and a
   done agent without a price keeps its reason in the sum.
+- A total's last hour is "—" when any row it sums has an unknown one. A known 0 is an empty last
+  hour, not "—".
+- A running session counts its linked flash/Harness workers in Agents, Tokens and both values
+  exactly as its closed row does, so nothing jumps when it closes.
+- A shown duration under a minute counts its seconds, redrawn once a second.
+- A blocking 5 h, week or model limit that drops early sends `PR is usable again: its week was reset
+  early.` (or `its 5h window was reset early` / `its {model} week was reset early`) at once, once per
+  account and reset.
 - Claude Code's own `cost.total_cost_usd` from the status line becomes the session's API value. An
   absent cost is no cost; a cost that is not a finite number of 0 or more is not stored, and the
   window shows the reason as a warning while it lasts.
 
 **Status line**
 - A separator's character is chosen from pipe `│`, middle dot `·`, bullet `•`, slash `/`, chevron
-  `›` or blank; a new separator starts as ` │ `. A separator saved by 1.1.0, without a character,
-  is a pipe.
+  `›` or blank; a new separator starts as ` │ `.
 - Spaces in a segment's prefix and suffix are shown as a faint dot and a count, such as "2 spaces".
 - A segment is removed by dropping it on the Segments box ("drop here to remove") or with the
   Options card's *Remove*; Delete keeps working.
-- The account tag's background covers its letters only, and a segment's suffix keeps the value's
-  colour when no background is painted.
+- The account tag's background covers its letters only.
 
 **History and statistics**
 - A limit drop of at least one percentage point before its reset time ends the window as a reset,
@@ -61,17 +73,25 @@ All notable changes to this project are documented here. The format follows
   reset keeps its use, the next window records the percent it began at (`from`), and a week may use
   more than 100 %.
 - A week keeps every window it offered, the one before an early reset and the one after, each placed
-  by its own midpoint. A reset window counts nothing as expired, so a reset week's used and expired
-  money can be more than one week's price.
+  by its own midpoint; a week can hold more than one ordinary window too. A reset window counts
+  nothing as expired, and a week's expired share is the sum of every window's, so a reset week's
+  used and expired money can be more than one week's price.
+- A week's Used and Expired percentages and its summary divide by the windows the week offered, not
+  by one week's price.
+- In Weeks, a cell draws the used part as a bar and the expired share as a hatched band from the
+  top; a click on a part opens that window's detail, also when it shares its week.
+- One window seen by two hosts counts once: the reset record wins over an ordinary record, and of
+  two ordinary records the one with the latest last reading.
 - Overview's Used and Expired shares are of the windows the week offered; a window above 100 %
   counts its whole use, so both shares together can pass 100 % and nothing is cut. Its Blocked line
   names the added account by its short name, also when the account filter leaves it out.
 - Overview shows Used and Expired with their percentages, a Switches total and "auto-burn"; Weeks
   shows plan and weekly price, "of about N possible" (or "N used, more than the about M your usual
   working hours hold"), the 100 % line, the "now" mark and clickable weeks with their detail;
-  Projects shows its totals, the Used footer, each project's share of all use, the "API values at
-  1 USD = …" line and the by-account bar in the account colours; Forecast shows its missing labels,
-  "about N a day" and the "none usable" lane last.
+  Projects shows its matrix totals, the Used footer, each project's share of all use, the "API values
+  at 1 USD = …" line and the by-account bar in the account colours; a share that cannot be computed
+  is "—" with its reason, never "0 %"; Forecast shows its missing labels, "about N a day" and the
+  "none usable" lane last.
 - Activity shows a total tokens box, the "What it shows" sentence ("night(s) with work on <host>"),
   the sum over hosts, a "running" tag on the current week, a taller hour chart and host names that
   wrap instead of being cut.
@@ -95,12 +115,17 @@ All notable changes to this project are documented here. The format follows
 - The model list lives in Settings → Providers, under "API prices from models.dev · checked 11:11",
   and is read-only.
 - Claude Code's own reported cost beats a models.dev price; a model with neither has no API value. A
-  Claude Code model without a price is asked for from models.dev at once, at most once per model
-  and hour.
+  Claude plan model (its id starts with `claude-`) without a price is asked for from models.dev at
+  once, at most once per model and hour; a model outside the plan is never asked for.
+- With a currency set and no stored dollar rate yet, API values are shown in US dollars labelled USD,
+  and the settings row says `no rate yet: API values are shown in USD`; they are not unknown. With
+  the look-ups off the same USD label says `look-ups are off: API values are shown in USD`.
 
 **Other**
 - The Swap S icon: a lowercase s with arrow ends on a green square, for the launcher, the Windows
-  `.exe`, notifications and every window. The tray icon stays the live one.
+  `.exe`, notifications and every window. The tray icon stays the live one. Notifications show
+  `<data folder>/notification-icon.png`, written when it is missing or holds another picture; no
+  installed icon file is needed.
 - Durations are written without a space between number and unit: `2h 31min`, `4h`, `12min`,
   `3d 4h`; from a day on, the minutes are not shown.
 - A session, agent or hour without tokens is worth a known 0, not an unknown value. A sum is
@@ -109,15 +134,32 @@ All notable changes to this project are documented here. The format follows
 ### Changed
 - With *Look up prices and the dollar rate* off, API values stay in US dollars and the column header
   says so.
+- A status line saved by 1.1.0 with a separator that had no character now prints `│` where 1.1.0
+  printed ASCII `|`. A segment's prefix and suffix keep the value's colour when no background is
+  painted.
+- A model outside the Claude plan (its id does not start with `claude-`) never takes part in a Claude
+  account's week: its subscription value is a known 0 and it never makes the week unknown. *If you
+  switched now* counts only Claude Code rows on plan models (or with no model known yet).
+- A reset is measured against the last poll reading only: the status line's merged number can never
+  show one, and a pair of readings that is a reset is left out of auto-burn's learned rates.
+- The status line feed is rewritten when the session, its cost or a cost problem changes, not only
+  when the 5 h or weekly numbers change, so a session's cost is seen within seconds.
 - An agent without Claude Code's `finished` mark counts as done once its transcript ends with the
   agent's final answer (`stop_reason` `end_turn`); a resumed agent counts as running again.
 
 ### Fixed
-- Settings: the focus frame in table fields shows all four sides; the Join projects line no longer
-  overlaps its button; the money rows no longer flicker; and the Activity page's Per week / Largest
-  sessions switch sits inside its frame.
+- Settings: every row wraps at 1100 px and below (the label takes the first line, the control the
+  second); the focus frame in table fields shows all four sides; the Join projects line no longer
+  overlaps its button; the money rows no longer flicker; a missing rate shows "—" with its reason in
+  the note, and the API prices row says `checked Fri 13 Nov 11:11`; and the Activity page's Per week
+  / Largest sessions switch sits inside its frame.
 - Sessions: "In use" wraps inside its box instead of overflowing, and a session without agent data
-  shows "—", not "0 · 0".
+  shows "—", not "0 · 0". A Codex rollout counts as running while any process holds its file open,
+  not only a process named `codex`. The Sessions area still reads Codex's rollout files while the
+  Codex card is off, as long as *Read Claude Code's session files* is on.
+- A transcript state written by 1.1.0 is migrated to version 2, keeping its offsets, and written
+  back as version 2 on the next save, so no transcript is read or recorded twice; a state of another
+  version is an error and that pass reads nothing, instead of being rebuilt.
 - A rate-limited request says when seatswap asks again, such as "Claude limits how often seatswap
   may ask; next try at 10:42", instead of "rate limited; retry after Some(0) seconds".
 

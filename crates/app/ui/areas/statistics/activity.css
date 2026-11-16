@@ -247,6 +247,10 @@ html[data-theme="light"] .stats-activity {
 }
 
 .stats-act-session-label {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
   font-size: 11px;
 }
 

@@ -1462,6 +1462,7 @@ mod tests {
                     .to_string(),
                 project: ProjectKey::Repo("github.com/sam/atlas".to_string()),
                 entrypoint: Some("cli".to_string()),
+                title: None,
                 first: at,
                 last: at,
                 agents_started: 0,

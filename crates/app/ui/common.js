@@ -1055,6 +1055,26 @@ function tokens(n) {
   return `${(n / 1000000).toFixed(1)} M`;
 }
 
+// The one way a session is named on a page (the Sessions rows, Activity's
+// largest sessions): Claude Code's own title when the data has one, with the
+// label (`atlas-a6`) as a small grey tag after it; the label alone otherwise.
+// A long title is cut by CSS (window.css) and its whole text is the hover text.
+// Returns the nodes to put inside the name's element.
+function sessionName(item) {
+  if (typeof item.label !== "string" || item.label === "") {
+    throw new Error(`a session without a label: ${String(item.session)}`);
+  }
+  const label = item.label;
+  const title = typeof item.title === "string" && item.title !== "" ? item.title : null;
+  if (title === null) {
+    return [h("span", { class: "session-title", title: label }, label)];
+  }
+  return [
+    h("span", { class: "session-title", title, dataset: { title: "true" } }, title),
+    h("span", { class: "session-label-tag", title: `session label ${label}` }, label),
+  ];
+}
+
 export {
   PALETTE,
   TRAY_GREY,
@@ -1063,6 +1083,7 @@ export {
   MODEL_NAMES,
   modelColor,
   modelName,
+  sessionName,
   WEEKDAYS,
   TAURI_GLOBAL,
   HAS_TAURI,

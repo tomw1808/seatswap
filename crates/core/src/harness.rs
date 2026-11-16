@@ -1305,6 +1305,7 @@ mod tests {
             recent: Vec::new(),
             recorded: None,
             flash_jobs: BTreeSet::new(),
+            title: None,
         }
     }
 

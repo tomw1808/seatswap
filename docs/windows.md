@@ -349,7 +349,6 @@ No git commits (AGENTS.md rule 7).
 
 - Installer, code signing, winget. The first Windows release is a zip with the two programs.
 - Explicit Windows permissions (ACLs) on the data folder or the fallback secret files.
-- A notification icon (`IconUri`); it needs an installed icon file.
 - Treating two spellings of the config folder that differ only in upper and lower case as the same folder.
 - macOS.
 
@@ -364,6 +363,8 @@ No git commits (AGENTS.md rule 7).
 - The tooltip limit is a constant per platform (`TOOLTIP_LIMIT`, none on Linux), so `fit_tooltip` is used everywhere.
 
 **Changed afterwards:** a program path or folder argument that is not valid Unicode is now an error on both platforms (`AutostartError::NotUnicode`, from the one `path_text`). Before, `startup_arguments` and the Linux `Exec` line wrote such a path with its odd characters replaced.
+
+**Changed in 1.2.0:** a notification's icon no longer needs an installed icon file: the app writes `<data folder>/notification-icon.png` when it is missing or holds another picture, and passes that path as the toast image (`IconUri`) on Windows and the image on Linux.
 
 **Checked afterwards in Claude Code 2.1.322:** every save of `.credentials.json` runs under `.storage-write.lock`, including the saves of `designOauth` and `cloudSessionsOauth`. The lock order in section 7 is therefore the one Claude Code uses.
 
@@ -391,20 +392,24 @@ beside them.
 
 | What | Windows path | Resolved by |
 |---|---|---|
-| Codex's login and rollouts | `%USERPROFILE%\.codex`, or `$CODEX_HOME`, or the `codexHome` setting; rollouts below `<home>\sessions\YYYY\MM\DD\rollout-*.jsonl` | `paths::CodexPaths::resolve` |
-| DeepSeek Harness sessions | `%USERPROFILE%\.dsh\sessions`, or `$DSH_HOME\sessions` | `harness::HarnessPaths::resolve` |
-| flash-agents job reports | `%USERPROFILE%\.local\state\flash-agents`, or `$XDG_STATE_HOME\flash-agents`; a report is `<state>\flash-agents\<key>\patches\job-<id>.report.json` | `harness::HarnessPaths::resolve` |
+| Codex's login and rollouts | `%USERPROFILE%\.codex`, or `$CODEX_HOME`, or the `codexHome` setting; rollouts below `<home>\sessions\YYYY\MM\DD\rollout-*.jsonl` | `paths::CodexPaths::resolve` (`resolve_with` for tests) |
+| DeepSeek Harness sessions | `%USERPROFILE%\.dsh\sessions`, or `$DSH_HOME/sessions` | `paths::harness_folders`, through `HarnessPaths::resolve` (`resolve_with` for tests) |
+| flash-agents job reports | `%USERPROFILE%\.local\state\flash-agents`, or `$XDG_STATE_HOME\flash-agents`; a report is `<state>\flash-agents\<key>\patches\job-<id>.report.json` | `paths::harness_folders`, through `HarnessPaths::resolve` (`resolve_with` for tests) |
 | Dropbox's `info.json` | `%APPDATA%\Dropbox\info.json` first, then `%LOCALAPPDATA%\Dropbox\info.json`; the first one that exists is used | `paths::dropbox_folder` |
 
 A missing Dropbox `info.json` is no suggestion; a broken one is an error naming the file, shown on the
 Settings page.
 
 A setting or a variable that names a Codex or Harness folder must be an absolute path; a relative one
-is an error, never resolved against the current folder.
+is an error naming its source and value, never resolved against the current folder. Codex's is
+`PathsError::RelativeCodexHome` (`the Codex folder (codexHome or $CODEX_HOME) must be an absolute
+path, got …`); `$DSH_HOME` and `$XDG_STATE_HOME` give
+`PathsError::RelativeHarnessFolder { variable, value }` (`${variable} must be an absolute path, got
+{value}`).
 
 **The process link does not exist on Windows.** `harness::RealProc` has no `/proc` to walk there, so
-it reports no process, no open file and no parent: `proc_links` and `running_owners` return no link,
-and no Codex rollout is matched through an open file. A worker job is therefore linked to its Claude
+it reports no process, no open file and no parent: `proc_links` returns no link, and no Codex rollout
+is matched through an open file. A worker job is therefore linked to its Claude
 Code session once its result is in that session's transcript; before that it is a row of its own,
 under its own Harness id and folder. Codex's running rule keeps its other half on Windows: a session
 whose last event is younger than the Harness quiet time is running. A running job whose result no

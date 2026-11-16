@@ -184,6 +184,9 @@ pub(crate) struct SessionsSummary {
 pub(crate) struct Waiting {
     pub session: String,
     pub label: String,
+    /// Claude Code's own title of the session; the waiting notification names
+    /// the session by it when it is known, else by `label`.
+    pub title: Option<String>,
     pub project: String,
     pub since: DateTime<Utc>,
     /// The host the session runs on; `None` is this host.

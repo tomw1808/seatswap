@@ -464,6 +464,10 @@ pub struct SessionRecord {
     pub project: ProjectKey,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<String>,
+    /// Claude Code's own title of the session, when it has one. Absent in a
+    /// record written before this field means none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub first: DateTime<Utc>,
     pub last: DateTime<Utc>,
     pub agents_started: u32,
@@ -942,6 +946,22 @@ mod tests {
         }
     }
 
+    fn a_session_record(t: DateTime<Utc>, title: Option<String>) -> SessionRecord {
+        SessionRecord {
+            t,
+            session: "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34".to_string(),
+            cwd: "/home/sam/projects/atlas".to_string(),
+            project: ProjectKey::Repo("github.com/sam/atlas".to_string()),
+            entrypoint: Some("cli".to_string()),
+            title,
+            first: t,
+            last: t,
+            agents_started: 0,
+            agents_finished: 0,
+            closed: false,
+        }
+    }
+
     #[test]
     fn a_sample_round_trips_with_the_short_keys() {
         let dir = tempdir().unwrap();
@@ -993,6 +1013,49 @@ mod tests {
         let read = history.read::<Sample>(&wide_range(), &Hosts::All).unwrap();
         assert_eq!(read.records.len(), 1);
         assert_eq!(read.records[0].record, sample);
+    }
+
+    #[test]
+    fn a_session_record_round_trips_its_title() {
+        let dir = tempdir().unwrap();
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let record = a_session_record(
+            utc("2026-11-14T10:00:00Z"),
+            Some("Fix the invoice export".to_string()),
+        );
+        history.append(&record).unwrap();
+
+        let read = history
+            .read::<SessionRecord>(&wide_range(), &Hosts::All)
+            .unwrap();
+        assert_eq!(read.records.len(), 1);
+        assert_eq!(
+            read.records[0].record.title.as_deref(),
+            Some("Fix the invoice export")
+        );
+    }
+
+    #[test]
+    fn a_1_1_session_record_reads_without_a_title() {
+        // The SessionRecord line 1.1.0 wrote: no `title` key at all.
+        let line = serde_json::json!({
+            "t": "2026-11-14T10:00:00Z",
+            "session": "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34",
+            "cwd": "/home/sam/projects/atlas",
+            "project": {"kind": "repo", "id": "github.com/sam/atlas"},
+            "entrypoint": "cli",
+            "first": "2026-11-14T09:00:00Z",
+            "last": "2026-11-14T10:00:00Z",
+            "agentsStarted": 2,
+            "agentsFinished": 1,
+            "closed": true
+        })
+        .to_string();
+
+        let record: SessionRecord = serde_json::from_str(&line).unwrap();
+
+        assert_eq!(record.title, None);
+        assert_eq!(record.session, "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34");
     }
 
     #[test]

@@ -132,6 +132,10 @@ pub struct ActivityWeek {
 pub struct BigSession {
     /// `<project>-<first two characters of the session id>`.
     pub label: String,
+    /// Claude Code's own title of the session from its newest
+    /// [`SessionRecord`]; `None` without one or without a title. The page
+    /// names the session by it, with the label as a tag.
+    pub title: Option<String>,
     pub project: String,
     pub host: String,
     /// The model with the most output tokens; `None` without tokens.
@@ -825,34 +829,34 @@ fn largest_sessions<Tz: TimeZone + Copy>(
     let read = keep_warnings(ctx.warnings, || {
         ctx.history.read::<SessionRecord>(&Range::ALL, &Hosts::All)
     })?;
-    let mut agents: BTreeMap<(String, String), (DateTime<Utc>, u32)> = BTreeMap::new();
+    // The newest session record of each session: its time, agents and title.
+    let mut newest_records: BTreeMap<(String, String), &SessionRecord> = BTreeMap::new();
     for hosted in &read.records {
         let record = &hosted.record;
-        agents
+        newest_records
             .entry((hosted.host.clone(), record.session.clone()))
             .and_modify(|newest| {
-                if record.t > newest.0 {
-                    *newest = (record.t, record.agents_started);
+                if record.t > newest.t {
+                    *newest = record;
                 }
             })
-            .or_insert((record.t, record.agents_started));
+            .or_insert(record);
     }
 
     let mut largest: Vec<BigSession> = sums
         .into_values()
         .map(|sum| {
-            let agents_started = agents
-                .get(&(sum.host.clone(), sum.session.clone()))
-                .map(|(_, started)| *started);
+            let newest = newest_records.get(&(sum.host.clone(), sum.session.clone()));
             BigSession {
                 label: session_label(&sum.project, &sum.session),
+                title: newest.and_then(|record| record.title.clone()),
                 project: sum.project,
                 host: sum.host,
                 model: most_output(&sum.by_model),
                 worked_hours: sum.hours.len() as u32,
                 tokens: sum.tokens,
                 values: Values::of(&sum.valued, ctx.settings, ctx.fx, ctx.now),
-                agents: agents_started,
+                agents: newest.map(|record| record.agents_started),
             }
         })
         .collect();
@@ -1720,6 +1724,7 @@ mod tests {
             cwd: "/home/sam/projects/atlas/frontend".to_string(),
             project: atlas(),
             entrypoint: Some("cli".to_string()),
+            title: Some("Fix the invoice export".to_string()),
             first: utc("2026-11-14T10:00:00Z"),
             last: utc("2026-11-14T12:00:00Z"),
             agents_started: 2,
@@ -1760,6 +1765,9 @@ mod tests {
             "atlas's own s3 record has started no agent"
         );
         assert_eq!(vega.agents, Some(2));
+        // The title comes from the session's own host's newest record, too.
+        assert_eq!(vega.title.as_deref(), Some("Fix the invoice export"));
+        assert_eq!(atlas.title, None);
     }
 
     /// A running session has tokens but no [`SessionRecord`] yet, so its

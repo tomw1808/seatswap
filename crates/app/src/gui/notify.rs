@@ -620,19 +620,19 @@ fn all_full_text(next: Option<(&str, &str)>) -> String {
     }
 }
 
-/// `acme-kb-dd is waiting for you (acme-kb, on atlas).` — the waiting
-/// session's own host when it is another one, this host's name otherwise; the
-/// host part is left out when there is no acceptable host name (spec §4.1).
+/// `Fix the invoice export is waiting for you (acme-kb, on atlas).` — the
+/// session named by Claude Code's own title when it is known, else by its
+/// label (`acme-kb-dd`); the waiting session's own host when it is another
+/// one, this host's name otherwise; the host part is left out when there is no
+/// acceptable host name (spec §4.1).
 fn waiting_text(waiting: &Waiting, this_host: Option<&str>) -> String {
+    let name = waiting.title.as_deref().unwrap_or(&waiting.label);
     match waiting.host.as_deref().or(this_host) {
         Some(host) => format!(
             "{} is waiting for you ({}, on {host}).",
-            waiting.label, waiting.project
+            name, waiting.project
         ),
-        None => format!(
-            "{} is waiting for you ({}).",
-            waiting.label, waiting.project
-        ),
+        None => format!("{} is waiting for you ({}).", name, waiting.project),
     }
 }
 
@@ -972,6 +972,7 @@ mod tests {
         Waiting {
             session: "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34".to_string(),
             label: "acme-kb-dd".to_string(),
+            title: None,
             project: "acme-kb".to_string(),
             since,
             host: None,
@@ -1609,6 +1610,20 @@ mod tests {
         assert!(
             deduper.due(&full, now).is_empty(),
             "a first snapshot that is already full is not a change to full"
+        );
+    }
+
+    #[test]
+    fn the_waiting_notification_names_the_title_when_known() {
+        let mut wait = waiting(utc("2026-11-10T09:56:00Z"));
+        assert_eq!(
+            waiting_text(&wait, Some("atlas")),
+            "acme-kb-dd is waiting for you (acme-kb, on atlas)."
+        );
+        wait.title = Some("Fix the invoice export".to_string());
+        assert_eq!(
+            waiting_text(&wait, Some("atlas")),
+            "Fix the invoice export is waiting for you (acme-kb, on atlas)."
         );
     }
 

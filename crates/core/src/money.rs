@@ -948,37 +948,31 @@ impl Valuer {
         // the first weekly reading at or after the reset. That reading is the
         // running window's `from`, so its use follows `stats::window_used`
         // (`final − from`) instead of counting the tokens from before the reset.
+        // The reading's own reset time names the new window, so a reset that
+        // also moved the reset time is found too.
         let mut window_starts = BTreeMap::new();
         for hosted in &windows.records {
             let record = &hosted.record;
             if record.k != crate::api::LimitKind::WeeklyAll || !record.reset {
                 continue;
             }
-            // The reset kept the window's reset time: the window it began ends
-            // one week after the reset record's start.
-            let Some(reset_end) = record.start.map(|start| start + Duration::days(7)) else {
-                continue;
-            };
-            let weekly = |sample: &&Hosted<Sample>| {
-                sample.record.l.iter().any(|limit| {
-                    limit.k == crate::api::LimitKind::WeeklyAll
-                        && limit.r.is_some_and(|end| same_reset(end, reset_end))
-                })
+            let weekly = |sample: &Hosted<Sample>| {
+                sample
+                    .record
+                    .l
+                    .iter()
+                    .find(|limit| limit.k == crate::api::LimitKind::WeeklyAll && limit.r.is_some())
+                    .map(|limit| (sample.record.t, limit.p))
             };
             let first = samples
                 .records
                 .iter()
                 .filter(|sample| sample.record.account == record.account)
                 .filter(|sample| sample.record.t >= record.end)
-                .filter(weekly)
-                .min_by_key(|sample| sample.record.t);
-            if let Some(first) = first {
-                if let Some(limit) = first.record.l.iter().find(|limit| {
-                    limit.k == crate::api::LimitKind::WeeklyAll
-                        && limit.r.is_some_and(|end| same_reset(end, reset_end))
-                }) {
-                    window_starts.insert((record.account.clone(), first.record.t), limit.p);
-                }
+                .filter_map(weekly)
+                .min_by_key(|(t, _)| *t);
+            if let Some((t, percent)) = first {
+                window_starts.insert((record.account.clone(), t), percent);
             }
         }
 
@@ -3463,6 +3457,65 @@ mod tests {
                 .iter()
                 .all(|window| window.unpriced.is_none()),
             "a worker record made the week unpriced"
+        );
+    }
+
+    /// A reset that also moved the reset time: the reset reading names the new
+    /// reset time, so the running window's `from` is that reading's percent and
+    /// its use is `p − from` (60 − 45), not its whole percent.
+    #[test]
+    fn a_reset_that_moved_the_reset_time_still_gives_the_running_window_its_from() {
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let old_reset = utc("2026-11-20T10:00:00Z");
+        let new_reset = utc("2026-11-27T10:00:00Z");
+        let before = utc("2026-11-16T09:00:00Z");
+        let reset_reading = utc("2026-11-18T08:30:00Z");
+        let later = utc("2026-11-19T12:00:00Z");
+        history
+            .append(&live(utc("2026-11-16T00:00:00Z"), Some(ac())))
+            .expect("a live event");
+        history
+            .append(&price_changed(
+                utc("2026-11-06T00:00:00Z"),
+                Some(140.0),
+                Some("EUR"),
+            ))
+            .expect("the account's price");
+        history
+            .append(&weekly_sample(before, old_reset, 70.0))
+            .expect("a weekly sample");
+        history
+            .append(&weekly_sample(reset_reading, new_reset, 45.0))
+            .expect("a weekly sample");
+        history
+            .append(&weekly_sample(later, new_reset, 60.0))
+            .expect("a weekly sample");
+        let mut reset = weekly_window(old_reset - Duration::days(7), reset_reading, 70.0);
+        reset.reset = true;
+        reset.last_sample = before;
+        history.append(&reset).expect("the reset window");
+
+        let valuer = Valuer::build(
+            &history,
+            &range("2026-11-19T00:00:00Z", "2026-11-20T00:00:00Z"),
+            &priced_prices(utc("2026-11-01T00:00:00Z")),
+            &empty_fx(),
+            &settings_eur(),
+            &[account_with_price(Some(140.0))],
+            &RefCell::new(Vec::new()),
+        )
+        .expect("a valuer");
+
+        let open = valuer
+            .windows
+            .iter()
+            .find(|window| !window.finished && same_reset(window.end, new_reset))
+            .expect("the running window");
+        assert_eq!(
+            open.used,
+            Some(15.0),
+            "the running window's use is 60 − 45, not 60"
         );
     }
 
