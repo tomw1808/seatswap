@@ -17,9 +17,9 @@ use crate::money::{window_money, Valuer};
 
 use super::{
     account_abbr, account_chosen, account_id, account_weeks_valued, accounts_without_price,
-    add_value, blocked_by_week, blocked_spans, hours_text, lost_percent, money_of, next_week_start,
-    output_by_account_week, range_of, stored_account, week_columns, week_of_record, windows_span,
-    working_rhythm, AccountWeek, Ctx, Query, StatsError,
+    add_value, blocked_by_week, blocked_spans, hours_text, keep_warnings, lost_percent, money_of,
+    next_week_start, output_by_account_week, range_of, stored_account, week_columns,
+    week_of_record, windows_span, working_rhythm, AccountWeek, Ctx, Query, StatsError,
 };
 
 /// One period of one account's subscription: from its `AccountAdded` (or its
@@ -150,7 +150,9 @@ pub(crate) fn subscriptions_in<Tz: TimeZone + Copy>(
     // A ratio divides each window by its own span, which can reach past the
     // range; the reads that serve it cover every chosen window whole.
     let week_span = windows_span(&weeks, range);
-    let tokens = ctx.history.read::<TokenRecord>(&week_span, &Hosts::All)?;
+    let tokens = keep_warnings(ctx.warnings, || {
+        ctx.history.read::<TokenRecord>(&week_span, &Hosts::All)
+    })?;
 
     let mut all_periods: BTreeMap<AccountRef, Vec<Period>> = BTreeMap::new();
     for (reference, history) in &histories {
@@ -374,7 +376,9 @@ pub(crate) fn what_if_in<Tz: TimeZone + Copy>(
         ctx.accounts,
         ctx.settings.read_sessions,
     )?;
-    let samples = ctx.history.read_claude::<Sample>(range, &Hosts::All)?;
+    let samples = keep_warnings(ctx.warnings, || {
+        ctx.history.read_claude::<Sample>(range, &Hosts::All)
+    })?;
     let sampled: BTreeSet<AccountRef> = samples
         .records
         .iter()
@@ -476,6 +480,7 @@ fn build_valuer<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, range: &Range) -> Result<Val
         ctx.fx,
         ctx.settings,
         ctx.accounts,
+        ctx.warnings,
     )?)
 }
 
@@ -730,16 +735,19 @@ impl AccountHistory {
 fn account_histories<Tz: TimeZone + Copy>(
     ctx: &Ctx<Tz>,
 ) -> Result<BTreeMap<AccountRef, AccountHistory>, StatsError> {
-    let events = ctx.history.read_claude::<Event>(&Range::ALL, &Hosts::All)?;
-    let samples = ctx
-        .history
-        .read_claude::<Sample>(&Range::ALL, &Hosts::All)?;
-    let windows = ctx
-        .history
-        .finished_claude_windows(&Range::ALL, &Hosts::All)?;
+    let events = keep_warnings(ctx.warnings, || {
+        ctx.history.read_claude::<Event>(&Range::ALL, &Hosts::All)
+    })?;
+    let samples = keep_warnings(ctx.warnings, || {
+        ctx.history.read_claude::<Sample>(&Range::ALL, &Hosts::All)
+    })?;
+    let windows = keep_warnings(ctx.warnings, || {
+        ctx.history
+            .finished_claude_windows(&Range::ALL, &Hosts::All)
+    })?;
 
     let mut histories: BTreeMap<AccountRef, AccountHistory> = BTreeMap::new();
-    for hosted in &windows {
+    for hosted in &windows.records {
         let record = &hosted.record;
         let entry = histories.entry(record.account.clone()).or_default();
         entry.see(record.weekly_start());

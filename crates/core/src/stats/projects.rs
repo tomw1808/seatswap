@@ -19,8 +19,8 @@ use crate::transcripts::Tokens;
 
 use super::{
     account_abbr, account_chosen, account_id, account_position, account_weeks_valued,
-    add_opt_value, add_value, join_names, money_text, output_by_account_week, percent_text,
-    range_of, thousands, week_start, windows_span, Ctx, Query, StatsError,
+    add_opt_value, add_value, join_names, keep_warnings, money_text, output_by_account_week,
+    percent_text, range_of, thousands, week_start, windows_span, Ctx, Query, StatsError,
 };
 
 /// The level of a row of the tree.
@@ -137,9 +137,12 @@ pub(crate) fn projects_page_in<Tz: TimeZone + Copy>(
         ctx.fx,
         ctx.settings,
         ctx.accounts,
+        ctx.warnings,
     )?;
     let weeks = account_weeks_valued(ctx, range, q, &valuer)?;
-    let read = ctx.history.read::<TokenRecord>(range, &Hosts::All)?;
+    let read = keep_warnings(ctx.warnings, || {
+        ctx.history.read::<TokenRecord>(range, &Hosts::All)
+    })?;
 
     // The chosen records of the range, each valued once, under the project it
     // belongs to after the project log's joins.
@@ -303,7 +306,9 @@ pub(crate) fn projects_page_in<Tz: TimeZone + Copy>(
     // The ratios divide each window by its own span, which can reach past the
     // range; the reads that serve them cover every chosen window whole.
     let week_span = windows_span(&weeks, range);
-    let week_tokens = ctx.history.read::<TokenRecord>(&week_span, &Hosts::All)?;
+    let week_tokens = keep_warnings(ctx.warnings, || {
+        ctx.history.read::<TokenRecord>(&week_span, &Hosts::All)
+    })?;
     let mut week_records: Vec<(AccountRef, &TokenRecord)> = Vec::new();
     for hosted in &week_tokens.records {
         if q.host.as_ref().is_some_and(|host| host != &hosted.host) {
@@ -441,8 +446,11 @@ pub(crate) fn project_detail_in<Tz: TimeZone + Copy>(
         ctx.fx,
         ctx.settings,
         ctx.accounts,
+        ctx.warnings,
     )?;
-    let read = ctx.history.read::<TokenRecord>(range, &Hosts::All)?;
+    let read = keep_warnings(ctx.warnings, || {
+        ctx.history.read::<TokenRecord>(range, &Hosts::All)
+    })?;
     let matching: Vec<_> = read
         .records
         .iter()

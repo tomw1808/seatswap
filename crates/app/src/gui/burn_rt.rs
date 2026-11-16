@@ -23,7 +23,7 @@ use seatswap_core::paths::AppPaths;
 use seatswap_core::store::{Account, Settings};
 use seatswap_core::switcher::UnsavedPolicy;
 
-use super::worker::{ActionCommand, ActionReply, EngineCommand, PrintedWarnings};
+use super::worker::{ActionCommand, ActionReply, EngineCommand};
 use crate::burn_text::{self, SwitchSuggestion};
 
 /// A switch that is waiting for a quiet moment; the panel shows its latest
@@ -112,7 +112,8 @@ pub(crate) struct BurnTick<'a> {
 pub(crate) type KeptForecast = (Inputs, Regime, DateTime<Utc>);
 
 /// What one tick produced. The worker adds `error` to the snapshot's error,
-/// prints `warnings` once, and sends `notification` after the switch landed.
+/// prints `warnings` through the one app printer, and sends `notification`
+/// after the switch landed.
 #[derive(Debug, Default)]
 pub(crate) struct BurnReport {
     pub view: Option<BurnView>,
@@ -159,7 +160,6 @@ pub(crate) struct BurnRuntime {
     /// The time of the last stale poll ask (at most one per [`STALE_ASK_SECS`]).
     last_stale_ask: Option<DateTime<Utc>>,
     view: Option<BurnView>,
-    printed_warnings: PrintedWarnings,
     /// The `burn-next.json` content this runtime wrote last, or `None` when
     /// it removed the file (or never wrote it in this run).
     next_written: Option<BurnNext>,
@@ -184,7 +184,6 @@ impl BurnRuntime {
             last_sent: None,
             last_stale_ask: None,
             view: None,
-            printed_warnings: PrintedWarnings::new(),
             next_written: None,
             force_learn: false,
             action,
@@ -238,9 +237,7 @@ impl BurnRuntime {
                     tick.settings.read_sessions,
                 ) {
                     Ok(learned) => {
-                        report
-                            .warnings
-                            .extend(self.printed_warnings.new_texts(&learned.warnings));
+                        report.warnings.extend(learned.warnings.iter().cloned());
                         self.learned = Some(learned);
                         self.learn_error = None;
                     }

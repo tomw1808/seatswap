@@ -18,7 +18,7 @@ use crate::transcripts::Tokens;
 
 use super::{
     account_abbr, account_chosen, account_id, account_position, account_weeks_valued,
-    blocked_by_week, blocked_spans, hours_text, lost_percent, money_of, money_text,
+    blocked_by_week, blocked_spans, hours_text, keep_warnings, lost_percent, money_of, money_text,
     next_week_start, percent_text, previous_week_start, range_of, switch_counts, top_three,
     week_columns, week_start, working_hours, working_rhythm, AccountWeek, Ctx, Query, RangeKey,
     StatsError, SwitchCounts,
@@ -172,6 +172,7 @@ pub(crate) fn weeks_in<Tz: TimeZone + Copy>(
         ctx.fx,
         ctx.settings,
         ctx.accounts,
+        ctx.warnings,
     )?;
     let finished = account_weeks_valued(ctx, range, q, &valuer)?;
     let spans = blocked_spans(ctx, range, q)?;
@@ -180,9 +181,9 @@ pub(crate) fn weeks_in<Tz: TimeZone + Copy>(
     let week_starts = week_columns(range, &ctx.zone);
     // The samples of the last 14 days and the newest one before now: one read
     // serves both the running percents and the curves.
-    let samples = ctx
-        .history
-        .read_claude::<Sample>(&Range::ALL, &Hosts::All)?;
+    let samples = keep_warnings(ctx.warnings, || {
+        ctx.history.read_claude::<Sample>(&Range::ALL, &Hosts::All)
+    })?;
     let recent_from = ctx.now - Duration::days(14);
 
     let mut rows = Vec::new();
@@ -394,6 +395,7 @@ pub fn week_summary<Tz: TimeZone + Copy>(
         ctx.fx,
         ctx.settings,
         ctx.accounts,
+        ctx.warnings,
     )?;
     let weeks = account_weeks_valued(ctx, &reading, q, &valuer)?;
 
@@ -458,12 +460,15 @@ pub fn week_summary<Tz: TimeZone + Copy>(
         .copied()
         .unwrap_or(0.0);
 
-    let events = ctx.history.read_claude::<Event>(&Range::ALL, &Hosts::All)?;
+    let events = keep_warnings(ctx.warnings, || {
+        ctx.history.read_claude::<Event>(&Range::ALL, &Hosts::All)
+    })?;
     let switches = switch_counts(&events.records, &week_range, q.host.as_deref());
 
-    let token_read = ctx
-        .history
-        .read::<crate::history::TokenRecord>(&week_range, &Hosts::All)?;
+    let token_read = keep_warnings(ctx.warnings, || {
+        ctx.history
+            .read::<crate::history::TokenRecord>(&week_range, &Hosts::All)
+    })?;
     let mut tokens = Tokens::default();
     let mut values: Option<Values> = None;
     let mut by_project: BTreeMap<String, Values> = BTreeMap::new();
@@ -632,9 +637,11 @@ pub fn window_detail<Tz: TimeZone + Copy>(
 ) -> Result<WindowDetail, StatsError> {
     // An account the store no longer holds is named by the id `account_id`
     // gives its window's account: the page shows that id's first 8 characters.
-    let finished = ctx
-        .history
-        .finished_claude_windows(&Range::ALL, &Hosts::All)?;
+    let finished = keep_warnings(ctx.warnings, || {
+        ctx.history
+            .finished_claude_windows(&Range::ALL, &Hosts::All)
+    })?
+    .records;
     let reference = match ctx.accounts.iter().find(|account| account.id == account_id) {
         Some(account) => AccountRef::of(account),
         None => finished
@@ -668,6 +675,7 @@ pub fn window_detail<Tz: TimeZone + Copy>(
         ctx.fx,
         ctx.settings,
         ctx.accounts,
+        ctx.warnings,
     )?;
     let query = Query {
         range: RangeKey::All,
@@ -681,7 +689,9 @@ pub fn window_detail<Tz: TimeZone + Copy>(
         .ok_or_else(|| unknown_window(account_id, end, false))?;
     let money = money_of(week);
 
-    let events = ctx.history.read_claude::<Event>(&Range::ALL, &Hosts::All)?;
+    let events = keep_warnings(ctx.warnings, || {
+        ctx.history.read_claude::<Event>(&Range::ALL, &Hosts::All)
+    })?;
     let reached_100_at = events
         .records
         .iter()
@@ -732,13 +742,15 @@ pub fn window_detail<Tz: TimeZone + Copy>(
         }
     }
 
-    let samples = ctx.history.read_claude::<Sample>(
-        &Range {
-            from: start,
-            to: window.end,
-        },
-        &Hosts::All,
-    )?;
+    let samples = keep_warnings(ctx.warnings, || {
+        ctx.history.read_claude::<Sample>(
+            &Range {
+                from: start,
+                to: window.end,
+            },
+            &Hosts::All,
+        )
+    })?;
     let curve = samples
         .records
         .iter()

@@ -6,6 +6,8 @@
 //! time, and a `snapshot` event reaches each of them.
 
 #[cfg(feature = "gui")]
+use std::cell::RefCell;
+#[cfg(feature = "gui")]
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "gui")]
 use std::future::Future;
@@ -571,6 +573,9 @@ pub(crate) struct StatsParts {
     prices: Prices,
     fx: Fx,
     projects: projects::Projects,
+    /// The history read warnings of the command; the shared printer gets them
+    /// once after the page ran.
+    warnings: RefCell<Vec<String>>,
 }
 
 #[cfg(feature = "gui")]
@@ -588,9 +593,15 @@ impl StatsParts {
             prices: &self.prices,
             fx: &self.fx,
             projects: &self.projects,
+            warnings: &self.warnings,
             now,
             zone,
         }
+    }
+
+    /// The warnings the command's reads collected, leaving the list empty.
+    pub(crate) fn take_warnings(&self) -> Vec<String> {
+        std::mem::take(&mut *self.warnings.borrow_mut())
     }
 }
 
@@ -613,15 +624,13 @@ pub(crate) fn stats_ctx_parts(app: &AppPaths, history: &HistoryDir) -> Result<St
     let (prices, fx) = load_prices_and_fx(app)?;
     let (projects, warnings) = projects::load(history, &file.accounts)
         .map_err(|error| format!("the projects cannot be read: {error}"))?;
-    for warning in warnings {
-        eprintln!("seatswap: warning: {warning}");
-    }
     Ok(StatsParts {
         accounts: file.accounts,
         settings: file.settings,
         prices,
         fx,
         projects,
+        warnings: RefCell::new(warnings),
     })
 }
 
@@ -826,9 +835,13 @@ where
         .as_ref()
         .map_err(|error| error.clone())?
         .clone();
+    let printed = std::sync::Arc::clone(&state.printed_warnings);
     tauri::async_runtime::spawn_blocking(move || {
         let parts = stats_ctx_parts(&app, &history)?;
-        run(&parts, &history, Utc::now(), Local)
+        let result = run(&parts, &history, Utc::now(), Local);
+        let warnings = parts.take_warnings();
+        super::lock(&printed).print(&warnings);
+        result
     })
     .await
     .map_err(|error| error.to_string())?
@@ -2330,6 +2343,56 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&page).expect("the page as JSON"),
             r#"{"empty":{"recordingSince":null}}"#
+        );
+    }
+
+    /// Two statistics reads of one torn line put the same warning into the
+    /// page's list twice, and the one app-wide printer prints it once.
+    #[cfg(feature = "gui")]
+    #[test]
+    fn two_statistics_reads_print_a_torn_line_once() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().expect("a temp folder");
+        let tiny = fixture::write(dir.path()).expect("the tiny fixture");
+        let events = tiny
+            .history
+            .root()
+            .join("atlas")
+            .join("events-2026-11.jsonl");
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&events)
+            .expect("the events file");
+        file.write_all(b"{\"t\":").expect("the torn last line");
+        drop(file);
+
+        let app = AppPaths::at(dir.path());
+        let parts = stats_ctx_parts(&app, &tiny.history).expect("the statistics parts");
+        let query = Query {
+            range: RangeKey::All,
+            accounts: Vec::new(),
+            host: None,
+        };
+        let printed = std::sync::Mutex::new(crate::gui::worker::PrintedWarnings::new());
+
+        for _ in 0..2 {
+            stats_overview_at(&parts, &tiny.history, tiny.now, tiny.offset, &query)
+                .expect("the overview");
+            let warnings = parts.take_warnings();
+            assert!(
+                warnings
+                    .iter()
+                    .any(|warning| warning.contains("events-2026-11.jsonl line")),
+                "the statistics read kept no warning: {warnings:?}"
+            );
+            crate::gui::lock(&printed).print(&warnings);
+        }
+
+        assert_eq!(
+            crate::gui::lock(&printed).len(),
+            1,
+            "the same warning text is printed once for both reads"
         );
     }
 

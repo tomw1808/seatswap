@@ -3,6 +3,7 @@
 //! kept in two files seatswap owns (`prices.json`, `fx.json`); a missing value is
 //! `None`, never a number.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io;
@@ -15,8 +16,8 @@ use crate::api::{Api, ApiError, Fetched};
 use crate::atomic::{self, Access};
 use crate::burn::rates::{timelines, Timeline};
 use crate::history::{
-    same_reset, AccountRef, Event, EventKind, HistoryDir, HistoryError, Hosted, Hosts, Range,
-    Sample, TokenRecord, WindowRecord,
+    keep_warnings, same_reset, AccountRef, Event, EventKind, HistoryDir, HistoryError, Hosted,
+    Hosts, Range, Sample, TokenRecord, WindowRecord,
 };
 use crate::locks::{self, LockError};
 use crate::paths::AppPaths;
@@ -803,6 +804,7 @@ impl Valuer {
         fx: &Fx,
         settings: &Settings,
         accounts: &[Account],
+        warnings: &RefCell<Vec<String>>,
     ) -> Result<Valuer, MoneyError> {
         let widened = Range {
             from: range.from - Duration::days(7),
@@ -810,10 +812,18 @@ impl Valuer {
         };
         // Codex's and Ollama's readings share the files; a Claude window, sample
         // or event is the only one this valuer prices (step-d.md Task 4).
-        let windows = history.finished_claude_windows(&widened, &Hosts::All)?;
-        let samples = history.read_claude::<Sample>(&widened, &Hosts::All)?;
-        let events = history.read_claude::<Event>(&Range::ALL, &Hosts::All)?;
-        let tokens = history.read::<TokenRecord>(&widened, &Hosts::All)?;
+        let windows = keep_warnings(warnings, || {
+            history.finished_claude_windows(&widened, &Hosts::All)
+        })?;
+        let samples = keep_warnings(warnings, || {
+            history.read_claude::<Sample>(&widened, &Hosts::All)
+        })?;
+        let events = keep_warnings(warnings, || {
+            history.read_claude::<Event>(&Range::ALL, &Hosts::All)
+        })?;
+        let tokens = keep_warnings(warnings, || {
+            history.read::<TokenRecord>(&widened, &Hosts::All)
+        })?;
 
         let mut valuer = Valuer {
             timelines: timelines(&events.records),
@@ -834,7 +844,7 @@ impl Valuer {
             fx: fx.clone(),
             settings: settings.clone(),
         };
-        for hosted in &windows {
+        for hosted in &windows.records {
             valuer.finished_window(&hosted.record);
         }
         for hosted in &samples.records {
@@ -1493,6 +1503,7 @@ mod tests {
             &empty_fx(),
             &settings_eur(),
             &[],
+            &RefCell::new(Vec::new()),
         )
         .expect("a valuer");
 
@@ -1652,6 +1663,7 @@ mod tests {
             &empty_fx(),
             &settings_eur(),
             &[account],
+            &RefCell::new(Vec::new()),
         )
         .expect("a valuer");
 
@@ -1694,6 +1706,7 @@ mod tests {
             &empty_fx(),
             &settings_eur(),
             &[account_with_price(Some(140.0))],
+            &RefCell::new(Vec::new()),
         )
         .expect("a valuer");
 
@@ -1738,6 +1751,7 @@ mod tests {
             &empty_fx(),
             &settings_eur(),
             &[account],
+            &RefCell::new(Vec::new()),
         )
         .expect("a valuer");
 
@@ -1772,6 +1786,7 @@ mod tests {
             &empty_fx(),
             &settings_eur(),
             &[account],
+            &RefCell::new(Vec::new()),
         )
         .expect("a valuer");
 
@@ -1798,6 +1813,7 @@ mod tests {
             &empty_fx(),
             &settings_eur(),
             &[account],
+            &RefCell::new(Vec::new()),
         )
         .expect("a valuer");
 
@@ -1840,6 +1856,7 @@ mod tests {
             &empty_fx(),
             &settings_eur(),
             &[account],
+            &RefCell::new(Vec::new()),
         )
         .expect("a valuer");
 
@@ -1994,6 +2011,7 @@ mod tests {
             &empty_fx(),
             &settings_eur(),
             &[account_with_price(Some(180.0))],
+            &RefCell::new(Vec::new()),
         )
         .expect("a valuer");
         let sum = valuer.value("atlas", &opus).subscription.expect("a value")
@@ -2138,6 +2156,7 @@ mod tests {
                 &empty_fx(),
                 &settings_eur(),
                 &[account_with_price(None)],
+                &RefCell::new(Vec::new()),
             )
             .expect("a valuer")
         };
@@ -2206,6 +2225,7 @@ mod tests {
             &empty_fx(),
             &settings_eur(),
             &[account_with_price(Some(140.0))],
+            &RefCell::new(Vec::new()),
         )
         .expect("a valuer");
 
@@ -2249,6 +2269,7 @@ mod tests {
             &empty_fx(),
             &settings_eur(),
             &[account_with_price(Some(140.0))],
+            &RefCell::new(Vec::new()),
         )
         .expect("a valuer");
 
@@ -2344,6 +2365,7 @@ mod tests {
                 &empty_fx(),
                 &settings_eur(),
                 &[account_with_price(Some(140.0))],
+                &RefCell::new(Vec::new()),
             )
             .expect("a valuer")
             .value("atlas", &opus)
@@ -2394,6 +2416,7 @@ mod tests {
                 &empty_fx(),
                 &settings,
                 std::slice::from_ref(&account),
+                &RefCell::new(Vec::new()),
             )
             .expect("a valuer")
             .value("atlas", &opus)
@@ -2441,6 +2464,7 @@ mod tests {
             &empty_fx(),
             &settings,
             &[account],
+            &RefCell::new(Vec::new()),
         )
         .expect("a valuer");
 
@@ -2474,6 +2498,7 @@ mod tests {
             &empty_fx(),
             &settings_eur(),
             &[account_with_price(Some(140.0))],
+            &RefCell::new(Vec::new()),
         )
         .expect("a valuer");
 
@@ -2548,6 +2573,7 @@ mod tests {
                 &empty_fx(),
                 settings,
                 &[],
+                &RefCell::new(Vec::new()),
             )
             .expect("a valuer")
             .value("atlas", &opus)
@@ -2598,6 +2624,7 @@ mod tests {
             &empty_fx(),
             &settings,
             &[],
+            &RefCell::new(Vec::new()),
         )
         .expect("a valuer")
         .value("atlas", &opus);
@@ -2932,6 +2959,7 @@ mod tests {
             &without.fx,
             &without.settings,
             &without.accounts,
+            &RefCell::new(Vec::new()),
         )
         .expect("the valuer");
         let after = Valuer::build(
@@ -2941,6 +2969,7 @@ mod tests {
             &with.fx,
             &with.settings,
             &with.accounts,
+            &RefCell::new(Vec::new()),
         )
         .expect("the valuer");
 

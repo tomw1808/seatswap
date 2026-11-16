@@ -16,8 +16,8 @@ use crate::history::{same_reset, AccountRef, Hosts, Range, Sample, WindowRecord}
 use crate::money::{window_money, Valuer};
 
 use super::{
-    account_abbr, account_weeks_valued, first_record, join_names, week_start, Ctx, Query, RangeKey,
-    StatsError,
+    account_abbr, account_weeks_valued, first_record, join_names, keep_warnings, week_start, Ctx,
+    Query, RangeKey, StatsError,
 };
 
 /// How many finished weekly windows the low forecast reads.
@@ -132,6 +132,7 @@ pub fn forecast<Tz: TimeZone + Copy>(
         ctx.fx,
         ctx.settings,
         ctx.accounts,
+        ctx.warnings,
     )?;
 
     // The stored account of every input account, in the input order. A plan
@@ -203,19 +204,19 @@ pub fn forecast<Tz: TimeZone + Copy>(
         });
     let samples = match earliest {
         None => Vec::new(),
-        Some(cutoff) => ctx
-            .history
-            .read_claude::<Sample>(
+        Some(cutoff) => keep_warnings(ctx.warnings, || {
+            ctx.history.read_claude::<Sample>(
                 &Range {
                     from: cutoff.min(inputs.now - Duration::weeks(LOW_HISTORY_WEEKS)),
                     to: inputs.now,
                 },
                 &Hosts::All,
-            )?
-            .records
-            .into_iter()
-            .map(|hosted| hosted.record)
-            .collect(),
+            )
+        })?
+        .records
+        .into_iter()
+        .map(|hosted| hosted.record)
+        .collect(),
     };
 
     let lows: Vec<Option<f64>> = inputs

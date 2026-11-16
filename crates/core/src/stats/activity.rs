@@ -17,9 +17,9 @@ use crate::transcripts::Tokens;
 
 use super::projects::folder_name;
 use super::{
-    account_chosen, blocked_by_weekday, blocked_spans, local_date_start, local_day_start,
-    local_hour_start, next_local_day_start, range_of, week_columns, week_start, working_rhythm,
-    Ctx, Query, StatsError,
+    account_chosen, blocked_by_weekday, blocked_spans, keep_warnings, local_date_start,
+    local_day_start, local_hour_start, next_local_day_start, range_of, week_columns, week_start,
+    working_rhythm, Ctx, Query, StatsError,
 };
 
 /// The Rhythm page: the heat map of the week and the averages per weekday.
@@ -175,7 +175,9 @@ pub(crate) fn rhythm_in<Tz: TimeZone + Copy>(
     q: &Query,
 ) -> Result<RhythmPage, StatsError> {
     let valuer = valuer(ctx, range)?;
-    let tokens = ctx.history.read::<TokenRecord>(range, &Hosts::All)?;
+    let tokens = keep_warnings(ctx.warnings, || {
+        ctx.history.read::<TokenRecord>(range, &Hosts::All)
+    })?;
     let entries = chosen_entries(ctx, q, range, &valuer, &tokens.records);
 
     let columns = week_columns(range, &ctx.zone);
@@ -250,8 +252,12 @@ pub(crate) fn activity_in<Tz: TimeZone + Copy>(
         from: range.from.min(lane.from).min(day_window.from),
         to: range.to.max(lane.to).max(day_window.to),
     };
-    let tokens = ctx.history.read::<TokenRecord>(&read, &Hosts::All)?;
-    let ups = ctx.history.read::<UpRecord>(&Range::ALL, &Hosts::All)?;
+    let tokens = keep_warnings(ctx.warnings, || {
+        ctx.history.read::<TokenRecord>(&read, &Hosts::All)
+    })?;
+    let ups = keep_warnings(ctx.warnings, || {
+        ctx.history.read::<UpRecord>(&Range::ALL, &Hosts::All)
+    })?;
     let entries = chosen_entries(ctx, q, range, &valuer, &tokens.records);
     let lane_entries = chosen_entries(ctx, q, &lane, &valuer, &tokens.records);
     let day_entries = chosen_entries(ctx, q, &day_window, &valuer, &tokens.records);
@@ -282,6 +288,7 @@ fn valuer<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, range: &Range) -> Result<Valuer, S
         ctx.fx,
         ctx.settings,
         ctx.accounts,
+        ctx.warnings,
     )?)
 }
 
@@ -618,9 +625,9 @@ fn largest_sessions<Tz: TimeZone + Copy>(
         sum.valued.push(entry.valued.clone());
     }
 
-    let read = ctx
-        .history
-        .read::<SessionRecord>(&Range::ALL, &Hosts::All)?;
+    let read = keep_warnings(ctx.warnings, || {
+        ctx.history.read::<SessionRecord>(&Range::ALL, &Hosts::All)
+    })?;
     let mut agents: BTreeMap<(String, String), (DateTime<Utc>, u32)> = BTreeMap::new();
     for hosted in &read.records {
         let record = &hosted.record;
@@ -668,7 +675,9 @@ fn waited_minutes<Tz: TimeZone + Copy>(
     range: &Range,
     q: &Query,
 ) -> Result<Vec<(NaiveDate, f64)>, StatsError> {
-    let read = ctx.history.read_claude::<Event>(range, &Hosts::All)?;
+    let read = keep_warnings(ctx.warnings, || {
+        ctx.history.read_claude::<Event>(range, &Hosts::All)
+    })?;
     let mut by_day: BTreeMap<NaiveDate, u64> = BTreeMap::new();
     for hosted in &read.records {
         if hosted.record.t < range.from || hosted.record.t >= range.to {

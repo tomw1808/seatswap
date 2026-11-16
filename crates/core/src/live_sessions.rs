@@ -1027,6 +1027,7 @@ mod tests {
             &Fx::default(),
             settings,
             accounts,
+            &std::cell::RefCell::new(Vec::new()),
         )
         .expect("a valuer")
     }

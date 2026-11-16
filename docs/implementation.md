@@ -1149,11 +1149,21 @@ struct TickDeadline { next: Instant }
 impl TickDeadline { fn new(now: Instant) -> TickDeadline; fn wait(&self, now: Instant) -> Duration;
                     fn due(&self, now: Instant) -> bool; fn advance(&mut self, now: Instant); }
 
-/// History-read warnings already printed this run. The tray app keeps one set; the auto-burn
-/// runtime uses the same type rather than a second set.
+/// History-read warnings already printed this run. The tray app keeps one set
+/// (`GuiState::printed_warnings`, an `Arc<Mutex<…>>`) that the engine, the action thread, the
+/// auto-burn report, the statistics commands and the projects commands all print through.
 pub(crate) struct PrintedWarnings { seen: BTreeSet<String> }
 impl PrintedWarnings { pub(crate) fn new() -> PrintedWarnings;
-                       pub(crate) fn new_texts(&mut self, warnings: &[String]) -> Vec<String>; }
+                       pub(crate) fn new_texts(&mut self, warnings: &[String]) -> Vec<String>;
+                       /// `seatswap: history: <warning>` for each new text.
+                       pub(crate) fn print(&mut self, warnings: &[String]); }
+
+// gui/mod.rs: the one app error reporter (`GuiState::reported_errors`): prints `seatswap: <text>`
+// and notifies once per text per run. The snapshot's error, a failed history write of an action
+// and the provider thread's recording errors all go through it.
+pub(crate) struct ReportedErrors { notified_errors: Mutex<HashSet<String>>, send: Box<dyn Fn(&str) + Send + Sync> }
+impl ReportedErrors { pub(crate) fn new(send: Box<dyn Fn(&str) + Send + Sync>) -> ReportedErrors;
+                      pub(crate) fn report(&self, text: &str); }
 
 // ops.rs
 pub(crate) fn open_history(app: &AppPaths, settings: &Settings) -> Result<Recorder, String>;
@@ -1690,8 +1700,8 @@ keeps the strip with `burn_text::unread_line` as its line and still asks the sta
 otherwise the next account of the plan auto-burn follows and its first use), removes it when
 auto-burn is off, paused or nothing is planned, and rewrites at least every
 `burn_next::REWRITE_AFTER_MIN` minutes.
-The runtime remembers the warnings it printed with `worker::PrintedWarnings`, shared rather than a
-second `BTreeSet`. `BurnView` is part of `Snapshot.burn`; the
+The runtime hands its learned warnings to the worker, which prints them through the app's one
+`worker::PrintedWarnings`. `BurnView` is part of `Snapshot.burn`; the
 settings toggle calls `worker::save_setting` and writes `EventKind::AutoBurnSet`, the pause calls
 `ActionCommand::PauseBurn { hours }` and writes `EventKind::AutoBurn`.
 
@@ -2120,7 +2130,8 @@ impl Valuer {
     /// history (a record's account is the last Live/Switch at or before it; a window's price is
     /// the last PriceChanged at or before its midpoint).
     pub fn build(history: &HistoryDir, range: &Range, prices: &Prices, fx: &Fx,
-                 settings: &Settings, accounts: &[Account]) -> Result<Valuer, MoneyError>;
+                 settings: &Settings, accounts: &[Account],
+                 warnings: &RefCell<Vec<String>>) -> Result<Valuer, MoneyError>;
     /// The price of a window ending at `end`: the account's price at its midpoint (end − 84 h),
     /// through price_at.
     pub(crate) fn window_price(&self, account: &AccountRef, end: DateTime<Utc>)
@@ -2271,7 +2282,7 @@ impl HistoryDir {
     /// record with the latest `lastSample` counts (spec §1.5), a tie goes to the host name that
     /// sorts first, so read order does not decide. Sorted by end, then account.
     pub fn finished_windows(&self, range: &Range, hosts: &Hosts)
-        -> Result<Vec<Hosted<WindowRecord>>, HistoryError>;
+        -> Result<Read<WindowRecord>, HistoryError>;
     /// Copy every file of `from`'s host folders that is missing here or longer there; keep a
     /// longer file; never read or write this host's folder; refuse this folder and a folder
     /// without a host folder. A host folder that is not here yet is copied as it is when its
@@ -2702,7 +2713,8 @@ pub struct Query { pub range: RangeKey, pub accounts: Vec<String>, pub host: Opt
 // the fixture; the app passes `chrono::Local`.
 pub struct Ctx<'a, Tz: TimeZone + Copy = FixedOffset> { pub history: &'a HistoryDir,
     pub accounts: &'a [Account], pub settings: &'a Settings, pub prices: &'a Prices,
-    pub fx: &'a Fx, pub projects: &'a Projects, pub now: DateTime<Utc>, pub zone: Tz }
+    pub fx: &'a Fx, pub projects: &'a Projects,
+    pub warnings: &'a RefCell<Vec<String>>, pub now: DateTime<Utc>, pub zone: Tz }
 
 /// ThisWeek: this week's Monday .. now. LastWeek: the Monday before .. this Monday.
 /// Days30/Days90/Months12: the Monday of the week holding now − 30/90/365 days .. now.
@@ -2953,8 +2965,11 @@ fn stats_page<T, Tz: TimeZone + Copy>(parts: &StatsParts, history: &HistoryDir,
 ```
 
 `stats_ctx_parts` loads `accounts.json`, the prices and the dollar rate through the one
-`load_prices_and_fx` that `sessions_rt::build_pricing` also uses, and the project log; the projects'
-warnings are printed as `seatswap: warning: {warning}`. The error texts are `the accounts cannot be
+`load_prices_and_fx` that `sessions_rt::build_pricing` also uses, and the project log. Every history read of a statistics page goes through
+`history::keep_warnings`, which adds the read's warnings to `Ctx::warnings` (`StatsParts` holds the
+`RefCell`, seeded with the projects' warnings); after the command the app prints the new ones
+through the shared `PrintedWarnings` as `seatswap: history: {warning}`. `money::Valuer::build` takes
+the same sink. The error texts are `the accounts cannot be
 read: …`, `the prices cannot be read: …`, `the dollar rate cannot be read: …` and `the projects
 cannot be read: …`. `stats_page` is the one place a page becomes a `Page`: it computes
 `range_of(query.range)` and `stats::empty`; an empty range is `Page::Empty` with the recording date,
@@ -3881,7 +3896,7 @@ impl Record for Event {
 impl HistoryDir {
     pub fn read_claude<R: Record>(&self, range: &Range, hosts: &Hosts) -> Result<Read<R>, HistoryError>;
     pub fn finished_claude_windows(&self, range: &Range, hosts: &Hosts)
-        -> Result<Vec<Hosted<WindowRecord>>, HistoryError>;
+        -> Result<Read<WindowRecord>, HistoryError>;
 }
 ```
 
@@ -3960,8 +3975,8 @@ sets `next = now`, so the first round happens at once, then waits on the command
 `next`; a timeout is `poll_round` and the next wait is 300 s. `Opened`, `SettingsSaved` and a save do
 not move the five-minute instant. `settings_of` reads `accounts.json` again for every command and
 round, and `poll` uses the same load through `SettingsLookup` after each request. So a switch, a Codex
-folder or an Ollama URL counts without a restart; a load failure is reported once per distinct text
-and the round is skipped.
+folder or an Ollama URL counts without a restart; a load failure is reported through `ReportedErrors` (once per text per
+run) and the round is skipped.
 
 `ProvidersRuntime` keeps one `Option<ProviderView>` and one last-attempt time for each provider, in
 the order Codex, Ollama. `poll_round` calls `settle(settings, previous)`: a card that is now off drops
@@ -3981,8 +3996,8 @@ Some(now), error: None, … }`, with `spend_24h`/`spend_24h_error` from the read
 `Some(Ok)`/`Some(Err)`; a failure becomes a view that copies the last view's numbers, plan, 24 h
 spend, its error and `fetched_at`, and sets `error` to the `ProviderError`'s text. A success with a
 `usage` is recorded through `Recorder::reading`; a history write failure is turned into the app's
-history text (`ops::history_unwritable`) and reported once per distinct text, and never changes the
-card. A recorder that could not be opened at start records nothing and reports nothing: that error is
+history text (`ops::history_unwritable`) and reported through the app's one `ReportedErrors` (once per text per run), and never
+changes the card. A recorder that could not be opened at start records nothing and reports nothing: that error is
 already the snapshot's error and was notified there.
 `publish` compares the list with the one sent last and sends `UiEvent::Providers(list)` only when it
 changes.

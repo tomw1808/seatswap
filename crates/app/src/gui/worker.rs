@@ -50,6 +50,7 @@ use super::lookup_rt::{self, LookupHandle, MoneyView};
 use super::notify;
 use super::providers_rt::{self, ProviderView, ProvidersClient, ProvidersHandle};
 use super::sessions_rt::{self, SessionsHandle};
+use super::ReportedErrors;
 use crate::format::{expand_tilde, with_tilde};
 use crate::ops;
 
@@ -394,6 +395,8 @@ pub(crate) fn spawn(
     autostart_args: Vec<String>,
     ui: Sender<UiEvent>,
     settings: Option<Settings>,
+    reported_errors: Arc<ReportedErrors>,
+    printed_warnings: Arc<Mutex<PrintedWarnings>>,
 ) -> Result<Worker, String> {
     let (engine_tx, engine_rx) = mpsc::channel::<EngineCommand>();
     let (action_tx, action_rx) = mpsc::channel::<ActionCommand>();
@@ -415,6 +418,7 @@ pub(crate) fn spawn(
     let engine_ui = ui.clone();
     let engine_history = history.clone();
     let engine_forecast = Arc::clone(&forecast);
+    let engine_warnings = Arc::clone(&printed_warnings);
     thread::Builder::new()
         .name("seatswap-engine".to_string())
         .spawn(move || {
@@ -426,6 +430,7 @@ pub(crate) fn spawn(
                 engine_commands,
                 engine_history,
                 engine_forecast,
+                engine_warnings,
             )
             .run(engine_rx)
         })
@@ -438,6 +443,7 @@ pub(crate) fn spawn(
         history.clone(),
         Api::new(),
         ui.clone(),
+        Arc::clone(&reported_errors),
     )?);
     let providers_client = providers.as_ref().map(ProvidersHandle::client);
 
@@ -467,6 +473,8 @@ pub(crate) fn spawn(
                 autostart_args,
                 action_engine,
                 action_history,
+                reported_errors,
+                printed_warnings,
             )
             .with_sessions(latest)
             .with_providers(providers_client)
@@ -651,6 +659,8 @@ struct EngineRuntime {
     /// The last auto-burn plan inputs, regime and oldest reading, shared with
     /// `GuiState` for the Forecast page.
     forecast: Arc<Mutex<Option<KeptForecast>>>,
+    /// The one set of history read warnings this run has printed.
+    printed_warnings: Arc<Mutex<PrintedWarnings>>,
     /// The sessions thread's busy sessions on a thinking-tied model. It is 0
     /// when the sessions thread cannot tell (with `readSessions` off): nothing
     /// is held back then (spec §2.12).
@@ -678,6 +688,7 @@ impl ClockBaseline {
 }
 
 impl EngineRuntime {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         app: AppPaths,
         claude: ClaudePaths,
@@ -686,6 +697,7 @@ impl EngineRuntime {
         engine: Sender<EngineCommand>,
         history: Result<HistoryDir, String>,
         forecast: Arc<Mutex<Option<KeptForecast>>>,
+        printed_warnings: Arc<Mutex<PrintedWarnings>>,
     ) -> EngineRuntime {
         let mut runtime = EngineRuntime {
             app,
@@ -702,6 +714,7 @@ impl EngineRuntime {
             baseline: ClockBaseline::now(),
             burn: BurnRuntime::new(action, engine),
             forecast,
+            printed_warnings,
             tied_busy: 0,
             thinking: Vec::new(),
         };
@@ -875,9 +888,7 @@ impl EngineRuntime {
             .and_then(|engine| engine.recorder())
             .map(|recorder| recorder.take_warnings());
         if let Some(warnings) = warnings {
-            for warning in warnings {
-                eprintln!("seatswap: history: {warning}");
-            }
+            super::lock(&self.printed_warnings).print(&warnings);
         }
     }
 
@@ -1044,9 +1055,7 @@ impl EngineRuntime {
         if let Some(error) = report.error {
             self.snapshot.error = combine(self.snapshot.error.take(), error);
         }
-        for warning in report.warnings {
-            eprintln!("seatswap: warning: {warning}");
-        }
+        super::lock(&self.printed_warnings).print(&report.warnings);
         if let Some(text) = report.notification {
             if settings.notify_on_switch {
                 notify::send_switch(&text);
@@ -1126,9 +1135,11 @@ struct ActionRuntime {
     providers: Option<ProvidersClient>,
     /// The last account seen live, so an external switch has a `from`.
     live: Option<AccountRef>,
-    /// The history read warnings this run has already printed, so a torn line
-    /// is not printed again at every live-account change.
-    printed_warnings: PrintedWarnings,
+    /// The one set of history read warnings this run has printed, so a torn
+    /// line is not printed again at every live-account change.
+    printed_warnings: Arc<Mutex<PrintedWarnings>>,
+    /// The one app error reporter for a failed history write.
+    reported_errors: Arc<ReportedErrors>,
 }
 
 impl ActionRuntime {
@@ -1138,6 +1149,8 @@ impl ActionRuntime {
         autostart_args: Vec<String>,
         engine: Sender<EngineCommand>,
         history: Result<HistoryDir, String>,
+        reported_errors: Arc<ReportedErrors>,
+        printed_warnings: Arc<Mutex<PrintedWarnings>>,
     ) -> ActionRuntime {
         let loaded = store::load_accounts(&app);
         let history = history.map(Recorder::new);
@@ -1156,7 +1169,8 @@ impl ActionRuntime {
             latest_sessions: Arc::new(Mutex::new(None)),
             providers: None,
             live,
-            printed_warnings: PrintedWarnings::new(),
+            printed_warnings,
+            reported_errors,
         }
     }
 
@@ -1427,7 +1441,7 @@ impl ActionRuntime {
         match result {
             Ok((_, history_error)) => {
                 if let Some(error) = history_error.or(open_error) {
-                    report_history_error(&error);
+                    self.reported_errors.report(&error);
                 }
                 let _ = self.engine.send(EngineCommand::Publish);
                 ActionReply::Done
@@ -1466,7 +1480,7 @@ impl ActionRuntime {
                         currency: edited.account.price_currency.clone(),
                     };
                     if let Err(error) = self.record(event) {
-                        report_history_error(&error);
+                        self.reported_errors.report(&error);
                     }
                 }
                 let _ = self.engine.send(EngineCommand::Publish);
@@ -1487,7 +1501,7 @@ impl ActionRuntime {
         match ops::remove_account(store, key, history, Utc::now()) {
             Ok((_, history_error)) => {
                 if let Some(error) = history_error.or(open_error) {
-                    report_history_error(&error);
+                    self.reported_errors.report(&error);
                 }
                 let _ = self.engine.send(EngineCommand::Publish);
                 ActionReply::Done
@@ -1520,7 +1534,7 @@ impl ActionRuntime {
                 Ok(()) => {
                     let _ = self.engine.send(EngineCommand::HistoryChanged);
                 }
-                Err(error) => report_history_error(&error),
+                Err(error) => self.reported_errors.report(&error),
             }
         }
         let warning = autostart::apply_autostart(settings.start_at_login, &self.autostart_args)
@@ -1588,7 +1602,7 @@ impl ActionRuntime {
                                 match &self.history {
                                     Ok(recorder) => match record_external_switch(
                                         recorder,
-                                        &mut self.printed_warnings,
+                                        &self.printed_warnings,
                                         self.live.clone(),
                                         to,
                                         counts,
@@ -1623,14 +1637,6 @@ impl ActionRuntime {
         }
         let _ = self.engine.send(EngineCommand::Publish);
     }
-}
-
-/// Report a history write failure from an action that still succeeded: the same
-/// way the switch's failed record is reported, as a notification and one line
-/// on standard error, never as a failed action.
-pub(crate) fn report_history_error(error: &str) {
-    eprintln!("seatswap: {error}");
-    notify::send_error(error);
 }
 
 /// The settings with one field replaced, checked as a whole. `field` must name
@@ -1709,8 +1715,16 @@ impl PrintedWarnings {
         texts
     }
 
+    /// Print the warnings this run has not printed yet, in the spec's one form
+    /// (`seatswap: history: <warning>`, spec §1.2).
+    pub(crate) fn print(&mut self, warnings: &[String]) {
+        for warning in self.new_texts(warnings) {
+            eprintln!("seatswap: history: {warning}");
+        }
+    }
+
     #[cfg(test)]
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.seen.len()
     }
 }
@@ -1729,7 +1743,7 @@ enum RecentSwitch {
 /// month file's read warnings are printed once per run through `printed`.
 fn record_external_switch(
     recorder: &Recorder,
-    printed: &mut PrintedWarnings,
+    printed: &Mutex<PrintedWarnings>,
     from: Option<AccountRef>,
     to: &AccountRef,
     sessions: Option<SessionCounts>,
@@ -1742,9 +1756,7 @@ fn record_external_switch(
         },
         &Hosts::One(recorder.dir().host().to_string()),
     )?;
-    for warning in printed.new_texts(&read.warnings) {
-        eprintln!("seatswap: history: {warning}");
-    }
+    super::lock(printed).print(&read.warnings);
     let already = read
         .records
         .iter()
@@ -1887,6 +1899,16 @@ mod tests {
     const ACCOUNT_UUID: &str = "4b7e2f91-3c5a-4d8e-9f1b-6a2c8e4d7b30";
     const ORG_UUID: &str = "e2a6c9d1-7f4b-4a3e-8c5d-1b9f0a7e3c62";
     const EMAIL: &str = "someone@example.com";
+
+    /// The app's one error reporter with a sink a test ignores.
+    fn test_errors() -> Arc<ReportedErrors> {
+        Arc::new(ReportedErrors::new(Box::new(|_| {})))
+    }
+
+    /// The app's one warning printer for a runtime a test builds by hand.
+    fn test_printed_warnings() -> Arc<Mutex<PrintedWarnings>> {
+        Arc::new(Mutex::new(PrintedWarnings::new()))
+    }
 
     struct Fixture {
         _tmp: tempfile::TempDir,
@@ -2250,8 +2272,15 @@ mod tests {
         fs::remove_file(&fixture.claude.credentials_file).expect("remove credentials");
         let (engine, _engine_rx) = mpsc::channel();
         let history = fixture.history();
-        let mut action =
-            ActionRuntime::new(fixture.app, fixture.claude, Vec::new(), engine, history);
+        let mut action = ActionRuntime::new(
+            fixture.app,
+            fixture.claude,
+            Vec::new(),
+            engine,
+            history,
+            test_errors(),
+            test_printed_warnings(),
+        );
         match action.save_current(None) {
             ActionReply::Failed(message) => {
                 assert!(message.contains("no live login"), "{message}");
@@ -2275,6 +2304,8 @@ mod tests {
             Vec::new(),
             engine,
             history,
+            test_errors(),
+            test_printed_warnings(),
         );
         let off = Settings {
             auto_burn: false,
@@ -2433,6 +2464,8 @@ mod tests {
             Vec::new(),
             engine,
             history,
+            test_errors(),
+            test_printed_warnings(),
         );
         let reply = action.edit(
             &fixture.account.id,
@@ -2494,6 +2527,8 @@ mod tests {
             Vec::new(),
             engine,
             history,
+            test_errors(),
+            test_printed_warnings(),
         );
         action.sync_live();
 
@@ -2535,6 +2570,8 @@ mod tests {
             Vec::new(),
             engine,
             history,
+            test_errors(),
+            test_printed_warnings(),
         );
         let host = seatswap_core::paths::host_name(None).expect("the host name");
         let history = HistoryDir::at(&fixture.app.history_dir(), &host);
@@ -2641,6 +2678,7 @@ mod tests {
             engine_commands,
             history,
             Arc::new(Mutex::new(None)),
+            test_printed_warnings(),
         );
         let error = runtime
             .snapshot
@@ -2695,6 +2733,7 @@ mod tests {
             engine_commands,
             history,
             Arc::new(Mutex::new(None)),
+            test_printed_warnings(),
         );
         assert!(runtime.engine.is_some(), "the engine reopened");
         let error = runtime
@@ -2730,6 +2769,7 @@ mod tests {
             engine_commands,
             history,
             Arc::new(Mutex::new(None)),
+            test_printed_warnings(),
         );
         assert!(runtime.engine.is_none(), "the engine could not open");
         assert_eq!(
@@ -2762,6 +2802,7 @@ mod tests {
             engine_commands,
             history,
             Arc::new(Mutex::new(None)),
+            test_printed_warnings(),
         );
         assert!(runtime.snapshot.settings.is_none());
         let error = runtime.snapshot.error.expect("an error is shown");
@@ -2835,7 +2876,7 @@ mod tests {
         assert_eq!(
             record_external_switch(
                 &recorder,
-                &mut PrintedWarnings::new(),
+                &Mutex::new(PrintedWarnings::new()),
                 None,
                 &account,
                 None,
@@ -2854,7 +2895,7 @@ mod tests {
         assert_eq!(
             record_external_switch(
                 &recorder,
-                &mut PrintedWarnings::new(),
+                &Mutex::new(PrintedWarnings::new()),
                 None,
                 &account,
                 None,
@@ -2906,15 +2947,19 @@ mod tests {
         )
         .expect("the torn event line");
         let recorder = Recorder::new(dir);
-        let mut printed = PrintedWarnings::new();
+        let printed = Mutex::new(PrintedWarnings::new());
 
-        record_external_switch(&recorder, &mut printed, None, &account, None, now)
+        record_external_switch(&recorder, &printed, None, &account, None, now)
             .expect("the events can be read");
-        assert_eq!(printed.len(), 1, "the torn line is one warning");
-        record_external_switch(&recorder, &mut printed, None, &account, None, now)
+        assert_eq!(
+            super::super::lock(&printed).len(),
+            1,
+            "the torn line is one warning"
+        );
+        record_external_switch(&recorder, &printed, None, &account, None, now)
             .expect("the events can be read again");
         assert_eq!(
-            printed.len(),
+            super::super::lock(&printed).len(),
             1,
             "the same warning text is remembered, not printed again"
         );
@@ -2969,6 +3014,7 @@ mod tests {
             baseline: ClockBaseline::now(),
             burn: BurnRuntime::new(action, engine_commands),
             forecast: Arc::new(Mutex::new(None)),
+            printed_warnings: test_printed_warnings(),
             tied_busy: 0,
             thinking: Vec::new(),
         };
@@ -3027,6 +3073,7 @@ mod tests {
             baseline: ClockBaseline::now(),
             burn: BurnRuntime::new(action, engine_commands),
             forecast: Arc::new(Mutex::new(None)),
+            printed_warnings: test_printed_warnings(),
             tied_busy: 0,
             thinking: Vec::new(),
         };
@@ -3094,6 +3141,7 @@ mod tests {
             baseline: ClockBaseline::now(),
             burn: BurnRuntime::new(action, engine_commands),
             forecast: Arc::clone(&forecast),
+            printed_warnings: test_printed_warnings(),
             tied_busy: 0,
             thinking: Vec::new(),
         };

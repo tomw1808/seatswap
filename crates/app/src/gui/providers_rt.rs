@@ -24,7 +24,8 @@ use seatswap_core::store::{self, Settings};
 
 use crate::ops;
 
-use super::worker::{report_history_error, UiEvent};
+use super::worker::UiEvent;
+use super::ReportedErrors;
 
 /// The provider cards are polled every five minutes (step-d.md Task 4).
 pub(crate) const PROVIDER_POLL_SECS: u64 = 300;
@@ -187,8 +188,8 @@ pub(crate) type CodexPathsLookup =
 pub(crate) type SettingsLookup = Box<dyn Fn(&Settings) -> Result<Settings, String> + Send>;
 
 /// The way the runtime reports a history write failure: in the app this is
-/// [`report_history_error`] (a notification and one line on stderr); a test
-/// counts the calls instead.
+/// [`ReportedErrors::report`] (a notification and one line on stderr, once per
+/// text); a test counts the calls instead.
 pub(crate) type ReportError = Box<dyn Fn(&str) + Send>;
 
 /// Start the provider thread. It is always started, whatever the two switches
@@ -198,13 +199,24 @@ pub(crate) fn spawn(
     history: Result<HistoryDir, String>,
     api: Api,
     ui: Sender<UiEvent>,
+    reported_errors: Arc<ReportedErrors>,
 ) -> Result<ProvidersHandle, String> {
     let (commands, received) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
     let thread = thread::Builder::new()
         .name("seatswap-providers".to_string())
-        .spawn(move || run(app, history, api, ui, thread_stop, received))
+        .spawn(move || {
+            run(
+                app,
+                history,
+                api,
+                ui,
+                thread_stop,
+                received,
+                reported_errors,
+            )
+        })
         .map_err(|error| format!("cannot start the provider thread: {error}"))?;
     Ok(ProvidersHandle {
         client: ProvidersClient { commands },
@@ -220,6 +232,7 @@ fn run(
     ui: Sender<UiEvent>,
     stop: Arc<AtomicBool>,
     commands: Receiver<ProvidersCommand>,
+    reported_errors: Arc<ReportedErrors>,
 ) {
     let app_for_lookup = app.clone();
     let mut runtime = ProvidersRuntime::new(
@@ -232,7 +245,7 @@ fn run(
                 .map(|file| file.settings)
                 .map_err(|error| error.to_string())
         }),
-        Box::new(report_history_error),
+        Box::new(move |text: &str| reported_errors.report(text)),
     );
     // The first round is at the start, before the first five minutes passed.
     let mut next = Instant::now();
@@ -285,11 +298,9 @@ pub(crate) struct ProvidersRuntime {
     settings_lookup: SettingsLookup,
     /// The recorder, or the sentence that says why there is none.
     recorder: Result<Recorder, String>,
-    /// The way a history write failure is reported.
+    /// The way a history write failure is reported. The app passes the one
+    /// reporter, which prints and notifies once per text for the whole run.
     report: ReportError,
-    /// The last error text reported; the same text is not reported again until
-    /// a recording succeeds or the text changes.
-    last_reported: Option<String>,
     /// The settings of the last round or save; the save compares against it.
     settings: Option<Settings>,
     codex: Option<ProviderView>,
@@ -316,7 +327,6 @@ impl ProvidersRuntime {
             settings_lookup,
             recorder: history.map(Recorder::new),
             report,
-            last_reported: None,
             settings: None,
             codex: None,
             ollama: None,
@@ -500,19 +510,15 @@ impl ProvidersRuntime {
             )
             .err()
             .map(|error| ops::history_unwritable(&error));
-        match failure {
-            Some(text) => self.report_error(&text),
-            None => self.last_reported = None,
+        if let Some(text) = failure {
+            self.report_error(&text);
         }
     }
 
-    /// Report an error text once: the same text again only after a recording
-    /// succeeded or the text changed.
+    /// Report an error text through the injected reporter: in the app that is
+    /// the one function that prints and notifies once per text for the whole
+    /// run. A test's reporter counts the calls.
     pub(crate) fn report_error(&mut self, text: &str) {
-        if self.last_reported.as_deref() == Some(text) {
-            return;
-        }
-        self.last_reported = Some(text.to_string());
         (self.report)(text);
     }
 
@@ -576,6 +582,8 @@ mod tests {
     use tempfile::tempdir;
 
     use seatswap_core::history::{Hosts, Range, Sample};
+
+    use crate::gui::ReportedErrors;
 
     const AUTH: &str = r#"{"OPENAI_API_KEY":null,"auth_mode":"chatgpt","last_refresh":"2026-11-14T16:53:03.750022420Z","tokens":{"id_token":"eyJhbGciOi.id.sig","access_token":"eyJhbGciOi.access.sig","refresh_token":"rt_9f2c","account_id":"0f3a6c2e-7b1d-4e9a-8c5f-2d4b6a8e0c13","login_owner_id":"user-sam","oauth_provenance":"cli"}}"#;
 
@@ -1111,9 +1119,10 @@ mod tests {
         std::fs::write(&root, b"not a history folder").expect("the root file");
         let server = Fake::start(vec![(200, PLUS_ANSWER.to_string())]);
         let (sender, reports) = mpsc::channel();
-        let report: ReportError = Box::new(move |text: &str| {
+        let errors = ReportedErrors::new(Box::new(move |text: &str| {
             let _ = sender.send(text.to_string());
-        });
+        }));
+        let report: ReportError = Box::new(move |text: &str| errors.report(text));
         let mut runtime = ProvidersRuntime::new(
             Ok(HistoryDir::at(&root, "atlas")),
             codex_api(&server.base),
@@ -1228,9 +1237,10 @@ mod tests {
         write_auth(&codex_home);
         let server = Fake::start(vec![(200, PLUS_ANSWER.to_string())]);
         let (sender, reports) = mpsc::channel();
-        let report: ReportError = Box::new(move |text: &str| {
+        let errors = ReportedErrors::new(Box::new(move |text: &str| {
             let _ = sender.send(text.to_string());
-        });
+        }));
+        let report: ReportError = Box::new(move |text: &str| errors.report(text));
         let lookup: SettingsLookup = Box::new(|_| Err("accounts.json is unreadable".to_string()));
         let folder = codex_home.clone();
         let mut runtime = test_runtime_with(

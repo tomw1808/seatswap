@@ -3,6 +3,7 @@
 //! `atlas`, `accounts.json` with the settings, `prices.json` and `fx.json`.
 //! Every file goes through the module that owns it.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, FixedOffset, Utc};
@@ -62,6 +63,8 @@ pub struct Tiny {
     pub prices: Prices,
     pub fx: Fx,
     pub projects: Projects,
+    /// The stats page's history read warnings; a test starts it empty.
+    pub warnings: RefCell<Vec<String>>,
     pub now: DateTime<Utc>,
     pub offset: FixedOffset,
     pub windows: Vec<WindowRecord>,
@@ -77,6 +80,7 @@ impl Tiny {
             prices: &self.prices,
             fx: &self.fx,
             projects: &self.projects,
+            warnings: &self.warnings,
             now: self.now,
             zone: self.offset,
         }
@@ -404,6 +408,7 @@ pub fn write(root: &Path) -> Result<Tiny, String> {
         prices,
         fx,
         projects,
+        warnings: RefCell::new(Vec::new()),
         now,
         offset,
         windows,

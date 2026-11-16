@@ -1,6 +1,7 @@
 //! The statistics pages (spec §3.1–§3.6, §3.9): what the history, the prices
 //! and the projects mean for a chosen range. Everything here only reads.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{
@@ -39,6 +40,8 @@ pub enum StatsError {
     #[error("{0}")]
     Message(String),
 }
+
+pub(crate) use crate::history::keep_warnings;
 
 /// Add `next` to a value that may not exist yet, through [`Values::sum`].
 pub(crate) fn add_opt_value(current: &mut Option<Values>, next: &Values) {
@@ -106,6 +109,9 @@ pub struct Ctx<'a, Tz: TimeZone + Copy = FixedOffset> {
     pub prices: &'a Prices,
     pub fx: &'a Fx,
     pub projects: &'a Projects,
+    /// The history read warnings of the page's reads (spec §1.2). The app
+    /// prints the new ones once after the command; the page shows nothing new.
+    pub warnings: &'a RefCell<Vec<String>>,
     pub now: DateTime<Utc>,
     /// The time zone of this computer; every local time is the zone's offset at
     /// that instant. The app passes `chrono::Local`, tests a [`FixedOffset`] or
@@ -268,6 +274,7 @@ pub fn account_weeks<Tz: TimeZone + Copy>(
         ctx.fx,
         ctx.settings,
         ctx.accounts,
+        ctx.warnings,
     )?;
     account_weeks_valued(ctx, range, q, &valuer)
 }
@@ -284,10 +291,11 @@ pub(crate) fn account_weeks_valued<Tz: TimeZone + Copy>(
     valuer: &Valuer,
 ) -> Result<Vec<AccountWeek>, StatsError> {
     let mut weeks: Vec<AccountWeek> = Vec::new();
-    for hosted in ctx
-        .history
-        .finished_claude_windows(&Range::ALL, &Hosts::All)?
-    {
+    let windows = keep_warnings(ctx.warnings, || {
+        ctx.history
+            .finished_claude_windows(&Range::ALL, &Hosts::All)
+    })?;
+    for hosted in windows.records {
         let window = hosted.record;
         if window.k != LimitKind::WeeklyAll {
             continue;
@@ -658,13 +666,16 @@ pub fn blocked_spans<Tz: TimeZone + Copy>(
     range: &Range,
     q: &Query,
 ) -> Result<Vec<BlockedSpan>, StatsError> {
-    let events = ctx.history.read_claude::<Event>(&Range::ALL, &Hosts::All)?;
+    let events = keep_warnings(ctx.warnings, || {
+        ctx.history.read_claude::<Event>(&Range::ALL, &Hosts::All)
+    })?;
     let intervals = block_intervals(&events.records, range.to);
     let mut weekly = Vec::new();
-    for hosted in ctx
-        .history
-        .finished_claude_windows(&Range::ALL, &Hosts::All)?
-    {
+    let windows = keep_warnings(ctx.warnings, || {
+        ctx.history
+            .finished_claude_windows(&Range::ALL, &Hosts::All)
+    })?;
+    for hosted in windows.records {
         if hosted.record.k == LimitKind::WeeklyAll {
             weekly.push(hosted);
         }
@@ -742,42 +753,48 @@ pub fn empty<Tz: TimeZone + Copy>(
 }
 
 fn earliest<R: Record>(
+    warnings: &RefCell<Vec<String>>,
     history: &HistoryDir,
     range: &Range,
 ) -> Result<Option<DateTime<Utc>>, HistoryError> {
-    let read = history.read_claude::<R>(range, &Hosts::All)?;
+    let read = keep_warnings(warnings, || history.read_claude::<R>(range, &Hosts::All))?;
     Ok(read.records.first().map(|hosted| hosted.record.at()))
 }
 
 fn first_record<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>) -> Result<Option<DateTime<Utc>>, StatsError> {
     let range = Range::ALL;
     let found = [
-        earliest::<Sample>(ctx.history, &range)?,
-        earliest::<WindowRecord>(ctx.history, &range)?,
-        earliest::<Event>(ctx.history, &range)?,
-        earliest::<TokenRecord>(ctx.history, &range)?,
-        earliest::<SessionRecord>(ctx.history, &range)?,
-        earliest::<UpRecord>(ctx.history, &range)?,
-        earliest::<ProjectsLogRecord>(ctx.history, &range)?,
+        earliest::<Sample>(ctx.warnings, ctx.history, &range)?,
+        earliest::<WindowRecord>(ctx.warnings, ctx.history, &range)?,
+        earliest::<Event>(ctx.warnings, ctx.history, &range)?,
+        earliest::<TokenRecord>(ctx.warnings, ctx.history, &range)?,
+        earliest::<SessionRecord>(ctx.warnings, ctx.history, &range)?,
+        earliest::<UpRecord>(ctx.warnings, ctx.history, &range)?,
+        earliest::<ProjectsLogRecord>(ctx.warnings, ctx.history, &range)?,
     ];
     Ok(found.into_iter().flatten().min())
 }
 
-fn any_record<R: Record>(history: &HistoryDir, range: &Range) -> Result<bool, HistoryError> {
-    Ok(!history
-        .read_claude::<R>(range, &Hosts::All)?
-        .records
-        .is_empty())
+fn any_record<R: Record>(
+    warnings: &RefCell<Vec<String>>,
+    history: &HistoryDir,
+    range: &Range,
+) -> Result<bool, HistoryError> {
+    Ok(
+        !keep_warnings(warnings, || history.read_claude::<R>(range, &Hosts::All))?
+            .records
+            .is_empty(),
+    )
 }
 
 fn has_record<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, range: &Range) -> Result<bool, StatsError> {
-    Ok(any_record::<Sample>(ctx.history, range)?
-        || any_record::<WindowRecord>(ctx.history, range)?
-        || any_record::<Event>(ctx.history, range)?
-        || any_record::<TokenRecord>(ctx.history, range)?
-        || any_record::<SessionRecord>(ctx.history, range)?
-        || any_record::<UpRecord>(ctx.history, range)?
-        || any_record::<ProjectsLogRecord>(ctx.history, range)?)
+    Ok(any_record::<Sample>(ctx.warnings, ctx.history, range)?
+        || any_record::<WindowRecord>(ctx.warnings, ctx.history, range)?
+        || any_record::<Event>(ctx.warnings, ctx.history, range)?
+        || any_record::<TokenRecord>(ctx.warnings, ctx.history, range)?
+        || any_record::<SessionRecord>(ctx.warnings, ctx.history, range)?
+        || any_record::<UpRecord>(ctx.warnings, ctx.history, range)?
+        || any_record::<ProjectsLogRecord>(ctx.warnings, ctx.history, range)?)
 }
 
 pub(crate) fn stored_account<'a, Tz: TimeZone + Copy>(
@@ -805,9 +822,10 @@ fn hosts_of(q: &Query, events: &[Hosted<Event>]) -> Vec<String> {
 /// rhythm of the four weeks before `range.to` is above 0.
 fn working_rhythm<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, range: &Range) -> Result<Rhythm, StatsError> {
     let from = range.to - Duration::weeks(RHYTHM_WEEKS);
-    let read = ctx
-        .history
-        .read::<TokenRecord>(&Range { from, to: range.to }, &Hosts::All)?;
+    let read = keep_warnings(ctx.warnings, || {
+        ctx.history
+            .read::<TokenRecord>(&Range { from, to: range.to }, &Hosts::All)
+    })?;
     Ok(rates::rhythm(&read.records, range.to, &ctx.zone))
 }
 
@@ -1209,9 +1227,41 @@ pub(crate) mod tests {
             prices: &tiny.prices,
             fx: &tiny.fx,
             projects: &tiny.projects,
+            warnings: &tiny.warnings,
             now: tiny.now,
             zone,
         }
+    }
+
+    /// A statistics page keeps a torn line's warning in the context's warnings
+    /// instead of dropping it (spec §1.2).
+    #[test]
+    fn a_statistics_page_keeps_a_torn_line_warning() {
+        use std::io::Write;
+
+        let tiny = tiny();
+        let events = tiny
+            .history
+            .root()
+            .join("atlas")
+            .join("events-2026-11.jsonl");
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&events)
+            .expect("the events file");
+        file.write_all(b"{\"t\":").expect("the torn last line");
+        drop(file);
+
+        let ctx = tiny.ctx();
+        overview::overview(&ctx, &all()).expect("the overview");
+
+        let warnings = tiny.warnings.borrow();
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("events-2026-11.jsonl line")),
+            "the torn line's warning is in Ctx: {warnings:?}"
+        );
     }
 
     #[test]
@@ -1314,6 +1364,7 @@ pub(crate) mod tests {
             &tiny.fx,
             &tiny.settings,
             &tiny.accounts,
+            &tiny.warnings,
         )
         .expect("a valuer");
         let tokens = tiny
@@ -1773,6 +1824,7 @@ pub(crate) mod tests {
             prices: &tiny.prices,
             fx: &tiny.fx,
             projects: &tiny.projects,
+            warnings: &tiny.warnings,
             now: tiny.now,
             zone: tiny.offset,
         };
@@ -1802,6 +1854,7 @@ pub(crate) mod tests {
             prices: &tiny.prices,
             fx: &tiny.fx,
             projects: &tiny.projects,
+            warnings: &tiny.warnings,
             now: tiny.now,
             zone: tiny.offset,
         };

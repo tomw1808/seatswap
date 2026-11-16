@@ -853,18 +853,15 @@ pub(crate) async fn skill_install(
 
 /// Every host's session records and project log lines (spec §3.6), over all
 /// time, with each folder written with `~` for `home` as the app shows paths
-/// everywhere: a torn line is skipped by the reader with its warning, as for
-/// the other kinds.
+/// everywhere: a torn line is skipped by the reader with its warning, which
+/// the caller prints through the app's one printer.
 fn projects_from(
     history: &HistoryDir,
     home: &Path,
     accounts: &[Account],
-) -> Result<Projects, String> {
+) -> Result<(Projects, Vec<String>), String> {
     let (mut projects, warnings) =
         projects::load(history, accounts).map_err(|error| error.to_string())?;
-    for warning in &warnings {
-        eprintln!("seatswap: history: {warning}");
-    }
     for project in &mut projects.projects {
         for cwds in project.folders.values_mut() {
             for cwd in cwds.iter_mut() {
@@ -872,19 +869,19 @@ fn projects_from(
             }
         }
     }
-    Ok(projects)
+    Ok((projects, warnings))
 }
 
 /// One project edit: validated first, so a refused edit appends nothing. The
 /// line goes to this host's own log through the history it already has, and
-/// the new resolution is returned.
+/// the new resolution is returned with the read's warnings.
 fn edit_projects(
     history: &HistoryDir,
     home: &Path,
     accounts: &[Account],
     at: DateTime<Utc>,
     edit: ProjectEdit,
-) -> Result<Projects, String> {
+) -> Result<(Projects, Vec<String>), String> {
     edit.validate().map_err(|error| error.to_string())?;
     history
         .append(&ProjectsLogRecord { t: at, edit })
@@ -904,11 +901,13 @@ fn stored_accounts(state: &GuiState) -> Result<Vec<Account>, String> {
 /// organization and its session count.
 #[tauri::command]
 pub(crate) async fn projects_view(state: State<'_, GuiState>) -> Result<Projects, String> {
-    projects_from(
+    let (projects, warnings) = projects_from(
         &history_of(&state)?,
         &state.claude.home,
         &stored_accounts(&state)?,
-    )
+    )?;
+    super::lock(&state.printed_warnings).print(&warnings);
+    Ok(projects)
 }
 
 /// Rename, join, unjoin or assign a project, or edit an organization. Returns
@@ -918,13 +917,15 @@ pub(crate) async fn projects_edit(
     state: State<'_, GuiState>,
     edit: ProjectEdit,
 ) -> Result<Projects, String> {
-    edit_projects(
+    let (projects, warnings) = edit_projects(
         &history_of(&state)?,
         &state.claude.home,
         &stored_accounts(&state)?,
         Utc::now(),
         edit,
-    )
+    )?;
+    super::lock(&state.printed_warnings).print(&warnings);
+    Ok(projects)
 }
 
 // ---------------------------------------------------------------------------
@@ -1445,8 +1446,9 @@ mod tests {
                 closed: false,
             })
             .expect("a session line");
-        let projects =
+        let (projects, warnings) =
             projects_from(&history, Path::new("/home/sam"), &[]).expect("the projects resolve");
+        assert!(warnings.is_empty(), "a clean history has no warning");
         assert_eq!(projects.projects.len(), 1);
         assert_eq!(
             projects.projects[0].folders.get("atlas"),

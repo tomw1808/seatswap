@@ -519,8 +519,16 @@ fn build_pricing(
     file: &store::AccountsFile,
 ) -> Result<(Valuer, Settings), String> {
     let (prices, fx) = super::window::load_prices_and_fx(app)?;
-    let valuer = Valuer::build(history, range, &prices, &fx, &file.settings, &file.accounts)
-        .map_err(|error| format!("the values cannot be read: {error}"))?;
+    let valuer = Valuer::build(
+        history,
+        range,
+        &prices,
+        &fx,
+        &file.settings,
+        &file.accounts,
+        &RefCell::new(Vec::new()),
+    )
+    .map_err(|error| format!("the values cannot be read: {error}"))?;
     Ok((valuer, file.settings.clone()))
 }
 

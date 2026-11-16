@@ -862,6 +862,12 @@ fn flags(base: &str, flags: &[(&str, bool)]) -> String {
     text
 }
 
+/// The CLI's one warning line: every warning this program prints goes through
+/// it, so the prefix is written once.
+fn warn(text: &str) {
+    eprintln!("seatswap: warning: {text}");
+}
+
 /// Every agent call is one `agentCall` event, allowed or refused. A history
 /// that cannot be written is one warning and never changes the call's result.
 fn record_agent_call(context: &Context, command: &str, allowed: bool, cwd: Option<String>) {
@@ -879,7 +885,7 @@ fn record_agent_call(context: &Context, command: &str, allowed: bool, cwd: Optio
             .map_err(|error| ops::history_unwritable(&error))
     })();
     if let Err(message) = result {
-        eprintln!("seatswap: warning: {message}");
+        warn(&message);
     }
 }
 
@@ -887,7 +893,9 @@ fn current_cwd() -> Option<String> {
     match record_cwd(std::env::current_dir()) {
         Ok(cwd) => Some(cwd),
         Err(reason) => {
-            eprintln!("seatswap: warning: {reason}; the agent call is recorded without a folder");
+            warn(&format!(
+                "{reason}; the agent call is recorded without a folder"
+            ));
             None
         }
     }
@@ -945,7 +953,7 @@ fn open_context(cli: &Cli) -> Result<Context, CliError> {
     let app = AppPaths::resolve(cli.data_dir.as_deref())?;
     let (store, warning) = store::open_store(app)?;
     if let Some(warning) = warning {
-        eprintln!("seatswap: warning: {warning}");
+        warn(&warning);
     }
     let file = store.load()?;
     let paths = resolve_paths(
@@ -1048,7 +1056,9 @@ fn record_cli_switch(
         Ok(())
     })();
     if let Err(error) = result {
-        eprintln!("seatswap: warning: the switch was not written to the history: {error}");
+        warn(&format!(
+            "the switch was not written to the history: {error}"
+        ));
     }
 }
 
@@ -1096,7 +1106,7 @@ fn next_account(
                 )
                 .map_err(CliError::Message)?;
                 if let Some(error) = history_error {
-                    eprintln!("seatswap: warning: {error}");
+                    warn(&error);
                 }
                 file = context.store.load()?;
                 live = switcher::live_state(&context.claude, &file)?;
@@ -1122,7 +1132,7 @@ fn cli_history(context: &Context) -> Option<Recorder> {
     match ops::open_history(context.store.app_paths(), &context.settings) {
         Ok(recorder) => Some(recorder),
         Err(error) => {
-            eprintln!("seatswap: warning: {error}");
+            warn(&error);
             None
         }
     }
@@ -1140,7 +1150,7 @@ fn add(context: Context, label: Option<String>) -> Result<(), CliError> {
     .map_err(CliError::Message)?;
     println!("Saved {} — {}", account.abbr, account.label);
     if let Some(error) = history_error {
-        eprintln!("seatswap: warning: {error}");
+        warn(&error);
     }
     Ok(())
 }
@@ -1160,7 +1170,7 @@ fn remove(context: Context, key: &str, yes: bool) -> Result<(), CliError> {
             .map_err(CliError::Message)?;
     println!("Removed {} — {}", removed.abbr, removed.label);
     if let Some(error) = history_error {
-        eprintln!("seatswap: warning: {error}");
+        warn(&error);
     }
     Ok(())
 }
@@ -1768,7 +1778,7 @@ fn burn_simulate(
         // Both replays read the same files; a torn line is one warning.
         for warning in &result.warnings {
             if printed.insert(warning.clone()) {
-                eprintln!("seatswap: warning: {warning}");
+                warn(warning);
             }
         }
         lines.push(burn_text::replay_report(&result, &accounts)?);

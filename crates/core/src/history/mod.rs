@@ -2,6 +2,7 @@
 //! range and merging several hosts. One subfolder per host, one JSON Lines
 //! file per kind and month; [`read`](HistoryDir::read) owns the reading side.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
@@ -24,6 +25,18 @@ pub use read::{
     export_csv, export_json, HostConflict, HostInfo, Hosted, Hosts, Imported, Range, Read,
 };
 pub use write::{closed_windows, sample_of, Recorder};
+
+/// One history read that keeps its records and adds its warnings to `warnings`
+/// (spec §1.2). The statistics pages and [`crate::money::Valuer::build`] go
+/// through it, so a torn line or an unknown shape is named and not dropped.
+pub(crate) fn keep_warnings<R: Record>(
+    warnings: &RefCell<Vec<String>>,
+    read: impl FnOnce() -> Result<Read<R>, HistoryError>,
+) -> Result<Read<R>, HistoryError> {
+    let read = read()?;
+    warnings.borrow_mut().extend(read.warnings.iter().cloned());
+    Ok(read)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum HistoryError {
@@ -1105,12 +1118,16 @@ mod tests {
         let windows = history
             .finished_windows(&wide_range(), &Hosts::All)
             .unwrap();
-        assert_eq!(windows.len(), 2, "finished_windows keeps every line");
+        assert_eq!(
+            windows.records.len(),
+            2,
+            "finished_windows keeps every line"
+        );
         let claude_windows = history
             .finished_claude_windows(&wide_range(), &Hosts::All)
             .unwrap();
-        assert_eq!(claude_windows.len(), 1);
-        assert_eq!(claude_windows[0].record.account, claude);
+        assert_eq!(claude_windows.records.len(), 1);
+        assert_eq!(claude_windows.records[0].record.account, claude);
 
         let events = history.read::<Event>(&wide_range(), &Hosts::All).unwrap();
         assert_eq!(events.records.len(), 3, "read keeps every line");
@@ -2136,9 +2153,9 @@ mod tests {
         mark_host(dir.path(), "vega");
 
         let windows = atlas.finished_windows(&wide_range(), &Hosts::All).unwrap();
-        assert_eq!(windows.len(), 1);
-        assert_eq!(windows[0].host, "vega");
-        assert_eq!(windows[0].record.final_percent, 63.0);
+        assert_eq!(windows.records.len(), 1);
+        assert_eq!(windows.records[0].host, "vega");
+        assert_eq!(windows.records[0].record.final_percent, 63.0);
     }
 
     #[test]
@@ -2156,9 +2173,9 @@ mod tests {
         mark_host(dir.path(), "vega");
 
         let windows = atlas.finished_windows(&wide_range(), &Hosts::All).unwrap();
-        assert_eq!(windows.len(), 1);
-        assert_eq!(windows[0].host, "atlas");
-        assert_eq!(windows[0].record.final_percent, 61.0);
+        assert_eq!(windows.records.len(), 1);
+        assert_eq!(windows.records[0].host, "atlas");
+        assert_eq!(windows.records[0].record.final_percent, 61.0);
     }
 
     #[test]

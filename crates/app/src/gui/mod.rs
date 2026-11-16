@@ -76,7 +76,37 @@ use sessions_rt::{SessionsClient, SessionsHandle};
 #[cfg(feature = "gui")]
 use worker::SessionsSummary;
 #[cfg(feature = "gui")]
-use worker::{ActionCommand, ActionReply, EngineCommand, PendingSwitch, Snapshot, UiEvent};
+use worker::{
+    ActionCommand, ActionReply, EngineCommand, PendingSwitch, PrintedWarnings, Snapshot, UiEvent,
+};
+
+/// Prints and notifies an app error once per text for this run. The snapshot,
+/// the action thread's history failures and the provider thread all report
+/// through one instance (spec §1.2).
+#[cfg(feature = "gui")]
+pub(crate) struct ReportedErrors {
+    notified_errors: Mutex<HashSet<String>>,
+    send: Box<dyn Fn(&str) + Send + Sync>,
+}
+
+#[cfg(feature = "gui")]
+impl ReportedErrors {
+    pub(crate) fn new(send: Box<dyn Fn(&str) + Send + Sync>) -> ReportedErrors {
+        ReportedErrors {
+            notified_errors: Mutex::new(HashSet::new()),
+            send,
+        }
+    }
+
+    /// Print and notify `text` when this run has not reported it yet.
+    pub(crate) fn report(&self, text: &str) {
+        let new = lock(&self.notified_errors).insert(text.to_string());
+        if new {
+            eprintln!("seatswap: {text}");
+            (self.send)(text);
+        }
+    }
+}
 
 /// The one pending 15 s re-check: when it wakes and whether its thread runs.
 #[cfg(feature = "gui")]
@@ -122,7 +152,11 @@ pub(crate) struct GuiState {
     /// The one pending 15 s re-check for a session that has just started to
     /// wait (`notify::Deduper::recheck_at`).
     recheck: Mutex<Recheck>,
-    notified_errors: Mutex<HashSet<String>>,
+    /// The one app-wide error reporter: print and notify once per text.
+    pub(crate) reported_errors: Arc<ReportedErrors>,
+    /// The one set of history read warnings this run has printed; every thread
+    /// and every statistics command prints through it.
+    pub(crate) printed_warnings: Arc<Mutex<PrintedWarnings>>,
     /// Where the panel was opened, its last height and when focus loss last
     /// hid it (`panel::PanelState`).
     panel: Mutex<panel::PanelState>,
@@ -389,12 +423,16 @@ fn setup(
     };
 
     let (ui_tx, ui_rx) = mpsc::channel();
+    let reported_errors = Arc::new(ReportedErrors::new(Box::new(notify::send_error)));
+    let printed_warnings = Arc::new(Mutex::new(PrintedWarnings::new()));
     let mut worker = worker::spawn(
         app.clone(),
         claude.clone(),
         autostart_args.clone(),
         ui_tx,
         settings.clone(),
+        Arc::clone(&reported_errors),
+        Arc::clone(&printed_warnings),
     )?;
     let _ = engine_slot.set(worker.engine.clone());
 
@@ -455,7 +493,8 @@ fn setup(
         deduper: Mutex::new(notify::Deduper::new()),
         waiting: Mutex::new(HashMap::new()),
         recheck: Mutex::new(Recheck::default()),
-        notified_errors: Mutex::new(HashSet::new()),
+        reported_errors,
+        printed_warnings,
         panel: Mutex::new(panel::PanelState::new()),
         tray: Mutex::new(None),
         _watcher: Mutex::new(watcher),
@@ -591,14 +630,7 @@ fn apply_snapshot(app: &AppHandle, mut snapshot: Snapshot) {
     }
 
     if let Some(error) = &snapshot.error {
-        let new = {
-            let mut seen = lock(&state.notified_errors);
-            seen.insert(error.clone())
-        };
-        if new {
-            eprintln!("seatswap: {error}");
-            notify::send_error(error);
-        }
+        state.reported_errors.report(error);
     }
 
     for notification in due {
@@ -967,5 +999,30 @@ mod tests {
         };
         assert!(settings.is_none());
         assert!(error.is_some());
+    }
+
+    /// The one app error reporter: the same text is printed and notified once,
+    /// a second text again.
+    #[test]
+    fn an_app_error_is_notified_once_per_text() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&sent);
+        let errors = ReportedErrors::new(Box::new(move |text: &str| {
+            lock(&sink).push(text.to_string());
+        }));
+
+        errors.report("the history cannot be written: no space left on device");
+        errors.report("the history cannot be written: no space left on device");
+        errors.report("auto-burn: cannot read the history");
+        errors.report("the history cannot be written: no space left on device");
+
+        assert_eq!(
+            *lock(&sent),
+            vec![
+                "the history cannot be written: no space left on device".to_string(),
+                "auto-burn: cannot read the history".to_string(),
+            ],
+            "each error text is notified once, and a new text is notified"
+        );
     }
 }

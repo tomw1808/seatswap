@@ -19,9 +19,9 @@ use crate::projects::ProjectId;
 
 use super::{
     account_abbr, account_id, account_position, account_weeks_valued, accounts_without_price,
-    blocked_by_week, blocked_spans, date_text, hours_text, lost_percent, money_of, money_text,
-    percent_text, range_of, switch_counts, top_three, week_columns, week_of_record, working_rhythm,
-    AccountWeek, Ctx, Query, StatsError, SwitchCounts,
+    blocked_by_week, blocked_spans, date_text, hours_text, keep_warnings, lost_percent, money_of,
+    money_text, percent_text, range_of, switch_counts, top_three, week_columns, week_of_record,
+    working_rhythm, AccountWeek, Ctx, Query, StatsError, SwitchCounts,
 };
 
 /// The Overview page's numbers for one range (spec §3.1).
@@ -120,16 +120,23 @@ pub(crate) fn overview_in<Tz: TimeZone + Copy>(
         ctx.fx,
         ctx.settings,
         ctx.accounts,
+        ctx.warnings,
     )?;
     let finished = account_weeks_valued(ctx, range, q, &valuer)?;
     let spans = blocked_spans(ctx, range, q)?;
     let rhythm = working_rhythm(ctx, range)?;
     let currency = ctx.settings.currency.clone();
 
-    let events = ctx.history.read_claude::<Event>(&Range::ALL, &Hosts::All)?;
+    let events = keep_warnings(ctx.warnings, || {
+        ctx.history.read_claude::<Event>(&Range::ALL, &Hosts::All)
+    })?;
     let reading = reading_range(range, &finished);
-    let samples = ctx.history.read_claude::<Sample>(&reading, &Hosts::All)?;
-    let tokens = ctx.history.read::<TokenRecord>(&reading, &Hosts::All)?;
+    let samples = keep_warnings(ctx.warnings, || {
+        ctx.history.read_claude::<Sample>(&reading, &Hosts::All)
+    })?;
+    let tokens = keep_warnings(ctx.warnings, || {
+        ctx.history.read::<TokenRecord>(&reading, &Hosts::All)
+    })?;
 
     let without_price = accounts_without_price(ctx, &finished);
 

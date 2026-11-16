@@ -132,39 +132,18 @@ impl HistoryDir {
     /// The window records of the range, one per (account, kind, end within
     /// `same_reset`): the one with the latest `last_sample` counts (spec §1.5).
     /// On a tie the host name that sorts first wins, so the result does not
-    /// depend on read order. Sorted by end, then account.
+    /// depend on read order. Sorted by end, then account. The read's warnings
+    /// are kept, so a caller that shows them gets them here too.
     pub fn finished_windows(
         &self,
         range: &Range,
         hosts: &Hosts,
-    ) -> Result<Vec<Hosted<WindowRecord>>, HistoryError> {
+    ) -> Result<Read<WindowRecord>, HistoryError> {
         let read = self.read::<WindowRecord>(range, hosts)?;
-        let mut windows: Vec<Hosted<WindowRecord>> = Vec::new();
-        for hosted in read.records {
-            let same = windows.iter().position(|kept| {
-                kept.record.account == hosted.record.account
-                    && kept.record.k == hosted.record.k
-                    && same_reset(kept.record.end, hosted.record.end)
-            });
-            let Some(index) = same else {
-                windows.push(hosted);
-                continue;
-            };
-            let kept = &windows[index];
-            let later = hosted.record.last_sample > kept.record.last_sample
-                || (hosted.record.last_sample == kept.record.last_sample
-                    && hosted.host < kept.host);
-            if later {
-                windows[index] = hosted;
-            }
-        }
-        windows.sort_by(|a, b| {
-            a.record
-                .end
-                .cmp(&b.record.end)
-                .then_with(|| a.record.account.cmp(&b.record.account))
-        });
-        Ok(windows)
+        Ok(Read {
+            records: finished_of(read.records),
+            warnings: read.warnings,
+        })
     }
 
     /// The Claude windows of the range: [`finished_windows`] with the Codex
@@ -175,10 +154,10 @@ impl HistoryDir {
         &self,
         range: &Range,
         hosts: &Hosts,
-    ) -> Result<Vec<Hosted<WindowRecord>>, HistoryError> {
-        let mut windows = self.finished_windows(range, hosts)?;
-        windows.retain(|hosted| hosted.record.is_claude());
-        Ok(windows)
+    ) -> Result<Read<WindowRecord>, HistoryError> {
+        let mut read = self.finished_windows(range, hosts)?;
+        read.records.retain(|hosted| hosted.record.is_claude());
+        Ok(read)
     }
 
     /// `Hosts::All` is every folder with a `host.json` plus this dir's own host
@@ -196,6 +175,37 @@ impl HistoryDir {
             }
         }
     }
+}
+
+/// The finished windows of a window read: one per (account, kind, end within
+/// `same_reset`), the one with the latest `last_sample`; on a tie the host name
+/// that sorts first wins. Sorted by end, then account.
+fn finished_of(mut records: Vec<Hosted<WindowRecord>>) -> Vec<Hosted<WindowRecord>> {
+    let mut windows: Vec<Hosted<WindowRecord>> = Vec::new();
+    for hosted in records.drain(..) {
+        let same = windows.iter().position(|kept| {
+            kept.record.account == hosted.record.account
+                && kept.record.k == hosted.record.k
+                && same_reset(kept.record.end, hosted.record.end)
+        });
+        let Some(index) = same else {
+            windows.push(hosted);
+            continue;
+        };
+        let kept = &windows[index];
+        let later = hosted.record.last_sample > kept.record.last_sample
+            || (hosted.record.last_sample == kept.record.last_sample && hosted.host < kept.host);
+        if later {
+            windows[index] = hosted;
+        }
+    }
+    windows.sort_by(|a, b| {
+        a.record
+            .end
+            .cmp(&b.record.end)
+            .then_with(|| a.record.account.cmp(&b.record.account))
+    });
+    windows
 }
 
 /// The month files of one kind in one host folder whose month overlaps the
@@ -1030,7 +1040,7 @@ fn export_rows(
     range: &Range,
     mut emit: impl FnMut(ExportRow) -> Result<(), HistoryError>,
 ) -> Result<(), HistoryError> {
-    for hosted in history.finished_windows(range, &Hosts::All)? {
+    for hosted in history.finished_windows(range, &Hosts::All)?.records {
         emit(ExportRow::Window(WindowRow::of(hosted.record)))?;
     }
     for month in months_in(history, Kind::Tokens, range)? {
