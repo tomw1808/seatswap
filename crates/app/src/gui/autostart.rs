@@ -40,6 +40,8 @@ pub(crate) enum AutostartError {
     #[cfg(windows)]
     #[error("cannot start at login: {path} is missing")]
     NoTrayProgram { path: PathBuf },
+    #[error("the seatswap program beside the running one is missing: {path}")]
+    NoConsoleProgram { path: PathBuf },
     #[error("cannot start at login: {path} is not valid Unicode")]
     NotUnicode { path: PathBuf },
     #[cfg(windows)]
@@ -205,15 +207,42 @@ const RUN_VALUE: &str = "seatswap";
 #[cfg(windows)]
 const RUN_COMMAND_LIMIT: usize = 260;
 
+/// The two seatswap programs beside the running one: the console program (the
+/// status line runs it) and the tray program (autostart runs it). The `.exe`
+/// suffix is the one difference between Windows and the other systems.
+fn program_beside(current_exe: &Path, console: bool) -> PathBuf {
+    #[cfg(windows)]
+    let name = if console {
+        "seatswap.exe"
+    } else {
+        "seatswap-tray.exe"
+    };
+    #[cfg(not(windows))]
+    let name = if console { "seatswap" } else { "seatswap-tray" };
+    current_exe.with_file_name(name)
+}
+
 /// The program the entry starts: `seatswap-tray.exe` in the folder of
 /// `current_exe`, the same program without a console window.
 #[cfg(windows)]
 fn tray_program(current_exe: &Path) -> Result<PathBuf, AutostartError> {
-    let path = current_exe.with_file_name("seatswap-tray.exe");
+    let path = program_beside(current_exe, false);
     if path.is_file() {
         Ok(path)
     } else {
         Err(AutostartError::NoTrayProgram { path })
+    }
+}
+
+/// The console program beside the running one (`seatswap.exe` on Windows):
+/// Claude Code runs it for the status line, also when the tray program is the
+/// one making the change.
+pub(crate) fn console_program(current_exe: &Path) -> Result<PathBuf, AutostartError> {
+    let path = program_beside(current_exe, true);
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(AutostartError::NoConsoleProgram { path })
     }
 }
 
@@ -365,6 +394,54 @@ mod tests {
                 Err(AutostartError::NotUnicode { path }) => assert_eq!(path, odd),
                 other => panic!("expected NotUnicode, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn console_program_finds_the_sibling_and_reports_a_missing_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let folder = tmp.path().join("seat swap");
+        std::fs::create_dir(&folder).expect("the program folder");
+        let name = if cfg!(windows) {
+            "seatswap.exe"
+        } else {
+            "seatswap"
+        };
+        let exe = folder.join(name);
+        std::fs::write(&exe, b"MZ").expect("the console program");
+        assert_eq!(console_program(&exe).expect("the sibling"), exe);
+
+        std::fs::remove_file(&exe).expect("remove");
+        match console_program(&exe) {
+            Err(AutostartError::NoConsoleProgram { path }) => assert_eq!(path, exe),
+            other => panic!("expected NoConsoleProgram, got {other:?}"),
+        }
+    }
+
+    /// The tray program makes the status line's change too, so its folder's
+    /// console program is the one Claude Code must run.
+    #[test]
+    fn console_program_from_the_tray_program_names_the_console_program() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (tray_name, console_name) = if cfg!(windows) {
+            ("seatswap-tray.exe", "seatswap.exe")
+        } else {
+            ("seatswap-tray", "seatswap")
+        };
+        let tray = tmp.path().join(tray_name);
+        std::fs::write(&tray, b"MZ").expect("the tray program");
+        let console = tmp.path().join(console_name);
+        std::fs::write(&console, b"MZ").expect("the console program");
+
+        assert_eq!(
+            console_program(&tray).expect("the console sibling"),
+            console
+        );
+
+        std::fs::remove_file(&console).expect("remove");
+        match console_program(&tray) {
+            Err(AutostartError::NoConsoleProgram { path }) => assert_eq!(path, console),
+            other => panic!("expected NoConsoleProgram, got {other:?}"),
         }
     }
 

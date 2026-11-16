@@ -134,6 +134,12 @@ impl ClaudePaths {
         append_to_file_name(&self.identity_file, ".lock")
     }
 
+    /// Claude Code's settings: `<config_dir>/settings.json`. seatswap writes
+    /// only its `statusLine` key.
+    pub fn settings_file(&self) -> PathBuf {
+        self.config_dir.join("settings.json")
+    }
+
     /// Claude Code's running session files: `<config_dir>/sessions`.
     pub fn sessions_dir(&self) -> PathBuf {
         self.config_dir.join("sessions")

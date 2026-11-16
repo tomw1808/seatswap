@@ -554,6 +554,33 @@ pub struct OwnRate {
     pub value: f64,
 }
 
+/// What seatswap remembers about the `statusLine` it wrote in Claude Code's
+/// settings (spec §5.4).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatuslineInstall {
+    /// The exact value seatswap wrote last.
+    pub installed: serde_json::Value,
+    /// The exact value the file had before seatswap's first install. `None`
+    /// (the key is absent) means the file had no `statusLine` key; a present
+    /// `null` is the value `null` and is written back as `null`.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub previous: Option<serde_json::Value>,
+}
+
+/// Read a present JSON value as `Some`, also when it is `null`; a missing field
+/// takes the serde default `None` instead, so the two cases stay distinct.
+fn deserialize_present_value<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(serde::Deserialize::deserialize(deserializer)?))
+}
+
 /// Settings (spec §10). Each field has a serde default, so a file written by an
 /// older build still loads with that setting's default; a present but invalid
 /// value is rejected by [`Settings::validate`], never silently replaced.
@@ -625,6 +652,11 @@ pub struct Settings {
     /// `None` (absent or `null`) records nothing.
     #[serde(default)]
     pub statusline_record_until: Option<DateTime<Utc>>,
+    /// The `statusLine` seatswap wrote last and the value the file had before
+    /// its first install (spec §5.4); `None` (absent or `null`) means seatswap
+    /// has no record, so there is nothing to restore.
+    #[serde(default)]
+    pub statusline_install: Option<StatuslineInstall>,
     /// The currency every amount is shown in, three capital letters (spec
     /// §1.4); `None` until it is set, and never assumed.
     #[serde(default)]
@@ -668,6 +700,7 @@ impl Default for Settings {
             statusline_feed: default_statusline_feed(),
             statusline: StatuslineConfig::current_line(),
             statusline_record_until: None,
+            statusline_install: None,
             currency: None,
             usd_rate: None,
             look_up_prices: default_look_up_prices(),
@@ -1677,6 +1710,56 @@ mod tests {
             .load()
             .expect("a statusline without a margin must still load");
         assert_eq!(file.settings.statusline.margin, 4);
+    }
+
+    /// A `statuslineInstall` with `"previous": null` keeps that `null`; one
+    /// without the field has no previous value, which is a different thing.
+    #[test]
+    fn statusline_install_keeps_a_null_previous_and_a_missing_one_apart() {
+        let installed = json!({
+            "type": "command",
+            "command": "\"/opt/seatswap\" statusline",
+            "refreshInterval": 2,
+        });
+        let with_null: Settings = serde_json::from_value(json!({
+            "statuslineInstall": { "installed": installed, "previous": null }
+        }))
+        .expect("a record with a null previous");
+        let record = with_null.statusline_install.expect("the record must load");
+        assert_eq!(record.previous, Some(Value::Null));
+        assert_eq!(
+            serde_json::to_value(&record).expect("serialize"),
+            json!({ "installed": installed, "previous": null }),
+            "a present null is written back"
+        );
+
+        let without: Settings = serde_json::from_value(json!({
+            "statuslineInstall": { "installed": installed }
+        }))
+        .expect("a record without a previous");
+        let record = without.statusline_install.expect("the record must load");
+        assert_eq!(record.previous, None);
+        assert_eq!(
+            serde_json::to_value(&record).expect("serialize"),
+            json!({ "installed": installed }),
+            "a missing previous leaves the field out"
+        );
+    }
+
+    /// An `accounts.json` written before Task 3 has no `statuslineInstall`, so
+    /// seatswap has no record and nothing to restore.
+    #[test]
+    fn an_older_accounts_file_has_no_statusline_install_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(&tmp.path().join("app"));
+        fs::create_dir_all(store.app_paths().data_dir.clone()).unwrap();
+        fs::write(
+            store.app_paths().accounts_file(),
+            br#"{"version":1,"accounts":[],"settings":{"trayText":"percentReset"}}"#,
+        )
+        .unwrap();
+        let file = store.load().unwrap();
+        assert_eq!(file.settings.statusline_install, None);
     }
 
     /// A segment written before `color` had a default still loads: a segment

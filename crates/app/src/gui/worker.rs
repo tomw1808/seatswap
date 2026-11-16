@@ -336,6 +336,10 @@ pub(crate) struct SavedSetting {
     pub(crate) warning: Option<String>,
 }
 
+/// `Saved` carries the whole settings, including the status line's previous
+/// value; a settings save happens once per edit, so boxing it would only move
+/// the allocation.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum ActionReply {
     Done,

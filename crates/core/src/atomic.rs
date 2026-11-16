@@ -3,12 +3,15 @@
 //! one way seatswap appends a line to a file.
 //!
 //! A write goes to a temp file in the same folder, is fsynced, renamed over the
-//! target, and (Unix) the folder is fsynced. On Unix an existing file keeps its
-//! mode and a new one gets the mode of `access_if_new`; on Windows a file gets
-//! the permissions of its folder, and the rename is retried briefly while
-//! another program holds the target open. An append is one write of every line
-//! and its newline, then fsynced; a new file gets the mode of `access_if_new`,
-//! an existing one keeps its mode.
+//! target, and (Unix) the folder is fsynced. When `path` is a symbolic link the
+//! write goes through it: the temp file is made beside the file the link finally
+//! points to, that file keeps its mode, and the link stays a link. A link whose
+//! target does not exist is an error naming the link and no file is created. On
+//! Unix an existing file keeps its mode and a new one gets the mode of
+//! `access_if_new`; on Windows a file gets the permissions of its folder, and the
+//! rename is retried briefly while another program holds the target open. An
+//! append is one write of every line and its newline, then fsynced; a new file
+//! gets the mode of `access_if_new`, an existing one keeps its mode.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -44,14 +47,21 @@ const RENAME_RETRY: Duration = Duration::from_secs(2);
 /// Replace `path` with `bytes` atomically. A reader sees the old or the new
 /// content, never a mix. The parent folder must exist. An existing file keeps
 /// its mode (Unix); a new one is created with `access_if_new`.
+///
+/// A symbolic link at `path` is written through, not replaced: the temp file is
+/// made beside the file the chain of links finally points to, that file keeps its
+/// mode, and every link stays. A link whose target (or later link) does not
+/// exist is a `NotFound` error naming that link, and no file is created beside
+/// it.
 pub fn write_atomic(path: &Path, bytes: &[u8], access_if_new: Access) -> io::Result<()> {
+    let target = write_target(path)?;
     #[cfg(unix)]
-    let dir = path
+    let dir = target
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     #[cfg(unix)]
-    let mode = match fs::metadata(path) {
+    let mode = match fs::metadata(&target) {
         Ok(m) => m.permissions().mode() & 0o7777,
         Err(e) if e.kind() == io::ErrorKind::NotFound => access_if_new.mode(),
         Err(e) => return Err(e),
@@ -59,7 +69,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8], access_if_new: Access) -> io::Res
     // Windows has no file modes: the new file gets its folder's permissions.
     #[cfg(windows)]
     let _ = access_if_new;
-    let tmp = temp_path(path);
+    let tmp = temp_path(&target);
     let result = (|| {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -74,17 +84,67 @@ pub fn write_atomic(path: &Path, bytes: &[u8], access_if_new: Access) -> io::Res
         drop(f);
         #[cfg(unix)]
         {
-            fs::rename(&tmp, path)?;
+            fs::rename(&tmp, &target)?;
             File::open(dir)?.sync_all()
         }
         // Windows refuses to open a folder as a file, so there is no folder sync.
         #[cfg(windows)]
-        rename_with_retry(&tmp, path, RENAME_RETRY)
+        rename_with_retry(&tmp, &target, RENAME_RETRY)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+/// The file a write to `path` must replace: `path` when it is not a symbolic
+/// link (also when it does not exist yet), or the file a chain of links at
+/// `path` finally points to. A link whose target is missing is `NotFound` with
+/// a text that names that link; a chain that loops is `InvalidInput`.
+fn write_target(path: &Path) -> io::Result<PathBuf> {
+    const MAX_LINKS: usize = 40;
+    let mut current = path.to_path_buf();
+    for _ in 0..=MAX_LINKS {
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(current),
+            Err(e) => return Err(e),
+        };
+        if !metadata.file_type().is_symlink() {
+            return Ok(current);
+        }
+        let target = fs::read_link(&current)?;
+        let next = if target.is_absolute() {
+            target
+        } else {
+            current
+                .parent()
+                .filter(|dir| !dir.as_os_str().is_empty())
+                .unwrap_or(Path::new("."))
+                .join(target)
+        };
+        match fs::symlink_metadata(&next) {
+            Ok(_) => current = next,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "{} is a symbolic link to {}, which does not exist",
+                        current.display(),
+                        next.display()
+                    ),
+                ))
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "{} has more than {MAX_LINKS} symbolic links in a row",
+            path.display()
+        ),
+    ))
 }
 
 /// The longest line, with its newline, that `append_line` and `append_lines`
@@ -519,6 +579,98 @@ mod tests {
         let err = append_line(&p, &"ä".repeat(2048), Access::Private).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(fs::read(&p).unwrap().len(), 4095);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_to_a_file_is_written_through_and_stays_a_link() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dotfiles = tmp.path().join("dotfiles");
+        fs::create_dir(&dotfiles).unwrap();
+        let target = dotfiles.join("settings.json");
+        fs::write(&target, b"old").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+        let link = tmp.path().join("settings.json");
+        symlink(&target, &link).unwrap();
+
+        write_atomic(&link, b"new", Access::Private).unwrap();
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link must stay a link"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"new", "the target is written");
+        assert_eq!(
+            fs::read(&link).unwrap(),
+            b"new",
+            "the link reads the new bytes"
+        );
+        assert_eq!(mode(&target), 0o640, "the target keeps its mode");
+        assert_eq!(names_in(&dotfiles), vec!["settings.json"]);
+        assert_eq!(names_in(tmp.path()), vec!["dotfiles", "settings.json"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_chain_of_two_symlinks_is_written_through() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("real.json");
+        fs::write(&target, b"old").unwrap();
+        let first = tmp.path().join("first.json");
+        symlink(&target, &first).unwrap();
+        let second = tmp.path().join("second.json");
+        symlink(&first, &second).unwrap();
+
+        write_atomic(&second, b"new", Access::Private).unwrap();
+
+        assert!(fs::symlink_metadata(&first)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(fs::symlink_metadata(&second)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        assert_eq!(
+            names_in(tmp.path()),
+            vec!["first.json", "real.json", "second.json"]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_dangling_symlink_is_refused_and_creates_nothing() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("missing.json");
+        let link = tmp.path().join("settings.json");
+        symlink(&target, &link).unwrap();
+
+        let err = write_atomic(&link, b"new", Access::Private).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(
+            err.to_string().contains(&link.display().to_string()),
+            "the error must name the link: {err}"
+        );
+        assert!(!target.exists(), "no file is created at the target");
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the dangling link is left as it was"
+        );
+        assert_eq!(names_in(tmp.path()), vec!["settings.json"]);
     }
 
     #[cfg(windows)]

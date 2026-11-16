@@ -7,6 +7,8 @@
 
 #[cfg(feature = "gui")]
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "gui")]
+use std::path::{Path, PathBuf};
 
 #[cfg(feature = "gui")]
 use chrono::{DateTime, Duration, Local, TimeZone, Utc};
@@ -20,6 +22,8 @@ use seatswap_core::burn::decide::Regime;
 #[cfg(all(feature = "gui", test))]
 use seatswap_core::burn::plan::Inputs;
 #[cfg(feature = "gui")]
+use seatswap_core::claude_settings;
+#[cfg(feature = "gui")]
 use seatswap_core::feed::Feed;
 #[cfg(feature = "gui")]
 use seatswap_core::history::HistoryDir;
@@ -30,7 +34,7 @@ use seatswap_core::live_sessions::{
 #[cfg(feature = "gui")]
 use seatswap_core::money::{Fx, Prices};
 #[cfg(feature = "gui")]
-use seatswap_core::paths::AppPaths;
+use seatswap_core::paths::{AppPaths, ClaudePaths};
 #[cfg(feature = "gui")]
 use seatswap_core::project::ProjectKey;
 #[cfg(feature = "gui")]
@@ -41,7 +45,7 @@ use seatswap_core::stats::{
     Empty, Query,
 };
 #[cfg(feature = "gui")]
-use seatswap_core::store::{self, Account, Settings, StatuslineConfig};
+use seatswap_core::store::{self, Account, Settings, StatuslineConfig, StatuslineInstall};
 #[cfg(feature = "gui")]
 use seatswap_core::switcher::LiveState;
 #[cfg(feature = "gui")]
@@ -1134,6 +1138,260 @@ pub(crate) fn statusline_keys(
     state: State<'_, super::GuiState>,
 ) -> Result<Option<RecordedKeys>, String> {
     statusline::read_recorded_keys(&state.app)
+}
+
+/// What Claude Code's status line is now, what seatswap would install, and the
+/// record of seatswap's install (spec §5.4). `restorable` follows the restore
+/// rule: a record exists and the current line is seatswap's or the record's
+/// `installed` line; `previous` is the record's previous value (`null` when
+/// there is no record).
+#[cfg(feature = "gui")]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct InstallState {
+    pub current: Option<serde_json::Value>,
+    pub ours: serde_json::Value,
+    pub installed: bool,
+    pub restorable: bool,
+    pub previous: Option<serde_json::Value>,
+}
+
+/// The install rule's decision, taken from one reading of Claude Code's file.
+/// `record` is the new record to save before the write (or `None` when the
+/// record stays); `write` is seatswap's line to write (or `None` when it is
+/// already there); `state` describes the file after the install.
+#[cfg(feature = "gui")]
+#[derive(Debug, Clone, PartialEq)]
+struct InstallDecision {
+    record: Option<StatuslineInstall>,
+    write: Option<serde_json::Value>,
+    state: InstallState,
+}
+
+/// The restore rule's decision: what to put back, the line that was there
+/// before the restore (for the rollback if clearing the record fails), and the
+/// state after the restore.
+#[cfg(feature = "gui")]
+#[derive(Debug, Clone, PartialEq)]
+struct RestoreDecision {
+    restore: Option<serde_json::Value>,
+    before: Option<serde_json::Value>,
+    state: InstallState,
+}
+
+/// The console `seatswap` program beside the running one; on Windows the tray
+/// program runs this command too, so `current_exe` may be `seatswap-tray.exe`.
+#[cfg(feature = "gui")]
+fn console_program() -> Result<PathBuf, String> {
+    let current = std::env::current_exe()
+        .map_err(|error| format!("cannot find the running seatswap program: {error}"))?;
+    super::autostart::console_program(&current).map_err(|error| error.to_string())
+}
+
+/// The settings page's one writer keeps `statuslineInstall`; this command only
+/// reads the saved record and sends changes back through `save_setting`.
+#[cfg(feature = "gui")]
+fn saved_install(state: &super::GuiState) -> Result<Option<StatuslineInstall>, String> {
+    let snapshot = state.snapshot()?;
+    let settings = snapshot.settings.ok_or_else(|| {
+        "accounts.json cannot be read; the status line's install record is unknown".to_string()
+    })?;
+    Ok(settings.statusline_install)
+}
+
+/// The install state for `claude` from `record`, without Tauri so the tests use
+/// plain paths. `restorable` is true exactly when the restore rule allows it: a
+/// record exists and the current line is seatswap's or the record's `installed`
+/// line.
+#[cfg(feature = "gui")]
+fn install_state_of(
+    claude: &ClaudePaths,
+    exe: &Path,
+    record: Option<StatuslineInstall>,
+) -> Result<InstallState, String> {
+    let ours = claude_settings::seatswap_status_line(exe).map_err(|error| error.to_string())?;
+    let current = claude_settings::status_line(claude).map_err(|error| error.to_string())?;
+    let installed = current.as_ref() == Some(&ours);
+    let restorable = restorable(record.as_ref(), current.as_ref(), &ours);
+    let previous = record.and_then(|record| record.previous);
+    Ok(InstallState {
+        current,
+        ours,
+        installed,
+        restorable,
+        previous,
+    })
+}
+
+/// The restore rule: a record exists and the current line is seatswap's or the
+/// record's `installed` line (seatswap's older line).
+#[cfg(feature = "gui")]
+fn restorable(
+    record: Option<&StatuslineInstall>,
+    current: Option<&serde_json::Value>,
+    ours: &serde_json::Value,
+) -> bool {
+    record.is_some_and(|record| current == Some(ours) || current == Some(&record.installed))
+}
+
+/// The install rule, decided from one reading of Claude Code's file:
+/// (a) the current line is seatswap's → write nothing and keep the record;
+/// (b) a record exists and the current line is the record's `installed` line
+/// (seatswap's older line) → keep the record's `previous` and write ours;
+/// (c) otherwise (the user's line, or no record) → the current value becomes
+/// the record's `previous` and ours is written. A present `null` previous is
+/// kept as `Some(null)`; an absent key is `None`.
+#[cfg(feature = "gui")]
+fn install_decision(
+    claude: &ClaudePaths,
+    exe: &Path,
+    record: Option<StatuslineInstall>,
+) -> Result<InstallDecision, String> {
+    let ours = claude_settings::seatswap_status_line(exe).map_err(|error| error.to_string())?;
+    let current = claude_settings::status_line(claude).map_err(|error| error.to_string())?;
+    if current.as_ref() == Some(&ours) {
+        let previous = record.as_ref().and_then(|record| record.previous.clone());
+        let restorable = restorable(record.as_ref(), current.as_ref(), &ours);
+        return Ok(InstallDecision {
+            record: None,
+            write: None,
+            state: InstallState {
+                current,
+                ours,
+                installed: true,
+                restorable,
+                previous,
+            },
+        });
+    }
+    let previous = match &record {
+        Some(record) if current.as_ref() == Some(&record.installed) => record.previous.clone(),
+        _ => current.clone(),
+    };
+    let new_record = StatuslineInstall {
+        installed: ours.clone(),
+        previous: previous.clone(),
+    };
+    Ok(InstallDecision {
+        record: Some(new_record),
+        write: Some(ours.clone()),
+        state: InstallState {
+            current: Some(ours.clone()),
+            ours,
+            installed: true,
+            restorable: true,
+            previous,
+        },
+    })
+}
+
+/// The restore rule from one reading of Claude Code's file. It needs a record
+/// and the current line must be seatswap's or the record's `installed` line;
+/// without a record it refuses with its own message, and with any other line it
+/// keeps today's refusal. `restore` is the record's `previous` exactly (`None`
+/// removes the key); the state has the record cleared.
+#[cfg(feature = "gui")]
+fn restore_decision(
+    claude: &ClaudePaths,
+    exe: &Path,
+    record: Option<StatuslineInstall>,
+) -> Result<RestoreDecision, String> {
+    let ours = claude_settings::seatswap_status_line(exe).map_err(|error| error.to_string())?;
+    let current = claude_settings::status_line(claude).map_err(|error| error.to_string())?;
+    let Some(record) = record else {
+        return Err(
+            "seatswap has no record of the line before its own: nothing to restore".to_string(),
+        );
+    };
+    if !restorable(Some(&record), current.as_ref(), &ours) {
+        return Err(
+            "the status line in Claude Code is not seatswap's: nothing to restore".to_string(),
+        );
+    }
+    let restored = record.previous;
+    let installed = restored.as_ref() == Some(&ours);
+    Ok(RestoreDecision {
+        restore: restored.clone(),
+        before: current,
+        state: InstallState {
+            current: restored,
+            ours,
+            installed,
+            restorable: false,
+            previous: None,
+        },
+    })
+}
+
+/// The status line's current state in Claude Code, the value seatswap would
+/// install, and the install record kept in seatswap's settings.
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub(crate) fn statusline_install_state(
+    state: State<'_, super::GuiState>,
+) -> Result<InstallState, String> {
+    let exe = console_program()?;
+    let record = saved_install(&state)?;
+    install_state_of(&state.claude, &exe, record)
+}
+
+/// Turn seatswap's status line on in Claude Code. [`install_decision`] reads the
+/// file once and decides the new record and the write; the record is saved
+/// through the settings page's one writer, `save_setting`, before seatswap's
+/// line is written. Installing again while ours is in place writes nothing and
+/// leaves the record unchanged.
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub(crate) async fn statusline_install(
+    state: State<'_, super::GuiState>,
+) -> Result<InstallState, String> {
+    let exe = console_program()?;
+    let record = saved_install(&state)?;
+    let claude = state.claude.clone();
+    let decision = install_decision(&claude, &exe, record)?;
+    if let Some(record) = &decision.record {
+        let value =
+            serde_json::to_value(record).map_err(|error| format!("statuslineInstall: {error}"))?;
+        super::panel::save_setting(state, "statuslineInstall".to_string(), value).await?;
+    }
+    if let Some(ours) = &decision.write {
+        claude_settings::set_status_line(&claude, Some(ours)).map_err(|error| error.to_string())?;
+    }
+    Ok(decision.state)
+}
+
+/// Put the record's `previous` value back exactly (a present `null` is written
+/// as `null`, an absent one removes the key), then clear the record through
+/// `save_setting`. It refuses without a record, and when the line in Claude Code
+/// is neither seatswap's nor the record's `installed` line, so a later
+/// hand-made line is never overwritten. If clearing the record fails, the line
+/// that was there before the restore is written back.
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub(crate) async fn statusline_restore(
+    state: State<'_, super::GuiState>,
+) -> Result<InstallState, String> {
+    let exe = console_program()?;
+    let record = saved_install(&state)?;
+    let claude = state.claude.clone();
+    let decision = restore_decision(&claude, &exe, record)?;
+    claude_settings::set_status_line(&claude, decision.restore.as_ref())
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = super::panel::save_setting(
+        state,
+        "statuslineInstall".to_string(),
+        serde_json::Value::Null,
+    )
+    .await
+    {
+        if let Err(rollback) = claude_settings::set_status_line(&claude, decision.before.as_ref()) {
+            return Err(format!(
+                "{error}; the status line could not be put back: {rollback}"
+            ));
+        }
+        return Err(error);
+    }
+    Ok(decision.state)
 }
 
 #[cfg(test)]
@@ -2495,5 +2753,330 @@ mod tests {
             Ok(Some(("AC".to_string(), switch_at))),
             "the preview shows the line's next account and time"
         );
+    }
+
+    // ---- turning the status line on in Claude Code (spec §5.4) ----
+
+    #[cfg(feature = "gui")]
+    fn statusline_paths(tmp: &tempfile::TempDir) -> (ClaudePaths, PathBuf) {
+        let config = tmp.path().join("claude");
+        std::fs::create_dir(&config).expect("the config folder");
+        let exe = tmp.path().join(if cfg!(windows) {
+            "seatswap.exe"
+        } else {
+            "seatswap"
+        });
+        std::fs::write(&exe, b"MZ").expect("the console program beside the running one");
+        (ClaudePaths::for_config_dir(&config, tmp.path()), exe)
+    }
+
+    #[cfg(feature = "gui")]
+    fn write_claude_settings(claude: &ClaudePaths, value: &serde_json::Value) {
+        std::fs::write(
+            claude.settings_file(),
+            serde_json::to_vec(value).expect("JSON"),
+        )
+        .expect("Claude Code's settings file");
+    }
+
+    /// [`install_decision`] plus the write, without `save_setting`; the tests
+    /// hold the record in an in-memory `Settings` instead. The second value is
+    /// the record after the install: the new one, or the unchanged one.
+    #[cfg(feature = "gui")]
+    fn install_line(
+        claude: &ClaudePaths,
+        exe: &Path,
+        record: Option<StatuslineInstall>,
+    ) -> Result<(InstallState, Option<StatuslineInstall>), String> {
+        let kept = record.clone();
+        let decision = install_decision(claude, exe, record)?;
+        if let Some(ours) = &decision.write {
+            claude_settings::set_status_line(claude, Some(ours))
+                .map_err(|error| error.to_string())?;
+        }
+        Ok((decision.state, decision.record.or(kept)))
+    }
+
+    /// [`restore_decision`] plus the write, without `save_setting`; the tests
+    /// hold the record in an in-memory `Settings` instead.
+    #[cfg(feature = "gui")]
+    fn restore_line(
+        claude: &ClaudePaths,
+        exe: &Path,
+        record: Option<StatuslineInstall>,
+    ) -> Result<(InstallState, Option<StatuslineInstall>), String> {
+        let decision = restore_decision(claude, exe, record)?;
+        claude_settings::set_status_line(claude, decision.restore.as_ref())
+            .map_err(|error| error.to_string())?;
+        Ok((decision.state, None))
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn restore_puts_the_previous_value_back() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (claude, exe) = statusline_paths(&tmp);
+        let old = serde_json::json!({"type": "command", "command": "bash ~/x.sh"});
+        write_claude_settings(
+            &claude,
+            &serde_json::json!({"model": "opus", "statusLine": old}),
+        );
+        let ours = claude_settings::seatswap_status_line(&exe).expect("the status line");
+        let mut settings = Settings::default();
+
+        let (installed, record) = install_line(&claude, &exe, settings.statusline_install.clone())
+            .expect("install seatswap's line");
+        settings.statusline_install = record;
+        assert!(installed.installed);
+        assert!(installed.restorable);
+        assert_eq!(installed.current.as_ref(), Some(&ours));
+        assert_eq!(
+            claude_settings::status_line(&claude).expect("read the line"),
+            Some(ours.clone())
+        );
+        assert_eq!(
+            settings
+                .statusline_install
+                .as_ref()
+                .and_then(|record| record.previous.clone()),
+            Some(old.clone()),
+            "the line that was there is kept"
+        );
+
+        // A second install keeps the first previous value, not seatswap's own.
+        let (again, record) = install_line(&claude, &exe, settings.statusline_install.clone())
+            .expect("install again");
+        settings.statusline_install = record;
+        assert!(again.installed);
+        assert_eq!(
+            settings
+                .statusline_install
+                .as_ref()
+                .and_then(|record| record.previous.clone()),
+            Some(old.clone())
+        );
+
+        let (restored, cleared) =
+            restore_line(&claude, &exe, settings.statusline_install.clone()).expect("restore");
+        settings.statusline_install = cleared;
+        assert!(!restored.installed);
+        assert!(!restored.restorable);
+        assert_eq!(restored.current, Some(old.clone()));
+        assert_eq!(
+            claude_settings::status_line(&claude).expect("read the restored line"),
+            Some(old.clone())
+        );
+        assert_eq!(settings.statusline_install, None);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn restore_without_a_previous_value_removes_the_key() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (claude, exe) = statusline_paths(&tmp);
+        write_claude_settings(&claude, &serde_json::json!({"model": "opus"}));
+        let mut settings = Settings::default();
+
+        let (installed, record) = install_line(&claude, &exe, settings.statusline_install.clone())
+            .expect("install over no status line");
+        settings.statusline_install = record;
+        assert!(installed.installed);
+        assert_eq!(
+            settings
+                .statusline_install
+                .as_ref()
+                .and_then(|record| record.previous.clone()),
+            None,
+            "the file had no statusLine key"
+        );
+
+        let (restored, cleared) =
+            restore_line(&claude, &exe, settings.statusline_install.clone()).expect("restore");
+        settings.statusline_install = cleared;
+        assert!(!restored.installed);
+        assert_eq!(restored.current, None);
+        assert_eq!(
+            claude_settings::status_line(&claude).expect("read the settings"),
+            None
+        );
+        let file: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(claude.settings_file()).expect("read"))
+                .expect("JSON");
+        assert_eq!(file, serde_json::json!({"model": "opus"}));
+        assert_eq!(settings.statusline_install, None);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn restore_refuses_a_line_that_is_not_ours() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (claude, exe) = statusline_paths(&tmp);
+        let hand_made = serde_json::json!({"type": "command", "command": "bash ~/later.sh"});
+        write_claude_settings(&claude, &serde_json::json!({"statusLine": hand_made}));
+        let original = std::fs::read(claude.settings_file()).expect("the file");
+        let record = StatuslineInstall {
+            installed: serde_json::json!({
+                "type": "command",
+                "command": "\"old/seatswap\" statusline",
+            }),
+            previous: Some(serde_json::json!({"type": "command", "command": "bash ~/x.sh"})),
+        };
+
+        let error = restore_line(&claude, &exe, Some(record))
+            .expect_err("a line the user set afterwards is not restored over");
+
+        assert_eq!(
+            error,
+            "the status line in Claude Code is not seatswap's: nothing to restore"
+        );
+        assert_eq!(
+            std::fs::read(claude.settings_file()).expect("the file"),
+            original,
+            "the refused file is untouched"
+        );
+        assert_eq!(
+            claude_settings::status_line(&claude).expect("read"),
+            Some(hand_made)
+        );
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn install_twice_keeps_the_first_previous() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (claude, exe) = statusline_paths(&tmp);
+        let old = serde_json::json!({"type": "command", "command": "bash ~/x.sh"});
+        write_claude_settings(&claude, &serde_json::json!({"statusLine": old}));
+        let mut settings = Settings::default();
+
+        let (_, record) = install_line(&claude, &exe, settings.statusline_install.clone())
+            .expect("first install");
+        settings.statusline_install = record;
+        let (_, record) = install_line(&claude, &exe, settings.statusline_install.clone())
+            .expect("second install");
+        settings.statusline_install = record;
+
+        assert_eq!(
+            settings
+                .statusline_install
+                .as_ref()
+                .and_then(|record| record.previous.clone()),
+            Some(old)
+        );
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn restore_without_a_record_is_refused_and_the_file_is_untouched() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (claude, exe) = statusline_paths(&tmp);
+        let ours = claude_settings::seatswap_status_line(&exe).expect("the status line");
+        write_claude_settings(
+            &claude,
+            &serde_json::json!({"model": "opus", "statusLine": ours}),
+        );
+        let original = std::fs::read(claude.settings_file()).expect("the file");
+
+        let error = restore_line(&claude, &exe, None)
+            .expect_err("without a record there is nothing to restore");
+
+        assert_eq!(
+            error,
+            "seatswap has no record of the line before its own: nothing to restore"
+        );
+        assert_eq!(
+            std::fs::read(claude.settings_file()).expect("the file"),
+            original,
+            "the refused file is untouched"
+        );
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn install_over_a_hand_line_after_an_install_stores_that_line_as_previous() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (claude, exe) = statusline_paths(&tmp);
+        let old = serde_json::json!({"type": "command", "command": "bash ~/x.sh"});
+        write_claude_settings(&claude, &serde_json::json!({"statusLine": old.clone()}));
+        let mut settings = Settings::default();
+        let (_, record) = install_line(&claude, &exe, settings.statusline_install.clone())
+            .expect("first install");
+        settings.statusline_install = record;
+
+        // The user sets a line by hand after seatswap's install.
+        let hand = serde_json::json!({"type": "command", "command": "bash ~/mine.sh"});
+        write_claude_settings(&claude, &serde_json::json!({"statusLine": hand.clone()}));
+        let (installed, record) = install_line(&claude, &exe, settings.statusline_install.clone())
+            .expect("install over the hand line");
+        settings.statusline_install = record;
+
+        assert!(installed.installed);
+        assert_eq!(
+            settings
+                .statusline_install
+                .as_ref()
+                .and_then(|record| record.previous.clone()),
+            Some(hand),
+            "the hand line, not seatswap's older line, is the previous value"
+        );
+        assert_eq!(
+            settings
+                .statusline_install
+                .as_ref()
+                .map(|record| record.installed.clone()),
+            Some(claude_settings::seatswap_status_line(&exe).expect("the status line"))
+        );
+    }
+
+    // ---- proof tests of the review ----
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn proof_install_from_a_moved_binary_keeps_the_first_previous() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (claude, exe) = statusline_paths(&tmp);
+        let moved_folder = tmp.path().join("moved");
+        std::fs::create_dir(&moved_folder).expect("folder");
+        let moved = moved_folder.join(exe.file_name().expect("name"));
+        std::fs::write(&moved, b"MZ").expect("program");
+        let old = serde_json::json!({"type": "command", "command": "bash ~/x.sh"});
+        write_claude_settings(&claude, &serde_json::json!({"statusLine": old}));
+
+        let (_, record) = install_line(&claude, &exe, None).expect("first install");
+        assert_eq!(
+            record.as_ref().and_then(|record| record.previous.clone()),
+            Some(old.clone())
+        );
+        // The program is installed somewhere else; the user presses the button again.
+        let (_, record) = install_line(&claude, &moved, record).expect("second install");
+
+        assert_eq!(
+            record.as_ref().and_then(|record| record.previous.clone()),
+            Some(old),
+            "the user's own line must not be lost"
+        );
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn proof_a_null_status_line_survives_install_and_restore() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (claude, exe) = statusline_paths(&tmp);
+        write_claude_settings(&claude, &serde_json::json!({"statusLine": null}));
+        let original = std::fs::read(claude.settings_file()).expect("file");
+        let (_, record) = install_line(&claude, &exe, None).expect("install");
+        // The record goes through accounts.json (serde) like save_setting does.
+        let settings = Settings {
+            statusline_install: record,
+            ..Settings::default()
+        };
+        let settings: Settings =
+            serde_json::from_value(serde_json::to_value(&settings).expect("to")).expect("from");
+        restore_line(&claude, &exe, settings.statusline_install).expect("restore");
+        let after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(claude.settings_file()).expect("file"))
+                .expect("JSON");
+        let before: serde_json::Value = serde_json::from_slice(&original).expect("JSON");
+        assert_eq!(after, before, "a null statusLine comes back as it was");
     }
 }
