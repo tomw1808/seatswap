@@ -20,13 +20,23 @@ Always pass `--offline`: every crate the project uses is already downloaded, and
 
 ## Hard rules
 
-1. **Never touch the real Claude Code files.** No code, test or command may read or write `~/.claude`, `~/.claude.json`, seatswap's data folder (`~/.config/seatswap`, on Windows `%APPDATA%\seatswap`), Codex's folder (`~/.codex`, or `$CODEX_HOME`) or the OS keyring of this machine, or call a real Ollama server. Tests build their own fake config folder in a `tempfile::tempdir()` and pass paths explicitly (`ClaudePaths::for_config_dir`, `AppPaths::at`, Codex's folder and the Ollama URL likewise). Tests never call `ClaudePaths::resolve`, `AppPaths::resolve`, `CodexPaths::resolve` or `store::open_secrets`, and never use `KeyringSecrets`. On Windows, setting `HOME` does not move the home folder, so only the explicit paths protect a test; registry tests write only under a throw-away key `HKCU\Software\seatswap-test-…` and delete it; and never start the tray app (`seatswap` or `seatswap-tray` without a subcommand) on a machine with a real login.
+1. **Never touch the real Claude Code files.** No code, test or command may read or write `~/.claude`, `~/.claude.json`, seatswap's data folder (`~/.config/seatswap`, on Windows `%APPDATA%\seatswap`), Codex's folder (`~/.codex`, or `$CODEX_HOME`), DeepSeek Harness's folder (`~/.dsh`, or `$DSH_HOME`), flash-agents' state folder (`~/.local/state/flash-agents`, or `$XDG_STATE_HOME/flash-agents`) or the OS keyring of this machine, or call a real Ollama server. Tests build their own fake config folder in a `tempfile::tempdir()` and pass paths explicitly (`ClaudePaths::for_config_dir`, `AppPaths::at`, Codex's and Harness's folders, Dropbox's `info.json` and the Ollama URL likewise). Tests never call `ClaudePaths::resolve`, `AppPaths::resolve`, `CodexPaths::resolve`, `HarnessPaths::resolve`, `paths::dropbox_folder` or `store::open_secrets`, and never use `KeyringSecrets`. On Windows, setting `HOME` does not move the home folder, so only the explicit paths protect a test; registry tests write only under a throw-away key `HKCU\Software\seatswap-test-…` and delete it; and never start the tray app (`seatswap` or `seatswap-tray` without a subcommand) on a machine with a real login.
 2. **No silent defaults, clamps or fallbacks.** An invalid value is an error with a clear message, never quietly replaced. The only allowed fallbacks are the ones the spec names (e.g. keyring → 0600 files, with a warning the UI shows).
 3. **One way per job.** Use the module that owns a job (`atomic` for every file write, file mode and private folder; `paths` for every path; `api` for every HTTP call; `gui/registry.rs` for the Windows registry). Never write a second helper beside an existing one. A `cfg` for the operating system belongs in the module that owns the difference, not at its callers.
 4. **Never log or print a token.** At most the last 4 characters of a refresh token.
 5. **Keep unknown data.** When rewriting `.credentials.json` or `.claude.json`, every key we do not own stays exactly as it was, in the same order (`serde_json` is built with `preserve_order`).
 6. No `unsafe`. No `unwrap()`/`expect()` outside tests, except on values the code just proved present.
 7. No git commits.
+
+## Parallel work
+
+Work is planned so that several agents can build at once without a mess when their changes come together.
+
+- **A task owns its files.** Its brief lists every file it may change; it changes no other file. Two tasks that need the same file never run at the same time: one waits until the other is committed.
+- **Shared files are not edited by parallel tasks.** `CHANGELOG.md`, `docs/spec.md`, `docs/implementation.md`, `README.md`, `crates/core/src/lib.rs`, `crates/app/ui/fixture.js` and `crates/app/ui/common.css` are changed only by a task of their own, or by the lead after the code tasks of a batch are in. A task that needs a line there says so in its report instead of writing it.
+- **Interfaces are fixed before work starts.** Names, signatures and data shapes that one task uses from another are written in the plan, so no task waits for another's code or guesses it.
+- **Every task starts from a committed tree** and is checked and committed on its own before a task that uses it starts. A change that no longer applies cleanly is built again on the new tree, not merged by hand.
+- **One task, one commit**, with the checks passing on that commit alone.
 
 ## Style
 

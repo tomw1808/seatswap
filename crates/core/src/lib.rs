@@ -7,7 +7,9 @@
 //!   and the only module that knows file modes and private files and folders
 //! - `burn`     auto-burn: work units, rhythm, rates, slack, plans, the decision (spec §2)
 //! - `claude_settings` the one key seatswap writes in Claude Code's settings.json
+//! - `codex_sessions` Codex's session files
 //! - `feed`     the status line's live numbers: its file, its account, and merging them
+//! - `harness`  DeepSeek Harness sessions: flash workers and their jobs
 //! - `history`  the history folder: record types, appending, reading a range, merging hosts
 //! - `project`  from a folder to the project's identity
 //! - `sessions` Claude Code's session files and which are alive
@@ -29,8 +31,10 @@ pub mod api;
 pub mod atomic;
 pub mod burn;
 pub mod claude_settings;
+pub mod codex_sessions;
 pub mod engine;
 pub mod feed;
+pub mod harness;
 pub mod history;
 pub mod live;
 pub mod live_sessions;
