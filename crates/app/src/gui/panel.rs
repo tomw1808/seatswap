@@ -867,7 +867,13 @@ fn edit_projects(
     at: DateTime<Utc>,
     edit: ProjectEdit,
 ) -> Result<(Projects, Vec<String>), String> {
-    edit.validate().map_err(|error| error.to_string())?;
+    // The edit is checked on its own and against the projects as they are now
+    // (a second organization of one name, an owner's organization removed):
+    // a refused edit never reaches the shared history.
+    let (current, _) = projects_from(history, home, accounts)?;
+    current
+        .validate_edit(&edit)
+        .map_err(|error| error.to_string())?;
     history
         .append(&ProjectsLogRecord { t: at, edit })
         .map_err(|error| error.to_string())?;

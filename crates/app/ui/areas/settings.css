@@ -7,12 +7,21 @@
   height: 100%;
 }
 
+/* The Settings page scrolls only its content pane: the group menu on the
+   left stays where it is (item 27). settings.js puts this class on the area
+   while the page is shown. */
+.area.settings-fixed {
+  overflow: hidden;
+}
+
 .settings-col {
   min-height: 0;
+  height: 100%;
 }
 
 .settings-card {
   min-height: 0;
+  height: 100%;
 }
 
 .settings-body {
@@ -20,6 +29,8 @@
   flex-direction: column;
   min-height: 0;
   padding-bottom: 8px;
+  overflow-y: auto;
+  flex: 1 1 auto;
 }
 
 /* One setting row and the error text under it; the rows keep the mock-up's
@@ -391,14 +402,46 @@
 }
 
 .proj-join {
+  display: flex;
+  flex: 1 1 100%;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* The row's note is a long sentence; give the join line its own full row so
+   the text and the button wrap beside each other instead of being squeezed
+   into the note's nowrap width (item 29). */
+.set-row[data-field="project:join"] .set > :last-child {
+  flex-wrap: wrap;
+}
+
+.proj-join select.inp {
+  max-width: 200px;
+}
+
+.org-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.org-add {
   display: inline-flex;
   align-items: center;
   gap: 6px;
   min-width: 0;
 }
 
-.proj-join select.inp {
-  max-width: 200px;
+.org-add-name {
+  width: 220px;
+  min-width: 0;
+}
+
+.org-confirm {
+  margin-left: 262px;
 }
 
 .org-chips {
@@ -624,6 +667,14 @@ button.link {
   border-top: 1px solid var(--border);
   font-size: 13px;
   line-height: 18px;
+}
+
+.price-toggle {
+  margin-left: auto;
+}
+
+.price-body[hidden] {
+  display: none;
 }
 
 a.link {

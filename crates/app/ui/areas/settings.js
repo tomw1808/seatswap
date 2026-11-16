@@ -70,6 +70,7 @@ const state = {
   openEditorId: null,
   selectedId: null,
   confirmRemoveId: null,
+  confirmRemoveOrgId: null,
   right: null,
   errors: Object.create(null),
   // The account ids the last snapshot held: only a change in this list makes
@@ -102,6 +103,9 @@ const state = {
   priceToken: 0,
   priceKey: null,
   priceNode: null,
+  // Whether the API price list is open; it starts closed and the same
+  // control opens and closes it (decision 27).
+  priceOpen: false,
   // Saves run one after another, each built from the settings as the one
   // before left them, so a quick second change never carries a stale copy.
   saving: Promise.resolve(),
@@ -172,6 +176,7 @@ export async function render(container, context) {
   const groupChanged = group !== state.group;
   const sameTarget = state.sub === context.sub;
   const openRequest = context.fromOpen === true;
+  if (groupChanged) state.confirmRemoveOrgId = null;
   state.sub = context.sub;
   if (parsed.item && (!sameTarget || openRequest)) {
     state.selectedId = parsed.item;
@@ -179,11 +184,13 @@ export async function render(container, context) {
   }
   if (focusInside(state.container) && group === state.group && state.container === container && !openRequest) {
     // Keep the control (and what was typed) until it is saved on change.
+    container.classList.add("settings-fixed");
     state.snapshot = snapshot;
     takeSettings(snapshot);
     state.context = context;
     return;
   }
+  container.classList.add("settings-fixed");
   state.snapshot = snapshot;
   takeSettings(snapshot);
   state.context = context;
@@ -263,6 +270,7 @@ function selectGroup(id, right) {
   state.openEditorId = null;
   state.selectedId = null;
   state.confirmRemoveId = null;
+  state.confirmRemoveOrgId = null;
   const target = `settings/${id}`;
   if (location.hash.slice(1) === target) {
     state.group = id;
@@ -296,24 +304,20 @@ function section(text) {
 
 function setting(label, control, note, field) {
   const text = field ? state.errors[field] || "" : "";
-  const error = h("div", { class: "row-error", hidden: text === "", text });
+  const error = text ? h("div", { class: "row-error", text }) : null;
   const noteNode = note
     ? typeof note === "string"
       ? h("span", { class: "mf" }, note)
       : note
     : null;
-  const wrapper = h(
-    "div",
-    { class: "set-row", dataset: field ? { field } : {} },
-    [
-      h("div", { class: "set" }, [
-        h("span", {}, label),
-        h("span", {}, [control, noteNode]),
-      ]),
-      error,
-    ]
-  );
-  return wrapper;
+  const children = [
+    h("div", { class: "set" }, [
+      h("span", {}, label),
+      h("span", {}, [control, noteNode]),
+    ]),
+  ];
+  if (error) children.push(error);
+  return h("div", { class: "set-row", dataset: field ? { field } : {} }, children);
 }
 
 function note(children) {
@@ -324,13 +328,38 @@ function note(children) {
 // saving: one control, one field, no Save button
 // ---------------------------------------------------------------------------
 
+function rowErrorNode(row) {
+  let node = row.querySelector(".row-error");
+  if (!node) {
+    node = h("div", { class: "row-error" });
+    row.appendChild(node);
+  }
+  return node;
+}
+
+// A row's stored error, added only when there is one: an empty error element
+// would still be a node the page's error check reports.
+function paintRowError(row, field) {
+  const text = state.errors[field];
+  if (!text) return;
+  const node = rowErrorNode(row);
+  node.textContent = text;
+  node.hidden = false;
+}
+
 function fieldError(field, text) {
   state.errors[field] = text || null;
   if (!state.container) return;
-  const nodes = state.container.querySelectorAll(`[data-field="${field}"] .row-error`);
-  for (const node of nodes) {
-    node.textContent = text || "";
-    node.hidden = !text;
+  const rows = state.container.querySelectorAll(`[data-field="${field}"]`);
+  for (const row of rows) {
+    const existing = row.querySelector(".row-error");
+    if (!text) {
+      if (existing) existing.remove();
+      continue;
+    }
+    const node = rowErrorNode(row);
+    node.textContent = text;
+    node.hidden = false;
   }
 }
 
@@ -833,7 +862,7 @@ function rateRow(times) {
       ? view.rateError
       : null;
   if (problem) {
-    const error = row.querySelector(".row-error");
+    const error = rowErrorNode(row);
     error.hidden = false;
     error.textContent = problem;
   }
@@ -894,12 +923,12 @@ function apiPricesRow(times) {
   if (note.childNodes.length === 0) note.textContent = "not looked up yet";
 
   const row = setting("API prices", control, note, "prices");
-  const error = row.querySelector(".row-error");
   const problem =
     view && typeof view.lastError === "string" && view.lastError !== ""
       ? view.lastError
       : state.moneyError;
   if (problem) {
+    const error = rowErrorNode(row);
     error.hidden = false;
     error.appendChild(document.createTextNode(problem));
     if (view && view.pricesCheckedAt) {
@@ -1028,7 +1057,28 @@ function priceBlock() {
   });
   if (state.priceNode && state.priceKey === key) return state.priceNode;
   const times = [];
-  const node = h("div", { class: "price-block" }, [pricesLine(times), priceList()]);
+  const body = h("div", { class: "price-body", hidden: !state.priceOpen }, [priceList()]);
+  const toggle = h("button", {
+    type: "button",
+    class: "hbtn xs price-toggle",
+  });
+  const paintToggle = () => {
+    toggle.textContent = state.priceOpen ? "Hide" : "Show…";
+    toggle.setAttribute("aria-expanded", state.priceOpen ? "true" : "false");
+    toggle.setAttribute(
+      "aria-label",
+      state.priceOpen ? "Hide the API price list" : "Show the API price list"
+    );
+    body.hidden = !state.priceOpen;
+  };
+  toggle.addEventListener("click", () => {
+    state.priceOpen = !state.priceOpen;
+    paintToggle();
+  });
+  paintToggle();
+  const line = pricesLine(times);
+  line.appendChild(toggle);
+  const node = h("div", { class: "price-block" }, [line, body]);
   const problem =
     view && typeof view.lastError === "string" && view.lastError !== ""
       ? view.lastError
@@ -1367,13 +1417,7 @@ function accountRow(row) {
       h("span", { class: "acc-text", text: loginEndsText(row) }),
     ])
   );
-  wrap.appendChild(
-    h("div", {
-      class: "row-error",
-      hidden: !state.errors[field],
-      text: state.errors[field] || "",
-    })
-  );
+  paintRowError(wrap, field);
 
   if (state.openEditorId === row.id) {
     wrap.appendChild(
@@ -1725,6 +1769,7 @@ function projectsCard() {
     body.appendChild(h("div", { class: "lr mf", text: "No organization yet." }));
   }
   for (const org of projects.orgs) body.appendChild(orgRow(org, projects));
+  body.appendChild(orgAddRow(projects));
   body.appendChild(
     note([
       h("b", { text: "Found by the repository." }),
@@ -1769,13 +1814,7 @@ function projectRow(project, projects) {
   if (Array.isArray(project.joined) && project.joined.length > 0) {
     wrap.appendChild(joinedLine(project, field));
   }
-  wrap.appendChild(
-    h("div", {
-      class: "row-error",
-      hidden: !state.errors[field],
-      text: state.errors[field] || "",
-    })
-  );
+  paintRowError(wrap, field);
   return wrap;
 }
 
@@ -1919,13 +1958,38 @@ function accountChip(ref, projects) {
   });
 }
 
+// The repositories whose owner is this organization, as core sends them. A
+// malformed entry is an error the page shows, never a repository quietly left
+// out.
+function orgOwnerRepositories(org) {
+  if (!Array.isArray(org.ownerRepositories)) {
+    throw new Error(
+      `the organization ${org.id} has no repository list: ${JSON.stringify(org.ownerRepositories)}`
+    );
+  }
+  return org.ownerRepositories.map((repo) => {
+    if (typeof repo !== "string" || repo === "") {
+      throw new Error(
+        `the organization ${org.id} has a repository entry that is not a name: ${JSON.stringify(repo)}`
+      );
+    }
+    return repo;
+  });
+}
+
+// An organization from a repository owner has no Remove button; its name says
+// in a tooltip why (decision 30).
 function orgRow(org, projects) {
   const field = `org:${org.id}`;
+  const owners = orgOwnerRepositories(org);
   const nameInput = textInput({
     class: "inp tall org-name",
     value: org.name || "",
     "aria-label": "Organization name",
   });
+  if (owners.length > 0) {
+    nameInput.title = `the organization ${org.name} comes from the owner of ${owners[0]}; it cannot be removed`;
+  }
   nameInput.addEventListener("change", async () => {
     const next = nameInput.value.trim();
     if (next === org.name) {
@@ -1940,15 +2004,147 @@ function orgRow(org, projects) {
     chips.length > 0
       ? h("span", { class: "org-chips" }, chips)
       : h("span", { class: "mf", text: "no account" });
+  const control = h("span", { class: "org-actions" }, [accounts]);
+  if (owners.length === 0) {
+    control.appendChild(
+      h("button", {
+        type: "button",
+        class: "hbtn xs danger org-remove",
+        text: "Remove",
+        "aria-label": `Remove organization ${org.name}`,
+        onclick: () => {
+          state.confirmRemoveOrgId = org.id;
+          renderGroup(state.right, "projects");
+        },
+      })
+    );
+  }
   const counts = `${countText(org.accounts.length, "account", "accounts")} · ${countText(
     org.projects,
     "project",
     "projects"
   )}`;
+  const source =
+    owners.length > 0
+      ? "from the owner of the repositories"
+      : org.accounts.length > 0
+        ? "from the account's login"
+        : "added here";
+  const row = setting(nameInput, control, `${source} · ${counts}`, field);
+  if (state.confirmRemoveOrgId === org.id) row.appendChild(orgRemoveConfirm(org, field));
+  return row;
+}
+
+// The confirmation first says what happens: the organization's projects and
+// accounts go back to none (decision 30). A malformed view is an error the page
+// shows, never a made-up "0 projects".
+function orgRemoveConfirm(org, field) {
+  if (!Number.isFinite(org.projects)) {
+    throw new Error(
+      `the organization ${org.id} has no project count: ${JSON.stringify(org.projects)}`
+    );
+  }
+  if (!Array.isArray(org.accounts)) {
+    throw new Error(
+      `the organization ${org.id} has no account list: ${JSON.stringify(org.accounts)}`
+    );
+  }
+  const projectCount = org.projects;
+  const accountCount = org.accounts.length;
+  return h("div", { class: "confirm org-confirm" }, [
+    h("div", {
+      class: "confirm-text",
+      text: `Remove ${org.name}? Its ${countText(projectCount, "project", "projects")} and ${countText(accountCount, "account", "accounts")} go back to none.`,
+    }),
+    h("div", { class: "confirm-actions" }, [
+      h("button", {
+        type: "button",
+        class: "hbtn xs danger",
+        text: "Remove",
+        onclick: async () => {
+          const ok = await saveProject(
+            { edit: "orgRemove", org: org.id },
+            field
+          );
+          if (ok) {
+            state.confirmRemoveOrgId = null;
+            renderGroup(state.right, "projects");
+          }
+        },
+      }),
+      h("button", {
+        type: "button",
+        class: "hbtn xs ghost",
+        text: "Keep it",
+        onclick: () => {
+          state.confirmRemoveOrgId = null;
+          renderGroup(state.right, "projects");
+        },
+      }),
+    ]),
+  ]);
+}
+
+// The same rule as core::projects::same_organization_name: compare the names
+// after `toLowerCase()`, Unicode case included.
+function organizationNamesMatch(first, second) {
+  return first.toLowerCase() === second.toLowerCase();
+}
+
+// The "+ Add organization" line under the list: a name and one button, so a
+// new organization starts empty. A name that exists is refused here, before
+// an edit is sent (decision 30).
+function orgAddRow(projects) {
+  const field = "org:add";
+  const input = textInput({
+    class: "inp tall org-add-name",
+    placeholder: "organization name",
+    "aria-label": "New organization name",
+  });
+  const add = h("button", {
+    type: "button",
+    class: "hbtn xs",
+    text: "Add organization",
+  });
+  const submit = async () => {
+    // core::projects refuses a name with outer white space; the page trims
+    // what was typed before it sends, so that refusal is never seen here.
+    const name = input.value.trim();
+    if (name === "") {
+      fieldError(field, "An organization name must not be empty.");
+      input.focus();
+      return;
+    }
+    const exists = (projects.orgs || []).some(
+      (org) =>
+        organizationNamesMatch(org.id, name) ||
+        organizationNamesMatch(org.name, name)
+    );
+    if (exists) {
+      fieldError(field, `an organization named ${name} already exists`);
+      input.focus();
+      return;
+    }
+    add.disabled = true;
+    const ok = await saveProject({ edit: "orgAdd", name }, field);
+    add.disabled = false;
+    if (!ok) {
+      input.focus();
+      return;
+    }
+    input.value = "";
+  };
+  add.addEventListener("click", submit);
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      submit();
+    }
+  });
   return setting(
-    nameInput,
-    accounts,
-    `from the owner of the repositories · ${counts}`,
+    "+ Add organization",
+    h("span", { class: "org-add" }, [input, add]),
+    "a new organization starts with no projects and no accounts",
     field
   );
 }
@@ -2756,4 +2952,10 @@ function importRow() {
     note,
     "historyImport"
   );
+}
+
+// Leaving Settings gives the window's area its own scrolling back; the group
+// menu stayed fixed only while this page showed (item 27).
+export function unmount() {
+  if (state.container) state.container.classList.remove("settings-fixed");
 }

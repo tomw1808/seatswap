@@ -313,6 +313,15 @@ code,
   white-space: nowrap;
 }
 
+/* A field's focus frame is drawn outside its box. The two cells that clip
+   their text to an ellipsis (a table row's cell and a setting's label cell)
+   would cut its top and bottom off; while a field inside one has the focus,
+   the cell shows its whole frame instead (items 10/28). */
+.lr > :focus-within,
+.set > :first-child:focus-within {
+  overflow: visible;
+}
+
 .lr.hd {
   height: 22px;
   border-top: 0;

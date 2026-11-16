@@ -90,12 +90,30 @@ function fixtureSameRef(first, second) {
 export function fixtureProjectView(fixture) {
   return {
     projects: clone(fixture.projectView.projects),
-    orgs: clone(fixture.projectView.orgs),
+    orgs: fixture.projectView.orgs.map((org) =>
+      Object.assign(clone(org), {
+        ownerRepositories: fixtureOwnerRepositories(fixture.projectView.projects, org.id),
+      })
+    ),
     accountRefs: fixture.accounts.map((account) => ({
       id: account.id,
       account: fixtureAccountRef(account),
     })),
   };
+}
+
+// The repositories whose owner is this organization, as core::projects finds
+// them: the part before the repository's name in `github.com/<owner>/<name>`.
+// The owner is compared with the same name rule as core (case-insensitive).
+function fixtureOwnerRepositories(projects, orgId) {
+  const found = new Set();
+  for (const project of projects) {
+    if (typeof project.repo !== "string" || project.repo === "") continue;
+    const parts = project.repo.split("/").filter((part) => part !== "");
+    if (parts.length < 2) continue;
+    if (fixtureOrganizationNamesMatch(parts[parts.length - 2], orgId)) found.add(project.repo);
+  }
+  return [...found].sort();
 }
 
 function fixtureFindProject(projects, id) {
@@ -120,6 +138,12 @@ function fixtureCheckIdentity(value) {
   const text = String(value === undefined || value === null ? "" : value);
   if (text.trim() === "") throw new Error("an organization name must not be empty");
   return text;
+}
+
+// The same rule as core::projects::same_organization_name: compare the names
+// after `toLowerCase()`, Unicode case included.
+function fixtureOrganizationNamesMatch(first, second) {
+  return first.toLowerCase() === second.toLowerCase();
 }
 
 // The same refusals as `ProjectEdit::validate`, then the fixed view is changed
@@ -219,6 +243,36 @@ export function fixtureEditProject(fixture, edit) {
         if (!target) throw new Error(`unknown organization ${org}`);
         target.accounts.push(ref);
       }
+      break;
+    }
+    case "orgAdd": {
+      const name = fixtureCheckName("organization", edit.name);
+      // No silent trimming: the real core refuses outer white space, and the
+      // page trims what was typed before it sends.
+      if (name.trim() !== name) {
+        throw new Error("an organization name must not start or end with a space");
+      }
+      const exists = view.orgs.some(
+        (org) =>
+          fixtureOrganizationNamesMatch(org.id, name) ||
+          fixtureOrganizationNamesMatch(org.name, name)
+      );
+      if (exists) throw new Error(`an organization named ${name} already exists`);
+      view.orgs.push({ id: name, name, accounts: [], projects: 0 });
+      view.orgs.sort((first, second) => first.name.localeCompare(second.name));
+      break;
+    }
+    case "orgRemove": {
+      const org = fixtureFindOrg(view.orgs, String(edit.org));
+      if (!org) throw new Error(`the organization ${String(edit.org)} does not exist`);
+      const owners = fixtureOwnerRepositories(view.projects, org.id);
+      if (owners.length > 0) {
+        throw new Error(
+          `the organization ${org.name} comes from the owner of ${owners[0]}; it cannot be removed`
+        );
+      }
+      for (const project of view.projects) if (project.org === org.id) project.org = null;
+      view.orgs = view.orgs.filter((entry) => entry !== org);
       break;
     }
     default:
