@@ -1329,7 +1329,7 @@ mod tests {
     /// the same order, with the same labels, groups and options.
     #[test]
     fn the_statusline_fixture_has_the_kinds_table() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/ui/fixture.js");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/ui/fixture/statusline.js");
         let source = fs::read_to_string(path).expect("the page fixture");
         let start = source
             .find("const FIXTURE_KINDS =")

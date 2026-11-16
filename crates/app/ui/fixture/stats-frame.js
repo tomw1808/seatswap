@@ -1,0 +1,466 @@
+// The statistics fixture's shared frame: weeks, accounts, ids, money and
+// range helpers, the findings, `statsEmpty` and `answer`.
+
+import { ensureFixture } from "../fixture.js";
+
+export const DAY = 86400000;
+export const HOUR = 3600000;
+
+// The snapshot's view order; the app's Rust commands walk Ctx::accounts, so
+// the pages see this order too.
+const VIEW_ABBRS = ["PR", "LB", "AC"];
+
+export const WEEKS = [
+  "2026-08-17",
+  "2026-08-24",
+  "2026-08-31",
+  "2026-09-07",
+  "2026-09-14",
+  "2026-09-21",
+  "2026-09-28",
+  "2026-10-05",
+  "2026-10-12",
+  "2026-10-19",
+  "2026-10-26",
+  "2026-11-02",
+];
+
+// data.py's ACC, in the mock-up's ORDER (LB, AC, PR). The id is the built-in
+// snapshot's view id for the abbreviation, filled in before an answer is built.
+export const ACCOUNTS = [
+  {
+    id: null,
+    abbr: "LB",
+    label: "Lab",
+    plan: "Max",
+    price: 180,
+    used: [100, 100, 96, 100, 100, 88, 74, 81, 69, 92, 94, 97],
+    now: 40,
+    resetDay: 7,
+    resetHour: 17,
+  },
+  {
+    id: null,
+    abbr: "AC",
+    label: "Acme",
+    plan: "Team 5x",
+    price: 140,
+    used: [91, 100, 100, 97, 100, 72, 58, 64, 49, 71, 91, 93],
+    now: 48,
+    resetDay: 7,
+    resetHour: 2,
+  },
+  {
+    id: null,
+    abbr: "PR",
+    label: "Private",
+    plan: "Ultra",
+    price: 360,
+    used: [null, null, null, null, null, 61, 83, 77, 90, 68, 88, 90],
+    now: 70,
+    resetDay: 5,
+    resetHour: 19,
+  },
+];
+
+// Each answer names the built-in snapshot's accounts: their ids come from its
+// views by abbreviation, never from ids of the fixture's own.
+export function resolveIds() {
+  const fixture = ensureFixture();
+  if (!fixture || !Array.isArray(fixture.views)) {
+    throw new Error("the built-in snapshot has no account views");
+  }
+  for (const account of ACCOUNTS) {
+    const view = fixture.views.find(
+      (candidate) => candidate && candidate.abbr === account.abbr
+    );
+    if (!view || typeof view.id !== "string" || view.id === "") {
+      throw new Error(`the built-in snapshot has no account ${JSON.stringify(account.abbr)}`);
+    }
+    account.id = view.id;
+  }
+}
+
+export function viewOrder() {
+  return VIEW_ABBRS.map((abbr) => {
+    const account = byAbbr(abbr);
+    if (!account) throw new Error(`unknown account abbreviation ${JSON.stringify(abbr)}`);
+    return account.id;
+  });
+}
+
+export const BLOCKED = [11, 14, 8, 12, 9, 1, 0, 0.5, 0, 1, 0.5, 0];
+const SW_YOU = [9, 11, 8, 10, 9, 6, 5, 6, 4, 6, 2, 1];
+export const SW_AUTO = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 19, 22];
+const SW_AGENT = [0, 0, 0, 0, 0, 0, 1, 0, 2, 0, 0, 0];
+
+// Output tokens (millions) of all accounts together, data.py's 68.9 in week 11
+// and 44.8 in week 8.
+export const OUT_M = [58.0, 61.5, 55.2, 66.4, 64.1, 70.8, 72.6, 79.4, 44.8, 88.0, 110.3, 68.9];
+export const TOK_TOTAL = 840.0;
+export const API_TOTAL = 17100;
+export const API_PER_M = API_TOTAL / TOK_TOTAL;
+export const NOW_MS = Date.parse("2026-11-12T10:00:00Z");
+
+// The mock-up's tokens per percent of a finished account week (data.py: LB 1.9 M,
+// AC 1.4 M, PR 3.8 M).
+export const TOKENS_PER_PERCENT = { LB: 1900000, AC: 1400000, PR: 3800000 };
+
+export const ORG_ACC = {
+  acme: { LB: 70, AC: 258, PR: 141 },
+  sam: { LB: 369, AC: 55, PR: 304 },
+  Unassigned: { LB: 14, AC: 6, PR: 17 },
+};
+
+export const TREE = [
+  { level: 0, name: "acme", share: 38, split: [15, 55, 30], sessions: 253, key: null },
+  { level: 1, name: "acme-kb", share: 31, split: [14, 58, 28], sessions: 212, key: ["repo", "github.com/acme/acme-kb"] },
+  { level: 2, name: "ingest", share: 19, split: [14, 58, 28], sessions: 131, key: null },
+  { level: 2, name: "web", share: 9, split: [14, 58, 28], sessions: 64, key: null },
+  { level: 2, name: "(top folder)", share: 3, split: [14, 58, 28], sessions: 17, key: null },
+  { level: 1, name: "acme-notes", share: 7, split: [19, 42, 39], sessions: 41, key: ["repo", "github.com/acme/acme-notes"] },
+  { level: 0, name: "sam", share: 59, split: [51, 7, 42], sessions: 428, key: null },
+  { level: 1, name: "atlas", share: 34, split: [55, 5, 40], sessions: 268, key: ["repo", "github.com/sam/atlas"] },
+  { level: 2, name: "engine", share: 21, split: [55, 5, 40], sessions: 160, key: null },
+  { level: 2, name: "frontend", share: 11, split: [55, 5, 40], sessions: 91, key: null },
+  { level: 2, name: "(top folder)", share: 2, split: [55, 5, 40], sessions: 17, key: null },
+  { level: 1, name: "ledger", share: 17, split: [44, 10, 46], sessions: 97, key: ["repo", "github.com/sam/ledger"] },
+  { level: 1, name: "notes", share: 8, split: [48, 10, 42], sessions: 63, key: ["repo", "github.com/sam/notes"] },
+  { level: 0, name: "Unassigned", share: 3, split: [38, 16, 46], sessions: 22, key: null },
+  { level: 1, name: "~ (home folder)", share: 3, split: [38, 16, 46], sessions: 22, key: ["folder", "~"] },
+];
+
+export const ORG_ACCOUNTS = { acme: ["AC"], sam: ["LB", "PR"] };
+
+export function accountById(id) {
+  return ACCOUNTS.find((account) => account.id === id) || null;
+}
+
+export function byAbbr(abbr) {
+  return ACCOUNTS.find((account) => account.abbr === abbr) || null;
+}
+
+export function sum(values) {
+  let total = 0;
+  for (const value of values) {
+    if (typeof value === "number" && Number.isFinite(value)) total += value;
+  }
+  return total;
+}
+
+export function round1(value) {
+  return Math.round(value * 10) / 10;
+}
+
+export function fixtureMoney(value, currency) {
+  const rounded = Math.round(value * 100) / 100;
+  if (rounded < 10) return `${rounded.toFixed(2)} ${currency}`;
+  return `${Math.round(rounded).toLocaleString("en-US")} ${currency}`;
+}
+
+export function fixtureWholePercent(value) {
+  return `${Math.round(value)} %`;
+}
+
+export function fixtureHours(value) {
+  const rounded = round1(value);
+  return Number.isInteger(rounded) ? `${rounded} h` : `${rounded.toFixed(1)} h`;
+}
+
+function joinNames(names) {
+  if (names.length === 0) return "";
+  if (names.length === 1) return names[0];
+  if (names.length === 2) return `${names[0]} and ${names[1]}`;
+  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+}
+
+export function weekIso(index) {
+  return `${WEEKS[index]}T00:00:00.000Z`;
+}
+
+export function weekTime(index) {
+  if (index < WEEKS.length) return Date.parse(weekIso(index));
+  // The running week after the last finished one.
+  return weekTime(WEEKS.length - 1) + (index - (WEEKS.length - 1)) * 7 * DAY;
+}
+
+export function weeklyPrice(account) {
+  return (account.price * 12) / 52;
+}
+
+export function usedMoney(account, index) {
+  const used = account.used[index];
+  if (used === null) return 0;
+  return (used / 100) * weeklyPrice(account);
+}
+
+export function expiredMoney(account, index) {
+  const used = account.used[index];
+  if (used === null) return 0;
+  return ((100 - used) / 100) * weeklyPrice(account);
+}
+
+export function resetEnd(account, index) {
+  return new Date(
+    weekTime(index) + account.resetDay * DAY + account.resetHour * HOUR
+  ).toISOString();
+}
+
+function rangeIndexes(range) {
+  switch (range) {
+    case "thisWeek":
+      return [11];
+    case "lastWeek":
+      return [10];
+    case "days30":
+      return [7, 8, 9, 10, 11];
+    case "days90":
+    case "months12":
+    case "all":
+      return WEEKS.map((_, index) => index);
+    default:
+      throw new Error(`unknown range ${JSON.stringify(range)}`);
+  }
+}
+
+export function chosenAccounts(query) {
+  if (!query || typeof query !== "object") throw new Error("a statistics query is missing");
+  const indexes = rangeIndexes(query.range);
+  if (!Array.isArray(query.accounts)) throw new Error("query.accounts must be a list");
+  const ids = query.accounts.length === 0 ? viewOrder() : query.accounts;
+  const chosen = [];
+  for (const id of ids) {
+    if (!accountById(id)) throw new Error(`unknown account ${JSON.stringify(id)}`);
+    if (!chosen.includes(id)) chosen.push(id);
+  }
+  return { indexes, chosen: chosen.map(accountById) };
+}
+
+function totalUsedMoney(index) {
+  return sum(
+    ACCOUNTS.filter((account) => account.used[index] !== null).map((account) =>
+      usedMoney(account, index)
+    )
+  );
+}
+
+export function accountOut(account, index) {
+  const used = account.used[index];
+  if (used === null) return 0;
+  const total = totalUsedMoney(index);
+  if (total <= 0) return 0;
+  return OUT_M[index] * 1000000 * (usedMoney(account, index) / total);
+}
+
+export function tokenCounts(out) {
+  return {
+    input: Math.round(out * 0.15),
+    out: Math.round(out),
+    cw: Math.round(out * 0.2),
+    cr: Math.round(out * 3.2),
+  };
+}
+
+export function switchesOf(indexes) {
+  return {
+    user: Math.round(sum(indexes.map((index) => SW_YOU[index]))),
+    cli: 0,
+    auto: Math.round(sum(indexes.map((index) => SW_AUTO[index]))),
+    agent: Math.round(sum(indexes.map((index) => SW_AGENT[index]))),
+    external: 0,
+  };
+}
+
+function projectShares(index) {
+  const atlas = 30 + ((index * 7) % 11);
+  const acmeKb = index === 8 ? 21 : 34 - ((index * 5) % 9);
+  const ledger = 13 + ((index * 3) % 8);
+  const other = 100 - atlas - acmeKb - ledger;
+  return [
+    ["atlas", atlas],
+    ["acme-kb", acmeKb],
+    ["ledger", ledger],
+    ["other", other],
+  ];
+}
+
+export function topProjects(index, usedTotal, asPercent) {
+  const shares = projectShares(index);
+  const named = shares.slice(0, 3);
+  named.sort((a, b) => b[1] - a[1]);
+  const other = shares[3][1];
+  const rows = named.map(([name, share]) => [
+    name,
+    asPercent ? share : (share / 100) * usedTotal,
+  ]);
+  rows.push(["other", asPercent ? other : (other / 100) * usedTotal]);
+  return rows;
+}
+
+export function weekAccounts(index, chosen) {
+  return chosen
+    .filter((account) => account.used[index] !== null)
+    .map((account) => ({
+      id: account.id,
+      usedPercent: account.used[index],
+      used: usedMoney(account, index),
+      expiredPercent: 100 - account.used[index],
+      expired: expiredMoney(account, index),
+      uncertain: false,
+    }));
+}
+
+export function expiredByAccount(indexes, chosen) {
+  const rows = chosen
+    .map((account) => [
+      account.id,
+      sum(indexes.map((index) => expiredMoney(account, index))),
+    ])
+    .filter(([, value]) => value > 0);
+  rows.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  return rows;
+}
+
+export function marksOf(indexes) {
+  const first = weekTime(indexes[0]);
+  const end = weekTime(indexes[indexes.length - 1]) + 7 * DAY;
+  return [
+    { at: "2026-09-21T00:00:00.000Z", label: "PR added" },
+    { at: "2026-10-26T00:00:00.000Z", label: "auto-burn on" },
+  ].filter((mark) => {
+    const at = Date.parse(mark.at);
+    return at >= first && at < end;
+  });
+}
+
+export function findingExpired(indexes, chosen, currency) {
+  const rows = expiredByAccount(indexes, chosen);
+  if (rows.length === 0) return null;
+  const [id, amount] = rows[0];
+  if (amount <= 0) return null;
+  const account = accountById(id);
+  if (!account) return null;
+  const weeks = indexes.filter((index) => account.used[index] !== null).length;
+  const noun = weeks === 1 ? "week" : "weeks";
+  return `${account.abbr} is where most money expired: ${fixtureMoney(amount, currency)} in ${weeks} ${noun}.`;
+}
+
+function weekMoney(week, chosen) {
+  let used = 0;
+  let expired = 0;
+  let paid = 0;
+  for (const account of chosen) {
+    if (account.used[week] === null) continue;
+    used += usedMoney(account, week);
+    expired += expiredMoney(account, week);
+    paid += weeklyPrice(account);
+  }
+  return { used, expired, paid };
+}
+
+export function findingBlocked(indexes, blockedHours, avoidableHours) {
+  if (blockedHours <= 0 || indexes.length === 0) return null;
+  const noun = indexes.length === 1 ? "week" : "weeks";
+  return `You were blocked ${fixtureHours(blockedHours)} in ${indexes.length} ${noun}; ${fixtureHours(avoidableHours)} of them while other quota expired.`;
+}
+
+export function findingAutoBurn(indexes, chosen) {
+  const at = Date.parse("2026-10-26T00:00:00.000Z");
+  const first = weekTime(indexes[0]);
+  const end = weekTime(indexes[indexes.length - 1]) + 7 * DAY;
+  if (at < first || at >= end) return null;
+  const before = indexes.filter((index) => weekTime(index) + 7 * DAY <= at);
+  const after = indexes.filter((index) => weekTime(index) >= at);
+  if (before.length === 0 || after.length === 0) return null;
+  let paidBefore = 0;
+  let expiredBefore = 0;
+  for (const index of before) {
+    const money = weekMoney(index, chosen);
+    paidBefore += money.paid;
+    expiredBefore += money.expired;
+  }
+  let paidAfter = 0;
+  let expiredAfter = 0;
+  for (const index of after) {
+    const money = weekMoney(index, chosen);
+    paidAfter += money.paid;
+    expiredAfter += money.expired;
+  }
+  if (paidBefore <= 0 || paidAfter <= 0) return null;
+  const blockedBefore = sum(before.map((index) => BLOCKED[index])) / before.length;
+  const blockedAfter = sum(after.map((index) => BLOCKED[index])) / after.length;
+  const date = new Date(at).toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+  return `Since auto-burn (${date}): ${fixtureHours(blockedAfter)} blocked a week, ${fixtureWholePercent(
+    (expiredAfter / paidAfter) * 100
+  )} expired. Before: ${fixtureHours(blockedBefore)}, ${fixtureWholePercent(
+    (expiredBefore / paidBefore) * 100
+  )}.`;
+}
+
+export function findingFull(indexes, chosen) {
+  let best = null;
+  for (const account of chosen) {
+    const weeks = indexes.filter((index) => account.used[index] !== null).length;
+    if (weeks === 0) continue;
+    const full = indexes.filter(
+      (index) => account.used[index] !== null && account.used[index] >= 100
+    ).length;
+    if (full === 0) continue;
+    if (best === null || full > best.full) best = { account, full, weeks };
+  }
+  if (best === null) return null;
+  const noun = best.weeks === 1 ? "week" : "weeks";
+  return `${best.account.abbr} was full in ${best.full} of ${best.weeks} ${noun}.`;
+}
+
+export function round2(value) {
+  return Math.round(value * 100) / 100;
+}
+
+export function allUsedMoney() {
+  let total = 0;
+  for (const account of ACCOUNTS) {
+    for (let index = 0; index < WEEKS.length; index += 1) {
+      total += usedMoney(account, index);
+    }
+  }
+  return total;
+}
+
+// A `Values` object for an answer whose two halves are already in money: the
+// fixture has no missing half and no second currency.
+export function fixtureValues(api, subscription) {
+  return {
+    api,
+    apiCurrency: api === null ? null : "EUR",
+    apiMissing: null,
+    subscription,
+    currency: "EUR",
+    subscriptionMissing:
+      subscription === null ? "the fixture has no subscription value here" : null,
+  };
+}
+
+export function chosenHosts(query) {
+  const all = ["atlas", "vega"];
+  if (!query || typeof query !== "object") throw new Error("a statistics query is missing");
+  if (query.host === null || query.host === undefined) return all;
+  if (typeof query.host !== "string" || !all.includes(query.host)) {
+    throw new Error(`unknown host ${JSON.stringify(query.host)}`);
+  }
+  return [query.host];
+}
+
+export function statsEmpty() {
+  return (
+    typeof location !== "undefined" &&
+    new URLSearchParams(location.search).get("fixture") === "stats-empty"
+  );
+}
+
+export function answer(query, build) {
+  if (statsEmpty()) {
+    return { empty: { recordingSince: "2026-11-09T08:00:00Z" } };
+  }
+  return { data: build(query) };
+}
