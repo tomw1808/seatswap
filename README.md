@@ -108,6 +108,12 @@ there, and seatswap does not read or write that yet.
   append-only history folder, one JSON Lines file per month and kind, with tokens per project and
   hour, and Ollama's hourly usage. Several hosts can share it through a synced folder; each writes
   only its own subfolder.
+- **A second computer.** Point both computers' history folder at the same synced folder, and the
+  second one gets more than the shared history: each account's label, abbreviation, colour, price
+  and whether auto-burn may use it, and your currency, notification and status line settings, follow
+  you there. The last edit wins, and another computer's edit shows within a few minutes of the
+  folder syncing. Logins never travel: log in to each account once on the new computer, and it then
+  takes that account's look and price at once.
 - **Running sessions in the pop-up.** seatswap reads Claude Code's session files and transcripts
   and shows how many sessions run, how many are busy, and how many are waiting for you. Only
   numbers and names leave the session files and transcripts: model, token counts, folder, session
@@ -364,7 +370,8 @@ the tray app, and `seatswap.exe` for everything you want to read in a terminal.
   accounts or this machine. Nothing else.
 - **Logs and output** never contain a token; at most the last four characters of a refresh token.
 - **What it records:** the history (every usage reading, finished window, switch and agent call,
-  the tokens each session used per project folder, hour and model, and Ollama's hourly usage) and,
+  the tokens each session used per project folder, hour and model, Ollama's hourly usage, and each
+  edit of an account's label, abbreviation, colour or price and of a shared setting) and,
   for your other hosts, a live report of this host's running sessions (`sessions-now.json`: session
   names and titles, folders, models and token counts, never an agent's task text or a worker's title). Both go
   into the history folder: by default `history` in the data folder; the setting `historyDir` can

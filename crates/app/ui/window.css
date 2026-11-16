@@ -48,10 +48,10 @@ code,
 .window {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
   height: 100vh;
   min-height: 0;
-  padding: 24px;
+  padding: 12px;
 }
 
 /* The mock-up's head: the area tabs top left, then the area's title and its

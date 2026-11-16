@@ -8,6 +8,7 @@ use seatswap_core::history::{
     AccountRef, By, EventKind, HistoryDir, HistoryError, Recorder, SessionCounts,
 };
 use seatswap_core::paths::{AppPaths, ClaudePaths};
+use seatswap_core::shared;
 #[cfg(feature = "gui")]
 use seatswap_core::store::AccountsFile;
 use seatswap_core::store::{Account, Settings, Store};
@@ -86,6 +87,28 @@ pub(crate) fn remove_account(
             .map(|error| history_unwritable(&error))
     });
     Ok((removed, history_error))
+}
+
+/// The one place an account edit is written to the history, for the CLI and
+/// the GUI: the events [`shared::edit_events`] makes of it (`accountLook` with
+/// the changed look fields, `priceChanged` when the price changed), so the
+/// other hosts take the edit (spec §5). The edit happened first; every event
+/// is tried and the first failure is returned as the one sentence for an
+/// unwritable history, never failing the edit. Without a recorder nothing is
+/// written; the caller already says why.
+pub(crate) fn record_edit(
+    recorder: Option<&Recorder>,
+    edited: &switcher::Edited,
+    at: DateTime<Utc>,
+) -> Option<String> {
+    let recorder = recorder?;
+    let mut first_error = None;
+    for kind in shared::edit_events(edited) {
+        if let Err(error) = recorder.event(at, kind) {
+            first_error.get_or_insert_with(|| history_unwritable(&error));
+        }
+    }
+    first_error
 }
 
 /// The one place a plan change is written to the history, for the switch, the

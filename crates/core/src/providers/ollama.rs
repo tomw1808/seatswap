@@ -20,10 +20,12 @@ use super::{Credits, ProviderError, ProviderReading, OLLAMA_ORG};
 /// `Err` with its reason, and the reading is still `Ok`. A usage call that
 /// itself failed leaves [`ProviderReading::hours`] `None`: there is no answer
 /// to read buckets from, and the card's spend error already shows it. The same
-/// answer's `buckets` become [`ProviderReading::hours`] one record per hour; an
-/// answer whose buckets cannot be read (a bucket not on a whole hour, not
-/// exactly one hour long, or carrying no whole number) is an `Err` whose text
-/// names the bucket, never a skipped hour and never a 0.
+/// answer's `buckets` become [`ProviderReading::hours`] one record per hour,
+/// the running hour (`"partial": true`, ending at the answer's moment)
+/// included; an answer whose buckets cannot be read (a bucket not on a whole
+/// hour, a whole bucket not exactly one hour long, a running one past its hour,
+/// or carrying no whole number) is an `Err` whose text names the bucket, never
+/// a skipped hour and never a 0.
 pub fn read(base_url: &str, api: &Api) -> Result<ProviderReading, ProviderError> {
     crate::store::validate_ollama_url(base_url)
         .map_err(|error| ProviderError::Setting(error.to_string()))?;
@@ -100,7 +102,27 @@ fn hour_record(bucket: &Value, index: usize) -> Result<OllamaHourRecord, String>
     }
     let until = bucket_time(object.get("until"), "until", index)?;
     let span = until - hour;
-    if span != chrono::Duration::hours(1) {
+    // The running hour comes as a bucket marked `"partial": true` that ends at
+    // the moment of the answer; every other bucket is one whole hour.
+    let partial = match object.get("partial") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(partial)) => *partial,
+        Some(_) => {
+            return Err(format!(
+                "the usage answer's buckets[{index}].partial is not true or false"
+            ))
+        }
+    };
+    let one_hour = chrono::Duration::hours(1);
+    if partial {
+        if span <= chrono::Duration::zero() || span > one_hour {
+            return Err(format!(
+                "the usage answer's buckets[{index}] is a running hour from {} to {}, not within one hour",
+                hour.to_rfc3339(),
+                until.to_rfc3339()
+            ));
+        }
+    } else if span != one_hour {
         return Err(format!(
             "the usage answer's buckets[{index}] runs from {} to {}, not exactly one hour",
             hour.to_rfc3339(),
@@ -637,6 +659,76 @@ mod tests {
                 assert!(text.contains("not exactly one hour"), "{text}");
             }
             other => panic!("expected an error naming the bucket, got {other:?}"),
+        }
+    }
+
+    /// Ollama's answer ends with the running hour: `"partial": true` and an
+    /// `until` at the moment of the answer (seen on 16 November 2026). It is
+    /// that hour's record so far, not an error.
+    #[test]
+    fn the_running_hour_is_a_partial_bucket() {
+        let body = r#"{
+          "from": "2026-11-13T00:00:00Z", "until": "2026-11-13T01:51:11.676897275Z",
+          "granularity": "hour", "range": "24h", "scope": "self",
+          "totals": {"request_count": 21, "usage_usd": 0.15},
+          "buckets": [
+            {"from": "2026-11-13T00:00:00Z", "until": "2026-11-13T01:00:00Z",
+             "request_count": 17, "usage_usd": 0.12, "input_tokens": 210000,
+             "cached_input_tokens": 160000, "output_tokens": 26000},
+            {"from": "2026-11-13T01:00:00Z", "until": "2026-11-13T01:51:11.676897275Z",
+             "partial": true,
+             "request_count": 4, "usage_usd": 0.03, "input_tokens": 48000,
+             "cached_input_tokens": 31000, "output_tokens": 5200}
+          ]
+        }"#;
+        let (base, receiver, handle) = start_ollama(Reply::ok(NEW_PLAN_BALANCE), Reply::ok(body));
+        let reading = read(&base, &Api::new()).unwrap();
+        let _ = captured(&receiver, handle);
+
+        let hours = match reading.hours {
+            Some(Ok(hours)) => hours,
+            other => panic!("expected two hour records, got {other:?}"),
+        };
+        assert_eq!(hours.len(), 2);
+        assert_eq!(hours[1].hour, at("2026-11-13T01:00:00Z"));
+        assert_eq!(hours[1].requests, 4);
+        assert_eq!(hours[1].output, 5200);
+    }
+
+    /// A running hour still lies within its hour: one that ends after it, or
+    /// a `partial` that is not true or false, is an error naming the bucket.
+    #[test]
+    fn a_partial_bucket_past_its_hour_is_an_error_naming_it() {
+        for (partial, until, expected) in [
+            ("true", "2026-11-13T02:10:00Z", "not within one hour"),
+            ("true", "2026-11-13T01:00:00Z", "not within one hour"),
+            (
+                "\"yes\"",
+                "2026-11-13T01:30:00Z",
+                "partial is not true or false",
+            ),
+        ] {
+            let body = format!(
+                r#"{{
+                  "totals": {{"request_count": 4, "usage_usd": 0.03}},
+                  "buckets": [
+                    {{"from": "2026-11-13T01:00:00Z", "until": "{until}", "partial": {partial},
+                     "request_count": 4, "usage_usd": 0.03, "input_tokens": 48000,
+                     "cached_input_tokens": 31000, "output_tokens": 5200}}
+                  ]
+                }}"#
+            );
+            let (base, receiver, handle) =
+                start_ollama(Reply::ok(NEW_PLAN_BALANCE), Reply::ok(body));
+            let reading = read(&base, &Api::new()).unwrap();
+            let _ = captured(&receiver, handle);
+            match reading.hours {
+                Some(Err(text)) => {
+                    assert!(text.contains("buckets[0]"), "{text}");
+                    assert!(text.contains(expected), "{text}");
+                }
+                other => panic!("expected an error for {partial} until {until}, got {other:?}"),
+            }
         }
     }
 

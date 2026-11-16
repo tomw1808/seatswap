@@ -379,6 +379,25 @@ pub enum EventKind {
     AutoBurnSet {
         on: bool,
     },
+    /// An account's look was edited on a host: only the fields that changed
+    /// (spec §5, "Shared between hosts"). [`crate::shared`] reads these back.
+    AccountLook {
+        account: AccountRef,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        abbr: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auto_burn: Option<bool>,
+    },
+    /// One shared setting ([`crate::store::SHARED_SETTINGS`]) was saved on a
+    /// host: its new value, the same JSON the settings file holds for it.
+    SettingSet {
+        key: String,
+        value: serde_json::Value,
+    },
 }
 
 impl EventKind {
@@ -393,6 +412,7 @@ impl EventKind {
             | EventKind::AccountRemoved { account }
             | EventKind::PlanChanged { account, .. }
             | EventKind::PriceChanged { account, .. }
+            | EventKind::AccountLook { account, .. }
             | EventKind::LoginEnded { account }
             | EventKind::LoginRenewed { account } => vec![account],
             EventKind::Live { account } => account.iter().collect(),
@@ -403,7 +423,8 @@ impl EventKind {
             | EventKind::AgentCall { .. }
             | EventKind::Waited { .. }
             | EventKind::AutoBurn { .. }
-            | EventKind::AutoBurnSet { .. } => Vec::new(),
+            | EventKind::AutoBurnSet { .. }
+            | EventKind::SettingSet { .. } => Vec::new(),
         }
     }
 }

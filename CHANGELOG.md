@@ -110,6 +110,20 @@ All notable changes to this project are documented here. The format follows
   Organizations can be added and removed by hand; one that comes from a GitHub owner cannot be
   removed, and any project can be assigned to another organization.
 
+**Several hosts**
+- Hosts that share a history folder share each account's label, abbreviation, colour, "Auto-burn may
+  use it" and monthly price, and the settings currency, notifications and status line. An edit
+  writes only what it changed, as an `accountLook` or `settingSet` line (the price stays a
+  `priceChanged`); each field takes the newest value over all hosts, so the last edit wins. The tray
+  app takes the other hosts' edits at start and every 5 minutes, and the open pages show them without
+  a restart. A value that does not pass this host's own checks, such as an abbreviation one of its
+  accounts already has, is not applied and is named in a warning with the host that wrote it. At
+  start a host shares its own values of every field no host has shared yet, except settings still at
+  their default. Logins never travel: an account appears on a host only after its login there, and a
+  login of an account the history knows takes its shared look and price at once (the tray app,
+  `seatswap add` and a switch that saves the live login). Settings → History and hosts says what is
+  shared.
+
 **Money**
 - The rate line reads "ECB rate of Fri 13 Nov · European Central Bank via Frankfurter · fetched today
   10:10". The rate is fetched once per Frankfurt day while it is older than today, and on working
@@ -166,6 +180,19 @@ All notable changes to this project are documented here. The format follows
   version is an error and that pass reads nothing, instead of being rebuilt.
 - A rate-limited request says when seatswap asks again, such as "Claude limits how often seatswap
   may ask; next try at 10:42", instead of "rate limited; retry after Some(0) seconds".
+- Ollama's usage answer ends with the running hour (`"partial": true`, ending at the moment of the
+  answer); it is read as that hour so far instead of raising a notification about `buckets[24]`.
+- Claude Code on an Ollama model: its answers count under the model the session asked for
+  (`deepseek-v4.1-flash:cloud`), not Ollama's shorter spelling, so they match the Harness rows, the
+  prices and the "other Ollama use" of Activity.
+- Statistics → Overview: "Share that expired" says so when no finished weekly window with a price is
+  in the range yet, instead of failing with "cannot place the mark".
+- Sessions: a flash job without its Claude Code session takes the project it was copied from
+  instead of `fm` (the worker copies' folder), and leaves the list once its task ended instead of
+  staying as an idle session.
+- The `tied` bubble and the count of sessions whose thinking is tied to the account leave out
+  models off the Claude plan (Harness, Codex, Ollama): a switch does not touch them.
+- The large window uses half the margin around its content (12 px instead of 24 px).
 
 ### Removed
 - *Use my own rate* (`usdRate`) and the own prices in Settings. With the look-ups off, money is

@@ -28,6 +28,7 @@ notify = "8"
 uuid = { version = "1", features = ["v4"] }
 filetime = "0.2"
 zstd = "0.13.3"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

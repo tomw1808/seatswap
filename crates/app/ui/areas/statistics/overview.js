@@ -245,6 +245,10 @@ export async function show(container, env) {
   const shareBody = h("div", { class: "stats-chart-body" });
   if (data.weeks.length === 0) {
     shareBody.appendChild(emptyLine("no week in the range"));
+  } else if (data.weeks.every((week) => week.expiredShare === null)) {
+    // A share needs a finished weekly window of an account with a price;
+    // without any there is no line and no time axis to place the marks on.
+    shareBody.appendChild(emptyLine("no finished weekly window with a price in the range yet"));
   } else {
     shareBody.appendChild(
       lines({

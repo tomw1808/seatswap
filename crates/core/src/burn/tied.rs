@@ -3,8 +3,11 @@
 //! Table as of 14 November 2026: thinking from Claude Fable 5.2, Mythos 5.2,
 //! Sonnet 5.5 and Haiku 5.5 works only in the organization that produced it, so
 //! a switch makes a running session continue without it. The Opus 5.5 and
-//! Fable 5.1 models are not on that list and keep it. A model id the table does
-//! not know counts as tied: the careful assumption.
+//! Fable 5.1 models are not on that list and keep it. A Claude model id the
+//! table does not know counts as tied: the careful assumption. A model that does
+//! not run on the Claude plan (`money::is_plan_model`: a Harness, Codex or
+//! Ollama model) has no thinking on a Claude account, so a switch never touches
+//! it: not tied.
 
 /// Models whose thinking is tied to the account, compared as whole ids.
 const TIED: [&str; 4] = [
@@ -48,7 +51,8 @@ fn without_suffix(model_id: &str) -> &str {
 
 /// Whether a session on this model loses its earlier thinking on another account
 /// (spec §2.11): the table above, exact ids as whole ids and older families by
-/// prefix; any other id is tied. One trailing `[...]` suffix, such as Claude
+/// prefix; any other Claude id is tied, and a model off the Claude plan never
+/// is. One trailing `[...]` suffix, such as Claude
 /// Code's `[1m]` in `claude-opus-5-5[1m]`, is stripped before the comparison;
 /// nothing else is changed.
 ///
@@ -59,6 +63,9 @@ fn without_suffix(model_id: &str) -> &str {
 /// `claude-opus-4`, `claude-sonnet-4`, `claude-haiku-4` or `claude-3`.
 pub fn thinking_tied(model_id: &str) -> bool {
     let model_id = without_suffix(model_id);
+    if !crate::money::is_plan_model(model_id) {
+        return false;
+    }
     if TIED.contains(&model_id) {
         return true;
     }
@@ -86,7 +93,19 @@ mod tests {
         assert!(!thinking_tied("claude-opus-5-5"));
         assert!(!thinking_tied("claude-opus-4-8"));
         assert!(!thinking_tied("claude-fable-5-1"));
-        assert!(thinking_tied("something-new-9"));
+        assert!(
+            thinking_tied("claude-something-new-9"),
+            "an unknown Claude id is tied"
+        );
+        // Off the Claude plan: a switch of the Claude account never touches it.
+        for id in [
+            "deepseek-v4.1-flash:cloud",
+            "minimax-m3.1-flash:cloud",
+            "gpt-6.1-sol",
+            "something-new-9",
+        ] {
+            assert!(!thinking_tied(id), "{id}");
+        }
         for id in TIED {
             assert!(thinking_tied(id), "{id}");
         }
@@ -111,7 +130,14 @@ mod tests {
             !thinking_tied("claude-opus-4-8[1m]"),
             "suffixed family prefix"
         );
-        assert!(thinking_tied("something-new-9[1m]"), "suffixed unknown id");
+        assert!(
+            thinking_tied("claude-something-new-9[1m]"),
+            "suffixed unknown id"
+        );
+        assert!(
+            !thinking_tied("something-new-9[1m]"),
+            "suffixed id off the plan"
+        );
         // One suffix only: what is left still has to be a known id.
         assert!(thinking_tied("claude-opus-5-5[1m][2m]"), "two suffixes");
     }

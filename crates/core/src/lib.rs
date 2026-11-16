@@ -14,6 +14,7 @@
 //! - `history`  the history folder: record types, appending, reading a range, merging hosts
 //! - `project`  from a folder to the project's identity
 //! - `sessions` Claude Code's session files and which are alive
+//! - `shared`   account looks and settings shared between hosts through the history (spec §5)
 //! - `stats`    everything the statistics pages show, computed from the history
 //! - `transcripts` Claude Code's transcripts: answers, user turns, token records
 //! - `locks`    Claude Code's six lock folders + seatswap's own switch.lock
@@ -47,6 +48,7 @@ pub mod project;
 pub mod projects;
 pub mod providers;
 pub mod sessions;
+pub mod shared;
 pub mod stats;
 pub mod store;
 pub mod switcher;

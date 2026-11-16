@@ -39,6 +39,7 @@ use seatswap_core::history::{
 };
 use seatswap_core::locks::{self, LockError};
 use seatswap_core::paths::{AppPaths, ClaudePaths};
+use seatswap_core::shared;
 use seatswap_core::store::{self, Account, AccountsFile, Settings, Store};
 use seatswap_core::switcher::{self, LiveState, SwitchError, Synced, UnsavedPolicy};
 #[cfg(test)]
@@ -56,6 +57,12 @@ use crate::ops;
 
 /// How often the engine thread polls even without a command.
 const TICK: Duration = Duration::from_secs(30);
+
+/// How often the engine thread asks the action thread to exchange the shared
+/// looks and settings with the other hosts (spec §5): on its poll tick, at most
+/// this often. Another host's edit arrives with the delay of the folder's sync
+/// plus up to this.
+const SHARE_EVERY_MIN: i64 = 5;
 
 /// The next timer poll as a fixed deadline. A command may arrive first, but it
 /// never moves the deadline: the timer poll runs as soon as it has passed.
@@ -334,6 +341,10 @@ pub(crate) enum ActionCommand {
     SyncLive,
     /// Pause auto-burn for `hours`, or resume with `None` (spec §2.5).
     PauseBurn { hours: Option<i64> },
+    /// Exchange the shared account looks and settings with the other hosts
+    /// (spec §5): the engine thread asks at start and every
+    /// [`SHARE_EVERY_MIN`] minutes.
+    Share,
 }
 
 /// One saved setting: the settings as they are after the merge, and a warning
@@ -677,6 +688,10 @@ struct EngineRuntime {
     /// The running tied sessions' answers with thinking, minute by minute. It is
     /// emptied together with `tied_busy`.
     thinking: Vec<(DateTime<Utc>, u32)>,
+    /// The action thread, asked to exchange the shared looks and settings.
+    action: Sender<ActionCommand>,
+    /// When that was asked last; `None` until the first ask at start.
+    share_asked_at: Option<DateTime<Utc>>,
 }
 
 /// The wall and monotonic clocks at one moment. Wake detection compares two of
@@ -721,11 +736,13 @@ impl EngineRuntime {
             notice: None,
             snapshot: Snapshot::empty(None, None, None),
             baseline: ClockBaseline::now(),
-            burn: BurnRuntime::new(action, engine),
+            burn: BurnRuntime::new(action.clone(), engine),
             forecast,
             printed_warnings,
             tied_busy: 0,
             thinking: Vec::new(),
+            action,
+            share_asked_at: None,
         };
         runtime.open();
         // Show the real settings even when the engine could not open.
@@ -742,6 +759,7 @@ impl EngineRuntime {
         // The first snapshot is the one built above; it carries a one-shot
         // notice (the moved usage cache) and the settings read at startup.
         self.send();
+        self.ask_share(Utc::now());
         let mut deadline = TickDeadline::new(Instant::now());
         loop {
             let wait = deadline.wait(Instant::now());
@@ -888,6 +906,17 @@ impl EngineRuntime {
         }
     }
 
+    /// Ask the action thread to exchange the shared looks and settings with the
+    /// other hosts, at start and then at most every [`SHARE_EVERY_MIN`]
+    /// minutes. The exchange runs on the action thread, where every edit and
+    /// settings save runs, so it never lands between an edit and its event.
+    fn ask_share(&mut self, now: DateTime<Utc>) {
+        if share_due(self.share_asked_at, now) {
+            self.share_asked_at = Some(now);
+            let _ = self.action.send(ActionCommand::Share);
+        }
+    }
+
     /// The recorder's read warnings (spec §1.2): a torn last line, a line this
     /// version does not know. The app prints each one once; core never prints.
     fn print_history_warnings(&mut self) {
@@ -918,6 +947,7 @@ impl EngineRuntime {
         // readSessions off too. Its error is the thread's history state, not
         // the engine's open error, so `publish()` cannot clear it.
         self.heartbeat(now);
+        self.ask_share(now);
         match result {
             Ok(views) => {
                 self.open_error = None;
@@ -1075,6 +1105,14 @@ impl EngineRuntime {
     fn send(&self) {
         let _ = self.ui.send(UiEvent::Snapshot(self.snapshot.clone()));
     }
+}
+
+/// Whether the shared looks and settings are due again: never asked yet, or
+/// asked at least [`SHARE_EVERY_MIN`] minutes before `now`.
+fn share_due(asked_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    asked_at.is_none_or(|at| {
+        now.signed_duration_since(at) >= chrono::Duration::minutes(SHARE_EVERY_MIN)
+    })
 }
 
 /// True when the wall clock moved more than [`WAKE_THRESHOLD`] further than the
@@ -1254,6 +1292,7 @@ impl ActionRuntime {
                     }
                     let _ = self.engine.send(EngineCommand::HistoryChanged);
                 }
+                ActionCommand::Share => self.share(),
             }
         }
     }
@@ -1303,6 +1342,9 @@ impl ActionRuntime {
         };
         match result {
             Ok(outcome) => {
+                if outcome.saved_new.is_some() {
+                    self.share();
+                }
                 let message = match self.store() {
                     Ok(store) => match ops::switch_message(store, &outcome.to) {
                         Ok(message) => message,
@@ -1437,6 +1479,32 @@ impl ActionRuntime {
             .map_err(|error| ops::history_unwritable(&error))
     }
 
+    /// Exchange the shared looks and settings with the other hosts (spec §5):
+    /// seed what no host shared yet and apply the newest values. Asked by the
+    /// engine thread at start and every few minutes, and run after an account
+    /// was added so a login of a known account takes its shared look at once.
+    /// Without a history folder nothing is shared; its error is shown already.
+    /// A change is published; the warnings are printed once, an error is
+    /// reported once.
+    fn share(&mut self) {
+        if let Err(error) = self.ensure_store() {
+            self.reported_errors.report(&error);
+            return;
+        }
+        let (Some(store), Ok(recorder)) = (self.store.as_ref(), self.history.as_ref()) else {
+            return;
+        };
+        match shared::sync(store, recorder, Utc::now()) {
+            Ok(applied) => {
+                super::lock(&self.printed_warnings).print(&applied.warnings);
+                if applied.changed() {
+                    let _ = self.engine.send(EngineCommand::Publish);
+                }
+            }
+            Err(error) => self.reported_errors.report(&error.to_string()),
+        }
+    }
+
     fn save_current(&mut self, label: Option<String>) -> ActionReply {
         if let Err(error) = self.ensure_store() {
             return ActionReply::Failed(error);
@@ -1452,6 +1520,7 @@ impl ActionRuntime {
                 if let Some(error) = history_error.or(open_error) {
                     self.reported_errors.report(&error);
                 }
+                self.share();
                 let _ = self.engine.send(EngineCommand::Publish);
                 ActionReply::Done
             }
@@ -1482,15 +1551,9 @@ impl ActionRuntime {
         };
         match result {
             Ok(edited) => {
-                if edited.price_changed {
-                    let event = EventKind::PriceChanged {
-                        account: AccountRef::of(&edited.account),
-                        amount: edited.account.price,
-                        currency: edited.account.price_currency.clone(),
-                    };
-                    if let Err(error) = self.record(event) {
-                        self.reported_errors.report(&error);
-                    }
+                let (history, open_error) = self.history_for_action();
+                if let Some(error) = ops::record_edit(history, &edited, Utc::now()).or(open_error) {
+                    self.reported_errors.report(&error);
                 }
                 let _ = self.engine.send(EngineCommand::Publish);
                 ActionReply::Done
@@ -1536,15 +1599,23 @@ impl ActionRuntime {
             Ok(saved) => saved,
             Err(error) => return ActionReply::Failed(error),
         };
-        // The setting is saved; its history event is one place, also used when
-        // the pop-up changes `autoBurn`.
-        if let Some(event) = settings_change_event(&previous, &settings) {
-            match self.record(event) {
-                Ok(()) => {
-                    let _ = self.engine.send(EngineCommand::HistoryChanged);
+        // The setting is saved; its history events come from one place, also
+        // used when the pop-up changes `autoBurn`. Only `autoBurnSet` changes
+        // what auto-burn learns.
+        match settings_change_events(&previous, &settings) {
+            Ok(events) => {
+                for event in events {
+                    let burn = matches!(event, EventKind::AutoBurnSet { .. });
+                    match self.record(event) {
+                        Ok(()) if burn => {
+                            let _ = self.engine.send(EngineCommand::HistoryChanged);
+                        }
+                        Ok(()) => {}
+                        Err(error) => self.reported_errors.report(&error),
+                    }
                 }
-                Err(error) => self.reported_errors.report(&error),
             }
+            Err(error) => self.reported_errors.report(&error),
         }
         let warning = autostart::apply_autostart(settings.start_at_login, &self.autostart_args)
             .err()
@@ -1651,25 +1722,18 @@ impl ActionRuntime {
     }
 }
 
-/// The settings with one field replaced, checked as a whole. `field` must name
-/// a key of the settings' JSON object; a bad value is the field's name followed
-/// by serde's text, and an invalid value is [`Settings::validate`]'s error.
-/// A `~` path typed into one of the path settings starts at the home folder
-/// (`format::expand_tilde`: `~/`, and `~\` on Windows).
+/// The settings with one field replaced, checked as a whole by
+/// [`Settings::with_setting`]: `field` must name a key of the settings' JSON
+/// object; a bad value is the field's name followed by serde's text, and an
+/// invalid value is [`Settings::validate`]'s error. A `~` path typed into one
+/// of the path settings starts at the home folder (`format::expand_tilde`:
+/// `~/`, and `~\` on Windows).
 fn merge_setting(
     settings: &Settings,
     field: &str,
     value: serde_json::Value,
     home: &Path,
 ) -> Result<Settings, String> {
-    let mut object =
-        serde_json::to_value(settings).map_err(|error| format!("settings: {error}"))?;
-    let entries = object
-        .as_object_mut()
-        .ok_or_else(|| "the settings are not a JSON object".to_string())?;
-    if !entries.contains_key(field) {
-        return Err(format!("unknown setting {field}"));
-    }
     let value = match value {
         serde_json::Value::String(text)
             if matches!(field, "claudeConfigDir" | "historyDir" | "codexHome") =>
@@ -1685,21 +1749,22 @@ fn merge_setting(
         }
         other => other,
     };
-    entries.insert(field.to_string(), value);
-    let merged: Settings =
-        serde_json::from_value(object).map_err(|error| format!("{field}: {error}"))?;
-    merged.validate().map_err(|error| error.to_string())?;
-    Ok(merged)
+    settings
+        .with_setting(field, value)
+        .map_err(|error| error.to_string())
 }
 
-/// The history event a settings save writes, or `None` when the save changes
-/// none of the settings the history records. Turning auto-burn on or off is
-/// `AutoBurnSet`, never a pause or resume (spec §2.5).
-fn settings_change_event(previous: &Settings, next: &Settings) -> Option<EventKind> {
+/// The history events a settings save writes, none when the save changes none
+/// of the settings the history records. Turning auto-burn on or off is
+/// `AutoBurnSet`, never a pause or resume (spec §2.5); a changed shared setting
+/// is `SettingSet` ([`shared::setting_events`], spec §5).
+fn settings_change_events(previous: &Settings, next: &Settings) -> Result<Vec<EventKind>, String> {
+    let mut events = Vec::new();
     if previous.auto_burn != next.auto_burn {
-        return Some(EventKind::AutoBurnSet { on: next.auto_burn });
+        events.push(EventKind::AutoBurnSet { on: next.auto_burn });
     }
-    None
+    events.extend(shared::setting_events(previous, next).map_err(|error| error.to_string())?);
+    Ok(events)
 }
 
 /// The history read warnings this run of the app has already printed. A month
@@ -2309,7 +2374,7 @@ mod tests {
 
     /// Turning auto-burn on or off writes `AutoBurnSet`, not the pause/resume
     /// event: a toggle must not end a manual switch's hold. The event a save
-    /// writes comes from `settings_change_event`, so this needs no
+    /// writes comes from `settings_change_events`, so this needs no
     /// `save_setting` (which applies `startAtLogin`).
     #[test]
     fn a_toggle_writes_auto_burn_set() {
@@ -2333,24 +2398,26 @@ mod tests {
             auto_burn: true,
             ..off.clone()
         };
-        let event = settings_change_event(&off, &on).expect("a toggle writes one event");
+        let mut events = settings_change_events(&off, &on).expect("the events");
+        assert_eq!(events.len(), 1, "a toggle writes one event");
+        let event = events.remove(0);
         assert_eq!(event, EventKind::AutoBurnSet { on: true });
         assert_eq!(
             serde_json::to_value(&event).expect("the event as JSON"),
             json!({"type": "autoBurnSet", "on": true})
         );
         assert_eq!(
-            settings_change_event(&on, &on),
-            None,
+            settings_change_events(&on, &on),
+            Ok(Vec::new()),
             "a save that leaves auto-burn alone writes no event"
         );
         let other = Settings {
-            notify_on_switch: !on.notify_on_switch,
+            hotkey: "Ctrl+Alt+S".to_string(),
             ..on.clone()
         };
         assert_eq!(
-            settings_change_event(&on, &other),
-            None,
+            settings_change_events(&on, &other),
+            Ok(Vec::new()),
             "another setting is not auto-burn"
         );
 
@@ -2521,6 +2588,142 @@ mod tests {
             json!("EUR"),
             "the currency setting at the time of the change"
         );
+    }
+
+    /// An edit writes `accountLook` with only the fields it changed, through
+    /// `ops::record_edit`, the function the CLI's edit uses too (spec §5).
+    #[test]
+    fn an_account_edit_writes_only_the_changed_look_fields() {
+        let fixture = Fixture::new();
+        let (engine, _engine_rx) = mpsc::channel();
+        let mut action = ActionRuntime::new(
+            fixture.app.clone(),
+            fixture.claude.clone(),
+            Vec::new(),
+            engine,
+            fixture.history(),
+            test_errors(),
+            test_printed_warnings(),
+        );
+        let same_abbr = fixture.account.abbr.clone();
+        let reply = action.edit(
+            &fixture.account.id,
+            Some("Acme Lab".to_string()),
+            Some(same_abbr),
+            Some("#14b8a6".to_string()),
+            None,
+            None,
+        );
+        assert!(matches!(reply, ActionReply::Done), "{reply:?}");
+
+        let host = seatswap_core::paths::host_name(None).expect("the host name");
+        let read = HistoryDir::at(&fixture.app.history_dir(), &host)
+            .read::<Event>(&Range::ALL, &Hosts::One(host))
+            .expect("the events are read");
+        let kinds: Vec<EventKind> = read
+            .records
+            .into_iter()
+            .map(|hosted| hosted.record.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![EventKind::AccountLook {
+                account: AccountRef::of(&fixture.account),
+                label: Some("Acme Lab".to_string()),
+                abbr: None,
+                color: Some("#14b8a6".to_string()),
+                auto_burn: None,
+            }],
+            "the unchanged abbreviation and the untouched fields are left out"
+        );
+    }
+
+    /// The action thread's share takes another host's edit into
+    /// `accounts.json` and has the engine publish it, so the open pages show it
+    /// without a restart (spec §5).
+    #[test]
+    fn a_share_applies_another_hosts_edit_and_publishes() {
+        let fixture = Fixture::new();
+        let vega = fixture.app.history_dir().join("vega");
+        fs::create_dir_all(&vega).expect("vega's folder");
+        fs::write(vega.join("host.json"), r#"{"machineId":"made-up"}"#).expect("marker");
+        HistoryDir::at(&fixture.app.history_dir(), "vega")
+            .append(&Event {
+                t: Utc::now(),
+                kind: EventKind::SettingSet {
+                    key: "currency".to_string(),
+                    value: json!("CHF"),
+                },
+            })
+            .expect("vega's event");
+        HistoryDir::at(&fixture.app.history_dir(), "vega")
+            .append(&Event {
+                t: Utc::now(),
+                kind: EventKind::AccountLook {
+                    account: AccountRef::of(&fixture.account),
+                    label: Some("Acme Lab".to_string()),
+                    abbr: None,
+                    color: None,
+                    auto_burn: None,
+                },
+            })
+            .expect("vega's event");
+        let (engine, engine_rx) = mpsc::channel();
+        let mut action = ActionRuntime::new(
+            fixture.app.clone(),
+            fixture.claude.clone(),
+            Vec::new(),
+            engine,
+            fixture.history(),
+            test_errors(),
+            test_printed_warnings(),
+        );
+
+        action.share();
+
+        let file = store::load_accounts(&fixture.app).expect("accounts");
+        assert_eq!(file.settings.currency.as_deref(), Some("CHF"));
+        assert_eq!(file.accounts[0].label, "Acme Lab");
+        assert!(
+            engine_rx
+                .try_iter()
+                .any(|command| matches!(command, EngineCommand::Publish)),
+            "the change is published"
+        );
+    }
+
+    #[test]
+    fn the_share_is_asked_at_start_and_then_every_five_minutes() {
+        let start = Utc::now();
+        assert!(share_due(None, start), "the first ask is at start");
+        assert!(!share_due(
+            Some(start),
+            start + chrono::Duration::seconds(299)
+        ));
+        assert!(share_due(Some(start), start + chrono::Duration::minutes(5)));
+    }
+
+    /// A save of a shared setting writes `settingSet` with the value as the
+    /// settings file holds it; a setting that is not shared writes nothing.
+    #[test]
+    fn a_currency_save_writes_setting_set_and_a_hotkey_save_none() {
+        let before = Settings::default();
+        let currency = Settings {
+            currency: Some("EUR".to_string()),
+            ..before.clone()
+        };
+        assert_eq!(
+            settings_change_events(&before, &currency),
+            Ok(vec![EventKind::SettingSet {
+                key: "currency".to_string(),
+                value: json!("EUR"),
+            }])
+        );
+        let hotkey = Settings {
+            hotkey: "Ctrl+Alt+S".to_string(),
+            ..before.clone()
+        };
+        assert_eq!(settings_change_events(&before, &hotkey), Ok(Vec::new()));
     }
 
     /// The mirror copies the live login into the stored account. When the plan
@@ -3037,11 +3240,13 @@ mod tests {
             notice: None,
             snapshot: Snapshot::empty(None, None, None),
             baseline: ClockBaseline::now(),
-            burn: BurnRuntime::new(action, engine_commands),
+            burn: BurnRuntime::new(action.clone(), engine_commands),
             forecast: Arc::new(Mutex::new(None)),
             printed_warnings: test_printed_warnings(),
             tied_busy: 0,
             thinking: Vec::new(),
+            action,
+            share_asked_at: None,
         };
 
         runtime.write_live_once();
@@ -3096,11 +3301,13 @@ mod tests {
             notice: None,
             snapshot: Snapshot::empty(None, None, None),
             baseline: ClockBaseline::now(),
-            burn: BurnRuntime::new(action, engine_commands),
+            burn: BurnRuntime::new(action.clone(), engine_commands),
             forecast: Arc::new(Mutex::new(None)),
             printed_warnings: test_printed_warnings(),
             tied_busy: 0,
             thinking: Vec::new(),
+            action,
+            share_asked_at: None,
         };
 
         runtime.heartbeat(Utc::now());
@@ -3166,11 +3373,13 @@ mod tests {
             notice: None,
             snapshot: Snapshot::empty(None, None, Some(file.settings)),
             baseline: ClockBaseline::now(),
-            burn: BurnRuntime::new(action, engine_commands),
+            burn: BurnRuntime::new(action.clone(), engine_commands),
             forecast: Arc::clone(&forecast),
             printed_warnings: test_printed_warnings(),
             tied_busy: 0,
             thinking: Vec::new(),
+            action,
+            share_asked_at: None,
         };
 
         // No account: the burn runtime has no situation to compute a plan from.

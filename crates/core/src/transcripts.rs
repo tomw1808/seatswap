@@ -1840,6 +1840,12 @@ impl ScanRun<'_> {
         if model == SYNTHETIC {
             return;
         }
+        // The model the session asked for names the answer: a gateway such as
+        // Ollama answers with its own spelling (`deepseek-v4.1-flash` for
+        // `deepseek-v4.1-flash:cloud`), while prices, providers and the
+        // Harness rows use the asked-for name. Claude's own models are spelled
+        // the same in both fields.
+        let model = line.requested_model.as_deref().unwrap_or(model);
         let thinking = message.content.as_ref().is_some_and(Content::thinking);
         if let Some(&index) = file.ids.get(id) {
             // A further line of an answer this scan already counted.
@@ -2431,6 +2437,9 @@ struct TitleLine {
 struct Line {
     timestamp: Option<DateTime<Utc>>,
     cwd: Option<String>,
+    /// The model the session asked for (an assistant line's `requestedModel`).
+    #[serde(rename = "requestedModel")]
+    requested_model: Option<String>,
     #[serde(rename = "isMeta")]
     is_meta: Option<bool>,
     origin: Option<Origin>,
@@ -2980,6 +2989,43 @@ mod tests {
         let mut scan = scan(claude, state, budget).unwrap();
         scan.commit(state);
         scan
+    }
+
+    /// Claude Code on an Ollama model (seen on 16 November 2026, Claude Code
+    /// 2.1.326): the answer says `deepseek-v4.1-flash`, the line's
+    /// `requestedModel` says `deepseek-v4.1-flash:cloud`. The asked-for name
+    /// counts, so the tokens match Ollama's and the Harness rows' spelling;
+    /// a line without `requestedModel` keeps the answer's model.
+    #[test]
+    fn the_requested_model_names_the_answer() {
+        let (_tmp, claude, _app) = fixture();
+        let mut asked: serde_json::Value = serde_json::from_str(&assistant_line(
+            "msg_01Ollama1",
+            AT,
+            ENGINE,
+            "deepseek-v4.1-flash",
+            &["text"],
+            USAGE,
+        ))
+        .unwrap();
+        asked["requestedModel"] = serde_json::json!("deepseek-v4.1-flash:cloud");
+        write_lines(
+            &folder(&claude, FOLDER),
+            &format!("{SESSION}.jsonl"),
+            &[
+                asked.to_string(),
+                assistant_line("msg_01QmB7xT", AT, ENGINE, OPUS, &["text"], USAGE),
+            ],
+        );
+
+        let (_state, scan) = scan_run(&claude);
+
+        let models: Vec<&str> = scan
+            .answers
+            .iter()
+            .map(|answer| answer.model.as_str())
+            .collect();
+        assert_eq!(models, vec!["deepseek-v4.1-flash:cloud", OPUS]);
     }
 
     #[test]

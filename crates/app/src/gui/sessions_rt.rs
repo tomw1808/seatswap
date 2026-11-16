@@ -6914,7 +6914,16 @@ mod tests {
             now,
             None,
         );
-        assert_eq!(harness_row(&memory, HARNESS_JOB).status, LiveStatus::Idle);
+        assert!(
+            memory
+                .rows
+                .as_ref()
+                .expect("rows after the pass")
+                .sessions
+                .iter()
+                .all(|row| row.session != HARNESS_JOB),
+            "a quiet job without a lock holder is done: no row"
+        );
 
         let held = FakeProc {
             processes: BTreeMap::from([(500, (vec![lock], Some(1))), (1, (Vec::new(), None))]),

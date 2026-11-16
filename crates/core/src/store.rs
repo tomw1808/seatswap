@@ -22,6 +22,21 @@ pub const PALETTE: [&str; 10] = [
     "#6366f1", "#84cc16",
 ];
 
+/// The settings every host shares through the history folder (spec §5,
+/// "Shared between hosts"; §10), by their key in the settings file. Every
+/// other setting stays on its host. This list is the one place that says which
+/// keys are shared.
+pub const SHARED_SETTINGS: [&str; 8] = [
+    "currency",
+    "notifyOnSwitch",
+    "notifyUsableAgain",
+    "notifyWaiting",
+    "notifyWaitingHosts",
+    "notifyLoginEnds",
+    "statusline",
+    "statuslineFeed",
+];
+
 /// Keyring service name; the keyring user is the account id (spec §5).
 const KEYRING_SERVICE: &str = "seatswap";
 /// Throw-away entry used to find out whether a keyring works at all.
@@ -57,6 +72,12 @@ pub enum StoreError {
     Keyring(String),
     #[error("invalid setting: {0}")]
     InvalidSetting(String),
+    #[error("unknown setting {0}")]
+    UnknownSetting(String),
+    /// A setting's JSON value that is not of the setting's type; `message` is
+    /// serde's text.
+    #[error("{key}: {message}")]
+    SettingValue { key: String, message: String },
     #[error("invalid price {0}: use a number above 0 per month")]
     InvalidPrice(f64),
     #[error("invalid account id {0:?}: expected 32 lower-case hex characters")]
@@ -1064,6 +1085,49 @@ impl Settings {
         validate_statusline(&self.statusline)?;
         Ok(())
     }
+
+    /// These settings with the one setting `key` (its camelCase name in the
+    /// settings file) replaced by `value`, checked as a whole by
+    /// [`Self::validate`]. The one way to change a setting by its key: the
+    /// settings page's save and the shared settings from other hosts
+    /// ([`crate::shared::apply`]) both come here. A key the settings do not
+    /// have is [`StoreError::UnknownSetting`], a value of the wrong type
+    /// [`StoreError::SettingValue`] naming the key.
+    pub fn with_setting(
+        &self,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<Settings, StoreError> {
+        let mut object = self.as_json()?;
+        let entries = object.as_object_mut().ok_or_else(|| {
+            StoreError::InvalidSetting("the settings are not a JSON object".to_string())
+        })?;
+        if !entries.contains_key(key) {
+            return Err(StoreError::UnknownSetting(key.to_string()));
+        }
+        entries.insert(key.to_string(), value);
+        let merged: Settings =
+            serde_json::from_value(object).map_err(|error| StoreError::SettingValue {
+                key: key.to_string(),
+                message: error.to_string(),
+            })?;
+        merged.validate()?;
+        Ok(merged)
+    }
+
+    /// One setting's value as the settings file holds it, by its camelCase
+    /// key; [`StoreError::UnknownSetting`] for a key the settings do not have.
+    pub fn value_of(&self, key: &str) -> Result<serde_json::Value, StoreError> {
+        self.as_json()?
+            .get(key)
+            .cloned()
+            .ok_or_else(|| StoreError::UnknownSetting(key.to_string()))
+    }
+
+    fn as_json(&self) -> Result<serde_json::Value, StoreError> {
+        serde_json::to_value(self)
+            .map_err(|error| StoreError::InvalidSetting(format!("settings: {error}")))
+    }
 }
 
 /// Check an `ollamaUrl`: it must start with `http://` or `https://`, name a
@@ -1156,8 +1220,9 @@ fn is_host_name(host: &str) -> bool {
 }
 
 /// The one currency rule (spec §1.4): three capital letters. Used by
-/// [`Settings::currency`].
-fn validate_currency(currency: &str) -> Result<(), StoreError> {
+/// [`Settings::currency`] and by a shared price's currency
+/// ([`crate::shared::apply`]).
+pub fn validate_currency(currency: &str) -> Result<(), StoreError> {
     let letters = currency.len() == 3 && currency.bytes().all(|byte| byte.is_ascii_uppercase());
     if !letters {
         return Err(StoreError::InvalidSetting(format!(
@@ -3057,6 +3122,51 @@ mod tests {
             ..Settings::default()
         };
         assert!(good.validate().is_ok());
+    }
+
+    /// The shared list names real keys of the settings file: a typo would
+    /// share nothing and say nothing.
+    #[test]
+    fn every_shared_setting_is_a_key_of_the_settings_file() {
+        let settings = Settings::default();
+        for key in SHARED_SETTINGS {
+            assert!(settings.value_of(key).is_ok(), "{key} is a settings key");
+        }
+        assert!(matches!(
+            settings.value_of("noSuchSetting"),
+            Err(StoreError::UnknownSetting(_))
+        ));
+    }
+
+    #[test]
+    fn with_setting_changes_one_key_and_checks_the_whole() {
+        let settings = Settings {
+            auto_burn: true,
+            ..Settings::default()
+        };
+        let merged = settings
+            .with_setting("currency", serde_json::json!("EUR"))
+            .expect("the currency is merged");
+        assert_eq!(merged.currency.as_deref(), Some("EUR"));
+        assert!(merged.auto_burn, "every other key is kept");
+        assert!(matches!(
+            settings.with_setting("currency", serde_json::json!("eur")),
+            Err(StoreError::InvalidSetting(_))
+        ));
+        let wrong_type = settings
+            .with_setting("notifyWaiting", serde_json::json!("yes"))
+            .expect_err("a text is not a switch");
+        assert!(
+            wrong_type.to_string().starts_with("notifyWaiting: "),
+            "{wrong_type}"
+        );
+        assert_eq!(
+            settings
+                .with_setting("noSuchSetting", serde_json::json!(true))
+                .expect_err("an unknown key")
+                .to_string(),
+            "unknown setting noSuchSetting"
+        );
     }
 
     /// A file written by 1.1.0 has `usdRate`; it is no longer a setting, so it

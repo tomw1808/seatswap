@@ -635,13 +635,21 @@ pub fn remove_account(store: &Store, key: &str) -> Result<Account, SwitchError> 
     Ok(removed)
 }
 
-/// What [`edit_account`] changed: the account as stored afterwards, and
-/// whether the price differs from what it was. The caller that records this
-/// path's history events writes `PriceChanged` only when `price_changed`.
+/// What [`edit_account`] changed: the account before the edit and as stored
+/// afterwards. The history events of an edit are made from the two by
+/// [`crate::shared::edit_events`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Edited {
+    pub before: Account,
     pub account: Account,
-    pub price_changed: bool,
+}
+
+impl Edited {
+    /// Whether the price or the currency it counts in differs from before.
+    pub fn price_changed(&self) -> bool {
+        self.before.price != self.account.price
+            || self.before.price_currency != self.account.price_currency
+    }
 }
 
 /// Change label, abbreviation, colour, whether auto-burn may use the account,
@@ -692,7 +700,7 @@ pub fn edit_account(
     };
 
     let mut changed = false;
-    let mut price_changed = false;
+    let before = file.accounts[index].clone();
     let account = &mut file.accounts[index];
     if let Some(label) = label {
         if account.label != label {
@@ -724,15 +732,14 @@ pub fn edit_account(
             account.price = price;
             account.price_currency = price_currency;
             changed = true;
-            price_changed = true;
         }
     }
     if changed {
         store.save(&file)?;
     }
     Ok(Edited {
+        before,
         account: file.accounts[index].clone(),
-        price_changed,
     })
 }
 
@@ -1892,14 +1899,14 @@ mod tests {
 
         let first =
             edit_account(&w.store, &w.a_id, None, None, None, None, Some(Some(180.0))).unwrap();
-        assert!(first.price_changed, "None to 180 is a change");
+        assert!(first.price_changed(), "None to 180 is a change");
         assert_eq!(first.account.price_currency.as_deref(), Some("EUR"));
 
         w.set_currency("CHF");
         let same =
             edit_account(&w.store, &w.a_id, None, None, None, None, Some(Some(180.0))).unwrap();
         assert!(
-            same.price_changed,
+            same.price_changed(),
             "the same amount in a new currency is a change: 180 EUR and 180 CHF differ"
         );
         assert_eq!(same.account.price, Some(180.0));
@@ -1908,7 +1915,7 @@ mod tests {
         let again =
             edit_account(&w.store, &w.a_id, None, None, None, None, Some(Some(180.0))).unwrap();
         assert!(
-            !again.price_changed,
+            !again.price_changed(),
             "the same amount in the same currency is not a change"
         );
     }
@@ -1920,20 +1927,23 @@ mod tests {
 
         let first =
             edit_account(&w.store, &w.a_id, None, None, None, None, Some(Some(180.0))).unwrap();
-        assert!(first.price_changed, "None to 180 is a change");
+        assert!(first.price_changed(), "None to 180 is a change");
 
         let same =
             edit_account(&w.store, &w.a_id, None, None, None, None, Some(Some(180.0))).unwrap();
-        assert!(!same.price_changed, "the same price again is not a change");
+        assert!(
+            !same.price_changed(),
+            "the same price again is not a change"
+        );
 
         let changed =
             edit_account(&w.store, &w.a_id, None, None, None, None, Some(Some(200.0))).unwrap();
-        assert!(changed.price_changed, "180 to 200 is a change");
+        assert!(changed.price_changed(), "180 to 200 is a change");
         assert_eq!(changed.account.price, Some(200.0));
 
         let untouched = edit_account(&w.store, &w.a_id, None, None, None, None, None).unwrap();
         assert!(
-            !untouched.price_changed,
+            !untouched.price_changed(),
             "a save that leaves the price alone is not a change"
         );
     }

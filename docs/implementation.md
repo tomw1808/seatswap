@@ -773,6 +773,8 @@ pub enum EventKind {
     AgentCall { command, cwd, allowed },
     Waited { session, project, secs },
     AutoBurn { on, paused_until }, AutoBurnSet { on },
+    AccountLook { account, label, abbr, color, auto_burn },  // absent fields skipped (1.2.0, S-5)
+    SettingSet { key, value: serde_json::Value },              // one shared setting (1.2.0, S-5)
 }
 pub struct Event { pub t: DateTime<Utc>, #[serde(flatten)] pub kind: EventKind }
 #[serde(rename_all = "camelCase")]
@@ -900,8 +902,9 @@ count anywhere is an older answer: the whole answer for that hour is dropped and
 once, through `take_warnings`; the hour updates again when every count is at least the stored one.
 Readers take the **largest line per hour**, over all hosts and among one host's own lines alike, and
 never sum two lines for one hour. An empty or unreadable `buckets` list is the reader's error, which
-the app reports once per text; one bucket that is not on a whole hour, not exactly one hour long, or
-missing a whole number is an error naming the bucket, and no hour is skipped and none becomes 0.
+the app reports once per text; one bucket that is not on a whole hour, not exactly one hour long (the
+running hour, `"partial": true`, ends at the answer's moment within its hour), or missing a whole
+number is an error naming the bucket, and no hour is skipped and none becomes 0.
 
 `HistoryDir::location(app, settings)` is the one rule for the folder and host name; `open` uses it
 and creates the host folder. `first_where`, `finished_windows`, `read_claude` and
@@ -1019,6 +1022,8 @@ impl Scan {
 /// stopped growing and was replaced is not counted again, and the warning says so. Other line
 /// types are skipped quietly. A user line counts only as a real user message whose origin is
 /// absent or "human". An answer counts once per file by message id; "<synthetic>" is skipped.
+/// An answer's model is the line's `requestedModel` when it has one (a gateway such as Ollama
+/// answers `deepseek-v4.1-flash` for `deepseek-v4.1-flash:cloud`), else `message.model`.
 /// The caller's state is not changed; the result carries the state to `commit`.
 pub fn scan(claude: &ClaudePaths, state: &ScanState, budget_bytes: u64)
     -> Result<Scan, TranscriptError>;
@@ -1634,7 +1639,9 @@ The ids are: tied `claude-fable-5-2`, `claude-mythos-5-2`,
 `claude-sonnet-5-5`, `claude-haiku-5-5`; not tied `claude-opus-5-5`, `claude-opus-5`,
 `claude-fable-5-1`, `claude-mythos-5-1`, `claude-fable-5`, `claude-mythos-5`, `claude-sonnet-5`,
 and every id starting with `claude-opus-4`, `claude-sonnet-4`, `claude-haiku-4`, `claude-3`. One
-trailing `[...]` suffix such as `[1m]` is stripped; any other id is tied.
+trailing `[...]` suffix such as `[1m]` is stripped. A model off the Claude plan (`money::is_plan_model`
+false: Harness, Codex, Ollama) is never tied, since a switch does not touch it; any other `claude-` id
+is tied.
 
 ## burn/cost.rs — what a switch costs (step B)
 
@@ -2153,8 +2160,9 @@ autostart entry failed. A refused save leaves the error under its row, and `sett
 error line from `state.errors[field]`, so the next redraw keeps it until that field saves
 successfully; the caller puts the control back to `savedValue(field)`. The worker merges one field
 under the app lock (`merge_setting`): the field must be a key of the settings' camelCase JSON
-object, the value replaces only it, the result is deserialised and validated, and a typed `~` or
-`~/` in `claudeConfigDir` or `historyDir` is expanded with `format::expand_tilde`. `label`, the
+object, the value replaces only it, the result is deserialised and validated
+(`Settings::with_setting`, since 1.2.0 the one way to change a setting by its key), and a typed `~`
+or `~/` in `claudeConfigDir` or `historyDir` is expanded with `format::expand_tilde`. `label`, the
 chip's letters and colour, `autoBurn` and `price` save through `edit_account`; `price` is sent as a
 number, the typed text when it is not a number, `null` to clear it, or left out to keep it.
 
@@ -2195,15 +2203,17 @@ silently, and the next write leaves them out.
 
 `switcher::edit_account` takes the price as `Option<Option<f64>>` (`None` keeps it, `Some(None)`
 clears it, `Some(Some(v))` sets it after `validate_price`) and returns
-`Edited { account, price_changed }`. Under the same app lock and from the same load of
+`Edited { before, account }` (1.2.0; `Edited::price_changed()` compares the two). Under the same app lock and from the same load of
 `accounts.json`, setting a price stores `account.price_currency = settings.currency`; clearing it
 clears the currency too. Setting a price while no currency is set is refused with
 `SwitchError::PriceWithoutCurrency` ("set a currency in Settings → General before a price"), and
 nothing is written. A save of the same amount counts as a change when `price_currency` differs from
 the settings' currency, so a `PriceChanged` with the new currency is recorded. The panel sends
 `price` as JSON: absent, `null`, or a number, because `Option<Option<f64>>` cannot tell absent from
-null over JSON. The worker writes `EventKind::PriceChanged { account, amount, currency }` only when
-`price_changed`, with `currency` taken from `edited.account.price_currency`. `ops::record_plan_change`
+null over JSON. Since 1.2.0 the worker and `seatswap edit` write an edit's events through
+`ops::record_edit`, which writes `shared::edit_events(&edited)`: `AccountLook` with the changed look
+fields and `EventKind::PriceChanged { account, amount, currency }` only when `price_changed()`, with
+`currency` taken from `edited.account.price_currency`. `ops::record_plan_change`
 writes `EventKind::PlanChanged` from a `switcher::PlanChange { account, from, to }` after a switch
 (CLI or app), a live sync or the mirror.
 
@@ -2614,8 +2624,9 @@ to this host's own log only, then returns the new resolution.
 `AccountRow { id, label, abbr, color, email, orgName, plan, price, autoBurn, loginEndsAtMs,
 loginDaysLeft, isActive }`. `save_setting(field, value)` takes the app lock, loads
 `accounts.json`, replaces that one field with `merge_setting`, validates the whole `Settings` and
-writes the file, then writes the one history event of a change (only `AutoBurnSet` for `autoBurn`
-today) and applies the autostart entry; it answers `SavedSetting { settings, warning }`, where an
+writes the file, then writes the history events of a change (`settings_change_events`:
+`AutoBurnSet` for `autoBurn`, and since 1.2.0 a `SettingSet` per changed shared setting) and applies
+the autostart entry; it answers `SavedSetting { settings, warning }`, where an
 autostart failure is `warning` = `settings saved; start at login could not be set: <error>`, not a
 failed save. `remember_settings` puts the reply's merged settings into the snapshot.
 
@@ -2801,8 +2812,13 @@ becomes a `"flash"` agent of that Claude Code session, with its workers below it
 the Claude Code session in the history. A job first seen unlinked is recorded under its own Harness
 id and folder; once it is linked its tokens go under the Claude Code session, and the total recorded
 so far is kept while its session file exists (`transcripts::prune_harness_recorded` drops it only
-when the file is gone). Another top-level Harness session is a row of its own, with the provider
-`DeepSeek Harness` and the status Busy or Idle, named by its `HarnessSession::title` (`LiveSession.title`,
+when the file is gone). An unlinked session's folder is `harness_location`'s: the Claude Code
+session's folder when linked, else `harness::copy_source(cwd, roots)` — a flash worker's copy
+`<base>/<key>/slots/<n>/…` mapped to the known Claude Code folder whose `copy_key` (first 12 hex
+digits of its path's SHA-256, flash-agents' naming) is `<key>`, subfolder kept — else its own folder.
+Another top-level Harness session is a row of its own while `harness::is_open` (a lock holder or a
+last event younger than the quiet time; a flash job only while `is_running`), with the provider
+`DeepSeek Harness` and the status Busy (`is_running`) or Idle, named by its `HarnessSession::title` (`LiveSession.title`,
 which the live report keeps) unless it is a flash job (`harness::is_flash_job`, a `flash-task-` id):
 an unlinked job's row has no title, because its title is a worker's task text; its agents are its
 workers. A worker's title is shown
@@ -4293,7 +4309,9 @@ field is absent or not a number. A failed usage call never fails the reading; th
 
 The same answer's `buckets` become `hours`: one `OllamaHourRecord` per bucket, in the answer's
 order. A bucket that is not an object, starts at something other than a whole UTC hour, does not run
-exactly one hour, or lacks a whole non-negative `request_count`, `input_tokens`,
+exactly one hour (the running hour is the exception: marked `"partial": true`, it ends at the
+answer's moment, after its start and at most one hour later; a `partial` that is not a boolean is an
+error), or lacks a whole non-negative `request_count`, `input_tokens`,
 `cached_input_tokens` or `output_tokens` (and a finite non-negative `usage_usd`) is an error whose
 text names the bucket, never a skipped hour and never a 0. An answer without `buckets` is `Err("the
 usage answer has no buckets")`, and one whose `buckets` is not an array says so. A usage call that
@@ -4620,6 +4638,8 @@ pub fn proc_links(paths: &HarnessPaths, procs: &dyn ProcSource,
 pub fn proc_links_in(sessions: Option<&Path>, procs: &dyn ProcSource,
     claude_pids: &BTreeMap<u32, String>) -> ProcLinks;   // Linux only; default elsewhere
 pub fn is_running(session: &HarnessSession, lock_held: bool, now: DateTime<Utc>) -> bool;
+pub fn is_open(session: &HarnessSession, lock_held: bool, now: DateTime<Utc>) -> bool;
+pub fn copy_source(cwd: &Path, roots: &[&str]) -> Option<String>;
 ```
 
 A session is `<sessions>/<cwd-key>/<id>/session.v4.jsonl.zstd` with an empty `session.lock` beside
@@ -4704,3 +4724,81 @@ the last cost per session in `memory.feed_costs`, because the feed holds only it
 `cost_problem` becomes a warning on every pass while it lasts. A row's own cost is converted once,
 through `money::api_in_currency`, and a converted value that is not finite is not used: the row keeps
 the valuer's API value and the thread names the session.
+
+## shared.rs — account looks and settings shared between hosts (1.2.0, S-5)
+
+Spec §5 "Shared between hosts", decision N5. The history folder is the medium; no second file.
+
+```rust
+// store.rs
+pub const SHARED_SETTINGS: [&str; 8] = ["currency", "notifyOnSwitch", "notifyUsableAgain",
+    "notifyWaiting", "notifyWaitingHosts", "notifyLoginEnds", "statusline", "statuslineFeed"];
+impl Settings {
+    /// One key replaced by its JSON value, checked as a whole: UnknownSetting, SettingValue
+    /// {key, message} (serde's text, shown as "<key>: <message>") or validate()'s error.
+    pub fn with_setting(&self, key: &str, value: serde_json::Value) -> Result<Settings, StoreError>;
+    pub fn value_of(&self, key: &str) -> Result<serde_json::Value, StoreError>;
+}
+pub fn validate_currency(currency: &str) -> Result<(), StoreError>; // now pub
+
+// switcher.rs
+pub struct Edited { pub before: Account, pub account: Account }
+impl Edited { pub fn price_changed(&self) -> bool; } // price or price_currency differ
+
+// shared.rs
+pub struct Stamped<T> { pub value: T, pub at: DateTime<Utc>, pub host: String }
+pub struct SharedPrice { pub amount: Option<f64>, pub currency: Option<String> }
+pub struct SharedLook { pub label, pub abbr, pub color: Option<Stamped<String>>,
+    pub auto_burn: Option<Stamped<bool>>, pub price: Option<Stamped<SharedPrice>> }
+pub struct Shared { pub accounts: BTreeMap<AccountRef, SharedLook>,
+    pub settings: BTreeMap<String, Stamped<serde_json::Value>>, pub warnings: Vec<String> }
+pub struct Applied { pub accounts: Vec<String> /* abbrs */, pub settings: Vec<String> /* keys */,
+    pub warnings: Vec<String> }                    // Applied::changed()
+pub struct Seeded { pub written: usize, pub warnings: Vec<String> }
+pub enum SharedError { History(HistoryError), Store(StoreError), Lock(LockError) }
+
+pub fn edit_events(edited: &Edited) -> Vec<EventKind>;           // AccountLook (changed fields), PriceChanged
+pub fn setting_events(previous: &Settings, next: &Settings) -> Result<Vec<EventKind>, StoreError>;
+pub fn latest(events: &[Hosted<Event>]) -> Shared;
+pub fn apply(store: &Store, shared: &Shared) -> Result<Applied, SharedError>;
+pub fn seed(store: &Store, shared: &Shared, recorder: &Recorder, now: DateTime<Utc>)
+    -> Result<Seeded, SharedError>;
+pub fn sync(store: &Store, recorder: &Recorder, now: DateTime<Utc>) -> Result<Applied, SharedError>;
+```
+
+Lines: `{"t":"…","type":"accountLook","account":{"acc":"…","org":"…"},"label":"Lab","autoBurn":false}`
+(only the changed fields) and `{"t":"…","type":"settingSet","key":"currency","value":"EUR"}`. The
+price is not part of `accountLook`: `priceChanged` stays its one event.
+
+- `latest`: per account and field (label, abbr, color, autoBurn, price from `priceChanged`) and per
+  setting key, the value with the greatest `(t, host)`; the same time and host is the later line. A
+  `settingSet` for a key outside `SHARED_SETTINGS` is left out with a warning naming key and host.
+- `apply`: under the app lock, one load of `accounts.json`; for each local account by
+  `AccountRef::of`: `validate_label`, `validate_color`, the price through `validate_price` and
+  `validate_currency` (a cleared price has no currency); abbreviations are decided together
+  (`validate_abbr` against the abbreviations the other accounts will have; a clash refuses one
+  account at a time until none is left, so a swap applies). Settings through `with_setting`. Every
+  refusal is a warning `account AC (Acme): the shared colour from host vega is not applied: …` or
+  `setting currency: the shared value from host vega is not applied: …`. Writes the file only when
+  something changed, and writes no event.
+- `seed`: for each local account one `AccountLook` with the fields no host shared, a `PriceChanged`
+  for a stored price no host shared, and a `SettingSet` per unshared key whose value differs from
+  `Settings::default()`. A failed append (a status line over 4096 bytes) is a warning.
+- `sync`: `read::<Event>(Range::ALL, Hosts::All)`, `latest`, `seed`, `apply`; warnings in that order.
+
+Who runs it:
+- `gui/worker.rs`: `ActionCommand::Share` runs `ActionRuntime::share()` (`shared::sync`; warnings
+  through `PrintedWarnings`, an error through `ReportedErrors`, `EngineCommand::Publish` when
+  something changed). The engine thread sends it from `run()` at start and from `poll()` when
+  `share_due` says so (`SHARE_EVERY_MIN = 5`, on the existing 30 s tick, no own timer). It runs on
+  the action thread so it never lands between an edit and its event. `save_current` and a switch
+  that saved a new account run `share()` at once. Without a history folder nothing is shared.
+- `cli.rs`: `add`, `next --save` and a `use`/`next` that saved the unsaved login run
+  `share_new_account` (warnings printed, never a failed command); `add` prints the account as stored
+  after it. `seatswap edit` writes `ops::record_edit`.
+- The pages need no command: the snapshot after `Publish` carries the new settings and accounts.
+
+Known limits: an edit made with the CLI at the very moment the tray app applies can be undone until
+the next round (at most 5 minutes later), because the CLI writes its event after its app lock. A
+host that adds an account before another host's events reached it through the sync seeds its own
+look; the newer one wins everywhere.

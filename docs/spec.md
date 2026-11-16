@@ -250,7 +250,9 @@ They use the `keyring` crate, with service `seatswap` and the account `id` as th
 
 **History.** seatswap keeps what it saw and did in a folder of its own: `<data folder>/history` (`historyDir` names another one). Every host writes only into its own subfolder `<host>/`, and only appends, so several hosts can share one synced folder without producing a conflict. `<host>/host.json` holds the id of the machine that writes there; when it names another machine, seatswap refuses to write into that subfolder and says why.
 
-The history has eight kinds of file, one JSON object per line, one file per month and kind: `samples-YYYY-MM.jsonl` (one line per usage answer the tray app receives, per account, when a number or a reset time changed, and at least once an hour while the app runs), `windows-YYYY-MM.jsonl` (a window that ended), `events-YYYY-MM.jsonl` (a switch; a limit crossing 100 %, as `blocked`, `unblocked`, `allBlocked` or `anyUsable`; an `accountAdded` or `accountRemoved` when the CLI or the tray app creates or removes an account; a `loginEnded` or `loginRenewed` when the tray app's poll sees an account's login end or work again; a `planChanged` when the plan label changes; a `priceChanged` when an account's monthly price changes; `live`; an `agentCall`; a wait), `tokens-YYYY-MM.jsonl` (what the sessions used, one line per session, hour and model), `sessions-YYYY-MM.jsonl` (a session's summary when it changes and when it closes, also for a session that is seen in a transcript but no longer runs), `projects-YYYY-MM.jsonl` (the project log: one line per rename, join, unjoin, organization assignment or organization edit, §11.6), `ollama-YYYY-MM.jsonl` (one line per hour of Ollama's own usage, from a successful `/api/usage?range=24h` answer, §7.9), and `up-YYYY-MM.jsonl` (at most one line per 5 minutes while seatswap runs on this host). The CLI writes the account events (`accountAdded`, `accountRemoved`); the tray app's engine writes the login events (`loginEnded`, `loginRenewed`) with the poll's time, and the app writes `planChanged` and `priceChanged` when it stores a login or a price edit changes them.
+The history has eight kinds of file, one JSON object per line, one file per month and kind: `samples-YYYY-MM.jsonl` (one line per usage answer the tray app receives, per account, when a number or a reset time changed, and at least once an hour while the app runs), `windows-YYYY-MM.jsonl` (a window that ended), `events-YYYY-MM.jsonl` (a switch; a limit crossing 100 %, as `blocked`, `unblocked`, `allBlocked` or `anyUsable`; an `accountAdded` or `accountRemoved` when the CLI or the tray app creates or removes an account; a `loginEnded` or `loginRenewed` when the tray app's poll sees an account's login end or work again; a `planChanged` when the plan label changes; a `priceChanged` when an account's monthly price changes; an `accountLook` when an account's label, abbreviation, colour or "Auto-burn may use it" is edited; a `settingSet` when a shared setting is saved; `live`; an `agentCall`; a wait), `tokens-YYYY-MM.jsonl` (what the sessions used, one line per session, hour and model), `sessions-YYYY-MM.jsonl` (a session's summary when it changes and when it closes, also for a session that is seen in a transcript but no longer runs), `projects-YYYY-MM.jsonl` (the project log: one line per rename, join, unjoin, organization assignment or organization edit, §11.6), `ollama-YYYY-MM.jsonl` (one line per hour of Ollama's own usage, from a successful `/api/usage?range=24h` answer, §7.9), and `up-YYYY-MM.jsonl` (at most one line per 5 minutes while seatswap runs on this host). The CLI writes the account events (`accountAdded`, `accountRemoved`); the tray app's engine writes the login events (`loginEnded`, `loginRenewed`) with the poll's time, and the app writes `planChanged` and `priceChanged` when it stores a login or a price edit changes them. The tray app and `seatswap edit` write `accountLook`, and a settings save `settingSet` (below).
+
+**Shared between hosts.** Hosts that share one history folder also share each account's look and price and some settings; logins never travel. Per account, named by `acc` and `org`: `label`, `abbr`, `color`, `autoBurn` ("Auto-burn may use it") and the monthly price. Of the settings (§10): `currency`, `notifyOnSwitch`, `notifyUsableAgain`, `notifyWaiting`, `notifyWaitingHosts`, `notifyLoginEnds`, `statusline` and `statuslineFeed`; every other setting, the logins and the account list stay on their host. An edit writes only what it changed: `{"t":"…","type":"accountLook","account":{"acc":"…","org":"…"},"label":"Lab","autoBurn":false}` with only the changed fields, `{"t":"…","type":"settingSet","key":"currency","value":"EUR"}` with the value as the settings file holds it, and the price as the `priceChanged` it already was. Each field and each setting takes its newest value over all hosts: the latest event time, and on the same time the later host name in sort order, so every host decides the same (the last edit wins). The tray app takes them at start and then every 5 minutes; a value another host wrote passes this host's own checks first (label, abbreviation against this host's other accounts, colour, price, the setting's rule), and one that fails is not applied and is named in a warning with the host that wrote it. At start the tray app also writes this host's value of every account field and every setting no host has written yet, except a setting still at its default, so a fresh host never overrides a set-up one. An account appears on a host only after its login there; a login of an account the history knows takes its shared look and price at once. A status line too long for one history line (4096 bytes) is not shared, and the app says so. A host on an older version skips the two new lines with a warning.
 
 **A window's `reset` and `from`.** One rule, `history::is_early_reset`, decides a reset: the percent
 is at least 1 point below the previous poll reading of the same account, limit and model, and the new
@@ -486,7 +488,7 @@ no modes and no tuning settings: every threshold is a constant in the code (see 
   equal), and among the candidates the account that produced more of the thinking the running
   sessions still hold wins; with none, or with equal counts, the usual order decides: slack, weekly
   reset, account id. The count is per minute: for every running session on a model whose thinking is
-  tied to the account (§2.11), each answer with thinking since the user's last message adds one to
+  tied to the account (§7.4.2), each answer with thinking since the user's last message adds one to
   the minute of its start, and that minute belongs to the account that was live on this host then,
   as the switch history says. A minute without a known account is left out. It needs learned rates
   (without a slack there is nothing to compare), `readSessions` on, and the sessions thread's list of
@@ -532,7 +534,8 @@ regime's words are `learning`, `no switch measured yet`, `switching before 100 %
 #### 7.4.2 Quiet moments
 
 A switch makes a running session send its conversation again, and on some models it continues
-without its earlier thinking (`thinking_tied` in `docs/implementation.md`). S2 therefore waits
+without its earlier thinking (`thinking_tied` in `docs/implementation.md`); a model off the Claude
+plan (Harness, Codex, Ollama) is never tied, since a switch does not touch it. S2 therefore waits
 while sessions on such a model are busy: the decision is a *waiting switch* to the target, with the
 latest time at which the rhythm's work from now reaches the target's slack (the end of the 7-day
 horizon when it never does). The pop-up
@@ -975,17 +978,17 @@ They give real click handling and exact placement on those desktops. They're not
 
 | Setting | Default | |
 |---|---|---|
-| `abbr`, `label`, `color`, `autoBurn` per account | from the account | `autoBurn`: auto-burn may use this account, §7.4.4 |
+| `abbr`, `label`, `color`, `autoBurn` per account | from the account | **shared**. `autoBurn`: auto-burn may use this account, §7.4.4 |
 | `trayText` | `percent` | `percent` · `percent+reset` · `off` |
 | `iconLimit` | `binding` | which limit the ring shows: `binding` · `session` · `week` |
 | `pollActive` / `pollInactive` | 120 s / 900 s | |
 | `autoBurn` | off | auto-burn switches by itself, §7.4 |
 | `suggestSwitches` | on | when auto-burn is off, say what it would do, §7.4 |
-| `statuslineFeed` | on | `seatswap statusline` writes the live numbers to `feed.json`, §7.6 |
-| `statusline` | "My current line" | the status line layout: `left`, `right`, `margin`, §7.6 |
+| `statuslineFeed` | on | **shared**. `seatswap statusline` writes the live numbers to `feed.json`, §7.6 |
+| `statusline` | "My current line" | **shared**. The status line layout: `left`, `right`, `margin`, §7.6 |
 | `statuslineInstall` | none | `null`, or `{ "installed": <value>, "previous": <value> }`: the exact `statusLine` seatswap last wrote in Claude Code's `settings.json` and the exact value the file had before its first install. `previous` absent means the file had no key; a present `null` is the value `null`. Written by *Use in Claude Code* and cleared by *Restore previous* (§11.4) |
 | `statuslineRecordUntil` | none | `null` or a time: while it is in the future, `seatswap statusline` records the payload's key paths and JSON types to `<data folder>/statusline-keys.json`. *Record for a minute* sets it to one minute from now (1 to 60 minutes are accepted), §11.4 |
-| `notifyOnSwitch` | on | |
+| `notifyOnSwitch` | on | **shared** |
 | `mirrorLive` | on | §6.4 |
 | `refreshInactive` | on | refresh the logins of inactive accounts (§6.3). Off: inactive accounts show their last known usage with its age |
 | `hotkey` | Ctrl+Alt+C | Linux v1: not used; bind `seatswap panel` in the desktop instead (§8.3) |
@@ -995,13 +998,13 @@ They give real click handling and exact placement on those desktops. They're not
 | `historyDir` | `null` (`<data folder>/history`) | text, an absolute folder; point it at a synced folder to share the history with other hosts |
 | `hostName` | `null` (the machine's host name) | text, 1–63 characters of `A–Z a–z 0–9 . _ -` that must start with a letter or a digit, stored in lower case; the name this host writes its history under |
 | `readSessions` | on | read the session files and transcripts of Claude Code, DeepSeek Harness and flash agents, and Codex's rollout files and thread names (`session_index.jsonl`): model, busy or idle, waits, tokens per folder, agents and their thinking. The Sessions area needs it; turning it on takes effect after a restart. A session's title is read from its `ai-title` lines and stored in the history; message text and worker task texts are never stored |
-| `notifyUsableAgain` | on | the "usable again" notification (§7.5) |
-| `notifyWaiting` | on | the "waiting for you" notification (§7.5); a click opens the Sessions area at that session |
-| `notifyWaitingHosts` | `thisHost` | `thisHost` · `allHosts`: whose waiting sessions notify. Other hosts report through the shared history folder, so their notifications come with the delay of the sync (§4.1, §11.4) |
-| `notifyLoginEnds` | on | the login warnings at 5 days, 1 day and when a login ended (§7.5). `bool`; Settings → Notifications, "A login ends" |
-| `currency` | none | `null` or three capital letters (`"EUR"`); `Option<String>`; the currency every amount is shown in. Until it is set, amounts in money stay missing (§11.5). Settings → General, section Money, "Currency" |
+| `notifyUsableAgain` | on | **shared**. The "usable again" notification (§7.5) |
+| `notifyWaiting` | on | **shared**. The "waiting for you" notification (§7.5); a click opens the Sessions area at that session |
+| `notifyWaitingHosts` | `thisHost` | **shared**. `thisHost` · `allHosts`: whose waiting sessions notify. Other hosts report through the shared history folder, so their notifications come with the delay of the sync (§4.1, §11.4) |
+| `notifyLoginEnds` | on | **shared**. The login warnings at 5 days, 1 day and when a login ended (§7.5). `bool`; Settings → Notifications, "A login ends" |
+| `currency` | none | **shared**. `null` or three capital letters (`"EUR"`); `Option<String>`; the currency every amount is shown in. Until it is set, amounts in money stay missing (§11.5). Settings → General, section Money, "Currency" |
 | `lookUpPrices` | on | `bool`; whether seatswap may ask models.dev for API prices and Frankfurter for the dollar rate (§11.5). Off, neither host is contacted and `prices --refresh` refuses; stored values stay and API values are shown in USD. Settings → General, Money, "Look up prices and the dollar rate" |
-| `price` per account | none | `null` or a number above 0: what the subscription costs per month, in `priceCurrency`; `Option<f64>`. Without one the account is left out of every sum in money and the page says so (§11.5). Settings → Accounts, column "Price / month" |
+| `price` per account | none | **shared** (as `priceCurrency` with it). `null` or a number above 0: what the subscription costs per month, in `priceCurrency`; `Option<f64>`. Without one the account is left out of every sum in money and the page says so (§11.5). Settings → Accounts, column "Price / month" |
 | `priceCurrency` per account | none | `null` or three capital letters: the `currency` in effect when `price` was entered. A price counts only in that currency; a price entered before a currency was set has `null` and does not count (§11.5). Settings → Accounts, the price cell |
 | `plan` per account | from the login | read-only `Option<String>`: the identity's `planDisplayName`, else the capitalised `subscriptionType` with its level from `rateLimitTier` ("Team 5x"; a tier seatswap cannot read as a multiplier in parentheses, "Team (team_premium)"). Shown in the pop-up, Settings → Accounts and `seatswap list` |
 | `agentsRead` | on | agents may run `list`, `status`, `burn plan`, `burn simulate`, `prices` and `history export` (§6.6, §7.7) |
@@ -1013,6 +1016,11 @@ They give real click handling and exact placement on those desktops. They're not
 
 Every setting above is edited in the large window's Settings area (§11.4); the last column names the
 group and the row. The pop-up has no settings view any more (§11.3).
+
+A setting marked **shared** travels to the other hosts through the history folder and takes the
+newest value any host saved (§5, "Shared between hosts"); `store::SHARED_SETTINGS` is the one list of
+the shared settings. Every other setting stays on its host. The per-account values are shared by the
+account's `acc` and `org`, never with its login.
 
 The former `suggestAt` and `suggestTargetBelow` (the fixed 90 % / 50 % suggestion) are gone. An
 older `accounts.json` that still has them loads: unknown keys are ignored, and the two settings
@@ -1180,7 +1188,10 @@ a snapshot ticks.
   marked and using its base price, and a Show/Hide control. Nothing in the list can be edited or
   added.
 - **History and hosts.** This host's name and its history folder; every host folder with its last
-  record, its first record and its size; export and import. A changed host name or folder takes
+  record, its first record and its size; export and import. A note says what the folder shares with
+  the other hosts: each account's label, abbreviation, colour, price and whether auto-burn may use
+  it, and the currency, the notifications and the status line; the last edit wins, and logins are
+  never shared (§5). Another host's edit shows on the open page when it arrives, without a restart. A changed host name or folder takes
   effect after a restart, and the row says so when the saved value differs from the one in effect.
   Export writes CSV or JSON to a file the person names (an existing file is refused); import copies
   another history folder's host folders in by hand and never writes this host's own folder or a
@@ -1209,7 +1220,7 @@ restart, and with it off the area says so. Every row names its provider: `Claude
 - Agents running, and how many completed today.
 - The total of exactly the sessions in the view: their tokens, subscription value and API value; the
   last hour's tokens with the last hour's subscription and API value.
-- The sessions whose thinking is tied to the account (§2.11), and how many of them are busy.
+- The sessions whose thinking is tied to the account (§7.4.2), and how many of them are busy.
 - The account in use, with its week; its name wraps inside its box instead of being cut.
 
 **The tree.** Two orders, switched at the top and remembered: by project → provider and model →
@@ -1267,7 +1278,13 @@ nothing jumps when it closes.
   younger than 30 minutes. Only a running rollout becomes a row. A `token_count` line without an
   `info` key is a warning; `info: null` is Codex's normal early line.
 - **DeepSeek Harness.** A job first seen unlinked is its own `DeepSeek Harness` session under its
-  Harness id and folder. Once it is linked to a Claude Code session — through the running process
+  Harness id and folder. A flash worker's folder is a copy, `<base>/<key>/slots/<n>`, which
+  flash-agents names by the first 12 hex digits of the SHA-256 of the folder it copied: an unlinked
+  job takes the folder of a known Claude Code session whose key matches (with the copy's subfolder),
+  else the copy's own folder. An unlinked session is a row while it is open — a process holds its
+  lock or its last event is younger than 30 minutes — Busy during a turn, Idle between turns; a
+  flash job does one task, so it is done once its turn ended and leaves the list (its tokens stay
+  in the history). Once it is linked to a Claude Code session — through the running process
   tree on Linux, or once its result is in a transcript — its later tokens go under that session. On
   Windows the transcript is the only link, so a running job appears once its result is collected. A
   recorded Harness total is kept while its session file exists, so a resumed old job is never counted
@@ -1278,7 +1295,7 @@ nothing jumps when it closes.
   providers keeps one total per provider in the tree and one entry in this card. A tied model carries
   the `tied` bubble, and the card's legend shows the bubble rather than a dot.
 - *If you switched now*: how many sessions would work without their earlier thinking, how many of
-  those are busy, how many would send their conversation again and how many pay nothing (§2.11),
+  those are busy, how many would send their conversation again and how many pay nothing (§7.4.2),
   with a Switch… button that opens the pop-up. Only Claude Code rows on a Claude plan model count
   (`money::is_plan_model`: the model id starts with `claude-`), or with no model known yet; Codex,
   Harness, flash and other models are left out.

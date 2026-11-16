@@ -23,9 +23,54 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::paths::PathsError;
 use crate::transcripts::{ClosedJob, SessionSeen, Tokens};
+
+/// The folder a flash worker's copy was made from, for a session whose
+/// Claude Code session is not known.
+///
+/// flash-agents (seen with 0.1.13) keeps a repository's worker copies under
+/// `<base>/<key>/slots/<n>`, where `<key>` is the first 12 hex digits of the
+/// SHA-256 of the folder its server was started in. `roots` are the folders
+/// that may have been copied (the known Claude Code sessions' folders); the
+/// one whose key matches is the source, with the copy's own subfolder kept.
+/// `None` when `cwd` lies in no such copy or no root matches: the caller then
+/// keeps the copy's folder, never a guessed one.
+pub fn copy_source(cwd: &Path, roots: &[&str]) -> Option<String> {
+    let parts: Vec<&std::ffi::OsStr> = cwd
+        .components()
+        .map(|component| component.as_os_str())
+        .collect();
+    let at = parts.windows(3).position(|window| {
+        let (key, slots, slot) = (window[0].to_str(), window[1], window[2].to_str());
+        key.is_some_and(|key| {
+            key.len() == 12
+                && key
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        }) && slots == "slots"
+            && slot.is_some_and(|slot| !slot.is_empty() && slot.bytes().all(|b| b.is_ascii_digit()))
+    })?;
+    let key = parts[at].to_str()?;
+    let root = roots.iter().find(|root| copy_key(root) == key)?;
+    let mut source = PathBuf::from(root);
+    for part in &parts[at + 3..] {
+        source.push(part);
+    }
+    source.into_os_string().into_string().ok()
+}
+
+/// The key flash-agents names a folder's worker copies by: the first 12 hex
+/// digits of the SHA-256 of the folder's path.
+fn copy_key(root: &str) -> String {
+    Sha256::digest(root.as_bytes())
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 /// Whether a Harness session id is a flash job's (`flash-task-<uuid>`); a
 /// worker's id is a plain UUID.
@@ -773,9 +818,23 @@ pub fn proc_links_in(
 /// quiet for longer and has no lock holder is a cancelled or killed job, shown
 /// as done.
 pub fn is_running(session: &HarnessSession, lock_held: bool, now: DateTime<Utc>) -> bool {
-    !session.finished
-        && (lock_held
-            || now.signed_duration_since(session.last) < Duration::minutes(HARNESS_QUIET_MINUTES))
+    !session.finished && is_alive(session, lock_held, now)
+}
+
+/// Whether a Harness session's process is still there: a process holds its
+/// lock, or its last event is less than [`HARNESS_QUIET_MINUTES`] old. A
+/// session of its own between two turns (waiting for its user) is open; a
+/// flash job does one task, so once its turn ended it is done.
+pub fn is_open(session: &HarnessSession, lock_held: bool, now: DateTime<Utc>) -> bool {
+    if is_flash_job(&session.id) {
+        is_running(session, lock_held, now)
+    } else {
+        is_alive(session, lock_held, now)
+    }
+}
+
+fn is_alive(session: &HarnessSession, lock_held: bool, now: DateTime<Utc>) -> bool {
+    lock_held || now.signed_duration_since(session.last) < Duration::minutes(HARNESS_QUIET_MINUTES)
 }
 
 /// The Harness session id of `<sessions>/<key>/<id>/session.lock`, if this is
@@ -826,6 +885,49 @@ mod tests {
     const KEY: &str = "--home-sam-fm-23490eb0ea8f-slots-10--";
     const CWD: &str = "/home/sam/fm/23490eb0ea8f/slots/10";
     const MODEL: &str = "deepseek-v4.1-flash:cloud";
+
+    /// flash-agents names a folder's worker copies by the first 12 hex digits
+    /// of the SHA-256 of its path (seen with 0.1.13: `~/projects/seatswap` →
+    /// `6228ea01ce3f`); a copy's subfolder is kept, and a copy of a folder no
+    /// root names, or a path that is no copy, gives none.
+    #[test]
+    fn a_worker_copy_names_the_folder_it_was_copied_from() {
+        assert_eq!(copy_key("/home/sam/projects/atlas"), "8279d42859b9");
+        let roots = ["/home/sam/projects/ledger", "/home/sam/projects/atlas"];
+
+        assert_eq!(
+            copy_source(Path::new("/home/sam/fm/8279d42859b9/slots/10"), &roots).as_deref(),
+            Some("/home/sam/projects/atlas")
+        );
+        assert_eq!(
+            copy_source(
+                Path::new("/home/sam/fm/8279d42859b9/slots/3/crates/core"),
+                &roots
+            )
+            .map(PathBuf::from),
+            Some(
+                PathBuf::from("/home/sam/projects/atlas")
+                    .join("crates")
+                    .join("core")
+            ),
+            "the copy's subfolder is kept"
+        );
+        assert_eq!(
+            copy_source(Path::new(CWD), &roots),
+            None,
+            "no root has that key"
+        );
+        assert_eq!(
+            copy_source(Path::new("/home/sam/projects/atlas"), &roots),
+            None,
+            "not a copy"
+        );
+        assert_eq!(
+            copy_source(Path::new("/home/sam/fm/8279d42859b9/slot/10"), &roots),
+            None,
+            "not the copies' layout"
+        );
+    }
 
     fn store() -> (TempDir, HarnessPaths) {
         let tmp = tempfile::tempdir().expect("tempdir");

@@ -25,6 +25,7 @@ use seatswap_core::history::{
 };
 use seatswap_core::money::{self, Prices};
 use seatswap_core::paths::{self, AppPaths, ClaudePaths, PathsError};
+use seatswap_core::shared;
 use seatswap_core::store::{self, Account, AccountsFile, LoginState, Settings, Store, StoreError};
 use seatswap_core::switcher::{self, LiveState, SwitchError, UnsavedPolicy};
 
@@ -1041,10 +1042,14 @@ fn record_cli_switch(
             .map(AccountRef::of);
         let saved_new = outcome.saved_new.as_deref().and_then(|id| file.find(id));
         let recorder = ops::open_history(context.store.app_paths(), &context.settings)?;
+        let added = saved_new.is_some();
         ops::record_switch(&recorder, from, to, saved_new, by, None, cwd, None, at)
             .map_err(|error| error.to_string())?;
         if let Some(change) = &outcome.plan_change {
             ops::record_plan_change(&recorder, change, at).map_err(|error| error.to_string())?;
+        }
+        if added {
+            share_new_account(context, &recorder);
         }
         Ok(())
     })();
@@ -1101,6 +1106,9 @@ fn next_account(
                 if let Some(error) = history_error {
                     warn(&error);
                 }
+                if let Some(recorder) = &recorder {
+                    share_new_account(&context, recorder);
+                }
                 file = context.store.load()?;
                 live = switcher::live_state(&context.claude, &file)?;
             }
@@ -1117,6 +1125,21 @@ fn next_account(
     let line = switch_line(&context.store, &outcome.to);
     record_cli_switch(&context, &outcome, by, cwd, now);
     Ok(line)
+}
+
+/// After a login was saved as an account: a login of an account the other
+/// hosts know takes its shared look and price at once (spec §5,
+/// [`shared::sync`]). What cannot be shared or applied is a warning, never a
+/// failed command.
+fn share_new_account(context: &Context, recorder: &Recorder) {
+    match shared::sync(&context.store, recorder, Utc::now()) {
+        Ok(applied) => {
+            for warning in &applied.warnings {
+                warn(warning);
+            }
+        }
+        Err(error) => warn(&error.to_string()),
+    }
 }
 
 /// The CLI's history recorder, or `None` with the reason printed once. The
@@ -1141,10 +1164,26 @@ fn add(context: Context, label: Option<String>) -> Result<(), CliError> {
         Utc::now(),
     )
     .map_err(CliError::Message)?;
-    println!("Saved {} — {}", account.abbr, account.label);
     if let Some(error) = history_error {
         warn(&error);
     }
+    // A known account's shared look replaces the one just picked, so the line
+    // names the account as it is stored now.
+    let account = match &recorder {
+        Some(recorder) => {
+            share_new_account(&context, recorder);
+            context
+                .store
+                .load()?
+                .find(&account.id)
+                .cloned()
+                .ok_or_else(|| {
+                    CliError::Message(format!("the store has no account {}", account.id))
+                })?
+        }
+        None => account,
+    };
+    println!("Saved {} — {}", account.abbr, account.label);
     Ok(())
 }
 
@@ -1207,6 +1246,11 @@ fn edit(
         None,
     )?;
     println!("Updated {} — {}", edited.account.abbr, edited.account.label);
+    // The edit is done; the other hosts take it from the history (spec §5).
+    let recorder = cli_history(&context);
+    if let Some(error) = ops::record_edit(recorder.as_ref(), &edited, Utc::now()) {
+        warn(&error);
+    }
     Ok(())
 }
 
@@ -3462,6 +3506,90 @@ pub(crate) mod tests {
                 .count(),
             1,
             "{events:?}"
+        );
+    }
+
+    /// `seatswap edit` writes the same events as the tray app's edit, through
+    /// the one function `ops::record_edit`: `accountLook` with only the
+    /// changed fields (spec §5).
+    #[test]
+    fn edit_writes_account_look_with_only_the_changed_fields() {
+        let fixture = Fixture::new();
+        fixture.add_account(0);
+
+        fixture
+            .run(
+                Command::Edit {
+                    key: "AC".to_string(),
+                    label: Some("Acme Lab".to_string()),
+                    abbr: Some("ac".to_string()),
+                    color: None,
+                },
+                Caller::Person,
+            )
+            .expect("the account is edited");
+
+        let events = fixture.events();
+        let looks: Vec<&Value> = events
+            .iter()
+            .filter(|event| event["type"] == json!("accountLook"))
+            .collect();
+        assert_eq!(looks.len(), 1, "{events:?}");
+        let mut look = looks[0].clone();
+        look.as_object_mut().expect("an object").remove("t");
+        assert_eq!(
+            look,
+            json!({"type": "accountLook",
+                   "account": {"acc": FIRST_ACCOUNT_UUID, "org": FIRST_ORG_UUID},
+                   "label": "Acme Lab"}),
+            "the same abbreviation is no change"
+        );
+    }
+
+    /// A login of an account another host already named takes that host's
+    /// look and price when it is added here (spec §5).
+    #[test]
+    fn add_of_a_known_account_takes_its_shared_look_and_price() {
+        let fixture = Fixture::new();
+        let vega = fixture.data_dir.join("history").join("vega");
+        fs::create_dir_all(&vega).expect("vega's folder");
+        fs::write(vega.join("host.json"), r#"{"machineId":"made-up"}"#).expect("marker");
+        let account = json!({"acc": FIRST_ACCOUNT_UUID, "org": FIRST_ORG_UUID});
+        fs::write(
+            vega.join("events-2026-11.jsonl"),
+            format!(
+                "{}\n{}\n",
+                json!({"t": "2026-11-15T10:00:00Z", "type": "accountLook", "account": account,
+                       "label": "Lumen Bay", "abbr": "LB", "color": "#10b981", "autoBurn": false}),
+                json!({"t": "2026-11-15T10:01:00Z", "type": "priceChanged", "account": account,
+                       "amount": 180.0, "currency": "EUR"}),
+            ),
+        )
+        .expect("vega's events");
+
+        fixture
+            .run(Command::Add { label: None }, Caller::Person)
+            .expect("the live login is saved");
+
+        let file = fixture.store().load().expect("accounts");
+        let stored = &file.accounts[0];
+        assert_eq!(
+            (
+                stored.label.as_str(),
+                stored.abbr.as_str(),
+                stored.color.as_str()
+            ),
+            ("Lumen Bay", "LB", "#10b981")
+        );
+        assert!(!stored.auto_burn);
+        assert_eq!(stored.price, Some(180.0));
+        assert_eq!(stored.price_currency.as_deref(), Some("EUR"));
+        assert!(
+            fixture
+                .events()
+                .iter()
+                .all(|event| event["type"] != json!("accountLook")),
+            "every field is shared already, so this host seeds none"
         );
     }
 

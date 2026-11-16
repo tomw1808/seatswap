@@ -2789,6 +2789,15 @@ function historyCard() {
       " a login copied to another host would log this one out.",
     ])
   );
+  body.appendChild(
+    note([
+      h("b", { text: "Shared with your other hosts through this folder:" }),
+      " each account's label, abbreviation, colour, price and whether auto-burn may use it," +
+        " and the currency, the notifications and the status line. The last edit wins." +
+        " An account appears on a host only after you log in to it there; it then takes" +
+        " these from the other hosts. Logins are never shared.",
+    ])
+  );
 
   body.appendChild(section("Export and import"));
   body.appendChild(exportRow());

@@ -636,6 +636,13 @@ pub fn harness_rows(
         tokens: Vec::new(),
         recorded: recorded.clone(),
     };
+    // The folders a flash worker's copy may have been made from.
+    let roots: Vec<&str> = claude_cwd
+        .values()
+        .map(String::as_str)
+        .collect::<BTreeSet<&str>>()
+        .into_iter()
+        .collect();
     for (root_id, mut component) in components {
         component.sort_by(|a, b| a.created.cmp(&b.created).then_with(|| a.id.cmp(&b.id)));
         let root = by_id[root_id];
@@ -654,6 +661,7 @@ pub fn harness_rows(
                     let Some((cwd, project)) = harness_location(
                         session,
                         claude_cwd.as_deref(),
+                        &roots,
                         project_of,
                         &mut out.rows.warnings,
                     ) else {
@@ -684,90 +692,20 @@ pub fn harness_rows(
                 }
             }
             None => {
-                let cwd = match root.cwd.to_str() {
-                    Some(cwd) => cwd.to_string(),
-                    None => {
-                        out.rows.warnings.push(format!(
-                            "Harness session {} has a folder that is not text; it is not shown",
-                            root.id
-                        ));
-                        continue;
-                    }
+                let Some((cwd, project)) =
+                    harness_location(root, None, &roots, project_of, &mut out.rows.warnings)
+                else {
+                    continue;
                 };
-                let project = project_of(&cwd);
-                let id = ProjectId::of(&project, host);
-                let (project_id, project_name, org) = named_project(projects, &id);
-                let mut agents = Vec::new();
-                for session in component.iter().filter(|session| session.id != root_id) {
-                    let is_running = harness::is_running(session, locks.contains(&session.id), now);
-                    let agent = harness_agent(
-                        session,
-                        session.parent.clone(),
-                        None,
-                        is_running,
-                        &cwd,
-                        &project,
-                        pricing,
-                        host,
+                // A tree without its Claude Code session is a row only while
+                // it is open, as a Codex row: a flash job whose task ended is
+                // done, not idle. Its tokens are recorded either way.
+                if harness::is_open(root, locks.contains(&root.id), now) {
+                    let row = harness_row(
+                        root, &component, &cwd, &project, projects, pricing, host, locks, now,
                     );
-                    agents.push(agent);
+                    out.rows.sessions.push(row);
                 }
-                let values = harness_values(root, &cwd, &project, pricing, host);
-                // The last hour of a Harness row is known from its answers'
-                // times, never a silent 0 (S-3): the messages inside the window,
-                // valued like the row's tokens at the newest of them, or at the
-                // row's last event when the window holds none (a known 0).
-                let (last_hour, last_hour_at) = harness_last_hour(root, now);
-                let last_hour_values = harness_values_at(
-                    root,
-                    last_hour,
-                    last_hour_at.unwrap_or(root.last),
-                    &cwd,
-                    &project,
-                    pricing,
-                    host,
-                );
-                let root_running = harness::is_running(root, locks.contains(&root.id), now);
-                let mut row = LiveSession {
-                    session: root.id.clone(),
-                    host: host.to_string(),
-                    label: session_label(&project_name, &root.id),
-                    // A Harness session that is its own row is named by its
-                    // last `session/title`, as a Claude Code row by its
-                    // `ai-title`. A flash job's title is a worker's task text:
-                    // it never names a row and never reaches the report.
-                    title: if harness::is_flash_job(&root.id) {
-                        None
-                    } else {
-                        root.title.clone()
-                    },
-                    project_id,
-                    project: project_name,
-                    org,
-                    cwd: cwd.clone(),
-                    provider: HARNESS_PROVIDER.to_string(),
-                    model: root.model.clone(),
-                    tied: root.model.as_deref().map(thinking_tied).unwrap_or(false),
-                    status: if root_running {
-                        LiveStatus::Busy
-                    } else {
-                        LiveStatus::Idle
-                    },
-                    since: root.last,
-                    started: root.created,
-                    agents_running: 0,
-                    agents_done: 0,
-                    agents: Vec::new(),
-                    tokens: root.tokens,
-                    last_hour: Some(last_hour),
-                    last_hour_values,
-                    agents_done_values: Values::sum(&[]),
-                    values,
-                };
-                // A row of its own counts its workers too, not only the root
-                // session: the one function that adds a worker into a row.
-                add_agents(&mut row, agents);
-                out.rows.sessions.push(row);
                 for session in component {
                     harness_token_line(
                         session,
@@ -785,6 +723,94 @@ pub fn harness_rows(
     out.tokens
         .sort_by(|a, b| a.session.cmp(&b.session).then_with(|| a.t.cmp(&b.t)));
     out
+}
+
+/// The row of a running Harness tree whose Claude Code session is not known:
+/// the root session with its workers as agents.
+#[allow(clippy::too_many_arguments)]
+fn harness_row(
+    root: &HarnessSession,
+    component: &[&HarnessSession],
+    cwd: &str,
+    project: &ProjectKey,
+    projects: Option<&Projects>,
+    pricing: &Pricing,
+    host: &str,
+    locks: &BTreeSet<String>,
+    now: DateTime<Utc>,
+) -> LiveSession {
+    let id = ProjectId::of(project, host);
+    let (project_id, project_name, org) = named_project(projects, &id);
+    let mut agents = Vec::new();
+    for session in component.iter().filter(|session| session.id != root.id) {
+        let is_running = harness::is_running(session, locks.contains(&session.id), now);
+        let agent = harness_agent(
+            session,
+            session.parent.clone(),
+            None,
+            is_running,
+            cwd,
+            project,
+            pricing,
+            host,
+        );
+        agents.push(agent);
+    }
+    let values = harness_values(root, cwd, project, pricing, host);
+    // The last hour of a Harness row is known from its answers'
+    // times, never a silent 0 (S-3): the messages inside the window,
+    // valued like the row's tokens at the newest of them, or at the
+    // row's last event when the window holds none (a known 0).
+    let (last_hour, last_hour_at) = harness_last_hour(root, now);
+    let last_hour_values = harness_values_at(
+        root,
+        last_hour,
+        last_hour_at.unwrap_or(root.last),
+        cwd,
+        project,
+        pricing,
+        host,
+    );
+    let mut row = LiveSession {
+        session: root.id.clone(),
+        host: host.to_string(),
+        label: session_label(&project_name, &root.id),
+        // A Harness session that is its own row is named by its
+        // last `session/title`, as a Claude Code row by its
+        // `ai-title`. A flash job's title is a worker's task text:
+        // it never names a row and never reaches the report.
+        title: if harness::is_flash_job(&root.id) {
+            None
+        } else {
+            root.title.clone()
+        },
+        project_id,
+        project: project_name,
+        org,
+        cwd: cwd.to_string(),
+        provider: HARNESS_PROVIDER.to_string(),
+        model: root.model.clone(),
+        tied: root.model.as_deref().map(thinking_tied).unwrap_or(false),
+        status: if harness::is_running(root, locks.contains(&root.id), now) {
+            LiveStatus::Busy
+        } else {
+            LiveStatus::Idle
+        },
+        since: root.last,
+        started: root.created,
+        agents_running: 0,
+        agents_done: 0,
+        agents: Vec::new(),
+        tokens: root.tokens,
+        last_hour: Some(last_hour),
+        last_hour_values,
+        agents_done_values: Values::sum(&[]),
+        values,
+    };
+    // A row of its own counts its workers too, not only the root
+    // session: the one function that adds a worker into a row.
+    add_agents(&mut row, agents);
+    row
 }
 
 /// The top known ancestor of a session: a parent that is not in the slice stops
@@ -915,23 +941,31 @@ pub fn take_provider_cost(
 fn harness_location(
     session: &HarnessSession,
     claude_cwd: Option<&str>,
+    roots: &[&str],
     project_of: &dyn Fn(&str) -> ProjectKey,
     warnings: &mut Vec<String>,
 ) -> Option<(String, ProjectKey)> {
     let cwd = match claude_cwd {
-        Some(cwd) => cwd,
-        None => match session.cwd.to_str() {
-            Some(cwd) => cwd,
-            None => {
-                warnings.push(format!(
-                    "Harness session {} has a folder that is not text; it is not shown",
-                    session.id
-                ));
-                return None;
-            }
+        Some(cwd) => cwd.to_string(),
+        // Without its Claude Code session, a flash worker's copy names the
+        // folder it was copied from (`harness::copy_source`); any other
+        // session keeps its own folder.
+        None => match harness::copy_source(&session.cwd, roots) {
+            Some(source) => source,
+            None => match session.cwd.to_str() {
+                Some(cwd) => cwd.to_string(),
+                None => {
+                    warnings.push(format!(
+                        "Harness session {} has a folder that is not text; it is not shown",
+                        session.id
+                    ));
+                    return None;
+                }
+            },
         },
     };
-    Some((cwd.to_string(), project_of(cwd)))
+    let project = project_of(&cwd);
+    Some((cwd, project))
 }
 
 /// One Harness session as a live agent; `kind` is `"flash"` for a linked job.
@@ -3993,6 +4027,7 @@ mod tests {
 
     const JOB_A: &str = "flash-task-5c974a53-178a-4254-93b2-b804a111414a";
     const JOB_B: &str = "flash-task-8d2f0e7c-6b1a-4c3d-9e0f-1a2b3c4d5e6f";
+    const OWN_SESSION: &str = "3f9a1c2e-7b4d-4e8a-9c1f-5d2e6a7b8c90";
     const WORKER_A: &str = "a25abffd-ed93-4296-868f-dbd77aca32ac";
     const HARNESS_KEY: &str = "--home-sam-projects-atlas--";
     const FLASH_MODEL: &str = "deepseek-v4.1-flash:cloud";
@@ -4547,7 +4582,7 @@ mod tests {
     fn no_title_reaches_the_history() {
         let (dir, paths) = harness_store();
         let title = "atlas link test";
-        write_harness_session(&paths, JOB_A, None, 0, true, 10516, 3585, None);
+        write_harness_session(&paths, JOB_A, None, 0, false, 10516, 3585, None);
         write_harness_session(
             &paths,
             WORKER_A,
@@ -4565,7 +4600,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
-            &BTreeSet::new(),
+            &BTreeSet::from([JOB_A.to_string()]),
             None,
             &unknown_pricing(),
             "atlas",
@@ -4605,7 +4640,7 @@ mod tests {
             own,
             None,
             0,
-            true,
+            false,
             10516,
             3585,
             Some("atlas link test"),
@@ -4628,7 +4663,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
-            &BTreeSet::new(),
+            &BTreeSet::from([own.to_string(), blank.to_string(), JOB_A.to_string()]),
             None,
             &unknown_pricing(),
             "atlas",
@@ -4645,6 +4680,11 @@ mod tests {
         };
         assert_eq!(row(own).title.as_deref(), Some("atlas link test"));
         assert_eq!(row(blank).title, None, "an all-space title is no title");
+        assert_eq!(
+            row(blank).status,
+            LiveStatus::Idle,
+            "a session of its own between two turns, its lock held, is open and idle"
+        );
         assert_eq!(row(JOB_A).title, None, "a flash job's title names no row");
 
         let history = HistoryDir::at(&dir.path().join("history"), "atlas");
@@ -4705,10 +4745,13 @@ mod tests {
         assert_eq!(out.agents.get(SESSION).map(Vec::len), Some(1));
     }
 
+    /// A flash job whose Claude Code session is not known and whose process
+    /// has ended is done: no row (a Codex session is a row only while it runs
+    /// too), but its tokens are still recorded.
     #[test]
-    fn a_worker_without_its_job_and_owner_is_its_own_row() {
+    fn a_finished_job_without_its_session_is_no_row_but_keeps_its_tokens() {
         let (_dir, paths) = harness_store();
-        write_harness_session(&paths, WORKER_A, Some(JOB_A), 1, true, 2200, 1100, None);
+        write_harness_session(&paths, JOB_A, None, 0, true, 10516, 3585, None);
         let harness = crate::harness::sessions(&paths, utc("2026-11-01T00:00:00Z"));
 
         let out = harness_rows(
@@ -4717,6 +4760,83 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeSet::new(),
+            None,
+            &unknown_pricing(),
+            "atlas",
+            utc("2026-11-14T19:00:00Z"),
+            &|_| project_key(),
+        );
+
+        assert!(out.rows.sessions.is_empty(), "{:?}", out.rows.sessions);
+        let output: u64 = out.tokens.iter().map(|line| line.out).sum();
+        assert_eq!(output, 3585, "the job's tokens are recorded");
+    }
+
+    /// A running flash job without its Claude Code session ran in a worker
+    /// copy (`<base>/<key>/slots/<n>`): its row takes the folder the copy was
+    /// made from, found among the known Claude Code sessions' folders.
+    #[test]
+    fn a_job_without_its_session_takes_the_folder_it_was_copied_from() {
+        let (_dir, paths) = harness_store();
+        // `8279d42859b9` is flash-agents' key of /home/sam/projects/atlas.
+        let copy = "/home/sam/fm/8279d42859b9/slots/10";
+        let dir = paths
+            .sessions
+            .join("--home-sam-fm-8279d42859b9-slots-10--")
+            .join(JOB_B);
+        std::fs::create_dir_all(&dir).expect("a session folder");
+        let header = serde_json::json!({
+            "type": "session", "version": 4, "id": JOB_B, "createdAt": 1794696000000_i64,
+            "cwd": copy, "isSeeded": false, "delegationDepth": 0,
+        });
+        let text = format!(
+            "{header}\n{}\n",
+            harness_event("turn/start", 1794696001000, serde_json::json!({"turn": 1}))
+        );
+        std::fs::write(
+            dir.join("session.v4.jsonl.zstd"),
+            zstd::encode_all(text.as_bytes(), 3).expect("zstd"),
+        )
+        .expect("a session file");
+        std::fs::write(dir.join("session.lock"), []).expect("a lock");
+        let harness = crate::harness::sessions(&paths, utc("2026-11-01T00:00:00Z"));
+        // An earlier Claude Code session of atlas, not the job's owner.
+        let claude_cwd = BTreeMap::from([(SESSION.to_string(), ATLAS_CWD.to_string())]);
+        let asked = std::cell::RefCell::new(Vec::new());
+
+        let out = harness_rows(
+            &harness.sessions,
+            &BTreeMap::new(),
+            &claude_cwd,
+            &BTreeMap::new(),
+            &BTreeSet::from([JOB_B.to_string()]),
+            None,
+            &unknown_pricing(),
+            "atlas",
+            utc("2026-11-14T19:00:00Z"),
+            &|cwd| {
+                asked.borrow_mut().push(cwd.to_string());
+                project_key()
+            },
+        );
+
+        assert_eq!(out.rows.sessions.len(), 1);
+        assert_eq!(out.rows.sessions[0].cwd, ATLAS_CWD);
+        assert_eq!(asked.borrow().as_slice(), [ATLAS_CWD.to_string()]);
+    }
+
+    #[test]
+    fn a_worker_without_its_job_and_owner_is_its_own_row() {
+        let (_dir, paths) = harness_store();
+        write_harness_session(&paths, WORKER_A, Some(JOB_A), 1, false, 2200, 1100, None);
+        let harness = crate::harness::sessions(&paths, utc("2026-11-01T00:00:00Z"));
+
+        let out = harness_rows(
+            &harness.sessions,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeSet::from([WORKER_A.to_string()]),
             None,
             &unknown_pricing(),
             "atlas",
@@ -4938,11 +5058,12 @@ mod tests {
 
     #[test]
     fn a_harness_rows_last_hour_counts_the_last_sixty_minutes() {
+        // A DeepSeek Harness session of its own between two turns.
         let (dir, paths) = harness_store();
         let now = utc("2026-11-14T19:00:00Z");
         write_harness_answers(
             &paths,
-            JOB_B,
+            OWN_SESSION,
             &[
                 (
                     (now - Duration::minutes(90)).timestamp_millis(),
@@ -4982,7 +5103,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
-            &BTreeSet::new(),
+            &BTreeSet::from([OWN_SESSION.to_string()]),
             None,
             &known_pricing(&valuer, &settings),
             "atlas",
@@ -5013,11 +5134,12 @@ mod tests {
 
     #[test]
     fn a_last_hour_without_tokens_is_a_known_zero() {
+        // A DeepSeek Harness session of its own between two turns.
         let (dir, paths) = harness_store();
         let now = utc("2026-11-14T19:00:00Z");
         write_harness_answers(
             &paths,
-            JOB_B,
+            OWN_SESSION,
             &[(
                 (now - Duration::minutes(90)).timestamp_millis(),
                 Some((1_000, 100)),
@@ -5047,7 +5169,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
-            &BTreeSet::new(),
+            &BTreeSet::from([OWN_SESSION.to_string()]),
             None,
             &known_pricing(&valuer, &settings),
             "atlas",
