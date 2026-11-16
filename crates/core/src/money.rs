@@ -808,9 +808,11 @@ impl Valuer {
             from: range.from - Duration::days(7),
             to: range.to + Duration::days(7),
         };
-        let windows = history.finished_windows(&widened, &Hosts::All)?;
-        let samples = history.read::<Sample>(&widened, &Hosts::All)?;
-        let events = history.read::<Event>(&Range::ALL, &Hosts::All)?;
+        // Codex's and Ollama's readings share the files; a Claude window, sample
+        // or event is the only one this valuer prices (step-d.md Task 4).
+        let windows = history.finished_claude_windows(&widened, &Hosts::All)?;
+        let samples = history.read_claude::<Sample>(&widened, &Hosts::All)?;
+        let events = history.read_claude::<Event>(&Range::ALL, &Hosts::All)?;
         let tokens = history.read::<TokenRecord>(&widened, &Hosts::All)?;
 
         let mut valuer = Valuer {
@@ -1100,6 +1102,7 @@ mod tests {
     use crate::api::LimitKind;
     use crate::history::{Source, WindowRecord};
     use crate::project::ProjectKey;
+    use crate::stats::tests::{append_codex_records, tiny};
     use crate::store::OwnRate;
 
     const AC_ACC: &str = "6f1c2a9e-1d4b-4c7f-9a3e-8b5d2e6f1c04";
@@ -2910,5 +2913,60 @@ mod tests {
             "the look-up overwrote the own price: {:?}",
             after.overrides
         );
+    }
+
+    #[test]
+    fn provider_records_do_not_change_the_valuer() {
+        let without = tiny();
+        let with = tiny();
+        append_codex_records(&with.history, utc("2026-11-14T09:00:00Z"));
+        let range = Range {
+            from: utc("2026-11-02T00:00:00Z"),
+            to: utc("2026-11-16T00:00:00Z"),
+        };
+
+        let before = Valuer::build(
+            &without.history,
+            &range,
+            &without.prices,
+            &without.fx,
+            &without.settings,
+            &without.accounts,
+        )
+        .expect("the valuer");
+        let after = Valuer::build(
+            &with.history,
+            &range,
+            &with.prices,
+            &with.fx,
+            &with.settings,
+            &with.accounts,
+        )
+        .expect("the valuer");
+
+        let windows = |valuer: &Valuer| {
+            valuer
+                .windows
+                .iter()
+                .map(|window| {
+                    (
+                        window.account.clone(),
+                        window.start,
+                        window.end,
+                        window.used,
+                        window.finished,
+                        window.last_sample,
+                        window.api_sum,
+                        window.unpriced.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            windows(&after),
+            windows(&before),
+            "a Codex window changed the Claude windows"
+        );
+        assert_eq!(after.price_changes, before.price_changes);
     }
 }

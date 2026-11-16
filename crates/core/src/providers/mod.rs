@@ -8,6 +8,7 @@ use std::io;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 
 use crate::api::{ApiError, Limit, Usage};
 use crate::history::AccountRef;
@@ -45,7 +46,8 @@ pub enum ProviderError {
 }
 
 /// A provider's credit balance, in US dollars.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Credits {
     pub left: f64,
     pub allowance: Option<f64>,

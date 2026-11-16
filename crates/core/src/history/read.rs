@@ -114,6 +114,21 @@ impl HistoryDir {
         Ok(Read { records, warnings })
     }
 
+    /// The Claude records of the range: [`read`](HistoryDir::read) with the
+    /// Codex and Ollama readings left out, warnings kept. Every reader that
+    /// serves Claude's accounts uses this; `read` stays for the recorder (it
+    /// loads a provider's own last line), the export, the import and the
+    /// tests.
+    pub fn read_claude<R: Record>(
+        &self,
+        range: &Range,
+        hosts: &Hosts,
+    ) -> Result<Read<R>, HistoryError> {
+        let mut read = self.read::<R>(range, hosts)?;
+        read.records.retain(|hosted| hosted.record.is_claude());
+        Ok(read)
+    }
+
     /// The window records of the range, one per (account, kind, end within
     /// `same_reset`): the one with the latest `last_sample` counts (spec §1.5).
     /// On a tie the host name that sorts first wins, so the result does not
@@ -149,6 +164,20 @@ impl HistoryDir {
                 .cmp(&b.record.end)
                 .then_with(|| a.record.account.cmp(&b.record.account))
         });
+        Ok(windows)
+    }
+
+    /// The Claude windows of the range: [`finished_windows`] with the Codex
+    /// and Ollama windows left out. Every reader that serves Claude's accounts
+    /// uses this; `finished_windows` stays for the export, the import and the
+    /// tests.
+    pub fn finished_claude_windows(
+        &self,
+        range: &Range,
+        hosts: &Hosts,
+    ) -> Result<Vec<Hosted<WindowRecord>>, HistoryError> {
+        let mut windows = self.finished_windows(range, hosts)?;
+        windows.retain(|hosted| hosted.record.is_claude());
         Ok(windows)
     }
 

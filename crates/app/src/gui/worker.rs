@@ -48,6 +48,7 @@ use super::autostart;
 use super::burn_rt::{BurnRuntime, BurnTick, KeptForecast};
 use super::lookup_rt::{self, LookupHandle, MoneyView};
 use super::notify;
+use super::providers_rt::{self, ProviderView, ProvidersClient, ProvidersHandle};
 use super::sessions_rt::{self, SessionsHandle};
 use crate::format::{expand_tilde, with_tilde};
 use crate::ops;
@@ -107,6 +108,9 @@ pub(crate) struct Snapshot {
     /// `None` when `readSessions` is off; the sessions thread fills it in on the
     /// main thread.
     pub sessions: Option<SessionsSummary>,
+    /// The switched-on provider cards; the provider thread fills them in on the
+    /// main thread.
+    pub providers: Vec<ProviderView>,
     /// `None` when accounts.json cannot be read: the panel shows the error and
     /// disables Save instead of offering defaults that would overwrite it.
     pub settings: Option<Settings>,
@@ -203,6 +207,7 @@ impl Snapshot {
             last_poll_at: None,
             error,
             sessions: None,
+            providers: Vec::new(),
             settings,
             claude_config_dir: String::new(),
         }
@@ -358,6 +363,7 @@ pub(crate) enum ActionReply {
 pub(crate) enum UiEvent {
     Snapshot(Snapshot),
     Sessions(SessionsSummary),
+    Providers(Vec<ProviderView>),
     Money(MoneyView),
     /// A pushed Sessions area view; the main thread sends it to the large
     /// window only.
@@ -372,6 +378,8 @@ pub(crate) struct Worker {
     pub sessions: Option<SessionsHandle>,
     /// The look-up thread runs whatever `lookUpPrices` says.
     pub lookup: Option<LookupHandle>,
+    /// The provider thread; it runs whatever the two card switches say.
+    pub providers: Option<ProvidersHandle>,
     /// The history folder the recorder opened at startup. Every reader uses
     /// this one; a changed setting takes effect after a restart.
     pub history: Result<seatswap_core::history::HistoryDir, String>,
@@ -425,6 +433,14 @@ pub(crate) fn spawn(
 
     let lookup = Some(lookup_rt::spawn(app.clone(), Api::new(), ui.clone())?);
 
+    let providers = Some(providers_rt::spawn(
+        app.clone(),
+        history.clone(),
+        Api::new(),
+        ui.clone(),
+    )?);
+    let providers_client = providers.as_ref().map(ProvidersHandle::client);
+
     let sessions = match settings.as_ref().filter(|settings| settings.read_sessions) {
         Some(_) => Some(sessions_rt::spawn(
             app.clone(),
@@ -453,6 +469,7 @@ pub(crate) fn spawn(
                 action_history,
             )
             .with_sessions(latest)
+            .with_providers(providers_client)
             .run(action_rx)
         })
         .map_err(|error| format!("cannot start the action thread: {error}"))?;
@@ -462,6 +479,7 @@ pub(crate) fn spawn(
         action: action_tx,
         sessions,
         lookup,
+        providers,
         history,
         forecast,
     })
@@ -556,6 +574,7 @@ pub(crate) fn build_snapshot(parts: SnapshotParts) -> Snapshot {
         last_poll_at: parts.last_poll_at,
         error,
         sessions: None,
+        providers: Vec::new(),
         settings,
         claude_config_dir: parts.claude_config_dir,
     }
@@ -1103,6 +1122,8 @@ struct ActionRuntime {
     /// The recorder, or the sentence that says why there is none.
     history: Result<Recorder, String>,
     latest_sessions: Arc<Mutex<Option<SessionsSummary>>>,
+    /// The provider thread's commands; every settings save tells it.
+    providers: Option<ProvidersClient>,
     /// The last account seen live, so an external switch has a `from`.
     live: Option<AccountRef>,
     /// The history read warnings this run has already printed, so a torn line
@@ -1133,6 +1154,7 @@ impl ActionRuntime {
             store: None,
             history,
             latest_sessions: Arc::new(Mutex::new(None)),
+            providers: None,
             live,
             printed_warnings: PrintedWarnings::new(),
         }
@@ -1140,6 +1162,11 @@ impl ActionRuntime {
 
     fn with_sessions(mut self, latest: Arc<Mutex<Option<SessionsSummary>>>) -> ActionRuntime {
         self.latest_sessions = latest;
+        self
+    }
+
+    fn with_providers(mut self, providers: Option<ProvidersClient>) -> ActionRuntime {
+        self.providers = providers;
         self
     }
 
@@ -1499,6 +1526,9 @@ impl ActionRuntime {
         let warning = autostart::apply_autostart(settings.start_at_login, &self.autostart_args)
             .err()
             .map(|error| autostart_failure_message(&error));
+        if let Some(providers) = &self.providers {
+            let _ = providers.settings_saved();
+        }
         let _ = self.engine.send(EngineCommand::Publish);
         ActionReply::Saved(SavedSetting { settings, warning })
     }
@@ -1598,7 +1628,7 @@ impl ActionRuntime {
 /// Report a history write failure from an action that still succeeded: the same
 /// way the switch's failed record is reported, as a notification and one line
 /// on standard error, never as a failed action.
-fn report_history_error(error: &str) {
+pub(crate) fn report_history_error(error: &str) {
     eprintln!("seatswap: {error}");
     notify::send_error(error);
 }
@@ -2129,6 +2159,7 @@ mod tests {
                 "lastPollAt",
                 "live",
                 "pending",
+                "providers",
                 "secretsWarning",
                 "sessions",
                 "settings",

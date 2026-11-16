@@ -284,7 +284,10 @@ pub(crate) fn account_weeks_valued<Tz: TimeZone + Copy>(
     valuer: &Valuer,
 ) -> Result<Vec<AccountWeek>, StatsError> {
     let mut weeks: Vec<AccountWeek> = Vec::new();
-    for hosted in ctx.history.finished_windows(&Range::ALL, &Hosts::All)? {
+    for hosted in ctx
+        .history
+        .finished_claude_windows(&Range::ALL, &Hosts::All)?
+    {
         let window = hosted.record;
         if window.k != LimitKind::WeeklyAll {
             continue;
@@ -655,10 +658,13 @@ pub fn blocked_spans<Tz: TimeZone + Copy>(
     range: &Range,
     q: &Query,
 ) -> Result<Vec<BlockedSpan>, StatsError> {
-    let events = ctx.history.read::<Event>(&Range::ALL, &Hosts::All)?;
+    let events = ctx.history.read_claude::<Event>(&Range::ALL, &Hosts::All)?;
     let intervals = block_intervals(&events.records, range.to);
     let mut weekly = Vec::new();
-    for hosted in ctx.history.finished_windows(&Range::ALL, &Hosts::All)? {
+    for hosted in ctx
+        .history
+        .finished_claude_windows(&Range::ALL, &Hosts::All)?
+    {
         if hosted.record.k == LimitKind::WeeklyAll {
             weekly.push(hosted);
         }
@@ -739,7 +745,7 @@ fn earliest<R: Record>(
     history: &HistoryDir,
     range: &Range,
 ) -> Result<Option<DateTime<Utc>>, HistoryError> {
-    let read = history.read::<R>(range, &Hosts::All)?;
+    let read = history.read_claude::<R>(range, &Hosts::All)?;
     Ok(read.records.first().map(|hosted| hosted.record.at()))
 }
 
@@ -758,7 +764,10 @@ fn first_record<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>) -> Result<Option<DateTime<Ut
 }
 
 fn any_record<R: Record>(history: &HistoryDir, range: &Range) -> Result<bool, HistoryError> {
-    Ok(!history.read::<R>(range, &Hosts::All)?.records.is_empty())
+    Ok(!history
+        .read_claude::<R>(range, &Hosts::All)?
+        .records
+        .is_empty())
 }
 
 fn has_record<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, range: &Range) -> Result<bool, StatsError> {
@@ -996,6 +1005,53 @@ pub(crate) mod tests {
 
     pub(crate) fn utc(text: &str) -> DateTime<Utc> {
         text.parse::<DateTime<Utc>>().expect("test date")
+    }
+
+    /// A Codex sample, window and event beside the Claude records: a Claude
+    /// reader must give the same answer with and without them (step-d.md Task 4).
+    pub(crate) fn append_codex_records(history: &HistoryDir, at: DateTime<Utc>) {
+        let account = AccountRef {
+            acc: "0f3a6c2e-7b1d-4e9a-8c5f-2d4b6a8e0c13".to_string(),
+            org: crate::providers::CODEX_ORG.to_string(),
+        };
+        history
+            .append(&Sample {
+                t: at,
+                account: account.clone(),
+                src: crate::history::Source::Poll,
+                l: vec![crate::history::LimitSample {
+                    k: LimitKind::WeeklyAll,
+                    m: None,
+                    p: 12.0,
+                    r: Some(at + Duration::days(7)),
+                    b: false,
+                }],
+            })
+            .expect("the Codex sample");
+        history
+            .append(&WindowRecord {
+                account: account.clone(),
+                k: LimitKind::WeeklyAll,
+                m: None,
+                start: Some(at - Duration::days(7)),
+                end: at,
+                final_percent: 12.0,
+                lost: None,
+                last_sample: at,
+                plan: Some("Plus".to_string()),
+                uncertain: false,
+            })
+            .expect("the Codex window");
+        history
+            .append(&Event {
+                t: at,
+                kind: EventKind::Blocked {
+                    account,
+                    k: LimitKind::WeeklyAll,
+                    m: None,
+                },
+            })
+            .expect("the Codex event");
     }
 
     fn winter() -> FixedOffset {
@@ -1675,5 +1731,88 @@ pub(crate) mod tests {
         let end = next_local_day_start(start, &FallZone);
         assert_eq!(end, utc("2026-10-25T23:00:00Z")); // Monday 00:00 +01:00
         assert_eq!(end - start, Duration::hours(25));
+    }
+
+    #[test]
+    fn provider_records_do_not_change_the_account_weeks() {
+        let without = tiny();
+        let with = tiny();
+        append_codex_records(&with.history, utc("2026-11-14T09:00:00Z"));
+
+        let before = account_weeks(&without.ctx(), &two_weeks(), &all()).expect("the weeks");
+        let after = account_weeks(&with.ctx(), &two_weeks(), &all()).expect("the weeks");
+
+        assert_eq!(after, before, "a Codex window changed the Claude weeks");
+
+        let before = blocked_spans(&without.ctx(), &two_weeks(), &all()).expect("the spans");
+        let after = blocked_spans(&with.ctx(), &two_weeks(), &all()).expect("the spans");
+        assert_eq!(
+            after, before,
+            "a Codex event changed the Claude blocked spans"
+        );
+    }
+
+    // ---- proof tests of the review ----
+
+    /// The statistics serve Claude's accounts, but they read the same files
+    /// the provider readings are written to. A history that holds only a
+    /// provider's sample, window and event holds no Claude record at all: the
+    /// page must say so, and the "All" range must start at this week, not at
+    /// the provider's reading.
+    #[test]
+    fn a_provider_record_is_not_the_statistics_first_record() {
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        append_codex_records(&history, utc("2026-11-14T09:00:00Z"));
+
+        let tiny = tiny();
+        let ctx = Ctx {
+            history: &history,
+            accounts: &tiny.accounts,
+            settings: &tiny.settings,
+            prices: &tiny.prices,
+            fx: &tiny.fx,
+            projects: &tiny.projects,
+            now: tiny.now,
+            zone: tiny.offset,
+        };
+
+        assert_eq!(
+            empty(&ctx, &two_weeks()).expect("the empty page"),
+            Some(Empty {
+                recording_since: None
+            }),
+            "a Codex record made the statistics page think it holds records"
+        );
+    }
+
+    /// The "All" range starts at the week of the first Claude record. A
+    /// provider's reading is not one, so it must not move the range's start.
+    #[test]
+    fn a_provider_record_does_not_move_the_all_range() {
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        append_codex_records(&history, utc("2026-11-14T09:00:00Z"));
+
+        let tiny = tiny();
+        let ctx = Ctx {
+            history: &history,
+            accounts: &tiny.accounts,
+            settings: &tiny.settings,
+            prices: &tiny.prices,
+            fx: &tiny.fx,
+            projects: &tiny.projects,
+            now: tiny.now,
+            zone: tiny.offset,
+        };
+
+        assert_eq!(
+            range_of(RangeKey::All, &ctx).expect("the range"),
+            Range {
+                from: utc("2026-11-16T00:00:00Z"),
+                to: tiny.now
+            },
+            "a Codex record moved the start of the All range"
+        );
     }
 }

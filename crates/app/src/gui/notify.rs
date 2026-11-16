@@ -731,6 +731,7 @@ mod tests {
             last_poll_at: None,
             error: None,
             sessions: None,
+            providers: Vec::new(),
             settings: Some(Settings::default()),
             claude_config_dir: String::new(),
         }
@@ -809,6 +810,7 @@ mod tests {
             last_poll_at: None,
             error: None,
             sessions,
+            providers: Vec::new(),
             settings,
             claude_config_dir: String::new(),
         }

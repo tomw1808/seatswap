@@ -262,6 +262,7 @@ pub(crate) fn show(app: &AppHandle, view: &str) -> Result<(), String> {
     let _ = state
         .engine
         .send(EngineCommand::Poll(PollReason::PanelOpened));
+    let _ = state.providers_client.opened();
     Ok(())
 }
 

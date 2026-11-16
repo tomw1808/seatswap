@@ -113,6 +113,12 @@ impl Kind {
 pub trait Record: Serialize + DeserializeOwned {
     const KIND: Kind;
     fn at(&self) -> DateTime<Utc>;
+
+    /// Whether this record belongs to a Claude account. A record that names no
+    /// account answers `true`: it belongs to no provider either.
+    fn is_claude(&self) -> bool {
+        true
+    }
 }
 
 /// An account by the ids the server uses, never by seatswap's local id.
@@ -129,6 +135,14 @@ impl AccountRef {
             acc: account.account_uuid.clone(),
             org: account.organization_uuid.clone(),
         }
+    }
+
+    /// Whether this is a Claude account's reference. Codex's and Ollama's
+    /// readings are stored beside Claude's with `org` [`crate::providers::CODEX_ORG`]
+    /// or [`crate::providers::OLLAMA_ORG`]; a Claude organization id is a
+    /// 36-character UUID, so those names cannot clash with one.
+    pub fn is_claude(&self) -> bool {
+        self.org != crate::providers::CODEX_ORG && self.org != crate::providers::OLLAMA_ORG
     }
 }
 
@@ -174,6 +188,10 @@ impl Record for Sample {
     fn at(&self) -> DateTime<Utc> {
         self.t
     }
+
+    fn is_claude(&self) -> bool {
+        self.account.is_claude()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -213,6 +231,10 @@ impl Record for WindowRecord {
 
     fn at(&self) -> DateTime<Utc> {
         self.end
+    }
+
+    fn is_claude(&self) -> bool {
+        self.account.is_claude()
     }
 }
 
@@ -335,6 +357,33 @@ pub enum EventKind {
     },
 }
 
+impl EventKind {
+    /// The accounts an event names. A `Live` or a `Switch` may name two; an
+    /// event about neither account names none.
+    pub fn accounts(&self) -> Vec<&AccountRef> {
+        match self {
+            EventKind::Switch { from, to, .. } => from.iter().chain(std::iter::once(to)).collect(),
+            EventKind::Blocked { account, .. }
+            | EventKind::Unblocked { account, .. }
+            | EventKind::AccountAdded { account, .. }
+            | EventKind::AccountRemoved { account }
+            | EventKind::PlanChanged { account, .. }
+            | EventKind::PriceChanged { account, .. }
+            | EventKind::LoginEnded { account }
+            | EventKind::LoginRenewed { account } => vec![account],
+            EventKind::Live { account } => account.iter().collect(),
+            // Named one by one, so a new kind must say whether it names an
+            // account.
+            EventKind::AllBlocked
+            | EventKind::AnyUsable
+            | EventKind::AgentCall { .. }
+            | EventKind::Waited { .. }
+            | EventKind::AutoBurn { .. }
+            | EventKind::AutoBurnSet { .. } => Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     pub t: DateTime<Utc>,
@@ -347,6 +396,13 @@ impl Record for Event {
 
     fn at(&self) -> DateTime<Utc> {
         self.t
+    }
+
+    /// True when the event names no account, or at least one Claude account:
+    /// an event about a provider alone is not Claude's.
+    fn is_claude(&self) -> bool {
+        let accounts = self.kind.accounts();
+        accounts.is_empty() || accounts.iter().any(|account| account.is_claude())
     }
 }
 
@@ -973,6 +1029,107 @@ mod tests {
         let read = history.read::<Sample>(&range, &Hosts::All).unwrap();
         assert_eq!(read.records.len(), 1);
         assert_eq!(read.records[0].record.t, utc("2026-11-14T11:00:00Z"));
+    }
+
+    fn codex_account() -> AccountRef {
+        AccountRef {
+            acc: "0f3a6c2e-7b1d-4e9a-8c5f-2d4b6a8e0c13".to_string(),
+            org: crate::providers::CODEX_ORG.to_string(),
+        }
+    }
+
+    /// The one place the Claude filter lives: `read_claude` and
+    /// `finished_claude_windows` keep a Claude account's records and an event
+    /// that names no account, while `read` and `finished_windows` keep every
+    /// line (step-d.md Task 4).
+    #[test]
+    fn read_claude_keeps_claude_records_and_the_account_less_event() {
+        let dir = tempdir().unwrap();
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let at = utc("2026-11-14T10:00:00Z");
+        let claude = atlas_account();
+        let codex = codex_account();
+        let sample = |account: &AccountRef| Sample {
+            t: at,
+            account: account.clone(),
+            src: Source::Poll,
+            l: vec![LimitSample {
+                k: LimitKind::Session,
+                m: None,
+                p: 12.0,
+                r: None,
+                b: false,
+            }],
+        };
+        let window = |account: &AccountRef| WindowRecord {
+            account: account.clone(),
+            k: LimitKind::WeeklyAll,
+            m: None,
+            start: Some(at - chrono::Duration::days(7)),
+            end: at,
+            final_percent: 12.0,
+            lost: None,
+            last_sample: at,
+            plan: None,
+            uncertain: false,
+        };
+        let blocked = |account: AccountRef| Event {
+            t: at,
+            kind: EventKind::Blocked {
+                account,
+                k: LimitKind::Session,
+                m: None,
+            },
+        };
+        history.append(&sample(&claude)).unwrap();
+        history.append(&sample(&codex)).unwrap();
+        history.append(&window(&claude)).unwrap();
+        history.append(&window(&codex)).unwrap();
+        history.append(&blocked(claude.clone())).unwrap();
+        history.append(&blocked(codex)).unwrap();
+        history
+            .append(&Event {
+                t: at,
+                kind: EventKind::Live { account: None },
+            })
+            .unwrap();
+
+        let samples = history.read::<Sample>(&wide_range(), &Hosts::All).unwrap();
+        assert_eq!(samples.records.len(), 2, "read keeps every line");
+        let claude_samples = history
+            .read_claude::<Sample>(&wide_range(), &Hosts::All)
+            .unwrap();
+        assert_eq!(claude_samples.records.len(), 1);
+        assert_eq!(claude_samples.records[0].record.account, claude);
+
+        let windows = history
+            .finished_windows(&wide_range(), &Hosts::All)
+            .unwrap();
+        assert_eq!(windows.len(), 2, "finished_windows keeps every line");
+        let claude_windows = history
+            .finished_claude_windows(&wide_range(), &Hosts::All)
+            .unwrap();
+        assert_eq!(claude_windows.len(), 1);
+        assert_eq!(claude_windows[0].record.account, claude);
+
+        let events = history.read::<Event>(&wide_range(), &Hosts::All).unwrap();
+        assert_eq!(events.records.len(), 3, "read keeps every line");
+        let claude_events = history
+            .read_claude::<Event>(&wide_range(), &Hosts::All)
+            .unwrap();
+        assert_eq!(
+            claude_events.records.len(),
+            2,
+            "the Claude event and the account-less one stay; the provider's goes"
+        );
+        assert!(claude_events.records.iter().any(|hosted| matches!(
+            &hosted.record.kind,
+            EventKind::Blocked { account, .. } if account == &claude
+        )));
+        assert!(claude_events
+            .records
+            .iter()
+            .any(|hosted| matches!(&hosted.record.kind, EventKind::Live { account: None })));
     }
 
     #[test]

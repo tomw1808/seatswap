@@ -73,9 +73,11 @@ pub fn learn<Tz: TimeZone + Copy>(
         from: now - Duration::days(RATES_DAYS),
         to: now,
     };
-    let samples = history.read::<Sample>(&weeks, &Hosts::All)?;
+    // Auto-burn reads Claude's history only (step-d.md Task 4): a provider's
+    // samples and events never make a rate, a hold or a switch cost.
+    let samples = history.read_claude::<Sample>(&weeks, &Hosts::All)?;
     let tokens = history.read::<TokenRecord>(&weeks, &Hosts::All)?;
-    let events = history.read::<Event>(&days, &Hosts::All)?;
+    let events = history.read_claude::<Event>(&days, &Hosts::All)?;
 
     let mut warnings = Vec::new();
     warnings.extend(samples.warnings);
@@ -399,6 +401,7 @@ mod tests {
     use crate::burn::plan::{follow, followed, Policy};
     use crate::history::{Recorder, Source, TokenRecord};
     use crate::project::ProjectKey;
+    use crate::stats::tests::{append_codex_records, tiny};
     use crate::types::OAuthAccount;
 
     const ORG: &str = "e92d7b31-5c8e-4f2a-9d6b-1e3c5a7f9b20";
@@ -1266,5 +1269,40 @@ mod tests {
             assessment.plan,
             follow(&assessment.situation.inputs, Policy::Lazy)
         );
+    }
+
+    #[test]
+    fn provider_records_do_not_change_what_auto_burn_learns() {
+        let without = tiny();
+        let with = tiny();
+        append_codex_records(&with.history, utc("2026-11-14T09:00:00Z"));
+
+        let before = learn(
+            &without.history,
+            without.now,
+            without.offset,
+            &without.accounts,
+            true,
+        )
+        .expect("the history reads");
+        let after = learn(&with.history, with.now, with.offset, &with.accounts, true)
+            .expect("the history reads");
+
+        assert_eq!(
+            after.rhythm, before.rhythm,
+            "a Codex sample changed the rhythm"
+        );
+        assert_eq!(after.cost, before.cost, "a Codex record changed the cost");
+        assert_eq!(
+            after.events.len(),
+            before.events.len(),
+            "a Codex event reached auto-burn"
+        );
+        assert_eq!(after.rates.len(), before.rates.len());
+        for (account, rates) in &before.rates {
+            let learned = after.rates.get(account).expect("the account's rates");
+            assert_eq!(learned.c, rates.c);
+            assert_eq!(learned.s, rates.s);
+        }
     }
 }

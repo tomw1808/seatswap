@@ -72,7 +72,7 @@ pub fn replay(
     without: &[AccountRef],
     policy: Policy,
 ) -> Result<ReplayResult, ReplayError> {
-    let sample_read = history.read::<Sample>(range, &Hosts::All)?;
+    let sample_read = history.read_claude::<Sample>(range, &Hosts::All)?;
     let token_read = history.read::<TokenRecord>(range, &Hosts::All)?;
     let samples = sample_read.records;
     let tokens = token_read.records;
@@ -188,6 +188,7 @@ mod tests {
     use crate::burn::plan::testkit::{inputs, now, offset, EPS};
     use crate::history::{LimitSample, Source, TokenRecord};
     use crate::project::ProjectKey;
+    use crate::stats::tests::append_codex_records;
 
     fn account_ref(id: &str) -> AccountRef {
         AccountRef {
@@ -463,5 +464,16 @@ mod tests {
             "{:?}",
             result.warnings
         );
+    }
+
+    #[test]
+    fn provider_records_do_not_change_the_replay() {
+        let (_dir, history, rates, range) = setup();
+        let before = replay(&history, &range, &rates, &[], Policy::Lazy).expect("the replay");
+
+        append_codex_records(&history, range.from + Duration::hours(1));
+        let after = replay(&history, &range, &rates, &[], Policy::Lazy).expect("the replay");
+
+        assert_eq!(after, before, "a Codex sample changed the Claude replay");
     }
 }

@@ -180,7 +180,9 @@ pub(crate) fn weeks_in<Tz: TimeZone + Copy>(
     let week_starts = week_columns(range, &ctx.zone);
     // The samples of the last 14 days and the newest one before now: one read
     // serves both the running percents and the curves.
-    let samples = ctx.history.read::<Sample>(&Range::ALL, &Hosts::All)?;
+    let samples = ctx
+        .history
+        .read_claude::<Sample>(&Range::ALL, &Hosts::All)?;
     let recent_from = ctx.now - Duration::days(14);
 
     let mut rows = Vec::new();
@@ -456,7 +458,7 @@ pub fn week_summary<Tz: TimeZone + Copy>(
         .copied()
         .unwrap_or(0.0);
 
-    let events = ctx.history.read::<Event>(&Range::ALL, &Hosts::All)?;
+    let events = ctx.history.read_claude::<Event>(&Range::ALL, &Hosts::All)?;
     let switches = switch_counts(&events.records, &week_range, q.host.as_deref());
 
     let token_read = ctx
@@ -630,7 +632,9 @@ pub fn window_detail<Tz: TimeZone + Copy>(
 ) -> Result<WindowDetail, StatsError> {
     // An account the store no longer holds is named by the id `account_id`
     // gives its window's account: the page shows that id's first 8 characters.
-    let finished = ctx.history.finished_windows(&Range::ALL, &Hosts::All)?;
+    let finished = ctx
+        .history
+        .finished_claude_windows(&Range::ALL, &Hosts::All)?;
     let reference = match ctx.accounts.iter().find(|account| account.id == account_id) {
         Some(account) => AccountRef::of(account),
         None => finished
@@ -677,7 +681,7 @@ pub fn window_detail<Tz: TimeZone + Copy>(
         .ok_or_else(|| unknown_window(account_id, end, false))?;
     let money = money_of(week);
 
-    let events = ctx.history.read::<Event>(&Range::ALL, &Hosts::All)?;
+    let events = ctx.history.read_claude::<Event>(&Range::ALL, &Hosts::All)?;
     let reached_100_at = events
         .records
         .iter()
@@ -728,7 +732,7 @@ pub fn window_detail<Tz: TimeZone + Copy>(
         }
     }
 
-    let samples = ctx.history.read::<Sample>(
+    let samples = ctx.history.read_claude::<Sample>(
         &Range {
             from: start,
             to: window.end,
@@ -818,7 +822,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::history::{Event, EventKind, HistoryDir, LimitSample, Sample, Source};
-    use crate::stats::tests::{all, tiny, utc};
+    use crate::stats::tests::{all, append_codex_records, tiny, utc};
 
     /// The plan's range: 2 Nov .. 16 Nov.
     fn two_weeks() -> Range {
@@ -1459,5 +1463,38 @@ mod tests {
         assert_eq!(summary.values.api_currency.as_deref(), Some("USD"));
         assert_eq!(summary.values.currency.as_deref(), Some("EUR"));
         assert_eq!(summary.top_projects, vec![("atlas".to_string(), 100.0)]);
+    }
+
+    #[test]
+    fn provider_records_do_not_change_a_window_detail() {
+        let without = tiny();
+        let with = tiny();
+        append_codex_records(&with.history, utc("2026-11-14T09:00:00Z"));
+        let end = without
+            .windows
+            .iter()
+            .find(|window| window.account == without.lb_ref())
+            .expect("LB's window")
+            .end;
+
+        let before = window_detail(&without.ctx(), &without.lb().id, end).expect("the detail");
+        let after = window_detail(&with.ctx(), &with.lb().id, end).expect("the detail");
+        assert_eq!(after, before, "a Codex record changed a Claude window");
+
+        let before = weeks_in(&without.ctx(), &two_weeks(), &all()).expect("the page");
+        let after = weeks_in(&with.ctx(), &two_weeks(), &all()).expect("the page");
+        assert_eq!(
+            after, before,
+            "a Codex record changed the Claude weeks page"
+        );
+
+        let before =
+            week_summary(&without.ctx(), &all(), utc("2026-11-09T00:00:00Z")).expect("the summary");
+        let after =
+            week_summary(&with.ctx(), &all(), utc("2026-11-09T00:00:00Z")).expect("the summary");
+        assert_eq!(
+            after, before,
+            "a Codex record changed a Claude week summary"
+        );
     }
 }

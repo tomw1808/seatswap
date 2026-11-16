@@ -24,6 +24,8 @@ pub(crate) mod notify;
 #[cfg(feature = "gui")]
 pub(crate) mod panel;
 #[cfg(feature = "gui")]
+pub(crate) mod providers_rt;
+#[cfg(feature = "gui")]
 pub(crate) mod registry;
 #[cfg(feature = "gui")]
 pub(crate) mod sessions_rt;
@@ -68,6 +70,8 @@ use burn_rt::KeptForecast;
 #[cfg(feature = "gui")]
 use lookup_rt::{LookupClient, LookupHandle};
 #[cfg(feature = "gui")]
+use providers_rt::{ProviderView, ProvidersClient, ProvidersHandle};
+#[cfg(feature = "gui")]
 use sessions_rt::{SessionsClient, SessionsHandle};
 #[cfg(feature = "gui")]
 use worker::SessionsSummary;
@@ -107,6 +111,11 @@ pub(crate) struct GuiState {
     /// The look-up thread's view, and the handle that keeps the thread alive.
     pub(crate) lookup: LookupClient,
     _lookup: Mutex<Option<LookupHandle>>,
+    /// The latest provider cards; every snapshot is emitted with them.
+    providers: Mutex<Vec<ProviderView>>,
+    /// The provider thread's commands; the pop-up and the settings save use them.
+    pub(crate) providers_client: ProvidersClient,
+    _providers: Mutex<Option<ProvidersHandle>>,
     deduper: Mutex<notify::Deduper>,
     /// The waiting notifications that can still be withdrawn, by session id.
     waiting: Mutex<HashMap<String, notify::WaitingHandle>>,
@@ -420,6 +429,11 @@ fn setup(
         .take()
         .ok_or_else(|| "the look-up thread did not start".to_string())?;
     let lookup = lookup_handle.client();
+    let providers_handle = worker
+        .providers
+        .take()
+        .ok_or_else(|| "the provider thread did not start".to_string())?;
+    let providers_client = providers_handle.client();
     let history = worker.history.clone();
     let forecast = worker.forecast.clone();
 
@@ -435,6 +449,9 @@ fn setup(
         action: worker.action.clone(),
         lookup,
         _lookup: Mutex::new(Some(lookup_handle)),
+        providers: Mutex::new(Vec::new()),
+        providers_client,
+        _providers: Mutex::new(Some(providers_handle)),
         deduper: Mutex::new(notify::Deduper::new()),
         waiting: Mutex::new(HashMap::new()),
         recheck: Mutex::new(Recheck::default()),
@@ -530,6 +547,12 @@ fn handle_ui_event(app: &AppHandle, event: UiEvent) {
             let snapshot = lock(&state.snapshot).clone();
             apply_snapshot(app, snapshot);
         }
+        UiEvent::Providers(list) => {
+            let state = app.state::<GuiState>();
+            *lock(&state.providers) = list;
+            let snapshot = lock(&state.snapshot).clone();
+            apply_snapshot(app, snapshot);
+        }
         UiEvent::Money(view) => {
             let _ = app.emit("money", &view);
         }
@@ -543,6 +566,7 @@ fn handle_ui_event(app: &AppHandle, event: UiEvent) {
 fn apply_snapshot(app: &AppHandle, mut snapshot: Snapshot) {
     let state = app.state::<GuiState>();
     snapshot.sessions = lock(&state.sessions).clone();
+    snapshot.providers = lock(&state.providers).clone();
     if let Some(startup) = &state.startup_error {
         snapshot.error = Some(match snapshot.error.take() {
             Some(engine) => format!("{engine}; {startup}"),

@@ -205,7 +205,7 @@ pub fn forecast<Tz: TimeZone + Copy>(
         None => Vec::new(),
         Some(cutoff) => ctx
             .history
-            .read::<Sample>(
+            .read_claude::<Sample>(
                 &Range {
                     from: cutoff.min(inputs.now - Duration::weeks(LOW_HISTORY_WEEKS)),
                     to: inputs.now,
@@ -525,7 +525,7 @@ mod tests {
     use crate::history::{LimitSample, Source};
     use crate::store::Account;
 
-    use crate::stats::tests::{tiny, utc, Tiny};
+    use crate::stats::tests::{append_codex_records, tiny, utc, Tiny};
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 0.001
@@ -1082,5 +1082,30 @@ mod tests {
         let blocked_hours = wu_hours(eager.blocked_wu, inputs.rhythm.typical_hour())
             .expect("the test rhythm has working hours");
         assert_eq!(page.kpis.blocked_hours, blocked_hours);
+    }
+
+    // ---- proof tests of the review ----
+
+    /// The Forecast page counts the weeks between the history's first record
+    /// and now. A provider's reading is not a Claude record, so it must not be
+    /// the first one and must not count a week.
+    #[test]
+    fn a_provider_record_does_not_count_the_forecast_basis_weeks() {
+        let without = tiny();
+        let with = tiny();
+        // A provider's reading older than the fixture's first record.
+        append_codex_records(&with.history, utc("2026-10-20T09:00:00Z"));
+        let accounts = stored_accounts(&without);
+        let inputs = inputs();
+        let regime = regime(false);
+
+        let before =
+            forecast(&context(&without, &accounts), &inputs, &regime).expect("the forecast");
+        let after = forecast(&context(&with, &accounts), &inputs, &regime).expect("the forecast");
+
+        assert_eq!(
+            after.basis_weeks, before.basis_weeks,
+            "a Codex record counted the forecast's basis weeks"
+        );
     }
 }

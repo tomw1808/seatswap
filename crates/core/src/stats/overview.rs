@@ -126,9 +126,9 @@ pub(crate) fn overview_in<Tz: TimeZone + Copy>(
     let rhythm = working_rhythm(ctx, range)?;
     let currency = ctx.settings.currency.clone();
 
-    let events = ctx.history.read::<Event>(&Range::ALL, &Hosts::All)?;
+    let events = ctx.history.read_claude::<Event>(&Range::ALL, &Hosts::All)?;
     let reading = reading_range(range, &finished);
-    let samples = ctx.history.read::<Sample>(&reading, &Hosts::All)?;
+    let samples = ctx.history.read_claude::<Sample>(&reading, &Hosts::All)?;
     let tokens = ctx.history.read::<TokenRecord>(&reading, &Hosts::All)?;
 
     let without_price = accounts_without_price(ctx, &finished);
@@ -519,7 +519,7 @@ fn finding_full<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, finished: &[AccountWeek]) ->
 mod tests {
     use super::*;
 
-    use crate::stats::tests::{all, tiny, utc};
+    use crate::stats::tests::{all, append_codex_records, tiny, utc};
     use crate::stats::RangeKey;
 
     fn close(a: f64, b: f64) -> bool {
@@ -933,5 +933,17 @@ mod tests {
             "avoidable hours {}",
             page.kpis.avoidable_hours
         );
+    }
+
+    #[test]
+    fn provider_records_do_not_change_the_overview() {
+        let without = tiny();
+        let with = tiny();
+        append_codex_records(&with.history, utc("2026-11-14T09:00:00Z"));
+
+        let before = overview_in(&without.ctx(), &two_weeks(), &all()).expect("the overview");
+        let after = overview_in(&with.ctx(), &two_weeks(), &all()).expect("the overview");
+
+        assert_eq!(after, before, "a Codex record changed the Claude overview");
     }
 }

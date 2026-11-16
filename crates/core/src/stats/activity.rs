@@ -668,7 +668,7 @@ fn waited_minutes<Tz: TimeZone + Copy>(
     range: &Range,
     q: &Query,
 ) -> Result<Vec<(NaiveDate, f64)>, StatsError> {
-    let read = ctx.history.read::<Event>(range, &Hosts::All)?;
+    let read = ctx.history.read_claude::<Event>(range, &Hosts::All)?;
     let mut by_day: BTreeMap<NaiveDate, u64> = BTreeMap::new();
     for hosted in &read.records {
         if hosted.record.t < range.from || hosted.record.t >= range.to {

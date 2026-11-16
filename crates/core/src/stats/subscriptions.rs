@@ -374,7 +374,7 @@ pub(crate) fn what_if_in<Tz: TimeZone + Copy>(
         ctx.accounts,
         ctx.settings.read_sessions,
     )?;
-    let samples = ctx.history.read::<Sample>(range, &Hosts::All)?;
+    let samples = ctx.history.read_claude::<Sample>(range, &Hosts::All)?;
     let sampled: BTreeSet<AccountRef> = samples
         .records
         .iter()
@@ -730,9 +730,13 @@ impl AccountHistory {
 fn account_histories<Tz: TimeZone + Copy>(
     ctx: &Ctx<Tz>,
 ) -> Result<BTreeMap<AccountRef, AccountHistory>, StatsError> {
-    let events = ctx.history.read::<Event>(&Range::ALL, &Hosts::All)?;
-    let samples = ctx.history.read::<Sample>(&Range::ALL, &Hosts::All)?;
-    let windows = ctx.history.finished_windows(&Range::ALL, &Hosts::All)?;
+    let events = ctx.history.read_claude::<Event>(&Range::ALL, &Hosts::All)?;
+    let samples = ctx
+        .history
+        .read_claude::<Sample>(&Range::ALL, &Hosts::All)?;
+    let windows = ctx
+        .history
+        .finished_claude_windows(&Range::ALL, &Hosts::All)?;
 
     let mut histories: BTreeMap<AccountRef, AccountHistory> = BTreeMap::new();
     for hosted in &windows {
@@ -755,7 +759,7 @@ fn account_histories<Tz: TimeZone + Copy>(
     }
     for hosted in &events.records {
         let at = hosted.record.t;
-        for account in event_accounts(&hosted.record.kind) {
+        for account in hosted.record.kind.accounts() {
             let entry = histories.entry(account.clone()).or_default();
             entry.see(at);
             match &hosted.record.kind {
@@ -780,23 +784,6 @@ fn account_histories<Tz: TimeZone + Copy>(
         history.plan_changes.sort_by_key(|(at, _, _)| *at);
     }
     Ok(histories)
-}
-
-/// The accounts an event names.
-fn event_accounts(kind: &EventKind) -> Vec<&AccountRef> {
-    match kind {
-        EventKind::Switch { from, to, .. } => from.iter().chain(std::iter::once(to)).collect(),
-        EventKind::Blocked { account, .. }
-        | EventKind::Unblocked { account, .. }
-        | EventKind::AccountAdded { account, .. }
-        | EventKind::AccountRemoved { account }
-        | EventKind::PlanChanged { account, .. }
-        | EventKind::PriceChanged { account, .. }
-        | EventKind::LoginEnded { account }
-        | EventKind::LoginRenewed { account } => vec![account],
-        EventKind::Live { account } => account.iter().collect(),
-        _ => Vec::new(),
-    }
 }
 
 /// Every period of one account, over the whole history: the page lists the
@@ -928,7 +915,7 @@ mod tests {
 
     use crate::api::LimitKind;
     use crate::history::{LimitSample, Source, WindowRecord};
-    use crate::stats::tests::{all, tiny, utc, Tiny};
+    use crate::stats::tests::{all, append_codex_records, tiny, utc, Tiny};
     use crate::stats::{Ctx, Range};
 
     /// The plan's range: 2 Nov .. 16 Nov.
@@ -1518,5 +1505,21 @@ mod tests {
             "AC's 100 % window counts the 3 M of 14 Nov and the 2 M of 17 Nov: {}",
             ratio.1
         );
+    }
+
+    #[test]
+    fn provider_records_do_not_change_the_page_or_the_what_if() {
+        let without = tiny();
+        let with = tiny();
+        append_codex_records(&with.history, utc("2026-11-14T09:00:00Z"));
+
+        let before = subscriptions_in(&without.ctx(), &two_weeks(), &all()).expect("the page");
+        let after = subscriptions_in(&with.ctx(), &two_weeks(), &all()).expect("the page");
+        assert_eq!(after, before, "a Codex record changed the Claude page");
+
+        let id = without.lb().id.clone();
+        let before = what_if_in(&without.ctx(), &two_weeks(), &all(), &id).expect("the what-if");
+        let after = what_if_in(&with.ctx(), &two_weeks(), &all(), &id).expect("the what-if");
+        assert_eq!(after, before, "a Codex record changed the Claude what-if");
     }
 }
