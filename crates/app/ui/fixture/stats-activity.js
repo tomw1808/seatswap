@@ -91,6 +91,21 @@ function valuesOfMillion(millions) {
   };
 }
 
+const ACT_OLLAMA_MODEL = "deepseek-v4.1-flash:cloud";
+const ACT_HOSTS = ["atlas", "vega"];
+// The part of a host's output tokens that a known session on an Ollama model
+// produced. The Ollama line is the whole account's, so `activityOllama` sums
+// this over every host, never over the page's host filter.
+const ACT_OLLAMA_SHARE = { atlas: 0.18, vega: 0.3 };
+
+function actOllamaOut(host, hour) {
+  const share = ACT_OLLAMA_SHARE[host];
+  if (typeof share !== "number") throw new Error(`unknown host ${JSON.stringify(host)}`);
+  const entry = actHostHour(host, hour);
+  if (entry.state !== "work") return 0;
+  return Math.round(Math.round(entry.tokens * 1000000) * share);
+}
+
 function hostLane(host) {
   const hours = [];
   let working = 0;
@@ -109,10 +124,13 @@ function hostLane(host) {
     out += outTokens;
     const byModel = [];
     if (entry.state === "work" && outTokens > 0) {
-      const opus = Math.round(outTokens * 0.7);
-      const sonnet = Math.round(outTokens * 0.22);
+      const ollamaOut = actOllamaOut(host, hour);
+      const claudeOut = outTokens - ollamaOut;
+      const opus = Math.round(claudeOut * 0.7);
+      const sonnet = Math.round(claudeOut * 0.22);
       byModel.push(["claude-opus-5-5", opus], ["claude-sonnet-5-5", sonnet]);
-      byModel.push(["claude-fable-5-2", outTokens - opus - sonnet]);
+      byModel.push(["claude-fable-5-2", claudeOut - opus - sonnet]);
+      if (ollamaOut > 0) byModel.push([ACT_OLLAMA_MODEL, ollamaOut]);
     }
     hours.push({
       t: new Date(ACT_START + hour * HOUR).toISOString(),
@@ -249,6 +267,84 @@ function activityWaited(indexes) {
 const ACT_WHAT_IT_SHOWS =
   "Two nights with work on atlas. vega is used on three evenings and at the weekend.";
 
+// The note an hour carries when the known sessions show more Ollama tokens
+// than Ollama reported (Review Focus 5): the same words as `activity.rs`.
+const ACT_OLLAMA_NOTE =
+  "sessions show more Ollama tokens than Ollama reported for this hour";
+
+// The known sessions on Ollama models in a UTC hour: the `:cloud` part of
+// every host's lane, summed over every host (the Ollama line is the whole
+// account's, so the page's host filter does not narrow it).
+function actOllamaTracked(hour) {
+  let tracked = 0;
+  for (const host of ACT_HOSTS) tracked += actOllamaOut(host, hour);
+  return tracked;
+}
+
+// Ollama's own use: a deterministic line per working hour. The known sessions
+// are the `:cloud` tokens the lanes carry, so the tooltip names sessions the
+// page shows; the total is therefore always at least the tracked figure,
+// except at 10:00 UTC where it is smaller on purpose (the note, no rest). At
+// 15:00 UTC the hour has known sessions but no Ollama figure. `withLine` is
+// false for `?fixture=noollama`: no Ollama line at all.
+function actOllamaHour(hour, withLine) {
+  const tracked = actOllamaTracked(hour);
+  if (!withLine || tracked <= 0) {
+    return { total: null, tracked, other: null, note: null };
+  }
+  const clock = new Date(ACT_START + hour * HOUR).getUTCHours();
+  // An hour with known sessions but no Ollama line (seatswap was off, or no
+  // Ollama account was configured): no other value and no note.
+  if (clock === 15) {
+    return { total: null, tracked, other: null, note: null };
+  }
+  // An hour in which the known sessions used more than Ollama reported: no
+  // other value, never a negative, and the note.
+  if (clock === 10) {
+    if (tracked <= 1200) {
+      throw new Error(`the fixture's 10:00 hour has only ${tracked} tracked tokens`);
+    }
+    return { total: tracked - 1200, tracked, other: null, note: ACT_OLLAMA_NOTE };
+  }
+  const reported = tracked + Math.round(tracked * 0.9) + 900;
+  return { total: reported, tracked, other: reported - tracked, note: null };
+}
+
+function activityOllama(indexes) {
+  const withLine = !noOllamaWanted();
+  const hours = [];
+  for (let step = 0; step < 168; step += 1) {
+    const hour = ACT_FIRST + step;
+    const entry = actOllamaHour(hour, withLine);
+    hours.push({
+      t: new Date(ACT_START + hour * HOUR).toISOString(),
+      total: entry.total,
+      tracked: entry.tracked,
+      other: entry.other,
+      note: entry.note,
+    });
+  }
+  const start = weekTime(indexes[0]);
+  const end = Math.min(ACT_NOW, weekTime(indexes[indexes.length - 1]) + 7 * DAY);
+  let otherTokens = 0;
+  let hoursWithoutFigure = 0;
+  let moreTrackedHours = 0;
+  let reportedHours = 0;
+  for (
+    let hour = Math.ceil((start - ACT_START) / HOUR);
+    hour < ACT_NOW_HOUR;
+    hour += 1
+  ) {
+    if (ACT_START + hour * HOUR >= end) break;
+    const entry = actOllamaHour(hour, withLine);
+    if (entry.total !== null) reportedHours += 1;
+    if (entry.total === null && entry.tracked > 0) hoursWithoutFigure += 1;
+    if (entry.total !== null && entry.tracked > entry.total) moreTrackedHours += 1;
+    if (entry.other !== null) otherTokens += entry.other;
+  }
+  return { hours, otherTokens, hoursWithoutFigure, moreTrackedHours, reportedHours };
+}
+
 // A 30-character host name for the wrapping check (`?fixture=longhost`).
 const ACT_LONG_HOSTS = {
   atlas: "atlas-sam-workstation-nov-2026",
@@ -259,6 +355,17 @@ function longHostsWanted() {
   if (typeof location === "undefined" || typeof URLSearchParams !== "function") return false;
   try {
     return new URLSearchParams(location.search).get("fixture") === "longhost";
+  } catch {
+    return false;
+  }
+}
+
+// `?fixture=noollama`: the page of a user without an Ollama line, so the
+// Ollama KPI, lane and legend entry must not appear.
+function noOllamaWanted() {
+  if (typeof location === "undefined" || typeof URLSearchParams !== "function") return false;
+  try {
+    return new URLSearchParams(location.search).get("fixture") === "noollama";
   } catch {
     return false;
   }
@@ -357,6 +464,7 @@ export function activity(query) {
       totalValues: sumValues(lanes.map((lane) => lane.values)),
       perWorkingHour: working > 0 ? laneOut / working : null,
       whatItShows: ACT_WHAT_IT_SHOWS,
+      ollama: activityOllama(indexes),
     }
   );
 }

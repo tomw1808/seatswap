@@ -2,6 +2,10 @@
 /* ---------- Activity ---------- */
 
 .stats-activity {
+  /* "Other Ollama use" has one meaning in both themes: this token is the
+     series' colour on the Activity page alone, so it cannot be confused with
+     a host's lane or a model's colour. */
+  --stats-act-ollama: #a78bfa;
   flex: 1 0 auto;
   align-content: start;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
@@ -10,6 +14,10 @@
      card. */
   grid-template-rows: auto auto minmax(min-content, 1fr);
   gap: 12px;
+}
+
+html[data-theme="light"] .stats-activity {
+  --stats-act-ollama: #7c3aed;
 }
 
 .stats-activity-kpis-card,
@@ -63,6 +71,19 @@
   text-overflow: ellipsis;
 }
 
+/* The Activity legend wraps whole labels instead of cutting one: at 1000 px
+   the model list and "other Ollama use" must stay readable. Scoped to this
+   page's legend, so the overview's own labels keep their rule. */
+.stats-act-legend .stats-legend-item {
+  flex: 0 0 auto;
+}
+
+.stats-act-legend .stats-legend-name {
+  max-width: none;
+  overflow: visible;
+  text-overflow: clip;
+}
+
 .stats-act-hours-body {
   flex: 1;
   /* The chart's 213 px plus its 8 px bottom padding: the row above cannot
@@ -83,7 +104,10 @@
 .stats-act-hours-body .chart-hours {
   flex: 1 1 auto;
   min-width: 0;
-  height: 213px;
+  /* The mock-up's 213 px for the two host lanes. The Ollama lane is one more
+     series, so the chart grows with it instead of squeezing or clipping a
+     lane; the card above the bottom row grows with the chart. */
+  min-height: 213px;
 }
 
 .stats-act-hours-body .chart-hours-row {

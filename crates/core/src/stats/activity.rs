@@ -8,7 +8,7 @@ use chrono::{DateTime, Datelike, Days, Duration, NaiveDate, TimeZone, Timelike, 
 use serde::Serialize;
 
 use crate::history::{
-    Event, EventKind, Hosted, Hosts, Range, SessionRecord, TokenRecord, UpRecord,
+    Event, EventKind, Hosted, Hosts, OllamaHourRecord, Range, SessionRecord, TokenRecord, UpRecord,
 };
 use crate::live_sessions::{most_output, session_label, Values};
 use crate::money::{Valued, Valuer};
@@ -145,6 +145,57 @@ pub struct BigSession {
     pub agents: Option<u32>,
 }
 
+/// One hour of Ollama's own usage beside the known sessions on Ollama models.
+///
+/// Ollama's lines are whole UTC hours, while `t` is the local lane cell that
+/// hour's start falls in. `total` is the largest Ollama line of that UTC hour
+/// across every host (never a sum over hosts); `tracked` is the input + output
+/// of every known session on an Ollama model whose instant falls in the same
+/// UTC hour. The two always name the same UTC hour, never two local hours that
+/// only look equal.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OllamaHour {
+    /// The start of the local lane hour: the local hour in which the UTC
+    /// hour's start falls, the same instant as the lane's cell.
+    pub t: DateTime<Utc>,
+    /// Input + output of the largest `OllamaHourRecord` for the UTC hour;
+    /// `None` when no host has an Ollama line for it.
+    pub total: Option<u64>,
+    /// The input + output of the known sessions on Ollama models in the same
+    /// UTC hour.
+    pub tracked: u64,
+    /// The rest of the hour: `total - tracked` when `total` is at least
+    /// `tracked`; `None` without an Ollama line, or when the known sessions
+    /// show more tokens than Ollama reported (Review Focus 5). It is never
+    /// negative and never silently 0.
+    pub other: Option<u64>,
+    /// The mismatch note when `tracked` exceeds `total`: the hour shows no
+    /// "other" value, only this note (Review Focus 5).
+    pub note: Option<String>,
+}
+
+/// Ollama's use on the Activity page: the hour series of the chart and the
+/// totals of the page's range.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OllamaUse {
+    /// One entry per lane hour, oldest first, so the page can draw the series
+    /// beside the host lanes without adding an hour itself.
+    pub hours: Vec<OllamaHour>,
+    /// The sum of the hours' `other` values inside the page's range.
+    pub other_tokens: u64,
+    /// The hours of the page's range with known sessions on Ollama models but
+    /// no Ollama line: no other value and no note.
+    pub hours_without_figure: u32,
+    /// The hours of the page's range whose known sessions show more Ollama
+    /// tokens than Ollama reported.
+    pub more_tracked_hours: u32,
+    /// The UTC hours of the page's range with an Ollama line. With 0 the page
+    /// has nothing to say about Ollama and shows no KPI, lane or legend entry.
+    pub reported_hours: u32,
+}
+
 /// The Activity page: the lanes, the days, the weeks, the largest sessions,
 /// the waited minutes and the peak hour.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -172,6 +223,8 @@ pub struct ActivityPage {
     /// The "What it shows" sentence, computed from the lanes: a night run and
     /// a host used in the evening and at the weekend.
     pub what_it_shows: String,
+    /// Ollama's own use beside the known sessions on Ollama models (N3).
+    pub ollama: OllamaUse,
 }
 
 /// The Rhythm page of the range the query names.
@@ -271,6 +324,9 @@ pub(crate) fn activity_in<Tz: TimeZone + Copy>(
     let ups = keep_warnings(ctx.warnings, || {
         ctx.history.read::<UpRecord>(&Range::ALL, &Hosts::All)
     })?;
+    let ollama = keep_warnings(ctx.warnings, || {
+        ctx.history.read::<OllamaHourRecord>(&read, &Hosts::All)
+    })?;
     let entries = chosen_entries(ctx, q, range, &valuer, &tokens.records);
     let lane_entries = chosen_entries(ctx, q, &lane, &valuer, &tokens.records);
     let day_entries = chosen_entries(ctx, q, &day_window, &valuer, &tokens.records);
@@ -284,6 +340,7 @@ pub(crate) fn activity_in<Tz: TimeZone + Copy>(
     let peak_hour = peak_hour(ctx, &entries);
     let (total_tokens, total_values, per_working_hour) = lane_totals(&lanes);
     let what_it_shows = what_it_shows_text(ctx, &lanes);
+    let ollama = ollama_use(ctx, range, &lane, &ollama.records, &tokens.records);
 
     Ok(ActivityPage {
         lanes,
@@ -296,6 +353,7 @@ pub(crate) fn activity_in<Tz: TimeZone + Copy>(
         total_values,
         per_working_hour,
         what_it_shows,
+        ollama,
     })
 }
 
@@ -857,6 +915,175 @@ fn peak_hour<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, entries: &[Entry]) -> Tokens {
     best.unwrap_or_default()
 }
 
+/// The note an hour carries when the known sessions show more Ollama tokens
+/// than Ollama reported for it (Review Focus 5). The hour has no "other"
+/// value; a negative rest is never shown or rounded to 0.
+const MORE_TRACKED_NOTE: &str =
+    "sessions show more Ollama tokens than Ollama reported for this hour";
+
+/// Whether a token record's model is one of Ollama's. The history's
+/// [`TokenRecord`] keeps the model and no provider field, so the model name is
+/// the one per-row signal: a model ending in `:cloud` is an Ollama cloud model
+/// (the names H-1 records, e.g. `deepseek-v4.1-flash:cloud`).
+fn is_ollama_model(model: &str) -> bool {
+    model.ends_with(":cloud")
+}
+
+/// The hour's largest Ollama line across the hosts that wrote one.
+///
+/// A bucket only grows while its hour runs, so a later answer has no smaller
+/// count; the largest line is therefore the newest. Several lines for one hour
+/// (the same host writing again, or two hosts polling one Ollama account) are
+/// never summed. Ties fall back to the larger cached input, requests and USD,
+/// then to the host name that sorts first.
+fn largest_ollama_line<'a>(lines: &[&'a Hosted<OllamaHourRecord>]) -> Option<&'a OllamaHourRecord> {
+    let total = |hosted: &Hosted<OllamaHourRecord>| hosted.record.input + hosted.record.output;
+    lines
+        .iter()
+        .copied()
+        .max_by(|a, b| {
+            total(a)
+                .cmp(&total(b))
+                .then_with(|| a.record.cached_input.cmp(&b.record.cached_input))
+                .then_with(|| a.record.requests.cmp(&b.record.requests))
+                .then_with(|| a.record.usd.total_cmp(&b.record.usd))
+                .then_with(|| b.host.cmp(&a.host))
+        })
+        .map(|hosted| &hosted.record)
+}
+
+/// The start of the whole UTC hour that holds `t`.
+fn utc_hour_start(t: DateTime<Utc>) -> DateTime<Utc> {
+    local_hour_start(t, &Utc)
+}
+
+/// The start of the whole UTC hour that begins inside the local lane hour
+/// `t`; a local lane cell always holds exactly one UTC hour start.
+fn utc_hour_in_local_hour(t: DateTime<Utc>) -> DateTime<Utc> {
+    let into_hour = t.timestamp().rem_euclid(3600);
+    if into_hour == 0 {
+        t
+    } else {
+        t + Duration::seconds(3600 - into_hour)
+    }
+}
+
+/// The input + output of the known sessions on Ollama models, per UTC hour.
+///
+/// Ollama's buckets are whole UTC hours, so a session's tokens belong to the
+/// UTC hour that holds its instant, not to the local hour the lane draws.
+fn tracked_ollama(records: &[Hosted<TokenRecord>]) -> BTreeMap<DateTime<Utc>, u64> {
+    let mut by_hour: BTreeMap<DateTime<Utc>, u64> = BTreeMap::new();
+    for hosted in records {
+        if !is_ollama_model(&hosted.record.model) {
+            continue;
+        }
+        *by_hour.entry(utc_hour_start(hosted.record.t)).or_insert(0) +=
+            hosted.record.input + hosted.record.out;
+    }
+    by_hour
+}
+
+/// Ollama's own use beside the known sessions on Ollama models (N3).
+///
+/// `records` are every host's [`OllamaHourRecord`] over `read`, the window that
+/// holds the page's range and its lanes. `sessions` is every host's and every
+/// account's [`TokenRecord`] over the same window, not the page's chosen
+/// entries: Ollama's line belongs to the whole Ollama account, so the known
+/// sessions subtracted from it are every session on an Ollama model, whatever
+/// host or account the page filters to. `lane` is the chart's 168-hour window;
+/// the returned [`OllamaUse::hours`] has one entry per local hour of it, oldest
+/// first, so the page can draw it beside the host lanes.
+///
+/// Ollama's lines are whole UTC hours: the known sessions of a UTC hour are
+/// subtracted from that same UTC hour's bucket. For the chart the bucket's
+/// figures go to the local lane cell in which the UTC hour starts (in a zone
+/// with a 30- or 45-minute offset the bar sits in the local hour where
+/// Ollama's hour starts). The sums ([`OllamaUse::other_tokens`],
+/// [`OllamaUse::hours_without_figure`], [`OllamaUse::more_tracked_hours`],
+/// [`OllamaUse::reported_hours`]) count the UTC hours whose start is inside
+/// `range`, the page's chosen range.
+///
+/// Ollama's line for an hour is the LARGEST line across all hosts, never a sum
+/// over hosts: two hosts may poll one Ollama account and write the same bucket.
+fn ollama_use<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
+    range: &Range,
+    lane: &Range,
+    records: &[Hosted<OllamaHourRecord>],
+    sessions: &[Hosted<TokenRecord>],
+) -> OllamaUse {
+    let mut lines: BTreeMap<DateTime<Utc>, Vec<&Hosted<OllamaHourRecord>>> = BTreeMap::new();
+    for hosted in records {
+        lines
+            .entry(utc_hour_start(hosted.record.hour))
+            .or_default()
+            .push(hosted);
+    }
+    let largest: BTreeMap<DateTime<Utc>, &OllamaHourRecord> = lines
+        .iter()
+        .filter_map(|(hour, lines)| largest_ollama_line(lines).map(|record| (*hour, record)))
+        .collect();
+
+    let tracked = tracked_ollama(sessions);
+
+    let mut hours = Vec::with_capacity(168);
+    for step in 0..168 {
+        let t = local_hour_start(lane.from + Duration::hours(step), &ctx.zone);
+        let utc_hour = utc_hour_in_local_hour(t);
+        let total = largest
+            .get(&utc_hour)
+            .map(|record| record.input + record.output);
+        let tracked = tracked.get(&utc_hour).copied().unwrap_or(0);
+        let other = total
+            .filter(|total| *total >= tracked)
+            .map(|total| total - tracked);
+        let note = total
+            .filter(|total| tracked > *total)
+            .map(|_| MORE_TRACKED_NOTE.to_string());
+        hours.push(OllamaHour {
+            t,
+            total,
+            tracked,
+            other,
+            note,
+        });
+    }
+
+    let mut other_tokens = 0;
+    let mut more_tracked_hours = 0;
+    let mut reported_hours = 0;
+    let mut recorded: BTreeSet<DateTime<Utc>> = BTreeSet::new();
+    for (hour, record) in &largest {
+        if *hour < range.from || *hour >= range.to {
+            continue;
+        }
+        reported_hours += 1;
+        recorded.insert(*hour);
+        let tracked = tracked.get(hour).copied().unwrap_or(0);
+        let total = record.input + record.output;
+        if tracked > total {
+            more_tracked_hours += 1;
+        } else {
+            other_tokens += total - tracked;
+        }
+    }
+    let hours_without_figure = tracked
+        .iter()
+        .filter(|(hour, tokens)| {
+            **tokens > 0 && **hour >= range.from && **hour < range.to && !recorded.contains(*hour)
+        })
+        .count() as u32;
+
+    OllamaUse {
+        hours,
+        other_tokens,
+        hours_without_figure,
+        more_tracked_hours,
+        reported_hours,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -901,6 +1128,44 @@ mod tests {
             answers: 1,
             agent_answers: 0,
         }
+    }
+
+    /// An Ollama hour line, as the provider thread writes it.
+    fn ollama_line(hour: &str, input: u64, output: u64) -> OllamaHourRecord {
+        OllamaHourRecord {
+            hour: utc(hour),
+            requests: 1,
+            input,
+            cached_input: 0,
+            output,
+            usd: 0.01,
+        }
+    }
+
+    /// A token record of a known session on an Ollama cloud model.
+    fn ollama_record(t: &str, session: &str, input: u64, out: u64) -> TokenRecord {
+        TokenRecord {
+            t: utc(t),
+            session: session.to_string(),
+            cwd: "/home/sam/projects/atlas/engine".to_string(),
+            project: atlas(),
+            model: "deepseek-v4.1-flash:cloud".to_string(),
+            input,
+            out,
+            cw: 0,
+            cr: 0,
+            answers: 1,
+            agent_answers: 0,
+        }
+    }
+
+    fn ollama_hour<'a>(page: &'a ActivityPage, t: &str) -> &'a OllamaHour {
+        let at = utc(t);
+        page.ollama
+            .hours
+            .iter()
+            .find(|hour| hour.t == at)
+            .unwrap_or_else(|| panic!("the Ollama hour {t}"))
     }
 
     fn lane<'a>(page: &'a ActivityPage, host: &str) -> &'a HostLane {
@@ -1804,6 +2069,273 @@ mod tests {
             "a host with neither is not named: {}",
             page.what_it_shows
         );
+    }
+
+    /// Ollama's total input + output for an hour minus the chosen sessions on
+    /// Ollama models in it is the "other Ollama use". A Claude record of the
+    /// same hour is not subtracted.
+    #[test]
+    fn other_use_is_the_rest_of_the_hour() {
+        let tiny = tiny();
+        // Ollama's line for 14 Nov 10:00: 600,000 input + 400,000 output.
+        tiny.history
+            .append(&ollama_line("2026-11-14T10:00:00Z", 600_000, 400_000))
+            .expect("the Ollama line");
+        // A known session on an Ollama model in the same hour: 100,000 input
+        // + 150,000 output. The fixture's Claude record of 2,000,000 output
+        // tokens in that hour is not Ollama's.
+        tiny.history
+            .append(&ollama_record(
+                "2026-11-14T10:05:00Z",
+                "a9",
+                100_000,
+                150_000,
+            ))
+            .expect("the Ollama token record");
+
+        let page = activity_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        let hour = ollama_hour(&page, "2026-11-14T10:00:00Z");
+        assert_eq!(hour.total, Some(1_000_000));
+        assert_eq!(hour.tracked, 250_000);
+        assert_eq!(hour.other, Some(750_000));
+        assert_eq!(hour.note, None);
+        assert_eq!(page.ollama.other_tokens, 750_000);
+        assert_eq!(page.ollama.hours_without_figure, 0);
+        assert_eq!(page.ollama.more_tracked_hours, 0);
+        assert_eq!(page.ollama.reported_hours, 1);
+    }
+
+    /// Review Focus 5: when the known sessions used more Ollama tokens than
+    /// Ollama reported in an hour, there is no other value (never a negative,
+    /// never a silent 0) and the hour carries the note. An hour with sessions
+    /// on Ollama models but no Ollama line has neither an other value nor a
+    /// note; it is counted as an hour without an Ollama figure.
+    #[test]
+    fn more_tracked_than_reported_is_a_note_not_a_negative() {
+        let tiny = tiny();
+        // Ollama reported 100,000 tokens; the known session shows 150,000.
+        tiny.history
+            .append(&ollama_line("2026-11-14T10:00:00Z", 60_000, 40_000))
+            .expect("the Ollama line");
+        tiny.history
+            .append(&ollama_record(
+                "2026-11-14T10:20:00Z",
+                "a9",
+                100_000,
+                50_000,
+            ))
+            .expect("the more tracked record");
+        // 14 Nov 11:00: an Ollama session with no Ollama line (seatswap was
+        // off or no Ollama account was configured).
+        tiny.history
+            .append(&ollama_record("2026-11-14T11:10:00Z", "a10", 10_000, 5_000))
+            .expect("the record without an Ollama line");
+
+        let page = activity_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        let hour = ollama_hour(&page, "2026-11-14T10:00:00Z");
+        assert_eq!(hour.total, Some(100_000));
+        assert_eq!(hour.tracked, 150_000);
+        assert_eq!(hour.other, None, "never a negative rest");
+        assert_eq!(
+            hour.note.as_deref(),
+            Some("sessions show more Ollama tokens than Ollama reported for this hour")
+        );
+
+        let without = ollama_hour(&page, "2026-11-14T11:00:00Z");
+        assert_eq!(without.total, None);
+        assert_eq!(without.tracked, 15_000);
+        assert_eq!(without.other, None);
+        assert_eq!(without.note, None);
+
+        assert_eq!(page.ollama.other_tokens, 0);
+        assert_eq!(page.ollama.hours_without_figure, 1);
+        assert_eq!(page.ollama.more_tracked_hours, 1);
+        assert_eq!(page.ollama.reported_hours, 1);
+    }
+
+    /// Two hosts polling the same Ollama account each write a line for the
+    /// same hour. The hour's figure is the largest line, never the sum over
+    /// hosts (a bucket only grows, so the largest is the newest).
+    #[test]
+    fn two_hosts_one_hour_take_the_largest() {
+        let tiny = tiny();
+        tiny.history
+            .append(&ollama_line("2026-11-14T10:00:00Z", 600_000, 400_000))
+            .expect("atlas's Ollama line");
+        let vega = HistoryDir::at(tiny.dir.path(), "vega");
+        vega.append(&ollama_line("2026-11-14T10:00:00Z", 900_000, 600_000))
+            .expect("vega's Ollama line");
+        fs::write(
+            tiny.dir.path().join("vega/host.json"),
+            "{\"machineId\":\"0b4e7c22-6a1d-4e3f-8c59-2d7a9e1b4f60\"}",
+        )
+        .expect("the vega marker");
+
+        let page = activity_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        let hour = ollama_hour(&page, "2026-11-14T10:00:00Z");
+        assert_eq!(
+            hour.total,
+            Some(1_500_000),
+            "the larger line (input + output), not 1,000,000 + 1,500,000"
+        );
+        assert_eq!(hour.other, Some(1_500_000));
+        assert_eq!(page.ollama.other_tokens, 1_500_000);
+        assert_eq!(page.ollama.reported_hours, 1);
+    }
+
+    /// Ollama's buckets are whole UTC hours, while the lane's hours are local.
+    /// In a zone with a half-hour offset the UTC hour that holds a known
+    /// session's tokens is not the hour the session looks like in the lane; the
+    /// session is still subtracted from the UTC hour that holds it.
+    #[test]
+    fn an_ollama_session_is_subtracted_from_the_hour_that_holds_it() {
+        let tiny = tiny();
+        // Ollama's bucket 10:00..11:00 UTC: 600,000 input + 400,000 output.
+        tiny.history
+            .append(&ollama_line("2026-11-14T10:00:00Z", 600_000, 400_000))
+            .expect("the Ollama line");
+        // A known session on an Ollama model inside that bucket: 10:45 UTC.
+        tiny.history
+            .append(&ollama_record(
+                "2026-11-14T10:45:00Z",
+                "a9",
+                100_000,
+                150_000,
+            ))
+            .expect("the Ollama token record");
+
+        let ctx = Ctx {
+            zone: FixedOffset::east_opt(5 * 3600 + 1800).expect("+05:30"),
+            ..tiny.ctx()
+        };
+        let page = activity_in(&ctx, &two_weeks(), &all()).unwrap();
+
+        // The known session's tokens are in Ollama's figure, so the rest of
+        // the figure is 1,000,000 - 250,000.
+        assert_eq!(
+            page.ollama.other_tokens, 750_000,
+            "the known session's 250,000 tokens are part of Ollama's figure"
+        );
+        let drawn: u64 = page.ollama.hours.iter().filter_map(|hour| hour.other).sum();
+        assert_eq!(
+            drawn, 750_000,
+            "the chart's hours show the same rest as the KPI"
+        );
+        assert_eq!(
+            page.ollama.hours_without_figure, 0,
+            "the session's hour has an Ollama figure: the bucket that holds it"
+        );
+        assert_eq!(page.ollama.more_tracked_hours, 0);
+    }
+
+    /// A UTC hour's figures go to the local lane cell in which that UTC hour
+    /// starts. At −03:30 the range's first UTC hour (00:00) starts at 20:30
+    /// local on the day before, so its bar is in the 20:00 cell, and its
+    /// session is subtracted there.
+    #[test]
+    fn ollama_hours_are_utc_hours_in_a_half_hour_zone() {
+        let tiny = tiny();
+        tiny.history
+            .append(&ollama_line("2026-11-09T00:00:00Z", 600_000, 400_000))
+            .expect("the Ollama line of the range's first hour");
+        tiny.history
+            .append(&ollama_record(
+                "2026-11-09T00:45:00Z",
+                "a9",
+                100_000,
+                150_000,
+            ))
+            .expect("the Ollama token record");
+        let range = Range {
+            from: utc("2026-11-09T00:00:00Z"),
+            // The lane is the last 168 local hours of the range; this end
+            // keeps the range's first UTC hour inside the lane at −03:30.
+            to: utc("2026-11-15T23:00:00Z"),
+        };
+
+        let ctx = Ctx {
+            zone: FixedOffset::west_opt(3 * 3600 + 1800).expect("-03:30"),
+            ..tiny.ctx()
+        };
+        let page = activity_in(&ctx, &range, &all()).unwrap();
+
+        assert_eq!(page.ollama.reported_hours, 1);
+        assert_eq!(page.ollama.other_tokens, 750_000);
+        assert_eq!(page.ollama.hours_without_figure, 0);
+        // The UTC hour 00:00 on 9 Nov starts at 20:30 local on 8 Nov; the
+        // lane's 20:00 cell is the instant 23:30 UTC on 8 Nov.
+        let cell = ollama_hour(&page, "2026-11-08T23:30:00Z");
+        assert_eq!(cell.total, Some(1_000_000));
+        assert_eq!(cell.tracked, 250_000);
+        assert_eq!(cell.other, Some(750_000));
+    }
+
+    /// Ollama's line is the whole account's, so every session on an Ollama
+    /// model of every host is subtracted, whatever host the page filters to.
+    #[test]
+    fn ollama_sessions_of_every_host_are_subtracted() {
+        let tiny = tiny();
+        tiny.history
+            .append(&ollama_record(
+                "2026-11-14T10:05:00Z",
+                "a9",
+                100_000,
+                150_000,
+            ))
+            .expect("atlas's Ollama token record");
+        let vega = HistoryDir::at(tiny.dir.path(), "vega");
+        vega.append(&ollama_record("2026-11-14T10:15:00Z", "v1", 50_000, 50_000))
+            .expect("vega's Ollama token record");
+        fs::write(
+            tiny.dir.path().join("vega/host.json"),
+            "{\"machineId\":\"0b4e7c22-6a1d-4e3f-8c59-2d7a9e1b4f60\"}",
+        )
+        .expect("the vega marker");
+        tiny.history
+            .append(&ollama_line("2026-11-14T10:00:00Z", 600_000, 400_000))
+            .expect("the Ollama line");
+
+        let all_hosts = activity_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        let one_host = activity_in(&tiny.ctx(), &two_weeks(), &host_query("atlas")).unwrap();
+        assert_eq!(
+            one_host.ollama, all_hosts.ollama,
+            "the Ollama numbers do not follow the host filter"
+        );
+        let hour = ollama_hour(&all_hosts, "2026-11-14T10:00:00Z");
+        assert_eq!(
+            hour.tracked, 350_000,
+            "both hosts' sessions are in the same UTC hour"
+        );
+        assert_eq!(hour.other, Some(650_000));
+    }
+
+    /// `reported_hours` counts the UTC hours whose start is inside the page's
+    /// range, also when the window read for the lanes and days is wider.
+    #[test]
+    fn reported_hours_counts_the_utc_hours_of_the_range() {
+        let tiny = tiny();
+        // Read for the lane and the day window, but before the range.
+        tiny.history
+            .append(&ollama_line("2026-11-03T00:00:00Z", 60_000, 40_000))
+            .expect("the line before the range");
+        tiny.history
+            .append(&ollama_line("2026-11-09T00:00:00Z", 600_000, 400_000))
+            .expect("the range's first hour");
+        tiny.history
+            .append(&ollama_line("2026-11-15T23:00:00Z", 300_000, 200_000))
+            .expect("the range's last hour");
+        let range = Range {
+            from: utc("2026-11-09T00:00:00Z"),
+            to: utc("2026-11-16T00:00:00Z"),
+        };
+
+        let page = activity_in(&tiny.ctx(), &range, &all()).unwrap();
+        assert_eq!(
+            page.ollama.reported_hours, 2,
+            "the line of 3 Nov is outside the range"
+        );
+        assert_eq!(page.ollama.other_tokens, 1_500_000);
+        assert_eq!(page.ollama.hours_without_figure, 0);
     }
 
     /// The lanes carry no agent data: an hour is "work" when it has tokens.
