@@ -1,0 +1,801 @@
+//! The Ollama reader (spec §7.1): the local server's balance and its usage over
+//! the last 24 h into a [`ProviderReading`]. A new plan is a monthly dollar
+//! allowance, an older one keeps a session and a weekly percent. Nothing of
+//! Ollama is ever written and no request generates text.
+
+use chrono::{DateTime, Utc};
+use serde_json::{Map, Value};
+
+use crate::api::{Api, ApiError, Limit, LimitKind, Severity, Usage};
+use crate::history::AccountRef;
+
+use super::{mark_highest_active, Credits, ProviderError, ProviderReading, OLLAMA_ORG};
+
+/// Read Ollama's cloud balance and the spend of the last 24 hours.
+///
+/// The configured base URL is checked first: a URL the settings refuse never
+/// reaches the server. The balance is what the card needs: a failed or
+/// incomplete usage answer only leaves [`ProviderReading::spend_24h`] empty and
+/// the reading is still `Ok`.
+pub fn read(base_url: &str, api: &Api) -> Result<ProviderReading, ProviderError> {
+    crate::store::validate_ollama_url(base_url)
+        .map_err(|error| ProviderError::Setting(error.to_string()))?;
+    let balance = api.ollama_balance(base_url).map_err(|error| match error {
+        ApiError::NoConnection(_) => ProviderError::NotRunning {
+            url: base_url.to_string(),
+        },
+        other => ProviderError::Api(other),
+    })?;
+    let (usage, credits) = balance_reading(&balance)?;
+    let spend_24h = api.ollama_usage_24h(base_url).ok().and_then(|answer| {
+        answer
+            .get("totals")
+            .and_then(|totals| totals.get("usage_usd"))
+            .and_then(amount)
+    });
+    Ok(ProviderReading {
+        account: AccountRef {
+            acc: OLLAMA_ORG.to_string(),
+            org: OLLAMA_ORG.to_string(),
+        },
+        plan: None,
+        usage,
+        credits,
+        spend_24h,
+    })
+}
+
+/// A JSON number, whole or fractional; anything else is `None`.
+pub fn amount(value: &Value) -> Option<f64> {
+    value.as_f64()
+}
+
+/// A balance answer into the usage limits and the credits it carries.
+fn balance_reading(balance: &Value) -> Result<(Option<Usage>, Option<Credits>), ProviderError> {
+    let object = balance
+        .as_object()
+        .ok_or_else(|| ProviderError::Shape("the Ollama balance answer is not an object".into()))?;
+    let included = match object.get("included") {
+        Some(Value::Object(included)) => included,
+        None => {
+            return Err(ProviderError::Shape(
+                "the Ollama balance answer has no included".to_string(),
+            ))
+        }
+        Some(_) => {
+            return Err(ProviderError::Shape(
+                "the Ollama balance answer's included is not an object".to_string(),
+            ))
+        }
+    };
+    if included.contains_key("balance_usd") {
+        if included.contains_key("session") || included.contains_key("weekly") {
+            return Err(ProviderError::Shape(
+                "the Ollama balance answer has both credits and session limits".to_string(),
+            ));
+        }
+        new_plan(object, included)
+    } else if included.contains_key("session") || included.contains_key("weekly") {
+        old_plan(included)
+    } else {
+        Err(ProviderError::Shape(
+            "the Ollama balance answer has neither credits nor session limits".to_string(),
+        ))
+    }
+}
+
+/// A new plan: the included credits and the monthly dollar allowance.
+fn new_plan(
+    object: &Map<String, Value>,
+    included: &Map<String, Value>,
+) -> Result<(Option<Usage>, Option<Credits>), ProviderError> {
+    let left = required_amount(included, "balance_usd", "included.balance_usd")?;
+    if left < 0.0 {
+        return Err(ProviderError::Shape(
+            "included.balance_usd is negative".to_string(),
+        ));
+    }
+    let allowance = optional_amount(included, "allowance_usd", "included.allowance_usd")?;
+    if let Some(allowance) = allowance {
+        if allowance < 0.0 {
+            return Err(ProviderError::Shape(
+                "included.allowance_usd is negative".to_string(),
+            ));
+        }
+        if left > allowance {
+            return Err(ProviderError::Shape(format!(
+                "included.balance_usd {left} is above included.allowance_usd {allowance}"
+            )));
+        }
+    }
+    let until = match included.get("period") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(period)) => time(period.get("until"), "included.period.until")?,
+        Some(_) => {
+            return Err(ProviderError::Shape(
+                "included.period is not an object".to_string(),
+            ))
+        }
+    };
+    let purchased = match object.get("purchased") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(purchased)) => {
+            optional_amount(purchased, "balance_usd", "purchased.balance_usd")?
+        }
+        Some(_) => {
+            return Err(ProviderError::Shape(
+                "purchased is not an object".to_string(),
+            ))
+        }
+    };
+
+    // Without a known allowance the share used is undefined, so there is no
+    // limit to record; the credits are still shown. A zero allowance has no
+    // share either (a balance above one is refused above), and dividing by it
+    // would be meaningless.
+    let usage = match allowance {
+        Some(allowance) if allowance != 0.0 => {
+            let percent = (allowance - left) / allowance * 100.0;
+            Some(Usage {
+                limits: vec![Limit {
+                    kind: LimitKind::Other("monthly_credits".to_string()),
+                    percent,
+                    severity: Severity::Normal,
+                    resets_at: until,
+                    model: None,
+                    is_active: true,
+                }],
+                extra_usage_enabled: false,
+            })
+        }
+        _ => None,
+    };
+    Ok((
+        usage,
+        Some(Credits {
+            left,
+            allowance,
+            until,
+            purchased,
+        }),
+    ))
+}
+
+/// An old plan: a session and a weekly limit, as a Claude account has them.
+fn old_plan(
+    included: &Map<String, Value>,
+) -> Result<(Option<Usage>, Option<Credits>), ProviderError> {
+    let mut limits = Vec::new();
+    for (name, kind) in [
+        ("session", LimitKind::Session),
+        ("weekly", LimitKind::WeeklyAll),
+    ] {
+        match included.get(name) {
+            None | Some(Value::Null) => {}
+            Some(window) => limits.push(percent_limit(window, &format!("included.{name}"), kind)?),
+        }
+    }
+    if limits.is_empty() {
+        return Err(ProviderError::Shape(
+            "the Ollama balance answer's session and weekly are null".to_string(),
+        ));
+    }
+    mark_highest_active(&mut limits);
+    Ok((
+        Some(Usage {
+            limits,
+            extra_usage_enabled: false,
+        }),
+        None,
+    ))
+}
+
+/// An old plan's window: `remaining_percent` becomes the used percent.
+fn percent_limit(window: &Value, path: &str, kind: LimitKind) -> Result<Limit, ProviderError> {
+    let object = window
+        .as_object()
+        .ok_or_else(|| ProviderError::Shape(format!("{path} is not an object")))?;
+    let remaining = required_amount(
+        object,
+        "remaining_percent",
+        &format!("{path}.remaining_percent"),
+    )?;
+    if !(0.0..=100.0).contains(&remaining) {
+        return Err(ProviderError::Shape(format!(
+            "{path}.remaining_percent is outside 0..=100"
+        )));
+    }
+    Ok(Limit {
+        kind,
+        percent: 100.0 - remaining,
+        severity: Severity::Normal,
+        resets_at: time(object.get("resets_at"), &format!("{path}.resets_at"))?,
+        model: None,
+        is_active: false,
+    })
+}
+
+fn required_amount(
+    object: &Map<String, Value>,
+    key: &str,
+    path: &str,
+) -> Result<f64, ProviderError> {
+    match object.get(key) {
+        None | Some(Value::Null) => Err(ProviderError::Shape(format!("{path} is missing"))),
+        Some(value) => {
+            amount(value).ok_or_else(|| ProviderError::Shape(format!("{path} is not a number")))
+        }
+    }
+}
+
+fn optional_amount(
+    object: &Map<String, Value>,
+    key: &str,
+    path: &str,
+) -> Result<Option<f64>, ProviderError> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => amount(value)
+            .map(Some)
+            .ok_or_else(|| ProviderError::Shape(format!("{path} is not a number"))),
+    }
+}
+
+/// A reset time given as RFC 3339 text.
+fn time(value: Option<&Value>, path: &str) -> Result<Option<DateTime<Utc>>, ProviderError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => DateTime::parse_from_rfc3339(text)
+            .map(|time| Some(time.with_timezone(&Utc)))
+            .map_err(|error| {
+                ProviderError::Shape(format!("{path} is not an RFC 3339 time: {error}"))
+            }),
+        Some(_) => Err(ProviderError::Shape(format!("{path} is not a string"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::net::TcpListener;
+    use std::sync::mpsc::{self, Receiver};
+    use std::thread::{self, JoinHandle};
+
+    use serde_json::json;
+    use tiny_http::{Response, Server, StatusCode};
+
+    const NEW_PLAN_BALANCE: &str = r#"{
+      "included": {
+        "balance_usd": 212.4,
+        "allowance_usd": 300,
+        "period": {
+          "from": "2026-11-03T00:00:00Z",
+          "until": "2026-12-03T00:00:00Z"
+        }
+      },
+      "purchased": {"balance_usd": 0}
+    }"#;
+
+    const OLD_PLAN_BALANCE: &str = r#"{
+      "included": {
+        "session": {"remaining_percent": 88, "resets_at": "2026-11-14T19:30:00Z"},
+        "weekly": {"remaining_percent": 52, "resets_at": "2026-11-16T02:00:00Z"}
+      }
+    }"#;
+
+    const USAGE_ANSWER: &str = r#"{
+      "totals": {
+        "request_count": 412,
+        "usage_usd": 3.18,
+        "input_tokens": 5120000,
+        "cached_input_tokens": 3900000,
+        "output_tokens": 640000
+      },
+      "buckets": [
+        {"from": "2026-11-13T00:00:00Z", "until": "2026-11-13T01:00:00Z",
+         "request_count": 17, "usage_usd": 0.12, "input_tokens": 210000,
+         "cached_input_tokens": 160000, "output_tokens": 26000}
+      ]
+    }"#;
+
+    fn at(text: &str) -> DateTime<Utc> {
+        text.parse().expect("an RFC 3339 time")
+    }
+
+    struct Reply {
+        status: u16,
+        body: String,
+    }
+
+    impl Reply {
+        fn ok(body: impl Into<String>) -> Reply {
+            Reply {
+                status: 200,
+                body: body.into(),
+            }
+        }
+
+        fn status(status: u16, body: impl Into<String>) -> Reply {
+            Reply {
+                status,
+                body: body.into(),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct Captured {
+        method: String,
+        path: String,
+        headers: Vec<(String, String)>,
+    }
+
+    impl Captured {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(field, _)| field.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str())
+        }
+    }
+
+    fn capture(request: &mut tiny_http::Request) -> Captured {
+        let mut body = String::new();
+        request.as_reader().read_to_string(&mut body).unwrap();
+        Captured {
+            method: request.method().as_str().to_string(),
+            path: request.url().to_string(),
+            headers: request
+                .headers()
+                .iter()
+                .map(|header| {
+                    (
+                        header.field.as_str().as_str().to_string(),
+                        header.value.as_str().to_string(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// A fake Ollama that answers the balance and then the 24 h usage.
+    fn start_ollama(
+        balance: Reply,
+        usage: Reply,
+    ) -> (String, Receiver<Vec<Captured>>, JoinHandle<()>) {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let base = format!("http://{address}");
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let mut request = server.recv().unwrap();
+                let reply = if request.url().contains("/api/balance") {
+                    &balance
+                } else {
+                    &usage
+                };
+                requests.push(capture(&mut request));
+                let response = Response::from_string(reply.body.clone())
+                    .with_status_code(StatusCode(reply.status));
+                request.respond(response).unwrap();
+            }
+            sender.send(requests).unwrap();
+        });
+        (base, receiver, handle)
+    }
+
+    /// A fake Ollama that answers one request and stops.
+    fn start_one(reply: Reply) -> (String, Receiver<Captured>, JoinHandle<()>) {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let base = format!("http://{address}");
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut request = server.recv().unwrap();
+            let captured = capture(&mut request);
+            let response =
+                Response::from_string(reply.body).with_status_code(StatusCode(reply.status));
+            request.respond(response).unwrap();
+            sender.send(captured).unwrap();
+        });
+        (base, receiver, handle)
+    }
+
+    fn captured(receiver: &Receiver<Vec<Captured>>, handle: JoinHandle<()>) -> Vec<Captured> {
+        let requests = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the fake Ollama received no request");
+        handle.join().unwrap();
+        requests
+    }
+
+    /// A port nothing listens on.
+    fn closed_base() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{address}")
+    }
+
+    /// One balance answer on a fake Ollama that serves a single request.
+    fn read_one_reply(balance: &str) -> Result<ProviderReading, ProviderError> {
+        let (base, receiver, handle) = start_one(Reply::ok(balance));
+        let reading = read(&base, &Api::new());
+        let _ = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the fake Ollama received no request");
+        handle.join().unwrap();
+        reading
+    }
+
+    #[test]
+    fn credits_from_the_new_plan() {
+        let (base, receiver, handle) =
+            start_ollama(Reply::ok(NEW_PLAN_BALANCE), Reply::ok(USAGE_ANSWER));
+        let reading = read(&base, &Api::new()).unwrap();
+        let _ = captured(&receiver, handle);
+
+        assert_eq!(
+            reading.credits,
+            Some(Credits {
+                left: 212.4,
+                allowance: Some(300.0),
+                until: Some(at("2026-12-03T00:00:00Z")),
+                purchased: Some(0.0),
+            })
+        );
+        let usage = reading.usage.expect("a monthly credits limit");
+        assert_eq!(usage.limits.len(), 1);
+        let limit = &usage.limits[0];
+        assert_eq!(limit.kind, LimitKind::Other("monthly_credits".to_string()));
+        assert!((limit.percent - 29.2).abs() < 1e-9, "{}", limit.percent);
+        assert_eq!(limit.severity, Severity::Normal);
+        assert_eq!(limit.resets_at, Some(at("2026-12-03T00:00:00Z")));
+        assert_eq!(limit.model, None);
+        assert!(limit.is_active);
+        assert!(!usage.extra_usage_enabled);
+        assert_eq!(reading.spend_24h, Some(3.18));
+        assert_eq!(reading.plan, None);
+        assert_eq!(
+            reading.account,
+            AccountRef {
+                acc: "ollama".to_string(),
+                org: "ollama".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn amounts_are_numbers_whole_or_fractional() {
+        assert_eq!(
+            amount(&json!({"allowance_usd": 300})["allowance_usd"]),
+            Some(300.0)
+        );
+        assert_eq!(
+            amount(&json!({"balance_usd": 212.4})["balance_usd"]),
+            Some(212.4)
+        );
+        assert_eq!(
+            amount(&json!({"balance_usd": "212.4"})["balance_usd"]),
+            None
+        );
+
+        let balance = r#"{
+          "included": {
+            "balance_usd": "212.4",
+            "allowance_usd": 300,
+            "period": {"until": "2026-12-03T00:00:00Z"}
+          },
+          "purchased": {"balance_usd": 0}
+        }"#;
+        let (base, receiver, handle) = start_one(Reply::ok(balance));
+        match read(&base, &Api::new()) {
+            Err(ProviderError::Shape(text)) => {
+                assert!(text.contains("included.balance_usd"), "{text}")
+            }
+            other => panic!("expected Shape, got {other:?}"),
+        }
+        let _ = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the fake Ollama received no request");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn an_old_plan_becomes_two_limits() {
+        let (base, receiver, handle) =
+            start_ollama(Reply::ok(OLD_PLAN_BALANCE), Reply::ok(USAGE_ANSWER));
+        let reading = read(&base, &Api::new()).unwrap();
+        let _ = captured(&receiver, handle);
+
+        assert_eq!(reading.credits, None);
+        let usage = reading.usage.expect("two limits");
+        assert_eq!(usage.limits.len(), 2);
+
+        let session = usage.session().expect("a session limit");
+        assert_eq!(session.percent, 12.0);
+        assert_eq!(session.resets_at, Some(at("2026-11-14T19:30:00Z")));
+        assert!(!session.is_active);
+
+        let weekly = usage.weekly_all().expect("a weekly limit");
+        assert_eq!(weekly.percent, 48.0);
+        assert_eq!(weekly.resets_at, Some(at("2026-11-16T02:00:00Z")));
+        assert!(weekly.is_active);
+
+        assert_eq!(reading.spend_24h, Some(3.18));
+    }
+
+    #[test]
+    fn a_refused_connection_is_not_running() {
+        let base = closed_base();
+        match read(&base, &Api::new()) {
+            Err(ProviderError::NotRunning { url }) => assert_eq!(url, base),
+            other => panic!("expected NotRunning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn usage_failing_does_not_fail_the_balance() {
+        let (base, receiver, handle) = start_ollama(
+            Reply::ok(NEW_PLAN_BALANCE),
+            Reply::status(500, "internal error"),
+        );
+        let reading = read(&base, &Api::new()).unwrap();
+        let _ = captured(&receiver, handle);
+
+        assert_eq!(reading.spend_24h, None);
+        assert_eq!(
+            reading.credits,
+            Some(Credits {
+                left: 212.4,
+                allowance: Some(300.0),
+                until: Some(at("2026-12-03T00:00:00Z")),
+                purchased: Some(0.0),
+            })
+        );
+    }
+
+    #[test]
+    fn only_get_requests_are_sent() {
+        let (base, receiver, handle) =
+            start_ollama(Reply::ok(NEW_PLAN_BALANCE), Reply::ok(USAGE_ANSWER));
+        let _ = read(&base, &Api::new()).unwrap();
+        let requests = captured(&receiver, handle);
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(requests[0].path, "/api/balance");
+        assert_eq!(requests[1].method, "GET");
+        assert_eq!(requests[1].path, "/api/usage?range=24h");
+        for request in &requests {
+            assert!(request
+                .header("User-Agent")
+                .is_some_and(|value| value.starts_with("seatswap/")));
+        }
+    }
+
+    #[test]
+    fn a_trailing_slash_gives_one_slash() {
+        let (base, receiver, handle) =
+            start_ollama(Reply::ok(NEW_PLAN_BALANCE), Reply::ok(USAGE_ANSWER));
+        let _ = read(&format!("{base}/"), &Api::new()).unwrap();
+        let requests = captured(&receiver, handle);
+
+        assert_eq!(requests[0].path, "/api/balance");
+        assert_eq!(requests[1].path, "/api/usage?range=24h");
+    }
+
+    #[test]
+    fn a_base_path_is_kept() {
+        let (base, receiver, handle) =
+            start_ollama(Reply::ok(NEW_PLAN_BALANCE), Reply::ok(USAGE_ANSWER));
+        let _ = read(&format!("{base}/base"), &Api::new()).unwrap();
+        let requests = captured(&receiver, handle);
+
+        assert_eq!(requests[0].path, "/base/api/balance");
+        assert_eq!(requests[1].path, "/base/api/usage?range=24h");
+    }
+
+    // ---- proof tests of the review ----
+
+    /// A fake Ollama that answers every request with `balance` (the 24 h usage
+    /// is answered with the fixture) and reports the path of each.
+    fn start_recorder(balance: &str) -> (String, Receiver<String>, JoinHandle<()>) {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let base = format!("http://{address}");
+        let balance = balance.to_string();
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            while let Ok(Some(request)) = server.recv_timeout(std::time::Duration::from_millis(500))
+            {
+                let path = request.url().to_string();
+                let body = if path.contains("/api/balance") {
+                    balance.clone()
+                } else {
+                    USAGE_ANSWER.to_string()
+                };
+                let response = Response::from_string(body).with_status_code(StatusCode(200));
+                request.respond(response).unwrap();
+                if sender.send(path).is_err() {
+                    break;
+                }
+            }
+        });
+        (base, receiver, handle)
+    }
+
+    /// The paths the fake Ollama saw, in the order it saw them.
+    fn paths_seen(receiver: &Receiver<String>, handle: JoinHandle<()>) -> Vec<String> {
+        let mut paths = Vec::new();
+        while let Ok(path) = receiver.recv_timeout(std::time::Duration::from_millis(200)) {
+            paths.push(path);
+        }
+        handle.join().unwrap();
+        paths
+    }
+
+    /// A new plan whose numbers do not allow a share: a balance above the
+    /// allowance, a negative balance, a negative allowance. The reader must
+    /// not show a percent outside 0..=100, the range the numbers allow.
+    #[test]
+    fn a_new_plan_with_impossible_amounts_has_no_made_up_percent() {
+        for (balance, allowance) in [("400", "300"), ("-50", "300"), ("212.4", "-300")] {
+            let body = format!(
+                r#"{{"included":{{"balance_usd":{balance},"allowance_usd":{allowance}}}}}"#
+            );
+            let (base, _receiver, handle) = start_recorder(&body);
+            let reading = read(&base, &Api::new());
+            handle.join().unwrap();
+
+            match reading {
+                Ok(reading) => {
+                    for limit in reading.usage.into_iter().flat_map(|usage| usage.limits) {
+                        assert!(
+                            (0.0..=100.0).contains(&limit.percent),
+                            "a balance of {balance} of an allowance of {allowance} claims {} %",
+                            limit.percent
+                        );
+                    }
+                }
+                Err(ProviderError::Shape(_)) => {}
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+    }
+
+    /// An old plan whose `remaining_percent` is outside 0..=100: the percent
+    /// the reader shows must stay inside the range the numbers allow.
+    #[test]
+    fn an_old_plan_with_an_impossible_remaining_percent_has_no_made_up_percent() {
+        for remaining in ["120", "-5"] {
+            let body = format!(
+                r#"{{"included":{{"session":{{"remaining_percent":{remaining},"resets_at":"2026-11-14T19:30:00Z"}}}}}}"#
+            );
+            let (base, _receiver, handle) = start_recorder(&body);
+            let reading = read(&base, &Api::new());
+            handle.join().unwrap();
+
+            match reading {
+                Ok(reading) => {
+                    for limit in reading.usage.into_iter().flat_map(|usage| usage.limits) {
+                        assert!(
+                            (0.0..=100.0).contains(&limit.percent),
+                            "a remaining percent of {remaining} claims {} %",
+                            limit.percent
+                        );
+                    }
+                }
+                Err(ProviderError::Shape(_)) => {}
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+    }
+
+    /// A base URL with two slashes is one the settings refuse; the reader must
+    /// report the setting and send nothing.
+    #[test]
+    fn a_base_with_two_slashes_is_refused() {
+        let (base, receiver, handle) = start_recorder(NEW_PLAN_BALANCE);
+        let reading = read(&format!("{base}//"), &Api::new());
+        let paths = paths_seen(&receiver, handle);
+
+        match reading {
+            Err(ProviderError::Setting(text)) => assert!(text.contains("ollamaUrl"), "{text}"),
+            other => panic!("expected Setting, got {other:?}"),
+        }
+        assert!(paths.is_empty(), "the reader asked {paths:?}");
+    }
+
+    /// A base URL with a query string is one the settings refuse; the reader
+    /// must report the setting and send nothing.
+    #[test]
+    fn a_base_with_a_query_string_is_refused() {
+        let (base, receiver, handle) = start_recorder(NEW_PLAN_BALANCE);
+        let reading = read(&format!("{base}?x=1"), &Api::new());
+        let paths = paths_seen(&receiver, handle);
+
+        match reading {
+            Err(ProviderError::Setting(text)) => assert!(text.contains("ollamaUrl"), "{text}"),
+            other => panic!("expected Setting, got {other:?}"),
+        }
+        assert!(paths.is_empty(), "the reader asked {paths:?}");
+    }
+
+    /// An amount outside what the plan allows names its own path, so the card
+    /// can say which number is wrong.
+    #[test]
+    fn impossible_amounts_are_shape_errors_naming_their_path() {
+        for (balance, path) in [
+            (
+                r#"{"included":{"balance_usd":400,"allowance_usd":300}}"#,
+                "included.balance_usd",
+            ),
+            (
+                r#"{"included":{"balance_usd":-50,"allowance_usd":300}}"#,
+                "included.balance_usd",
+            ),
+            (
+                r#"{"included":{"balance_usd":212.4,"allowance_usd":-300}}"#,
+                "included.allowance_usd",
+            ),
+            (
+                r#"{"included":{"session":{"remaining_percent":120,"resets_at":"2026-11-14T19:30:00Z"}}}"#,
+                "included.session.remaining_percent",
+            ),
+            (
+                r#"{"included":{"weekly":{"remaining_percent":-5,"resets_at":"2026-11-16T02:00:00Z"}}}"#,
+                "included.weekly.remaining_percent",
+            ),
+        ] {
+            match read_one_reply(balance) {
+                Err(ProviderError::Shape(text)) => {
+                    assert!(text.contains(path), "{balance}: {text}")
+                }
+                other => panic!("expected Shape for {balance}, got {other:?}"),
+            }
+        }
+    }
+
+    /// A zero allowance leaves the share undefined: the credits are shown and
+    /// there is no limit.
+    #[test]
+    fn a_zero_allowance_shows_the_credits_without_a_limit() {
+        let (base, receiver, handle) = start_ollama(
+            Reply::ok(r#"{"included":{"balance_usd":0,"allowance_usd":0}}"#),
+            Reply::ok(USAGE_ANSWER),
+        );
+        let reading = read(&base, &Api::new()).unwrap();
+        let _ = captured(&receiver, handle);
+
+        assert_eq!(reading.usage, None);
+        assert_eq!(
+            reading.credits,
+            Some(Credits {
+                left: 0.0,
+                allowance: Some(0.0),
+                until: None,
+                purchased: None,
+            })
+        );
+    }
+
+    /// An answer that carries both plan shapes at once is neither plan.
+    #[test]
+    fn both_plan_shapes_at_once_is_a_shape_error() {
+        let reading = read_one_reply(
+            r#"{"included":{"balance_usd":212.4,"allowance_usd":300,"session":{"remaining_percent":88,"resets_at":"2026-11-14T19:30:00Z"}}}"#,
+        );
+
+        match reading {
+            Err(ProviderError::Shape(text)) => assert_eq!(
+                text,
+                "the Ollama balance answer has both credits and session limits"
+            ),
+            other => panic!("expected Shape, got {other:?}"),
+        }
+    }
+}

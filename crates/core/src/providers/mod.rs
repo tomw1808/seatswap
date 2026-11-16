@@ -1,17 +1,24 @@
 //! The other providers (spec §7): one reader per provider, read-only, into
 //! seatswap's own `Usage` and `Limit` types so cards, colours and history
-//! need no second implementation. Codex's `auth.json` is only ever read; no
-//! token is refreshed, stored or printed, and nothing of a provider is written.
+//! need no second implementation. Codex's `auth.json` is only ever read and
+//! Ollama's own server is only ever asked for its balance and usage; no token
+//! is refreshed, stored or printed, and nothing of a provider is written.
 
 use std::io;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 
-use crate::api::{ApiError, Usage};
+use crate::api::{ApiError, Limit, Usage};
 use crate::history::AccountRef;
 
 pub mod codex;
+pub mod ollama;
+
+/// The `org` of a Codex [`AccountRef`]; its `acc` is the account id.
+pub const CODEX_ORG: &str = "codex";
+/// The `org` of an Ollama [`AccountRef`]; its `acc` is the same name.
+pub const OLLAMA_ORG: &str = "ollama";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
@@ -23,6 +30,8 @@ pub enum ProviderError {
     LoginExpired,
     #[error("Ollama is not running on {url}.")]
     NotRunning { url: String },
+    #[error("{0}")]
+    Setting(String),
     #[error(transparent)]
     Api(ApiError),
     #[error("Unexpected answer: {0}")]
@@ -52,4 +61,19 @@ pub struct ProviderReading {
     pub usage: Option<Usage>,
     pub credits: Option<Credits>,
     pub spend_24h: Option<f64>,
+}
+
+/// Exactly one limit is active: the one with the highest percent, the first of
+/// equals.
+pub(crate) fn mark_highest_active(limits: &mut [Limit]) {
+    let mut highest: Option<usize> = None;
+    for (index, limit) in limits.iter().enumerate() {
+        match highest {
+            Some(best) if limits[best].percent >= limit.percent => {}
+            _ => highest = Some(index),
+        }
+    }
+    if let Some(index) = highest {
+        limits[index].is_active = true;
+    }
 }

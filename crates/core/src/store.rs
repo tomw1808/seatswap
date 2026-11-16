@@ -1051,11 +1051,13 @@ impl Settings {
 /// host — the text after the scheme, up to the first `/`, `?` or `#`, must not
 /// be empty and must have a non-empty part before a port colon — and contain no
 /// whitespace or control character anywhere: no HTTP client can use such a
-/// URL, so it is refused here and not at the request. A port (`:8443`), a path
-/// (`/base`), an IPv6 host (`[::1]`) and a trailing slash are fine. Anything
-/// else is [`StoreError::InvalidSetting`] naming the field and the value, never
-/// a fallback.
-fn validate_ollama_url(url: &str) -> Result<(), StoreError> {
+/// URL, so it is refused here and not at the request. It must have no query
+/// string (`?…`), no fragment (`#…`) and no empty path segment (`//` after the
+/// host): the reader appends `/api/…` to the base, which such a URL would
+/// mangle. A port (`:8443`), a path (`/base`), an IPv6 host (`[::1]`) and a
+/// single trailing slash are fine. Anything else is [`StoreError::InvalidSetting`]
+/// naming the field and the value, never a fallback.
+pub fn validate_ollama_url(url: &str) -> Result<(), StoreError> {
     if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err(StoreError::InvalidSetting(format!(
             "ollamaUrl must not contain a whitespace or control character, got {url:?}"
@@ -1077,6 +1079,22 @@ fn validate_ollama_url(url: &str) -> Result<(), StoreError> {
     if host.is_empty() {
         return Err(StoreError::InvalidSetting(format!(
             "ollamaUrl must name a host after http:// or https://, got {url:?}"
+        )));
+    }
+    if url.contains('?') {
+        return Err(StoreError::InvalidSetting(format!(
+            "ollamaUrl must not have a query string, got {url:?}"
+        )));
+    }
+    if url.contains('#') {
+        return Err(StoreError::InvalidSetting(format!(
+            "ollamaUrl must not have a fragment, got {url:?}"
+        )));
+    }
+    let path = &rest[authority.len()..];
+    if path.contains("//") {
+        return Err(StoreError::InvalidSetting(format!(
+            "ollamaUrl must not have an empty path segment, got {url:?}"
         )));
     }
     Ok(())
@@ -2718,6 +2736,69 @@ mod tests {
                 }
                 other => panic!("expected InvalidSetting for {bad:?}, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn validate_rejects_an_ollama_url_with_a_query() {
+        let url = "http://127.0.0.1:11434/?x=1";
+        let settings = Settings {
+            ollama_url: url.to_string(),
+            ..Settings::default()
+        };
+        match settings.validate() {
+            Err(StoreError::InvalidSetting(message)) => {
+                assert!(message.contains("ollamaUrl"), "{message}");
+                assert!(message.contains(&format!("{url:?}")), "{message}");
+            }
+            other => panic!("expected InvalidSetting for {url:?}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_an_ollama_url_with_a_fragment() {
+        let url = "http://127.0.0.1:11434/#top";
+        let settings = Settings {
+            ollama_url: url.to_string(),
+            ..Settings::default()
+        };
+        match settings.validate() {
+            Err(StoreError::InvalidSetting(message)) => {
+                assert!(message.contains("ollamaUrl"), "{message}");
+                assert!(message.contains(&format!("{url:?}")), "{message}");
+            }
+            other => panic!("expected InvalidSetting for {url:?}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_an_ollama_url_with_an_empty_path_segment() {
+        for url in ["http://127.0.0.1:11434//", "http://127.0.0.1:11434/a//b"] {
+            let settings = Settings {
+                ollama_url: url.to_string(),
+                ..Settings::default()
+            };
+            match settings.validate() {
+                Err(StoreError::InvalidSetting(message)) => {
+                    assert!(message.contains("ollamaUrl"), "{message}");
+                    assert!(message.contains(&format!("{url:?}")), "{message}");
+                }
+                other => panic!("expected InvalidSetting for {url:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn validate_accepts_an_ollama_url_with_a_path_or_a_single_trailing_slash() {
+        for url in [
+            "https://ollama.example:8443/base",
+            "http://127.0.0.1:11434/",
+        ] {
+            let settings = Settings {
+                ollama_url: url.to_string(),
+                ..Settings::default()
+            };
+            assert!(settings.validate().is_ok(), "{url:?} must be accepted");
         }
     }
 

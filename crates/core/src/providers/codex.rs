@@ -9,7 +9,7 @@ use crate::api::{Api, ApiError, Limit, LimitKind, Severity, Usage};
 use crate::history::AccountRef;
 use crate::paths::CodexPaths;
 
-use super::{ProviderError, ProviderReading};
+use super::{mark_highest_active, ProviderError, ProviderReading, CODEX_ORG};
 
 /// Read Codex's login and ask its usage endpoint for the account's limits.
 pub fn read(paths: &CodexPaths, api: &Api) -> Result<ProviderReading, ProviderError> {
@@ -181,7 +181,7 @@ pub fn usage_from(answer: &Value) -> Result<(Usage, Option<String>, AccountRef),
         plan,
         AccountRef {
             acc: account_id.to_string(),
-            org: "codex".to_string(),
+            org: CODEX_ORG.to_string(),
         },
     ))
 }
@@ -302,21 +302,6 @@ fn plan_type(value: Option<&Value>) -> Result<Option<String>, ProviderError> {
         Some(_) => Err(ProviderError::Shape(
             "the Codex answer's plan_type is not a string".to_string(),
         )),
-    }
-}
-
-/// Exactly one limit is active: the one with the highest percent, the first of
-/// equals.
-fn mark_highest_active(limits: &mut [Limit]) {
-    let mut highest: Option<usize> = None;
-    for (index, limit) in limits.iter().enumerate() {
-        match highest {
-            Some(best) if limits[best].percent >= limit.percent => {}
-            _ => highest = Some(index),
-        }
-    }
-    if let Some(index) = highest {
-        limits[index].is_active = true;
     }
 }
 

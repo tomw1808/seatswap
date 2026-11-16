@@ -1,8 +1,8 @@
 //! The HTTP endpoints seatswap uses: an account's usage, the OAuth token
-//! refresh (spec §3, §6.3, §7.2, §7.3), Codex's usage (spec §7.2), models.dev's
-//! prices and Frankfurter's dollar rate (spec §1.4.1). The first three are
-//! undocumented, so their URLs, headers and reply shapes live here and nowhere
-//! else.
+//! refresh (spec §3, §6.3, §7.2, §7.3), Codex's usage (spec §7.2), Ollama's
+//! balance and usage (spec §7.1), models.dev's prices and Frankfurter's
+//! dollar rate (spec §1.4.1). The first three are undocumented, so their URLs,
+//! headers and reply shapes live here and nowhere else.
 
 use std::io::Read;
 use std::time::Duration;
@@ -59,6 +59,8 @@ pub enum ApiError {
     Http { status: u16, body: String },
     #[error("network error: {0}")]
     Network(String),
+    #[error("cannot connect: {0}")]
+    NoConnection(String),
     #[error("cannot decode the reply: {0}")]
     Decode(String),
 }
@@ -69,7 +71,10 @@ impl ApiError {
     pub fn is_transient(&self) -> bool {
         matches!(
             self,
-            ApiError::RateLimited { .. } | ApiError::Server(_) | ApiError::Network(_)
+            ApiError::RateLimited { .. }
+                | ApiError::Server(_)
+                | ApiError::Network(_)
+                | ApiError::NoConnection(_)
         )
     }
 }
@@ -149,6 +154,24 @@ impl Api {
             .set("User-Agent", USER_AGENT)
             .set("Authorization", &format!("Bearer {access_token}"))
             .set("chatgpt-account-id", account_id);
+        get_json(request)
+    }
+
+    /// GET Ollama's cloud balance from the server at `base_url`.
+    pub fn ollama_balance(&self, base_url: &str) -> Result<serde_json::Value, ApiError> {
+        let request = self
+            .agent
+            .get(&ollama_url(base_url, "/api/balance"))
+            .set("User-Agent", USER_AGENT);
+        get_json(request)
+    }
+
+    /// GET Ollama's usage over the last 24 hours from the server at `base_url`.
+    pub fn ollama_usage_24h(&self, base_url: &str) -> Result<serde_json::Value, ApiError> {
+        let request = self
+            .agent
+            .get(&ollama_url(base_url, "/api/usage?range=24h"))
+            .set("User-Agent", USER_AGENT);
         get_json(request)
     }
 
@@ -287,16 +310,44 @@ fn get_json(request: ureq::Request) -> Result<Value, ApiError> {
     serde_json::from_str(&body).map_err(|error| ApiError::Decode(error.to_string()))
 }
 
+/// An Ollama request's URL: `base_url` without one trailing `/`, then the
+/// endpoint's own path, so a base with a path (`https://host/base`) keeps it.
+fn ollama_url(base_url: &str, path: &str) -> String {
+    let base = base_url.strip_suffix('/').unwrap_or(base_url);
+    format!("{base}{path}")
+}
+
 /// A transport failure. ureq's `BadHeader` text is the whole header line, which
 /// for `Authorization` carries the token; that kind keeps no text of ours that
-/// names a header value (rule: no error text may contain a token).
+/// names a header value (rule: no error text may contain a token). A refused
+/// connection is its own variant, so a caller can tell "nothing listens there"
+/// from a line that broke: ureq maps every connect error to `ConnectionFailed`,
+/// a failed TLS handshake included, so only a `ConnectionRefused` in the
+/// source chain is a refused connection.
 fn transport_error(error: ureq::Transport) -> ApiError {
     match error.kind() {
+        ureq::ErrorKind::ConnectionFailed if refused_connection(&error) => {
+            ApiError::NoConnection(error.to_string())
+        }
         ureq::ErrorKind::BadHeader => {
             ApiError::Network("a request header holds a character that is not allowed".to_string())
         }
         _ => ApiError::Network(error.to_string()),
     }
+}
+
+/// Whether a transport error's source chain holds a refused connection.
+fn refused_connection(error: &ureq::Transport) -> bool {
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        if let Some(io_error) = cause.downcast_ref::<std::io::Error>() {
+            if io_error.kind() == std::io::ErrorKind::ConnectionRefused {
+                return true;
+            }
+        }
+        source = std::error::Error::source(cause);
+    }
+    false
 }
 
 fn too_large() -> ApiError {
@@ -1148,9 +1199,10 @@ mod tests {
     }
 
     #[test]
-    fn closed_port_is_a_network_error() {
+    fn a_refused_connection_is_no_connection() {
         let error = closed_port_api().usage(&usage_token()).unwrap_err();
-        assert!(matches!(error, ApiError::Network(_)), "got {error:?}");
+        assert!(matches!(error, ApiError::NoConnection(_)), "got {error:?}");
+        assert!(error.is_transient());
     }
 
     #[test]
@@ -1688,5 +1740,34 @@ mod tests {
         let _ = captured(&receiver, handle);
         assert!(matches!(error, ApiError::Decode(_)), "got {error:?}");
         assert!(error.to_string().contains("EUR"), "got {error}");
+    }
+
+    // ---- proof tests of the review ----
+
+    /// ureq's `ConnectionFailed` is its kind for *every* connect error, and a
+    /// failed TLS handshake is one of them (ureq's `rtls.rs` maps the handshake
+    /// error to `ConnectionFailed`). Something is listening in that case, so it
+    /// is not "nothing listens there" and must not be `NoConnection`.
+    #[test]
+    fn a_failed_tls_handshake_is_not_a_refused_connection() {
+        // A server that accepts the connection and closes it at once: the TLS
+        // handshake cannot finish.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let base = format!("https://{address}");
+        let handle = thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                drop(stream);
+            }
+        });
+
+        let error = Api::new()
+            .ollama_balance(&base)
+            .expect_err("the TLS handshake fails");
+        let _ = handle.join();
+        assert!(
+            !matches!(error, ApiError::NoConnection(_)),
+            "a failed TLS handshake is reported as a refused connection: {error:?}"
+        );
     }
 }
