@@ -977,6 +977,7 @@ mod tests {
                 drop: None,
                 time_format: Some(TimeFormat::Seatswap),
                 text: None,
+                separator: None,
             }],
             margin: 0,
         };
@@ -1252,6 +1253,7 @@ mod tests {
             drop: None,
             time_format: None,
             text: None,
+            separator: None,
         };
         let mut folder = part(SegmentKind::Folder);
         folder.prefix = String::new();
@@ -1314,6 +1316,7 @@ mod tests {
                 drop: Some(1),
                 time_format: None,
                 text: None,
+                separator: None,
             }],
             right: Vec::new(),
             margin: 0,

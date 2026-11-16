@@ -173,8 +173,8 @@ pub struct StatuslineConfig {
 
 /// One segment of a status line zone. `prefix` and `suffix` are printed only
 /// when the segment has a value; `drop` is the drop order (1 is dropped first,
-/// `None` is never dropped); `time_format` is used by the reset segments and
-/// `text` by the `Text` segment.
+/// `None` is never dropped); `time_format` is used by the reset segments,
+/// `text` by the `Text` segment and `separator` by the `Separator` segment.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Segment {
@@ -191,6 +191,38 @@ pub struct Segment {
     pub time_format: Option<TimeFormat>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// The character a separator segment prints. `None` is a pipe: that is the
+    /// documented rule for a layout saved by 1.1.0, which stored no character.
+    /// Only a separator segment takes one; saving it on another kind is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub separator: Option<SeparatorChar>,
+}
+
+/// The character a separator segment prints (spec §5.4): `│`, `·`, `•`, `/`,
+/// `›`, or one space ("blank"). Serialised camelCase (`"pipe"`, `"dot"`, …).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SeparatorChar {
+    Pipe,
+    Dot,
+    Bullet,
+    Slash,
+    Chevron,
+    Blank,
+}
+
+impl SeparatorChar {
+    /// The character this choice prints.
+    pub fn text(self) -> &'static str {
+        match self {
+            SeparatorChar::Pipe => "│",
+            SeparatorChar::Dot => "·",
+            SeparatorChar::Bullet => "•",
+            SeparatorChar::Slash => "/",
+            SeparatorChar::Chevron => "›",
+            SeparatorChar::Blank => " ",
+        }
+    }
 }
 
 /// What a status line segment shows (spec §5.4).
@@ -503,6 +535,7 @@ impl StatuslineConfig {
                     drop: None,
                     time_format: None,
                     text: None,
+                    separator: None,
                 },
                 Segment {
                     kind: SegmentKind::Text,
@@ -512,6 +545,7 @@ impl StatuslineConfig {
                     drop: None,
                     time_format: None,
                     text: Some(":".to_string()),
+                    separator: None,
                 },
                 Segment {
                     kind: SegmentKind::Folder,
@@ -523,6 +557,7 @@ impl StatuslineConfig {
                     drop: None,
                     time_format: None,
                     text: None,
+                    separator: None,
                 },
                 Segment {
                     kind: SegmentKind::Model,
@@ -532,6 +567,7 @@ impl StatuslineConfig {
                     drop: None,
                     time_format: None,
                     text: None,
+                    separator: None,
                 },
                 Segment {
                     kind: SegmentKind::Effort,
@@ -541,6 +577,7 @@ impl StatuslineConfig {
                     drop: None,
                     time_format: None,
                     text: None,
+                    separator: None,
                 },
             ],
             right: vec![
@@ -552,6 +589,7 @@ impl StatuslineConfig {
                     drop: None,
                     time_format: None,
                     text: None,
+                    separator: None,
                 },
                 Segment {
                     kind: SegmentKind::FiveHourPercent,
@@ -561,6 +599,7 @@ impl StatuslineConfig {
                     drop: Some(2),
                     time_format: None,
                     text: None,
+                    separator: None,
                 },
                 Segment {
                     kind: SegmentKind::FiveHourReset,
@@ -570,6 +609,7 @@ impl StatuslineConfig {
                     drop: Some(1),
                     time_format: Some(TimeFormat::CompactLeft),
                     text: None,
+                    separator: None,
                 },
                 Segment {
                     kind: SegmentKind::WeekPercent,
@@ -579,6 +619,7 @@ impl StatuslineConfig {
                     drop: None,
                     time_format: None,
                     text: None,
+                    separator: None,
                 },
                 Segment {
                     kind: SegmentKind::WeekReset,
@@ -588,6 +629,7 @@ impl StatuslineConfig {
                     drop: Some(1),
                     time_format: Some(TimeFormat::CompactLeft),
                     text: None,
+                    separator: None,
                 },
             ],
             margin: 4,
@@ -630,6 +672,7 @@ impl StatuslineConfig {
                 drop,
                 time_format: None,
                 text: None,
+                separator: None,
             }
         }
 
@@ -1184,6 +1227,12 @@ fn validate_statusline(config: &StatuslineConfig) -> Result<(), StoreError> {
             if segment.kind == SegmentKind::Text && segment.text.is_none() {
                 return Err(StoreError::InvalidSetting(format!(
                     "{at}.text: a Text segment needs text"
+                )));
+            }
+            if segment.separator.is_some() && segment.kind != SegmentKind::Separator {
+                return Err(StoreError::InvalidSetting(format!(
+                    "{at}.separator: {} does not take a separator character",
+                    spec.label
                 )));
             }
         }
@@ -2545,6 +2594,29 @@ mod tests {
         assert_eq!(
             statusline_error(config),
             "invalid setting: statusline.left[1].text: a Text segment needs text"
+        );
+    }
+
+    /// A separator character belongs to the separator segment; another kind
+    /// refuses it, naming the kind and its place, never quietly ignoring it.
+    #[test]
+    fn validate_refuses_a_separator_char_on_the_wrong_kind() {
+        let mut config = StatuslineConfig::current_line();
+        config.left[0].separator = Some(SeparatorChar::Dot);
+        assert_eq!(
+            statusline_error(config),
+            "invalid setting: statusline.left[0].separator: user@host does not take a separator character"
+        );
+
+        let mut config = StatuslineConfig::everything();
+        for segment in config.left.iter_mut() {
+            if segment.kind == SegmentKind::Separator {
+                segment.separator = Some(SeparatorChar::Chevron);
+            }
+        }
+        assert!(
+            settings_with_statusline(config).validate().is_ok(),
+            "a separator segment takes a separator character"
         );
     }
 

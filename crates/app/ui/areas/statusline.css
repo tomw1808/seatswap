@@ -251,6 +251,151 @@
   width: 90px;
 }
 
+.sl-prefix {
+  flex-wrap: wrap;
+  gap: 10px 14px;
+}
+
+/* A prefix or suffix field: the input, the faint mirror of its spaces behind
+   the text, and the count beside it. */
+.sl-space-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sl-space-box {
+  position: relative;
+  display: inline-flex;
+  height: 28px;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background: var(--input);
+}
+
+.sl-space-box:focus-within {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+.sl-space-input {
+  position: relative;
+  z-index: 1;
+  width: 90px;
+  height: 26px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  font-size: 12px;
+  line-height: 26px;
+}
+
+.sl-space-input:focus-visible {
+  outline: none;
+}
+
+/* The mirrored value: same text, font and padding as the input's, but its
+   characters are invisible; only each space's faint `·` (`.sl-space-dot`)
+   shows, so a dot sits in every empty cell. It scrolls with the input. */
+.sl-space-mirror {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  padding: 0 8px;
+  color: transparent;
+  font: inherit;
+  font-size: 12px;
+  line-height: 26px;
+  white-space: pre;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.sl-space-dot {
+  position: relative;
+}
+
+.sl-space-dot::after {
+  content: "·";
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  color: var(--muted);
+  opacity: 0.7;
+}
+
+.sl-space-count {
+  font-size: 11px;
+  line-height: 14px;
+  white-space: nowrap;
+}
+
+.sl-space-count:empty {
+  display: none;
+}
+
+/* The separator's six characters: one segmented control, each choice with its
+   glyph and name. */
+.sl-sep-control {
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.sl-separators {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--input);
+}
+
+.sl-sep-choice {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 22px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.sl-sep-choice:hover {
+  color: var(--text);
+}
+
+.sl-sep-choice:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+.sl-sep-choice.sel {
+  background: var(--button-bg);
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+}
+
+.sl-sep-glyph {
+  display: inline-block;
+  min-width: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 16px;
+  text-align: center;
+}
+
+.sl-sep-name {
+  font-size: 11.5px;
+}
+
 .sl-preview .ch {
   gap: 10px;
 }

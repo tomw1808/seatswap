@@ -61,6 +61,19 @@ const SCENARIOS = [
 
 const PREVIEW_DELAY_MS = 150;
 
+// The six separator characters of store.rs's `SeparatorChar`, in its order:
+// the stored id, the glyph it prints and the name the page shows. `blank` is
+// one space. The fixture's preview reads this table too, so the glyphs are
+// written once.
+export const SEPARATOR_CHARS = [
+  ["pipe", "│", "pipe"],
+  ["dot", "·", "dot"],
+  ["bullet", "•", "bullet"],
+  ["slash", "/", "slash"],
+  ["chevron", "›", "chevron"],
+  ["blank", " ", "blank"],
+];
+
 const state = {
   active: false,
   container: null,
@@ -264,6 +277,14 @@ function normalizedSegment(segment) {
     drop: segment.drop === undefined ? null : segment.drop,
     timeFormat: segment.timeFormat === undefined ? null : segment.timeFormat,
     text: segment.text === undefined ? null : segment.text,
+    // A separator without a stored character is a pipe (the 1.1.0 rule), so
+    // the two compare equal: choosing "pipe" does not make a preset custom.
+    separator:
+      segment.kind === "separator"
+        ? typeof segment.separator === "string"
+          ? segment.separator
+          : "pipe"
+        : null,
   };
 }
 
@@ -595,6 +616,14 @@ function renderErrors() {
   if (typeof state.notice === "string" && state.notice !== "") {
     state.errorHost.appendChild(banner("info", "ℹ", state.notice));
   }
+  // The box is in the page only while it shows something, so a page without an
+  // error carries no `.sl-errors` element at all.
+  const filled = state.errorHost.childNodes.length > 0;
+  if (filled && !state.errorHost.isConnected && state.root) {
+    state.root.insertBefore(state.errorHost, state.root.firstChild);
+  } else if (!filled && state.errorHost.isConnected) {
+    state.errorHost.remove();
+  }
 }
 
 function renderAll() {
@@ -604,7 +633,6 @@ function renderAll() {
   state.previewErrorHost = null;
   const errors = h("div", { class: "sl-errors" });
   state.errorHost = errors;
-  state.root.appendChild(errors);
   renderErrors();
 
   state.root.appendChild(head());
@@ -874,6 +902,13 @@ function newSegment(kind) {
   const segment = { kind, color: { rule: "none" }, prefix: "", suffix: "" };
   if (spec && spec.time) segment.timeFormat = "seatswap";
   if (spec && spec.text) segment.text = "";
+  // A separator dragged from the palette starts as ` │ `: one space before
+  // and after the character, with the pipe the 1.1.0 lines were drawn with.
+  if (kind === "separator") {
+    segment.prefix = " ";
+    segment.suffix = " ";
+    segment.separator = "pipe";
+  }
   return segment;
 }
 
@@ -1381,6 +1416,120 @@ function removeButton(selection) {
   });
 }
 
+// The separator's six characters as one segmented control: each choice shows
+// its glyph and its name, "blank" for the space. A character the page does not
+// know is shown as stored, never replaced by a guess.
+function separatorChoice(selection, segment) {
+  const stored = typeof segment.separator === "string" ? segment.separator : null;
+  const known = stored === null || SEPARATOR_CHARS.some(([id]) => id === stored);
+  const current = known ? (stored === null ? "pipe" : stored) : null;
+  const choices = SEPARATOR_CHARS.map(([id, glyph, name]) => {
+    const button = h(
+      "button",
+      {
+        type: "button",
+        class: `sl-sep-choice${id === current ? " sel" : ""}`,
+        role: "radio",
+        "aria-checked": id === current ? "true" : "false",
+        "aria-label": name,
+        dataset: { separator: id },
+        title: name === "blank" ? "blank · one space" : `${name} · ${glyph}`,
+      },
+      [
+        h("span", { class: "sl-sep-glyph", "aria-hidden": "true", text: glyph }),
+        h("span", { class: "sl-sep-name", text: name }),
+      ]
+    );
+    button.addEventListener("click", () => {
+      if (id === current) return;
+      changeSegment(
+        selection,
+        (segmentNow) => {
+          segmentNow.separator = id;
+        },
+        true
+      );
+    });
+    return button;
+  });
+  return h("span", { class: "row sl-sep-control" }, [
+    h(
+      "span",
+      { class: "sl-separators", role: "radiogroup", "aria-label": "Separator character" },
+      choices
+    ),
+    known ? null : h("span", { class: "mf sl-option-note", text: `— ${JSON.stringify(stored)} (unknown)` }),
+  ]);
+}
+
+// The characters a terminal prints as one blank column: the space and the
+// non-breaking space. The count and the dots both use this one rule.
+function isSpace(character) {
+  return character === " " || character === "\u00a0";
+}
+
+// How many spaces a prefix or suffix holds, as the words beside it: nothing
+// for none, "1 space", "2 spaces".
+function spaceCount(text) {
+  const count = [...String(text)].filter(isSpace).length;
+  if (count === 0) return "";
+  return count === 1 ? "1 space" : `${count} spaces`;
+}
+
+// The mirror's text: the value itself, so every character keeps its width, with
+// each space in its own span. The span's `::after` draws the faint `·` over it
+// (statusline.css) without taking room, so a long value stays lined up.
+function paintSpaces(mirror, value) {
+  clear(mirror);
+  let run = "";
+  for (const character of String(value)) {
+    if (isSpace(character)) {
+      if (run !== "") {
+        mirror.appendChild(document.createTextNode(run));
+        run = "";
+      }
+      mirror.appendChild(h("span", { class: "sl-space-dot", text: character }));
+    } else {
+      run += character;
+    }
+  }
+  if (run !== "") mirror.appendChild(document.createTextNode(run));
+}
+
+// A prefix or suffix field with each space made visible: a faint `·` per space
+// is drawn behind the input's text by a mirrored overlay (same font, same
+// padding, pointer-events none) and the count stands beside it. The input's
+// value stays exactly what is stored. Both fields of every kind use this one.
+function spaceField(value, opt, label, onInput) {
+  const input = h("input", {
+    type: "text",
+    spellcheck: "false",
+    class: "inp sl-space-input",
+    value,
+    dataset: { opt },
+    "aria-label": label,
+  });
+  const mirror = h("span", { class: "sl-space-mirror", "aria-hidden": "true" });
+  const count = h("span", { class: "mf sl-space-count" });
+  const sync = () => {
+    paintSpaces(mirror, input.value);
+    count.textContent = spaceCount(input.value);
+    mirror.scrollLeft = input.scrollLeft;
+  };
+  input.addEventListener("input", () => {
+    sync();
+    onInput(input.value);
+  });
+  input.addEventListener("scroll", () => {
+    mirror.scrollLeft = input.scrollLeft;
+  });
+  sync();
+  return h("span", { class: "sl-space-field" }, [
+    h("span", { class: "sl-space-box" }, [mirror, input]),
+    count,
+  ]);
+}
+
 function optionsCard() {
   const segment = selectedSegment();
   if (!segment) {
@@ -1589,32 +1738,29 @@ function optionsCard() {
     });
     body.push(optionRow("Text", text, "prints nothing when empty"));
   }
-  const prefix = h("input", {
-    type: "text",
-    spellcheck: "false",
-    class: "inp",
-    value: typeof segment.prefix === "string" ? segment.prefix : "",
-    dataset: { opt: "prefix" },
-    "aria-label": "Prefix",
-  });
-  prefix.addEventListener("input", () => {
-    changeSegment(selection, (segmentNow) => {
-      segmentNow.prefix = prefix.value;
-    });
-  });
-  const suffix = h("input", {
-    type: "text",
-    spellcheck: "false",
-    class: "inp",
-    value: typeof segment.suffix === "string" ? segment.suffix : "",
-    dataset: { opt: "suffix" },
-    "aria-label": "Suffix",
-  });
-  suffix.addEventListener("input", () => {
-    changeSegment(selection, (segmentNow) => {
-      segmentNow.suffix = suffix.value;
-    });
-  });
+  if (spec.kind === "separator") {
+    body.push(optionRow("Separator", separatorChoice(selection, segment)));
+  }
+  const prefix = spaceField(
+    typeof segment.prefix === "string" ? segment.prefix : "",
+    "prefix",
+    "Prefix",
+    (value) => {
+      changeSegment(selection, (segmentNow) => {
+        segmentNow.prefix = value;
+      });
+    }
+  );
+  const suffix = spaceField(
+    typeof segment.suffix === "string" ? segment.suffix : "",
+    "suffix",
+    "Suffix",
+    (value) => {
+      changeSegment(selection, (segmentNow) => {
+        segmentNow.suffix = value;
+      });
+    }
+  );
   body.push(
     optionRow(
       "Prefix / suffix",

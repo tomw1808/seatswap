@@ -5,6 +5,7 @@
 
 import { clone, isColor, isObject } from "../common.js";
 import { DEFAULT_SETTINGS, isoIn } from "../fixture.js";
+import { SEPARATOR_CHARS } from "../areas/statusline.js";
 
 // ---------------------------------------------------------------------------
 // the status line builder (spec §5.4). This is fixture data for the browser,
@@ -123,8 +124,13 @@ function fixtureSampleValue(kind, segment, scenario) {
       return "14:32";
     case "text":
       return typeof segment.text === "string" && segment.text !== "" ? segment.text : null;
-    case "separator":
-      return "|";
+    case "separator": {
+      // The page's one table of the six characters (store.rs's
+      // `SeparatorChar`); a separator saved without one is a pipe.
+      const chosen = typeof segment.separator === "string" ? segment.separator : "pipe";
+      const found = SEPARATOR_CHARS.find(([id]) => id === chosen);
+      return found ? found[1] : null;
+    }
     case "contextUsed":
       return "41%";
     case "sessionCost":

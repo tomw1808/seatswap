@@ -12,7 +12,9 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde::{Serialize, Serializer};
 
 use seatswap_core::project::{git_dir, repository_root};
-use seatswap_core::store::{ColorRule, Segment, SegmentKind, StatuslineConfig, TimeFormat};
+use seatswap_core::store::{
+    ColorRule, Segment, SegmentKind, SeparatorChar, StatuslineConfig, TimeFormat,
+};
 
 use super::Payload;
 use crate::format::{
@@ -641,7 +643,13 @@ where
             .as_ref()
             .filter(|text| !text.is_empty())
             .cloned(),
-        SegmentKind::Separator => Some("|".to_string()),
+        SegmentKind::Separator => Some(
+            segment
+                .separator
+                .unwrap_or(SeparatorChar::Pipe)
+                .text()
+                .to_string(),
+        ),
         SegmentKind::ContextUsed => field_paths(SegmentKind::ContextUsed)
             .first()
             .and_then(|path| number_at(payload, path))
@@ -1244,7 +1252,122 @@ mod tests {
             drop: None,
             time_format: None,
             text: None,
+            separator: None,
         }
+    }
+
+    /// A separator segment as the page adds one from the palette: one space
+    /// before and after the character.
+    fn separator_segment(character: Option<SeparatorChar>) -> Segment {
+        let mut separator = segment(SegmentKind::Separator);
+        separator.prefix = " ".to_string();
+        separator.suffix = " ".to_string();
+        separator.separator = character;
+        separator
+    }
+
+    fn line_of(segments: Vec<Segment>) -> (Vec<Span>, Vec<u8>) {
+        let config = StatuslineConfig {
+            left: segments,
+            right: Vec::new(),
+            margin: 0,
+        };
+        render_spans(&config, &payload(), &facts(), None, &offset())
+    }
+
+    #[test]
+    fn every_separator_char_renders() {
+        let glyphs = [
+            (SeparatorChar::Pipe, "│"),
+            (SeparatorChar::Dot, "·"),
+            (SeparatorChar::Bullet, "•"),
+            (SeparatorChar::Slash, "/"),
+            (SeparatorChar::Chevron, "›"),
+            (SeparatorChar::Blank, " "),
+        ];
+        for (character, glyph) in glyphs {
+            let (spans, dropped) = line_of(vec![separator_segment(Some(character))]);
+            assert!(dropped.is_empty(), "nothing to drop in one segment");
+            let texts: Vec<&str> = spans.iter().map(|span| span.text.as_str()).collect();
+            assert_eq!(
+                texts,
+                [" ", glyph, " "],
+                "{character:?} sits between the prefix's and the suffix's space"
+            );
+            assert_eq!(ansi(&spans), format!(" {glyph} "), "{character:?}");
+        }
+    }
+
+    #[test]
+    fn blank_is_one_space() {
+        assert_eq!(SeparatorChar::Blank.text(), " ", "blank is one space");
+        let (spans, _) = line_of(vec![separator_segment(Some(SeparatorChar::Blank))]);
+        assert_eq!(ansi(&spans), "   ", "two spaces around the blank");
+        assert_eq!(visible_width(&ansi(&spans)), 3);
+
+        let mut bare = separator_segment(Some(SeparatorChar::Blank));
+        bare.prefix = String::new();
+        bare.suffix = String::new();
+        let (spans, _) = line_of(vec![bare]);
+        assert_eq!(spans.len(), 1, "only the value span");
+        assert_eq!(spans[0].text, " ", "the value is exactly one space");
+        assert_eq!(ansi(&spans), " ");
+        assert_eq!(visible_width(&ansi(&spans)), 1, "one column");
+    }
+
+    #[test]
+    fn a_1_1_separator_without_char_is_a_pipe() {
+        // A layout as 1.1.0 wrote it: the separator segment carries no
+        // `separator`, and its prefix and suffix are spaces. The file's shape
+        // is the one `StatuslineConfig` serialises (camelCase, a colour rule
+        // tagged by "rule", short keys left out).
+        let stored = r##"{
+            "left": [
+                {"kind": "userHost", "color": {"rule": "fixed", "color": "#22c55e"}},
+                {"kind": "text", "color": {"rule": "none"}, "text": ":"},
+                {"kind": "folder", "color": {"rule": "fixed", "color": "#3b82f6"}},
+                {"kind": "model", "color": {"rule": "byModelFamily"}, "prefix": " "},
+                {"kind": "effort", "color": {"rule": "byEffort"}, "prefix": " "}
+            ],
+            "right": [
+                {"kind": "account", "color": {"rule": "account"}, "suffix": " "},
+                {"kind": "fiveHourPercent", "color": {"rule": "byLoad", "warn": 50, "bad": 80}, "suffix": "%", "drop": 2},
+                {"kind": "separator", "color": {"rule": "none"}, "prefix": " ", "suffix": " "},
+                {"kind": "weekPercent", "color": {"rule": "byLoad", "warn": 50, "bad": 80}, "prefix": "  ", "suffix": "%"},
+                {"kind": "weekReset", "color": {"rule": "none"}, "prefix": " ", "drop": 1, "timeFormat": "compactLeft"}
+            ],
+            "margin": 4
+        }"##;
+        let config: StatuslineConfig =
+            serde_json::from_str(stored).expect("a 1.1.0 status line layout");
+        let separator = config
+            .right
+            .iter()
+            .find(|segment| segment.kind == SegmentKind::Separator)
+            .expect("the stored separator segment");
+        assert_eq!(separator.separator, None, "1.1.0 stored no character");
+
+        let (spans, dropped) = render_spans(&config, &payload(), &facts(), None, &offset());
+        assert!(dropped.is_empty(), "nothing is dropped without a width");
+        let texts: Vec<&str> = spans.iter().map(|span| span.text.as_str()).collect();
+        assert!(
+            texts.windows(3).any(|window| window == [" ", "│", " "]),
+            "a separator without a character is drawn as a pipe: {texts:?}"
+        );
+        assert!(
+            visible_text(&ansi(&spans)).contains(" │ "),
+            "{}",
+            visible_text(&ansi(&spans))
+        );
+
+        // A layout saved by this build omits a character it does not store;
+        // an explicit choice is written as its camelCase name.
+        let saved = serde_json::to_string(&config).expect("the layout as JSON");
+        assert!(!saved.contains("\"separator\":"), "{saved}");
+        let mut chosen = config;
+        chosen.right[2].separator = Some(SeparatorChar::Chevron);
+        let saved = serde_json::to_string(&chosen).expect("the layout as JSON");
+        assert!(saved.contains("\"separator\":\"chevron\""), "{saved}");
     }
 
     #[test]
