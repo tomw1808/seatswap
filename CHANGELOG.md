@@ -44,11 +44,18 @@ All notable changes to this project are documented here. The format follows
   another host notifies here too, and a click opens the Sessions area at that session.
 - Auto-burn goes back to the account that produced the running sessions' thinking when two accounts
   are about equally good.
+- The status line builder in the large window: segments in two zones, options per segment, a preview
+  at three widths.
+- "Use in Claude Code" and "Restore previous": seatswap writes only the `statusLine` key of Claude
+  Code's settings and can put the earlier value back.
+- Status line segments for context used, session cost and lines changed (shown when Claude Code
+  sends those fields).
 
 ### Changed
 - Settings and the account editor moved from the pop-up to the large window; the gear, `,` and an
   account's badge or ✎ open it there.
 - A per-model limit blocks an account only while a session on that model is open.
+- Files seatswap rewrites that are symbolic links stay links; the link's target is rewritten.
 - `seatswap status --json`: `suggestion` has a new shape, `{toId, text}` instead of the old
   `{fromId, toId, fromPercent, toPercent, fromResetsAt}`, so the target and the whole sentence are
   both there.

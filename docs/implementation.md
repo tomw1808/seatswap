@@ -1590,8 +1590,9 @@ pub(crate) struct Facts { pub user: String, pub host: String, pub home: String,
 pub(crate) struct AccountFacts { pub abbr: String, pub color: String, pub plan: Option<String> }
 pub(crate) struct Limit2 { pub percent: f64, pub resets_at: Option<DateTime<Utc>> }
 
-pub(crate) fn render<Tz: TimeZone>(config: &StatuslineConfig, payload: &Payload, facts: &Facts,
-    width: Option<u16>, tz: &Tz) -> String where Tz::Offset: Display;
+pub(crate) fn render_spans<Tz: TimeZone>(config: &StatuslineConfig, payload: &Payload, facts: &Facts,
+    width: Option<u16>, tz: &Tz) -> (Vec<Span>, Vec<u8>) where Tz::Offset: Display; // step C4
+pub(crate) fn ansi(spans: &[Span]) -> String; // step C4: the old `render`, byte for byte
 pub(crate) fn visible_width(text: &str) -> usize;
 pub(crate) fn compact_left(seconds: i64, week: bool) -> String; // also used by burn_text::duration
 pub(crate) fn clock(at: DateTime<Utc>, now: DateTime<Utc>, offset: FixedOffset) -> String; // §7.4.5
@@ -1606,10 +1607,10 @@ the stored accounts to their abbreviations: a missing file, an unknown account i
 is `None`, and an unreadable file is the line's error. `publish_feed` does nothing when
 `statusline_feed` is off or the payload
 has no `rate_limits`/`seven_day`; when `write_if_due` wrote, it sends `feed` to the tray app (no
-socket is not an error). `render` is pure; `facts` is the one part that reads `.git/HEAD`. `width`
-walks the `/proc` ancestors' pseudo-terminals (Linux, `rustix::termios::tcgetwinsize`) and falls
-back to `$COLUMNS`, else `None`. `format::clock` is the local `HH:MM` today and `Mon HH:MM` when not
-today; `weekday_clock` is always `Mon HH:MM`; both are the §7.4.5 texts and moved here from
+socket is not an error). `render_spans` is pure; `facts` is the one part that reads `.git/HEAD`.
+`width` walks the `/proc` ancestors' pseudo-terminals (Linux, `rustix::termios::tcgetwinsize`) and
+falls back to `$COLUMNS`, else `None`. `format::clock` is the local `HH:MM` today and `Mon HH:MM`
+when not today; `weekday_clock` is always `Mon HH:MM`; both are the §7.4.5 texts and moved here from
 `burn_text` so the line and the auto-burn words share them. `compact_left` rounds minutes up and
 drops a zero smaller unit (`2h`, not `2h00m`); `week` chooses days/hours, otherwise hours/minutes.
 
@@ -3189,3 +3190,374 @@ chip), up to 20 minutes old; the Activity waits follow the host but no account c
 an empty query still lets core count the history of accounts no longer stored; page detail is
 always fetched by its own command, never computed in the page; and the browser opens on
 `fixture-stats.js` with no tray app, which is for pictures only and is not the app's data.
+
+## Step C4: the status line builder
+
+The renderer of step B is split into "segments → coloured spans" and "spans → ANSI text", so the
+builder's preview and Claude Code's line come from one implementation. One core module owns the one
+key seatswap writes in Claude Code's settings; one page edits `settings.statusline`.
+
+| Module | Job |
+|---|---|
+| `core::claude_settings` | the `statusLine` key of Claude Code's `settings.json`: read, set, remove |
+| `core::atomic` (extended) | `write_atomic` writes through a symbolic link and keeps the link |
+| `app::statusline::render` (extended) | the three new segments, their field path table, spans, the one fitting |
+| `app::statusline` (extended) | the preview's lines and scenarios, the recorder of field names |
+| `app::gui::window` (extended) | the eight `statusline_*` commands, the install record's two decisions |
+| `app::gui::autostart` (extended) | `console_program`: the `seatswap` program beside the running one |
+| `app::ui/areas/statusline.js` | the Status line area: palette, zones, options, preview, install card, recorder |
+
+## store.rs additions (step C4)
+
+```rust
+#[serde(rename_all = "camelCase")]
+pub enum SegmentKind { …, Separator, ContextUsed, SessionCost, LinesChanged }
+impl StatuslineConfig {
+    pub fn presets() -> Vec<(String, StatuslineConfig)>; // "My current line", "Limits only", "Everything"
+    pub fn limits_only() -> StatuslineConfig;           // no left zone, the current line's right zone
+    pub fn everything() -> StatuslineConfig;            // every kind once; the drop numbers 1, 2, 3 on
+                                                        // the two resets, the 5 h percent and the branch
+}
+pub struct StatuslineInstall {
+    pub installed: serde_json::Value,                  // the exact line seatswap wrote last
+    #[serde(default, deserialize_with = "deserialize_present_value",
+            skip_serializing_if = "Option::is_none")]
+    pub previous: Option<serde_json::Value>,           // absent = no key; Some(null) = the value null
+}
+// Settings gains:
+pub statusline_record_until: Option<DateTime<Utc>>,    // serde default None
+pub statusline_install: Option<StatuslineInstall>,     // serde default None
+```
+
+`deserialize_present_value` reads a present field as `Some`, also when it is `null`; a missing field
+takes the default `None`. That is what keeps "the file had no `statusLine` key" and "the file had
+`statusLine: null`" apart through `accounts.json`, and the install proof test round-trips a `null`
+through serde to check it. An older `accounts.json` loads with both settings `None`: no recording
+runs and there is nothing to restore.
+
+## spans, `ansi` and the one fitting (step C4)
+
+```rust
+// statusline/render.rs
+pub(crate) enum NamedColor { Green, Yellow, Red, Magenta, Cyan, BrightYellow, BrightRed }
+const NAMED_COLORS: [(&str, &str, &str, &str); 7]; // name, SGR foreground, SGR background, #rrggbb
+pub(crate) enum Color { Named(NamedColor), Rgb([u8; 3]) }   // Serialize writes #rrggbb
+#[derive(Clone, PartialEq, Serialize)] #[serde(rename_all = "camelCase")]
+pub(crate) struct Span { pub text: String, pub fg: Option<Color>, pub bg: Option<Color>, pub bold: bool }
+pub(crate) struct FittedLine { pub spans: Vec<Span>, pub dropped: Vec<u8>,
+                               pub dropped_kinds: Vec<SegmentKind> }
+pub(crate) fn render_spans<Tz: TimeZone>(config: &StatuslineConfig, payload: &Payload, facts: &Facts,
+    width: Option<u16>, tz: &Tz) -> (Vec<Span>, Vec<u8>) where Tz::Offset: Display;
+pub(crate) fn fitted_line<Tz: TimeZone>(config: &StatuslineConfig, payload: &Payload, facts: &Facts,
+    width: Option<u16>, tz: &Tz) -> FittedLine where Tz::Offset: Display;
+pub(crate) fn ansi(spans: &[Span]) -> String;
+pub(crate) fn at_path<'a>(raw: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value>;
+pub(crate) fn visible_width(text: &str) -> usize;   // ANSI stripped, each code point by char_width
+```
+
+`fitted_line` is the only fitting rule; `render_spans` is `fitted_line(..)`'s spans and drop numbers,
+so the command and the preview cannot drift. `Span.fg`/`.bg` are the `Color` enum, whose `Serialize`
+writes the `#rrggbb` the page paints (a named colour uses the xterm default of `NAMED_COLORS`), so
+the preview receives a colour string or `null`; `ansi` keeps writing the same SGR bytes as
+step B: `\x1b[1m` for bold, then the background, then the foreground, the text and `\x1b[0m`; a span
+with no colour and no bold is written as plain text. An empty list of spans is the empty line.
+
+The fitting itself is step B's rule: the drop numbers of the pieces that have a value, sorted and
+deduplicated, are raised one at a time until `fits` holds — left width + 2 + right width + margin ≤
+width — and every number at or below the last level is dropped. Without a width nothing is dropped
+and the right zone follows the left after two spaces. A right zone that is empty leaves no gap; an
+empty left zone puts the right zone flush with `width - margin`; otherwise the gap is
+`width - margin - left - right`, at least 2. `visible_width` strips ANSI CSI sequences and counts a
+code point as 2 columns in the East Asian wide/fullwidth and emoji ranges, 0 for a combining mark or
+a zero-width format character, else 1 — an approximation kept without a dependency, so a code point
+outside those tables counts as one column.
+
+## the field path table and the three new segments (step C4)
+
+```rust
+const FIELD_PATHS: [(SegmentKind, &[&str]); 3] = [
+    (SegmentKind::ContextUsed,  &["context_window.used_percentage"]),
+    (SegmentKind::SessionCost,  &["cost.total_cost_usd"]),
+    (SegmentKind::LinesChanged, &["cost.total_lines_added", "cost.total_lines_removed"]),
+];
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)] #[serde(rename_all = "camelCase")]
+pub(crate) struct FieldPaths { pub kind: SegmentKind, pub paths: &'static [&'static str] }
+pub(crate) fn field_paths(kind: SegmentKind) -> &'static [&'static str]; // [] for every other kind
+pub(crate) fn all_field_paths() -> Vec<FieldPaths>;                      // feature "gui" / tests
+```
+
+The table is the one place a payload path is written; the renderer reads it and so does the
+window's `statusline_fields`, which the page uses to mark a segment whose field a recording did not
+see. There are no separate path constants: a fourth reader would be a fourth place to change.
+
+| Kind | Value | Missing |
+|---|---|---|
+| `ContextUsed` | `format!("{}%", whole(n))` | the path is absent, `null` or not a number |
+| `SessionCost` | `format!("${n:.2}")` | the path is absent, `null` or not a number |
+| `LinesChanged` | `format!("+{} -{}", whole(added), whole(removed))` | either path is absent, `null` or not a number |
+
+`number_at` is `at_path(raw, path).and_then(Value::as_f64)`, so a string, a boolean, an object and
+`null` all print nothing and the segment's prefix and suffix are not printed either. `whole` prints
+a whole number exactly (`120`) and otherwise the `integer_percent` rounding. The numbers come from
+the payload's raw JSON (`Payload.raw`), which is the whole payload Claude Code sent (`Null` when
+standard input was not JSON): the typed `Payload` fields did not grow a `context_window` or a `cost`
+struct, because the path table and `at_path` already read any shape. Before a session's first answer
+`used_percentage` is `null` (nothing printed) and `total_cost_usd` is a whole `0` (`$0.00`).
+
+## the preview (step C4)
+
+```rust
+// statusline/mod.rs
+#[derive(Debug, Clone, Copy, Deserialize)] #[serde(rename_all = "camelCase")]
+pub(crate) enum Scenario { Live, NearFull, Blocked, NoSessionLimit }
+#[derive(Serialize)] #[serde(rename_all = "camelCase")]
+pub(crate) struct PreviewLine { pub width: u16, pub spans: Vec<Span>,
+                                pub dropped: Vec<u8>, pub note: String }
+pub(crate) fn preview_lines<Tz: TimeZone>(config: &StatuslineConfig, payload: &Payload, facts: &Facts,
+    widths: &[u16], scenario: Scenario, tz: &Tz) -> Result<Vec<PreviewLine>, String>;
+```
+
+`preview_lines` renders the given config — never the stored one — once per width, in the width
+order it was given. An empty list is `the preview needs at least one width`, and a width of 0 is
+`a preview width must be at least 1 column; 0 cannot show a line`. A scenario changes one value of
+the facts and nothing else: `Live` takes them as they are, `NearFull` sets the week to 97 %,
+`Blocked` to 100 % (each keeps the week's reset), `NoSessionLimit` drops the 5 h values. `dropped`
+is the drop numbers the fitting removed; `note` is built from the kinds those numbers removed, one
+name per kind, in drop order then line order: `everything fits`, or
+`{names joined with ", " and " and "} {is|are} dropped`
+(`5 h reset, week reset and 5 h percent are dropped`). A segment without a value is not a piece the
+fitting can drop, so the note never names it (`kind_name` is the page's word for each kind).
+
+The window's `statusline_preview` builds the facts from the snapshot (`SnapshotFacts`: the views'
+abbr, colour and plan, the cache's usage, the per-model limits, `burn-next.json` through the
+snapshot's views, the live state, `claude.home()` and `$USER`/`%USERNAME%`) and
+`statusline::README_PAYLOAD` for the payload, so every scenario has the same folder, model and
+effort. It is the same `facts_from_source` the command uses, with a different `FactsSource`; the
+facts builder, not the page, decides what a segment shows.
+
+## the recorder of field names (step C4)
+
+```rust
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)] #[serde(rename_all = "camelCase")]
+pub(crate) struct KeyInfo { pub path: String, pub kind: String } // string|number|boolean|null|object|array
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)] #[serde(rename_all = "camelCase")]
+pub(crate) struct RecordedKeys { pub at: DateTime<Utc>, pub keys: Vec<KeyInfo> }
+pub(crate) fn key_paths(raw: &serde_json::Value) -> Vec<KeyInfo>;
+pub(crate) fn read_recorded_keys(app: &AppPaths) -> Result<Option<RecordedKeys>, String>;
+pub(crate) fn write_recorded_keys(app: &AppPaths, recorded: &RecordedKeys) -> Result<(), String>;
+pub(crate) fn record_keys(app: &AppPaths, settings: &Settings, payload: &Payload,
+                          now: DateTime<Utc>) -> Result<(), String>;
+pub(crate) fn record_until(minutes: u32, now: DateTime<Utc>) -> Result<DateTime<Utc>, String>;
+```
+
+`key_paths` walks the raw payload and keeps the path and the JSON kind only — never a value. An
+array adds `path[]` for its elements (one entry per kind when they differ) and an array of objects
+continues below `path[].key`; the result is sorted by path then kind and deduplicated. A key that
+holds a dot is written as it is, so it cannot be told apart from a nested key of the same name; a
+key with an empty name is written as the empty path, and its children lose that level (`c`, not
+`.c`). A payload that is not a JSON object has no paths.
+
+`record_keys` runs from `seatswap statusline` before the feed and the render: outside a recording
+(`statuslineRecordUntil` absent or not in the future) or for a payload that is not an object it
+neither reads nor writes the file; inside one it merges the file's paths with this payload's,
+writes the union through `atomic::write_atomic` with mode 0600 (making the data folder private
+first) and stamps it with `now`. A keys file that does not parse is an error, never replaced; the
+command prints it as `seatswap: keys: …` and still exits 0. `record_until` accepts 1 to 60 minutes
+and refuses 0 and more with `a recording lasts 1 to 60 minutes, got N`; the page asks for 1.
+
+`AppPaths::statusline_keys_file()` is `<data_dir>/statusline-keys.json`. The page's *Record for a
+minute* calls `statusline_record(1)`, which saves `statuslineRecordUntil` through the settings
+page's one writer (`save_setting`) and nothing else; the page then reads `statusline_keys` every
+5 s while the minute runs and once more after it. `statusline_keys` returns the file's content or
+`null` when the file is missing, and an error naming the path when it cannot be read or parsed.
+
+## claude_settings — the one key in Claude Code's settings (step C4)
+
+```rust
+pub enum ClaudeSettingsError {
+    Io { path: PathBuf, source: std::io::Error },
+    NotAnObject { path: PathBuf },              // an empty file, a list, a string, a number
+    Json { path: PathBuf, source: serde_json::Error },
+    NotUnicode { path: PathBuf },               // the exe path, when the line is built
+}
+pub fn status_line(claude: &ClaudePaths) -> Result<Option<Value>, ClaudeSettingsError>;
+pub fn set_status_line(claude: &ClaudePaths, value: Option<&Value>)
+    -> Result<Option<Value>, ClaudeSettingsError>;   // the previous value
+pub fn seatswap_status_line(exe: &Path) -> Result<Value, ClaudeSettingsError>;
+fn read_object(path: &Path) -> Result<Option<Map<String, Value>>, ClaudeSettingsError>;  // missing = None
+fn write_object(path: &Path, object: &Map<String, Value>) -> Result<(), ClaudeSettingsError>;
+```
+
+`ClaudePaths::settings_file()` is `<config_dir>/settings.json`. `status_line` reads the object and
+clones `statusLine`; a missing file or a missing key is `None`. `set_status_line` reads the file
+once, inserts or removes the one key (`serde_json`'s `preserve_order` keeps every other key and its
+position), calls `atomic::backup_once` before the first write of an existing file, and writes the
+object through `write_atomic` with `Access::Shared`. Removing a key that is not there writes
+nothing. A missing file is created holding only `statusLine` (there is nothing to back up). An empty
+file, broken JSON and a JSON value that is not an object are errors with the path and the file is
+left untouched. `write_object` is `serde_json::to_vec_pretty`, so two spaces per level and no
+trailing newline.
+
+`seatswap_status_line` builds `{"type":"command","command":"\"<exe>\" statusline",
+"refreshInterval":2}`. The path is **always** inside double quotes, not only when it has a space, so
+bash and Git Bash on Windows read it as one word; inside the quotes `"`, `$` and `` ` `` get a
+leading backslash, a backslash is doubled when it ends the path, precedes one of those three or
+another backslash, or is part of a run (so a UNC path's leading `\\` becomes `\\\\`). A path that is
+not valid Unicode is `NotUnicode`, never a lossy replacement. The tests cover `/opt/my apps/seatswap`,
+a plain path, an inner quote, `$`, a backtick, `C:\Program Files\seatswap\seatswap.exe` and
+`\\vega\tools\seatswap.exe`.
+
+## write_atomic through a symbolic link (step C4)
+
+```rust
+fn write_target(path: &Path) -> io::Result<PathBuf>;   // private to atomic.rs
+```
+
+`write_atomic` first resolves the file it must replace: `path` itself when it is not a symbolic link
+(also when it does not exist yet), else the file the chain of links finally points to (a relative
+link target is resolved against the link's own folder). The temp file is made beside that file, the
+file keeps its mode (or gets `access_if_new` when it is new), and the rename replaces the target, so
+every link in the chain stays a link. A link whose target (or later link) does not exist is
+`NotFound` with a text naming the link, and no file is created beside it; more than 40 links in a row
+is `InvalidInput`. The tests are `a_symlink_to_a_file_is_written_through_and_stays_a_link`,
+`a_chain_of_two_symlinks_is_written_through` and `a_dangling_symlink_is_refused_and_creates_nothing`
+on Unix; `claude_settings` adds the same proof for Claude Code's `settings.json`. The resolving code
+is not `cfg`-gated, so Windows takes the same path; only the link tests are Unix.
+
+## the install record and the two decisions (step C4)
+
+```rust
+// gui/window.rs
+#[derive(Debug, Clone, PartialEq, Serialize)] #[serde(rename_all = "camelCase")]
+pub(crate) struct InstallState {
+    pub current: Option<serde_json::Value>,   // Claude Code's statusLine now (null = no key)
+    pub ours: serde_json::Value,              // the line seatswap would write
+    pub installed: bool,                      // current == ours
+    pub restorable: bool,                     // the restore rule allows it
+    pub previous: Option<serde_json::Value>,  // the record's previous value
+    pub settings_file: String,                // <config>/settings.json, as the page shows it
+}
+struct InstallDecision { record: Option<StatuslineInstall>, write: Option<Value>, state: InstallState }
+struct RestoreDecision { restore: Option<Value>, before: Option<Value>, state: InstallState }
+fn install_state_of(claude: &ClaudePaths, exe: &Path, record: Option<StatuslineInstall>)
+    -> Result<InstallState, String>;
+fn restorable(record: Option<&StatuslineInstall>, current: Option<&Value>, ours: &Value) -> bool;
+fn install_decision(claude: &ClaudePaths, exe: &Path, record: Option<StatuslineInstall>)
+    -> Result<InstallDecision, String>;
+fn restore_decision(claude: &ClaudePaths, exe: &Path, record: Option<StatuslineInstall>)
+    -> Result<RestoreDecision, String>;
+fn console_program() -> Result<PathBuf, String>;   // autostart::console_program(current_exe)
+fn saved_install(state: &GuiState) -> Result<Option<StatuslineInstall>, String>;
+```
+
+Both decisions are taken from one reading of Claude Code's file and the saved record; the decision
+functions take plain paths and the record, so the tests run them without Tauri.
+
+- **Install.** (a) The current line is seatswap's: write nothing, keep the record, `installed` and
+  `restorable` true. (b) A record exists and the current line is the record's `installed` line (an
+  older seatswap path): keep the record's `previous` and write today's line. (c) Otherwise — the
+  user's own line, or no record: the current value (a present `null` kept as `Some(null)`, an absent
+  key as `None`) becomes the new record's `previous`. The command saves the record through
+  `save_setting("statuslineInstall", …)` **before** it writes the line, so a line it could not write
+  leaves a record whose `installed` value is not in the file: an install started again then falls
+  into (c) and keeps the user's line as `previous`, and a restore refuses because the file does not
+  hold seatswap's line.
+- **Restore.** Without a record: `seatswap has no record of the line before its own: nothing to
+  restore`. With a current line that is neither seatswap's nor the record's `installed` line:
+  `the status line in Claude Code is not seatswap's: nothing to restore`; both leave the file
+  untouched. Otherwise it writes the record's `previous` exactly (`None` removes the key), then
+  clears the record through `save_setting("statuslineInstall", null)`; if clearing fails, the line
+  that was there before the restore is written back and the error is returned, with the rollback's
+  own error appended when that also fails.
+- `console_program` is `autostart::console_program(current_exe)`: `seatswap.exe` (`seatswap` on
+  Linux) beside the running program, an error naming the path when it is not a file. On Windows the
+  tray program makes the change too, so the line never names `seatswap-tray.exe`.
+
+## the status line commands and their JSON shapes (step C4)
+
+All eight are `#[cfg(feature = "gui")]` and are registered in `gui/mod.rs`'s handler list.
+
+| Command | Arguments | Reply |
+|---|---|---|
+| `statusline_preview` | `{config, widths: [u16], scenario}` | `[{width, spans: [{text, fg, bg, bold}], dropped: [u8], note}]` |
+| `statusline_presets` | — | `[["My current line", config], ["Limits only", config], ["Everything", config]]` |
+| `statusline_record` | `{minutes: u32}` | `null`; saves `statuslineRecordUntil` |
+| `statusline_keys` | — | `{at, keys: [{path, kind}]}`, or `null` when no recording wrote the file |
+| `statusline_fields` | — | `[{kind, paths: [path]}]`, the field path table in its order |
+| `statusline_install_state` | — | `InstallState` |
+| `statusline_install` | — | `InstallState` after the install |
+| `statusline_restore` | — | `InstallState` after the restore |
+
+`scenario` is `"live"`, `"nearFull"`, `"blocked"` or `"noSessionLimit"` (serde camelCase). `fg` and
+`bg` are `#rrggbb` or `null`; `bold` is always present. A width of 0 or an empty list is an error
+with its text; `statusline_preview` also refuses when `accounts.json` cannot be read ("accounts.json
+cannot be read; the preview has no data"). A command's error is the `String` Tauri shows the page,
+and the page puts it in a banner.
+
+## the Status line area page (step C4)
+
+```text
+crates/app/ui/areas/statusline.js   the area: palette, zones, options, preview, install, recorder
+crates/app/ui/window.js             the area list: the title "Status line" for id "statusline"
+crates/app/ui/common.js             panel, banner, selectInput, switchControl, clone, isObject, …
+crates/app/ui/window.css            the .sl-* rules
+crates/app/ui/fixture.js            the browser fixture: the commands' replies and a config
+```
+
+`statusline.js` exports `render(container, context)`, `update(snapshot)` and `unmount()`. `render`
+reads `settings.statusline` and `settings.statuslineFeed` (naming every value it cannot read, never
+replacing one), then loads the install state, the recorded keys and the field paths once, and draws:
+the head (preset, Restore previous, Use in Claude Code), the palette, the line, the options, the
+preview and the fields card. `update(snapshot)` takes the snapshot's settings and redraws, except
+while a save is pending (the page's copy wins) or while focus is inside the page (only the settings
+are taken, so a redraw does not take a field away mid-typing). Every change is saved through
+`save_setting` at once, queued one after another each built from the settings the one before left;
+a refused save restores the stored layout and shows its text, and changes queued behind it are
+counted as dropped rather than saved stale.
+
+The page's kinds table (`KINDS`) is the one place the page names a segment and the options its kind
+offers; it mirrors `SegmentKind`, `ColorRule`, `TimeFormat` and `render.rs`:
+
+| Kind (`id`) | Group | Label | Colour rules | Time format | Text | Repeatable |
+|---|---|---|---|---|---|---|
+| `account` | seatswap | account | none · the account's colour · fixed | | | |
+| `plan` | seatswap | plan | none · fixed | | | |
+| `fiveHourPercent` | seatswap | 5 h percent | none · by load · fixed | | | |
+| `fiveHourReset` | seatswap | 5 h reset | none · fixed | ✓ | | |
+| `weekPercent` | seatswap | week percent | none · by load · fixed | | | |
+| `weekReset` | seatswap | week reset | none · fixed | ✓ | | |
+| `modelPercent` | seatswap | per-model % | none · by load · fixed | | | |
+| `autoBurn` | seatswap | auto-burn: next | none · fixed | | | |
+| `model` | Claude Code | model | none · by model family · fixed | | | |
+| `effort` | Claude Code | effort | none · by effort · fixed | | | |
+| `folder` | Claude Code | folder | none · fixed | | | |
+| `gitBranch` | Claude Code | git branch | none · fixed | | | |
+| `contextUsed` | Claude Code | context used | none · fixed | | | |
+| `sessionCost` | Claude Code | session cost | none · fixed | | | |
+| `linesChanged` | Claude Code | lines changed | none · fixed | | | |
+| `userHost` | System | user@host | none · fixed | | | |
+| `clock` | System | clock | none · fixed | | | |
+| `text` | System | free text | none · fixed | | ✓ | ✓ |
+| `separator` | System | separator | none · fixed | | | ✓ |
+
+The palette filters `repeatable`; a kind already in a zone is not offered again. "Drop when narrow"
+offers never · 1 · 2 · 3 only. A colour rule whose values are not typed yet is held in
+`state.pendingColorRule` and is neither in `state.config` nor saved, so the page never writes a
+threshold or a hex it made up; an unknown kind, a colour rule its kind does not offer, a time format
+or a drop number outside the table are shown as stored with "not offered" and left alone.
+
+The preview asks `statusline_preview` with the whole config, the three parsed widths and the chosen
+scenario, 150 ms after the last change, and drops a reply that a newer request has overtaken. The
+width fields are read as typed: a value that is not a whole number of columns or outside 1–65535 is
+shown as its error, not replaced. The terminal tab recolours the boxes only; the spans' colours come
+from the reply. A segment whose kind is in the field path table and whose path is not in a recorded
+list carries `Claude Code did not send this field (<time of the recording>)` as a warning banner in
+its options and in its chip's tooltip; the note exists only when a recorded list exists.
+
+The head's *Use in Claude Code* opens the card (the file, `now` and `after` as JSON, the sentence
+`seatswap changes only this key. The value it replaces is kept and can be put back.`, Install and
+Cancel) and never writes before Install is pressed; the button reads *In use in Claude Code* and is
+disabled while `installed`. *Restore previous* is drawn only when `restorable`. Both show the
+command's error as a banner and their success as a notice. `fixture.js` has a stand-in for every
+`statusline_*` reply with the same shape and its own small preview drawing, so the browser page works
+with no tray app; that drawing is for pictures only and is not the app's renderer.

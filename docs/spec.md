@@ -594,12 +594,20 @@ from its cache, and prints one line.
   may be set; the command is never gated and writes no `agentCall` event.
 - **The preset and the segments:** the preset reproduces the old script. The layout can also hold
   the account (abbreviation in its colour), plan, 5 h percent and reset, week percent and reset,
-  per-model percent, auto-burn, model, effort, folder (`~` short), git branch, `user@host`, clock,
-  free text and a separator. Each segment has an optional colour rule (fixed, by load with two
-  thresholds, by model family, by effort, or the account's colour), prefix, suffix and drop order;
-  reset segments can use the compact time left, seatswap's own format (§7.2) or a clock time. The
-  `autoBurn` segment shows the next account and the planned switch time, like the reset segments
-  show their times; it has no value when the tray app plans no switch (§7.6).
+  per-model percent, auto-burn, model, effort, folder (`~` short), git branch, context used, session
+  cost, lines changed, `user@host`, clock, free text and a separator. Each segment has an optional
+  colour rule (fixed, by load with two thresholds, by model family, by effort, or the account's
+  colour), prefix, suffix and drop order; reset segments can use the compact time left, seatswap's
+  own format (§7.2) or a clock time. The `autoBurn` segment shows the next account and the planned
+  switch time, like the reset segments show their times; it has no value when the tray app plans no
+  switch (§7.6). The three segments Claude Code itself supplies read
+  `context_window.used_percentage` (`41%`), `cost.total_cost_usd` (`$3.20`) and
+  `cost.total_lines_added` with `cost.total_lines_removed` (`+120 -8`) from the payload; a field that
+  is `null` or absent prints nothing, as before a session's first answer, when `used_percentage` is
+  `null` and `total_cost_usd` a whole `0` (`$0.00`).
+- **Turning it on:** the large window's Status line area builds the layout and writes it into Claude
+  Code with *Use in Claude Code*; that is the one key `statusLine` of Claude Code's `settings.json`,
+  and *Restore previous* puts the earlier value back (§11.4).
 
 **The feed.** When `statuslineFeed` is on (default) and the payload has `rate_limits` with a
 `seven_day`, the command writes the live numbers to `<data folder>/feed.json`, atomic and mode
@@ -801,6 +809,8 @@ They give real click handling and exact placement on those desktops. They're not
 | `suggestSwitches` | on | when auto-burn is off, say what it would do, §7.4 |
 | `statuslineFeed` | on | `seatswap statusline` writes the live numbers to `feed.json`, §7.6 |
 | `statusline` | "My current line" | the status line layout: `left`, `right`, `margin`, §7.6 |
+| `statuslineInstall` | none | `null`, or `{ "installed": <value>, "previous": <value> }`: the exact `statusLine` seatswap last wrote in Claude Code's `settings.json` and the exact value the file had before its first install. `previous` absent means the file had no key; a present `null` is the value `null`. Written by *Use in Claude Code* and cleared by *Restore previous* (§11.4) |
+| `statuslineRecordUntil` | none | `null` or a time: while it is in the future, `seatswap statusline` records the payload's key paths and JSON types to `<data folder>/statusline-keys.json`. *Record for a minute* sets it to one minute from now (1 to 60 minutes are accepted), §11.4 |
 | `notifyOnSwitch` | on | |
 | `mirrorLive` | on | §6.4 |
 | `refreshInactive` | on | refresh the logins of inactive accounts (§6.3). Off: inactive accounts show their last known usage with its age |
@@ -916,8 +926,8 @@ already open one is shown, un-minimized, focused and sent `open-area`. The pop-u
 `navigate` event, because an event reaches every window.
 
 **The areas.** Four tabs at the top left, in this order: Sessions · Statistics · Status line ·
-Settings. An empty address opens Sessions. Sessions, Statistics and Settings have a page; Status
-line says "Comes with a later version." Under `statistics` the sub-area is one of the seven page
+Settings. An empty address opens Sessions. Each area has a page; the Status line area is the
+builder below. Under `statistics` the sub-area is one of the seven page
 names (`statistics/forecast`); without one the area keeps the page last chosen. The area's title and
 its subtitle stand above the card, and the snapshot's error is a banner above both. The theme
 follows the `theme` setting and the system, as in the pop-up.
@@ -1301,6 +1311,124 @@ account.
 sessions waited for you" are on these pages (Subscriptions and Activity). "What auto-burn did" and
 "Where tokens are lost" are not built and stay proposals.
 
+### The Status line area
+
+The third area: the layout of `seatswap statusline` is built here, and turned on in Claude Code from
+here. The page edits `settings.statusline` and asks the backend for every preview; it draws no line
+of its own. Every change is saved through the settings page's one writer at once; a refused save
+puts the stored layout back and shows the reason at the top of the page.
+
+**The palette.** The segments that are in neither zone, in three groups: *seatswap* (account, plan,
+5 h percent, 5 h reset, week percent, week reset, per-model %, auto-burn: next), *Claude Code*
+(model, effort, folder, git branch, context used, session cost, lines changed) and *System*
+(`user@host`, clock, free text, separator). Free text and separator can be added more than once; a
+segment that is already on the line is not in the palette. A click adds it to the zone last used.
+
+**The two zones and the margin.** *Left*, and *Right* which is flush with the right edge of the
+terminal; at least two spaces stay between the zones. A segment is dragged from the palette into a
+zone, between two zones and inside one; the keyboard does the same: ←/→ reorder it, `L`/`R` move it
+to that zone, `Delete` sends it back to the palette. A segment dropped onto itself, or a drop
+outside a zone, changes nothing. Below the zones: the *margin*, the columns kept free at the
+terminal's right edge, and the switch *Pass Claude Code's live numbers on to seatswap*
+(`statuslineFeed`, §7.6).
+
+**The options of the chosen segment.** The page offers only what applies to its kind:
+
+| Option | What it offers |
+|---|---|
+| Colour | *none* · *fixed colour* (`#rrggbb`) for every kind; *by load* (yellow from, red from) only for the 5 h percent, the week percent and the per-model percent; *by model family* only for the model; *by effort* only for the effort; *the account's colour* only for the account |
+| Time format | Only the 5 h reset and the week reset: *Compact time left* · *seatswap's* (the rule of §7.2) · *Clock time*; without one seatswap's own format is used |
+| Text | Only free text; a segment whose text is empty prints nothing |
+| Prefix / suffix | Every kind; printed only when the segment has a value |
+| Drop when narrow | *never* · *1 · first* · *2* · *3* |
+
+The folder has no style option: it is always `~`-shortened. A value the page cannot read (an unknown
+kind, a colour rule its kind does not offer, a drop number above 3) is shown as it was stored, never
+replaced by a guess.
+
+**The preview.** Three width fields (120, 100 and 80 columns at start, each 1 to 65535 and
+editable), a *Dark terminal* and a *Light terminal* tab, and the scenario *Live data* · *Test: 97 %*
+· *Test: account blocked* · *Test: no 5 h limit*. Every width gets its own line, drawn with the
+spans' own colours and bold flags on the terminal background, in a monospace terminal font, in a box
+as wide as its width in columns; the line ends the margin before the right edge, as in a terminal. Beside each line is its note: `everything fits`, or the kinds the fitting
+removed, as `5 h reset, week reset and 5 h percent are dropped`. The text and the colours come from
+`statusline_preview`, the command's own renderer (§7.6): the preview and the real line are one
+implementation. The preview is requested again 150 ms after the last change.
+
+**The presets.** *My current line* (what the script of §5.1 printed; the stored default), *Limits
+only* and *Everything*. A layout that equals none of them shows *Custom layout*. Choosing a preset
+while the layout was changed asks *Replace the layout?* with Cancel and Replace first; without a
+change it applies at once. Every preset is saved like a hand-made layout.
+
+**The three payload segments.** They read Claude Code's own numbers from the payload, and each is a
+plain number in the JSON:
+
+| Segment | Payload fields | Prints |
+|---|---|---|
+| context used | `context_window.used_percentage` | `41%` |
+| session cost | `cost.total_cost_usd` | `$3.20` |
+| lines changed | `cost.total_lines_added` and `cost.total_lines_removed` | `+120 -8` |
+
+A field that is `null` or absent prints nothing, like every other segment, and so does a value that
+is not a number. Lines changed needs both numbers. Before a session's first answer Claude Code sends
+`"used_percentage": null`, so the context used segment is empty, and `"total_cost_usd": 0`, a whole
+number, which prints as `$0.00`.
+
+**Use in Claude Code.** The button first shows a card: the file (`<config>/settings.json`; on Linux
+`~/.claude/settings.json`, on Windows `%USERPROFILE%\.claude\settings.json`), the value of
+`statusLine` *now* and *after* as JSON, and the sentence "seatswap changes only this key. The value
+it replaces is kept and can be put back."; then Install or Cancel. When seatswap's line is already
+in place the button reads *In use in Claude Code*, and *Restore previous* stands beside it whenever
+there is something to restore.
+
+The value seatswap writes is
+
+```json
+{"type": "command", "command": "\"<path>\" statusline", "refreshInterval": 2}
+```
+
+where `<path>` is the console `seatswap` program beside the running one (on Windows
+`seatswap.exe`, also when the tray program makes the change). The path is always inside double
+quotes, so the shell Claude Code runs the command through — bash, or Git Bash on Windows — reads it
+as one word; inside the quotes `"`, `$` and `` ` `` get a leading backslash and a backslash is
+doubled where it would otherwise escape or be eaten, so a path with a space, a dollar sign or
+Windows backslashes arrives unchanged. A path that is not valid Unicode is refused.
+
+The write itself:
+- **One key.** seatswap writes exactly one key of Claude Code's `settings.json`: `statusLine`. Every
+  other key keeps its value and its place in the file's order; the file is written again as JSON
+  with two spaces per level and no trailing newline.
+- **A backup once.** Before the first write of an existing file, a copy is kept beside it as
+  `settings.json.seatswap-backup`. It is never updated.
+- **A missing file** is created holding only `statusLine`.
+- **A file that is not a JSON object** — an empty file, broken JSON, a list, a string — is refused
+  with its path and the reason, and left byte for byte as it was.
+- **A symbolic link stays a link.** The target the link (or the chain of links) points at is
+  rewritten; the link is never replaced by a regular file. A link whose target does not exist is
+  refused with the link's path, and no file is created beside it.
+- Every write is atomic (`atomic::write_atomic`), so a reader sees the old or the new file.
+
+**The install record.** seatswap keeps `statuslineInstall` in its own settings:
+`{installed, previous}` — the exact `statusLine` value it wrote last, and the exact value the file
+had before its first install. `previous` absent means the file had no `statusLine` key; `previous:
+null` means the key was there with the value `null`, and that is what comes back. Installing again
+while seatswap's line is in place writes nothing and keeps the record. Installing from a moved
+program (another `<path>`) writes the new command but keeps the first `previous` while the file
+still holds the record's `installed` line, so the user's own line is never replaced by seatswap's
+older one; a line set by hand after an install becomes the new `previous`.
+
+**Restore previous.** It is offered only while seatswap's line is in Claude Code — the record exists
+and the current value is seatswap's line or the record's `installed` line. It then writes the
+record's `previous` back exactly, or removes the key when there was none, and clears the record. A
+line set by hand afterwards is never overwritten: without a record it refuses with "seatswap has no
+record of the line before its own: nothing to restore", and when the file holds any other line "the
+status line in Claude Code is not seatswap's: nothing to restore", leaving the file untouched.
+
+**Undoing it by hand.** In Claude Code's `settings.json`, `statusLine` may be deleted (or replaced by
+the old value) with an editor; nothing else seatswap wrote there has to be touched, because it
+wrote nothing else. The copy `settings.json.seatswap-backup` is the file as it was before seatswap's
+first write to it.
+
 ---
 
 ## 11.5 Money: API prices, the dollar rate and the value of tokens
@@ -1521,9 +1649,6 @@ the past too, because the history stores the repository's identity, not the show
 - In-app login for new accounts (OAuth PKCE), so `/login` in Claude Code is no longer needed.
 - Claude Desktop: research whether its login can be switched safely (separate `--user-data-dir` per account and swapping which one the launcher uses is the likely route).
 - Usage history: a small sparkline per account across the last 7 days, from the poll cache.
-- The status line builder: a button that writes the `statusLine` key into Claude Code's
-  `settings.json`, with the change shown first and a restore. Until then the line is set by hand
-  (§7.6).
 - Native Cinnamon, GNOME and KDE front ends (§9.3).
 
 ---
@@ -1536,9 +1661,17 @@ the past too, because the history stores the repository's identity, not the show
   `api.frankfurter.dev` for the dollar rate (§11.5). The two look-ups send the User-Agent
   `seatswap/<version>` and no account, token or machine data. No telemetry, no update pings unless
   enabled.
-- Every write to Claude Code's files is atomic (temp file + rename) and keeps the original file mode.
+- Every write to Claude Code's files is atomic (temp file + rename) and keeps the original file mode;
+  a file that is a symbolic link stays a link and its target is rewritten.
 - The status line reads Claude Code's JSON, seatswap's settings and its usage cache; its only write
-  is `<data folder>/feed.json` (mode 0600). It prints no token and sends none.
+  is `<data folder>/feed.json` (mode 0600), plus `<data folder>/statusline-keys.json` while a
+  recording runs — the key paths and JSON types of the payload, never a value. It prints no token
+  and sends none.
+- **seatswap's one write in Claude Code's settings:** *Use in Claude Code* writes exactly one key of
+  `<config>/settings.json`, `statusLine`, and nothing else in that file changes: every other key
+  keeps its value and its order. The file is backed up once (`settings.json.seatswap-backup`), the
+  change is shown before it is made, and *Restore previous* puts the exact earlier value back or
+  removes the key (§11.4).
 - Before seatswap first writes to them, it backs up `.credentials.json` and `.claude.json` once as `*.seatswap-backup`.
 - seatswap records the Claude Code version it was tested with. If the installed version is newer, the pop-up shows a warning, because the rules in §2.6 may have changed.
 - Each account must be a licence the user holds. The app moves the user's own logins between the user's own slots and shares nothing.

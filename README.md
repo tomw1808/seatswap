@@ -34,11 +34,11 @@ read or write that yet.
 
 - **One-click switch** from the tray menu or the pop-up, or `seatswap use AC`. Running Claude
   Code sessions pick up the new login on their next request.
-- **A large window with Sessions, Statistics and Settings.** The gear in the pop-up (or `,`) opens
-  a full window: Sessions, Statistics, Status line and Settings. Sessions, Statistics and Settings
-  are there now — every setting, plus the account editor that used to sit in the pop-up; Status line
-  comes with a later version. `seatswap window [AREA]` opens it from a terminal, and so do the
-  tray's *Settings…* and *Open seatswap…*. Every control saves at once.
+- **A large window with Sessions, Statistics, Status line and Settings.** The gear in the pop-up (or
+  `,`) opens a full window: Sessions, Statistics, Status line and Settings, each with its page.
+  Settings holds every setting, plus the account editor that used to sit in the pop-up; the Status
+  line area builds Claude Code's status line (below). `seatswap window [AREA]` opens it from a
+  terminal, and so do the tray's *Settings…* and *Open seatswap…*. Every control saves at once.
 - **The Sessions area.** It shows every running Claude Code session on this host and, through the
   shared history folder, on your other hosts: live, with its agents to any depth, its tokens and
   what they are worth, and the sessions that closed in the last 24 hours, 7 or 30 days. Numbers on
@@ -71,7 +71,8 @@ read or write that yet.
   the switch. Switched off, it suggests the same switch instead.
 - **Status line for Claude Code.** `seatswap statusline` prints the live account and its limits in
   Claude Code's status line, and hands the live numbers back to the tray app without an extra
-  request.
+  request. The large window's Status line area builds the line, previews it at three terminal
+  widths, and turns it on in Claude Code with one button that can be undone.
 - **History.** Every usage reading, finished window, switch and agent call is kept in an
   append-only history folder, one JSON Lines file per month and kind, with tokens per project and
   hour. Several hosts can share it through a synced folder; each writes only its own subfolder.
@@ -175,19 +176,42 @@ is `seatswap-tray.exe panel`, which opens no console window.
 
 ## Status line and auto-burn
 
-**Set the status line by hand for now.** Add this top-level key to Claude Code's `settings.json`
-(`~/.claude/settings.json`; on Windows `%USERPROFILE%\.claude\settings.json`):
+**Build the status line in the large window.** The Status line area (the third tab, or
+`seatswap window statusline`) has a palette of segments in three groups — seatswap, Claude Code
+and System — and two zones, Left and Right, that you fill by dragging or with the keyboard. Each
+segment has its own options: a colour rule, prefix and suffix, a drop order for narrow terminals,
+a time format for the two reset segments and a text for the free text segment. A preview shows the
+line at three widths you can change, on a dark or a light terminal, with the live numbers or a test
+case, and says what was dropped. Three presets are a click away; *My current line* reproduces the
+old script.
+
+**Use in Claude Code.** The button shows the change first — the file, the `statusLine` value now
+and after — and then writes it. seatswap writes exactly one key, `statusLine`, of Claude Code's
+`settings.json` (`~/.claude/settings.json`; on Windows `%USERPROFILE%\.claude\settings.json`), keeps
+every other key as it was and in the same order, and backs the file up once as
+`settings.json.seatswap-backup`. The value is
 
 ```json
-"statusLine": {"type": "command", "command": "seatswap statusline", "refreshInterval": 2}
+{"type": "command", "command": "\"<path>\" statusline", "refreshInterval": 2}
+```
+
+with the console `seatswap` program beside the running one, always in double quotes so bash (or Git
+Bash on Windows) reads a path with spaces as one word. *Restore previous* puts the value that was
+there exactly back, or removes the key if there was none, and is offered only while seatswap's line
+is the one in the file. To undo it without the window, delete that `statusLine` key in
+`settings.json` (or put the old value back); nothing else in the file was touched.
+
+**Without the window**, add this top-level key to Claude Code's `settings.json` yourself:
+
+```json
+"statusLine": {"type": "command", "command": "\"<path>\" statusline", "refreshInterval": 2}
 ```
 
 Claude Code then runs `seatswap statusline` every 2 seconds. The command reads Claude Code's JSON
 from standard input and prints one line with the account, its 5 h and weekly numbers and the reset
 times. It never uses the network, never waits on a lock and always exits 0; any error is the line
-`seatswap: <reason>`. The layout comes from seatswap's settings (the preset reproduces the old
-script); a button that writes this key comes later, so seatswap does not change Claude Code's
-settings file.
+`seatswap: <reason>`. The layout comes from seatswap's settings, and the same settings are what the
+builder edits.
 
 **What auto-burn does.** One switch in the settings, `Auto-burn`, off by default.
 
@@ -260,7 +284,8 @@ the tray app, and `seatswap.exe` for everything you want to read in a terminal.
   says so. On Linux those files have mode `0600`; on Windows they are protected only by the
   permissions of your user folder.
 - **What else it writes:** its own data folder (including `feed.json`, the status line's live
-  numbers), and the entry that starts it at login
+  numbers), the one key `statusLine` of Claude Code's `settings.json` when you press *Use in Claude
+  Code*, and the entry that starts it at login
   (`~/.config/autostart/seatswap.desktop` on Linux, the value `seatswap` under
   `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` on Windows). On Windows it also registers
   the name its notifications are shown under
