@@ -1642,7 +1642,8 @@ impl ActionRuntime {
 /// The settings with one field replaced, checked as a whole. `field` must name
 /// a key of the settings' JSON object; a bad value is the field's name followed
 /// by serde's text, and an invalid value is [`Settings::validate`]'s error.
-/// A `~/` typed into one of the path settings is the home folder.
+/// A `~` path typed into one of the path settings starts at the home folder
+/// (`format::expand_tilde`: `~/`, and `~\` on Windows).
 fn merge_setting(
     settings: &Settings,
     field: &str,
@@ -1659,9 +1660,10 @@ fn merge_setting(
     }
     let value = match value {
         serde_json::Value::String(text)
-            if matches!(field, "claudeConfigDir" | "historyDir" | "codexHome")
-                && (text == "~" || text.starts_with("~/")) =>
+            if matches!(field, "claudeConfigDir" | "historyDir" | "codexHome") =>
         {
+            // `expand_tilde` owns which spellings name the home folder (`~\`
+            // too on Windows, as the page shows it); any other text stays.
             let expanded = expand_tilde(&text, home);
             let text = expanded
                 .into_os_string()
