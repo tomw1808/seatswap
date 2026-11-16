@@ -672,9 +672,9 @@ pub struct WindowRecord { #[serde(flatten)] pub account: AccountRef, pub k: Limi
     pub plan: Option<String>, pub uncertain: bool }
 pub enum By { User, Cli, Auto, Agent, External }
 pub struct SessionCounts { pub running: u32, pub busy: u32, pub tied: Option<u32> }
-// `tied` (sessions on a model whose thinking is tied to the account, spec §7.4.2) is written only
-// when known and left out of the line when None; until step B measures it, it is None. An old line
-// with "tied":0 still reads.
+// `tied` (sessions on a model whose thinking is tied to the account, spec §7.4.2) is the count the
+// sessions thread reports; it is written only when known and left out of the line when None. An old
+// line with "tied":0 still reads.
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum EventKind {
     Switch { from, to, by, reason, cwd, sessions, waited_secs },
@@ -1884,11 +1884,11 @@ ages come from `time_texts`; the page never adds values.
 
 ## The Settings page and its save queue (step C1)
 
-`areas/settings.js` exports `render(container, context)` and `update(snapshot)`; the seven groups
-are `general`, `accounts`, `auto-burn`, `notifications`, `projects`, `agents`, `history`. The
-address is `settings/<group>[?<item>]`, with `groupFrom` accepting the aliases `gen`, `acc`,
-`autoburn`/`burn`, `noti`, `proj`, `hist`; an item opens that account's editor (and an `open-area`
-request applies it even when the address already names it). A group click writes
+`areas/settings.js` exports `render(container, context)` and `update(snapshot)`; the eight groups
+are `general`, `accounts`, `auto-burn`, `notifications`, `projects`, `agents`, `providers`,
+`history`. The address is `settings/<group>[?<item>]`, with `groupFrom` accepting the aliases `gen`,
+`acc`, `autoburn`/`burn`, `noti`, `proj`, `prov`, `hist`; an item opens that account's editor (and
+an `open-area` request applies it even when the address already names it). A group click writes
 `settings/<group>` and the `hashchange` redraws it.
 
 `update(snapshot)` stores the snapshot and its settings the way `takeSettings` does, then redraws

@@ -6,50 +6,70 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-16
+
 ### Added
-- A history of every usage reading, finished window, switch and agent call, plus the tokens each
-  session used per project and hour, in an append-only folder that several hosts can share.
-- The pop-up shows the running Claude Code sessions: how many run, how many are busy, and how
-  many are waiting for you.
-- Notifications "usable again", "all accounts are full" and "waiting for you".
-- Settings for agents ("Agents may read usage", "Agents may switch accounts") and
-  `seatswap agent-skill install|uninstall`.
-- `usable` in `seatswap status --json`: whether an account can be used right now.
-- `seatswap statusline`: Claude Code's status line, with the account and its live limits.
-- Live numbers from the status line: the command feeds Claude Code's 5 h and weekly numbers into
-  seatswap's usage cache, so the active account is seconds old instead of up to 2 minutes.
-- Auto-burn: one switch that lets seatswap move between accounts by itself, with switch
-  suggestions while it is off, a quiet moment for sessions on a model that would lose its
-  thinking, a manual hold, a pause, and a per-account "Auto-burn may use this account".
-- `seatswap burn plan` and `seatswap burn simulate` (`--json` for the plan): the early-switching
-  regime, the lazy plan, and a replay of recorded work for the lazy and eager policies.
-- `slackHours` in every `status --json` view while known, and `autoBurn` and `next` at the top
-  level.
-- A large window with the Settings area: every setting, the account editor (abbreviation, colour,
-  label, price, auto-burn) and the History and hosts view, with each control saving at once.
-- Statistics (Overview, Weeks with a summary per week, Projects and organizations, Subscriptions
-  with "what if", Forecast, Rhythm, Activity).
-- Money: a currency, each account's monthly price, API prices from models.dev and the dollar rate
-  from Frankfurter, both kept with their dates; *Look up prices and the dollar rate* switches both
-  look-ups off.
-- Projects and organizations: names, joins for the same project seen in two places, and
-  organizations, kept in a project log that travels with the history folder.
+
+**Pop-up**
+- The pop-up shows the running Claude Code sessions: how many run, how many are busy and how many
+  are waiting for you.
+- Notifications "usable again", "all accounts are full" and "waiting for you"; with *For sessions
+  on: all hosts*, a session waiting on another host notifies here too, and a click opens the
+  Sessions area at that session.
 - The plan level on every account, such as "Team 5x".
-- `seatswap window [AREA]` for the large window, `seatswap prices [--refresh]` for the stored API
-  prices, and `seatswap history export --format csv|json` / `seatswap history import <folder>`.
-- The Sessions area of the large window: every running session on this host and the user's other
-  hosts, live, with its agents, tokens and their subscription and API values, the closed sessions
-  of the last 24 hours, 7 or 30 days, and the account in use.
-- The waiting notification for other hosts: with *For sessions on: all hosts*, a session waiting on
-  another host notifies here too, and a click opens the Sessions area at that session.
-- Auto-burn goes back to the account that produced the running sessions' thinking when two accounts
-  are about equally good.
-- The status line builder in the large window: segments in two zones, options per segment, a preview
-  at three widths.
+
+**Large window**
+- A large window with four areas, Sessions, Statistics, Status line and Settings, opened from the
+  pop-up's gear, `,`, an account's badge or ✎, the tray's *Settings…* and *Open seatswap…*, or
+  `seatswap window [AREA]`; every control saves at once.
+- The Settings area: every setting, the account editor (abbreviation, colour, label, price) and the
+  History and hosts view.
+- The Sessions area: every running session on this host and on the user's other hosts, live, with
+  its agents, tokens and their subscription and API values, the closed sessions of the last 24
+  hours, 7 or 30 days, and the account in use.
+
+**Status line and auto-burn**
+- `seatswap statusline`: Claude Code's status line with the account and its live limits, which also
+  feeds Claude Code's 5 h and weekly numbers into seatswap's usage cache, so the active account is
+  seconds old instead of up to 2 minutes.
+- A status line builder in the large window: segments in two zones, options per segment and a
+  preview at three widths.
 - "Use in Claude Code" and "Restore previous": seatswap writes only the `statusLine` key of Claude
   Code's settings and can put the earlier value back.
-- Status line segments for context used, session cost and lines changed (shown when Claude Code
-  sends those fields).
+- Status line segments for context used, session cost and lines changed, shown when Claude Code
+  sends those fields.
+- Auto-burn: one switch that moves between accounts by itself, with switch suggestions while it is
+  off, a quiet moment for sessions on a model that would lose its thinking, a manual hold, a pause,
+  and a per-account "Auto-burn may use it".
+- `seatswap burn plan` and `seatswap burn simulate` (`--json` for the plan): the early-switching
+  regime, the lazy plan and a replay of recorded work for the lazy and eager policies.
+- The pop-up, `burn-next.json` and the status line name the same next account as the Forecast while
+  early switching is on; the pop-up's line says `Then AC, before PR is full.` when that plan leaves
+  PR before its week fills.
+- Auto-burn goes back to the account that produced the running sessions' thinking when two
+  accounts are about equally good.
+- `usable` in `seatswap status --json` (whether an account can be used right now), `slackHours` in
+  every view while known, and `autoBurn` and `next` at the top level.
+
+**History and statistics**
+- A history of every usage reading, finished window, switch and agent call, plus the tokens each
+  session used per project and hour, in an append-only folder that several hosts can share;
+  `seatswap history export --format csv|json` and `seatswap history import <folder>` read and copy
+  it.
+- The Statistics area: Overview, Weeks with a summary per week, Projects and organizations,
+  Subscriptions with "what if", Forecast, Rhythm and Activity.
+- Money: a currency, each account's monthly price, API prices from models.dev and the dollar rate
+  from Frankfurter, each kept with its date, so past days keep that day's price; one switch,
+  *Look up prices and the dollar rate*, turns both look-ups off, and `seatswap prices [--refresh]`
+  prints the stored API prices.
+- Projects and organizations: names, joins for the same project seen in two places, and
+  organizations, in a project log that travels with the history folder.
+
+**Agents**
+- Settings for agents ("Agents may read usage", "Agents may switch accounts") and
+  `seatswap agent-skill install|uninstall`.
+
+**Other providers**
 - Read-only cards for Codex (5 h and weekly limits) and Ollama's cloud plan (credits left, reset
   date, spend in the last 24 h), each off by default, in Settings → Providers.
 
@@ -57,10 +77,8 @@ All notable changes to this project are documented here. The format follows
 - Settings and the account editor moved from the pop-up to the large window; the gear, `,` and an
   account's badge or ✎ open it there.
 - A per-model limit blocks an account only while a session on that model is open.
-- Files seatswap rewrites that are symbolic links stay links; the link's target is rewritten.
-- A file seatswap rewrites (`.claude.json`, `.credentials.json`, accounts.json, the history and
-  the others) that is a symbolic link pointing nowhere is now an error that names the link,
-  instead of being replaced by a file.
+- A file seatswap rewrites that is a symbolic link stays a link, with its target rewritten; a link
+  pointing nowhere is now an error that names the link, instead of being replaced by a file.
 - `seatswap status --json`: `suggestion` has a new shape, `{toId, text}` instead of the old
   `{fromId, toId, fromPercent, toPercent, fromResetsAt}`, so the target and the whole sentence are
   both there.
@@ -70,11 +88,8 @@ All notable changes to this project are documented here. The format follows
   auto-burn. An older `accounts.json` with them still loads; the keys are ignored.
 
 ### Fixed
-- `seatswap status --help` names the fields of the JSON output as they are: `views`, `active`
-  and `suggestion`. It said "the active id", which is not a field.
-- The pop-up, `burn-next.json` and the status line name the same next account as the Forecast
-  while early switching is on. The pop-up's line says `Then AC, before PR is full.` when that
-  plan leaves PR before its week fills.
+- `seatswap status --help` names the JSON fields `views`, `active` and `suggestion` as they are; it
+  said "the active id", which is not a field.
 
 ## [1.0.6] - 2026-11-14
 
@@ -149,7 +164,8 @@ All notable changes to this project are documented here. The format follows
   starts later): it says so and shows the icon as soon as a tray appears; `seatswap panel` opens
   the pop-up meanwhile.
 
-[Unreleased]: https://github.com/ymihere/seatswap/compare/v1.0.6...HEAD
+[Unreleased]: https://github.com/ymihere/seatswap/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/ymihere/seatswap/releases/tag/v1.1.0
 [1.0.6]: https://github.com/ymihere/seatswap/releases/tag/v1.0.6
 [1.0.5]: https://github.com/ymihere/seatswap/releases/tag/v1.0.5
 [1.0.4]: https://github.com/ymihere/seatswap/releases/tag/v1.0.4

@@ -254,8 +254,8 @@ pub struct SessionCounts {
     pub running: u32,
     pub busy: u32,
     /// How many sessions run on a model whose thinking is tied to the account
-    /// (spec §2.11). Step B measures it; until then it is `None` and left out
-    /// of the file. An old line with `"tied":0` still reads.
+    /// (spec §2.11), as the sessions thread counts it; `None` when not known,
+    /// and then left out of the file. An old line with `"tied":0` still reads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tied: Option<u32>,
 }
