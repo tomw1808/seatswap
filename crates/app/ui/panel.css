@@ -677,6 +677,73 @@ input[type="checkbox"] {
   color: var(--text);
 }
 
+/* ---------- other provider cards ---------- */
+
+.providers {
+  margin-top: 11px;
+}
+
+.providers-heading {
+  margin: 0 0 6px 1px;
+  color: var(--muted);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.provider-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+/* A provider card has no accent bar. */
+.provider-card::before {
+  display: none;
+}
+
+/* A card without a ring (Ollama credits without the monthly limit) uses the
+   full width for its text. */
+.provider-card.no-gauge {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+/* A failed poll keeps the last numbers, greyed. */
+.provider-card.stale .gauge,
+.provider-card.stale .usage-rows,
+.provider-card.stale .provider-rows {
+  opacity: 0.55;
+  filter: grayscale(1);
+}
+
+.provider-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 2px;
+}
+
+.provider-row {
+  display: grid;
+  grid-template-columns: 56px minmax(0, 1fr);
+  column-gap: 6px;
+  align-items: baseline;
+  font-size: 11px;
+}
+
+.provider-row-name {
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.provider-row-value {
+  min-width: 0;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
 /* ---------- gauge ---------- */
 
 .gauge {

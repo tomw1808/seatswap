@@ -32,6 +32,10 @@ const DEFAULT_SETTINGS = {
   theme: "system",
   claudeConfigDir: null,
   historyDir: null,
+  codexCard: false,
+  codexHome: null,
+  ollamaCard: false,
+  ollamaUrl: "http://127.0.0.1:11434",
   hostName: null,
   readSessions: true,
   notifyUsableAgain: true,
@@ -97,9 +101,46 @@ export function ensureFixture() {
     for (const row of fixture.priceList) {
       fixture.priceLookedUp[row.key] = clone(row.price);
     }
+    exposeFixtureHooks();
     console.info("[fixture] no window.__TAURI__; using the built-in snapshot");
   }
   return fixture;
+}
+
+// The bench flips these from the page: a failed provider poll that keeps the
+// last numbers, and both provider cards switched off. The page announces the
+// change so the open view is drawn again.
+function exposeFixtureHooks() {
+  if (typeof window === "undefined") return;
+  window.__fixture = {
+    providerError(provider, text) {
+      if (!fixture) throw new Error("fixture is not ready");
+      if (typeof text !== "string" || text === "") {
+        throw new Error(`an error text is needed, not ${JSON.stringify(text)}`);
+      }
+      const view = fixture.providers.find((entry) => entry.provider === provider);
+      if (!view) throw new Error(`no provider ${provider}`);
+      view.error = text;
+      if (view.usage || view.credits) {
+        view.fetchedAt = isoIn(-6 * 60000);
+      }
+      publishFixtureChange();
+      return view.error;
+    },
+    providersOff() {
+      if (!fixture) throw new Error("fixture is not ready");
+      fixture.providers = [];
+      fixture.settings.codexCard = false;
+      fixture.settings.ollamaCard = false;
+      publishFixtureChange();
+      return "off";
+    },
+  };
+}
+
+function publishFixtureChange() {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(new CustomEvent("seatswap:fixture"));
 }
 
 // The snapshot the fixture commands change, or null before `ensureFixture`.
@@ -164,6 +205,11 @@ function isoIn(milliseconds) {
 function makeFixture() {
   const day = 86400000;
   const hour = 3600000;
+  // Ollama's monthly allowance resets on the third of the coming month.
+  const nextMonth = new Date();
+  nextMonth.setMonth(nextMonth.getMonth() + 1, 3);
+  nextMonth.setHours(0, 0, 0, 0);
+  const untilNextMonth = nextMonth.toISOString();
   const acmeId = "5d1c2a9b-e0d3-4c11-9e21-7c8f1a2b3c4d";
   const labId = "8b4e7f20-6a1d-4d33-b8c5-2f9a0e6d7c81";
   const privateId = "c0a1b2d3-e4f5-4a6b-8c7d-9e0f1a2b3c4d";
@@ -377,6 +423,67 @@ function makeFixture() {
       unavailable: null,
       warning: null,
     },
+    // The open provider cards (spec §7): a Codex Plus login and an Ollama
+    // cloud plan, as gui/providers_rt.rs sends them.
+    providers: [
+      {
+        provider: "codex",
+        title: "Codex",
+        plan: "Plus",
+        usage: {
+          limits: [
+            {
+              kind: "session",
+              percent: 12,
+              severity: "normal",
+              resetsAt: isoIn(2 * hour + 15 * 60000),
+              model: null,
+              isActive: false,
+            },
+            {
+              kind: "weekly_all",
+              percent: 48,
+              severity: "normal",
+              resetsAt: isoIn(5 * day + 3 * hour),
+              model: null,
+              isActive: true,
+            },
+          ],
+          extraUsageEnabled: false,
+        },
+        credits: null,
+        spend24h: null,
+        fetchedAt: isoIn(0),
+        error: null,
+      },
+      {
+        provider: "ollama",
+        title: "Ollama",
+        plan: null,
+        usage: {
+          limits: [
+            {
+              kind: { other: "monthly_credits" },
+              percent: 29.2,
+              severity: "normal",
+              resetsAt: untilNextMonth,
+              model: null,
+              isActive: true,
+            },
+          ],
+          extraUsageEnabled: false,
+        },
+        credits: {
+          left: 212.4,
+          allowance: 300,
+          until: untilNextMonth,
+          purchased: 0,
+        },
+        spend24h: 3.18,
+        fetchedAt: isoIn(0),
+        error: null,
+      },
+    ],
     money: {
       currency: "EUR",
       rate: { value: 0.9048, date: "2026-11-13", own: false },
@@ -768,6 +875,21 @@ function validateFixtureSettings(settings) {
   ) {
     throw new Error(`historyDir must be an absolute path, got ${merged.historyDir}`);
   }
+  if (
+    merged.codexHome !== null &&
+    merged.codexHome !== undefined &&
+    !String(merged.codexHome).startsWith("/")
+  ) {
+    throw new Error(`codexHome must be an absolute path, got ${merged.codexHome}`);
+  }
+  if (
+    typeof merged.ollamaUrl !== "string" ||
+    !/^https?:\/\/[^/\s]+/.test(merged.ollamaUrl)
+  ) {
+    throw new Error(
+      `ollamaUrl must start with http:// or https:// and name a host, got ${JSON.stringify(merged.ollamaUrl)}`
+    );
+  }
   if (merged.hostName !== null && merged.hostName !== undefined) {
     const name = String(merged.hostName);
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/.test(name)) {
@@ -804,7 +926,7 @@ function validateFixtureSettings(settings) {
 }
 
 // One field replaced, the way the worker's `merge_setting` does it: the field
-// must be a settings key, the two path settings expand a typed `~/`, and the
+// must be a settings key, the path settings expand a typed `~/`, and the
 // result is validated as a whole.
 function fixtureSaveSetting(fixture, field, value) {
   const base = Object.assign({}, DEFAULT_SETTINGS, fixture.settings || {});
@@ -814,7 +936,7 @@ function fixtureSaveSetting(fixture, field, value) {
   const next = clone(base);
   next[field] = value === undefined ? null : value;
   if (
-    (field === "claudeConfigDir" || field === "historyDir") &&
+    (field === "claudeConfigDir" || field === "historyDir" || field === "codexHome") &&
     typeof next[field] === "string" &&
     (next[field] === "~" || next[field].startsWith("~/"))
   ) {

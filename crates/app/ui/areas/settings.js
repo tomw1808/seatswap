@@ -1,4 +1,4 @@
-// The Settings area of the large window (spec §3.7): seven groups on the left,
+// The Settings area of the large window (spec §3.7): eight groups on the left,
 // the chosen group's card on the right. Every control saves one field at once
 // through `save_setting`; a refused save shows its error under the row and puts
 // the control back to the saved value. A snapshot updates the open group in
@@ -33,6 +33,7 @@ const GROUPS = [
   { id: "notifications", label: "Notifications" },
   { id: "projects", label: "Projects" },
   { id: "agents", label: "Agents" },
+  { id: "providers", label: "Providers" },
   { id: "history", label: "History and hosts" },
 ];
 
@@ -49,6 +50,8 @@ const ALIASES = {
   projects: "projects",
   proj: "projects",
   agents: "agents",
+  providers: "providers",
+  prov: "providers",
   history: "history",
   hist: "history",
 };
@@ -137,7 +140,7 @@ function labelOf(id) {
 }
 
 // ---------------------------------------------------------------------------
-// the page and its seven groups
+// the page and its eight groups
 // ---------------------------------------------------------------------------
 
 // The account ids a snapshot holds, as one comparable text: only a changed
@@ -280,6 +283,7 @@ function renderGroup(right, id) {
       "notifications",
       "projects",
       "agents",
+      "providers",
       "history",
     ].includes(id)
   ) {
@@ -291,6 +295,7 @@ function renderGroup(right, id) {
   else if (id === "auto-burn") right.appendChild(autoBurnCard());
   else if (id === "notifications") right.appendChild(notificationsCard());
   else if (id === "projects") right.appendChild(projectsCard());
+  else if (id === "providers") right.appendChild(providersCard());
   else if (id === "history") right.appendChild(historyCard());
   else right.appendChild(agentsCard());
 }
@@ -2529,6 +2534,40 @@ function renderCalls(container) {
       )
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// Providers (spec §7, step D task 5)
+// ---------------------------------------------------------------------------
+
+function providersCard() {
+  return panel(
+    "Providers",
+    "read-only cards for Codex and Ollama's cloud plan",
+    [
+      section("Codex"),
+      setting(
+        "Show a Codex card",
+        toggle("codexCard", "Show a Codex card"),
+        "read only · every 5 minutes",
+        "codexCard"
+      ),
+      note(
+        "seatswap reads Codex's login file and asks chatgpt.com for your usage every 5 minutes. It never changes Codex's files."
+      ),
+      textField("codexHome", "Codex folder", {
+        note: "empty: $CODEX_HOME or ~/.codex",
+      }),
+      section("Ollama"),
+      setting(
+        "Show an Ollama card",
+        toggle("ollamaCard", "Show an Ollama card"),
+        "asks the Ollama server on this machine for your cloud balance every 5 minutes",
+        "ollamaCard"
+      ),
+      textField("ollamaUrl", "Ollama server"),
+    ]
+  );
 }
 
 // ---------------------------------------------------------------------------

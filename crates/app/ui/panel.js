@@ -25,6 +25,7 @@ import {
   shortPercent,
   switchControl,
   textInput,
+  twoDecimalAmount,
 } from "./common.js";
 import { currentFixture, ensureFixture } from "./fixture.js";
 
@@ -51,6 +52,10 @@ const state = {
     add: null,
   },
 };
+
+// The line both a card and a provider card show when the reply carried no usage
+// limits at all.
+const NO_LIMITS_TEXT = "No usage limits in the reply.";
 
 function fmtPercent(value) {
   return `${shortPercent(value)} %`;
@@ -135,9 +140,10 @@ function otherLimits(view) {
     .filter((entry) => entry.name && !known.has(entry.name));
 }
 
-// The age of an account's usage, shown once it is older than two minutes.
+// The age of an account's usage or a provider's last reading, shown once it is
+// older than two minutes.
 function usageAge(view) {
-  if (!view || !view.usage || !view.fetchedAt) return null;
+  if (!view || !(view.usage || view.credits) || !view.fetchedAt) return null;
   const time = Date.parse(view.fetchedAt);
   if (!Number.isFinite(time)) return null;
   if (Date.now() - time < 120000) return null;
@@ -218,6 +224,7 @@ function renderMain() {
   state.lastCardOrder = nextOrder;
   if (reordered) animateCardMoves(cards, previousPositions);
 
+  renderProviders();
   renderFooter();
   updateAge();
   fitPanel();
@@ -672,7 +679,11 @@ function renderCard(view, index) {
     event.stopPropagation();
     switchTo(view.id);
   };
-  const gauge = renderGauge(view);
+  const gauge = renderGauge(
+    findLimit(view, "weekly_all"),
+    findLimit(view, "session"),
+    view.id
+  );
   if (switchable) {
     gauge.classList.add("switchable");
     const tip = document.createElementNS("http://www.w3.org/2000/svg", "title");
@@ -754,23 +765,13 @@ function renderCard(view, index) {
   if (view.loginState === "loggedOut") {
     main.appendChild(renderLoggedOut());
   } else {
-    const rows = [];
-    const week = findLimit(view, "weekly_all");
-    if (week) rows.push(renderUsageRow("Week", week, true));
-    const session = findLimit(view, "session");
-    if (session) rows.push(renderUsageRow("Session", session, true));
-    for (const scoped of scopedLimits(view)) {
-      rows.push(renderUsageRow(scoped.model || "Scoped", scoped, false));
-    }
-    for (const other of otherLimits(view)) {
-      rows.push(renderUsageRow(other.name, other.limit, Boolean(other.limit.resetsAt)));
-    }
+    const rows = renderLimitRows(view);
     if (rows.length > 0) {
       main.appendChild(h("div", { class: "usage-rows" }, rows));
     } else if (!view.usage) {
       main.appendChild(h("div", { class: "card-note", text: "Usage not fetched yet." }));
     } else {
-      main.appendChild(h("div", { class: "card-note", text: "No usage limits in the reply." }));
+      main.appendChild(h("div", { class: "card-note", text: NO_LIMITS_TEXT }));
     }
   }
 
@@ -822,6 +823,23 @@ function renderLoggedOut() {
   ]);
 }
 
+// One account card's and one provider card's limit rows: the week, the 5 h
+// session, the scoped limits and any other limit, in that order.
+function renderLimitRows(view) {
+  const rows = [];
+  const week = findLimit(view, "weekly_all");
+  if (week) rows.push(renderUsageRow("Week", week, true));
+  const session = findLimit(view, "session");
+  if (session) rows.push(renderUsageRow("Session", session, true));
+  for (const scoped of scopedLimits(view)) {
+    rows.push(renderUsageRow(scoped.model || "Scoped", scoped, false));
+  }
+  for (const other of otherLimits(view)) {
+    rows.push(renderUsageRow(other.name, other.limit, Boolean(other.limit.resetsAt)));
+  }
+  return rows;
+}
+
 function renderUsageRow(name, limit, showReset) {
   const level = limitLevel(limit);
   const color = LEVEL_COLORS[level];
@@ -860,11 +878,9 @@ function renderUsageRow(name, limit, showReset) {
 
 let gaugeSequence = 0;
 
-function renderGauge(view) {
+function renderGauge(outer, inner, ringKey) {
   const template = document.getElementById("gauge-template");
   const gauge = template.content.firstElementChild.cloneNode(true);
-  const session = findLimit(view, "session");
-  const week = findLimit(view, "weekly_all");
 
   // Outer ring: the week (the limit that matters most). Inner ring: the 5 h
   // session, left out entirely on plans that have no session limit.
@@ -872,23 +888,23 @@ function renderGauge(view) {
     gauge,
     gauge.querySelector(".ring-arc.ring-outer"),
     gauge.querySelector(".grad-week"),
-    week,
-    view,
+    outer,
+    ringKey,
     "week"
   );
   setupArc(
     gauge,
     gauge.querySelector(".ring-arc.ring-inner"),
     gauge.querySelector(".grad-session"),
-    session,
-    view,
+    inner,
+    ringKey,
     "session"
   );
 
   const weekText = gauge.querySelector(".gauge-week");
-  setGaugeText(weekText, week);
-  setGaugeText(gauge.querySelector(".gauge-session"), session);
-  if (!session) {
+  setGaugeText(weekText, outer);
+  setGaugeText(gauge.querySelector(".gauge-session"), inner);
+  if (!inner) {
     gauge.querySelector(".ring-track.ring-inner").remove();
     // Alone in the middle: centre the week's figure vertically.
     weekText.setAttribute("y", "36");
@@ -906,7 +922,7 @@ function setGaugeText(node, limit) {
   node.classList.add(`lv-${limitLevel(limit)}`);
 }
 
-function setupArc(gauge, arc, gradient, limit, view, slot) {
+function setupArc(gauge, arc, gradient, limit, ringKey, slot) {
   if (!arc) return;
   if (!limit) {
     arc.style.display = "none";
@@ -938,7 +954,7 @@ function setupArc(gauge, arc, gradient, limit, view, slot) {
   if (level === "critical" || level === "locked") arc.classList.add("glow");
 
   const target = clamp(Number(limit.percent) || 0, 0, 100);
-  const key = `${view.id}:${slot}`;
+  const key = `${ringKey}:${slot}`;
   const startPercent = state.lastPercents.has(key) ? state.lastPercents.get(key) : 0;
 
   arc.style.strokeDasharray = String(circumference);
@@ -957,6 +973,156 @@ function setupArc(gauge, arc, gradient, limit, view, slot) {
   }
 
   state.lastPercents.set(key, target);
+}
+
+// ---------------------------------------------------------------------------
+// other provider cards
+// ---------------------------------------------------------------------------
+
+function providerViews() {
+  if (!state.snapshot || !Array.isArray(state.snapshot.providers)) return [];
+  return state.snapshot.providers.filter(isObject);
+}
+
+// The list after the account cards: empty, it leaves neither heading nor
+// section. The keyboard cursor and the card order animation stay on accounts.
+function renderProviders() {
+  const section = document.getElementById("providers");
+  const list = document.getElementById("provider-cards");
+  if (!section || !list) return;
+  clear(list);
+  const views = providerViews();
+  section.hidden = views.length === 0;
+  for (const view of views) {
+    list.appendChild(renderProviderCard(view));
+  }
+}
+
+function renderProviderCard(view) {
+  const credits = isObject(view.credits) ? view.credits : null;
+  const numbers = Boolean(credits || view.usage);
+  const stale = Boolean(view.error) && numbers;
+  const ringKey = `provider:${view.provider}`;
+
+  let gauge = null;
+  if (credits) {
+    const monthly = findLimit(view, "monthly_credits");
+    if (monthly) gauge = renderGauge(monthly, null, ringKey);
+  } else if (view.usage) {
+    const week = findLimit(view, "weekly_all");
+    const session = findLimit(view, "session");
+    if (week || session) gauge = renderGauge(week, session, ringKey);
+  }
+  const card = h("div", {
+    class:
+      "card provider-card" +
+      (stale ? " stale" : "") +
+      (gauge ? "" : " no-gauge"),
+    role: "listitem",
+  });
+  if (gauge) card.appendChild(gauge);
+
+  const main = h("div", { class: "card-main" });
+  main.appendChild(
+    h("div", { class: "card-top" }, [
+      h("span", {
+        class: "card-label",
+        text: view.title,
+      }),
+    ])
+  );
+
+  // The plan sits where an account's plan does; a failed first poll with no
+  // numbers leaves the title and the error text alone. The age appears only
+  // once the reading is old or a poll has failed.
+  const meta = [];
+  if (numbers && typeof view.plan === "string" && view.plan !== "") meta.push(view.plan);
+  const age = numbers ? usageAge(view) : null;
+  if (age) {
+    if (meta.length > 0) meta.push(" · ");
+    meta.push(age);
+  }
+  if (meta.length > 0) {
+    main.appendChild(
+      h("div", { class: "card-meta-row" }, [
+        h("div", { class: "card-meta" }, meta),
+      ])
+    );
+  }
+
+  if (credits) {
+    main.appendChild(renderCreditRows(view, credits));
+  } else if (view.usage) {
+    const rows = renderLimitRows(view);
+    if (rows.length > 0) {
+      main.appendChild(h("div", { class: "usage-rows" }, rows));
+    } else {
+      main.appendChild(h("div", { class: "card-note", text: NO_LIMITS_TEXT }));
+    }
+  }
+
+  if (view.error) {
+    main.appendChild(
+      h("div", {
+        class: "card-note error",
+        text: String(view.error),
+        title: String(view.error),
+      })
+    );
+  }
+
+  card.appendChild(main);
+  return card;
+}
+
+// The rows of an Ollama card on a new plan: the included credits with the
+// reset date, the spend of the last 24 h, and bought credits when there are
+// any.
+function renderCreditRows(view, credits) {
+  const rows = h("div", { class: "provider-rows" });
+
+  const creditValue = [];
+  if (typeof credits.allowance === "number" && Number.isFinite(credits.allowance)) {
+    creditValue.push(`${twoDecimalAmount(credits.left)} of ${twoDecimalAmount(credits.allowance)} USD`);
+  } else {
+    creditValue.push(`${twoDecimalAmount(credits.left)} USD`);
+  }
+  if (credits.until) {
+    creditValue.push("  ·  resets ");
+    creditValue.push(timeNode(credits.until, "day"));
+  }
+  rows.appendChild(
+    h("div", { class: "provider-row" }, [
+      h("span", { class: "provider-row-name", text: "Credits" }),
+      h("span", { class: "provider-row-value" }, creditValue),
+    ])
+  );
+
+  if (typeof view.spend24h === "number" && Number.isFinite(view.spend24h)) {
+    rows.appendChild(
+      h("div", { class: "provider-row" }, [
+        h("span", { class: "provider-row-name", text: "Last 24 h" }),
+        h("span", {
+          class: "provider-row-value",
+          text: `${twoDecimalAmount(view.spend24h)} USD`,
+        }),
+      ])
+    );
+  }
+
+  if (typeof credits.purchased === "number" && credits.purchased > 0) {
+    rows.appendChild(
+      h("div", { class: "provider-row" }, [
+        h("span", { class: "provider-row-name", text: "Purchased" }),
+        h("span", {
+          class: "provider-row-value",
+          text: `${twoDecimalAmount(credits.purchased)} USD`,
+        }),
+      ])
+    );
+  }
+
+  return rows;
 }
 
 function renderAdd() {
@@ -1467,7 +1633,14 @@ function handleSnapshot(snapshot) {
 async function boot() {
   wireStatic();
   followTheme(currentThemeSetting);
-  if (!HAS_TAURI) ensureFixture();
+  if (!HAS_TAURI) {
+    ensureFixture();
+    // The fixture's test hooks change the snapshot and announce it.
+    window.addEventListener("seatswap:fixture", () => {
+      const fixture = currentFixture();
+      if (fixture) handleSnapshot(fixture);
+    });
+  }
   applyTheme(currentThemeSetting());
   setView(viewFromHash(), { noHash: true });
 

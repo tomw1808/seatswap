@@ -1636,7 +1636,7 @@ pub(crate) fn report_history_error(error: &str) {
 /// The settings with one field replaced, checked as a whole. `field` must name
 /// a key of the settings' JSON object; a bad value is the field's name followed
 /// by serde's text, and an invalid value is [`Settings::validate`]'s error.
-/// A `~/` typed into one of the two path settings is the home folder.
+/// A `~/` typed into one of the path settings is the home folder.
 fn merge_setting(
     settings: &Settings,
     field: &str,
@@ -1653,7 +1653,7 @@ fn merge_setting(
     }
     let value = match value {
         serde_json::Value::String(text)
-            if matches!(field, "claudeConfigDir" | "historyDir")
+            if matches!(field, "claudeConfigDir" | "historyDir" | "codexHome")
                 && (text == "~" || text.starts_with("~/")) =>
         {
             let expanded = expand_tilde(&text, home);
@@ -2400,7 +2400,7 @@ mod tests {
             config.claude_config_dir,
             Some(std::path::PathBuf::from("/home/sam/claude"))
         );
-        // Only the two path settings expand: the host name stays "~x" and is
+        // Only the path settings expand: the host name stays "~x" and is
         // refused by its own rule, exactly as it would be without this merge.
         let error = merge_setting(&Settings::default(), "hostName", json!("~x"), home)
             .expect_err("a host name may not start with ~");
@@ -2408,6 +2408,17 @@ mod tests {
         assert!(
             !error.contains("/home/sam"),
             "the host name is not a path: {error}"
+        );
+    }
+
+    #[test]
+    fn merge_setting_expands_a_tilde_in_the_codex_folder() {
+        let home = Path::new("/home/sam");
+        let merged = merge_setting(&Settings::default(), "codexHome", json!("~/codex"), home)
+            .expect("the Codex folder is a path");
+        assert_eq!(
+            merged.codex_home,
+            Some(std::path::PathBuf::from("/home/sam/codex"))
         );
     }
 
