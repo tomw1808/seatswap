@@ -437,6 +437,7 @@ impl StatuslineConfig {
 const DEFAULT_POLL_ACTIVE_SECS: u64 = 120;
 const DEFAULT_POLL_INACTIVE_SECS: u64 = 900;
 const DEFAULT_HOTKEY: &str = "Ctrl+Alt+C";
+const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
 
 fn default_tray_text() -> TrayText {
     TrayText::Percent
@@ -524,6 +525,18 @@ fn default_statusline_feed() -> bool {
 
 fn default_look_up_prices() -> bool {
     true
+}
+
+fn default_codex_card() -> bool {
+    false
+}
+
+fn default_ollama_card() -> bool {
+    false
+}
+
+fn default_ollama_url() -> String {
+    DEFAULT_OLLAMA_URL.to_string()
 }
 
 /// A missing status line field takes the preset's value for that field, read
@@ -670,6 +683,22 @@ pub struct Settings {
     /// default on.
     #[serde(default = "default_look_up_prices")]
     pub look_up_prices: bool,
+    /// When on, the pop-up shows a read-only Codex card (spec §7.2); default off.
+    #[serde(default = "default_codex_card")]
+    pub codex_card: bool,
+    /// The Codex folder to read; `None` (absent or `null` in the file) means
+    /// `$CODEX_HOME`, else `~/.codex`. A relative path is refused by
+    /// [`Settings::validate`].
+    #[serde(default)]
+    pub codex_home: Option<PathBuf>,
+    /// When on, the pop-up shows a read-only Ollama card (spec §7.1); default off.
+    #[serde(default = "default_ollama_card")]
+    pub ollama_card: bool,
+    /// The Ollama server the card asks (spec §7.1); default
+    /// `"http://127.0.0.1:11434"`. Anything but http(s) with a host is refused by
+    /// [`Settings::validate`].
+    #[serde(default = "default_ollama_url")]
+    pub ollama_url: String,
 }
 
 impl Default for Settings {
@@ -704,6 +733,10 @@ impl Default for Settings {
             currency: None,
             usd_rate: None,
             look_up_prices: default_look_up_prices(),
+            codex_card: default_codex_card(),
+            codex_home: None,
+            ollama_card: default_ollama_card(),
+            ollama_url: default_ollama_url(),
         }
     }
 }
@@ -732,6 +765,14 @@ impl Settings {
                 )));
             }
         }
+        if let Some(dir) = &self.codex_home {
+            if !dir.is_absolute() {
+                return Err(StoreError::InvalidSetting(format!(
+                    "codexHome must be an absolute path, got {}",
+                    dir.display()
+                )));
+            }
+        }
         if let Some(dir) = &self.history_dir {
             crate::paths::check_history_dir(dir)
                 .map_err(|error| StoreError::InvalidSetting(error.to_string()))?;
@@ -752,9 +793,45 @@ impl Settings {
                 )));
             }
         }
+        validate_ollama_url(&self.ollama_url)?;
         validate_statusline(&self.statusline)?;
         Ok(())
     }
+}
+
+/// Check an `ollamaUrl`: it must start with `http://` or `https://`, name a
+/// host — the text after the scheme, up to the first `/`, `?` or `#`, must not
+/// be empty and must have a non-empty part before a port colon — and contain no
+/// whitespace or control character anywhere: no HTTP client can use such a
+/// URL, so it is refused here and not at the request. A port (`:8443`), a path
+/// (`/base`), an IPv6 host (`[::1]`) and a trailing slash are fine. Anything
+/// else is [`StoreError::InvalidSetting`] naming the field and the value, never
+/// a fallback.
+fn validate_ollama_url(url: &str) -> Result<(), StoreError> {
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(StoreError::InvalidSetting(format!(
+            "ollamaUrl must not contain a whitespace or control character, got {url:?}"
+        )));
+    }
+    let rest = match url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+    {
+        Some(rest) => rest,
+        None => {
+            return Err(StoreError::InvalidSetting(format!(
+                "ollamaUrl must start with http:// or https://, got {url:?}"
+            )))
+        }
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.split(':').next().unwrap_or("");
+    if host.is_empty() {
+        return Err(StoreError::InvalidSetting(format!(
+            "ollamaUrl must name a host after http:// or https://, got {url:?}"
+        )));
+    }
+    Ok(())
 }
 
 /// The one currency rule (spec §1.4): three capital letters. Used by
@@ -2169,6 +2246,140 @@ mod tests {
             statusline_error(config),
             "invalid setting: statusline.left[1].text: a Text segment needs text"
         );
+    }
+
+    #[test]
+    fn provider_settings_default_to_off() {
+        let defaults = Settings::default();
+        assert!(!defaults.codex_card);
+        assert_eq!(defaults.codex_home, None);
+        assert!(!defaults.ollama_card);
+        assert_eq!(defaults.ollama_url, "http://127.0.0.1:11434");
+
+        // An older file without the four keys loads with the defaults.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_at(&tmp.path().join("app"));
+        fs::create_dir_all(store.app_paths().data_dir.clone()).unwrap();
+        fs::write(
+            store.app_paths().accounts_file(),
+            br#"{"version":1,"accounts":[],"settings":{"trayText":"percent"}}"#,
+        )
+        .unwrap();
+        let older = store.load().unwrap();
+        assert!(!older.settings.codex_card);
+        assert_eq!(older.settings.codex_home, None);
+        assert!(!older.settings.ollama_card);
+        assert_eq!(older.settings.ollama_url, "http://127.0.0.1:11434");
+
+        // A file with them loads back the same values.
+        let settings = Settings {
+            codex_card: true,
+            codex_home: Some(PathBuf::from("/x/codex")),
+            ollama_card: true,
+            ollama_url: "https://ollama.example:8443/base".to_string(),
+            ..Settings::default()
+        };
+        let file = AccountsFile {
+            settings: settings.clone(),
+            ..AccountsFile::default()
+        };
+        let text = serde_json::to_string(&file).unwrap();
+        for expected in [
+            "\"codexCard\":true",
+            "\"codexHome\":\"/x/codex\"",
+            "\"ollamaCard\":true",
+            "\"ollamaUrl\":\"https://ollama.example:8443/base\"",
+        ] {
+            assert!(text.contains(expected), "missing {expected} in {text}");
+        }
+        fs::write(store.app_paths().accounts_file(), &text).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.settings, settings);
+    }
+
+    #[test]
+    fn validate_rejects_a_bad_ollama_url() {
+        for bad in ["127.0.0.1:11434", "", "http://", "ftp://x"] {
+            let settings = Settings {
+                ollama_url: bad.to_string(),
+                ..Settings::default()
+            };
+            match settings.validate() {
+                Err(StoreError::InvalidSetting(message)) => {
+                    assert!(message.contains("ollamaUrl"), "{bad:?}: {message}");
+                    let quoted = format!("{bad:?}");
+                    assert!(message.contains(&quoted), "{bad:?}: {message}");
+                }
+                other => panic!("expected InvalidSetting for {bad:?}, got {other:?}"),
+            }
+        }
+        for good in ["http://127.0.0.1:11434", "https://ollama.example:8443/base"] {
+            let settings = Settings {
+                ollama_url: good.to_string(),
+                ..Settings::default()
+            };
+            assert!(settings.validate().is_ok(), "{good:?} must be accepted");
+        }
+    }
+
+    /// The task's rule: the URL "must start with `http://` or `https://` and
+    /// have a host". A host with a space in it is no host: no HTTP client can
+    /// use such a URL, so the setting has to be refused here and not at the
+    /// request.
+    #[test]
+    fn validate_rejects_an_ollama_url_without_a_real_host() {
+        for good in [
+            "http://127.0.0.1:11434",
+            "http://[::1]:11434",
+            "https://ollama.example:8443/base",
+            "http://127.0.0.1:11434/",
+        ] {
+            let settings = Settings {
+                ollama_url: good.to_string(),
+                ..Settings::default()
+            };
+            assert!(settings.validate().is_ok(), "{good:?} must be accepted");
+        }
+        for bad in [
+            "http://127.0.0.1 :11434",
+            "http://ollama host:11434",
+            "http://127.0.0.1:11434/\u{7}",
+        ] {
+            let settings = Settings {
+                ollama_url: bad.to_string(),
+                ..Settings::default()
+            };
+            match settings.validate() {
+                Err(StoreError::InvalidSetting(message)) => {
+                    assert!(message.contains("ollamaUrl"), "{bad:?}: {message}");
+                    let quoted = format!("{bad:?}");
+                    assert!(message.contains(&quoted), "{bad:?}: {message}");
+                }
+                other => panic!("expected InvalidSetting for {bad:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn validate_rejects_a_relative_codex_home() {
+        let settings = Settings {
+            codex_home: Some(PathBuf::from("codex")),
+            ..Settings::default()
+        };
+        match settings.validate() {
+            Err(StoreError::InvalidSetting(message)) => {
+                assert!(message.contains("absolute path"), "got {message}");
+                assert!(message.contains("codex"), "got {message}");
+                assert!(message.contains("codexHome"), "got {message}");
+            }
+            other => panic!("expected InvalidSetting for a relative codexHome, got {other:?}"),
+        }
+
+        let absolute = Settings {
+            codex_home: Some(std::env::temp_dir().join(".codex")),
+            ..Settings::default()
+        };
+        assert!(absolute.validate().is_ok());
     }
 
     #[test]

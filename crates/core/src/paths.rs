@@ -32,6 +32,8 @@ pub enum PathsError {
     HostName(String),
     #[error("historyDir must be an absolute path, got {0}")]
     HistoryDir(String),
+    #[error("the Codex folder (codexHome or $CODEX_HOME) must be an absolute path, got {0}")]
+    RelativeCodexHome(PathBuf),
 }
 
 /// Claude Code's files for one config folder.
@@ -153,6 +155,56 @@ impl ClaudePaths {
     /// Claude Code's skill folder: `<config_dir>/skills`.
     pub fn skills_dir(&self) -> PathBuf {
         self.config_dir.join("skills")
+    }
+}
+
+/// Codex's login file (spec §7.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexPaths {
+    /// `~/.codex`, or `$CODEX_HOME`; seatswap only ever reads here.
+    pub home: PathBuf,
+    /// `<home>/auth.json`: the login seatswap reads, never writes.
+    pub auth_file: PathBuf,
+}
+
+impl CodexPaths {
+    /// Resolve from the real environment: `explicit` (the `codexHome` setting)
+    /// wins, then a non-empty `$CODEX_HOME`, then `~/.codex`. A relative folder
+    /// is [`PathsError::RelativeCodexHome`], never resolved against the current
+    /// folder.
+    pub fn resolve(explicit: Option<&Path>) -> Result<CodexPaths, PathsError> {
+        let home = dirs::home_dir().ok_or(PathsError::NoHome)?;
+        Self::resolve_with(explicit, std::env::var_os("CODEX_HOME"), &home)
+    }
+
+    /// Same as [`resolve`](Self::resolve) without reading the process environment
+    /// (for tests): `explicit` wins, then a non-empty `env_codex_home`, then
+    /// `home/.codex`. A relative `explicit` folder or `env_codex_home` is
+    /// [`PathsError::RelativeCodexHome`]: the setting is checked by
+    /// `Settings::validate`, but a hand-edited file is not checked on load, and
+    /// `$CODEX_HOME` is never checked at all.
+    pub fn resolve_with(
+        explicit: Option<&Path>,
+        env_codex_home: Option<OsString>,
+        home: &Path,
+    ) -> Result<CodexPaths, PathsError> {
+        let dir = match (explicit, env_codex_home) {
+            (Some(p), _) => p.to_path_buf(),
+            (None, Some(v)) if !v.is_empty() => PathBuf::from(v),
+            _ => return Ok(Self::at(&home.join(".codex"))),
+        };
+        if !dir.is_absolute() {
+            return Err(PathsError::RelativeCodexHome(dir));
+        }
+        Ok(Self::at(&dir))
+    }
+
+    /// The files of a given Codex folder: the login is `<home>/auth.json`.
+    pub fn at(home: &Path) -> CodexPaths {
+        CodexPaths {
+            home: home.to_path_buf(),
+            auth_file: home.join("auth.json"),
+        }
     }
 }
 
@@ -475,6 +527,66 @@ mod tests {
         assert_eq!(p.config_dir, Path::new("/x"));
         let p = ClaudePaths::resolve_with(None, Some("".into()), Path::new("/h"));
         assert_eq!(p.config_dir, Path::new("/h/.claude"));
+    }
+
+    #[test]
+    fn codex_paths_at() {
+        let p = CodexPaths::at(Path::new("/x/codex"));
+        assert_eq!(p.home, Path::new("/x/codex"));
+        assert_eq!(p.auth_file, Path::new("/x/codex/auth.json"));
+    }
+
+    #[test]
+    fn codex_paths_resolve_order() {
+        // An explicit folder wins over the variable.
+        let p = CodexPaths::resolve_with(
+            Some(Path::new("/x/codex")),
+            Some("/y/codex".into()),
+            Path::new("/home/u"),
+        )
+        .expect("an explicit absolute folder is fine");
+        assert_eq!(p.home, Path::new("/x/codex"));
+        assert_eq!(p.auth_file, Path::new("/x/codex/auth.json"));
+
+        // A non-empty variable wins over the home folder.
+        let p = CodexPaths::resolve_with(None, Some("/y/codex".into()), Path::new("/home/u"))
+            .expect("an absolute variable is fine");
+        assert_eq!(p.home, Path::new("/y/codex"));
+        assert_eq!(p.auth_file, Path::new("/y/codex/auth.json"));
+
+        // An empty variable is ignored.
+        let p = CodexPaths::resolve_with(None, Some("".into()), Path::new("/home/u"))
+            .expect("an empty variable falls back to the home folder");
+        assert_eq!(p.home, Path::new("/home/u/.codex"));
+        assert_eq!(p.auth_file, Path::new("/home/u/.codex/auth.json"));
+    }
+
+    /// A relative `$CODEX_HOME` must not become a folder relative to the
+    /// current one: seatswap would then read a different folder than Codex
+    /// does, without saying so. The history folder has the same rule
+    /// ([`check_history_dir`]), and so has the `codexHome` setting
+    /// (`Settings::validate`), but a hand-edited settings file is not checked
+    /// on load.
+    #[test]
+    fn the_codex_folder_from_the_environment_is_never_relative() {
+        let error =
+            CodexPaths::resolve_with(None, Some("codex".into()), Path::new("/home/u")).unwrap_err();
+        assert!(
+            matches!(&error, PathsError::RelativeCodexHome(path) if path == Path::new("codex")),
+            "expected RelativeCodexHome for codex, got {error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "the Codex folder (codexHome or $CODEX_HOME) must be an absolute path, got codex"
+        );
+
+        // The explicit `codexHome` folder is the same error.
+        let error = CodexPaths::resolve_with(Some(Path::new("codex")), None, Path::new("/home/u"))
+            .unwrap_err();
+        assert!(
+            matches!(&error, PathsError::RelativeCodexHome(path) if path == Path::new("codex")),
+            "expected RelativeCodexHome for codex, got {error:?}"
+        );
     }
 
     #[test]
