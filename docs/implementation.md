@@ -3671,10 +3671,15 @@ local Ollama URL: each field has a `#[serde(default = "…")]` or `#[serde(defau
 be rewritten. `Settings::validate` checks `codexHome` with the other paths (it must be absolute when
 `Some`) and always calls `validate_ollama_url`. The URL rule is: no whitespace or control character
 anywhere; it must start with `http://` or `https://`; the text after the scheme up to the first `/`,
-`?` or `#` must not be empty and must have a non-empty part before a port colon; no `?`, no `#`, and
-no `//` after the authority. A port, a path, an IPv6 host and one trailing `/` are accepted. Every
-refusal is `StoreError::InvalidSetting`, names `ollamaUrl` and quotes the value; there is no
-fallback. `providers::ollama::read` calls the same function again before it asks the server.
+`?` or `#` is the authority and must start with a real host — a DNS name (dot-separated labels of
+letters, digits and inner hyphens, each 1 to 63 bytes, 253 bytes in all), an IPv4 address (accepted by
+that same name rule) or a bracketed IPv6 address followed by nothing or `:port`; no `?`, no `#`, and
+no `//` after the authority. User info (an `@` in the authority) is refused before the host check. A
+port, a path, an IPv6 host and one trailing `/` are accepted. Every refusal is
+`StoreError::InvalidSetting`; all but the user-info refusal name `ollamaUrl` and quote the value — the
+user-info text is fixed (`ollamaUrl must not contain a user name or password`) because the URL may
+hold a password. There is no fallback. `providers::ollama::read` calls the same function again before
+it asks the server.
 
 ## providers — the one reading type and its errors (step D)
 
@@ -3684,7 +3689,7 @@ pub const OLLAMA_ORG: &str = "ollama";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
-    #[error("No Codex login found in {path}.")]
+    #[error("No Codex login found in {path}. If Codex keeps its login in the system keyring, seatswap cannot read it.")]
     NoLogin { path: PathBuf },
     #[error("Codex keeps its login in the system keyring. seatswap reads the login file only.")]
     KeyringLogin,
@@ -3692,6 +3697,8 @@ pub enum ProviderError {
     LoginExpired,
     #[error("Ollama is not running on {url}.")]
     NotRunning { url: String },
+    #[error("Ollama on {url} refused the request (HTTP {status}). Is it signed in?")]
+    OllamaRefused { url: String, status: u16 },
     #[error("{0}")]
     Setting(String),
     #[error(transparent)]
@@ -3717,16 +3724,16 @@ pub struct ProviderReading {
     pub plan: Option<String>,
     pub usage: Option<Usage>,     // None when the answer has no limit to record
     pub credits: Option<Credits>, // Ollama's new plan only
-    pub spend_24h: Option<f64>,   // USD, Ollama only
+    /// None for Codex; for Ollama the 24 h spend, `Err` when its own request or
+    /// answer could not be read (the balance is still in the reading).
+    pub spend_24h: Option<Result<f64, String>>,
 }
-
-pub(crate) fn mark_highest_active(limits: &mut [Limit]);
 ```
 
-`mark_highest_active` sets `is_active` on exactly one limit: the one with the highest percent, the
-first of equals. `ProviderError::Setting` carries the text of the setting or path that refused the
-reading; it is not a second setting error. The `Api` variant is transparent, so the card prints the
-API error's own text.
+`api::mark_highest_active` (in the api.rs section below) sets `is_active` on exactly one limit: the
+one with the highest percent, the first of equals. `ProviderError::Setting` carries the text of the
+setting or path that refused the reading; it is not a second setting error. The `Api` variant is
+transparent, so the card prints the API error's own text.
 
 ## codex — `auth.json` and the usage answer (step D)
 
@@ -3737,19 +3744,20 @@ fn window_kind(seconds: i64, additional: bool) -> LimitKind;
 fn plan_type(value: Option<&Value>) -> Result<Option<String>, ProviderError>;
 ```
 
-`read` reads `paths.auth_file` once. A missing file is `NoLogin`. A file that is not JSON, or whose
-`tokens` is not an object, is `Shape` with a sentence that never quotes a token. `tokens` absent or
-`null` with `auth_mode == "chatgpt"` is `KeyringLogin`; otherwise `NoLogin`. `tokens.access_token` and
+`read` reads `paths.auth_file` once. A missing file is `NoLogin`, whose text also says that a login
+kept in the system keyring cannot be read. A file that is not JSON, or whose `tokens` is not an
+object, is `Shape` with a sentence that never quotes a token. `tokens` absent or `null` with
+`auth_mode == "chatgpt"` is `KeyringLogin`; otherwise `NoLogin`. `tokens.access_token` and
 `tokens.account_id` must be non-empty strings (`Shape` with the field's name only). It then calls
 `api.codex_usage(access_token, account_id)`; HTTP 401 is `LoginExpired`, every other API error stays
 `Api`. The request carries both values; the file is not changed.
 
 `usage_from` reads `rate_limit.primary_window` and `.secondary_window` as the account's limits:
 `used_percent` is the percent, `limit_window_seconds` picks the kind, `reset_at` (seconds since the
-epoch) is the reset. `rate_limit` missing is a shape error; `null` carries no limits; either window
-may be absent or `null`. `additional_rate_limits` may be absent, `null` or an array; an entry's
-`rate_limit` may be `null` (skipped), and its `limit_name` is required and becomes the limit's
-`model`. `window_kind` is the one mapping:
+epoch) is the reset when present; absent or `null` is no reset. `rate_limit` missing is a shape error;
+`null` carries no limits; either window may be absent or `null`. `additional_rate_limits` may be
+absent, `null` or an array; an entry's `rate_limit` may be `null` (skipped), and its `limit_name` is
+required and becomes the limit's `model`. `window_kind` is the one mapping:
 
 | `limit_window_seconds` | additional entry | Kind |
 |---|---|---|
@@ -3761,9 +3769,10 @@ may be absent or `null`. `additional_rate_limits` may be absent, `null` or an ar
 | anything else | either | `Other("{s} s limit")` |
 
 Every limit's `severity` is `Normal`; the load level comes from the percent. The account is the
-answer's non-empty `account_id` with `org` `codex`; `plan_type` is `None` when absent or `null`, a
-string with its first character uppercased when present, and a shape error for any other type.
-`mark_highest_active` runs last. `ProviderReading.credits` and `.spend_24h` stay `None`.
+answer's non-empty `account_id` with `org` `codex`; `plan_type` is `None` when absent, `null` or the
+empty string, otherwise a string with its first character uppercased, and a shape error for any other
+type. `api::mark_highest_active` runs last. `ProviderReading.credits` stays `None`, and `spend_24h` is
+`None` for Codex.
 
 ## ollama — the balance and the last 24 h (step D)
 
@@ -3774,8 +3783,9 @@ pub fn amount(value: &Value) -> Option<f64>; // a JSON number, whole or fraction
 
 `read` first runs `store::validate_ollama_url(base_url)`; a URL the settings refuse is
 `ProviderError::Setting` and no request is made. It then calls `api.ollama_balance(base_url)`; a
-refused connection (`ApiError::NoConnection`) becomes `NotRunning { url }`, every other API error
-stays `Api`. The balance answer is `balance_reading`:
+refused connection (`ApiError::NoConnection`) becomes `NotRunning { url }`, a balance answer of 401
+becomes `OllamaRefused { url, status: 401 }`, a 403 becomes `OllamaRefused { url, status: 403 }`, and
+every other API error stays `Api`. The balance answer is `balance_reading`:
 
 - `included.balance_usd` present selects the **new plan**: `balance_usd` (required, not negative),
   `allowance_usd` (optional, not negative, and `left > allowance` is refused),
@@ -3787,15 +3797,16 @@ stays `Api`. The balance answer is `balance_reading`:
 - `included.session` or `included.weekly` without `balance_usd` selects the **old plan**: each
   non-null window becomes `Session` or `WeeklyAll` with `percent = 100 − remaining_percent` (the
   remaining must be within 0..=100) and `resets_at` from `resets_at`; both null is a shape error and
-  no credits are returned. `mark_highest_active` runs over the two.
+  no credits are returned. `api::mark_highest_active` runs over the two.
 - An `included` with `balance_usd` and also `session`/`weekly` is refused as both plan shapes at
   once; an `included` with neither is refused. A non-object answer, a missing `included`, a number
   given as a string and a bad time are `Shape` errors naming the field path.
 
-The usage call is made after a successful balance. `api.ollama_usage_24h(base_url).ok()` then
-`totals.usage_usd` is used through `amount`; any failure (HTTP, network, decode, a missing number)
-leaves `spend_24h` `None` and does not fail the reading. The account is
-`AccountRef { acc: "ollama", org: "ollama" }`, the plan `None`, and nothing is written.
+The usage call is made after a successful balance. `spend_24h` is always `Some`: `Ok(totals.usage_usd)`
+through `amount` when the answer carries that number, else `Err({the API error's text})` for an HTTP,
+network or decode failure, or `Err("the usage answer has no number at totals.usage_usd")` when the
+field is absent or not a number. A failed usage call never fails the reading; the balance is kept. The
+account is `AccountRef { acc: "ollama", org: "ollama" }`, the plan `None`, and nothing is written.
 
 ## api.rs additions (step D)
 
@@ -3809,9 +3820,14 @@ impl Api {
     pub fn ollama_usage_24h(&self, base_url: &str) -> Result<serde_json::Value, ApiError>;
 }
 fn get_json(request: ureq::Request) -> Result<serde_json::Value, ApiError>;
+fn get_json_no_redirect(request: ureq::Request) -> Result<serde_json::Value, ApiError>;
+fn call(request: ureq::Request) -> Result<ureq::Response, ApiError>;
+fn read_json(response: ureq::Response) -> Result<serde_json::Value, ApiError>;
 fn ollama_url(base_url: &str, path: &str) -> String;
 fn transport_error(error: ureq::Transport) -> ApiError;
 fn refused_connection(error: &ureq::Transport) -> bool;
+pub(crate) fn mark_highest_active(limits: &mut [Limit]);
+fn highest_limit_index(limits: &[Limit]) -> Option<usize>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
@@ -3825,11 +3841,22 @@ pub enum ApiError {
 `codex_usage` sends `GET CODEX_USAGE_URL` with `User-Agent: seatswap/<version>`,
 `Authorization: Bearer <access token>` and `chatgpt-account-id: <account id>`; it returns the parsed
 JSON and knows nothing about `auth.json`. `ollama_balance` asks `<base>/api/balance` and
-`ollama_usage_24h` asks `<base>/api/usage?range=24h`, both with only the User-Agent. `ollama_url`
-removes one trailing `/` from the base and appends the endpoint's own path, so a base with a path
-keeps it. `get_json` is the one status/body/decode path for these three GETs: a non-2xx answer is
-`ApiError::Http` (or `Unauthorized`, `RateLimited`, `Server` by status), an unreadable body is
-`Network`, and unparsable JSON is `Decode`.
+`ollama_usage_24h` asks `<base>/api/usage?range=24h`, both with only the User-Agent. All three use
+the `lookup_agent` (the agent of the two look-ups too): `redirects(0)` plus `no_redirect` makes a 3xx
+answer an `ApiError::Http` naming where it pointed, and nothing is asked there. `get_json_no_redirect`
+is the status/body/decode path for these three GETs and for Frankfurter's rate look-up; models.dev
+has its own reader (the 304 answer and the size cap) on the same no-redirect agent, and Claude's
+`usage` GET goes through `get_json`. `get_json` and `get_json_no_redirect` share `call` (status and
+transport mapping) and `read_json` (body and JSON): a non-2xx answer is `ApiError::Http` (or
+`Unauthorized`, `RateLimited`, `Server` by status), a redirect in the no-redirect path is an
+`ApiError::Http` whose body says `redirected to {location}; seatswap asks no other host`, an
+unreadable body is `Network`, and unparsable JSON is `Decode`. `ollama_url` removes one trailing `/`
+from the base and appends the endpoint's own path, so a base with a path keeps it.
+
+The one highest-limit rule lives here too: `highest_limit_index` is the index of the highest percent,
+the first of equals. `mark_highest_active` sets that limit's `is_active` for a provider reading, and
+`Usage::binding` uses the same index for its fallback when no limit is active, so a Claude reply and a
+Codex or Ollama reading choose the same limit when two are equal.
 
 `transport_error` maps a transport failure: `ConnectionFailed` whose source chain holds an
 `io::Error` of kind `ConnectionRefused` becomes `ApiError::NoConnection` (displayed as `cannot
@@ -3890,6 +3917,7 @@ pub(crate) struct ProviderView {
     pub usage: Option<Usage>,
     pub credits: Option<Credits>,
     pub spend_24h: Option<f64>,
+    pub spend_24h_error: Option<String>, // why the 24 h spend could not be read
     pub fetched_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
 }
@@ -3906,15 +3934,18 @@ impl ProvidersHandle { pub(crate) fn client(&self) -> ProvidersClient; pub(crate
 
 pub(crate) type CodexPathsLookup =
     Box<dyn Fn(Option<&Path>) -> Result<CodexPaths, PathsError> + Send>;
+/// The way to read the settings after a request; the app loads `accounts.json`.
+pub(crate) type SettingsLookup = Box<dyn Fn(&Settings) -> Result<Settings, String> + Send>;
 pub(crate) type ReportError = Box<dyn Fn(&str) + Send>;
 
 pub(crate) fn spawn(app: AppPaths, history: Result<HistoryDir, String>, api: Api,
                     ui: Sender<UiEvent>) -> Result<ProvidersHandle, String>;
 
-pub(crate) struct ProvidersRuntime { /* api, ui, codex_paths, recorder, report, … */ }
+pub(crate) struct ProvidersRuntime { /* api, ui, codex_paths, settings_lookup, recorder, report, … */ }
 impl ProvidersRuntime {
     pub(crate) fn new(history: Result<HistoryDir, String>, api: Api, ui: Option<Sender<UiEvent>>,
-                      codex_paths: CodexPathsLookup, report: ReportError) -> ProvidersRuntime;
+                      codex_paths: CodexPathsLookup, settings_lookup: SettingsLookup,
+                      report: ReportError) -> ProvidersRuntime;
     pub(crate) fn views(&self) -> Vec<ProviderView>;
     pub(crate) fn poll_round(&mut self, settings: &Settings, now: DateTime<Utc>) -> Vec<ProviderView>;
     pub(crate) fn opened(&mut self, settings: &Settings, now: DateTime<Utc>) -> Vec<ProviderView>;
@@ -3928,31 +3959,39 @@ impl ProvidersRuntime {
 sets `next = now`, so the first round happens at once, then waits on the command channel until
 `next`; a timeout is `poll_round` and the next wait is 300 s. `Opened`, `SettingsSaved` and a save do
 not move the five-minute instant. `settings_of` reads `accounts.json` again for every command and
-round, so a switch, a Codex folder or an Ollama URL counts without a restart; a load failure is
-reported once per distinct text and the round is skipped.
+round, and `poll` uses the same load through `SettingsLookup` after each request. So a switch, a Codex
+folder or an Ollama URL counts without a restart; a load failure is reported once per distinct text
+and the round is skipped.
 
 `ProvidersRuntime` keeps one `Option<ProviderView>` and one last-attempt time for each provider, in
-the order Codex, Ollama. `poll_round` calls `settle` (a card that is now off drops its view and its
-last attempt), then polls every switched-on card. `opened` polls only a switched-on card whose last
-*attempt* is more than 60 s old (exactly 60 s is not older). `settings_saved` compares with the
-previous settings: a card that was just switched on, or whose `codexHome`/`ollamaUrl` changed, is
-polled at once; a changed folder or URL first drops the old view because those numbers belong to
-another login or server; a card that is now off is dropped at once. Any other save does not poll.
+the order Codex, Ollama. `poll_round` calls `settle(settings, previous)`: a card that is now off drops
+its view and its last attempt; a card whose `codexHome`/`ollamaUrl` changed drops its old view,
+because those numbers belong to another login or server, and is polled. `opened` and `settings_saved`
+run the same check, so a folder or URL changed by hand in `accounts.json` drops the old numbers before
+the next round just like a save. `poll_round` then polls every switched-on card. `opened` polls a
+switched-on card whose place changed, or whose last *attempt* is more than 60 s old (exactly 60 s is
+not older). `settings_saved` polls a card that was just switched on, or whose `codexHome`/`ollamaUrl`
+changed; a card that is now off is dropped at once, and any other save does not poll.
 
-`poll` marks the attempt time before the reading, runs `read_codex` or
-`providers::ollama::read`, and turns a success into `ProviderView { fetched_at: Some(now),
-error: None, … }` or a failure into a view that copies every number, plan and `fetched_at` of the last
-view and sets `error` to the `ProviderError`'s text. A success with a `usage` is recorded through
-`Recorder::reading`; a history write failure is turned into the app's history text
-(`ops::history_unwritable`) and reported once per distinct text, and never changes the card.
+`poll` marks the attempt time before the reading, runs `read_codex` or `providers::ollama::read`,
+then reads the settings again through the `SettingsLookup`: an answer for a card that is now off, or
+whose folder/URL changed while the request ran, is neither recorded nor shown. A failed settings read
+is reported once and drops the answer too. Otherwise a success becomes `ProviderView { fetched_at:
+Some(now), error: None, … }`, with `spend_24h`/`spend_24h_error` from the reading's
+`Some(Ok)`/`Some(Err)`; a failure becomes a view that copies the last view's numbers, plan, 24 h
+spend, its error and `fetched_at`, and sets `error` to the `ProviderError`'s text. A success with a
+`usage` is recorded through `Recorder::reading`; a history write failure is turned into the app's
+history text (`ops::history_unwritable`) and reported once per distinct text, and never changes the
+card. A recorder that could not be opened at start records nothing and reports nothing: that error is
+already the snapshot's error and was notified there.
 `publish` compares the list with the one sent last and sends `UiEvent::Providers(list)` only when it
 changes.
 
 `Snapshot.providers: Vec<ProviderView>` is always present (empty when no card is on). The main thread
 keeps it in `GuiState.providers`, fills it on `UiEvent::Providers`, and `apply_snapshot` copies it into
 every snapshot, so the pop-up and the large window see the same list. The JSON is camelCase:
-`provider`, `title`, `plan`, `usage`, `credits`, `spend24h`, `fetchedAt`, `error`. `Usage` is
-`{limits: [{kind, percent, severity, resetsAt, model, isActive}], extraUsageEnabled}`; a
+`provider`, `title`, `plan`, `usage`, `credits`, `spend24h`, `spend24hError`, `fetchedAt`, `error`.
+`Usage` is `{limits: [{kind, percent, severity, resetsAt, model, isActive}], extraUsageEnabled}`; a
 `LimitKind::Other("monthly_credits")` is `{"other":"monthly_credits"}`; `Credits` is
 `{left, allowance, until, purchased}`. Example:
 
@@ -3963,14 +4002,14 @@ every snapshot, so the pop-up and the large window see the same list. The JSON i
      {"kind":"session","percent":12.0,"severity":"normal","resetsAt":null,"model":null,"isActive":false},
      {"kind":"weekly_all","percent":48.0,"severity":"normal","resetsAt":null,"model":null,"isActive":true}],
     "extraUsageEnabled":false},
-   "credits":null,"spend24h":null,"fetchedAt":"2026-11-14T09:00:00Z","error":null},
+   "credits":null,"spend24h":null,"spend24hError":null,"fetchedAt":"2026-11-14T09:00:00Z","error":null},
   {"provider":"ollama","title":"Ollama","plan":null,
    "usage":{"limits":[
      {"kind":{"other":"monthly_credits"},"percent":29.2,"severity":"normal",
       "resetsAt":"2026-12-03T00:00:00Z","model":null,"isActive":true}],
     "extraUsageEnabled":false},
    "credits":{"left":212.4,"allowance":300.0,"until":"2026-12-03T00:00:00Z","purchased":0.0},
-   "spend24h":3.18,"fetchedAt":"2026-11-14T09:00:00Z","error":null}
+   "spend24h":3.18,"spend24hError":null,"fetchedAt":"2026-11-14T09:00:00Z","error":null}
 ]
 ```
 
@@ -3994,16 +4033,27 @@ text.
 
 The limit rows are the account card's `renderLimitRows`: `Week`, `Session`, the scoped limits by
 their model (or `Scoped`) and every other limit by its kind name, in that order, each with its reset
-when it has one. With no rows the card says `No usage limits in the reply.` A credits card instead
-uses `renderCreditRows`:
+when it has one. An `Other` limit that names a model is labelled `{model} · {name}`
+(`gpt-6-astra · 5 h limit`), so two per-model limits of the same length do not become two identical
+rows. With no rows the card says `No usage limits in the reply.` A credits card instead uses
+`renderCreditRows`:
 
 | Row | Value |
 |---|---|
 | `Credits` | `{left} of {allowance} USD`, or `{left} USD` without an allowance; with the reset date, `  ·  resets {day}` |
-| `Last 24 h` | `{spend24h} USD`, only when it is a finite number |
+| `Last 24 h` | `{spend24h} USD` when it is a finite number; when `spend24hError` is a non-empty string, `not read: {spend24hError}` in the muted `not-read` row, with the text as its title |
 | `Purchased` | `{purchased} USD`, only when it is a number above zero |
 
-Amounts use `twoDecimalAmount`. A provider card has no accent bar and no Switch button.
+Amounts use `money`, the page's one rule (`1,234 USD` from 10 on, `6.47 USD` below) with `USD` after
+each amount, so a full allowance reads `212 USD of 300 USD`; `twoDecimalAmount` is gone. A provider
+card has no accent bar and no Switch button.
+
+`fixture.js` keeps every provider view in `providerCardViews` and computes `providers` from its own
+`codexCard`/`ollamaCard` settings (`fixtureOpenProviders`), so the browser bench shows only the
+switched-on cards in the Rust order; `fixtureSaveSetting` recomputes the list, the fixture's settings
+default both cards on, and its `providersOff` hook switches both off through the settings save.
+`providerError(text)` keeps the last numbers and sets the error; `spendError(text)` sets `spend24h`
+to null and `spend24hError` to the text.
 
 ## app: the Providers settings group (step D)
 

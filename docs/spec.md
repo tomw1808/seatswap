@@ -412,7 +412,8 @@ For each account it shows:
 - **Week, all models:** percentage and the reset: more than 48 h away the weekday and clock time (`Sun 02:00`); otherwise the time until it, `1d18h` from 24 h on, `5h40m` below.
 - One rule for every reset shown (pop-up, tray menu, CLI): under 24 h hours and minutes, 24–48 h days and hours, beyond 48 h weekday and clock time. Minutes round up, and a reset time is shown rounded up to the full minute: the server sends a moment just before the boundary (`00:59:59.59`), which is meant as `01:00`.
 - **Week, scoped:** one row per scoped weekly limit (e.g. Fable), percentage only.
-- **Binding limit:** the one with `is_active: true`, or else the highest percentage. This drives the tray icon.
+- **Binding limit:** the one with `is_active: true`, or else the highest percentage, the first of
+  equals. This drives the tray icon.
 - **Usable:** the login works, the usage is known, and no limit blocks the account. The week is below 100 %, the 5 h session below 100 %, and a per-model weekly limit below 100 % while a running session uses that model. A per-model limit at 100 % blocks the account only while a session on that model is open (busy or idle); with `readSessions` off, it blocks only while the server marks it as the binding one.
 - **Which limit blocks:** when several limits are at 100 %, the one with the latest reset time is named; one without a reset time comes before one with a time. On a tie the week comes before a model, and a model before the 5 h session.
 - **Extra usage / spend:** only if enabled.
@@ -713,13 +714,16 @@ Claude account's, under an organization of their own.
 `$CODEX_HOME`, else `~/.codex/auth.json`. The file is only read, never written. Of it seatswap uses
 `tokens.access_token` and `tokens.account_id`; `auth_mode` is looked at only to tell a login kept in
 the OS keyring from none. No other field is used or stored, and the access token is never refreshed.
-A missing file says so; a file without tokens whose `auth_mode` is `chatgpt` means Codex keeps its
-login in the keyring, and the card says that instead of guessing. Nothing in the keyring is read.
+A missing file says so, and names the keyring too: `No Codex login found in {path}. If Codex keeps
+its login in the system keyring, seatswap cannot read it.` A file without tokens whose `auth_mode`
+is `chatgpt` means Codex keeps its login in the keyring, and the card says that instead of guessing.
+Nothing in the keyring is read.
 
 With the card on, seatswap sends `GET https://chatgpt.com/backend-api/wham/usage` with
 `Authorization: Bearer <access token>`, `chatgpt-account-id: <account id>` and its own
 `User-Agent: seatswap/<version>`. The token goes only to that host, the service that issued it, and is
-never logged.
+never logged. The request follows no redirect: a 3xx answer is an error naming where it pointed, and
+nothing is asked there.
 
 The answer becomes the same limits a Claude account has:
 
@@ -737,7 +741,9 @@ The answer becomes the same limits a Claude account has:
 **Ollama.** The card asks the Ollama server at `ollamaUrl`, default `http://127.0.0.1:11434`:
 `GET <ollamaUrl>/api/balance`, then `GET <ollamaUrl>/api/usage?range=24h`, both with seatswap's
 `User-Agent` and no secret: the local server signs them with the machine's own key. A path on the
-base URL is kept; one trailing `/` is dropped before the endpoint's path is appended.
+base URL is kept; one trailing `/` is dropped before the endpoint's path is appended. Both requests
+follow no redirect, like the Codex one: a 3xx answer is an error naming where it pointed, and nothing
+is asked there.
 
 - A **new plan** (monthly credits) has `included.balance_usd`, `included.allowance_usd`,
   `included.period.until` and `purchased.balance_usd`. The card shows the credits left of the
@@ -746,36 +752,47 @@ base URL is kept; one trailing `/` is dropped before the endpoint's path is appe
   known and above zero, the card's ring is the share of it used, and the reading is recorded as one
   limit of kind `monthly_credits` that resets at the period's end. Without an allowance there is no
   share and no such limit; the credits are still shown and the reading records no usage. A spend that
-  cannot be read leaves the 24 h row empty; the balance still counts.
+  cannot be read keeps its row as `not read: {reason}`; the balance still counts.
 - An **old plan** (session and weekly limits) has `included.session` and `included.weekly`, each with
   `remaining_percent` and `resets_at`. They become a session and a week limit with
   `percent = 100 − remaining_percent`, like a Claude account; the card has no credits.
 - The account is named `ollama` under the organization `ollama`; the plan is empty.
 
 **What the card shows.** One card per switched-on provider, Codex first. A Codex card has the
-account card's rings and bars, the plan and a row per limit with its reset and its own name; an
-Ollama card on a new plan has the credit rows. A card has no Switch button and no accent bar. A first
-reading without limits says `No usage limits in the reply.`; a provider that is switched off has no
-card. A failed poll keeps the last numbers and their time, greys them and shows the error text under
-them; the age is printed once the reading is older than two minutes. The next poll tries again.
+account card's rings and bars, the plan and a row per limit with its reset and its own name; a
+per-model limit of another length is labelled `{model} · {name}`, for example
+`gpt-6-astra · 5 h limit`. An Ollama card on a new plan has the credit rows, in the page's one money
+rule (§11.5): whole dollars from 10 on, two decimals below, so `212 USD of 300 USD` and `3.18 USD`. A
+card has no Switch button and no accent bar. A first reading without limits says
+`No usage limits in the reply.`; a provider that is switched off has no card. A failed poll keeps
+the last numbers and their time, greys them and shows the error text under them; the age is printed
+once the reading is older than two minutes. The next poll tries again.
+
+**A late answer.** The provider thread reads the settings again after every request. If the card was
+switched off, or its folder or URL changed, while the request ran, the answer is neither recorded nor
+shown. A `codexHome` or `ollamaUrl` changed by hand in `accounts.json` (not through a save) drops the
+old numbers before the next round asks the new place, exactly as a save does.
 
 **Every error text the card shows.** The provider reader's own messages are:
 
 | Case | Text |
 |---|---|
-| no `auth.json` | `No Codex login found in {path}.` |
+| no `auth.json` | `No Codex login found in {path}. If Codex keeps its login in the system keyring, seatswap cannot read it.` |
 | a Codex login in the keyring | `Codex keeps its login in the system keyring. seatswap reads the login file only.` |
 | HTTP 401 from Codex | `Codex's login has expired. Run codex once to renew it.` |
 | a refused connection to Ollama | `Ollama is not running on {url}.` |
+| HTTP 401 or 403 from Ollama's balance request | `Ollama on {url} refused the request (HTTP {status}). Is it signed in?` |
 | an unusable setting | the setting's own text, for example `the Codex folder (codexHome or $CODEX_HOME) must be an absolute path, got codex` or `ollamaUrl must start with http:// or https://, got "127.0.0.1:11434"` |
 | a file that cannot be read | `cannot read {path}: {reason}` |
 | an answer of the wrong shape | `Unexpected answer: {reason}` |
 | an HTTP or network failure | the API's own text: `the access token is not authorized` · `rate limited; retry after Some(60) seconds` (or `None`) · `server error 500` · `HTTP 404: {body}` · `cannot connect: {reason}` (Codex) · `network error: {reason}` · `cannot decode the reply: {reason}` |
 
-For Ollama a refused connection becomes `Ollama is not running on {url}.`; every other transport
-failure keeps the API's `network error: …`. The `Setting` row is what a hand-edited `codexHome` or
-`ollamaUrl` produces: the settings page refuses such a value before it is saved, and the reader
-checks it again before reading or asking anything.
+For Ollama a refused connection becomes `Ollama is not running on {url}.`; a balance answer of HTTP
+401 or 403 becomes `Ollama on {url} refused the request (HTTP {status}). Is it signed in?` (seatswap
+sends no token, so the card speaks of none); every other API failure keeps the API's text. A failed
+24 h usage request is not the card's error at all: its API text is the `not read:` row. The `Setting`
+row is what a hand-edited `codexHome` or `ollamaUrl` produces: the settings page refuses such a value
+before it is saved, and the reader checks it again before reading or asking anything.
 
 **History.** A reading that carries a usage is recorded like an account's: a `Sample` with source
 `Poll` under `AccountRef {acc, org}`, with `org` `codex` or `ollama`; a window that ends and a 100 %
@@ -786,14 +803,17 @@ the status line's next account, money and every statistics page stay Claude-only
 readings add no Sessions rows, no statistics and no switch. `read` stays for the recorder, the export
 and the import: an export's windows and daily token rows are raw history, so a provider's finished
 window can appear in an export, while its samples do not, because the export has no sample rows. An
-import copies a host folder as it is, provider lines included.
+import copies a host folder as it is, provider lines included. A history folder that could not be
+opened at start is already the snapshot's error and was notified there; the provider thread records
+nothing and reports nothing a second time.
 
 **Settings.** The four settings are in the settings table (§10) and in Settings → Providers:
 `codexCard` and `ollamaCard` default off, `codexHome` is empty unless set, and `ollamaUrl` defaults to
 `http://127.0.0.1:11434`. `codexHome` must be an absolute folder when set. `ollamaUrl` must start with
-`http://` or `https://` and name a host; a whitespace or control character, a query string, a fragment
-and an empty path segment are refused, while a port, a path, an IPv6 host and one trailing `/` are
-accepted.
+`http://` or `https://` and name a host: a DNS name (dot-separated labels of letters, digits and inner
+hyphens), an IPv4 address or a bracketed IPv6 address. A whitespace or control character, user info
+(`user:pass@`, refused without quoting the URL), a query string, a fragment and an empty path segment
+are refused, while a port, a path, an IPv6 host and one trailing `/` are accepted.
 
 **What is not done.** No switching, no sign-in or sign-out (of Codex or Ollama), no token renewal, no
 request that generates text, no keyring read (a Codex login kept in the keyring is only named on the
@@ -937,7 +957,7 @@ They give real click handling and exact placement on those desktops. They're not
 | `codexCard` | off | `bool`; show a read-only Codex card in the pop-up. While off, no Codex file is read and no request is sent (§7.9). Settings → Providers, "Show a Codex card" |
 | `codexHome` | none | `null` or an absolute folder: where Codex's `auth.json` is; `null` means `$CODEX_HOME`, else `~/.codex`. A relative folder is refused. Settings → Providers, "Codex folder" (§7.9) |
 | `ollamaCard` | off | `bool`; show a read-only Ollama card. While off, no request is sent to the Ollama server (§7.9). Settings → Providers, "Show an Ollama card" |
-| `ollamaUrl` | `"http://127.0.0.1:11434"` | the Ollama server the card asks; must start with `http://` or `https://` and name a host. Refused: a whitespace or control character, no such scheme, no host, a query string, a fragment, an empty path segment. A port, a path, an IPv6 host and one trailing `/` are accepted. Settings → Providers, "Ollama server" (§7.9) |
+| `ollamaUrl` | `"http://127.0.0.1:11434"` | the Ollama server the card asks; must start with `http://` or `https://` and name a host: a DNS name, an IPv4 address or a bracketed IPv6 address. Refused: a whitespace or control character, user info (without quoting the URL), no such scheme, a host that is not one of those, a query string, a fragment, an empty path segment. A port, a path, an IPv6 host and one trailing `/` are accepted. Settings → Providers, "Ollama server" (§7.9) |
 
 Every setting above is edited in the large window's Settings area (§11.4); the last column names the
 group and the row. The pop-up has no settings view any more (§11.3).
@@ -1778,12 +1798,14 @@ the past too, because the history stores the repository's identity, not the show
   at `ollamaUrl` for `/api/balance` and `/api/usage?range=24h` while the Ollama card is on; and — only
   while `lookUpPrices` is on — to `models.dev` for API prices and `api.frankfurter.dev` for the dollar
   rate (§11.5). The two look-ups send the User-Agent `seatswap/<version>` and no account, token or
-  machine data. No telemetry, no update pings unless enabled.
+  machine data. The provider requests follow no redirect: a 3xx answer is an error naming where it
+  pointed, and no other host is asked. No telemetry, no update pings unless enabled.
 - **The two provider cards' requests.** The Codex card sends one GET to `chatgpt.com` and carries
   Codex's own access token and account id only to that service; the token is never logged, and
   seatswap never refreshes it. The Ollama card sends two GETs to the Ollama server and carries no
-  secret: the local server signs them with the machine's own key. Each card is off by default; while
-  it is off nothing is read and nothing is sent, and no request generates text (§7.9).
+  secret: the local server signs them with the machine's own key. Neither follows a redirect: a 3xx
+  answer is an error naming where it pointed, and nothing is asked there. Each card is off by
+  default; while it is off nothing is read and nothing is sent, and no request generates text (§7.9).
 - Every write to Claude Code's files is atomic (temp file + rename) and keeps the original file mode;
   a file that is a symbolic link stays a link and its target is rewritten.
 - The status line reads Claude Code's JSON, seatswap's settings and its usage cache; its only write
@@ -1834,7 +1856,7 @@ Run on 2026-11-10 with two real accounts in a separate config folder. Evidence a
 | Everything marked *(code)* or *(tested)* comes from one version of the program (2.1.322) | A later Claude Code version may lock, re-read or save differently, and a switch could then lose a login. Several versions can also run at once: on this machine the VS Code extension brings its own 2.1.321. | seatswap records the Claude Code version it was tested with and warns when the installed version is newer. The backup from §13 is kept. |
 | A switch moves all running sessions (§6.5) | A long agent run continues on the other account, with its settings and limits. | The pop-up says so before the switch. Per-terminal accounts are a non-goal (§1). |
 | Claude Code can move the Windows login into Windows Credential Manager (`docs/windows.md` §13) | Version 2.1.322 has this store behind a server-side flag (`tengu_windows_credman`, off on the test machine on 2026-11-11). With it on, Claude Code reads the login from Credential Manager and deletes `.credentials.json` after its first save there; a switch on Windows then changes nothing. | seatswap reports "no login" instead of failing silently. Support for that store is not built; it is the Windows counterpart of the macOS Keychain work (§2.2). |
-| The Codex usage endpoint is internal and not documented by OpenAI (§7.9) | OpenAI can change or remove it in any release; the card would then stop showing numbers. | The endpoint lives in `api.rs` with Codex's other endpoints. A changed answer shows the API error text on that card, and nothing else — no switch, no stored account, no Claude reading — is affected. The card is off by default. |
+| The Codex usage endpoint is internal and not documented by OpenAI (§7.9) | OpenAI can change or remove it in any release; the card would then stop showing numbers. | The endpoint lives in `api.rs` beside seatswap's other endpoints; it is the only Codex endpoint. A changed answer shows the API error text on that card, and nothing else — no switch, no stored account, no Claude reading — is affected. The card is off by default. |
 | Linux tray limits (§8.3, §9.2) | A desktop without a StatusNotifierItem host shows no icon at all; on Wayland the pop-up cannot sit at the icon. | The menu and `seatswap panel` reach the pop-up too. Native applets later (§9.3). |
 
 ## 17. Known issues
