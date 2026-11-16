@@ -6,6 +6,127 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-17
+
+### Added
+
+**Pop-up**
+- The auto-burn line names each account with its coloured chip; the tray menu and notifications show
+  the same line as plain text.
+- *N sessions* opens the Sessions area, *N waiting for you* opens that session there, *see the plan*
+  opens Statistics → Forecast, and *Statistics ↗* opens Statistics. A waiting session id the window
+  cannot read is refused with an error.
+
+**Large window**
+- Settings → History and hosts suggests `<Dropbox>/seatswap` while no history folder is set, read
+  from Dropbox's own `info.json`; Use saves it as the history folder. A file that cannot be read is
+  shown with its path and why.
+- The tray menu has *Sessions…* and *Statistics…*, each opening the large window at that area; they
+  sit between *Add account…* and *Settings…*. *Open seatswap…* is gone.
+- The Settings area has no second heading under its tab.
+- The Settings menu stays on screen while the content pane scrolls.
+
+**Sessions**
+- Codex sessions (provider "Codex") beside Claude Code's, read from Codex's rollout files: their
+  session id, folder, model, token counts and times. A Codex session counts as running while a
+  process holds its file open or its last event is younger than 30 minutes. A token total that went
+  down leaves its last hour unknown, shown as "—" with the reason.
+- DeepSeek Harness sessions (provider "DeepSeek Harness") and flash workers: a flash job hangs under
+  the Claude Code session that started it, as an agent tagged "flash", with its workers below. A job
+  named in a transcript is linked there; on Windows a running job appears once its result is
+  collected.
+- Every total row shows the same numbers as a session row: Agents, Tokens, Last hour, value and API
+  value. A model under two providers has one sum per provider.
+- The "thinking tied to the account" bubble replaces the brown dot in the Models card and the words
+  on a tied model's row in the By model tree; it also marks each session row that has it.
+- The last hour has its EUR and API EUR values, the "N completed" agents line has its total, and a
+  done agent without a price keeps its reason in the sum.
+- Claude Code's own `cost.total_cost_usd` from the status line becomes the session's API value. An
+  absent cost is no cost; a cost that is not a finite number of 0 or more is not stored, and the
+  window shows the reason as a warning while it lasts.
+
+**Status line**
+- A separator's character is chosen from pipe `│`, middle dot `·`, bullet `•`, slash `/`, chevron
+  `›` or blank; a new separator starts as ` │ `. A separator saved by 1.1.0, without a character,
+  is a pipe.
+- Spaces in a segment's prefix and suffix are shown as a faint dot and a count, such as "2 spaces".
+- A segment is removed by dropping it on the Segments box ("drop here to remove") or with the
+  Options card's *Remove*; Delete keeps working.
+- The account tag's background covers its letters only, and a segment's suffix keeps the value's
+  colour when no background is painted.
+
+**History and statistics**
+- A limit drop of at least one percentage point before its reset time ends the window as a reset,
+  never a reading error; a smaller drop is kept as a reading and logged once. The window before the
+  reset keeps its use, the next window records the percent it began at (`from`), and a week may use
+  more than 100 %.
+- A week keeps every window it offered, the one before an early reset and the one after, each placed
+  by its own midpoint. A reset window counts nothing as expired, so a reset week's used and expired
+  money can be more than one week's price.
+- Overview's Used and Expired shares are of the windows the week offered; a window above 100 %
+  counts its whole use, so both shares together can pass 100 % and nothing is cut. Its Blocked line
+  names the added account by its short name, also when the account filter leaves it out.
+- Overview shows Used and Expired with their percentages, a Switches total and "auto-burn"; Weeks
+  shows plan and weekly price, "of about N possible" (or "N used, more than the about M your usual
+  working hours hold"), the 100 % line, the "now" mark and clickable weeks with their detail;
+  Projects shows its totals, the Used footer, each project's share of all use, the "API values at
+  1 USD = …" line and the by-account bar in the account colours; Forecast shows its missing labels,
+  "about N a day" and the "none usable" lane last.
+- Activity shows a total tokens box, the "What it shows" sentence ("night(s) with work on <host>"),
+  the sum over hosts, a "running" tag on the current week, a taller hour chart and host names that
+  wrap instead of being cut.
+- Ollama's hourly usage, with requests, tokens and US dollars, is kept in the history.
+- "Other Ollama use" is Ollama's hourly input + output minus the tokens of every known session on an
+  Ollama model (`…:cloud`) in that UTC hour, over every host whatever the page's host filter. An
+  hour where the known sessions used more has a note and no "other" value. The KPI, the lane and the
+  legend entry show only when Ollama reported at least one hour in the range.
+- The Statistics frame names the history's start and size ("since … · now", Export as a button) and
+  marks where subscription values begin.
+- Organizations whose names differ only in case are one organization, also in a 1.1.0 history.
+  Organizations can be added and removed by hand; one that comes from a GitHub owner cannot be
+  removed, and any project can be assigned to another organization.
+
+**Money**
+- The rate line reads "ECB rate of Fri 13 Nov · European Central Bank via Frankfurter · fetched today
+  10:10". The rate is fetched once per Frankfurt day while it is older than today, and on working
+  days from 16:00 again every 30 minutes until an answer carries today's date or it is 18:00. An
+  `fx.json` from 1.1.0 keeps its rate but has no fetch time, so the page says "fetched: not
+  recorded".
+- The model list lives in Settings → Providers, under "API prices from models.dev · checked 11:11",
+  and is read-only.
+- Claude Code's own reported cost beats a models.dev price; a model with neither has no API value. A
+  Claude Code model without a price is asked for from models.dev at once, at most once per model
+  and hour.
+
+**Other**
+- The Swap S icon: a lowercase s with arrow ends on a green square, for the launcher, the Windows
+  `.exe`, notifications and every window. The tray icon stays the live one.
+- Durations are written without a space between number and unit: `2h 31min`, `4h`, `12min`,
+  `3d 4h`; from a day on, the minutes are not shown.
+- A session, agent or hour without tokens is worth a known 0, not an unknown value. A sum is
+  unknown only when a part is unknown, and a missing value shows "—" with its reason as a tooltip.
+
+### Changed
+- With *Look up prices and the dollar rate* off, API values stay in US dollars and the column header
+  says so.
+- An agent without Claude Code's `finished` mark counts as done once its transcript ends with the
+  agent's final answer (`stop_reason` `end_turn`); a resumed agent counts as running again.
+
+### Fixed
+- Settings: the focus frame in table fields shows all four sides; the Join projects line no longer
+  overlaps its button; the money rows no longer flicker; and the Activity page's Per week / Largest
+  sessions switch sits inside its frame.
+- Sessions: "In use" wraps inside its box instead of overflowing, and a session without agent data
+  shows "—", not "0 · 0".
+- A rate-limited request says when seatswap asks again, such as "Claude limits how often seatswap
+  may ask; next try at 10:42", instead of "rate limited; retry after Some(0) seconds".
+
+### Removed
+- *Use my own rate* (`usdRate`) and the own prices in Settings. With the look-ups off, money is
+  shown in US dollars. An older settings file still loads; both keys are ignored silently.
+- The tray's *Open seatswap…* entry; *Sessions…* and *Statistics…* open the large window instead.
+- The brown dot that marked a model whose thinking is tied to the account; the bubble replaces it.
+
 ## [1.1.0] - 2026-11-16
 
 ### Added
@@ -173,8 +294,8 @@ All notable changes to this project are documented here. The format follows
   starts later): it says so and shows the icon as soon as a tray appears; `seatswap panel` opens
   the pop-up meanwhile.
 
-[Unreleased]: https://github.com/ymihere/seatswap/compare/v1.1.0...HEAD
-[1.1.0]: https://github.com/ymihere/seatswap/releases/tag/v1.1.0
+[Unreleased]: https://github.com/ymihere/seatswap/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/ymihere/seatswap/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/ymihere/seatswap/releases/tag/v1.1.0
 [1.0.6]: https://github.com/ymihere/seatswap/releases/tag/v1.0.6
 [1.0.5]: https://github.com/ymihere/seatswap/releases/tag/v1.0.5

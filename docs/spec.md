@@ -2,7 +2,7 @@
 name: seatswap — specification
 status: Draft
 created: 2026-11-10
-updated: 2026-11-15
+updated: 2026-11-16
 tags: [seatswap, spec, claude-code, tray, linux, macos, windows]
 ---
 
@@ -248,7 +248,19 @@ They use the `keyring` crate, with service `seatswap` and the account `id` as th
 
 **History.** seatswap keeps what it saw and did in a folder of its own: `<data folder>/history` (`historyDir` names another one). Every host writes only into its own subfolder `<host>/`, and only appends, so several hosts can share one synced folder without producing a conflict. `<host>/host.json` holds the id of the machine that writes there; when it names another machine, seatswap refuses to write into that subfolder and says why.
 
-The history has seven kinds of file, one JSON object per line, one file per month and kind: `samples-YYYY-MM.jsonl` (one line per usage answer the tray app receives, per account, when a number or a reset time changed, and at least once an hour while the app runs), `windows-YYYY-MM.jsonl` (a window that ended), `events-YYYY-MM.jsonl` (a switch; a limit crossing 100 %, as `blocked`, `unblocked`, `allBlocked` or `anyUsable`; an `accountAdded` or `accountRemoved` when the CLI or the tray app creates or removes an account; a `loginEnded` or `loginRenewed` when the tray app's poll sees an account's login end or work again; a `planChanged` when the plan label changes; a `priceChanged` when an account's monthly price changes; `live`; an `agentCall`; a wait), `tokens-YYYY-MM.jsonl` (what the sessions used, one line per session, hour and model), `sessions-YYYY-MM.jsonl` (a session's summary when it changes and when it closes, also for a session that is seen in a transcript but no longer runs), `projects-YYYY-MM.jsonl` (the project log: one line per rename, join, unjoin, organization assignment or organization edit, §11.6), and `up-YYYY-MM.jsonl` (at most one line per 5 minutes while seatswap runs on this host). The CLI writes the account events (`accountAdded`, `accountRemoved`); the tray app's engine writes the login events (`loginEnded`, `loginRenewed`) with the poll's time, and the app writes `planChanged` and `priceChanged` when it stores a login or a price edit changes them.
+The history has eight kinds of file, one JSON object per line, one file per month and kind: `samples-YYYY-MM.jsonl` (one line per usage answer the tray app receives, per account, when a number or a reset time changed, and at least once an hour while the app runs), `windows-YYYY-MM.jsonl` (a window that ended), `events-YYYY-MM.jsonl` (a switch; a limit crossing 100 %, as `blocked`, `unblocked`, `allBlocked` or `anyUsable`; an `accountAdded` or `accountRemoved` when the CLI or the tray app creates or removes an account; a `loginEnded` or `loginRenewed` when the tray app's poll sees an account's login end or work again; a `planChanged` when the plan label changes; a `priceChanged` when an account's monthly price changes; `live`; an `agentCall`; a wait), `tokens-YYYY-MM.jsonl` (what the sessions used, one line per session, hour and model), `sessions-YYYY-MM.jsonl` (a session's summary when it changes and when it closes, also for a session that is seen in a transcript but no longer runs), `projects-YYYY-MM.jsonl` (the project log: one line per rename, join, unjoin, organization assignment or organization edit, §11.6), `ollama-YYYY-MM.jsonl` (one line per hour of Ollama's own usage, from a successful `/api/usage?range=24h` answer, §7.9), and `up-YYYY-MM.jsonl` (at most one line per 5 minutes while seatswap runs on this host). The CLI writes the account events (`accountAdded`, `accountRemoved`); the tray app's engine writes the login events (`loginEnded`, `loginRenewed`) with the poll's time, and the app writes `planChanged` and `priceChanged` when it stores a login or a price edit changes them.
+
+**A window's `reset` and `from`.** A reading at least 1 percentage point below the previous reading of
+the same account, limit and model, before that reading's reset time, is a reset; a smaller drop is
+kept as a reading and logged once, never smoothed. A finished window carries `reset: true` when it
+ended that way — by hand, for one model, or by the provider after an incident. Nothing expired then,
+so its `lost` is absent. The window that follows a reset carries `from`, the percent of its first
+reading (`0` after a manual reset); its own use is `final − from`, and `from` absent means 0. A week
+can therefore hold two windows: the one before an early reset and the one after. A reset window's
+`final` and `reset` keep what it did; §11.4 counts both windows. The auto-burn plan, the "usable
+again" notification and the Forecast see the new value at the next reading.
+
+**An Ollama hour.** `ollama-YYYY-MM.jsonl` lines are `{"hour":"2026-11-16T10:00:00Z","requests":17,"input":210000,"cachedInput":160000,"output":26000,"usd":0.12}`. An hour is written once and replaced only by a later answer for the same hour whose counts did not shrink and at least one grew; an answer in which one count of the hour is smaller than that hour's last line is not written, and the hour is named once. The record belongs to no Claude account and never counts in a subscription value; §11.4's Activity page reads it.
 
 Next to the history files, each host writes one live report into its own host folder, `<host>/sessions-now.json` (§11.4): what is running on that host, for the other hosts' Sessions area. It is not history: the import never copies it and a host folder's size leaves it out.
 
@@ -304,7 +316,7 @@ switch(target):
   write ~/.claude.json:
       read → replace oauthAccount only → write temp → rename
   unlock all, in reverse order
-  update tray icon, notify "Switched to P — Private (12 % · 5 h)"
+  update tray icon, notify "Switched to P — Private"
 ```
 
 Notes:
@@ -330,7 +342,8 @@ An account is **inactive** when its login is not the one in Claude Code's file. 
 - A network error or a 5xx is not a logout. The account keeps its state and the refresh is tried again with the back-off from §7.1.
 
 **The end date of a login.** A login ends on a fixed date that no refresh moves *(tested, §2.1)*. seatswap cannot keep a login alive. It makes sure the end is never a surprise:
-- The pop-up shows "login ends in N days" for every account.
+- The pop-up shows the login's end for every account: "login ends today" on its last day,
+  "login ends in 3d" otherwise.
 - A notification comes 5 days and 1 day before the end, with the re-login steps from §6.1.
 
 This is accepted (decided 2026-11-10): a `/login` per account about once a month is what is needed today without the app.
@@ -397,10 +410,12 @@ What the settings page says about the two switches:
 
 | Account | Interval | Also |
 |---|---|---|
-| Active | 2 min | right after a switch; when the pop-up opens (if older than 30 s) |
-| Inactive | 15 min | when the pop-up opens (if older than 5 min) |
+| Active | 2min | right after a switch; when the pop-up opens (if older than 30 s) |
+| Inactive | 15min | when the pop-up opens (if older than 5min) |
 
-- On an HTTP 429 or 5xx, back off exponentially up to 30 min and show the time of the last fetch.
+- On an HTTP 429 or 5xx, back off exponentially up to 30min and show the time of the last fetch. A
+  rate limit's message names when seatswap asks again, in local time: `Claude limits how often
+  seatswap may ask; next try at 10:42`.
 - On a 401: for the active account, read the live file again (Claude Code may have renewed it). For an inactive account, refresh (§6.3).
 - An account that a limit blocks is polled once 30 s after that limit's reset time, whatever its interval, so a notification does not wait for the 15-minute poll of inactive accounts.
 - While the active account's binding limit is at 90 % or more and below 100 %, it is polled every 30 s; at 100 % the reset poll above applies. The status line's feed (§7.6) can make the numbers newer still, without a request. The feed never moves a timer poll: the poll schedule keeps its times whatever the feed does.
@@ -409,14 +424,14 @@ What the settings page says about the two switches:
 ### 7.2 What the app derives from the response
 
 For each account it shows:
-- **Session (5 h):** percentage and time until reset (`1h12m`, `35m`). Only if the reply has a session limit (§3).
-- **Week, all models:** percentage and the reset: more than 48 h away the weekday and clock time (`Sun 02:00`); otherwise the time until it, `1d18h` from 24 h on, `5h40m` below.
-- One rule for every reset shown (pop-up, tray menu, CLI): under 24 h hours and minutes, 24–48 h days and hours, beyond 48 h weekday and clock time. Minutes round up, and a reset time is shown rounded up to the full minute: the server sends a moment just before the boundary (`00:59:59.59`), which is meant as `01:00`.
+- **Session (5h):** percentage and time until reset (`1h 12min`, `35min`). Only if the reply has a session limit (§3).
+- **Week, all models:** percentage and the reset: more than 48h away the weekday and clock time (`Sun 02:00`); otherwise the time until it, `1d 18h` from 24h on, `5h 40min` below.
+- One rule for every reset shown (pop-up, tray menu, CLI): under 24h hours and minutes, 24–48h days and hours, beyond 48h weekday and clock time. Minutes round up, and a reset time is shown rounded up to the full minute: the server sends a moment just before the boundary (`00:59:59.59`), which is meant as `01:00`.
 - **Week, scoped:** one row per scoped weekly limit (e.g. Fable), percentage only.
 - **Binding limit:** the one with `is_active: true`, or else the highest percentage, the first of
   equals. This drives the tray icon.
-- **Usable:** the login works, the usage is known, and no limit blocks the account. The week is below 100 %, the 5 h session below 100 %, and a per-model weekly limit below 100 % while a running session uses that model. A per-model limit at 100 % blocks the account only while a session on that model is open (busy or idle); with `readSessions` off, it blocks only while the server marks it as the binding one.
-- **Which limit blocks:** when several limits are at 100 %, the one with the latest reset time is named; one without a reset time comes before one with a time. On a tie the week comes before a model, and a model before the 5 h session.
+- **Usable:** the login works, the usage is known, and no limit blocks the account. The week is below 100 %, the 5h session below 100 %, and a per-model weekly limit below 100 % while a running session uses that model. A per-model limit at 100 % blocks the account only while a session on that model is open (busy or idle); with `readSessions` off, it blocks only while the server marks it as the binding one.
+- **Which limit blocks:** when several limits are at 100 %, the one with the latest reset time is named; one without a reset time comes before one with a time. On a tie the week comes before a model, and a model before the 5h session.
 - **Extra usage / spend:** only if enabled.
 
 ### 7.3 Colours by load
@@ -441,11 +456,11 @@ no modes and no tuning settings: every threshold is a constant in the code (see 
 | S2 | Another usable account has clearly less slack | only while early switching is on: switch to it at a quiet moment (below) |
 | S3 | Nothing is usable | no switch; the "All accounts are full" notification of §7.5, and the reset poll of §7.1 |
 
-- **Blocked** means the week or the 5 h window is at 100 % or more, the login has ended, or a
+- **Blocked** means the week or the 5h window is at 100 % or more, the login has ended, or a
   per-model limit at 100 % blocks the account while a session on that model is open (§7.2).
 - **Least slack** is the work the account can still take before its weekly reset minus the work
   needed to empty it. A capped account can only take a window's worth at a time, so its remaining
-  5 h windows count, not just its percent. An account whose rates are not learned yet is played
+  5h windows count, not just its percent. An account whose rates are not learned yet is played
   like one without rates: the fixed order is used instead, capped accounts with an open window
   first, then the others, each by the earlier weekly reset and then the account id.
 - **S2** needs another usable account whose slack is at least 2 typical working hours below the
@@ -524,9 +539,9 @@ With `readSessions` off there is no session count and S2 does not wait.
 
 - **Manual switch while auto-burn is on.** A switch auto-burn did not make — by a person
   (`seatswap use`, `next` or the pop-up), the CLI, an agent, or Claude Code's `/login` — holds S2
-  back for 4 hours, or until the account switched to is blocked, whichever comes first. Blocked means what "Usable" (§7.2) means: the week or the 5 h session at 100 % ends the hold from the history's record of it; a per-model limit at 100 % ends it only while it blocks the account when the hold is checked (the history does not know which models ran). The hold
+  back for 4 hours, or until the account switched to is blocked, whichever comes first. Blocked means what "Usable" (§7.2) means: the week or the 5h session at 100 % ends the hold from the history's record of it; a per-model limit at 100 % ends it only while it blocks the account when the hold is checked (the history does not know which models ran). The hold
   ends for good at that first block and does not come back. S1 is not held back.
-- **Pause.** "Pause 4 h" in the pop-up writes an `autoBurn` event with `pausedUntil`; "Resume"
+- **Pause.** "Pause 4h" in the pop-up writes an `autoBurn` event with `pausedUntil`; "Resume"
   writes one with no end. The pop-up shows `Auto-burn paused until 18:10 · Resume`. A pause holds
   S2 like a manual switch; a resume also ends a manual hold. Turning `autoBurn` on or off in the
   settings writes `autoBurnSet`, which is neither a pause nor a resume and leaves both alone.
@@ -539,21 +554,22 @@ leaves it; if every other account is also unusable, S3 applies.
 
 #### 7.4.5 The texts
 
-Times are local `HH:MM`, or `Mon HH:MM` when not today; durations are `35m`, `2h`, `2h05m`,
-`1d3h`.
+Times are local `HH:MM`, or `Mon HH:MM` when not today; durations are `35min`, `2h`, `2h 5min`,
+`1d 3h`, with at most two units and no leading zero (`2h 5min`, not `2h 05min`). From a day on the
+minutes are not shown (`3d 4h`); `about 2h` keeps its word.
 
 - **The line under the switch:** `On PR until its week is full, about 2h. Then AC.`, `On AC until
-  its 5 h window is full, about 1h30m. Then LB.`, `On PR for about 2h. Then AC, before PR is full.`
+  its 5h window is full, about 1h 30min. Then LB.`, `On PR for about 2h. Then AC, before PR is full.`
   (the plan leaves PR before it fills), `On PR. No switch planned this week.` While rates are
   missing: `Learning how fast AC, LB are used. Until then: switch only when full.`
 - **An automatic switch** (when `notifyOnSwitch` is on): `Auto-burn: now on PR. AC is full until
   14:40.` or `Auto-burn: now on PR: its week resets on Mon 02:00.`
-- **A suggestion** (auto-burn off): `Switch to AC now: its 5 h window is open and its week resets
+- **A suggestion** (auto-burn off): `Switch to AC now: its 5h window is open and its week resets
   on Mon 02:00.` When the plan that switches only at 100 % — the lazy plan, not the plan auto-burn
   follows — expects more than 1 % of the target's week to be left unused at its reset, it adds
   ` Staying on PR is expected to let 12 % of AC expire.` The pop-up shows the same sentence and a
   [Switch] button; the desktop notification is sent once per target and hour.
-- **The reason of a switch:** `AC is full until 14:40`, `its 5 h window is open and its week
+- **The reason of a switch:** `AC is full until 14:40`, `its 5h window is open and its week
   resets on Mon 02:00`, `its week resets on Mon 02:00`, or `no account was in use`.
 - While auto-burn is on, no suggestions are sent: it would ask for what auto-burn does anyway.
 
@@ -569,7 +585,7 @@ is a reading too, so a running session can keep the numbers fresh without a requ
 
 ### 7.5 Notifications about limits and waiting
 
-- **Usable again.** When an account that a limit blocked is usable again and is not the active account, seatswap sends `PR is usable again: its 5 h window reset.` The reason is `its 5 h window reset`, `its week reset` or `its {model} week reset`. It is sent at most once per account and reset minute, and only while `notifyUsableAgain` is on. The poll 30 s after the reset time (§7.1) is what makes it timely. It is sent only when the block ended because its reset time passed (the previous `blocked_until` is at or before now): a per-model block whose last session on that model closed, or a block the server lifted early, sends nothing and does not use up the once-per-reset.
+- **Usable again.** When an account that a limit blocked is usable again and is not the active account, seatswap sends `PR is usable again: its 5h window reset.` The reason is `its 5h window reset`, `its week reset` or `its {model} week reset`. It is sent at most once per account and reset minute, and only while `notifyUsableAgain` is on. The poll 30 s after the reset time (§7.1) is what makes it timely. It is sent only when the block ended because its reset time passed (the previous `blocked_until` is at or before now): a per-model block whose last session on that model closed, or a block the server lifted early, sends nothing and does not use up the once-per-reset.
 - **All accounts are full.** When every account whose login still works is blocked by a limit, and the previous snapshot had a usable account, seatswap sends `All accounts are full. Next: AC at 14:40.` once; without a next reset time it is `All accounts are full.` An account whose usage is not known yet is not usable but not blocked either, so it does not count as full. Only accounts whose login still works count.
 - **Waiting for you.** A session that is still waiting 15 s after it entered `waiting` sends `acme-kb-dd is waiting for you (acme-kb, on atlas).` The label is the session's name, or `<project>-<first two hex digits of the session id>` when the session has no name. The host part is left out when this host's name cannot be read: `acme-kb-dd is waiting for you (acme-kb).` It is sent once per session and wait, and only while `notifyWaiting` is on. When the session stops waiting, its notification is withdrawn. With `notifyWaitingHosts` set to all hosts, another host's waiting session notifies here too, with that host's name; it arrives with the delay of the shared history folder (`sessions-now.json`, §11.4), so the 15 s counts from the session's own `since`.
 - A waiting notification does not time out where the desktop allows that (Linux). On Windows it follows the system's rules; the pop-up keeps the count either way. A click opens the Sessions area at that session, opened and marked for 3 seconds; a session that is no longer listed says so there.
@@ -587,7 +603,7 @@ from its cache, and prints one line.
   payload malformed. Anything that is not a JSON object of this shape is treated as an empty
   payload: a malformed payload must not hide the line.
 - **What it prints:** the layout `statusline: {left, right, margin}`. The preset "My current line"
-  is `sam@atlas:~/projects/atlas Fable 5.2 high` on the left and `AC 12% 4h45m  48% 3d16h` on the
+  is `sam@atlas:~/projects/atlas Fable 5.2 high` on the left and `AC 12% 4h 45min  48% 3d 17h` on the
   right. A segment without a value prints nothing, with its prefix and suffix. The right part is
   flush with the terminal's right edge minus the margin; when the line does not fit, segments are
   dropped by their `drop` number (1 first) until it does, and when nothing is left to drop it is
@@ -602,7 +618,7 @@ from its cache, and prints one line.
 - **The recorder's file is not the line:** a `statusline-keys.json` that cannot be parsed does not
   change the printed line and does not stop the feed; the page shows that file's error (§11.4).
 - **The preset and the segments:** the preset reproduces the old script. The layout can also hold
-  the account (abbreviation in its colour), plan, 5 h percent and reset, week percent and reset,
+  the account (abbreviation in its colour), plan, 5h percent and reset, week percent and reset,
   per-model percent, auto-burn, model, effort, folder (`~` short), git branch, context used, session
   cost, lines changed, `user@host`, clock, free text and a separator. Each segment has an optional
   colour rule (fixed, by load with two thresholds, by model family, by effort, or the account's
@@ -637,8 +653,8 @@ from its cache, and prints one line.
 - **The tray app takes it.** After a write the command sends `feed` on the existing single-instance
   socket; no tray app running is not an error, the file waits. The tray app reads the file, merges
   it into that account's cache entry only when `at` is later than both the poll's `fetchedAt` and
-  the last feed, and writes a usage sample with `src: statusline` like a poll. The 5 h percent and
-  its reset follow the feed when its window is new or the same window is not lower; a 5 h window
+  the last feed, and writes a usage sample with `src: statusline` like a poll. The 5h percent and
+  its reset follow the feed when its window is new or the same window is not lower; a 5h window
   whose reset is at or before the feed's `at` is ignored, so a window that has already ended cannot
   come back after a poll replaced it. The weekly
   percent follows it only when it is not lower, and the weekly reset stays the cache's. Per-model
@@ -736,11 +752,11 @@ nothing is asked there.
 The answer becomes the same limits a Claude account has:
 
 - `rate_limit.primary_window` and `.secondary_window`: a `limit_window_seconds` of 18000 s is the
-  5 h session and 604800 s the week; `used_percent` is the percent and `reset_at` (seconds since the
+  5h session and 604800 s the week; `used_percent` is the percent and `reset_at` (seconds since the
   epoch) the reset time. `reset_after_seconds` is ignored.
 - An `additional_rate_limits` entry is a per-model limit: its `limit_name` is the model. A 604800 s
   window is a scoped week; 18000 s and every other length keep their own name instead of becoming the
-  account's session or week: `5 h limit`, `24 h limit`, `30 min limit`, `45 s limit`.
+  account's session or week: `5h limit`, `24h limit`, `30min limit`, `45s limit`.
 - The plan is `plan_type` with its first letter capitalised (`plus` → `Plus`); the account is the
   answer's `account_id` under the organization `codex`.
 - One limit is marked active: the one with the highest percent, the first of equals. The answer has
@@ -756,7 +772,7 @@ is asked there.
 - A **new plan** (monthly credits) has `included.balance_usd`, `included.allowance_usd`,
   `included.period.until` and `purchased.balance_usd`. The card shows the credits left of the
   allowance (or left alone when there is no allowance), the reset date, the bought credits when above
-  zero, and the spend of the last 24 h from `totals.usage_usd` of `/api/usage`. When an allowance is
+  zero, and the spend of the last 24h from `totals.usage_usd` of `/api/usage`. When an allowance is
   known and above zero, the card's ring is the share of it used, and the reading is recorded as one
   limit of kind `monthly_credits` that resets at the period's end. Without an allowance there is no
   share and no such limit; the credits are still shown and the reading records no usage. A spend that
@@ -765,11 +781,12 @@ is asked there.
   `remaining_percent` and `resets_at`. They become a session and a week limit with
   `percent = 100 − remaining_percent`, like a Claude account; the card has no credits.
 - The account is named `ollama` under the organization `ollama`; the plan is empty.
+- Every successful `/api/usage?range=24h` answer's `buckets` also become the history's Ollama hours (§5); the Activity page draws them (§11.4).
 
 **What the card shows.** One card per switched-on provider, Codex first. A Codex card has the
 account card's rings and bars, the plan and a row per limit with its reset and its own name; a
 per-model limit of another length is labelled `{model} · {name}`, for example
-`gpt-6-astra · 5 h limit`. An Ollama card on a new plan has the credit rows, in the page's one money
+`gpt-6-astra · 5h limit`. An Ollama card on a new plan has the credit rows, in the page's one money
 rule (§11.5): whole dollars from 10 on, two decimals below, so `212 USD of 300 USD` and `3.18 USD`. A
 card has no Switch button and no accent bar. A first reading without limits says
 `No usage limits in the reply.`; a provider that is switched off has no card. A failed poll keeps
@@ -793,12 +810,12 @@ old numbers before the next round asks the new place, exactly as a save does.
 | an unusable setting | the setting's own text, for example `the Codex folder (codexHome or $CODEX_HOME) must be an absolute path, got codex` or `ollamaUrl must start with http:// or https://, got "127.0.0.1:11434"` |
 | a file that cannot be read | `cannot read {path}: {reason}` |
 | an answer of the wrong shape | `Unexpected answer: {reason}` |
-| an HTTP or network failure | the API's own text: `the access token is not authorized` · `rate limited; retry after Some(60) seconds` (or `None`) · `server error 500` · `HTTP 404: {body}` · `cannot connect: {reason}` (Codex) · `network error: {reason}` · `cannot decode the reply: {reason}` |
+| an HTTP or network failure | the API's own text: `the access token is not authorized` · `{service} limits how often seatswap may ask` · `server error 500` · `HTTP 404: {body}` · `cannot connect: {reason}` (Codex) · `network error: {reason}` · `cannot decode the reply: {reason}` |
 
 For Ollama a refused connection becomes `Ollama is not running on {url}.`; a balance answer of HTTP
 401 or 403 becomes `Ollama on {url} refused the request (HTTP {status}). Is it signed in?` (seatswap
 sends no token, so the card speaks of none); every other API failure keeps the API's text. A failed
-24 h usage request is not the card's error at all: its API text is the `not read:` row. The `Setting`
+24h usage request is not the card's error at all: its API text is the `not read:` row. The `Setting`
 row is what a hand-edited `codexHome` or `ollamaUrl` produces: the settings page refuses such a value
 before it is saved, and the reader checks it again before reading or asking anything.
 
@@ -807,8 +824,10 @@ before it is saved, and the reader checks it again before reading or asking anyt
 crossing become a `WindowRecord` and a `Blocked`/`Unblocked` event like a Claude account's. A Claude
 organization id is a 36-character UUID, so those names cannot clash. Every reader that serves Claude's
 accounts uses `read_claude` (and `finished_claude_windows`), which leaves those records out: auto-burn,
-the status line's next account, money and every statistics page stay Claude-only, and provider
-readings add no Sessions rows, no statistics and no switch. `read` stays for the recorder, the export
+the status line's next account and money stay Claude-only, and a provider reading never makes a
+switch. The Activity page is the one statistics page that reads Ollama's own hourly lines; the
+provider cards' samples and windows are in no statistics page. Codex's rollout files give the Sessions
+area its Codex rows (§11.4), separately from these readings. `read` stays for the recorder, the export
 and the import: an export's windows and daily token rows are raw history, so a provider's finished
 window can appear in an export, while its samples do not, because the export has no sample rows. An
 import copies a host folder as it is, provider lines included. A history folder that could not be
@@ -825,7 +844,7 @@ are refused, while a port, a path, an IPv6 host and one trailing `/` are accepte
 
 **What is not done.** No switching, no sign-in or sign-out (of Codex or Ollama), no token renewal, no
 request that generates text, no keyring read (a Codex login kept in the keyring is only named on the
-card), no statistics and no Sessions area entries.
+card), no statistics from the cards' readings, and no switch by them.
 
 ---
 
@@ -848,7 +867,7 @@ card), no statistics and no Sessions area entries.
 - **Text next to the icon, where the platform shows it:**
   - macOS: the menu bar title.
   - Linux: the AppIndicator label. **Cinnamon does not show it** *(tested, Cinnamon 6.6.9)*: the app publishes the label, but Cinnamon's tray bridge (`xapp-sn-watcher`) hands an empty one to the panel. There the ring carries the number, and the tooltip once the app publishes one (below).
-  - The text reads `97%`. A setting `trayText` offers `percent`, `percent+reset` (`97% · 1h12m`) or `off`.
+  - The text reads `97%`. A setting `trayText` offers `percent`, `percent+reset` (`97% · 1h 12min`) or `off`.
 - Tooltip: "AC · Acme — session 97 % (resets 14:40) · week 48 %".
 - **High-contrast / monochrome option:** macOS "template" style, or a plain white icon for dark panels. The ring stays, the letters become cut-outs.
 
@@ -869,20 +888,30 @@ card), no statistics and no Sessions area entries.
 
 **Linux menu:**
 ```
-  ● AC  Acme                97 % · 5 h   ✓
-  ● P   Private             12 % · 5 h
+  ● AC  Acme                97 % · 5h   ✓
+  ● P   Private             12 % · 5h
   ───────────────────────────────────────
   Open panel…                       ⌃⌥C
   Add account…
+  Sessions…
+  Statistics…
   Settings…
-  Quit
+  Quit seatswap
 ```
 
 - Clicking an account switches to it.
 - The usage text in the menu updates live.
-- "Open panel…" opens the pop-up.
+- "Open panel…" opens the pop-up. "Sessions…", "Statistics…" and "Settings…" open the large window at that area.
 - An optional global shortcut (default Ctrl+Alt+C, configurable) opens the pop-up on every platform.
   - **Linux v1:** the app registers no shortcut itself. The person binds `seatswap panel` to a key in the desktop's keyboard settings; that command asks the running tray app to open its pop-up. It works the same on X11 and Wayland. A built-in shortcut would need Tauri's global-shortcut plugin, which is not in the project yet (and cannot grab keys on Wayland).
+
+### 8.4 The app icon
+
+The tray icon above is live: it changes with the account and its usage. The app's own icon is fixed:
+the *Swap S*, a green rounded square (`#22c55e`) holding a dark S whose two ends are arrow heads. It
+is 256 px (`crates/app/icons/icon.png`, drawn from `icon.svg`); `icon.ico` carries 16, 24, 32, 48,
+64 and 256 px for Windows. It is the launcher's icon, the Windows `.exe`'s, the icon of every window
+(taskbar and Alt+Tab) and of every notification.
 
 ---
 
@@ -949,21 +978,20 @@ They give real click handling and exact placement on those desktops. They're not
 | `claudeConfigDir` | `$CLAUDE_CONFIG_DIR` or `~/.claude` | |
 | `historyDir` | `null` (`<data folder>/history`) | text, an absolute folder; point it at a synced folder to share the history with other hosts |
 | `hostName` | `null` (the machine's host name) | text, 1–63 characters of `A–Z a–z 0–9 . _ -` that must start with a letter or a digit, stored in lower case; the name this host writes its history under |
-| `readSessions` | on | read Claude Code's session files and transcripts: model, busy or idle, waits, tokens per folder, agents and their thinking. The Sessions area needs it; turning it on takes effect after a restart. Message text is never stored |
+| `readSessions` | on | read the session files and transcripts of Claude Code, DeepSeek Harness and flash agents, and Codex's rollout files: model, busy or idle, waits, tokens per folder, agents and their thinking. The Sessions area needs it; turning it on takes effect after a restart. Message text, session titles and worker task texts are never stored |
 | `notifyUsableAgain` | on | the "usable again" notification (§7.5) |
 | `notifyWaiting` | on | the "waiting for you" notification (§7.5); a click opens the Sessions area at that session |
 | `notifyWaitingHosts` | `thisHost` | `thisHost` · `allHosts`: whose waiting sessions notify. Other hosts report through the shared history folder, so their notifications come with the delay of the sync (§4.1, §11.4) |
 | `notifyLoginEnds` | on | the login warnings at 5 days, 1 day and when a login ended (§7.5). `bool`; Settings → Notifications, "A login ends" |
 | `currency` | none | `null` or three capital letters (`"EUR"`); `Option<String>`; the currency every amount is shown in. Until it is set, amounts in money stay missing (§11.5). Settings → General, section Money, "Currency" |
-| `usdRate` | none | `null` or `{ "currency": "EUR", "value": 0.95 }`: units of that currency per 1 USD, value above 0; `Option<OwnRate>`. It is used only while its currency is `currency`; an entered rate wins over the looked-up one (§11.5). Settings → General, Money, "Use my own rate" |
-| `lookUpPrices` | on | `bool`; whether seatswap may ask models.dev for API prices and Frankfurter for the dollar rate (§11.5). Off, neither host is contacted and `prices --refresh` refuses; stored values stay. Settings → General, Money, "Look up prices and the dollar rate" |
+| `lookUpPrices` | on | `bool`; whether seatswap may ask models.dev for API prices and Frankfurter for the dollar rate (§11.5). Off, neither host is contacted and `prices --refresh` refuses; stored values stay and API values are shown in USD. Settings → General, Money, "Look up prices and the dollar rate" |
 | `price` per account | none | `null` or a number above 0: what the subscription costs per month, in `priceCurrency`; `Option<f64>`. Without one the account is left out of every sum in money and the page says so (§11.5). Settings → Accounts, column "Price / month" |
 | `priceCurrency` per account | none | `null` or three capital letters: the `currency` in effect when `price` was entered. A price counts only in that currency; a price entered before a currency was set has `null` and does not count (§11.5). Settings → Accounts, the price cell |
 | `plan` per account | from the login | read-only `Option<String>`: the identity's `planDisplayName`, else the capitalised `subscriptionType` with its level from `rateLimitTier` ("Team 5x"; a tier seatswap cannot read as a multiplier in parentheses, "Team (team_premium)"). Shown in the pop-up, Settings → Accounts and `seatswap list` |
 | `agentsRead` | on | agents may run `list`, `status`, `burn plan`, `burn simulate`, `prices` and `history export` (§6.6, §7.7) |
 | `agentsSwitch` | off | agents may run `use` and `next` (§6.6); an agent's `next` does nothing while auto-burn is on (§7.8) |
 | `codexCard` | off | `bool`; show a read-only Codex card in the pop-up. While off, no Codex file is read and no request is sent (§7.9). Settings → Providers, "Show a Codex card" |
-| `codexHome` | none | `null` or an absolute folder: where Codex's `auth.json` is; `null` means `$CODEX_HOME`, else `~/.codex`. A relative folder is refused. Settings → Providers, "Codex folder" (§7.9) |
+| `codexHome` | none | `null` or an absolute folder: where Codex's `auth.json` and `sessions/` are; `null` means `$CODEX_HOME`, else `~/.codex`. A relative folder is refused. Settings → Providers, "Codex folder" (§7.9) |
 | `ollamaCard` | off | `bool`; show a read-only Ollama card. While off, no request is sent to the Ollama server (§7.9). Settings → Providers, "Show an Ollama card" |
 | `ollamaUrl` | `"http://127.0.0.1:11434"` | the Ollama server the card asks; must start with `http://` or `https://` and name a host: a DNS name, an IPv4 address or a bracketed IPv6 address. Refused: a whitespace or control character, user info (without quoting the URL), no such scheme, a host that is not one of those, a query string, a fragment, an empty path segment. A port, a path, an IPv6 host and one trailing `/` are accepted. Settings → Providers, "Ollama server" (§7.9) |
 
@@ -973,6 +1001,9 @@ group and the row. The pop-up has no settings view any more (§11.3).
 The former `suggestAt` and `suggestTargetBelow` (the fixed 90 % / 50 % suggestion) are gone. An
 older `accounts.json` that still has them loads: unknown keys are ignored, and the two settings
 default to auto-burn off and suggestions on.
+
+An older `accounts.json` that still has `usdRate` loads and ignores it silently, and an older
+`prices.json` with own prices does the same (§11.5); the next save leaves them out.
 
 ---
 
@@ -989,23 +1020,25 @@ The target is somewhere between the macOS Control Centre and Raycast: one floati
   - Dark: background `#0f1115`, cards `#171a21`, text `#e7e9ee`, muted text `#8b93a7`.
   - Light: background `#f6f7f9`, cards `#ffffff`, text `#0f1115`.
 - **Type:** Inter, or the system UI font as a fallback. Numbers use tabular figures so percentages don't jitter.
-- **Gauges:** two concentric rings per account. The outer ring is the week, the inner the 5 h session; the week's percent is the large figure in the middle. The bars beside the gauge follow the same order: week, then session, then the per-model limits. On a plan without a session limit the inner ring is left out (no grey track) and the week's figure sits centred.
+- **Gauges:** two concentric rings per account. The outer ring is the week, the inner the 5h session; the week's percent is the large figure in the middle. The bars beside the gauge follow the same order: week, then session, then the per-model limits. On a plan without a session limit the inner ring is left out (no grey track) and the week's figure sits centred.
   - Rings fill with an ease-out animation (400 ms) when the pop-up opens and when values change.
   - Colours follow §7.3, drawn as a soft gradient along the arc, with a faint glow on the red state.
   - Clicking the gauge of an account that is not in use switches to it, like its Switch button. The pointer becomes a hand over it.
 - **Account colour:** a 3 px accent bar on the card's left edge and the abbreviation badge.
 - **Active account:** at the bottom. The card is raised (slightly lighter), with a subtle ring in the account colour and an "Active" pill.
 - **Closing:** Esc, the × in the header, a click anywhere else (the pop-up loses focus), or a second left click on the tray icon. The pop-up must actually get the keyboard focus when it opens, or none of the first three work (on Cinnamon it did not at first, §17).
-- **Motion:** after a switch, the cards trade places with a 250 ms spring animation. The ticking reset countdowns ("1h12m") update every minute without flicker. All animation is off when the system asks for reduced motion.
+- **Motion:** after a switch, the cards trade places with a 250 ms spring animation. The ticking reset countdowns ("1h 12min") update every minute without flicker. All animation is off when the system asks for reduced motion.
 - **Keyboard:** ↑/↓ moves between accounts, Enter switches, 1–9 switch directly, `,` opens the settings in the large window, Esc closes. The cursor (a blue ring) appears only with the first ↑/↓, starting from the account in use, and is gone again each time the pop-up opens; until then Enter does nothing. Clicking a card does not move it.
 
-**Sessions line.** In the footer next to "+ Add account" the pop-up reads `9 sessions · 2 busy` (the mock-up shows it without a waiting session), and while someone waits ` · 1 waiting for you` in the warning colour. With `readSessions` off there is no line. When the session files cannot be read, their reason stands there muted instead; a newer Claude Code adds a small ⚠ whose tooltip is the warning text. The numbers do not depend on the pop-up being open.
+**Sessions line.** In the footer next to "+ Add account" the pop-up reads `9 sessions · 2 busy · see the plan` (the mock-up shows it shorter: `3 sessions · 1 busy`), and while someone waits ` · 1 waiting for you` in the warning colour before the plan link. With `readSessions` off there is no line. When the session files cannot be read, their reason stands there muted instead; a newer Claude Code adds a small ⚠ whose tooltip is the warning text. The numbers do not depend on the pop-up being open. `9 sessions` opens the Sessions area; `1 waiting for you` opens Sessions at that session (`sessions?<id>`), and a waiting id the window cannot parse is refused with an error; `see the plan` opens Statistics at Forecast.
+
+**The auto-burn line.** The line under the cards names every account it mentions as a chip in the account's colour, so a sentence like `On AC until its 5h window is full, about 1h 30min. Then LB.` shows `AC` and `LB` as chips. Where plain text is needed — the tray menu, a notification, the CLI — the same line is printed with each account's abbreviation and no chips.
 
 ### 11.2 Mock-up
 
 ```
 ╭──────────────────────────────────────────────────────╮
-│  seatswap                           ⟳ 12 s ago  ⚙  ✕ │
+│  seatswap                           ⟳ 12s ago  ⚙  ✕ │
 │                                                      │
 │ ▌╭────╮  P   Private                       [ Switch ]│
 │ ▌│ 31 │  …@example.com · Ultra                       │
@@ -1015,7 +1048,7 @@ The target is somewhere between the macOS Control Centre and Raycast: one floati
 │ ▌╭────╮  AC  Acme ✎                       ● Active   │
 │ ▌│ 48 │  someone@… · Team                            │
 │ ▌│ 97 │  Week      █████████▋             48 %  Sun  │
-│ ▌╰────╯  Session   ████████████████████▉  97 % 1h12m │
+│ ▌╰────╯  Session   ████████████████▉   97 % 1h 12min │
 │ ▌        Fable     ████████▋              43 %       │
 │                                                      │
 │  ⚠ AC is almost out. P has room — switch?   [Switch] │
@@ -1038,13 +1071,14 @@ large window at Accounts with that account's editor open. The editor and every s
 seatswap has a second window next to the pop-up: label `main`, title "seatswap", 1280 × 800 at
 start, resizable, decorated, in the taskbar and not always on top. It is one more Tauri webview
 window with its own page (`window.html`); both windows can exist at the same time and both receive
-the app's `snapshot`.
+the app's `snapshot`. Its content keeps a 24 px margin on every side.
 
 **How it is opened.**
 - The pop-up's gear (or `,`): the Settings area.
 - An account's badge or ✎ in the pop-up: Accounts, with that account's editor open
   (`settings/accounts?<account id>`).
-- The tray menu: "Settings…" opens Settings, "Open seatswap…" opens Sessions.
+- The tray menu: "Sessions…" opens Sessions, "Statistics…" opens Statistics, "Settings…" opens
+  Settings.
 - `seatswap window [AREA]` asks the running tray app; without an area it opens `sessions`.
   `seatswap panel settings` sends the same line as `seatswap window settings`.
 - A page's `open_window` command, which takes the same target.
@@ -1069,25 +1103,26 @@ follows the `theme` setting and the system, as in the pop-up.
 General · Accounts · Auto-burn · Notifications · Projects · Agents · Providers · History and hosts.
 The address names the group, with an alias accepted (`gen`, `acc`, `autoburn`/`burn`, `noti`, `proj`,
 `prov`, `hist`), and an optional item that opens a row's editor. A click on a group writes the new
-address, so Back returns to the previous group.
+address, so Back returns to the previous group. Settings has no second title: the chosen group's card
+follows the tabs directly.
 
 Every control saves at once; there is no Save button. A refused save shows its error under the row
 and puts the control back to the saved value. Saves run one after another, each built from the
 settings the one before left, so a quick second change never carries a stale copy; while a save is
-pending, an incoming snapshot does not overwrite the page's own copy.
+pending, an incoming snapshot does not overwrite the page's own copy. The left group menu stays on
+screen while only the content pane scrolls. A text field's focus frame is drawn outside its box, and
+the table or label cell that holds it shows the whole frame instead of cutting it; the money rows
+are drawn again only when their view changed, so the checked time and the rate do not flicker while
+a snapshot ticks.
 
 - **General.**
   - *Money*: the currency; "Look up prices and the dollar rate"; "1 US dollar is" with the rate in
-    effect and whether it was looked up (with its date) or entered by hand, or "no rate yet: API
-    values are shown in USD", with a failed rate look-up's text under that row; "Use my own rate",
-    which saves the rate with the currency it is for and is disabled while no currency is set or it
-    is USD; the API prices row with how many models have a price, when they were checked, what the
-    last look-up changed, how many models models.dev's list left out and which, and a price list. In
-    the price list each model's four prices are fields: changing one saves it as that model's own
-    price, and a button puts the looked-up price back; a model whose price depends on the prompt size
-    is marked and uses its base price. The list ends with "add a model": a provider (one of the
-    three models.dev providers seatswap reads), a model id and the four prices, which saves an own
-    price for any model, also with look-ups off and no list (§11.5).
+    effect and below it its source — `ECB rate of Fri 13 Nov · European Central Bank via
+    Frankfurter · fetched today 10:10`, where an older rate says `fetched: not recorded` — or "no
+    rate yet: API values are shown in USD", or "USD itself", with a failed rate look-up's text under
+    that row; the API prices row with how many models have a price, when they were checked, what the
+    last look-up changed, and how many models the models.dev list left out and which. The price list
+    itself is under Providers.
   - *Look*: theme, tray text, which limit the tray ring shows.
   - *Start and polling*: start at login; how often the active account and the inactive accounts are
     read.
@@ -1109,7 +1144,9 @@ pending, an incoming snapshot does not overwrite the page's own copy.
   sessions notify; "An account is usable again"; "All accounts are full" (always on); "Every
   automatic switch"; "A switch by an agent" (always on); a link to the suggested switches under
   Auto-burn; "A login ends", the 5-day, 1-day and ended warnings.
-- **Projects.** §11.6.
+- **Projects.** §11.6. Under the list stands `+ Add organization`; each organization has a Remove
+  button, except one that comes from a repository owner, which has none and says why. The *Join
+  projects* row keeps its text and its button apart at every width.
 - **Agents.** "Agents may read usage" and "Agents may switch accounts", with the text of §6.6; the
   skill's state, an install and a remove button; the last 20 calls by agents, newest first, with
   their folder and whether they were allowed.
@@ -1117,69 +1154,112 @@ pending, an incoming snapshot does not overwrite the page's own copy.
   (empty: `$CODEX_HOME` or `~/.codex`) and "Ollama server" (default
   `http://127.0.0.1:11434`). The section's two notes say that seatswap reads Codex's login file and
   asks chatgpt.com for the usage every 5 minutes without changing Codex's files, and that the Ollama
-  card asks the server on this machine for the cloud balance every 5 minutes (§7.9).
+  card asks the server on this machine for the cloud balance every 5 minutes (§7.9). Below them
+  stands "API prices from models.dev · checked 11:11", models.dev a link, and the price list: one
+  read-only row per model with its four prices, a model whose price depends on the prompt size
+  marked and using its base price, and a Show/Hide control. Nothing in the list can be edited or
+  added.
 - **History and hosts.** This host's name and its history folder; every host folder with its last
   record, its first record and its size; export and import. A changed host name or folder takes
   effect after a restart, and the row says so when the saved value differs from the one in effect.
   Export writes CSV or JSON to a file the person names (an existing file is refused); import copies
   another history folder's host folders in by hand and never writes this host's own folder or a
-  same-named folder of another machine.
+  same-named folder of another machine. While the saved settings name no history folder, the section
+  reads Dropbox's own `info.json` (macOS and Linux `~/.dropbox/info.json`; Windows
+  `%APPDATA%\Dropbox\info.json`, then `%LOCALAPPDATA%\Dropbox\info.json`: `personal.path`, else
+  `business.path`) and suggests `Dropbox found: <Dropbox folder>/seatswap` with a Use button that
+  saves the folder through the same `save_setting` command the field uses, so there is one way to set
+  it. The folder is only suggested: nothing is created or written there until Use is pressed. A
+  missing `info.json` is no suggestion; a file that cannot be read, a section of another kind, or a
+  path that is not a string or is empty is an error naming the file, shown under the host list
+  together with the history error if there is one.
 
 ### The Sessions area
 
-The first area, and what an empty address opens: every running Claude Code session on this host and,
-through the shared history folder, on the user's other hosts, live, with its agents, tokens and
-their two values. It is read from Claude Code's session files and transcripts, so it needs
-`readSessions` (default on); turning that on takes effect after a restart, and with it off the area
-says so.
+The first area, and what an empty address opens: every running session on this host and, through the
+shared history folder, on the user's other hosts, live, with its agents, tokens and their two values.
+It reads Claude Code's session files and transcripts, DeepSeek Harness's session files and
+flash-agents' state, and Codex's rollout files. All of it is read while `readSessions` is on (default
+on); turning that on takes effect after a restart, and with it off the area says so. Every row names
+its provider: `Claude Code`, `Codex` or `DeepSeek Harness`.
 
 **Numbers on top.**
 - Sessions running, and on how many hosts; busy, with how many are waiting for you.
 - Agents running, and how many completed today.
 - The total of exactly the sessions in the view: their tokens, subscription value and API value; the
-  last hour's tokens.
+  last hour's tokens with the last hour's subscription and API value.
 - The sessions whose thinking is tied to the account (§2.11), and how many of them are busy.
-- The account in use, with its week.
+- The account in use, with its week; its name wraps inside its box instead of being cut.
 
 **The tree.** Two orders, switched at the top and remembered: by project → provider and model →
-session, or by provider → model → session with the project after the session's name. Every group
-row shows how many running and closed sessions it holds, how many are busy, how many agents are
-running, and the totals of its tokens and their two values; every total counts exactly the sessions
-in the view — a grey row that has left is shown but no longer counted. A session's row has:
+session, or by provider → model → session with the project after the session's name. Every top-level
+group row stands on the mock-up's highlighted background and shows how many running and closed
+sessions it holds, how many are busy, how many agents are running, and the totals of its tokens and
+their two values; every total counts exactly the sessions in the view — a grey row that has left is
+shown but no longer counted. Every total row fills the same columns as a session row — Agents, Tokens, Last h,
+subscription value and API value — and leaves Model and Status empty: in By project a project and
+its provider · model rows, in By model a provider and its model rows. The model rows under a
+provider do not repeat it. A session's row has:
 
 | Column | Content |
 |---|---|
 | Name | the session's name; opens to its agents |
-| Model | the model of its last answer, with a mark when its thinking is tied to the account |
+| Model | the model of its last answer, with the `tied` bubble when its thinking is tied to the account |
 | Status | busy · idle · waiting for you, with how long; for a closed session, when it closed |
-| Agents | running · completed, the running number in the busy colour (grey at zero), completed always grey |
+| Agents | running · completed, the running number in the busy colour (grey at zero), completed always grey; `—` when a session has no agent data |
 | Tokens | output tokens of the session and its agents since it started |
-| Last hour | output tokens in the last 60 minutes, empty when there were none |
+| Last hour | output tokens in the last 60 minutes, empty when there were none; the *Last hour* KPI adds both values, the *Last hour* card the subscription value |
 | Subscription value | the value of those tokens in the account's plan (§11.5) |
 | API value | the same tokens at API prices (§11.5) |
 | Host | where it runs; for another host, the age of its last report |
 
+The last hour is kept per minute and model, so its tokens are priced like the rest, and a closed
+session's hourly token records are priced with it.
+
 A session opens to its agents, grouped by provider and model. One row per agent has kind, task,
-running or completed, tokens and both values, and its own agents as "1 running · 2 done". An agent
-that started agents opens the same way, to any depth. Completed agents are folded into one
-"38 completed" row that opens.
+running or completed with when it finished, tokens and both values, and its own agents as "1 running ·
+2 done". An agent that started agents opens the same way, to any depth. A flash job is an agent with
+the tag `flash`, its workers below it. Completed agents are folded into one "38 completed" row that opens and that
+carries the subscription and API value of their tokens — one sum for the session, shown only when the
+row holds all of its completed agents. An agent
+without Claude Code's `finished` mark counts as done once its transcript ends with the agent's final
+answer (an assistant entry with `stop_reason` `end_turn`); a resumed agent writes again and counts as
+running again. A task text that a row shows comes from a live transcript; it is never written to the
+history.
+
+**Codex and Harness rows.**
+- **Codex.** Rows come from Codex's rollout files, `<codex folder>/sessions/YYYY/MM/DD/rollout-*.jsonl`,
+  with folder links followed. A resumed session has several files: its tokens are the newest total
+  in time over all of them, and its last hour is that total minus the newest total at or before an
+  hour ago. A total that went down makes the last hour `—` with that reason. A rollout is listed as
+  running while a `codex` process holds the file open, or while its last event is younger than 30
+  minutes. Only a running rollout becomes a row. A `token_count` line without an `info` key is a
+  warning; `info: null` is Codex's normal early line.
+- **DeepSeek Harness.** A job first seen unlinked is its own `DeepSeek Harness` session under its
+  Harness id and folder. Once it is linked to a Claude Code session — through the running process
+  tree on Linux, or once its result is in a transcript — its later tokens go under that session. On
+  Windows the transcript is the only link, so a running job appears once its result is collected. A
+  recorded Harness total is kept while its session file exists, so a resumed old job is never counted
+  twice.
 
 **Around the tree.**
-- *By model*: sessions, busy ones and the last hour's tokens per model.
+- *By model*: sessions, busy ones and the last hour's tokens per model; a model that runs under two
+  providers keeps one total per provider in the tree and one entry in this card. A tied model carries
+  the `tied` bubble, and the card's legend shows the bubble rather than a dot.
 - *If you switched now*: how many sessions would work without their earlier thinking, how many of
   those are busy, how many would send their conversation again and how many pay nothing (§2.11),
   with a Switch… button that opens the pop-up.
-- *Last hour*: output tokens by project.
+- *Last hour*: output tokens by project, with their subscription value.
 
 **Closed sessions and hosts.**
-- **Closed sessions**: none (the default) · last 24 hours · last 7 days · last 30 days. They stand in
+- **Closed sessions**: none (the default) · 24h · 7d · 30d. They stand in
   the same tree, in their project and model group, in grey, with the time they closed. Every total
   follows the choice: the numbers on top and each group's total count exactly the sessions that are
   listed. They come from the history's session and token records, so they are there after Claude
   Code has deleted the transcript.
 - **Hosts**: all, or one. Each host writes what is running on it into its own report in the shared
   history folder (`<host>/sessions-now.json`, below). Another host's row carries the age of its
-  report ("vega · 2 min ago"); a host whose report is older than 15 minutes says "no report since …"
+  report ("vega · 2min ago"); a host whose report is older than 15 minutes says "no report since …"
   instead of running. Without a shared history folder only this host is shown; the report is still
   written whenever this host has a history folder, shared or not.
 
@@ -1191,7 +1271,11 @@ agent appears in its group. A session that left turns grey for 60 seconds and is
 with closed sessions shown, a session that has a closing record is already there as a closed row.
 Other hosts' rows change when their
 report arrives. The thread reads the session files and transcripts whether or not the window is
-open; the transcript folder watches and the pushes exist only while the area is subscribed.
+open; the transcript folder watches and the pushes exist only while the area is subscribed. The
+transcript parser's place is kept in a state file under the data folder. That file is a cache: a
+state written by an older version is discarded, the transcripts are read again from the start, and
+one line says so — `seatswap: the transcript state was written by an older version; reading the
+transcripts again`.
 
 **The link `sessions?<session id>`.** The waiting notification's click (§7.5) opens that session:
 the area opens it, marks it for 3 seconds and scrolls to it. A session that is no longer listed says
@@ -1217,12 +1301,17 @@ project log of §11.6. **The statistics only read:** no function of `core::stats
 history records they count hold only time, folder, model, block kinds, token counts and ids; no
 message text is read or kept for them.
 
-**The frame.** Seven tabs at the top of the page, in this order: Overview · Weeks · Projects ·
-Subscriptions · Forecast · Rhythm · Activity. Above them stand:
+**The frame.** Above the controls stands one line: `{n} accounts · {n} hosts`, and `since {date} ·
+now` when the history has a first reading or switch. `since` is the earliest usage reading or switch
+of any host — a Codex or Ollama reading counts too — while token and session records, which go back
+further, do not set it; `now` marks the line's right end. Below the controls, the row of seven tabs
+ends with the history's size (`history: 4.6 MB`, one decimal, 1 MB = 1 048 576 bytes) and an Export
+button that opens Settings → History and hosts. The tabs are Overview · Weeks · Projects ·
+Subscriptions · Forecast · Rhythm · Activity. Under them:
 
-- **The range**: This week · Last week · 30 d · 90 d · 12 mo · All. Every range starts at Monday
+- **The range**: This week · Last week · 30d · 90d · 12 mo · All. Every range starts at Monday
   00:00 local time. *This week* runs from this week's Monday to now, *Last week* is the week before,
-  and *30 d* / *90 d* / *12 mo* start at the Monday of the week that holds now − 30 / 90 / 365 days.
+  and *30d* / *90d* / *12 mo* start at the Monday of the week that holds now − 30 / 90 / 365 days.
   *All* starts at the Monday of the week that holds the first record, so every page's first
   calendar week holds all its windows; a history with no record uses this week's Monday.
 - **The accounts**, as chips in their colours. A click takes an account out of every page; at least
@@ -1251,21 +1340,25 @@ first` instead.
   this host's local time for every host.
 - **A calendar week** is Monday 00:00 local to the next Monday 00:00 local. A page shows every
   calendar week its range touches; a partial week counts as one.
-- **One window per account and calendar week.** A finished `weekly_all` window belongs to the
-  calendar week of its midpoint, its end minus 3.5 days, and a range chooses the windows whose
-  midpoints fall inside it. If several hosts recorded the same window (same account, same end), the
-  history keeps the one with the latest last reading. If one account has two windows whose
-  midpoints fall in one week because its reset moved, only the window with the later end is kept.
+- **Every window of a week.** A finished `weekly_all` window belongs to the calendar week of its
+  midpoint, `start + (end − start) / 2` (a window without a recorded start uses seven days before its
+  end), and a range chooses the windows whose midpoints fall inside it. If several hosts recorded the
+  same window (same account, same end), the history keeps the one with the latest last reading. A
+  week can hold two windows when a reset ended one early; both are kept, each placed by its own
+  midpoint. Every statistics page reads this one shared list.
 - **The price of a window** is the account's monthly price at the window's midpoint: the last
   `PriceChanged` at or before it, or the first change when the midpoint lies before all of them, or
   the stored price when there is no change. It counts only in the currency it was entered in, as in
   §11.5.
 - **Used, paid and expired money.** One percent of a week is worth `pv(price) = price × 12 / 52 /
   100` in the display currency. The money paid for a week is `100 × pv`, one week's share of the
-  monthly price. What expired is `max(0, 100 − final percent) × pv`, the history's `lost`; what was
-  used is the rest, `paid − expired`. A window above 100 % therefore expired nothing. A week
-  without a price is left out of every money sum — the account's other, priced weeks still count —
-  and the Overview and Subscriptions pages name that account under "No price for …".
+  monthly price. What expired is `max(0, 100 − final percent) × pv`, the history's `lost`; a reset
+  window expired nothing, so its absent `lost` counts as 0. A window's use is `final − from` (`from`
+  absent = 0), and a week's used money is the sum of its windows' use at one week's price. A window
+  above 100 % therefore expired nothing; in a week with a reset, used and expired money together can
+  be more than one week's price, because the reset gave a fresh window. A week without a price is
+  left out of every money sum — the account's other, priced weeks still count — and the Overview and
+  Subscriptions pages name that account under "No price for …".
 - **Blocked hours.** A block is counted only while its account was the account in use on that host,
   and only in the working hours of the rhythm of the four weeks before the range's end: an hour of
   the week whose learned work is above zero. A block that is still open at the range's end counts
@@ -1281,20 +1374,27 @@ first` instead.
 
 **Overview.** Five numbers for the range:
 
-- **Used**: the money used of the priced account weeks, with the money paid for them below it.
-- **Expired unused**: the money that expired, split per account, largest first.
-- **Blocked**: the working hours in which the account in use was blocked.
+- **Used**: the money used of the priced account weeks, with the money paid for them below it; its
+  percent is the used money over the money the windows offered, one week's price per window, so a
+  reset week offers two.
+- **Expired unused**: the money that expired and its percent of the same offered windows, split per
+  account, largest first. A window above 100 % counts all its use, so Used and Expired together can
+  pass 100 %; nothing is cut.
+- **Blocked**: the working hours in which the account in use was blocked. When some of them began
+  before an account was added, the line below names that account by its short name, also when the
+  account chips leave it out.
 - **Avoidable**: the part of those hours in which another account's quota expired.
-- **Switches**: by you, cli, auto, agents and external, and what one switch costs this host's
-  account in use at the range's end as a percent of its 5 h window (the measured cost of §2.13);
-  `—` when the cost or the rates are missing.
+- **Switches**: the total, by you, cli, auto-burn, agents and external, and what one switch costs
+  this host's account in use at the range's end as a percent of its 5h window (the measured cost of
+  §2.13); `—` when the cost or the rates are missing.
 
 Below them, every calendar week of the range carries two stacked bars in money: one stacked in the
 accounts' colours with the expired part hatched on top, and one splitting the projects'
 subscription value among the projects (the three largest, the rest as *other*). The hours blocked
 stand under each week, and the marks say when an account was added and when auto-burn was switched
-on or off. Beside them, "Share that expired, per week" is one line: the expired money over the paid
-money of that week's priced weeks; a week without a priced week has no point. "What the numbers say"
+on or off. Beside them, "Share that expired, per week" is one line: the expired money over the money
+the week's windows offered, by the same rule as the Expired share; a week without a priced week has
+no point. "What the numbers say"
 holds at most four sentences, in this order, each only when it has data:
 
 1. `{abbr} is where most money expired: {amount} in {n} weeks.` — the account with the largest
@@ -1304,16 +1404,21 @@ holds at most four sentences, in this order, each only when it has data:
    `AutoBurnSet { on: true }` in the range that stayed on, with a full week before and after it.
 4. `{abbr} was full in {n} of {m} weeks.` — the account with the most weeks at 100 %.
 
-**Weeks.** Every window as a grid: one row per account, one column per calendar week. A cell is
-filled up to its final percent, the rest is hatched; a week before the account existed is empty, not
-zero. Next to the rows stands the account's percent now from its newest reading, and a row below
-the grid holds the hours blocked per week. One curve per stored account shows its weekly percent
-over the last 14 days; a reset is a drop to 0 at the earlier window's reset when that lies between
-two readings, else at the later reading. The page opens on the summary of the newest finished week
-of the range when it has one.
+**Weeks.** Every window as a grid under the heading "Every weekly window": one row per account, one
+column per calendar week, the weeks' dates above, and the chosen week's detail in the card on the
+right. The week blocks are built as the mock-up's. A cell is filled up to its final percent, the rest
+is hatched; a week before the account existed is empty, not zero. A cell holds one part per window of that account week, so a week with a
+reset has two parts and its total may pass 100 %. A dashed line marks 100 %, a `now` mark stands at
+the grid's right, and next to the rows stands the account's percent now from its newest reading; a
+row below the grid holds the hours blocked per week. One curve per stored account shows its weekly
+percent over the last 14 days; a reset is a drop to 0 at the earlier window's reset when that lies
+between two readings, else at the later reading, and the curve carries a `now` mark and, when the
+history starts after its first point, `history from 16 Nov · no subscription value before`. The page
+opens on the summary of the newest finished week of the range when it has one.
 
 - **The summary of a week** (a click on a week's date): used as a percent of what was paid and in
-  money, expired in money, the hours blocked, the switches by who made them, the money used per
+  money (a reset week's use can push the percent past 100 %), expired in money, the hours blocked,
+  the switches by who made them, the money used per
   account, the three projects with the largest share of the week's API value (then *other*), the
   week's tokens and API value, and the change of the used money against the week before (`—` when
   either week has no priced account week). Its conclusion has at most three sentences:
@@ -1321,13 +1426,16 @@ of the range when it has one.
   came closest to expiring unused: {n} left at its reset.` under 10 %, else `{n} of {abbr}'s week
   expired, {money}.` when a currency is set; then `Auto-burn held back {n} planned
   {switch|switches}, {m} {minute|minutes} in total.` when switches of the week carry a waited time.
-- **The detail of a window** (a click on a cell): used and expired in percent and money; the first
-  weekly block of that account inside the window (`reached 100 %`) and the working hours blocked
-  after it; how many finished session windows of the account ended inside it with some use; how
-  many switches went into or out of the account and how many of them were auto-burn's; the age of
-  the last reading before the reset; whether the window is marked uncertain (seatswap was off at the
-  reset); and the week's curve, built from the account's weekly readings inside the window that name
-  its reset.
+- **The detail of a window** (a click on a cell): its head names the window's plan and its weekly
+  price (`X a week`); then used and expired in percent and money; how many of the account's 5h
+  windows fit in its usual working hours and how many were used — `{n} used, more than the about {m}
+  your usual working hours hold` when the use passes that count, else `{n} used of about {m} possible
+  in your working hours`; the first weekly block of that account inside the window (`reached 100 %`)
+  and the working hours blocked after it; how many switches went into or out of the account and how
+  many of them were auto-burn's; the age of the last reading before the reset; whether the window is
+  marked uncertain (seatswap was off at the reset); a note when a reset ended the window early or the
+  last reading was uncertain; and the week's curve, built from the account's weekly readings inside
+  the window that name its reset.
 
 **Projects and organizations.** A tree table with three levels: organization → project → folder.
 An organization's row comes first; its projects follow by API value, and a project's folders appear
@@ -1335,7 +1443,10 @@ under it when it has more than one. A folder is the first path part below the pr
 that host (the common parent of the project's folders), or the top folder. The second view is the
 plain folder tree without organization rows; either view opens and closes its rows. Every row shows
 its tokens, its share of the page's API value, its subscription value and API value, a bar split by
-account, and its distinct sessions.
+account in the accounts' colours, and its distinct sessions. The matrix's `Used` footer repeats the
+column totals, each the sum of the cells above it. A project's detail gives its share of all use
+(`21.9 % of all use · 18 sessions`) and the line `API values at 1 USD = 0.9048 EUR (13 Nov)`, or
+`API values at each day's rate; latest …` when the rates of the range differed.
 
 - **Organization × account** is the subscription value per organization and account, in the stored
   accounts' order. For an organization linked to its own subscription it carries the sentence
@@ -1349,9 +1460,9 @@ account, and its distinct sessions.
   hosts chosen, the detail of that key counts every host's folder of that name; with one host chosen,
   only that host's.
 - **Tokens per percent** of each account is its output tokens of its finished weeks over the sum of
-  those weeks' final percents. A fall means use that left no transcript, such as claude.ai, the
-  phone, Claude Desktop or a host without the shared history. The page says that such use is in the
-  percent but in no project, and how many tokens have no known account at all.
+  those weeks' use (each week's windows summed). A fall means use that left no transcript, such as
+  claude.ai, the phone, Claude Desktop or a host without the shared history. The page says that such
+  use is in the percent but in no project, and how many tokens have no known account at all.
 - The page also names the models whose API value is missing because they have no price, and the
   tokens that have no subscription value with the reasons. It does not merge two projects with the
   same name: their keys differ.
@@ -1366,7 +1477,7 @@ one per account, stored accounts first and accounts no longer stored after them:
 | Plan, price | the plan and monthly price of the account's latest period that overlaps the range; without one, the stored account's plan and price, or for an account no longer stored its latest window record's plan and the price at the range's end |
 | Since | the start of its first period in the whole history, or its `addedAt` without one |
 | Weeks | its finished account weeks in the range |
-| Average used | the mean final percent of those weeks (`—` without a week) |
+| Average used | the mean use of those weeks — the sum of their windows' use, which a reset week may carry above 100 % (`—` without a week) |
 | Expired | the mean expired percent and the expired money (`—` without a week or a price) |
 | Full | the weeks at 100 % out of all its weeks |
 | Blocked on it | the working hours blocked while it was the account in use |
@@ -1393,10 +1504,12 @@ auto-burn runtime; when the oldest reading that plan was built from is older tha
 page refuses it and says `the forecast needs a reading of every account first`. It says how many
 weeks of history that plan reads. Below it:
 
-- **Four numbers**: the money expected to expire this week with auto-burn's plan as it is set now
-  (eager when early switching pays, else lazy), the same when switching only when an account is full
-  (the lazy plan), the hours of this plan with no usable account, and the switches planned with each
-  of the two rules.
+- **Four numbers**: `Expected to expire this week`, the money expected to expire with auto-burn's plan
+  as it is set now (eager when early switching pays, else lazy); `With “only when full”`, the same
+  when switching only when an account is full (the lazy plan); `Hours with no usable account`, the
+  hours of this plan with no usable account; and `Switches planned`, the switches planned with
+  `about N a day · N with “only when full”` below it. One sentence for all accounts together follows
+  them.
 - **Per account**: the weekly percent now; the percent the plan expects at its reset (`100 − the
   plan's unused percent`); the low of its last 8 finished windows; when the plan first has it full;
   its next reset; and what switching only when full would leave unused, in percent and money.
@@ -1410,9 +1523,10 @@ weeks of history that plan reads. Below it:
   `All accounts full from {weekday HH:MM} to the end of the forecast.`, or
   `All accounts full from {weekday HH:MM} until {abbr} resets {weekday HH:MM}.` when the gap ends at
   that account's reset, else `All accounts full from {weekday HH:MM} until {abbr} is usable again
-  {weekday HH:MM}.` A reopened 5 h window is not a reset.
+  {weekday HH:MM}.` A reopened 5h window is not a reset.
 - **The lanes** are the next 7 days, one row per account: the stretches the plan plays it, its
-  weekly reset as a mark, and the stretches where no account is usable. Times are local.
+  weekly reset as a mark, and the stretches where no account is usable. The `none usable` row is
+  always last. Times are local.
 
 **Rhythm.** A heat map of 7 weekdays × 24 clock hours: the output tokens of each hour of the week,
 averaged over the range's calendar weeks (a partial week counts as one), all chosen hosts together.
@@ -1432,18 +1546,31 @@ holds the range's end. Each hour is one of four states, decided in this order:
 | Unknown | before the host's first `up` record, or without one |
 
 An hour's tooltip holds its output tokens per model, its sessions and the project that used most;
-the strip below each lane shows how many sessions worked in that hour. On top, per host: hours
-working, on but idle, off and not known, the tokens of the whole range and their two values, and
-the output tokens of the last 7 days over its working hours; the highest hour of the
-range is all chosen hosts together. A switch picks what the hour bars measure: tokens (per model) ·
-subscription value · API value (the two values exist per hour only). Below the lanes: output tokens
-per day for the last 14 days, one bar per host; one row per calendar week with its working hours per
-host, tokens and their two values, sessions, and the project and folder that used most; and the
-largest sessions of the range, at most 20, by output tokens, with project, host, model, hours worked,
-tokens and their two values, and the agents it started once the session has ended (a running
-session has none yet). The minutes sessions waited for you per local day come from
-the `Waited` events; they follow the host choice but no account chip, because a wait names no
-account.
+the strip below each lane shows how many sessions worked in that hour. On top stand the boxes:
+**Tokens**, the range's output tokens summed over the hosts with each host's below it; **Their
+value**, the subscription value and the API value summed over the hosts; **Per working hour**, with
+the highest hour; and, only when Ollama reported an hour in the range, **Other Ollama use** —
+Ollama's input + output of an hour minus the tokens of the known sessions on Ollama models
+(`…:cloud`) in that same UTC hour, counted over every host whatever the host filter, with a note for
+hours without an Ollama figure and for hours where the sessions used more than Ollama reported (such
+an hour has no rest). Then **What it shows**: a sentence about the last 7 days — `2 nights with
+work on atlas.` for the first host with work before 05:00, and each other host's evenings and
+weekend use; with none of those, `No night work, evening or weekend use stands out in the last 7
+days.` The lanes carry no agent data, so it never claims an agent ran. Per host the page also counts
+hours working, on but idle, off and not known, and its tokens and two values. A switch picks what
+the hour bars measure: tokens (per model) · subscription value · API value (the two values exist per
+hour only); in the subscription view the chart marks `history from 16 Nov · no subscription value
+before`. The chart is as tall as the mock-up's, its host names wrap instead of being cut, and it has
+no row labels. Ollama's hours are UTC hours, each placed in the local hour cell where its UTC hour
+starts; the Ollama line has its own colour and a legend entry `other Ollama use`. Below the lanes:
+output tokens per day for the last 14 days, one bar per host. The card below has two tabs, *Per week*
+and *Largest sessions*, and its switch sits inside the card's frame, which lines up with the card
+above. *Per week*: one row per calendar week with its working hours per host, tokens and their two
+values, sessions, and the project and folder that used most, the current week tagged `running`.
+*Largest sessions*: at most 20, by output tokens, with project, host, model, hours worked, tokens and
+their two values, and the agents it started once the session has ended (a running session has none
+yet). The minutes sessions waited for you per local day come from the `Waited` events; they follow
+the host choice but no account chip, because a wait names no account.
 
 **What is not built here.** Of the proposals of §3.10, "Tokens per percent, over time" and "Time
 sessions waited for you" are on these pages (Subscriptions and Activity). "What auto-burn did" and
@@ -1457,29 +1584,37 @@ of its own. Every change is saved through the settings page's one writer at once
 puts the stored layout back and shows the reason at the top of the page.
 
 **The palette.** The segments that are in neither zone, in three groups: *seatswap* (account, plan,
-5 h percent, 5 h reset, week percent, week reset, per-model %, auto-burn: next), *Claude Code*
+5h percent, 5h reset, week percent, week reset, per-model %, auto-burn: next), *Claude Code*
 (model, effort, folder, git branch, context used, session cost, lines changed) and *System*
 (`user@host`, clock, free text, separator). Free text and separator can be added more than once; a
-segment that is already on the line is not in the palette. A click adds it to the zone last used.
+segment that is already on the line is not in the palette. A click adds it to the zone last used. A
+separator added from the palette starts as ` │ `, one space before and after the pipe.
 
 **The two zones and the margin.** *Left*, and *Right* which is flush with the right edge of the
 terminal; at least two spaces stay between the zones while both print something, and an empty
 zone takes no gap. A segment is dragged from the palette into a
 zone, between two zones and inside one; the keyboard does the same: ←/→ reorder it, `L`/`R` move it
 to that zone, `Delete` sends it back to the palette. A segment dropped onto itself, or a drop
-outside a zone, changes nothing. Below the zones: the *margin*, the columns kept free at the
-terminal's right edge, and the switch *Pass Claude Code's live numbers on to seatswap*
-(`statuslineFeed`, §7.6).
+outside a zone, changes nothing. A segment from a zone dropped onto the *Segments* box is removed —
+the box lights up `drop here to remove` while a chip is dragged over it — and the Options card's
+Remove button removes the chosen segment; `Delete` keeps working. Below the zones: the *margin*, the
+columns kept free at the terminal's right edge, and the switch *Pass Claude Code's live numbers on to
+seatswap* (`statuslineFeed`, §7.6).
 
 **The options of the chosen segment.** The page offers only what applies to its kind:
 
 | Option | What it offers |
 |---|---|
-| Colour | *none* · *fixed colour* (`#rrggbb`) for every kind; *by load* (yellow from, red from) only for the 5 h percent, the week percent and the per-model percent; *by model family* only for the model; *by effort* only for the effort; *the account's colour* only for the account |
-| Time format | Only the 5 h reset and the week reset: *Compact time left* · *seatswap's* (the rule of §7.2) · *Clock time*; without one seatswap's own format is used |
+| Colour | *none* · *fixed colour* (`#rrggbb`) for every kind; *by load* (yellow from, red from) only for the 5h percent, the week percent and the per-model percent; *by model family* only for the model; *by effort* only for the effort; *the account's colour* only for the account |
+| Time format | Only the 5h reset and the week reset: *Compact time left* · *seatswap's* (the rule of §7.2) · *Clock time*; without one seatswap's own format is used |
 | Text | Only free text; a segment whose text is empty prints nothing, with its prefix and suffix |
-| Prefix / suffix | Every kind; printed only when the segment has a value |
+| Separator | Only the separator: *pipe* `│` · *dot* `·` · *bullet* `•` · *slash* `/` · *chevron* `›` · *blank* (one space). A separator saved by 1.1.0 without a character prints a pipe. No powerline glyphs |
+| Prefix / suffix | Every kind; printed only when the segment has a value; every space in the field is shown (a faint mark behind it, and a count such as "2 spaces") |
 | Drop when narrow | *never* · *1 · first* · *2* · *3* |
+
+A segment is drawn as up to three spans: prefix, value and suffix. Only the value span carries the
+colour rule's background, and the account tag's background covers its letters only. With no
+background the suffix keeps the value's colour.
 
 The folder has no style option: it is always `~`-shortened. The settings check refuses a colour
 rule, a time format or text that the segment's kind does not offer, naming the kind and its place
@@ -1488,10 +1623,10 @@ offer, a drop number above 3) is shown as it was stored, never replaced by a gue
 
 **The preview.** Three width fields (120, 100 and 80 columns at start, each 1 to 65535 and
 editable), a *Dark terminal* and a *Light terminal* tab, and the scenario *Live data* · *Test: 97 %*
-· *Test: account blocked* · *Test: no 5 h limit*. Every width gets its own line, drawn with the
+· *Test: account blocked* · *Test: no 5h limit*. Every width gets its own line, drawn with the
 spans' own colours and bold flags on the terminal background, in a monospace terminal font, in a box
 as wide as its width in columns; the line ends the margin before the right edge, as in a terminal. Beside each line is its note: `everything fits`, or the kinds the fitting
-removed, as `5 h reset, week reset and 5 h percent are dropped`. The preview draws a made-up
+removed, as `5h reset, week reset and 5h percent are dropped`. The preview draws a made-up
 session with the live account's numbers: the folder `~/projects/atlas` under the user's home,
 the branch `main`, context used `41%`, session cost `$3.20`, lines changed `+120 -8`, and the
 model and effort the payload names; the account's abbreviation, colour, plan and limits are the
@@ -1589,12 +1724,14 @@ number: `1,234 EUR`, and below 10 with two decimals, `6.47 EUR`.
   in money, and the window says so; it is never assumed. A price whose `priceCurrency` is another
   currency than the current one does not count, and the page marks it so it can be entered again; a
   price entered before a currency was set has no `priceCurrency` and does not count either.
-- **The dollar rate.** API prices are in dollars; a rate turns them into the chosen currency. A rate
-  entered by hand (`usdRate`) wins over the looked-up one, but only while its own `currency` is the
-  current one; a rate for another currency is not used. `USD` itself is always 1, with no looked-up
+- **The dollar rate.** API prices are in dollars; a rate turns them into the chosen currency. No rate
+  is entered by hand: `USD` itself is always 1, and every other currency uses the looked-up ECB
   rate. Without a rate an API value has no value in the currency, and the value says its rate is
   missing; the code never assumes a rate. The settings row shows the rate in effect and where it came
-  from, or that API values are shown in USD, and a failed rate look-up is shown there.
+  from — `ECB rate of Fri 13 Nov · European Central Bank via Frankfurter · fetched today 10:10`, or
+  `fetched: not recorded` for a point saved by 1.1.0 — or that API values are shown in USD, and a
+  failed rate look-up is shown there. With `lookUpPrices` off the API column stays in USD and its
+  header says so.
 - **The value of one percent** of an account's week is `monthly price × 12 / 52 / 100`: 180 EUR a
   month is 41.54 EUR a week and 0.415 EUR per percent.
 
@@ -1606,22 +1743,34 @@ lacks an input or an output price is left out; a missing cache price counts as 0
 not a number, negative or not finite leaves that model out of the list and names it in the settings
 ("2 models of models.dev's list were left out"), while the rest of the list is stored; a provider
 without a model list, an answer that is not the expected model list, and an answer with none of the
-three providers are errors naming the answer, and nothing is stored. Any model, listed or not, can
-be given an own price in the settings; its key must be `<provider>/<model id>` with one of those
-three providers and a non-empty model id.
+three providers are errors naming the answer, and nothing is stored. The list is read-only: no price
+can be edited or added. A model that shows up without a price is asked for from models.dev at once,
+at most once per model and per hour.
+
+**A provider's own cost.** Claude Code's status line feed carries `cost.total_cost_usd` of a session
+(§7.6). Where a session has such a provider's number, that number is the session's API value and
+beats the models.dev price (`money::api_value`); without one the models.dev price is used, and
+without either there is no API value. A price that cannot be put in the page's currency is not
+guessed at: the row says why. The feed holds only the last session that wrote it, so a session's cost
+can be seconds old, and the feed's own reason for a cost it did not store is shown as a warning on
+every pass while it lasts; a cost that is null, absent, not a finite number of 0 or more, or converts
+to a non-finite amount is not used. The status line itself is never broken by any of it.
 
 **Prices are kept with their dates.** Each looked-up price that differs from the stored one starts a
 new point at the look-up's time; the tokens of a past day keep the price of that day. `prices.json`
-holds the points per key, the last look-up's `checkedAt`, its `etag`, the last change and the own
-prices. The price of a key at a time is its own price if there is one, else the last point at or
-before that time, else the first point. A model missing from a later list keeps its points; it is
-reported as removed once, not on every list that still lacks it. The settings page's price list and
-`seatswap prices` show the price in effect.
+holds the points per key, the last look-up's `checkedAt`, its `etag`, the last change and the models
+the last list lacked. The price of a key at a time is the last point at or before that time, else
+the first point. A model missing from a later list keeps its points; it is reported as removed once,
+not on every list that still lacks it. The settings page's price list and `seatswap prices` show the
+price in effect. An older `prices.json` that still holds `overrides` (own prices) loads and ignores
+them; the next write leaves them out.
 
-**The dollar rate from Frankfurter.** `fx.json` holds one currency and its dated points. The rate of
-a day is the last point at or before it, else the first point. A looked-up rate that is not a
-finite number above 0 is an error and nothing is saved. On the next look-up after the currency
-changes, the old currency's points are replaced by a new file for the new currency.
+**The dollar rate from Frankfurter.** `fx.json` holds one currency and its dated points, each with
+the time it was fetched. The rate of a day is the last point at or before it, else the first point.
+A looked-up rate that is not a finite number above 0 is an error and nothing is saved. On the next
+look-up after the currency changes, the old currency's points are replaced by a new file for the new
+currency. A point written by 1.1.0 keeps no fetch time; the settings row shows `fetched: not
+recorded` for it.
 
 **The two look-ups and the switch.** `lookUpPrices` (default on) is the one switch. Both requests go
 through `api`, both carry the User-Agent `seatswap/<version>` and nothing about the user, an account
@@ -1630,9 +1779,12 @@ or this machine:
 | What | Request | When |
 |---|---|---|
 | API prices | `GET https://models.dev/api.json`, with `If-None-Match: <etag>` when a list is stored | at the tray app's start, then every hour while `lookUpPrices` is on; on a Money setting's save; and with `seatswap prices --refresh` |
-| The dollar rate | `GET https://api.frankfurter.dev/v1/latest?base=USD&symbols=<currency>` | at the tray app's start and then in the hourly round, once per local day, only when `lookUpPrices` is on and the currency is set and not `USD` |
+| The dollar rate | `GET https://api.frankfurter.dev/v1/latest?base=USD&symbols=<currency>` | at the tray app's start and then in the hourly round, once per local day; on working days from 16:00 Frankfurt time while the stored rate is older than today, every 30min until the answer carries today's date or it is 18:00, then not again that day. Only when `lookUpPrices` is on and the currency is set and not `USD` |
 
-"Not modified" only moves `checkedAt`; the stored prices stay. A look-up that fails saves nothing:
+"Not modified" only moves `checkedAt`; the stored prices stay. The 16:00–18:00 asks are Frankfurt
+time, computed from UTC with the EU summer-time rule (the last Sunday of March and of October at
+01:00 UTC); they run on Monday to Friday, and an answer that carries today's date ends them for the
+day. A look-up that fails saves nothing:
 the last values stay with their age, the error is shown under "API prices" or at the rate, and no
 number is zeroed or replaced. After a failed rate request the next round tries again; an answer for
 today is not asked for again that day, so a weekend with no new ECB rate does not cause an hourly
@@ -1652,18 +1804,18 @@ the account has no price, or when the week's used part or its API value is unkno
   The value in the currency is that USD amount times the rate of the record's day.
 - A token record belongs to the account that the history's live and switch events say was in use on
   its host at its time.
-- The value of a subscription for a week: the window's used money, `paid − expired` and at most
-  what was paid, split among the account's token records of that week in proportion to their API
-  value. A record's subscription value is `its API USD / the week's API USD × used money`. The used
-  percent is a finished window's final percent, or the latest sample's percent for a running week;
-  a window above 100 % expired nothing, so its used money is what was paid. The paid and expired
-  money are the Statistics area's "Used, paid and expired money": `paid = 100 ×
-  percent_value(price)`, `expired = max(0, 100 − used percent) × percent_value(price)`,
-  `used = paid − expired`.
+- The value of a subscription for a week: the week's used money, split among the account's token
+  records of that week in proportion to their API value. A record's subscription value is `its API
+  USD / the week's API USD × used money`. A finished window's use is `final − from` (`from` absent =
+  0), and a week's used percent is the sum of its windows' use, so a reset week's may pass 100 %; a
+  running week uses the latest sample's percent. A window above 100 % expired nothing, and a reset
+  window expired nothing either. The paid and expired money are the Statistics area's "Used, paid
+  and expired money": `paid = 100 × percent_value(price)`, `expired = max(0, 100 − used percent) ×
+  percent_value(price)`, and `used` is the windows' summed use at one week's price.
 - The price used is the Statistics area's "The price of a window": the account's monthly price at
-  the window's midpoint, its end minus 3.5 days; the last `priceChanged` at or before the midpoint,
-  the first change when the midpoint lies before all of them, or, when the account has no such
-  event, the price stored in `accounts.json` with its `priceCurrency`. A price entered in another
+  the window's midpoint, `start + (end − start) / 2`; the last `priceChanged` at or before the
+  midpoint, the first change when the midpoint lies before all of them, or, when the account has no
+  such event, the price stored in `accounts.json` with its `priceCurrency`. A price entered in another
   currency than the current `currency` is not used, and the value is left out; a price without a
   currency does not count either. So is a record whose week has no reading, or whose account's
   records in that week have no API value to split.
@@ -1693,9 +1845,6 @@ is a change, so it is recorded with the new currency. A plan change is `planChan
         "price": { "input": 4.0, "output": 20.0, "cacheWrite": 5.0, "cacheRead": 0.2, "tiered": false } }
     ]
   },
-  "overrides": {
-    "anthropic/claude-haiku-5-5": { "input": 0.1, "output": 0.5, "cacheWrite": 0.125, "cacheRead": 0.01, "tiered": false }
-  },
   "missing": ["openai/gpt-6"]
 }
 ```
@@ -1704,12 +1853,12 @@ is a change, so it is recorded with the new currency. A plan change is `planChan
 
 ```json
 { "version": 1, "currency": "EUR",
-  "points": [ { "date": "2026-11-13", "rate": 0.90481 } ] }
+  "points": [ { "date": "2026-11-13", "rate": 0.90481, "fetchedAt": "2026-11-13T10:10:00Z" } ] }
 ```
 
 `checkedAt`, `etag` and `lastChange` are left out of the file rather than written as null;
-`models`, `overrides` and `missing` are always present, empty when nothing is there. A file of
-another `version` is refused with its path, never replaced.
+`models` and `missing` are always present, empty when nothing is there. A file of another
+`version` is refused with its path, never replaced.
 
 ---
 
@@ -1741,7 +1890,17 @@ order, puts the account in the root of its organization, or in none. Nothing els
 so moving one account never drops another — even one only another host stores. Organizations have
 an identity, which a rename does not change, and a shown name, which starts as that identity.
 Organizations can be joined like projects; their accounts and projects then count for the
-organization they were joined into.
+organization they were joined into. A project can be assigned to another organization by hand, also
+when it came from a repository; its default organization is only where it starts. Names that differ
+only in case are one organization, also in a
+1.1.0 history, because a GitHub owner is case-insensitive. The spelling shown comes from the shared
+history — the session records and the project log, oldest first — so every host shows the same name;
+a login's own spelling is used only when nothing shared names it. Organizations can be added and
+removed by hand in Settings: an added one is a log record like the others, and a removed one asks
+first, saying that its projects and accounts go back to none, and then sends them back. An
+organization that comes from a repository owner has no Remove button; its tooltip says why, and the
+attempt is refused with `the organization {name} comes from the owner of {repository}; it cannot be
+removed`.
 
 **Sessions and folders.** A project's folders per host and its session count come from the session
 records of every host, over all time: distinct session ids, and the folders the sessions ran in. A
@@ -1765,11 +1924,14 @@ row shows the reason.
 | `assign` | `key`, `org` (an identity, or `null` for none) | the project's organization; creating an organization is an `assign` with a new name |
 | `orgRename` | `org`, `name` | an organization's shown name; `org` stays its identity |
 | `orgJoin` | `org`, `into` | `org`'s accounts and projects count for `into` |
+| `orgAdd` | `name` | a new organization, named by hand |
+| `orgRemove` | `org` | the organization goes; its projects and accounts go back to none |
 | `accountOrg` | `account`, `org` (an identity, or `null` for none) | one account's organization |
 
 A shown project or organization name is 1 to 40 characters and not only spaces. An organization
-identity is only checked to be non-empty: it comes from a login's `orgName` or a repository owner,
-not from typing. A project or an organization cannot be joined into itself. A folder project id
+identity is only checked to be non-empty; it comes from a login's `orgName` or a repository owner, or
+from a name typed by hand, which is trimmed and must be unique. A project or an organization cannot be
+joined into itself. A folder project id
 names its host; a repository id does not, because a repository is one project on every host. The
 Projects group shows each project with its repository, its folders per host, its organization
 (chosen from the list or created in place), its session count and the keys joined into it, each
@@ -1814,6 +1976,20 @@ the past too, because the history stores the repository's identity, not the show
   secret: the local server signs them with the machine's own key. Neither follows a redirect: a 3xx
   answer is an error naming where it pointed, and nothing is asked there. Each card is off by
   default; while it is off nothing is read and nothing is sent, and no request generates text (§7.9).
+- **What seatswap reads for the Sessions area.** Claude Code's session files and transcripts
+  (session id, folder, model, times, token counts, agents and states); DeepSeek Harness's session
+  files (`$DSH_HOME/sessions` or `~/.dsh/sessions`: job id, folder, model, tokens, state) and
+  flash-agents' state (`$XDG_STATE_HOME/flash-agents` or `~/.local/state/flash-agents`: the report
+  that links a short job id to its flash task); and Codex's rollout files under the Codex folder
+  (`$CODEX_HOME` or `~/.codex`: session id, model, token totals, event times). None of these files is
+  written or created, and a session's title, a flash worker's task text and all message text are never
+  stored; none of what is read is sent anywhere.
+- **The history folder suggestion.** Only while the saved settings name no history folder, seatswap
+  reads Dropbox's own `info.json` (macOS and Linux `~/.dropbox/info.json`; Windows
+  `%APPDATA%\Dropbox\info.json`, then `%LOCALAPPDATA%\Dropbox\info.json`: `personal.path`, else
+  `business.path`) to suggest a history folder. A missing file is no suggestion; a broken one is an
+  error naming the file, shown in Settings. It is never written or created, and nothing it holds is
+  sent anywhere.
 - Every write to Claude Code's files is atomic (temp file + rename) and keeps the original file mode;
   a file that is a symbolic link stays a link and its target is rewritten.
 - The status line reads Claude Code's JSON, seatswap's settings and its usage cache; its only write
@@ -1875,7 +2051,7 @@ From daily use on Linux Mint 22 Cinnamon (X11) and the headless test runs, as of
 - *The pop-up did not close* (Esc, click elsewhere). Muffin, Cinnamon's window manager, refuses a focus request without a timestamp and ignores the first one while the window is still being mapped, so the pop-up never had the keyboard focus. Now it asks with the X server's time and repeats the request after mapping until it has the focus (`panel::focus_when_mapped`).
 - *The pop-up flashed white at its old place before appearing.* It was shown first and moved and resized afterwards. Now it is built hidden at startup and only shown once the page has measured its height and it sits at its final place (`pending_show`, see the panel section of `docs/implementation.md`).
 - *A second start did not find the first* when `--data-dir` named the same folder differently (relative and absolute): the socket's name was a hash of the spelling. Now it is a hash of the folder's real path (`AppPaths::gui_socket`).
-- *The reset-time rule existed twice*, in Rust for the tray and the CLI and in the pop-up's JavaScript, and the suggestion's clock time already differed (no weekday beyond 24 h). The pop-up now asks the Rust side for every reset text, and since 2026-11-11 also for its "12 s ago" ages (`panel::time_texts`, `format::format_age`).
+- *The reset-time rule existed twice*, in Rust for the tray and the CLI and in the pop-up's JavaScript, and the suggestion's clock time already differed (no weekday beyond 24h). The pop-up now asks the Rust side for every reset text, and since 2026-11-11 also for its "12s ago" ages (`panel::time_texts`, `format::format_age`).
 - *Picking a value in a settings drop-down closed the pop-up.* WebKitGTK shows the list as its own window that holds the input, so the pop-up lost the focus for as long as the list was open; the 150 ms recheck could not cover that. Now focus loss is ignored while a pop-up of seatswap holds the input (`panel::own_popup_open`). Reproduced and checked headless with Muffin, 2026-11-11.
 - *Without a tray on the desktop the app crashed at startup* (no StatusNotifierWatcher on the session bus: GNOME without the AppIndicator extension, or the desktop's panel starting after seatswap at login). Now it keeps running without an icon, says so, and shows the icon as soon as a tray appears (`tray::start`); `seatswap panel` works meanwhile.
 - *At every login on Linux Mint a "no system tray" notification appeared*, although the icon came a moment later. Cinnamon starts its tray (`xapp-sn-watcher`) and seatswap's autostart entry in the same second, so seatswap's first try often comes before the tray. Now it waits 30 s for a tray before it notifies (`tray::TRAY_GRACE`); the icon still appears the moment the tray does. Checked headless with a tray that comes 3 s late (no notification) and with none (notification after 30 s), 2026-11-11.
@@ -1887,3 +2063,6 @@ From daily use on Linux Mint 22 Cinnamon (X11) and the headless test runs, as of
 
 **Open:**
 - No built-in global shortcut (§8.3).
+- The separator characters `│`, `·`, `•` and `›` are East Asian "ambiguous" width. A terminal that
+  draws them two columns wide makes the line one column wider per separator than seatswap counted
+  (§11.4). `ASCII` separators `/` and the blank are unaffected.

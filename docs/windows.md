@@ -380,3 +380,32 @@ Claude Code 2.1.322 contains a second store for the login on Windows, read from 
 - The login is stored through `Bun.secrets` under Claude Code's service name and the user name, as base64 text split over several entries: one entry `<name>#m` with the number of parts and the total length, then `<name>#0`, `<name>#1`, …
 
 What it means for seatswap: with the flag on, a switch that only rewrites `.credentials.json` no longer switches anything on Windows, and once the file is gone seatswap reports "no login" (it does not fail silently). Supporting it means reading and writing those Credential Manager entries, the Windows counterpart of the macOS Keychain work in `docs/spec.md` §2.2. The `keyring` crate is already a dependency. Nothing of this is built.
+
+## 14. New files 1.2.0 reads on Windows (2026-11-16)
+
+1.2.0 reads the Harness's and flash-agents' folders and, while the saved settings name no history
+folder, looks for Dropbox's `info.json`; Codex's folder was already read in 1.1.0. Every one is read
+only; seatswap never writes there. As on Linux, `HOME` does not move the Codex or Harness folders on
+Windows: they come from `dirs::home_dir()`, which is `%USERPROFILE%`, or from the variable named
+beside them.
+
+| What | Windows path | Resolved by |
+|---|---|---|
+| Codex's login and rollouts | `%USERPROFILE%\.codex`, or `$CODEX_HOME`, or the `codexHome` setting; rollouts below `<home>\sessions\YYYY\MM\DD\rollout-*.jsonl` | `paths::CodexPaths::resolve` |
+| DeepSeek Harness sessions | `%USERPROFILE%\.dsh\sessions`, or `$DSH_HOME\sessions` | `harness::HarnessPaths::resolve` |
+| flash-agents job reports | `%USERPROFILE%\.local\state\flash-agents`, or `$XDG_STATE_HOME\flash-agents`; a report is `<state>\flash-agents\<key>\patches\job-<id>.report.json` | `harness::HarnessPaths::resolve` |
+| Dropbox's `info.json` | `%APPDATA%\Dropbox\info.json` first, then `%LOCALAPPDATA%\Dropbox\info.json`; the first one that exists is used | `paths::dropbox_folder` |
+
+A missing Dropbox `info.json` is no suggestion; a broken one is an error naming the file, shown on the
+Settings page.
+
+A setting or a variable that names a Codex or Harness folder must be an absolute path; a relative one
+is an error, never resolved against the current folder.
+
+**The process link does not exist on Windows.** `harness::RealProc` has no `/proc` to walk there, so
+it reports no process, no open file and no parent: `proc_links` and `running_owners` return no link,
+and no Codex rollout is matched through an open file. A worker job is therefore linked to its Claude
+Code session once its result is in that session's transcript; before that it is a row of its own,
+under its own Harness id and folder. Codex's running rule keeps its other half on Windows: a session
+whose last event is younger than the Harness quiet time is running. A running job whose result no
+transcript holds yet is not shown as its session's agent on Windows.

@@ -32,9 +32,15 @@ seatswap handles Claude login tokens, so it is built to keep them where they bel
   and the first write to each file keeps a `.seatswap-backup` copy.
 - **Reading sessions, not conversations.** To show running sessions and count tokens, seatswap
   reads Claude Code's session files and transcripts (on by default; *Read Claude Code's session
-  files* turns it off). It keeps model names, token counts, times, folders and session ids; it
-  never stores, logs or sends message text, and it never opens the secret `.key` files that sit
-  next to the session files.
+  files* turns it off). It also reads DeepSeek Harness's session files (`$DSH_HOME/sessions` or
+  `~/.dsh/sessions`), flash-agents' job reports (`$XDG_STATE_HOME/flash-agents` or
+  `~/.local/state/flash-agents`) and Codex's rollout files
+  (`<codex folder>/sessions/YYYY/MM/DD/rollout-*.jsonl`). From a Harness session it takes the
+  session id, its parent, folder, model, token counts and times; from a job report only the job's
+  `sessionId`, to link the job to its Claude Code session; from a Codex rollout the session id,
+  folder, model, token counts and times. Message text and a worker's title or task text are never
+  stored, logged or sent, and no file among them is ever written. It never opens the secret `.key`
+  files that sit next to Claude Code's session files.
 - **What a shared history folder holds.** The history (usage readings, switches, tokens per
   project and hour) and the live report other hosts read (`sessions-now.json`: session names,
   folders, models and token counts, never an agent's task text) are written to the history folder.

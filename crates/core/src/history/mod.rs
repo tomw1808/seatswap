@@ -500,8 +500,8 @@ impl Record for UpRecord {
 /// [`usd`](Self::usd)) smaller than the hour's last line and at least one
 /// larger. A line is written only when that holds, so an older or overlapping
 /// answer with smaller numbers never replaces a newer one. Readers take the
-/// **largest line per hour across hosts** (or the last line per hour in file
-/// order within one host): that is the newest answer's numbers.
+/// **largest line per hour**, over the hosts' lines of that hour and among one
+/// host's own lines alike: that is the newest answer's numbers, never a sum.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OllamaHourRecord {

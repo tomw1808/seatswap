@@ -15,16 +15,16 @@ history with statistics of what each subscription was used for, and builds Claud
 line.
 
 <p>
-  <img src="docs/images/panel-dark.png" alt="The pop-up in the dark theme: auto-burn's plan and a waiting switch, three accounts with usage rings, bars and reset times, and the Codex and Ollama cards" width="380">
+  <img src="docs/images/panel-dark.png" alt="The pop-up in the dark theme: auto-burn's line with account chips and a waiting switch, the sessions line with links to Sessions, the plan and Statistics, three accounts with usage rings, bars and reset times, and the Codex and Ollama cards" width="380">
   <img src="docs/images/panel-light.png" alt="The same pop-up in the light theme" width="380">
 </p>
 
 <p>
-  <img src="docs/images/window-sessions.png" alt="The large window's Sessions area: running sessions grouped by project, with model, status, agents, tokens and their value, and a card for what a switch would cost them" width="760">
+  <img src="docs/images/window-sessions.png" alt="The large window's Sessions area: Claude Code, Codex and DeepSeek Harness sessions grouped by project and provider, with their agents, tokens, last hour and values, and cards for the models, what a switch would cost and the last hour by project" width="760">
 </p>
 
 <p>
-  <img src="docs/images/window-statusline.png" alt="The large window's Status line area: a palette of segments, the two zones of the line, and a preview at three terminal widths" width="760">
+  <img src="docs/images/window-statusline.png" alt="The large window's Status line area: the segment palette, the Left and Right zones with the margin, the options card, and a preview of the line at three terminal widths" width="760">
 </p>
 
 *Screenshots show the app's built-in demo data; every name in them is made up.*
@@ -50,13 +50,20 @@ there, and seatswap does not read or write that yet.
   `,`) opens a full window: Sessions, Statistics, Status line and Settings, each with its page.
   Settings holds every setting, plus the account editor that used to sit in the pop-up; the Status
   line area builds Claude Code's status line (below). `seatswap window [AREA]` opens it from a
-  terminal, and so do the tray's *Settings…* and *Open seatswap…*. Every control saves at once.
+  terminal, and so do the tray's *Sessions…*, *Statistics…* and *Settings…*, each at its area.
+  Every control saves at once.
+- **The Swap S icon.** A lowercase s with arrow ends on a green square
+  (`crates/app/icons/icon.svg`) is the app icon of the launcher, the Windows `.exe`,
+  notifications and every window; the tray icon stays the live account ring.
 - **The Sessions area.** It shows every running Claude Code session on this host and, through the
   shared history folder, on your other hosts: live, with its agents to any depth, its tokens and
-  what they are worth, and the sessions that closed in the last 24 hours, 7 or 30 days. Numbers on
-  top, two groupings and a card for what a switch would cost the running sessions. It updates by
-  itself (at most twice a second) and needs *Read Claude Code's session files* (on by default);
-  turning it on takes effect after a restart.
+  what they are worth, and the sessions that closed in the last 24 hours, 7 or 30 days. Codex
+  sessions and DeepSeek Harness sessions sit beside them, and a flash job hangs under the Claude
+  Code session that started it, with its workers below; a job already named in a transcript is
+  linked there, and on Windows a running job appears once its result is collected. Numbers on top,
+  two groupings and a card for what a switch would cost the running sessions. It updates by itself
+  (at most twice a second) and needs *Read Claude Code's session files* (on by default); turning it
+  on takes effect after a restart.
 - **The Statistics area.** Seven pages over the recorded history, for a range from this week to
   all of it, with account chips and a host choice: Overview (what was used, expired, blocked and
   switched), Weeks (a grid of every account's week, with a summary per week and the detail of one
@@ -64,25 +71,32 @@ there, and seatswap does not read or write that yet.
   (what dropping an account would have changed), Forecast (the latest plan for the next 7 days),
   Rhythm (when your week is worked) and Activity (when each host worked, idled or was off).
 - **Money.** seatswap shows what tokens and subscriptions are worth: API prices from
-  [models.dev](https://models.dev) and the dollar rate from
-  [Frankfurter](https://frankfurter.dev), each kept with its dates, so past days keep the price of
-  that day. Set a currency and each account's monthly price; the weekly percentage then has a money
-  value. One switch, *Look up prices and the dollar
-  rate*, turns both look-ups off. They send a User-Agent and nothing else — no account, token or
-  machine data — and with the switch off neither site is contacted.
+  [models.dev](https://models.dev) and the dollar rate from the European Central Bank via
+  [Frankfurter](https://frankfurter.dev), each kept with its dates and fetched time, so past days
+  keep the price of that day. Set a currency and each account's monthly price; the weekly percentage
+  then has a money value. The model list under *Settings → Providers* is read-only. Claude Code's
+  own reported cost beats a models.dev price; a model with neither has no API value rather than a
+  guessed one, and a Claude Code model without a price is asked for from models.dev at once, at
+  most once per model and hour. The rate is fetched once per Frankfurt day while it is older than today, and on working
+  days from 16:00 again every 30 minutes until an answer carries today's date or it is 18:00. One
+  switch, *Look up prices and the dollar rate*, turns both look-ups off; with it off, API values
+  are in US dollars and the column says so. They send a User-Agent and nothing else — no account,
+  token or machine data — and with the switch off neither site is contacted.
 - **Projects and organizations.** seatswap groups the folders Claude Code works in into projects
   (a repository, or a folder), with names you choose, joins for the same project seen in two
-  places, and organizations. The project log travels with the history folder, so every host shows
-  the same names once the folder has synced. History can be exported as CSV or JSON, and another
-  history folder's files imported by hand.
+  places, and organizations. Names that differ only in case are one organization; organizations can
+  be added and removed by hand, an organization that comes from a GitHub owner cannot be removed,
+  and any project can be assigned to another organization. The project log travels with the history
+  folder, so every host shows the same names once the folder has synced. History can be exported as
+  CSV or JSON, and another history folder's files imported by hand.
 - **Usage at a glance.** The icon ring shows the active account's binding limit, coloured green,
   amber or red. The pop-up shows every account's session (5 h) and weekly limits, with the time
   until each one resets — and its plan, such as "Team 5x".
 - **Two read-only provider cards.** With a switch in *Settings → Providers*, the pop-up shows a
   Codex card (its 5 h and weekly limits, or whatever window lengths Codex sends) and an Ollama card
   (credits left, reset date, spend in the last 24 h, or session and weekly limits on an old plan).
-  Both are off by default; while one is off, seatswap reads no Codex file and sends no request. The
-  cards never switch, sign in or refresh a token.
+  Both are off by default; while one is off, seatswap reads no Codex login file and sends no request
+  for that card. The cards never switch, sign in or refresh a token.
 - **Auto-burn.** Switched on, seatswap moves between accounts by itself so that as little work as
   possible is blocked; it switches before an account is full only when the measured gain is worth
   the switch. Switched off, it suggests the same switch instead.
@@ -92,11 +106,12 @@ there, and seatswap does not read or write that yet.
   widths, and turns it on in Claude Code with one button that can be undone.
 - **History.** Every usage reading, finished window, switch and agent call is kept in an
   append-only history folder, one JSON Lines file per month and kind, with tokens per project and
-  hour. Several hosts can share it through a synced folder; each writes only its own subfolder.
+  hour, and Ollama's hourly usage. Several hosts can share it through a synced folder; each writes
+  only its own subfolder.
 - **Running sessions in the pop-up.** seatswap reads Claude Code's session files and transcripts
   and shows how many sessions run, how many are busy, and how many are waiting for you. Only
-  numbers and names leave the transcripts: model, token counts, folder, session id; never message
-  text.
+  numbers and names leave the session files and transcripts: model, token counts, folder, session
+  id; never message text.
 - **Notifications that matter.** When a blocked account is usable again, when the last usable
   account fills up, or when a session has waited for you for 15 s. A click on a waiting notification
   opens the Sessions area at that session; with *For sessions on: all hosts*, another host's waiting
@@ -182,7 +197,7 @@ Clicking an account's badge or ✎ in the pop-up opens that editor.
 | Action | Effect |
 |---|---|
 | Left click on the icon | Open or close the pop-up |
-| Right click | Menu: one entry per account (click to switch), *Open panel…*, *Add account…*, *Settings…*, *Open seatswap…* (the large window), *Quit* |
+| Right click | Menu: one entry per account (click to switch), *Open panel…*, *Add account…*, *Sessions…*, *Statistics…*, *Settings…* (each the large window at its area), *Quit seatswap* |
 | Hover | Tooltip with the active account's session and weekly usage |
 | In the pop-up | ↑/↓ move, Enter switches, 1–9 switch directly, `,` settings in the large window, Esc closes |
 | Account badge or ✎ | That account's editor in the large window (*Settings → Accounts*) |
@@ -197,10 +212,15 @@ is `seatswap-tray.exe panel`, which opens no console window.
 `seatswap window statusline`) has a palette of segments in three groups — seatswap, Claude Code
 and System — and two zones, Left and Right, that you fill by dragging or with the keyboard. Each
 segment has its own options: a colour rule, prefix and suffix, a drop order for narrow terminals,
-a time format for the two reset segments and a text for the free text segment. A preview shows the
-line at three widths you can change, on a dark or a light terminal, with the live numbers or a test
-case, and says what was dropped. Three presets are a click away; *My current line* reproduces the
-old script.
+a time format for the two reset segments and a text for the free text segment. A separator's
+character is chosen from pipe `│`, middle dot `·`, bullet `•`, slash `/`, chevron `›` or blank;
+spaces in a prefix or suffix are shown as a faint dot with a count. `│ · • ›` are East Asian
+"ambiguous" width: a terminal that draws them two columns wide makes the line one column wider per
+separator. Dropping a segment on the Segments box removes it, and so does the Options card's
+*Remove*; Delete keeps working. A preview
+shows the line at three widths you can change, on a dark or a light terminal, with the live numbers
+or a test case, and says what was dropped. Three presets are a click away; *My current line*
+reproduces the old script.
 
 **Use in Claude Code.** The button shows the change first — the file, the `statusLine` value now
 and after — and then writes it. seatswap writes exactly one key, `statusLine`, of Claude Code's
@@ -240,7 +260,7 @@ builder edits.
   switch costs, and only when that is expected to save at least 0.5 working hours and twice its
   extra switches' cost.
 - A switch that would make busy sessions lose their earlier thinking waits for a quiet moment; a
-  manual switch holds early switching back for 4 hours, and Pause 4 h suspends it.
+  manual switch holds early switching back for 4 hours, and Pause 4h suspends it.
 - Every account has "Auto-burn may use this account"; off, it is never a target. Each switch is
   written to the history with its reason.
 
@@ -320,6 +340,16 @@ the tray app, and `seatswap.exe` for everything you want to read in a terminal.
   token and never reads the OS keyring. With the Ollama card on it only asks the Ollama server for
   the balance and the last 24 h's spend. Both cards are off by default, and neither card sends a
   request that generates text.
+- **Sessions and the files behind them:** with *Read Claude Code's session files* on, seatswap also
+  reads Codex's rollout files (`<codex folder>/sessions/YYYY/MM/DD/rollout-*.jsonl`; the folder is
+  the *Codex folder* setting, `$CODEX_HOME` or `~/.codex`), DeepSeek Harness's sessions
+  (`$DSH_HOME/sessions` or `~/.dsh/sessions`) and flash-agents' job reports
+  (`$XDG_STATE_HOME/flash-agents` or `~/.local/state/flash-agents`). While the saved settings name
+  no history folder, it reads Dropbox's `info.json` (macOS and Linux `~/.dropbox/info.json`; Windows
+  `%APPDATA%\Dropbox\info.json`, then `%LOCALAPPDATA%\Dropbox\info.json`) only to suggest
+  `<Dropbox>/seatswap` as the history folder; a file it cannot read is shown with its path and why.
+  All of these are read only and never written. seatswap keeps ids, folders, model names, token counts
+  and times; message text is never stored, and neither is a worker's title or task text.
 - **Network:** the usage endpoint (`api.anthropic.com/api/oauth/usage`) and Claude Code's token
   endpoint (`platform.claude.com/v1/oauth/token`, with Claude Code's own client id) to refresh
   stored logins. While the Codex card is on, `chatgpt.com/backend-api/wham/usage` with Codex's own
@@ -330,13 +360,14 @@ the tray app, and `seatswap.exe` for everything you want to read in a terminal.
   accounts or this machine. Nothing else.
 - **Logs and output** never contain a token; at most the last four characters of a refresh token.
 - **What it records:** the history (every usage reading, finished window, switch and agent call,
-  and the tokens each session used per project folder, hour and model) and, for your other hosts,
-  a live report of this host's running sessions (`sessions-now.json`: session names, folders,
-  models and token counts, never an agent's task text). Both go into the history folder: by
-  default `history` in the data folder; the setting `historyDir` can point it at a synced folder
-  so several hosts share it, and then these records travel with that service. From the
-  transcripts seatswap keeps only numbers and names; it never stores message text. *Read Claude
-  Code's session files* off stops reading sessions and transcripts.
+  the tokens each session used per project folder, hour and model, and Ollama's hourly usage) and,
+  for your other hosts, a live report of this host's running sessions (`sessions-now.json`: session
+  names, folders, models and token counts, never an agent's task text or a worker's title). Both go
+  into the history folder: by default `history` in the data folder; the setting `historyDir` can
+  point it at a synced folder so several hosts share it, and then these records travel with that
+  service. From the session files and transcripts seatswap keeps only numbers and names; it never
+  stores message text. *Read Claude Code's session files* off stops reading sessions, transcripts
+  and the Codex and Harness files.
 - **Locks:** a switch holds Claude Code's own lock files (the renewal locks of the main and the two
   secondary logins, credentials write, identity write) and its own app lock, so it never
   overwrites a login Claude Code is writing.

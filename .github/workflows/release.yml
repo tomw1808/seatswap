@@ -30,7 +30,7 @@ jobs:
             platform: x86_64-windows
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: The tag matches the version in Cargo.toml
         shell: bash
         run: |
@@ -56,7 +56,7 @@ jobs:
             tar czf "$PACKAGE.tar.gz" "$PACKAGE"
             sha256sum "$PACKAGE.tar.gz" > "$PACKAGE.tar.gz.sha256"
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: ${{ env.PACKAGE }}
           path: ${{ env.PACKAGE }}.*
@@ -68,8 +68,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true
