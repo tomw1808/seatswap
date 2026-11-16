@@ -744,6 +744,11 @@ input[type="checkbox"] {
   overflow-wrap: anywhere;
 }
 
+/* A reading that failed stays a row, in the muted grey of a missing value. */
+.provider-row-value.not-read {
+  color: var(--muted);
+}
+
 /* ---------- gauge ---------- */
 
 .gauge {

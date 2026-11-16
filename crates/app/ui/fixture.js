@@ -97,6 +97,7 @@ let fixture = null;
 export function ensureFixture() {
   if (!fixture) {
     fixture = makeFixture();
+    fixture.providers = fixtureOpenProviders(fixture);
     fixture.priceLookedUp = Object.create(null);
     for (const row of fixture.priceList) {
       fixture.priceLookedUp[row.key] = clone(row.price);
@@ -107,9 +108,35 @@ export function ensureFixture() {
   return fixture;
 }
 
+// The provider views whose card the fixture's settings switch on, as
+// gui/providers_rt.rs sends only the switched-on providers, in its order.
+function fixtureOpenProviders(fixture) {
+  const settings = fixture.settings || {};
+  const open = [];
+  for (const view of fixture.providerCardViews) {
+    let on;
+    if (view.provider === "codex") on = settings.codexCard;
+    else if (view.provider === "ollama") on = settings.ollamaCard;
+    else throw new Error(`unknown provider ${JSON.stringify(view.provider)}`);
+    if (typeof on !== "boolean") {
+      throw new Error(`the ${view.provider} card setting must be true or false, got ${on}`);
+    }
+    if (on) open.push(view);
+  }
+  return open;
+}
+
+function fixtureProviderView(fixture, provider) {
+  const name = String(provider);
+  const view = fixture.providerCardViews.find((entry) => entry.provider === name);
+  if (!view) throw new Error(`no provider ${name}`);
+  return view;
+}
+
 // The bench flips these from the page: a failed provider poll that keeps the
-// last numbers, and both provider cards switched off. The page announces the
-// change so the open view is drawn again.
+// last numbers, a 24 h spend that could not be read, and both provider cards
+// switched off through the settings save. The page announces the change so the
+// open view is drawn again.
 function exposeFixtureHooks() {
   if (typeof window === "undefined") return;
   window.__fixture = {
@@ -118,8 +145,7 @@ function exposeFixtureHooks() {
       if (typeof text !== "string" || text === "") {
         throw new Error(`an error text is needed, not ${JSON.stringify(text)}`);
       }
-      const view = fixture.providers.find((entry) => entry.provider === provider);
-      if (!view) throw new Error(`no provider ${provider}`);
+      const view = fixtureProviderView(fixture, provider);
       view.error = text;
       if (view.usage || view.credits) {
         view.fetchedAt = isoIn(-6 * 60000);
@@ -127,11 +153,21 @@ function exposeFixtureHooks() {
       publishFixtureChange();
       return view.error;
     },
+    spendError(text) {
+      if (!fixture) throw new Error("fixture is not ready");
+      if (typeof text !== "string" || text === "") {
+        throw new Error(`a spend error text is needed, not ${JSON.stringify(text)}`);
+      }
+      const view = fixtureProviderView(fixture, "ollama");
+      view.spend24h = null;
+      view.spend24hError = text;
+      publishFixtureChange();
+      return view.spend24hError;
+    },
     providersOff() {
       if (!fixture) throw new Error("fixture is not ready");
-      fixture.providers = [];
-      fixture.settings.codexCard = false;
-      fixture.settings.ollamaCard = false;
+      fixtureSaveSetting(fixture, "codexCard", false);
+      fixtureSaveSetting(fixture, "ollamaCard", false);
       publishFixtureChange();
       return "off";
     },
@@ -423,9 +459,10 @@ function makeFixture() {
       unavailable: null,
       warning: null,
     },
-    // The open provider cards (spec §7): a Codex Plus login and an Ollama
-    // cloud plan, as gui/providers_rt.rs sends them.
-    providers: [
+    // Every provider view the fixture keeps (spec §7): a Codex Plus login and
+    // an Ollama cloud plan, as gui/providers_rt.rs can send them. `providers`
+    // is the list its settings open, as Rust sends only the switched-on ones.
+    providerCardViews: [
       {
         provider: "codex",
         title: "Codex",
@@ -453,6 +490,7 @@ function makeFixture() {
         },
         credits: null,
         spend24h: null,
+        spend24hError: null,
         fetchedAt: isoIn(0),
         error: null,
       },
@@ -480,10 +518,12 @@ function makeFixture() {
           purchased: 0,
         },
         spend24h: 3.18,
+        spend24hError: null,
         fetchedAt: isoIn(0),
         error: null,
       },
     ],
+    providers: [],
     money: {
       currency: "EUR",
       rate: { value: 0.9048, date: "2026-11-13", own: false },
@@ -663,6 +703,8 @@ function makeFixture() {
     settings: Object.assign({}, DEFAULT_SETTINGS, {
       autoBurn: true,
       suggestSwitches: true,
+      codexCard: true,
+      ollamaCard: true,
     }),
   };
 }
@@ -943,6 +985,7 @@ function fixtureSaveSetting(fixture, field, value) {
     next[field] = fixtureExpand(next[field]);
   }
   fixture.settings = validateFixtureSettings(next);
+  fixture.providers = fixtureOpenProviders(fixture);
   if (fixture.burn) {
     fixture.burn.on = fixture.settings.autoBurn;
     if (fixture.settings.autoBurn) fixture.burn.suggestion = null;
@@ -1869,6 +1912,9 @@ export async function fixtureInvoke(command, args) {
       const snapshot = clone(fixture);
       snapshot.accounts = fixture.views.map((view) => clone(view));
       delete snapshot.projectView;
+      // The stored views stay in the fixture; the snapshot carries the list
+      // its settings open, as the Rust one does.
+      delete snapshot.providerCardViews;
       return snapshot;
     }
 

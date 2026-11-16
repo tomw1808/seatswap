@@ -1012,16 +1012,6 @@ function money(amount, currency) {
   return `${number} ${currency}`;
 }
 
-// "212.40" and "3.18": an amount with exactly two decimals, with neither a
-// currency nor a thousands rule; the provider rows write "USD" beside it. A bad
-// value is an error, never a made-up number.
-function twoDecimalAmount(amount) {
-  if (typeof amount !== "number" || !Number.isFinite(amount)) {
-    throw new Error(`invalid amount ${String(amount)}: use a finite number`);
-  }
-  return amount.toFixed(2);
-}
-
 // "12.4 M" and "0.4 M" for every count of tokens, and "0 M" for none: the
 // Sessions page writes every token cell and total in millions, one decimal.
 function tokens(n) {
@@ -1077,7 +1067,6 @@ export {
   invoke,
   listen,
   money,
-  twoDecimalAmount,
   tokens,
   readChoice,
   writeChoice,

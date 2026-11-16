@@ -21,11 +21,11 @@ import {
   limitLevel,
   listen,
   mixHex,
+  money,
   rgba,
   shortPercent,
   switchControl,
   textInput,
-  twoDecimalAmount,
 } from "./common.js";
 import { currentFixture, ensureFixture } from "./fixture.js";
 
@@ -133,11 +133,22 @@ function scopedLimits(view) {
   return accountLimits(view).filter((limit) => limitKindName(limit) === "weekly_scoped");
 }
 
+// Every limit that is neither the session nor a week: its own kind name, and
+// the model's name before it when the reply names one (a Codex per-model limit
+// of another length, e.g. "gpt-6-astra · 5 h limit").
 function otherLimits(view) {
   const known = new Set(["session", "weekly_all", "weekly_scoped"]);
   return accountLimits(view)
-    .map((limit) => ({ name: limitKindName(limit), limit }))
-    .filter((entry) => entry.name && !known.has(entry.name));
+    .map((limit) => {
+      const kind = limitKindName(limit);
+      if (!kind || known.has(kind)) return null;
+      const name =
+        typeof limit.model === "string" && limit.model !== ""
+          ? `${limit.model} · ${kind}`
+          : kind;
+      return { name, limit };
+    })
+    .filter(Boolean);
 }
 
 // The age of an account's usage or a provider's last reading, shown once it is
@@ -1083,9 +1094,9 @@ function renderCreditRows(view, credits) {
 
   const creditValue = [];
   if (typeof credits.allowance === "number" && Number.isFinite(credits.allowance)) {
-    creditValue.push(`${twoDecimalAmount(credits.left)} of ${twoDecimalAmount(credits.allowance)} USD`);
+    creditValue.push(`${money(credits.left, "USD")} of ${money(credits.allowance, "USD")}`);
   } else {
-    creditValue.push(`${twoDecimalAmount(credits.left)} USD`);
+    creditValue.push(money(credits.left, "USD"));
   }
   if (credits.until) {
     creditValue.push("  ·  resets ");
@@ -1098,13 +1109,28 @@ function renderCreditRows(view, credits) {
     ])
   );
 
-  if (typeof view.spend24h === "number" && Number.isFinite(view.spend24h)) {
+  const spendError =
+    typeof view.spend24hError === "string" && view.spend24hError !== ""
+      ? view.spend24hError
+      : null;
+  if (spendError !== null) {
+    rows.appendChild(
+      h("div", { class: "provider-row" }, [
+        h("span", { class: "provider-row-name", text: "Last 24 h" }),
+        h("span", {
+          class: "provider-row-value not-read",
+          text: `not read: ${spendError}`,
+          title: spendError,
+        }),
+      ])
+    );
+  } else if (typeof view.spend24h === "number" && Number.isFinite(view.spend24h)) {
     rows.appendChild(
       h("div", { class: "provider-row" }, [
         h("span", { class: "provider-row-name", text: "Last 24 h" }),
         h("span", {
           class: "provider-row-value",
-          text: `${twoDecimalAmount(view.spend24h)} USD`,
+          text: money(view.spend24h, "USD"),
         }),
       ])
     );
@@ -1116,7 +1142,7 @@ function renderCreditRows(view, credits) {
         h("span", { class: "provider-row-name", text: "Purchased" }),
         h("span", {
           class: "provider-row-value",
-          text: `${twoDecimalAmount(credits.purchased)} USD`,
+          text: money(credits.purchased, "USD"),
         }),
       ])
     );
