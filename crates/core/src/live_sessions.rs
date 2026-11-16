@@ -5,12 +5,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
+use std::path::PathBuf;
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::atomic::{self, Access};
 use crate::burn::tied::thinking_tied;
+use crate::codex_sessions::CodexSession;
 use crate::harness::{self, HarnessSession};
 use crate::history::{HistoryDir, HistoryError, Hosted, Hosts, Range, SessionRecord, TokenRecord};
 use crate::money::{Valued, Valuer};
@@ -973,6 +975,172 @@ fn harness_token_line(
         lines.push(record);
     }
     recorded.insert(session.id.clone(), current);
+}
+
+/// The provider of a Codex row (spec §3.8).
+const CODEX_PROVIDER: &str = "Codex";
+
+/// Why a Codex row's last hour has no value: its newest token total is below the
+/// total the hour is measured from, which the read warns about and never turns
+/// into a number. The row carries that reason in `last_hour_values`; showing it
+/// in the row and in the sums is task S-3's.
+const CODEX_LAST_HOUR_UNKNOWN: &str =
+    "the Codex session's token total went down, so its last hour is not known";
+
+/// Put the running Codex sessions into the Sessions area. A session is running
+/// when a process holds its rollout file open (`open_files`, from the one
+/// process walk the Harness links use) or its last event is less than
+/// [`harness::HARNESS_QUIET_MINUTES`] old; its `busy` says whether a task is
+/// open. The two rules are Harness's running rule without its finished test: a
+/// Codex session between two tasks is still open, only idle.
+///
+/// Only running sessions are rows. This task writes no Codex session or token
+/// record to the history, so a closed Codex session has no closed row to read;
+/// the providers' readings already count Codex use.
+///
+/// The values use the same [`Pricing`] and [`Valuer`] as the other rows: a
+/// session's tokens at its model, dated at its last event, and its `last_hour`
+/// at the same model and time with the same valuer. A session without a model
+/// has both values missing with the same reason as an agent without one. A
+/// last hour that is not known has both values missing with
+/// [`CODEX_LAST_HOUR_UNKNOWN`] rather than a value of 0; the row carries that
+/// reason in `last_hour_values`, and showing it in the row and in the sums is
+/// task S-3's.
+pub fn codex_rows(
+    sessions: &[CodexSession],
+    open_files: &BTreeSet<PathBuf>,
+    projects: Option<&Projects>,
+    pricing: &Pricing,
+    host: &str,
+    now: DateTime<Utc>,
+    project_of: &dyn Fn(&str) -> ProjectKey,
+) -> Rows {
+    let mut rows = Rows {
+        sessions: Vec::new(),
+        warnings: Vec::new(),
+    };
+    for session in sessions {
+        if !codex_running(session, open_files, now) {
+            continue;
+        }
+        let Some(cwd) = session.cwd.to_str() else {
+            rows.warnings.push(format!(
+                "Codex session {} has a folder that is not text; it is not shown",
+                session.id
+            ));
+            continue;
+        };
+        let project = project_of(cwd);
+        let id = ProjectId::of(&project, host);
+        let (project_id, project_name, org) = named_project(projects, &id);
+        let last_hour_values = match session.last_hour {
+            Some(last_hour) => {
+                codex_tokens_values(session, last_hour, cwd, &project, pricing, host)
+            }
+            None => pricing.missing(CODEX_LAST_HOUR_UNKNOWN),
+        };
+        rows.sessions.push(LiveSession {
+            session: session.id.clone(),
+            host: host.to_string(),
+            label: session_label(&project_name, &session.id),
+            project_id,
+            project: project_name,
+            org,
+            cwd: cwd.to_string(),
+            provider: CODEX_PROVIDER.to_string(),
+            model: session.model.clone(),
+            // Codex does not run on the Claude account, so no thinking of its is
+            // tied to that account.
+            tied: false,
+            status: if session.busy {
+                LiveStatus::Busy
+            } else {
+                LiveStatus::Idle
+            },
+            since: session.last,
+            started: session.started,
+            agents_running: 0,
+            agents_done: 0,
+            agents: Vec::new(),
+            tokens: session.tokens,
+            // A row's tokens cannot say "not known"; its values carry the
+            // reason (`CODEX_LAST_HOUR_UNKNOWN`), which S-3 shows in the row
+            // and the sums.
+            last_hour: session.last_hour.unwrap_or_default(),
+            last_hour_values,
+            agents_done_values: Values::sum(&[]),
+            values: codex_values(session, cwd, &project, pricing, host),
+        });
+    }
+    rows
+}
+
+/// Whether a Codex session is running: a process holds its rollout file open,
+/// or its last event is less than [`harness::HARNESS_QUIET_MINUTES`] old.
+fn codex_running(
+    session: &CodexSession,
+    open_files: &BTreeSet<PathBuf>,
+    now: DateTime<Utc>,
+) -> bool {
+    codex_recent(session, now) || holds_open(open_files, session)
+}
+
+/// Whether a Codex session's last event is inside the quiet window, so the
+/// running rule holds without the process walk.
+fn codex_recent(session: &CodexSession, now: DateTime<Utc>) -> bool {
+    now.signed_duration_since(session.last) < Duration::minutes(harness::HARNESS_QUIET_MINUTES)
+}
+
+/// Whether any Codex session is old enough that only an open file could still
+/// make it running: the one condition under which the process walk's open files
+/// are needed. The session thread asks this before walking, so a pass with only
+/// recent Codex sessions does not walk at all.
+pub fn codex_needs_process_walk(sessions: &[CodexSession], now: DateTime<Utc>) -> bool {
+    sessions.iter().any(|session| !codex_recent(session, now))
+}
+
+/// Whether the process walk found `session`'s file open. The kernel reports an
+/// open file by its resolved path, so a store reached through a symlink is
+/// matched after resolving the file too.
+fn holds_open(open_files: &BTreeSet<PathBuf>, session: &CodexSession) -> bool {
+    if open_files.contains(&session.file) {
+        return true;
+    }
+    match fs::canonicalize(&session.file) {
+        Ok(resolved) => open_files.contains(&resolved),
+        Err(_) => false,
+    }
+}
+
+/// The values of a Codex session's tokens at its reported model.
+fn codex_values(
+    session: &CodexSession,
+    cwd: &str,
+    project: &ProjectKey,
+    pricing: &Pricing,
+    host: &str,
+) -> Values {
+    codex_tokens_values(session, session.tokens, cwd, project, pricing, host)
+}
+
+/// The values of one token total of a Codex session, at its model and the
+/// session's last event: the one valuer both `tokens` and `last_hour` use.
+fn codex_tokens_values(
+    session: &CodexSession,
+    tokens: Tokens,
+    cwd: &str,
+    project: &ProjectKey,
+    pricing: &Pricing,
+    host: &str,
+) -> Values {
+    let Some(model) = session.model.as_deref() else {
+        return pricing.missing(NO_AGENT_MODEL);
+    };
+    let record = token_record(&session.id, cwd, project, model, session.last, tokens);
+    match pricing {
+        Pricing::Known { valuer, .. } => pricing.of(&[valuer.value(host, &record)]),
+        Pricing::Unknown { .. } => pricing.of(&[]),
+    }
 }
 
 /// The sessions of every host that closed in `[since, now)` (spec §3.8). A row
@@ -3643,6 +3811,169 @@ mod tests {
         assert_eq!(row.agents[0].parent.as_deref(), Some(JOB_A));
         assert_eq!(row.agents_running, 0);
         assert_eq!(row.agents_done, 1);
+    }
+
+    #[test]
+    fn a_codex_session_is_a_row_while_held_or_recent() {
+        let now = utc("2026-11-14T19:00:00Z");
+        let old = crate::codex_sessions::CodexSession {
+            id: "3f7b2c1e-9a4d-4e8f-8b6a-2c5d9e1f7a30".to_string(),
+            cwd: PathBuf::from(ATLAS_CWD),
+            model: Some("gpt-6.1-sol".to_string()),
+            started: utc("2026-11-14T16:00:00Z"),
+            last: utc("2026-11-14T16:30:00Z"),
+            tokens: Tokens {
+                input: 12000,
+                out: 900,
+                cw: 300,
+                cr: 8000,
+            },
+            last_hour: Some(Tokens {
+                input: 1200,
+                out: 90,
+                cw: 0,
+                cr: 800,
+            }),
+            busy: true,
+            file: PathBuf::from("/home/sam/.codex/sessions/2026/11/14/rollout-old.jsonl"),
+        };
+
+        let quiet = codex_rows(
+            std::slice::from_ref(&old),
+            &BTreeSet::new(),
+            None,
+            &unknown_pricing(),
+            "atlas",
+            now,
+            &|_| project_key(),
+        );
+        assert!(
+            quiet.sessions.is_empty(),
+            "a quiet file that no process holds is not a row"
+        );
+
+        let open = BTreeSet::from([old.file.clone()]);
+        let rows = codex_rows(
+            std::slice::from_ref(&old),
+            &open,
+            None,
+            &unknown_pricing(),
+            "atlas",
+            now,
+            &|_| project_key(),
+        );
+        assert_eq!(rows.sessions.len(), 1);
+        let row = &rows.sessions[0];
+        assert_eq!(row.session, old.id);
+        assert_eq!(row.provider, "Codex");
+        assert_eq!(row.status, LiveStatus::Busy);
+        assert_eq!(row.model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(row.tokens, old.tokens);
+        assert_eq!(row.started, old.started);
+        assert_eq!(row.since, old.last);
+        assert!(row.agents.is_empty());
+        assert_eq!(row.agents_running, 0);
+
+        let mut recent = old.clone();
+        recent.last = now - Duration::minutes(5);
+        recent.busy = false;
+        let rows = codex_rows(
+            &[recent],
+            &BTreeSet::new(),
+            None,
+            &unknown_pricing(),
+            "atlas",
+            now,
+            &|_| project_key(),
+        );
+        assert_eq!(rows.sessions.len(), 1);
+        assert_eq!(rows.sessions[0].status, LiveStatus::Idle);
+    }
+
+    #[test]
+    fn a_codex_row_values_its_last_hour_and_says_when_it_is_not_known() {
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let settings = settings_eur();
+        let mut prices = Prices::default();
+        prices.take(
+            BTreeMap::from([(
+                crate::money::price_key("anthropic", "gpt-6.1-sol"),
+                ModelPrice {
+                    input: 1.0,
+                    output: 2.0,
+                    cache_write: 1.0,
+                    cache_read: 0.1,
+                    tiered: false,
+                },
+            )]),
+            utc("2026-01-01T00:00:00Z"),
+        );
+        let valuer = valuer_with(&history, &settings, &[], &prices);
+        let now = utc("2026-11-14T19:00:00Z");
+        let session = crate::codex_sessions::CodexSession {
+            id: "3f7b2c1e-9a4d-4e8f-8b6a-2c5d9e1f7a30".to_string(),
+            cwd: PathBuf::from(ATLAS_CWD),
+            model: Some("gpt-6.1-sol".to_string()),
+            started: now - Duration::minutes(30),
+            last: now - Duration::minutes(5),
+            tokens: Tokens {
+                input: 1000,
+                out: 100,
+                cw: 0,
+                cr: 500,
+            },
+            last_hour: Some(Tokens {
+                input: 400,
+                out: 40,
+                cw: 0,
+                cr: 200,
+            }),
+            busy: false,
+            file: PathBuf::from("/home/sam/.codex/sessions/2026/11/14/rollout-now.jsonl"),
+        };
+
+        let rows = codex_rows(
+            std::slice::from_ref(&session),
+            &BTreeSet::new(),
+            None,
+            &known_pricing(&valuer, &settings),
+            "atlas",
+            now,
+            &|_| project_key(),
+        );
+        assert_eq!(rows.sessions.len(), 1);
+        let row = &rows.sessions[0];
+        assert_eq!(Some(row.last_hour), session.last_hour);
+        assert!(
+            row.last_hour_values.api.is_some(),
+            "the last hour is valued like the tokens: {:?}",
+            row.last_hour_values
+        );
+
+        let mut unknown = session.clone();
+        unknown.last_hour = None;
+        let rows = codex_rows(
+            &[unknown],
+            &BTreeSet::new(),
+            None,
+            &known_pricing(&valuer, &settings),
+            "atlas",
+            now,
+            &|_| project_key(),
+        );
+        let row = &rows.sessions[0];
+        assert_eq!(row.last_hour, Tokens::default());
+        assert_eq!(
+            row.last_hour_values.api_missing.as_deref(),
+            Some(CODEX_LAST_HOUR_UNKNOWN),
+            "an unknown last hour says so, never 0: {:?}",
+            row.last_hour_values
+        );
+        assert_eq!(
+            row.last_hour_values.subscription_missing.as_deref(),
+            Some(CODEX_LAST_HOUR_UNKNOWN)
+        );
     }
 
     #[test]

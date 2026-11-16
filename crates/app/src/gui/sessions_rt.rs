@@ -17,11 +17,12 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 
+use seatswap_core::codex_sessions::{self, CodexSession};
 use seatswap_core::harness::{self, HarnessPaths, HarnessSession};
 use seatswap_core::history::{EventKind, HistoryDir, Range, Recorder, SessionRecord, TokenRecord};
 use seatswap_core::live_sessions::{self, LiveSession, LiveStatus, OtherHost, Rows};
 use seatswap_core::money::Valuer;
-use seatswap_core::paths::{AppPaths, ClaudePaths};
+use seatswap_core::paths::{AppPaths, ClaudePaths, CodexPaths};
 use seatswap_core::project::{self, ProjectKey};
 use seatswap_core::projects;
 use seatswap_core::sessions::{self, Liveness, SessionFile, SessionStatus, SystemProbe};
@@ -64,12 +65,13 @@ const ROWS_CONTEXT_RETRY_SECS: i64 = 60;
 /// This host reports even when nothing changed after this many seconds, so
 /// another host does not take a quiet host for a stale one.
 const REPORT_HEARTBEAT_SECS: i64 = 300;
-/// A Harness session whose file was not written for this long is not part of
-/// the live rows: a running job writes its file while it works, so a job that
-/// has been quiet for a day is no longer shown. This window does not drop a
-/// recorded token total (a total goes only when its session file leaves the
-/// store), and a closed Claude session's job links are kept this long after
-/// that session's last answer.
+/// A Harness or Codex session whose file was not written for this long is not
+/// part of the live rows: a session that works writes its file while it works,
+/// so one that has been quiet for a day is no longer shown. This window does
+/// not drop a recorded Harness token total (a total goes only when its session
+/// file leaves the store), and a closed Claude session's job links are kept this
+/// long after that session's last answer. One window for both stores, so the
+/// two reads never drift apart.
 const HARNESS_SINCE_HOURS: i64 = 24;
 
 /// What one pass found, for the thread and the tests.
@@ -243,6 +245,11 @@ pub(crate) struct SessionMemory {
     harness_paths: Option<HarnessPaths>,
     /// Why the Harness folders cannot be found, said in the view's warnings.
     harness_error: Option<String>,
+    /// Codex's home; `None` when it cannot be found, or in a test that does not
+    /// build a store.
+    codex_paths: Option<CodexPaths>,
+    /// Why Codex's home cannot be found, said in the view's warnings.
+    codex_error: Option<String>,
     /// The rows of the last pass, which the view is built from.
     rows: Option<Rows>,
     /// Each running session's answers with thinking since the user's last turn.
@@ -291,6 +298,8 @@ impl SessionMemory {
             history_error: None,
             harness_paths: None,
             harness_error: None,
+            codex_paths: None,
+            codex_error: None,
             rows: None,
             thinking: BTreeMap::new(),
             unavailable: None,
@@ -601,6 +610,7 @@ pub(crate) fn spawn(
     claude: ClaudePaths,
     history: Result<HistoryDir, String>,
     harness: Result<HarnessPaths, String>,
+    codex: Result<CodexPaths, String>,
     ui: Sender<UiEvent>,
     engine: Sender<EngineCommand>,
 ) -> Result<SessionsHandle, String> {
@@ -621,6 +631,7 @@ pub(crate) fn spawn(
                 claude,
                 history,
                 harness,
+                codex,
                 ui,
                 engine,
                 thread_stop,
@@ -645,6 +656,7 @@ fn run(
     claude: ClaudePaths,
     history: Result<HistoryDir, String>,
     harness: Result<HarnessPaths, String>,
+    codex: Result<CodexPaths, String>,
     ui: Sender<UiEvent>,
     engine: Sender<EngineCommand>,
     stop: Arc<AtomicBool>,
@@ -662,6 +674,10 @@ fn run(
     match harness {
         Ok(paths) => memory.harness_paths = Some(paths),
         Err(error) => memory.harness_error = Some(error),
+    }
+    match codex {
+        Ok(paths) => memory.codex_paths = Some(paths),
+        Err(error) => memory.codex_error = Some(error),
     }
     memory.ui = Some(ui.clone());
     let mut watch: Option<FolderWatch> = None;
@@ -1340,12 +1356,32 @@ pub(crate) fn run_pass(
             .iter()
             .any(|session| !running_ids.contains(session));
 
+    // The Codex sessions of the same live window. The process table is walked
+    // for them together with the Harness sessions below, never twice.
+    if let Some(error) = &memory.codex_error {
+        add_warning(&mut summary, error.clone());
+    }
+    let codex_sessions = match &memory.codex_paths {
+        Some(paths) => {
+            let read = codex_sessions::sessions(
+                &paths.home,
+                now - ChronoDuration::hours(HARNESS_SINCE_HOURS),
+                now,
+            );
+            for warning in &read.warnings {
+                add_warning(&mut summary, warning.clone());
+            }
+            read.sessions
+        }
+        None => Vec::new(),
+    };
+
     // The Harness sessions of the range and the Claude Code sessions they hang
     // under: named in a transcript, or (on Linux) through a running job's lock.
     if let Some(error) = &memory.harness_error {
         add_warning(&mut summary, error.clone());
     }
-    let (harness_sessions, harness_owners, claude_cwd, harness_locks, harness_recorded) =
+    let (harness_sessions, mut harness_owners, claude_cwd, harness_recorded, harness_walk) =
         match &memory.harness_paths {
             Some(paths) => {
                 let read =
@@ -1353,7 +1389,7 @@ pub(crate) fn run_pass(
                 for warning in &read.warnings {
                     add_warning(&mut summary, warning.clone());
                 }
-                let mut links = harness::links(paths, &state.sessions, &state.closed_flash_jobs);
+                let links = harness::links(paths, &state.sessions, &state.closed_flash_jobs);
                 for warning in &links.warnings {
                     add_warning(&mut summary, warning.clone());
                 }
@@ -1362,10 +1398,10 @@ pub(crate) fn run_pass(
                     .iter()
                     .map(|session| (session.id.as_str(), session))
                     .collect();
-                // The process table is walked only when the running rule needs
-                // it: an unfinished session is unlinked (to find its owner) or
-                // quiet for the whole quiet window (to find its lock). A
-                // finished session needs neither.
+                // The process table is walked only when a running rule needs
+                // it: an unfinished Harness session is unlinked (to find its
+                // owner) or quiet for the whole quiet window (to find its
+                // lock). A finished session needs neither.
                 let unlinked = |session: &HarnessSession| {
                     let mut seen = BTreeSet::new();
                     let mut current = Some(session.id.as_str());
@@ -1389,20 +1425,6 @@ pub(crate) fn run_pass(
                             >= ChronoDuration::minutes(harness::HARNESS_QUIET_MINUTES)
                             || unlinked(session))
                 });
-                let mut locks = BTreeSet::new();
-                if needs_walk {
-                    let claude_pids: BTreeMap<u32, String> = running
-                        .sessions
-                        .iter()
-                        .map(|session| (session.pid, session.session_id.clone()))
-                        .collect();
-                    let found = harness::proc_links(paths, procs, &claude_pids);
-                    for (id, owner) in found.owners {
-                        // A transcript's owner wins over the process link.
-                        links.owners.entry(id).or_insert(owner);
-                    }
-                    locks = found.locks;
-                }
                 if paths.sessions.exists() {
                     // A recorded total goes only when its session's file has
                     // left the store; the window and a failed read keep it.
@@ -1417,16 +1439,52 @@ pub(crate) fn run_pass(
                 for session in &running.sessions {
                     claude_cwd.insert(session.session_id.clone(), session.cwd.clone());
                 }
-                (read.sessions, links.owners, claude_cwd, locks, recorded)
+                (
+                    read.sessions,
+                    links.owners,
+                    claude_cwd,
+                    recorded,
+                    needs_walk,
+                )
             }
             None => (
                 Vec::new(),
                 BTreeMap::new(),
                 BTreeMap::new(),
-                BTreeSet::new(),
                 BTreeMap::new(),
+                false,
             ),
         };
+
+    // One walk of the process table serves both stores: the Harness locks and
+    // owners, and the files a process holds open. A Codex session needs it only
+    // when its last event is old enough that a holder is what makes it running.
+    let codex_walk = live_sessions::codex_needs_process_walk(&codex_sessions, now);
+    let mut harness_locks = BTreeSet::new();
+    let mut codex_open_files = BTreeSet::new();
+    if harness_walk || codex_walk {
+        let claude_pids: BTreeMap<u32, String> = running
+            .sessions
+            .iter()
+            .map(|session| (session.pid, session.session_id.clone()))
+            .collect();
+        // Without a Harness store only the open files are collected; Codex
+        // still needs them.
+        let found = match &memory.harness_paths {
+            Some(paths) => harness::proc_links(paths, procs, &claude_pids),
+            None => harness::proc_links_in(None, procs, &claude_pids),
+        };
+        // A walk that Codex alone needed does not change a Harness row: its
+        // links are used only when its own running rule asked for the walk.
+        if harness_walk {
+            for (id, owner) in found.owners {
+                // A transcript's owner wins over the process link.
+                harness_owners.entry(id).or_insert(owner);
+            }
+            harness_locks = found.locks;
+        }
+        codex_open_files = found.files;
+    }
 
     // The rows of this host, and the report the other hosts read. The session
     // files alone are enough to build them: a history that cannot be read gives
@@ -1454,6 +1512,8 @@ pub(crate) fn run_pass(
                     &claude_cwd,
                     &harness_locks,
                     &harness_recorded,
+                    &codex_sessions,
+                    &codex_open_files,
                 )
             };
             memory.rows_context = Some(context);
@@ -1479,6 +1539,8 @@ pub(crate) fn run_pass(
                 &claude_cwd,
                 &harness_locks,
                 &harness_recorded,
+                &codex_sessions,
+                &codex_open_files,
             );
             (Some(rows), (tokens, recorded))
         }
@@ -1957,6 +2019,8 @@ fn live_rows(
     claude_cwd: &BTreeMap<String, String>,
     harness_locks: &BTreeSet<String>,
     harness_recorded: &BTreeMap<String, HarnessRecorded>,
+    codex_sessions: &[CodexSession],
+    codex_open_files: &BTreeSet<PathBuf>,
 ) -> (
     live_sessions::Rows,
     Vec<TokenRecord>,
@@ -1977,29 +2041,44 @@ fn live_rows(
         now,
         &project_of,
     );
-    if harness_sessions.is_empty() {
-        return (rows, Vec::new(), harness_recorded.clone());
-    }
-    let harness = live_sessions::harness_rows(
-        harness_sessions,
-        harness_owners,
-        claude_cwd,
-        harness_recorded,
-        harness_locks,
-        projects,
-        pricing,
-        host,
-        now,
-        &project_of,
-    );
-    for (session, agents) in harness.agents {
-        if let Some(row) = rows.sessions.iter_mut().find(|row| row.session == session) {
-            live_sessions::add_agents(row, agents);
+    let (harness_tokens, harness_recorded) = if harness_sessions.is_empty() {
+        (Vec::new(), harness_recorded.clone())
+    } else {
+        let harness = live_sessions::harness_rows(
+            harness_sessions,
+            harness_owners,
+            claude_cwd,
+            harness_recorded,
+            harness_locks,
+            projects,
+            pricing,
+            host,
+            now,
+            &project_of,
+        );
+        for (session, agents) in harness.agents {
+            if let Some(row) = rows.sessions.iter_mut().find(|row| row.session == session) {
+                live_sessions::add_agents(row, agents);
+            }
         }
+        rows.warnings.extend(harness.rows.warnings);
+        rows.sessions.extend(harness.rows.sessions);
+        (harness.tokens, harness.recorded)
+    };
+    if !codex_sessions.is_empty() {
+        let codex = live_sessions::codex_rows(
+            codex_sessions,
+            codex_open_files,
+            projects,
+            pricing,
+            host,
+            now,
+            &project_of,
+        );
+        rows.warnings.extend(codex.warnings);
+        rows.sessions.extend(codex.sessions);
     }
-    rows.warnings.extend(harness.rows.warnings);
-    rows.sessions.extend(harness.rows.sessions);
-    (rows, harness.tokens, harness.recorded)
+    (rows, harness_tokens, harness_recorded)
 }
 
 fn session_record(
@@ -5022,6 +5101,7 @@ mod tests {
                 tmp.path().join("sessions"),
                 tmp.path().join("reports"),
             )),
+            Ok(CodexPaths::at(&tmp.path().join("codex"))),
             ui,
             engine,
         )
@@ -5322,6 +5402,115 @@ mod tests {
         assert_eq!(job.kind.as_deref(), Some("flash"));
         assert!(job.running);
         assert_eq!(job.model.as_deref(), Some(HARNESS_MODEL));
+    }
+
+    #[test]
+    fn run_pass_reads_codex_sessions_from_their_folder() {
+        let (tmp, claude, app) = fixture();
+        let now = time("2026-11-16T14:00:00Z");
+        let codex = CodexPaths::at(&tmp.path().join("codex"));
+        let day = codex
+            .home
+            .join("sessions")
+            .join("2026")
+            .join("11")
+            .join("16");
+        fs::create_dir_all(&day).unwrap();
+        let id = "3f7b2c1e-9a4d-4e8f-8b6a-2c5d9e1f7a30";
+        let event = |timestamp: &str, ordinal: u32, kind: &str, payload: serde_json::Value| {
+            serde_json::json!({
+                "timestamp": timestamp,
+                "ordinal": ordinal,
+                "type": kind,
+                "payload": payload,
+            })
+            .to_string()
+        };
+        let text = [
+            event(
+                "2026-11-16T11:50:00.000Z",
+                0,
+                "session_meta",
+                serde_json::json!({
+                    "id": id,
+                    "session_id": id,
+                    "cwd": "/home/sam/projects/atlas",
+                    "originator": "codex-tui",
+                    "source": "cli",
+                    "cli_version": "0.51.0",
+                    "model_provider": "openai",
+                }),
+            ),
+            event(
+                "2026-11-16T11:50:01.000Z",
+                1,
+                "turn_context",
+                serde_json::json!({
+                    "turn_id": "9b8a7c6d-5e4f-4a3b-2c1d-0e9f8a7b6c5d",
+                    "cwd": "/home/sam/projects/atlas",
+                    "model": "gpt-6.1-sol",
+                    "effort": "high",
+                }),
+            ),
+            event(
+                "2026-11-16T11:55:00.000Z",
+                2,
+                "event_msg",
+                serde_json::json!({
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 12000,
+                            "cached_input_tokens": 8000,
+                            "cache_write_input_tokens": 300,
+                            "output_tokens": 700,
+                            "reasoning_output_tokens": 100,
+                            "total_tokens": 12700,
+                        },
+                    },
+                }),
+            ),
+        ]
+        .map(|line| format!("{line}\n"))
+        .join("");
+        let file = day.join(format!("rollout-2026-11-16T11-50-00-{id}.jsonl"));
+        fs::write(&file, text).unwrap();
+        set_mtime(&file, now - ChronoDuration::hours(3));
+        // The file is quiet for longer than the running rule's window; only the
+        // process that holds it open makes it running.
+        let procs = FakeProc {
+            processes: BTreeMap::from([(700, (vec![file.clone()], None))]),
+            walks: Cell::new(0),
+        };
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        memory.codex_paths = Some(codex);
+
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            &procs,
+            None,
+            &mut state,
+            &mut memory,
+            now,
+            None,
+        );
+
+        assert!(procs.walks.get() > 0, "the quiet file needs the walk");
+        let row = memory
+            .rows
+            .as_ref()
+            .expect("rows after the pass")
+            .sessions
+            .iter()
+            .find(|row| row.session == id)
+            .expect("the Codex row");
+        assert_eq!(row.provider, "Codex");
+        assert_eq!(row.status, LiveStatus::Idle);
+        assert_eq!(row.model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(row.tokens.out, 700);
     }
 
     #[test]

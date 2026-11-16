@@ -449,12 +449,14 @@ pub(crate) fn spawn(
     let providers_client = providers.as_ref().map(ProvidersHandle::client);
 
     let sessions = match settings.as_ref().filter(|settings| settings.read_sessions) {
-        Some(_) => Some(sessions_rt::spawn(
+        Some(settings) => Some(sessions_rt::spawn(
             app.clone(),
             claude.clone(),
             history.clone(),
             seatswap_core::harness::HarnessPaths::resolve()
                 .map_err(|error| format!("the Harness folders cannot be found: {error}")),
+            seatswap_core::paths::CodexPaths::resolve(settings.codex_home.as_deref())
+                .map_err(|error| format!("the Codex folder cannot be found: {error}")),
             ui,
             engine_tx.clone(),
         )?),

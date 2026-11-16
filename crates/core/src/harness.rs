@@ -637,36 +637,54 @@ impl ProcSource for RealProc {
     }
 }
 
-/// What one walk of the process table found: the locks held and the Claude Code
-/// sessions their holders hang under.
+/// What one walk of the process table found: the locks held, the Claude Code
+/// sessions their holders hang under, and every file a process holds open.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProcLinks {
     /// Harness session id → Claude Code session id.
     pub owners: BTreeMap<String, String>,
     /// The Harness sessions whose lock a process holds.
     pub locks: BTreeSet<String>,
+    /// Every file a process holds open. Codex's sessions use the same walk to
+    /// find their rollout files (C-1); the set is empty where there is no
+    /// `/proc`.
+    pub files: BTreeSet<PathBuf>,
 }
 
-/// Walk the process table once: every Harness lock held, and the Claude Code
-/// session of a lock holder's parent when there is one. The sessions folder is
-/// resolved once, because the kernel reports an open file by its resolved path;
-/// a folder that cannot be resolved (it does not exist) has no lock to find.
-#[cfg(target_os = "linux")]
+/// Walk the process table once: every Harness lock held, the Claude Code
+/// session of a lock holder's parent when there is one, and every file a
+/// process holds open. The sessions folder is resolved once, because the kernel
+/// reports an open file by its resolved path; a folder that cannot be resolved
+/// (it does not exist) has no lock to find.
 pub fn proc_links(
     paths: &HarnessPaths,
     procs: &dyn ProcSource,
     claude_pids: &BTreeMap<u32, String>,
 ) -> ProcLinks {
+    let sessions = fs::canonicalize(&paths.sessions).ok();
+    proc_links_in(sessions.as_deref(), procs, claude_pids)
+}
+
+/// The same one walk with the Harness sessions folder already resolved;
+/// `None` when there is no Harness store, so only the open files are collected
+/// (C-1 needs them for Codex when there is no Harness folder).
+#[cfg(target_os = "linux")]
+pub fn proc_links_in(
+    sessions: Option<&Path>,
+    procs: &dyn ProcSource,
+    claude_pids: &BTreeMap<u32, String>,
+) -> ProcLinks {
     let mut links = ProcLinks::default();
-    let Ok(sessions) = fs::canonicalize(&paths.sessions) else {
-        return links;
-    };
     for pid in procs.pids() {
-        let ids: BTreeSet<String> = procs
-            .open_files(pid)
-            .iter()
-            .filter_map(|file| harness_id_of(&sessions, file))
-            .collect();
+        let files = procs.open_files(pid);
+        let ids: BTreeSet<String> = match sessions {
+            Some(sessions) => files
+                .iter()
+                .filter_map(|file| harness_id_of(sessions, file))
+                .collect(),
+            None => BTreeSet::new(),
+        };
+        links.files.extend(files);
         for id in ids {
             links.locks.insert(id.clone());
             if let Some(session) = walk_to_claude(procs, claude_pids, pid) {
@@ -678,8 +696,8 @@ pub fn proc_links(
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn proc_links(
-    _paths: &HarnessPaths,
+pub fn proc_links_in(
+    _sessions: Option<&Path>,
     _procs: &dyn ProcSource,
     _claude_pids: &BTreeMap<u32, String>,
 ) -> ProcLinks {
@@ -1016,6 +1034,38 @@ mod tests {
         let owners = running_owners(&paths, &procs, &claude_pids);
 
         assert!(owners.is_empty(), "{owners:?}");
+    }
+
+    #[test]
+    fn one_walk_collects_the_locks_and_the_open_files() {
+        let (tmp, paths) = store();
+        let lock = paths.sessions.join(KEY).join(JOB).join(SESSION_LOCK);
+        fs::create_dir_all(lock.parent().expect("a session folder")).expect("a session folder");
+        fs::write(&lock, "").expect("a lock");
+        let lock = fs::canonicalize(&lock).expect("the resolved lock");
+        let rollout = tmp
+            .path()
+            .join("codex")
+            .join("sessions")
+            .join("2026")
+            .join("11")
+            .join("14")
+            .join("rollout-2026-11-14T17-53-10-3f7b2c1e-9a4d-4e8f-8b6a-2c5d9e1f7a30.jsonl");
+        let procs = FakeProc {
+            processes: BTreeMap::from([
+                (500, (vec![lock.clone(), rollout.clone()], Some(1))),
+                (1, (Vec::new(), None)),
+            ]),
+        };
+
+        let links = proc_links(&paths, &procs, &BTreeMap::new());
+
+        assert!(links.locks.contains(JOB));
+        assert!(links.files.contains(&lock));
+        assert!(
+            links.files.contains(&rollout),
+            "the same walk gives Codex the open files"
+        );
     }
 
     #[test]
