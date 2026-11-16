@@ -640,7 +640,7 @@ pub(crate) fn send_waiting(
         }
         Err(error) => eprintln!("seatswap: notification: {error}"),
     });
-    WaitingHandle
+    WaitingHandle {}
 }
 
 /// The handle that can withdraw a waiting notification before the person
