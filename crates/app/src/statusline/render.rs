@@ -366,25 +366,41 @@ where
     }
 }
 
-/// The spans as the terminal line: exactly the SGR bytes the status line
-/// command printed before the spans were split out.
+/// The spans as the terminal line: one SGR run per stretch of spans with the
+/// same style, closed by a reset. Neighbouring spans with the same style are
+/// written as one run, so a value and its suffix that share a foreground are
+/// one coloured run. A segment's prefix is always plain, and a suffix is plain
+/// when the value has a background, so a background covers the value only.
 pub(crate) fn ansi(spans: &[Span]) -> String {
     let mut out = String::new();
-    for span in spans {
+    let mut index = 0;
+    while index < spans.len() {
+        let span = &spans[index];
         if span.fg.is_none() && span.bg.is_none() && !span.bold {
             out.push_str(&span.text);
+            index += 1;
             continue;
         }
-        if span.bold {
+        let (fg, bg, bold) = (span.fg, span.bg, span.bold);
+        if bold {
             out.push_str("\x1b[1m");
         }
-        if let Some(background) = span.bg {
+        if let Some(background) = bg {
             out.push_str(&background.sgr(true));
         }
-        if let Some(foreground) = span.fg {
+        if let Some(foreground) = fg {
             out.push_str(&foreground.sgr(false));
         }
         out.push_str(&span.text);
+        index += 1;
+        while index < spans.len() {
+            let next = &spans[index];
+            if next.fg != fg || next.bg != bg || next.bold != bold {
+                break;
+            }
+            out.push_str(&next.text);
+            index += 1;
+        }
         out.push_str(RESET);
     }
     out
@@ -762,6 +778,15 @@ fn load_percent(kind: SegmentKind, facts: &Facts) -> Option<f64> {
 /// segment between them was left out (no value, or dropped by the fitting), so
 /// a gap leaves no leading spaces while two segments adjacent in the
 /// configuration print their suffix and prefix as written.
+///
+/// A segment becomes up to three spans: its prefix, its value and its suffix.
+/// Only the value carries the colour rule's background, so the account tag's
+/// background covers its letters and not the space after them. A prefix is
+/// plain. A suffix keeps the value's foreground when the rule paints no
+/// background (the unit "%" stays the value's colour, and `ansi` writes the
+/// same run as before); with a background, the suffix is plain too, so the
+/// colour stops at the value. The visible text and its width are the same as
+/// one span's would be.
 fn compose_zone(pieces: &[Piece], level: Option<u8>) -> Vec<Span> {
     let mut spans = Vec::new();
     let mut ends_space = false;
@@ -782,12 +807,31 @@ fn compose_zone(pieces: &[Piece], level: Option<u8>) -> Vec<Span> {
         let text = format!("{prefix}{}{}", piece.text, piece.suffix);
         ends_space = text.ends_with(' ');
         left_out = false;
-        spans.push(Span {
-            text,
-            fg: piece.fg,
-            bg: piece.bg,
-            bold: false,
-        });
+        if !prefix.is_empty() {
+            spans.push(Span {
+                text: prefix.to_string(),
+                fg: None,
+                bg: None,
+                bold: false,
+            });
+        }
+        if !piece.text.is_empty() {
+            spans.push(Span {
+                text: piece.text.clone(),
+                fg: piece.fg,
+                bg: piece.bg,
+                bold: false,
+            });
+        }
+        if !piece.suffix.is_empty() {
+            let fg = if piece.bg.is_some() { None } else { piece.fg };
+            spans.push(Span {
+                text: piece.suffix.clone(),
+                fg,
+                bg: None,
+                bold: false,
+            });
+        }
     }
     spans
 }
@@ -1005,14 +1049,18 @@ mod tests {
         });
 
         let (spans, _) = render_spans(&config, &payload(), &facts, None, &offset());
-        let span = spans.first().expect("the one 5 h percent span");
+        // The value "49" and its suffix "%" are two spans; the suffix keeps the
+        // value's foreground because the rule paints no background, so `ansi`
+        // writes the same run as before the split.
+        let span = spans.first().expect("the 5 h percent's value span");
+        assert_eq!(span.text, "49");
         assert_eq!(span.fg, Some(Color::Named(GREEN)));
         assert_eq!(
             serde_json::to_value(span).expect("a serialised span")["fg"],
             serde_json::json!("#00cd00")
         );
         assert_eq!(
-            ansi(std::slice::from_ref(span)),
+            ansi(&spans),
             "\x1b[32m49%\x1b[0m",
             "ansi keeps the named colour's SGR bytes"
         );
@@ -1149,6 +1197,42 @@ mod tests {
             "an empty text prints no prefix and no suffix"
         );
         assert!(dropped.is_empty(), "nothing was dropped");
+    }
+
+    #[test]
+    fn the_account_background_covers_the_letters_only() {
+        let mut config = StatuslineConfig::current_line();
+        config.left = Vec::new();
+        // The account segment: the value "AC" and the suffix " ".
+        config.right = vec![config.right[0].clone()];
+
+        let (spans, dropped) = render_spans(&config, &payload(), &facts(), None, &offset());
+        assert!(dropped.is_empty(), "nothing was dropped");
+        assert_eq!(visible_text(&ansi(&spans)), "AC ");
+        assert_eq!(
+            spans.len(),
+            2,
+            "an empty prefix makes no span: the value and the suffix"
+        );
+        assert_eq!(spans[0].text, "AC");
+        assert!(
+            spans[0].fg.is_some() && spans[0].bg.is_some(),
+            "the letters carry the account colour"
+        );
+        assert!(
+            spans[1].fg.is_none() && spans[1].bg.is_none(),
+            "the suffix's space is plain"
+        );
+
+        let line = ansi(&spans);
+        assert!(
+            line.contains(&format!("AC{RESET} ")),
+            "the background reset comes right after the letters: {line:?}"
+        );
+        assert!(
+            !line.contains(&format!("AC {RESET}")),
+            "the suffix's space carries no background: {line:?}"
+        );
     }
 
     fn segment(kind: SegmentKind) -> Segment {

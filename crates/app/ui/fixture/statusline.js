@@ -184,9 +184,33 @@ function fixturePiece(segment, scenario) {
     kind: segment.kind,
     drop:
       Number.isInteger(segment.drop) && segment.drop >= 1 ? segment.drop : null,
+    prefix,
+    value,
+    suffix,
     text: `${prefix}${value}${suffix}`,
     colour: fixtureSpanColour(segment.kind, segment, scenario),
   };
+}
+
+// One segment as the spans `render.rs` writes: a plain prefix, the value with
+// the colour rule's foreground and background, and the suffix. A suffix keeps
+// the value's foreground unless the rule paints a background: then the colour
+// stops at the value, as it does for the account tag.
+function fixtureSpans(piece) {
+  const colour = piece.colour || {};
+  const fg = colour.fg || null;
+  const bg = colour.bg || null;
+  const spans = [];
+  if (piece.prefix !== "") {
+    spans.push({ text: piece.prefix, fg: null, bg: null, bold: false });
+  }
+  if (piece.value !== "") {
+    spans.push({ text: piece.value, fg, bg, bold: false });
+  }
+  if (piece.suffix !== "") {
+    spans.push({ text: piece.suffix, fg: bg ? null : fg, bg: null, bold: false });
+  }
+  return spans;
 }
 
 function fixtureDroppedNote(names) {
@@ -253,12 +277,7 @@ export function fixtureStatuslinePreview(config, widths, scenario) {
     const spans = [];
     for (const piece of chosen.left) {
       if (!piece) continue;
-      spans.push({
-        text: piece.text,
-        fg: piece.colour.fg || null,
-        bg: piece.colour.bg || null,
-        bold: false,
-      });
+      for (const span of fixtureSpans(piece)) spans.push(span);
     }
     const rightPrints = chosen.right.some((piece) => piece !== null && piece.text.length > 0);
     if (rightPrints && chosen.gap > 0) {
@@ -266,12 +285,7 @@ export function fixtureStatuslinePreview(config, widths, scenario) {
     }
     for (const piece of chosen.right) {
       if (!piece) continue;
-      spans.push({
-        text: piece.text,
-        fg: piece.colour.fg || null,
-        bg: piece.colour.bg || null,
-        bold: false,
-      });
+      for (const span of fixtureSpans(piece)) spans.push(span);
     }
     return { width, spans, dropped, note: fixtureDroppedNote(droppedNames) };
   });

@@ -95,6 +95,20 @@
   padding: 5px;
 }
 
+/* The Segments box while a chip from a zone is dragged over it: dropping there
+   removes the segment. */
+.sl-palette.sl-remove-over {
+  outline: 2px solid var(--danger);
+  outline-offset: 1px;
+}
+
+.sl-remove-hint {
+  color: var(--danger);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 16px;
+}
+
 .sl-chip {
   display: inline-flex;
   align-items: center;
@@ -201,6 +215,11 @@
 
 .sl-options .set {
   grid-template-columns: 118px minmax(0, 1fr);
+}
+
+.sl-options-remove {
+  padding: 8px 12px 4px;
+  border-top: 1px solid var(--border);
 }
 
 .sl-option-control {

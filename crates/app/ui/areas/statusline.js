@@ -75,6 +75,11 @@ const state = {
   errors: [],
   saveError: null,
   dragError: null,
+  // The segment a drag carries, and the Segments box's "drop here to remove"
+  // state while a chip from a zone is dragged over it.
+  dragging: null,
+  paletteCard: null,
+  removeHint: null,
   installError: null,
   presetError: null,
   kindsError: null,
@@ -888,6 +893,12 @@ function paletteCard() {
       }
     }
   }
+  const hint = h("span", {
+    class: "sl-remove-hint",
+    hidden: true,
+    role: "status",
+    text: "drop here to remove",
+  });
   const groups = GROUPS.map((group) => {
     const zone = h("div", { class: "sl-zone sl-zone-palette", role: "list" });
     for (const kind of groupKinds(group.id)) {
@@ -899,10 +910,42 @@ function paletteCard() {
       zone,
     ]);
   });
-  return panel("Segments", "not on the line", groups, null, {
+  const card = panel("Segments", "not on the line", [hint, ...groups], null, {
     cardClass: "sl-card sl-palette",
     bodyClass: "sl-card-body",
   });
+  state.paletteCard = card;
+  state.removeHint = hint;
+
+  // The Segments box takes drops from the two zones: dropping a segment here
+  // removes it from its zone, through the one `removeSegment` Delete uses. A
+  // chip dragged from the palette onto the palette is not a drop.
+  card.addEventListener("dragover", (event) => {
+    if (!isObject(state.dragging) || state.dragging.from !== "zone") return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+    setRemoveHint(true);
+  });
+  card.addEventListener("dragleave", (event) => {
+    if (event.relatedTarget && card.contains(event.relatedTarget)) return;
+    setRemoveHint(false);
+  });
+  card.addEventListener("drop", (event) => {
+    if (!isObject(state.dragging) || state.dragging.from !== "zone") return;
+    event.preventDefault();
+    setRemoveHint(false);
+    const read = readDrag(event);
+    state.dragging = null;
+    if (read.error) {
+      state.dragError = read.error;
+      renderAll();
+      return;
+    }
+    state.dragError = null;
+    const source = read.payload;
+    if (source.from === "zone") removeSegment(source.zone, source.index);
+  });
+  return card;
 }
 
 function paletteChip(kind) {
@@ -1184,11 +1227,17 @@ function readDrag(event) {
   return { payload };
 }
 
+function setRemoveHint(on) {
+  if (state.paletteCard) state.paletteCard.classList.toggle("sl-remove-over", on);
+  if (state.removeHint) state.removeHint.hidden = !on;
+}
+
 function clearDropMarks() {
   if (!state.root) return;
   for (const node of state.root.querySelectorAll(".sl-zone.over, .sl-chip.over")) {
     node.classList.remove("over");
   }
+  setRemoveHint(false);
 }
 
 function chipKeydown(event, zoneId, index) {
@@ -1321,6 +1370,17 @@ function changeSegment(selection, change, redraw) {
   return true;
 }
 
+function removeButton(selection) {
+  return h("button", {
+    type: "button",
+    class: "hbtn",
+    text: "Remove",
+    dataset: { action: "remove" },
+    title: "removes the chosen segment from the line",
+    onclick: () => removeSegment(selection.zone, selection.index),
+  });
+}
+
 function optionsCard() {
   const segment = selectedSegment();
   if (!segment) {
@@ -1342,6 +1402,10 @@ function optionsCard() {
             state.selected.index
           }]`
         ),
+        h("div", { class: "row sl-actions sl-options-remove" }, [
+          h("span", { class: "sp" }),
+          removeButton(selection),
+        ]),
       ],
       null,
       { cardClass: "sl-card sl-options", bodyClass: "sl-card-body" }
@@ -1580,6 +1644,12 @@ function optionsCard() {
   });
   drop.dataset.opt = "drop";
   body.push(optionRow("Drop when narrow", drop));
+  body.push(
+    h("div", { class: "row sl-actions sl-options-remove" }, [
+      h("span", { class: "sp" }),
+      removeButton(selection),
+    ])
+  );
 
   return panel(
     `Options · ${spec.label}`,
@@ -2100,6 +2170,9 @@ export function unmount() {
   state.errors = [];
   state.saveError = null;
   state.dragError = null;
+  state.dragging = null;
+  state.paletteCard = null;
+  state.removeHint = null;
   state.installError = null;
   state.presetError = null;
   state.kindsError = null;
