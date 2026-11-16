@@ -3,13 +3,15 @@
 //!
 //! Everything here is pure: the numbers come in as [`Facts`], the layout from
 //! the stored [`StatuslineConfig`], and the time zone is a parameter so the
-//! tests can fix an offset. No file is read except `.git/HEAD` for the branch.
+//! tests can fix an offset. No file is read except the repository's `HEAD` for
+//! the branch.
 
 use std::path::Path;
 
 use chrono::{DateTime, TimeZone, Utc};
 use serde::{Serialize, Serializer};
 
+use seatswap_core::project::{git_dir, repository_root};
 use seatswap_core::store::{ColorRule, Segment, SegmentKind, StatuslineConfig, TimeFormat};
 
 use super::Payload;
@@ -208,6 +210,8 @@ pub(crate) struct Limit2 {
 /// text before it ends in a space and a segment between them was left out: a
 /// missing segment leaves no gap.
 struct Piece {
+    /// Only the preview's note names a dropped kind.
+    #[cfg(any(feature = "gui", test))]
     kind: SegmentKind,
     prefix: String,
     text: String,
@@ -227,6 +231,8 @@ struct Piece {
 pub(crate) struct FittedLine {
     pub spans: Vec<Span>,
     pub dropped: Vec<u8>,
+    /// The preview's note reads this; the command renders without it.
+    #[cfg(any(feature = "gui", test))]
     pub dropped_kinds: Vec<SegmentKind>,
 }
 
@@ -303,6 +309,7 @@ where
         }
         None => Vec::new(),
     };
+    #[cfg(any(feature = "gui", test))]
     let dropped_kinds: Vec<SegmentKind> = match level {
         Some(level) => {
             let mut removed: Vec<(u8, SegmentKind)> = left
@@ -329,6 +336,7 @@ where
         return FittedLine {
             spans: left_spans,
             dropped,
+            #[cfg(any(feature = "gui", test))]
             dropped_kinds,
         };
     }
@@ -353,6 +361,7 @@ where
     FittedLine {
         spans,
         dropped,
+        #[cfg(any(feature = "gui", test))]
         dropped_kinds,
     }
 }
@@ -489,10 +498,15 @@ fn in_ranges(ranges: &[(u32, u32)], code: u32) -> bool {
         .any(|(first, last)| (*first..=*last).contains(&code))
 }
 
-/// The branch of the repository at `cwd`, from `.git/HEAD`; a detached HEAD
-/// (a commit hash) has none. Nothing is executed and no worktree file is read.
-pub(crate) fn git_branch(cwd: &Path) -> Option<String> {
-    let head = std::fs::read_to_string(cwd.join(".git").join("HEAD")).ok()?;
+/// The branch of the repository `cwd` belongs to, from its git dir's `HEAD`.
+/// The repository is found with core's walk ([`repository_root`]), so a folder
+/// below the repository root and a worktree (a `.git` file) find their branch,
+/// and [`git_dir`] follows a `.git` file to the folder holding `HEAD`. A
+/// detached HEAD (a commit hash) has none. Nothing is executed.
+pub(crate) fn git_branch(cwd: &Path, home: &Path) -> Option<String> {
+    let root = repository_root(cwd, home)?;
+    let gitdir = git_dir(&root.join(".git"))?;
+    let head = std::fs::read_to_string(gitdir.join("HEAD")).ok()?;
     let head = head.trim_end_matches(['\n', '\r']);
     let name = head.strip_prefix("ref: refs/heads/")?;
     if name.is_empty() {
@@ -523,6 +537,7 @@ where
             continue;
         };
         pieces.push(Piece {
+            #[cfg(any(feature = "gui", test))]
             kind: segment.kind,
             prefix: segment.prefix.clone(),
             text,
@@ -1357,19 +1372,41 @@ mod tests {
         );
     }
 
+    /// The repository is found with core's walk from the session's folder: a
+    /// folder two levels below the root still shows the branch, a worktree (a
+    /// `.git` file naming its git dir) shows the branch in that git dir, and a
+    /// detached HEAD shows none.
     #[test]
     fn git_branch_reads_head() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let git = tmp.path().join(".git");
+        let home = tmp.path().join("home");
+        let repo = home.join("projects/atlas");
+        let git = repo.join(".git");
         std::fs::create_dir_all(&git).expect("the .git folder");
         std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").expect("HEAD");
-        assert_eq!(git_branch(tmp.path()), Some("main".to_string()));
+        let cwd = repo.join("engine/tests");
+        std::fs::create_dir_all(&cwd).expect("a folder two levels below the root");
+        assert_eq!(git_branch(&cwd, &home), Some("main".to_string()));
+
+        // A worktree: `.git` is a file naming another folder, and that folder's
+        // HEAD names the branch.
+        let worktree = home.join("projects/atlas-w1");
+        std::fs::create_dir_all(&worktree).expect("the worktree folder");
+        let gitdir = tmp.path().join("git/worktrees/w1");
+        std::fs::create_dir_all(&gitdir).expect("the worktree's git dir");
+        std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/atlas-w1\n").expect("HEAD");
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .expect("the .git file");
+        assert_eq!(git_branch(&worktree, &home), Some("atlas-w1".to_string()));
 
         std::fs::write(
             git.join("HEAD"),
             "9c2f3b7d5e1a4c6b8d0f2e4a6c8b0d2f4e6a8c0b\n",
         )
         .expect("a detached HEAD");
-        assert_eq!(git_branch(tmp.path()), None);
+        assert_eq!(git_branch(&repo, &home), None);
     }
 }

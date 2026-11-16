@@ -368,6 +368,21 @@ pub fn host_name(explicit: Option<&str>) -> Result<String, PathsError> {
     Ok(name.to_ascii_lowercase())
 }
 
+/// The user name of the status line's `user@host`: `$USER` on Unix,
+/// `%USERNAME%` on Windows. The operating system's naming difference belongs
+/// here, not at the caller. Not set is an error the line shows, never a made-up
+/// name.
+pub fn user_name() -> Result<String, String> {
+    #[cfg(windows)]
+    let variable = "USERNAME";
+    #[cfg(not(windows))]
+    let variable = "USER";
+    match std::env::var(variable) {
+        Ok(name) if !name.is_empty() => Ok(name),
+        _ => Err(format!("{variable} is not set")),
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn machine_host_name() -> Result<String, PathsError> {
     const FILE: &str = "/proc/sys/kernel/hostname";
@@ -468,6 +483,15 @@ mod tests {
         }
         for name in ["atlas", "9vega", "vega-2.lan", "a"] {
             assert_eq!(host_name(Some(name)).unwrap(), name);
+        }
+    }
+
+    #[test]
+    fn the_user_name_is_the_environments_variable() {
+        let variable = if cfg!(windows) { "USERNAME" } else { "USER" };
+        match std::env::var(variable) {
+            Ok(name) if !name.is_empty() => assert_eq!(user_name().unwrap(), name),
+            _ => assert_eq!(user_name().unwrap_err(), format!("{variable} is not set")),
         }
     }
 

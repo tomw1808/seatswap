@@ -49,7 +49,7 @@ All notable changes to this project are documented here. The format follows
 - Auto-burn goes back to the account that produced the running sessions' thinking when two
   accounts are about equally good.
 - `usable` in `seatswap status --json` (whether an account can be used right now), `slackHours` in
-  every view while known, and `autoBurn` and `next` at the top level.
+  every view while known, and `autoBurn`, `next` and `burnError` at the top level.
 
 **History and statistics**
 - A history of every usage reading, finished window, switch and agent call, plus the tokens each

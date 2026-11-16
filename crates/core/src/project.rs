@@ -103,7 +103,11 @@ pub fn canonical_cwd(cwd: &str) -> String {
 /// `.git`. The ancestors are looked at even when `cwd` no longer exists (a
 /// deleted worktree folder). When `cwd` is inside `home`, the walk stops before
 /// `home`: only the folders strictly below `home` can be a repository root.
-fn repository_root(cwd: &Path, home: &Path) -> Option<PathBuf> {
+///
+/// This is the one walk from a folder to its repository. [`identify`] and the
+/// status line's branch both use it, so a session in a subfolder of a
+/// repository, and a worktree, belong to the same repository everywhere.
+pub fn repository_root(cwd: &Path, home: &Path) -> Option<PathBuf> {
     let cwd_parts: Vec<Component> = cwd.components().collect();
     let home_parts: Vec<Component> = home.components().collect();
     let inside_home =
@@ -134,8 +138,9 @@ fn origin_url(root: &Path) -> Option<String> {
 
 /// The folder holding the repository's data: `.git` itself, or what a `.git`
 /// file's "gitdir: <path>" names. A relative path is relative to the folder
-/// holding the `.git` file.
-fn git_dir(dot_git: &Path) -> Option<PathBuf> {
+/// holding the `.git` file. The status line reads `HEAD` from this folder, so it
+/// finds a worktree's branch too.
+pub fn git_dir(dot_git: &Path) -> Option<PathBuf> {
     let metadata = fs::metadata(dot_git).ok()?;
     if metadata.is_dir() {
         return Some(dot_git.to_path_buf());

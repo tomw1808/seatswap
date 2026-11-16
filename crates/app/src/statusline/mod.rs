@@ -6,7 +6,9 @@
 //! the line shows besides the payload; `render_spans` fits it to the terminal
 //! and `ansi` turns the spans into the command's one line.
 
-use chrono::{DateTime, TimeZone, Utc};
+#[cfg(any(feature = "gui", test))]
+use chrono::TimeZone;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use seatswap_core::api::Usage;
@@ -15,7 +17,9 @@ use seatswap_core::burn::burn_next;
 use seatswap_core::engine::UsageCache;
 use seatswap_core::feed::{self, Feed, FeedLimit};
 use seatswap_core::paths::{self, AppPaths};
-use seatswap_core::store::{Account, AccountsFile, SegmentKind, Settings, StatuslineConfig};
+use seatswap_core::store::{Account, AccountsFile, Settings};
+#[cfg(any(feature = "gui", test))]
+use seatswap_core::store::{SegmentKind, StatuslineConfig};
 use seatswap_core::switcher::LiveState;
 
 use crate::gui::ipc;
@@ -23,21 +27,22 @@ use crate::gui::ipc;
 pub(crate) mod render;
 pub(crate) mod width;
 
-use render::{git_branch, AccountFacts, Facts, Limit2, Span};
+#[cfg(any(feature = "gui", test))]
+use render::Span;
+use render::{git_branch, AccountFacts, Facts, Limit2};
 
 /// The status line payload of `specs/plan/README.md` §5, whole. The preview
 /// draws [`preview_payload`] instead; this is the tests' copy of README §5.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) const README_PAYLOAD: &str = r#"{"workspace":{"current_dir":"/home/sam/projects/atlas"},"model":{"id":"claude-fable-5-2","display_name":"Fable 5.2"},"effort":{"level":"high"},"rate_limits":{"five_hour":{"used_percentage":12,"resets_at":1794490200},"seven_day":{"used_percentage":48,"resets_at":1794790800}}}"#;
 
 /// The branch the preview's made-up session is on. The preview's folder does
 /// not exist on the machine, so `.git/HEAD` has no branch to read.
+#[cfg(any(feature = "gui", test))]
 const PREVIEW_BRANCH: &str = "main";
 
 /// The parts of the payload seatswap reads. Unknown keys are ignored: Claude
 /// Code adds keys with new versions. A key that is missing or `null` is `None`.
-// used by the statusline command (step B, Task 2)
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Deserialize, Default)]
 pub(crate) struct Payload {
     /// The whole payload as Claude Code sent it, for the fields that are not
@@ -51,16 +56,12 @@ pub(crate) struct Payload {
 }
 
 /// `workspace.current_dir`: the session's folder.
-// used by the statusline command (step B, Task 2)
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Deserialize)]
 pub(crate) struct Workspace {
     pub current_dir: Option<String>,
 }
 
 /// The model's id (coloured by family) and display name (printed).
-// used by the statusline command (step B, Task 2)
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Deserialize)]
 pub(crate) struct Model {
     pub id: Option<String>,
@@ -68,16 +69,12 @@ pub(crate) struct Model {
 }
 
 /// The current effort level (`low`, `medium`, `high`, `xhigh`, `max`).
-// used by the statusline command (step B, Task 2)
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Deserialize)]
 pub(crate) struct Effort {
     pub level: Option<String>,
 }
 
 /// The live limits of the session's account; absent until its first answer.
-// used by the statusline command (step B, Task 2)
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Deserialize)]
 pub(crate) struct RateLimits {
     pub five_hour: Option<RateLimit>,
@@ -85,8 +82,6 @@ pub(crate) struct RateLimits {
 }
 
 /// One limit: a whole percent and the reset in seconds since the epoch.
-// used by the statusline command (step B, Task 2)
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Deserialize)]
 pub(crate) struct RateLimit {
     pub used_percentage: f64,
@@ -98,8 +93,6 @@ pub(crate) struct RateLimit {
 /// input was. `raw` keeps what was parsed, or `null` when it was not JSON. A
 /// present key of the wrong type is an error for the whole typed payload (the
 /// `RateLimit` fields are not optional), so it is defaulted too.
-// used by the statusline command (step B, Task 2)
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn parse(stdin: &[u8]) -> Payload {
     let raw: serde_json::Value = serde_json::from_slice(stdin).unwrap_or_default();
     let mut payload: Payload = serde_json::from_value(raw.clone()).unwrap_or_default();
@@ -111,7 +104,7 @@ pub(crate) fn parse(stdin: &[u8]) -> Payload {
 /// `home/projects/atlas` and the keys Claude Code sends after a session's first
 /// answer (its context window, cost, lines and prompt). The numbers are the
 /// fixture's samples; only the account's numbers on the preview line are live.
-#[cfg_attr(not(any(feature = "gui", test)), allow(dead_code))]
+#[cfg(any(feature = "gui", test))]
 pub(crate) fn preview_payload(home: &std::path::Path) -> Payload {
     let folder = home.join("projects").join("atlas");
     let raw = serde_json::json!({
@@ -352,7 +345,7 @@ pub(crate) fn record_keys(
 
 /// How long a recording lasts: 1 to 60 minutes from `now`. 0 and more than 60
 /// are refused with the reason; the page only asks for 1.
-#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+#[cfg(any(feature = "gui", test))]
 pub(crate) fn record_until(minutes: u32, now: DateTime<Utc>) -> Result<DateTime<Utc>, String> {
     if !(1..=60).contains(&minutes) {
         return Err(format!("a recording lasts 1 to 60 minutes, got {minutes}"));
@@ -396,6 +389,22 @@ pub(crate) trait FactsSource {
     fn usage(&self, account_id: &str, feed: Option<&Feed>) -> Option<Usage>;
     fn model_limits(&self, account_id: &str) -> Vec<(String, f64)>;
     fn burn_next(&self, now: DateTime<Utc>) -> Result<Option<(String, DateTime<Utc>)>, String>;
+}
+
+/// The per-model weekly limits of `usage`: each scoped limit's model and
+/// percent. The one body both [`FactsSource`]s use for
+/// [`FactsSource::model_limits`], so the command and the preview cannot drift
+/// apart.
+pub(crate) fn model_limits_of(usage: &Usage) -> Vec<(String, f64)> {
+    usage
+        .weekly_scoped()
+        .filter_map(|limit| {
+            limit
+                .model
+                .as_ref()
+                .map(|model| (model.clone(), limit.percent))
+        })
+        .collect()
 }
 
 /// The command's source: the files it read without a lock.
@@ -444,17 +453,7 @@ impl FactsSource for AccountsFacts<'_> {
             .entries
             .get(account_id)
             .and_then(|entry| entry.usage.as_ref())
-            .map(|usage| {
-                usage
-                    .weekly_scoped()
-                    .filter_map(|limit| {
-                        limit
-                            .model
-                            .as_ref()
-                            .map(|model| (model.clone(), limit.percent))
-                    })
-                    .collect()
-            })
+            .map(model_limits_of)
             .unwrap_or_default()
     }
 
@@ -526,7 +525,7 @@ pub(crate) fn facts_from_source<S: FactsSource>(
         .workspace
         .as_ref()
         .and_then(|workspace| workspace.current_dir.as_deref())
-        .and_then(|folder| git_branch(std::path::Path::new(folder)));
+        .and_then(|folder| git_branch(std::path::Path::new(folder), home));
     let burn_next = source.burn_next(now)?;
     Ok(Facts {
         user,
@@ -543,7 +542,7 @@ pub(crate) fn facts_from_source<S: FactsSource>(
 }
 
 /// One test case of the preview: the live data, or one number changed.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(any(feature = "gui", test))]
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum Scenario {
@@ -553,7 +552,7 @@ pub(crate) enum Scenario {
     NoSessionLimit,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(any(feature = "gui", test))]
 impl Scenario {
     /// This scenario's numbers. Each case changes only the one value it names.
     fn facts(self, mut facts: Facts) -> Facts {
@@ -585,7 +584,7 @@ impl Scenario {
 
 /// One width of the preview: the fitted spans, the drop numbers removed, and
 /// the sentence about them.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(any(feature = "gui", test))]
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PreviewLine {
@@ -599,7 +598,7 @@ pub(crate) struct PreviewLine {
 /// is made up: its folder is the payload's, its branch is [`PREVIEW_BRANCH`] and
 /// only the account's numbers come from `facts`. A width of 0 or an empty list
 /// is an error: the preview must show a line, not silently skip it.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(any(feature = "gui", test))]
 pub(crate) fn preview_lines<Tz: TimeZone>(
     config: &StatuslineConfig,
     payload: &Payload,
@@ -635,7 +634,7 @@ where
 
 /// What a preview says about the segments the fitting dropped, one label per
 /// kind, from the store's one kind table.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(any(feature = "gui", test))]
 fn dropped_note(dropped: &[SegmentKind]) -> String {
     let mut names: Vec<&'static str> = Vec::new();
     for kind in dropped {
@@ -837,6 +836,26 @@ mod tests {
         assert_eq!(facts.account.expect("the live account").abbr, "LB");
         assert_eq!(facts.five_hour.expect("LB's session").percent, 10.0);
         assert_eq!(facts.week.expect("LB's week").percent, 40.0);
+    }
+
+    /// The per-model limits are the scoped ones, and only they: the command
+    /// and the preview ask this one function for them.
+    #[test]
+    fn the_model_limits_are_the_scoped_ones() {
+        let mut usage = usage(10.0, 40.0, at("2026-11-16T02:00:00.336716Z"));
+        usage.limits.push(Limit {
+            kind: LimitKind::WeeklyScoped,
+            percent: 62.0,
+            severity: Severity::Normal,
+            resets_at: Some(at("2026-11-16T02:00:00.336716Z")),
+            model: Some("claude-fable-5-2".to_string()),
+            is_active: false,
+        });
+
+        assert_eq!(
+            model_limits_of(&usage),
+            vec![("claude-fable-5-2".to_string(), 62.0)]
+        );
     }
 
     #[test]

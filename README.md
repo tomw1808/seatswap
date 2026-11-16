@@ -235,6 +235,13 @@ builder edits.
 The plan is visible before it runs: `seatswap burn plan` prints the regime and the lazy plan as
 time ranges, and `seatswap burn plan --json` prints the same as one object.
 
+**The status in JSON.** `seatswap status --json` prints one object for scripts: `views` (every
+account, each with `usable` and, while it is known, `slackHours`), `active` (the id in use, or
+null), `suggestion` (`{toId, text}` or null), `autoBurn` (`{on, pausedUntil}`), `next` (the id
+auto-burn would switch to, or null) and `burnError` (a history or planner error, or null). Like
+`seatswap burn plan`, `next` is planned without the sessions' thinking data, so while a session on
+a model that would lose its thinking runs it can name another account than the pop-up.
+
 To see what the two policies would have done with recorded work:
 
 ```sh

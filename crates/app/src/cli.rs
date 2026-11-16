@@ -212,8 +212,12 @@ pub(crate) enum Command {
 
     /// Print the live account and its binding limit.
     Status {
-        /// Print JSON: `views` (every account), `active` (the id of the account in use) and
-        /// `suggestion` (where to switch, or null).
+        /// Print JSON: `views` (every account, each with `usable` and, while known, `slackHours`),
+        /// `active` (the id of the account in use, or null), `suggestion` (where to switch, or
+        /// null), `autoBurn` (`{on, pausedUntil}`), `next` (the id auto-burn would switch to, or
+        /// null) and `burnError` (a history or planner error, or null). `next` is planned without
+        /// the sessions' thinking data, as `burn plan` is, so it can name another account than the
+        /// pop-up while sessions on a model that would lose their thinking run.
         #[arg(long, conflicts_with_all = ["waybar", "i3blocks"])]
         json: bool,
 
@@ -671,7 +675,7 @@ fn statusline_line(cli: &Cli, stdin: &[u8], now: DateTime<Utc>) -> Result<String
         &live,
         &cache,
         claude.home(),
-        user_name()?,
+        paths::user_name()?,
         now,
     )?;
     let line = statusline::render::ansi(
@@ -688,19 +692,6 @@ fn statusline_line(cli: &Cli, stdin: &[u8], now: DateTime<Utc>) -> Result<String
     // keys file must not cost the line or the feed above.
     let _ = statusline::record_keys(&app, &file.settings, &payload, now);
     Ok(line)
-}
-
-/// The user name of the line's `user@host`: `$USER` on Unix, `%USERNAME%` on
-/// Windows. Not set is an error the line shows, never a made-up name.
-pub(crate) fn user_name() -> Result<String, String> {
-    #[cfg(windows)]
-    let variable = "USERNAME";
-    #[cfg(not(windows))]
-    let variable = "USER";
-    match std::env::var(variable) {
-        Ok(name) if !name.is_empty() => Ok(name),
-        _ => Err(format!("{variable} is not set")),
-    }
 }
 
 /// The gate table of spec §6.2. A person is always allowed.

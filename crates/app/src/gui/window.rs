@@ -38,7 +38,7 @@ use seatswap_core::live_sessions::{
 #[cfg(feature = "gui")]
 use seatswap_core::money::{Fx, Prices};
 #[cfg(feature = "gui")]
-use seatswap_core::paths::{AppPaths, ClaudePaths};
+use seatswap_core::paths::{self, AppPaths, ClaudePaths};
 #[cfg(feature = "gui")]
 use seatswap_core::project::ProjectKey;
 #[cfg(feature = "gui")]
@@ -1041,17 +1041,7 @@ impl FactsSource for SnapshotFacts<'_> {
             .iter()
             .find(|view| view.id == account_id)
             .and_then(|view| view.usage.as_ref())
-            .map(|usage| {
-                usage
-                    .weekly_scoped()
-                    .filter_map(|limit| {
-                        limit
-                            .model
-                            .as_ref()
-                            .map(|model| (model.clone(), limit.percent))
-                    })
-                    .collect()
-            })
+            .map(statusline::model_limits_of)
             .unwrap_or_default()
     }
 
@@ -1115,7 +1105,7 @@ pub(crate) fn statusline_preview(
         &payload,
         &live_state_of(&snapshot.live),
         state.claude.home(),
-        crate::cli::user_name()?,
+        paths::user_name()?,
         now,
     )?;
     statusline::preview_lines(&config, &payload, &facts, &widths, scenario, &Local)

@@ -660,6 +660,9 @@ whatever this file says.
 ### 7.7 `seatswap burn plan` and `seatswap burn simulate`
 
 Both commands only read; for an agent they follow `agentsRead` like `status` and `list`.
+`seatswap status --json`'s `next` is planned the same way, without the sessions' thinking data, so
+it can name another account than the pop-up while sessions on a model that would lose their
+thinking run.
 
 - **`seatswap burn plan [--json]`** prints the early-switching regime and the plan auto-burn
   follows (eager while early switching is on), read the same way the tray app reads them (with no
