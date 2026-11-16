@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Datelike, Local, TimeZone, Utc};
+use chrono::{DateTime, Local, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use tauri::{
     AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, State, WebviewUrl, WebviewWindow,
@@ -1129,8 +1129,8 @@ pub(crate) fn icon_preview(abbr: String, color: String) -> Result<Vec<IconPx>, S
 /// (`format_reset_clock`), `dayClock` for a call today as `09:41`, within the
 /// last six days as `Thu 09:41`, and older as `13 Nov 09:41`, `age` of a poll
 /// or a usage fetch (`format_age`), `day` for a looked-up value's time in local
-/// time, and `date` for a calendar date without a time zone conversion
-/// (`13 Nov`).
+/// time, `date` for a calendar date without a time zone conversion (`13 Nov`),
+/// and `dayYear` for the local calendar day and year (`17 Aug 2026`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum TimeStyle {
@@ -1140,6 +1140,7 @@ pub(crate) enum TimeStyle {
     Day,
     Date,
     DayClock,
+    DayYear,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -1165,33 +1166,10 @@ where
             TimeStyle::Countdown => format::format_reset_at(time.at, now, tz),
             TimeStyle::Clock => format::format_reset_clock(time.at, now, tz),
             TimeStyle::Age => format::format_age(time.at, now),
-            TimeStyle::Day => {
-                let local = time.at.with_timezone(tz);
-                format!("{} {}", local.day(), local.format("%b"))
-            }
-            TimeStyle::Date => {
-                // A calendar date: the day as written, never moved by the
-                // time zone of the machine.
-                let date = time.at.date_naive();
-                format!("{} {}", date.day(), date.format("%b"))
-            }
-            TimeStyle::DayClock => {
-                let local = time.at.with_timezone(tz);
-                let today = now.with_timezone(tz).date_naive();
-                let days = (today - local.date_naive()).num_days();
-                if days == 0 {
-                    local.format("%H:%M").to_string()
-                } else if (1..=6).contains(&days) {
-                    local.format("%a %H:%M").to_string()
-                } else {
-                    format!(
-                        "{} {} {}",
-                        local.day(),
-                        local.format("%b"),
-                        local.format("%H:%M")
-                    )
-                }
-            }
+            TimeStyle::Day => format::day(time.at, tz),
+            TimeStyle::Date => format::date(time.at),
+            TimeStyle::DayClock => format::day_clock(time.at, now, tz),
+            TimeStyle::DayYear => format::day_year(time.at, tz),
         })
         .collect()
 }
@@ -1688,6 +1666,22 @@ mod tests {
             time_texts_at(&times, now, &Utc),
             vec!["09:41", "Thu 09:41", "Sat 09:41", "13 Nov 09:41"]
         );
+    }
+
+    /// A `dayYear` is the local calendar day: a first record on 31 Dec 23:30
+    /// UTC reads 1 Jan 2027 at UTC+1 and 31 Dec 2026 at UTC.
+    #[test]
+    fn time_texts_day_year_read_the_local_calendar_day() {
+        let times: Vec<TimeRequest> = serde_json::from_value(serde_json::json!([
+            { "at": "2026-12-31T23:30:00Z", "style": "dayYear" },
+        ]))
+        .expect("the panel's request");
+        let now = DateTime::parse_from_rfc3339("2026-12-31T23:30:00Z")
+            .expect("now")
+            .with_timezone(&Utc);
+        let plus_one = chrono::FixedOffset::east_opt(60 * 60).expect("a time zone");
+        assert_eq!(time_texts_at(&times, now, &plus_one), vec!["1 Jan 2027"]);
+        assert_eq!(time_texts_at(&times, now, &Utc), vec!["31 Dec 2026"]);
     }
 
     /// The rate's date is a calendar date: `13 Nov` also west of UTC, where a

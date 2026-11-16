@@ -1145,14 +1145,6 @@ button.link:hover {
   font-size: 12px;
 }
 
-.sess-live-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: #22c55e;
-  flex-shrink: 0;
-}
-
 .sess-unavailable,
 .sess-error,
 .sess-link-message {
@@ -2560,8 +2552,7 @@ details[open] > summary .sess-car {
   color: var(--muted);
 }
 
-.chart-click,
-.chart-head-click {
+.chart-click {
   cursor: pointer;
 }
 

@@ -56,7 +56,6 @@ const ALIASES = {
   hist: "history",
 };
 
-const NOT_YET = "Comes with a later version.";
 const MISSING = "not measured yet: it needs a few days of work";
 
 const state = {
@@ -134,24 +133,23 @@ function groupFrom(sub) {
   return { group: ALIASES[name] || null, item };
 }
 
-function labelOf(id) {
-  const group = GROUPS.find((entry) => entry.id === id);
-  return group ? group.label : "Settings";
-}
-
 // ---------------------------------------------------------------------------
 // the page and its eight groups
 // ---------------------------------------------------------------------------
 
+// The `accounts` list of the real snapshot, which always has it. A snapshot
+// without it is an error the page shows; it is never read as an empty list.
+function accountsOf(snapshot) {
+  if (!Array.isArray(snapshot.accounts)) {
+    throw new Error("the snapshot has no accounts list");
+  }
+  return snapshot.accounts;
+}
+
 // The account ids a snapshot holds, as one comparable text: only a changed
 // list makes the Accounts group read the projects again.
 function accountIdsOf(snapshot) {
-  const rows = Array.isArray(snapshot.accounts)
-    ? snapshot.accounts
-    : Array.isArray(snapshot.views)
-      ? snapshot.views
-      : [];
-  return rows
+  return accountsOf(snapshot)
     .map((row) => (isObject(row) && typeof row.id === "string" ? row.id : ""))
     .filter((id) => id !== "")
     .sort()
@@ -273,21 +271,6 @@ function renderGroup(right, id) {
   state.right = right;
   if (!GROUPS.some((group) => group.id === id)) {
     right.appendChild(panel("Settings", "", [message("Unknown setting group.")]));
-    return;
-  }
-  if (
-    ![
-      "general",
-      "accounts",
-      "auto-burn",
-      "notifications",
-      "projects",
-      "agents",
-      "providers",
-      "history",
-    ].includes(id)
-  ) {
-    right.appendChild(panel(labelOf(id), "", [message(NOT_YET)]));
     return;
   }
   if (id === "general") right.appendChild(generalCard());
@@ -634,9 +617,24 @@ async function reloadMoney() {
 }
 
 // The page's times all come from `time_texts`; the Rust side formats them.
+// A failed `time_texts` is shown once in the open group, not once for every
+// node that got its "?".
+function showTimeError(error) {
+  const text = `The times could not be read: ${errorMessage(error)}`;
+  console.warn(`[settings] ${text}`);
+  const right = state.right;
+  if (!right || right.querySelector("[data-time-error]")) return;
+  const node = message(text, "error");
+  node.dataset.timeError = "true";
+  right.appendChild(node);
+}
+
+// The page's times all come from `time_texts`; the Rust side formats them. A
+// failed request puts "?" into each node and says why once in the group.
 async function fillTimeNodes(requests) {
   if (requests.length === 0 || !state.context) return;
-  let texts;
+  let texts = null;
+  let error = null;
   try {
     texts = await state.context.invoke("time_texts", {
       times: requests.map((request) => ({ at: request.at, style: request.style })),
@@ -644,16 +642,17 @@ async function fillTimeNodes(requests) {
     if (!Array.isArray(texts) || texts.length !== requests.length) {
       throw new Error("time_texts returned an unexpected reply");
     }
-  } catch (error) {
-    console.error(`money times: ${errorMessage(error)}`);
-    texts = requests.map((request) => request.fallback || "");
+  } catch (problem) {
+    error = problem;
   }
   for (let index = 0; index < requests.length; index += 1) {
     const request = requests[index];
-    const text = `${request.prefix || ""}${texts[index] || ""}${request.suffix || ""}`;
+    const value = error ? "?" : texts[index] || "";
+    const text = `${request.prefix || ""}${value}${request.suffix || ""}`;
     if (request.attribute) request.node.setAttribute(request.attribute, text);
     else request.node.textContent = text;
   }
+  if (error) showTimeError(error);
 }
 
 // The note rows lay their parts out as flex items; a bare " · " text node loses
@@ -789,7 +788,6 @@ function rateRow(times) {
         style: "date",
         at: `${view.rate.date}T00:00:00Z`,
         prefix: "looked up ",
-        fallback: view.rate.date,
       });
     } else if (code === "USD") {
       note.textContent = "USD itself";
@@ -908,7 +906,6 @@ function apiPricesRow(times) {
         style: "clock",
         at: view.pricesCheckedAt,
         prefix: "checked ",
-        fallback: "—",
       });
     }
     if (isObject(view.lastChange) && view.lastChange.at) {
@@ -927,7 +924,6 @@ function apiPricesRow(times) {
         at: view.lastChange.at,
         prefix: "last change ",
         suffix: parts.length > 0 ? `: ${parts.join(", ")}` : "",
-        fallback: "—",
       });
     }
   }
@@ -950,7 +946,6 @@ function apiPricesRow(times) {
         node: day,
         style: "day",
         at: view.pricesCheckedAt,
-        fallback: "—",
       });
     } else {
       error.appendChild(document.createTextNode(" · nothing is stored yet"));
@@ -1071,7 +1066,6 @@ function priceRow(row, times) {
       at: row.since,
       prefix: "since ",
       attribute: "title",
-      fallback: row.since,
     });
   }
   const grid = h("div", { class: "lr price-grid" });
@@ -1213,13 +1207,12 @@ function addModelRow() {
 // ---------------------------------------------------------------------------
 
 function accountRows() {
-  const snapshot = state.snapshot || {};
-  if (Array.isArray(snapshot.accounts)) return snapshot.accounts;
-  return Array.isArray(snapshot.views) ? snapshot.views : [];
+  return accountsOf(state.snapshot || {});
 }
 
-// Task 4 adds `settings.currency`; until then a missing code is said as such
-// and no made-up code is put beside a price.
+// The currency code saved under General: three capital letters, or null when
+// none is set. Without one, a price says its currency is unknown and
+// `amountText` writes "—" instead of a made-up code.
 function currencyCode() {
   const value = state.settings && state.settings.currency;
   return typeof value === "string" && /^[A-Z]{3}$/.test(value) ? value : null;
@@ -1279,7 +1272,12 @@ function accountsCard() {
   );
   body.appendChild(
     note([
-      "Account and plan come from the login and cannot be changed here. Price is what you pay per month, in the currency set under General. It turns percent into money, so accounts can be added up. Auto-burn may use it: switch it off for an account that should be left alone.",
+      h("b", { text: "Account and plan" }),
+      " come from the login and cannot be changed here. ",
+      h("b", { text: "Price" }),
+      " is what you pay per month, in the currency set under General. It turns percent into money, so accounts can be added up. ",
+      h("b", { text: "Auto-burn may use it:" }),
+      " switch it off for an account that should be left alone.",
     ])
   );
   return card;
@@ -2159,10 +2157,6 @@ function burn() {
   return isObject(state.snapshot.burn) ? state.snapshot.burn : null;
 }
 
-function percentText(value) {
-  return shortPercent(value);
-}
-
 // The window share is the range over the accounts auto-burn may use; one value
 // when they agree.
 function measuredText(measured) {
@@ -2177,12 +2171,12 @@ function measuredText(measured) {
     const low = Math.min(...values);
     const high = Math.max(...values);
     const share =
-      low === high ? percentText(low) : `${percentText(low)}–${percentText(high)}`;
+      low === high ? shortPercent(low) : `${shortPercent(low)}–${shortPercent(high)}`;
     parts.push(`a full 5 h window is about ${share} % of a week`);
   }
   const cost = measured.switchCostPercentOfWindow;
   if (Number.isFinite(cost)) {
-    parts.push(`a switch costs about ${percentText(cost)} % of a window`);
+    parts.push(`a switch costs about ${shortPercent(cost)} % of a window`);
   } else {
     parts.push(`a switch cost is ${MISSING}`);
   }
@@ -2194,7 +2188,7 @@ function switchesNote(view) {
   if (!view.early) return "early switching is off";
   const value = view.measured ? view.measured.switchesPerDay : null;
   if (!Number.isFinite(value)) return MISSING;
-  return `about ${percentText(value)} switches a day`;
+  return `about ${shortPercent(value)} switches a day`;
 }
 
 function autoBurnCard() {
@@ -2662,7 +2656,7 @@ function renderHosts(container, view, error) {
       const stale = !Number.isFinite(age) || now - age > HOST_STALE_MS;
       const text = h("span");
       last = h("span", { class: stale ? "sw warn" : "sw ok" }, [text]);
-      times.push({ node: text, style: "age", at: info.lastRecord, fallback: "" });
+      times.push({ node: text, style: "age", at: info.lastRecord });
     } else {
       last = h("span", { class: "mf", text: "no record yet" });
     }
@@ -2672,11 +2666,10 @@ function renderHosts(container, view, error) {
       const date = h("span");
       times.push({
         node: date,
-        style: "date",
+        style: "dayYear",
         at: info.firstRecord,
-        fallback: info.firstRecord.slice(0, 10),
       });
-      since = h("span", {}, [date, document.createTextNode(` ${info.firstRecord.slice(0, 4)}`)]);
+      since = h("span", {}, [date]);
       if (info.thisHost) since.appendChild(document.createTextNode(" · this host"));
     } else {
       since = h("span", { class: "mf", text: "—" });
@@ -2772,12 +2765,21 @@ function importRow() {
     noteChildren.push(line);
   }
   const result = h("span", { class: "mf" }, noteChildren);
+  const sub = h("span");
+  const note = h("span", { class: "mf" }, [result, sub]);
+  const paintSub = () => {
+    sub.textContent = result.hasChildNodes()
+      ? " · for hosts without a synced folder"
+      : "for hosts without a synced folder";
+  };
+  paintSub();
   const run = async () => {
     const from = String(state.importFolder || "").trim();
     if (from === "") {
       state.importResult = "";
       state.importConflicts = [];
       result.textContent = "";
+      paintSub();
       fieldError("historyImport", "enter a folder path");
       return;
     }
@@ -2811,6 +2813,7 @@ function importRow() {
       state.importResult = "";
       state.importConflicts = [];
       result.textContent = "";
+      paintSub();
       fieldError("historyImport", errorMessage(error));
       return;
     }
@@ -2823,7 +2826,7 @@ function importRow() {
       input,
       h("button", { type: "button", class: "hbtn xs", onclick: run }, "Import"),
     ]),
-    result,
+    note,
     "historyImport"
   );
 }

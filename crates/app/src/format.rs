@@ -3,6 +3,8 @@
 //! The CLI and the tray must show the same percentages, reset times and
 //! tooltips, so there is exactly one copy of each format here.
 
+#[cfg(feature = "gui")]
+use chrono::Datelike;
 use chrono::{DateTime, FixedOffset, TimeZone, Utc};
 
 use seatswap_core::api::{LimitKind, LoadLevel, Usage};
@@ -168,6 +170,63 @@ pub(crate) fn clock(at: DateTime<Utc>, now: DateTime<Utc>, offset: FixedOffset) 
 /// The local weekday and clock (spec §7.4.5), as in "resets on Mon 02:00".
 pub(crate) fn weekday_clock(at: DateTime<Utc>, offset: FixedOffset) -> String {
     at.with_timezone(&offset).format("%a %H:%M").to_string()
+}
+
+/// A locally read day and month, as in `13 Nov`.
+#[cfg(feature = "gui")]
+pub(crate) fn day<Tz: TimeZone>(at: DateTime<Utc>, tz: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    let local = at.with_timezone(tz);
+    format!("{} {}", local.day(), local.format("%b"))
+}
+
+/// A calendar date as written, never moved by the time zone of the machine:
+/// `13 Nov`.
+#[cfg(feature = "gui")]
+pub(crate) fn date(at: DateTime<Utc>) -> String {
+    let date = at.date_naive();
+    format!("{} {}", date.day(), date.format("%b"))
+}
+
+/// A local call time: `09:41` today, `Thu 09:41` within the last six days,
+/// and `13 Nov 09:41` older.
+#[cfg(feature = "gui")]
+pub(crate) fn day_clock<Tz: TimeZone>(at: DateTime<Utc>, now: DateTime<Utc>, tz: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    let local = at.with_timezone(tz);
+    let today = now.with_timezone(tz).date_naive();
+    let days = (today - local.date_naive()).num_days();
+    if days == 0 {
+        local.format("%H:%M").to_string()
+    } else if (1..=6).contains(&days) {
+        local.format("%a %H:%M").to_string()
+    } else {
+        format!(
+            "{} {} {}",
+            local.day(),
+            local.format("%b"),
+            local.format("%H:%M")
+        )
+    }
+}
+
+/// The local calendar day and year, as in `17 Aug 2026`.
+#[cfg(feature = "gui")]
+pub(crate) fn day_year<Tz: TimeZone>(at: DateTime<Utc>, tz: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    let local = at.with_timezone(tz);
+    format!(
+        "{} {} {}",
+        local.day(),
+        local.format("%b"),
+        local.format("%Y")
+    )
 }
 
 /// The compact duration of `seconds`: `35m`, `2h`, `2h05m`, `1d3h` (spec
@@ -428,6 +487,15 @@ mod tests {
         assert_eq!(format_age(now - Duration::minutes(5), now), "5 min ago");
         assert_eq!(format_age(now - Duration::hours(2), now), "2 h ago");
         assert_eq!(format_age(now - Duration::days(3), now), "3 d ago");
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn a_day_year_is_the_local_calendar_day() {
+        let at = utc("2026-12-31T23:30:00Z");
+        let plus_one = FixedOffset::east_opt(60 * 60).expect("offset");
+        assert_eq!(day_year(at, &plus_one), "1 Jan 2027");
+        assert_eq!(day_year(at, &Utc), "31 Dec 2026");
     }
 
     #[cfg(feature = "gui")]

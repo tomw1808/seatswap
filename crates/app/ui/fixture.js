@@ -10,6 +10,10 @@ import { fixtureStats } from "./fixture-stats.js";
 // is test data for the bench, not a second behaviour of the app.
 let pendingRefusal = null;
 
+// The bench's time-text failure: `time_texts` throws this text until the page
+// is loaded again, so the page's own "?" and its error message can be checked.
+let timeTextsError = null;
+
 export function refuseNextFixtureCall(command, text) {
   pendingRefusal = {
     command: String(command),
@@ -164,6 +168,14 @@ function exposeFixtureHooks() {
       publishFixtureChange();
       return view.spend24hError;
     },
+    timeTextsFail(text) {
+      if (!fixture) throw new Error("fixture is not ready");
+      if (typeof text !== "string" || text === "") {
+        throw new Error(`a time-text error is needed, not ${JSON.stringify(text)}`);
+      }
+      timeTextsError = text;
+      return timeTextsError;
+    },
     providersOff() {
       if (!fixture) throw new Error("fixture is not ready");
       fixtureSaveSetting(fixture, "codexCard", false);
@@ -260,10 +272,7 @@ function makeFixture() {
         abbr: "PR",
         color: "#8b5cf6",
         email: "sam.private@mail.example",
-        orgName: "sam",
         plan: "Ultra",
-        price: 180.0,
-        priceCurrency: "USD",
         autoBurn: true,
         isActive: false,
         loginState: "ok",
@@ -299,6 +308,8 @@ function makeFixture() {
           ],
           extraUsageEnabled: false,
         },
+        usable: true,
+        blockedUntil: null,
         fetchedAt: isoIn(-8 * 60000),
         lastError: null,
       },
@@ -308,10 +319,7 @@ function makeFixture() {
         abbr: "LB",
         color: "#10b981",
         email: "sam@lab.example",
-        orgName: "sam",
         plan: "Max",
-        price: null,
-        priceCurrency: null,
         autoBurn: true,
         isActive: false,
         loginState: "ok",
@@ -338,6 +346,8 @@ function makeFixture() {
           ],
           extraUsageEnabled: false,
         },
+        usable: true,
+        blockedUntil: null,
         fetchedAt: isoIn(-60000),
         lastError: null,
       },
@@ -347,10 +357,7 @@ function makeFixture() {
         abbr: "AC",
         color: "#3b82f6",
         email: "sam@acme.example",
-        orgName: "acme",
         plan: "Team 5x",
-        price: 320.0,
-        priceCurrency: "EUR",
         autoBurn: true,
         isActive: true,
         loginState: "ok",
@@ -385,8 +392,60 @@ function makeFixture() {
           ],
           extraUsageEnabled: false,
         },
+        usable: true,
+        blockedUntil: null,
         fetchedAt: isoIn(-12000),
         lastError: null,
+      },
+    ],
+    // The stored accounts behind the views, as `gui/worker.rs`'s `AccountRow`:
+    // the Accounts group needs `orgName`, `price` and `priceCurrency`, which an
+    // `AccountView` does not hold.
+    accounts: [
+      {
+        id: privateId,
+        label: "Private",
+        abbr: "PR",
+        color: "#8b5cf6",
+        email: "sam.private@mail.example",
+        orgName: "sam",
+        plan: "Ultra",
+        price: 180.0,
+        priceCurrency: "USD",
+        autoBurn: true,
+        loginEndsAtMs: Date.now() + 4 * day,
+        loginDaysLeft: 4,
+        isActive: false,
+      },
+      {
+        id: labId,
+        label: "Lab",
+        abbr: "LB",
+        color: "#10b981",
+        email: "sam@lab.example",
+        orgName: "sam",
+        plan: "Max",
+        price: null,
+        priceCurrency: null,
+        autoBurn: true,
+        loginEndsAtMs: Date.now() + 12 * day,
+        loginDaysLeft: 12,
+        isActive: false,
+      },
+      {
+        id: acmeId,
+        label: "Acme",
+        abbr: "AC",
+        color: "#3b82f6",
+        email: "sam@acme.example",
+        orgName: "acme",
+        plan: "Team 5x",
+        price: 320.0,
+        priceCurrency: "EUR",
+        autoBurn: true,
+        loginEndsAtMs: Date.now() + 41 * day,
+        loginDaysLeft: 41,
+        isActive: true,
       },
     ],
     activeId: acmeId,
@@ -437,7 +496,7 @@ function makeFixture() {
         allowed: true,
       },
     ],
-    warnings: [{ kind: "soon", id: labId, daysLeft: 4 }],
+    warnings: [{ kind: "soon", id: privateId, daysLeft: 4 }],
     pending: null,
     secretsWarning: null,
     lastPollAt: isoIn(-12000),
@@ -774,28 +833,48 @@ function fixtureCreateFromLive(fixture, labelValue) {
   const label = String(labelValue || "").trim().slice(0, 40);
   if (!label) throw new Error("invalid label: use 1 to 40 characters");
   const color = PALETTE.find((candidate) => !fixture.views.some((view) => view.color === candidate));
+  const id = fixtureId();
+  const abbr = fixtureUniqueAbbr(fixture, label);
+  const loginEndsAtMs = Date.now() + 30 * 86400000;
   const account = {
-    id: fixtureId(),
+    id,
     label,
-    abbr: fixtureUniqueAbbr(fixture, label),
+    abbr,
     color: color || PALETTE[0],
     email: fixture.live.email || null,
+    orgName: fixture.live.orgName || null,
     plan: "Ultra",
     price: null,
     priceCurrency: null,
     autoBurn: true,
+    loginEndsAtMs,
+    loginDaysLeft: 30,
+    isActive: false,
+  };
+  const view = {
+    id,
+    label,
+    abbr,
+    color: account.color,
+    email: account.email,
+    plan: account.plan,
+    autoBurn: account.autoBurn,
     isActive: false,
     loginState: "ok",
-    loginEndsAtMs: Date.now() + 30 * 86400000,
+    loginEndsAtMs,
     loginDaysLeft: 30,
     usage: null,
+    usable: true,
+    blockedUntil: null,
     fetchedAt: null,
     lastError: null,
   };
-  fixture.views.push(account);
-  for (const view of fixture.views) view.isActive = view.id === account.id;
-  fixture.activeId = account.id;
-  fixture.live = { kind: "known", accountId: account.id };
+  fixture.accounts.push(account);
+  fixture.views.push(view);
+  for (const entry of fixture.views) entry.isActive = entry.id === id;
+  for (const entry of fixture.accounts) entry.isActive = entry.id === id;
+  fixture.activeId = id;
+  fixture.live = { kind: "known", accountId: id };
   if (fixture.burn) fixture.burn.suggestion = null;
   fixture.lastPollAt = new Date().toISOString();
   return account;
@@ -1001,8 +1080,8 @@ function fixtureSaveSetting(fixture, field, value) {
 // page in a browser.
 // ---------------------------------------------------------------------------
 
-function fixtureAccountRef(view) {
-  return { acc: view.id, org: `org:${view.orgName || view.id}` };
+function fixtureAccountRef(account) {
+  return { acc: account.id, org: `org:${account.orgName || account.id}` };
 }
 
 function fixtureIdText(id) {
@@ -1020,9 +1099,9 @@ function fixtureProjectView(fixture) {
   return {
     projects: clone(fixture.projectView.projects),
     orgs: clone(fixture.projectView.orgs),
-    accountRefs: fixture.views.map((view) => ({
-      id: view.id,
-      account: fixtureAccountRef(view),
+    accountRefs: fixture.accounts.map((account) => ({
+      id: account.id,
+      account: fixtureAccountRef(account),
     })),
   };
 }
@@ -1135,8 +1214,8 @@ function fixtureEditProject(fixture, edit) {
     }
     case "accountOrg": {
       const ref =
-        fixture.views
-          .map((view) => fixtureAccountRef(view))
+        fixture.accounts
+          .map((account) => fixtureAccountRef(account))
           .find((entry) => fixtureSameRef(entry, edit.account)) || null;
       if (!ref) throw new Error("unknown account");
       for (const org of view.orgs) {
@@ -1910,10 +1989,9 @@ export async function fixtureInvoke(command, args) {
   switch (command) {
     case "get_snapshot": {
       const snapshot = clone(fixture);
-      snapshot.accounts = fixture.views.map((view) => clone(view));
       delete snapshot.projectView;
-      // The stored views stay in the fixture; the snapshot carries the list
-      // its settings open, as the Rust one does.
+      // The stored views and accounts stay in the fixture; the snapshot carries
+      // the lists the Rust one does.
       delete snapshot.providerCardViews;
       return snapshot;
     }
@@ -1950,6 +2028,7 @@ export async function fixtureInvoke(command, args) {
       }
       fixture.pending = null;
       for (const view of fixture.views) view.isActive = view.id === target.id;
+      for (const account of fixture.accounts) account.isActive = account.id === target.id;
       fixture.activeId = target.id;
       fixture.live = { kind: "known", accountId: target.id };
       if (fixture.burn) fixture.burn.suggestion = null;
@@ -1979,10 +2058,12 @@ export async function fixtureInvoke(command, args) {
 
     case "edit_account": {
       const key = String(args.key || "");
-      const account = fixture.views.find(
-        (view) => view.id === key || String(view.abbr).toLowerCase() === key.toLowerCase()
+      const view = fixture.views.find(
+        (entry) => entry.id === key || String(entry.abbr).toLowerCase() === key.toLowerCase()
       );
-      if (!account) throw new Error(`unknown account ${key}`);
+      if (!view) throw new Error(`unknown account ${key}`);
+      const account = fixture.accounts.find((entry) => entry.id === view.id);
+      if (!account) throw new Error(`the account ${key} has no stored row`);
       const label = args.label === undefined || args.label === null
         ? account.label
         : String(args.label).trim();
@@ -2000,7 +2081,7 @@ export async function fixtureInvoke(command, args) {
           `invalid abbreviation ${JSON.stringify(abbr)}: use 1-2 letters A-Z or digits`
         );
       }
-      if (fixture.views.some((view) => view.id !== account.id && view.abbr === abbr)) {
+      if (fixture.views.some((entry) => entry.id !== view.id && entry.abbr === abbr)) {
         throw new Error(`abbreviation ${JSON.stringify(abbr)} is already used by another account`);
       }
       const color = (args.color === undefined || args.color === null
@@ -2043,10 +2124,12 @@ export async function fixtureInvoke(command, args) {
           priceCurrency = code;
         }
       }
-      account.label = label;
-      account.abbr = abbr;
-      account.color = color;
-      account.autoBurn = autoBurn;
+      for (const entry of [view, account]) {
+        entry.label = label;
+        entry.abbr = abbr;
+        entry.color = color;
+        entry.autoBurn = autoBurn;
+      }
       account.price = price;
       account.priceCurrency = priceCurrency;
       return clone(account);
@@ -2060,6 +2143,7 @@ export async function fixtureInvoke(command, args) {
       if (index < 0) throw new Error(`unknown account ${key}`);
       const removed = fixture.views[index];
       fixture.views.splice(index, 1);
+      fixture.accounts = fixture.accounts.filter((account) => account.id !== removed.id);
       if (fixture.live.kind === "known" && fixture.live.accountId === removed.id) {
         fixture.live = {
           kind: "unknown",
@@ -2069,6 +2153,7 @@ export async function fixtureInvoke(command, args) {
       }
       if (fixture.activeId === removed.id) fixture.activeId = null;
       for (const view of fixture.views) view.isActive = view.id === fixture.activeId;
+      for (const account of fixture.accounts) account.isActive = account.id === fixture.activeId;
       if (fixture.burn) fixture.burn.suggestion = null;
       if (Array.isArray(fixture.warnings)) {
         fixture.warnings = fixture.warnings.filter((warning) => warning.id !== removed.id);
@@ -2304,6 +2389,7 @@ export async function fixtureInvoke(command, args) {
     // Only a stand-in so the page can be looked at in a browser: the real
     // texts come from `format.rs`, which a browser cannot run.
     case "time_texts": {
+      if (timeTextsError) throw new Error(timeTextsError);
       const months = [
         "Jan",
         "Feb",
@@ -2331,6 +2417,10 @@ export async function fixtureInvoke(command, args) {
             return `${date.getUTCDate()} ${months[date.getUTCMonth()]}`;
           }
           return `${date.getDate()} ${months[date.getMonth()]}`;
+        }
+        if (time.style === "dayYear") {
+          // The local calendar day and year, as `TimeStyle::DayYear`.
+          return `${date.getDate()} ${months[date.getMonth()]} ${date.getFullYear()}`;
         }
         if (time.style === "dayClock") {
           const now = new Date();

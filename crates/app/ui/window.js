@@ -29,9 +29,6 @@ const AREAS = [
   },
 ];
 
-// Shown for an area whose page does not exist yet (no file under ui/areas/).
-const NOT_YET = "Comes with a later version.";
-
 const state = {
   // The target as it came from the hash or `open-area`; null only before boot.
   target: null,
@@ -149,15 +146,18 @@ async function loadArea(id) {
       id,
       import(`./areas/${id}.js`)
         .then((module) => {
+          if (!module || typeof module.render !== "function") {
+            throw new Error(`areas/${id}.js has no render function`);
+          }
           loaded.set(id, module);
           return module;
         })
         .catch((error) => {
-          // A module that does not exist yet is the normal case until its task
-          // builds it. The real reason goes to the console, where a broken
-          // module is not swallowed.
+          // A broken module (a syntax error, a bad import) must not be
+          // swallowed: its reason goes to the console, and `renderArea` puts
+          // the same message on the page.
           console.warn(`[window] cannot load areas/${id}.js`, error);
-          return null;
+          throw error;
         })
     );
   }
@@ -201,15 +201,20 @@ async function renderArea(options = {}) {
     return;
   }
 
-  const module = await loadArea(area.id);
-  if (token !== renderToken) return;
-  if (!module || typeof module.render !== "function") {
+  let module;
+  try {
+    module = await loadArea(area.id);
+  } catch (error) {
+    if (token !== renderToken) return;
     rendered = { area: area.id, module: null, busy: false, snapshot: state.snapshot };
     clear(container);
     if (state.error) container.appendChild(message(state.error, "error"));
-    container.appendChild(message(NOT_YET));
+    container.appendChild(
+      message(`This page could not be loaded: ${errorMessage(error)}`, "error")
+    );
     return;
   }
+  if (token !== renderToken) return;
   const snapshot = state.snapshot;
   rendered = { area: area.id, module: null, busy: true, snapshot };
   try {
