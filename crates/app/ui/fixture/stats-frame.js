@@ -1,6 +1,7 @@
 // The statistics fixture's shared frame: weeks, accounts, ids, money and
 // range helpers, the findings, `statsEmpty` and `answer`.
 
+import { durationText } from "../common.js";
 import { ensureFixture } from "../fixture.js";
 
 export const DAY = 86400000;
@@ -173,11 +174,6 @@ export function fixtureMoney(value, currency) {
 
 export function fixtureWholePercent(value) {
   return `${Math.round(value)} %`;
-}
-
-export function fixtureHours(value) {
-  const rounded = round1(value);
-  return Number.isInteger(rounded) ? `${rounded} h` : `${rounded.toFixed(1)} h`;
 }
 
 export function joinNames(names) {
@@ -374,7 +370,7 @@ function weekMoney(week, chosen) {
 export function findingBlocked(indexes, blockedHours, avoidableHours) {
   if (blockedHours <= 0 || indexes.length === 0) return null;
   const noun = indexes.length === 1 ? "week" : "weeks";
-  return `You were blocked ${fixtureHours(blockedHours)} in ${indexes.length} ${noun}; ${fixtureHours(avoidableHours)} of them while other quota expired.`;
+  return `You were blocked ${durationText(Math.round(blockedHours * 3600))} in ${indexes.length} ${noun}; ${durationText(Math.round(avoidableHours * 3600))} of them while other quota expired.`;
 }
 
 export function findingAutoBurn(indexes, chosen) {
@@ -403,11 +399,13 @@ export function findingAutoBurn(indexes, chosen) {
   const blockedBefore = sum(before.map((index) => BLOCKED[index])) / before.length;
   const blockedAfter = sum(after.map((index) => BLOCKED[index])) / after.length;
   const date = new Date(at).toLocaleDateString("en-GB", { day: "numeric", month: "short" });
-  return `Since auto-burn (${date}): ${fixtureHours(blockedAfter)} blocked a week, ${fixtureWholePercent(
+  return `Since auto-burn (${date}): ${durationText(
+    Math.round(blockedAfter * 3600)
+  )} blocked a week, ${fixtureWholePercent(
     (expiredAfter / paidAfter) * 100
-  )} expired. Before: ${fixtureHours(blockedBefore)}, ${fixtureWholePercent(
-    (expiredBefore / paidBefore) * 100
-  )}.`;
+  )} expired. Before: ${durationText(
+    Math.round(blockedBefore * 3600)
+  )}, ${fixtureWholePercent((expiredBefore / paidBefore) * 100)}.`;
 }
 
 export function findingFull(indexes, chosen) {

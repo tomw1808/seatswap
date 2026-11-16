@@ -322,7 +322,7 @@ impl SegmentKind {
             },
             SegmentKind::FiveHourPercent => KindSpec {
                 kind: self,
-                label: "5 h percent",
+                label: "5h percent",
                 group: PaletteGroup::Seatswap,
                 colors: &[COLOR_NONE, COLOR_BY_LOAD, COLOR_FIXED],
                 time: false,
@@ -331,7 +331,7 @@ impl SegmentKind {
             },
             SegmentKind::FiveHourReset => KindSpec {
                 kind: self,
-                label: "5 h reset",
+                label: "5h reset",
                 group: PaletteGroup::Seatswap,
                 colors: &[COLOR_NONE, COLOR_FIXED],
                 time: true,
@@ -1018,18 +1018,18 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// Check the ranges the spec fixes: poll intervals >= 30 s, a currency of
+    /// Check the ranges the spec fixes: poll intervals >= 30s, a currency of
     /// three capital letters, and the status line's rules.
     pub fn validate(&self) -> Result<(), StoreError> {
         if self.poll_active_secs < 30 {
             return Err(StoreError::InvalidSetting(format!(
-                "pollActiveSecs must be at least 30 s, got {}",
+                "pollActiveSecs must be at least 30s, got {}",
                 self.poll_active_secs
             )));
         }
         if self.poll_inactive_secs < 30 {
             return Err(StoreError::InvalidSetting(format!(
-                "pollInactiveSecs must be at least 30 s, got {}",
+                "pollInactiveSecs must be at least 30s, got {}",
                 self.poll_inactive_secs
             )));
         }

@@ -10,9 +10,9 @@ import {
   amountNode,
   clear,
   dateText,
+  durationText,
   emptyLine,
   h,
-  hoursText,
   isObject,
   kpi,
   legendItem,
@@ -137,20 +137,27 @@ export async function show(container, env) {
   root.appendChild(kpisCard);
 
   for (const lane of lanes) {
-    const parts = [`on but idle ${hoursText(lane.idle)}`, `off ${hoursText(lane.off)}`];
+    const parts = [
+      `on but idle ${durationText(Math.round(lane.idle * 3600))}`,
+      `off ${durationText(Math.round(lane.off * 3600))}`,
+    ];
     if (lane.unknown > 0) {
-      parts.push(`not known ${hoursText(lane.unknown)}`);
+      parts.push(`not known ${durationText(Math.round(lane.unknown * 3600))}`);
     }
     parts.push(`${tokenText(lane.tokens)} tokens in the range`);
     kpis.appendChild(
       kpi(
         `${lane.host} · last 7 days`,
-        `${hoursText(lane.working)} working`,
+        `${durationText(Math.round(lane.working * 3600))} working`,
         parts.join(" · "),
-        `${lane.host} | last 7 days: working ${hoursText(lane.working)} · idle ${hoursText(
-          lane.idle
-        )} · off ${hoursText(lane.off)}${
-          lane.unknown > 0 ? ` · not known ${hoursText(lane.unknown)}` : ""
+        `${lane.host} | last 7 days: working ${durationText(
+          Math.round(lane.working * 3600)
+        )} · idle ${durationText(Math.round(lane.idle * 3600))} · off ${durationText(
+          Math.round(lane.off * 3600)
+        )}${
+          lane.unknown > 0
+            ? ` · not known ${durationText(Math.round(lane.unknown * 3600))}`
+            : ""
         } | in the range: ${tokensTip(lane.tokens)} | ${valueTip(
           lane.values,
           "subscription",
@@ -599,7 +606,7 @@ export async function show(container, env) {
             name: "waited",
             color: "var(--warn)",
             values: data.waited.map(([, minutes]) => Math.round(minutes * 10) / 10),
-            unit: " min",
+            unit: "min",
             tip: (category, value) => `${category} | ${value} minutes waited for you`,
           },
         ],
@@ -669,7 +676,7 @@ export async function show(container, env) {
         row.appendChild(
           h("span", {
             class: "n",
-            text: found ? hoursText(found[1]) : "—",
+            text: found ? durationText(Math.round(found[1] * 3600)) : "—",
             title: found ? undefined : `no hour recorded on ${host} in this week`,
           })
         );
@@ -745,7 +752,12 @@ export async function show(container, env) {
               : undefined,
         })
       );
-      row.appendChild(h("span", { class: "n", text: hoursText(session.workedHours) }));
+      row.appendChild(
+        h("span", {
+          class: "n",
+          text: durationText(Math.round(session.workedHours * 3600)),
+        })
+      );
       row.appendChild(
         h("span", { class: "n", text: tokenText(session.tokens), title: tokensTip(session.tokens) })
       );

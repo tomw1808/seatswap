@@ -8,6 +8,7 @@
 //! - `burn`     auto-burn: work units, rhythm, rates, slack, plans, the decision (spec §2)
 //! - `claude_settings` the one key seatswap writes in Claude Code's settings.json
 //! - `codex_sessions` Codex's session files
+//! - `duration` every duration as one text: `2h 31min`, `12min`, `3d 4h` (review item 42)
 //! - `feed`     the status line's live numbers: its file, its account, and merging them
 //! - `harness`  DeepSeek Harness sessions: flash workers and their jobs
 //! - `history`  the history folder: record types, appending, reading a range, merging hosts
@@ -32,6 +33,7 @@ pub mod atomic;
 pub mod burn;
 pub mod claude_settings;
 pub mod codex_sessions;
+pub mod duration;
 pub mod engine;
 pub mod feed;
 pub mod harness;

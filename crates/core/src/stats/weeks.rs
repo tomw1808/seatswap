@@ -1466,7 +1466,7 @@ mod tests {
         );
         assert!(
             close(summary.blocked_hours, 2.0),
-            "the week of 2 Nov shows {} h blocked; the Overview shows 2 h for it",
+            "the week of 2 Nov shows {} blocked; the Overview shows 2h for it",
             summary.blocked_hours
         );
     }
@@ -1826,7 +1826,7 @@ mod tests {
         assert_eq!(
             detail.possible_session_windows,
             Some(8),
-            "40 typical working hours / 5 h windows"
+            "40 typical working hours / 5h windows"
         );
     }
 
@@ -1909,11 +1909,11 @@ mod tests {
         assert_eq!(
             detail.possible_session_windows,
             Some(8),
-            "40 typical working hours / 5 h windows"
+            "40 typical working hours / 5h windows"
         );
         assert!(
             detail.used_more_than_possible,
-            "the used 5 h windows ({:?}) are above the possible ones ({:?}), so the page must not \
+            "the used 5h windows ({:?}) are above the possible ones ({:?}), so the page must not \
              print \"12 used of about 8 possible in your working hours\"",
             detail.session_windows_used, detail.possible_session_windows
         );
@@ -1992,7 +1992,7 @@ mod tests {
 
         let note = window_note(&window, 20.0, false, None).unwrap_or_default();
         assert!(
-            note.contains("The last reading came 2 h before the reset; the use may be low."),
+            note.contains("The last reading came 2h before the reset; the use may be low."),
             "the note names the early reading and that the use may be low: {note:?}"
         );
         assert!(
@@ -2031,7 +2031,7 @@ mod tests {
             "the note says the first percent is missing: {note:?}"
         );
         assert!(
-            note.contains("The last reading came 3 h before the reset; the use may be low."),
+            note.contains("The last reading came 3h before the reset; the use may be low."),
             "the note names the early reading too: {note:?}"
         );
     }
@@ -2142,7 +2142,7 @@ mod tests {
             "the reset began the window and its first percent is unknown: {note:?}"
         );
         assert!(
-            note.contains("The last reading came 2 h before the reset; the use may be low."),
+            note.contains("The last reading came 2h before the reset; the use may be low."),
             "the last reading came early too: {note:?}"
         );
     }

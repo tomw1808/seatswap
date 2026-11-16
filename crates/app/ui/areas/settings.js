@@ -2199,7 +2199,7 @@ function generalCard() {
         "iconLimit",
         [
           ["binding", "The binding limit"],
-          ["session", "The 5 h session"],
+          ["session", "The 5h session"],
           ["week", "The week"],
         ],
         "The tray ring shows"
@@ -2219,7 +2219,7 @@ function generalCard() {
         step: 30,
         unit: "s",
       }),
-      "every 30 s from 90 %",
+      "every 30s from 90 %",
       "pollActiveSecs"
     )
   );
@@ -2286,13 +2286,13 @@ function measuredText(measured) {
   );
   const parts = [];
   if (values.length === 0) {
-    parts.push(`a full 5 h window is ${MISSING}`);
+    parts.push(`a full 5h window is ${MISSING}`);
   } else {
     const low = Math.min(...values);
     const high = Math.max(...values);
     const share =
       low === high ? shortPercent(low) : `${shortPercent(low)}–${shortPercent(high)}`;
-    parts.push(`a full 5 h window is about ${share} % of a week`);
+    parts.push(`a full 5h window is about ${share} % of a week`);
   }
   const cost = measured.switchCostPercentOfWindow;
   if (Number.isFinite(cost)) {
@@ -2336,7 +2336,7 @@ function autoBurnCard() {
       setting(
         "How early it switches",
         h("span", { text: "from what it has measured" }),
-        "the size of your 5 h windows and what a switch costs"
+        "the size of your 5h windows and what a switch costs"
       ),
       setting("Measured so far", h("span", { text: measuredText(view && view.measured) })),
       setting(

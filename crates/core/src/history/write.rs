@@ -1498,7 +1498,7 @@ mod tests {
                 .ollama_hours(std::slice::from_ref(&bucket))
                 .unwrap(),
             0,
-            "the same 24 h answer came again"
+            "the same 24h answer came again"
         );
 
         // A new recorder reads the line from this host's month file: still no

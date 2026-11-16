@@ -323,10 +323,10 @@ export function validateFixtureSettings(settings) {
     );
   }
   if (!Number.isInteger(merged.pollActiveSecs) || merged.pollActiveSecs < 30) {
-    throw new Error(`pollActiveSecs must be at least 30 s, got ${merged.pollActiveSecs}`);
+    throw new Error(`pollActiveSecs must be at least 30s, got ${merged.pollActiveSecs}`);
   }
   if (!Number.isInteger(merged.pollInactiveSecs) || merged.pollInactiveSecs < 30) {
-    throw new Error(`pollInactiveSecs must be at least 30 s, got ${merged.pollInactiveSecs}`);
+    throw new Error(`pollInactiveSecs must be at least 30s, got ${merged.pollInactiveSecs}`);
   }
   if (
     merged.claudeConfigDir !== null &&

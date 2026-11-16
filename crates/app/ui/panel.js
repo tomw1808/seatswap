@@ -11,6 +11,7 @@ import {
   clamp,
   clear,
   contrastText,
+  durationText,
   errorMessage,
   followTheme,
   h,
@@ -182,8 +183,11 @@ function loginWarningText(warning) {
   const account = findView(warning.id);
   const name = account ? account.label : "An account";
   if (warning.kind === "soon") {
-    const days = Number(warning.daysLeft);
-    return `${name} — login ends in ${Number.isFinite(days) ? days : "?"} d`;
+    const days = warning.daysLeft;
+    if (!Number.isInteger(days) || days < 0) {
+      throw new Error(`a login warning's daysLeft is not a day count: ${JSON.stringify(days)}`);
+    }
+    return `${name} — login ends in ${durationText(days * 86400)}`;
   }
   if (warning.kind === "tomorrow") return `${name} — login ends tomorrow`;
   if (warning.kind === "ended") return `${name} — login ended, log in again`;
@@ -429,7 +433,7 @@ function renderBurnStrip() {
     paused.appendChild(button("Resume", "ghost small", () => pauseBurn(null)));
     row.appendChild(paused);
   } else {
-    row.appendChild(button("Pause 4 h", "ghost small", () => pauseBurn(4)));
+    row.appendChild(button("Pause 4h", "ghost small", () => pauseBurn(4)));
   }
   strip.appendChild(row);
 
@@ -878,7 +882,7 @@ function renderCard(view, index) {
     let text;
     if (daysLeft < 0) text = "login ended — log in again";
     else if (daysLeft === 0) text = "login ends today";
-    else text = `login ends in ${daysLeft} d`;
+    else text = `login ends in ${durationText(daysLeft * 86400)}`;
     main.appendChild(h("div", { class: "login-ends", text }));
   }
 
@@ -1199,7 +1203,7 @@ function renderCreditRows(view, credits) {
   if (spendError !== null) {
     rows.appendChild(
       h("div", { class: "provider-row" }, [
-        h("span", { class: "provider-row-name", text: "Last 24 h" }),
+        h("span", { class: "provider-row-name", text: "Last 24h" }),
         h("span", {
           class: "provider-row-value not-read",
           text: `not read: ${spendError}`,
@@ -1210,7 +1214,7 @@ function renderCreditRows(view, credits) {
   } else if (typeof view.spend24h === "number" && Number.isFinite(view.spend24h)) {
     rows.appendChild(
       h("div", { class: "provider-row" }, [
-        h("span", { class: "provider-row-name", text: "Last 24 h" }),
+        h("span", { class: "provider-row-name", text: "Last 24h" }),
         h("span", {
           class: "provider-row-value",
           text: money(view.spend24h, "USD"),
@@ -1524,9 +1528,9 @@ function updateAge() {
   updateTimes();
 }
 
-// A time written by `updateTimes`. `style` is `countdown` (`35m`, `1h05m`,
-// `1d18h`, `Sun 02:00`), `clock` (`14:40`, `Sun 02:00`) or `age` (`12 s ago`,
-// `5 min ago`).
+// A time written by `updateTimes`. `style` is `countdown` (`35min`, `1h 5min`,
+// `1d 18h`, `Sun 02:00`), `clock` (`14:40`, `Sun 02:00`) or `age` (`12s ago`,
+// `5min ago`).
 function timeNode(iso, style, className) {
   return h("span", {
     class: className || "",

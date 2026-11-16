@@ -6494,7 +6494,7 @@ mod tests {
 
         assert!(
             state.harness_recorded.contains_key(HARNESS_JOB),
-            "a total outside the 24 h window is kept while its file exists"
+            "a total outside the 24h window is kept while its file exists"
         );
     }
 

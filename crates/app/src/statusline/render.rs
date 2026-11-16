@@ -851,7 +851,7 @@ mod tests {
     use chrono::FixedOffset;
     use seatswap_core::store::StatuslineConfig;
 
-    /// 4 h 45 min before the 5 h reset, 3 d 16 h before the weekly one.
+    /// 4 h 45 min before the 5h reset, 3 d 16 h before the weekly one.
     const NOW: i64 = 1_794_473_100;
 
     fn at(seconds: i64) -> DateTime<Utc> {
@@ -929,14 +929,14 @@ mod tests {
             Some(120),
             &offset(),
         );
-        // 58 columns left, 23 right, 35 spaces between them; the margin of 4
+        // 58 columns left, 27 right, 31 spaces between them; the margin of 4
         // stays free at the right edge.
         assert_eq!(
             visible_text(&line),
             format!(
-                "sam@atlas:{} Fable 5.2 high{}AC 12% 4h45m  48% 3d16h",
+                "sam@atlas:{} Fable 5.2 high{}AC 12% 4h 45min  48% 3d 17h",
                 crate::test_support::tilde("projects/seatswap/crates/app/ui"),
-                " ".repeat(35)
+                " ".repeat(31)
             )
         );
         assert_eq!(visible_width(&line), 116);
@@ -958,7 +958,7 @@ mod tests {
         );
         assert!(visible_text(&line).ends_with("AC 12%  48%"), "{line}");
 
-        // The next drop number removes the 5 h percent too, and the week
+        // The next drop number removes the 5h percent too, and the week
         // percent's separator leaves no gap after it.
         let line = rendered(
             &StatuslineConfig::current_line(),
@@ -982,7 +982,7 @@ mod tests {
         assert_eq!(
             visible_text(&line),
             format!(
-                "sam@atlas:{} Fable 5.2 high  AC 12% 4h45m  48% 3d16h",
+                "sam@atlas:{} Fable 5.2 high  AC 12% 4h 45min  48% 3d 17h",
                 crate::test_support::tilde("projects/seatswap/crates/app/ui")
             )
         );
@@ -1014,17 +1014,17 @@ mod tests {
             &offset(),
         );
         let text = visible_text(&line);
-        assert!(text.ends_with("AC 48% 3d16h"), "{text}");
+        assert!(text.ends_with("AC 48% 3d 17h"), "{text}");
         assert!(!text.contains("AC   48%"), "{text}");
     }
 
     #[test]
     fn compact_left_drops_a_zero_unit() {
-        assert_eq!(compact_left(17_100, false), "4h45m");
-        assert_eq!(compact_left(2_100, false), "35m");
-        assert_eq!(compact_left(316_800, true), "3d16h");
+        assert_eq!(compact_left(17_100, false), "4h 45min");
+        assert_eq!(compact_left(2_100, false), "35min");
+        assert_eq!(compact_left(316_800, true), "3d 16h");
         assert_eq!(compact_left(57_600, true), "16h");
-        assert_eq!(compact_left(-5, false), "0m");
+        assert_eq!(compact_left(-5, false), "0s");
     }
 
     #[test]
@@ -1060,7 +1060,7 @@ mod tests {
         // The value "49" and its suffix "%" are two spans; the suffix keeps the
         // value's foreground because the rule paints no background, so `ansi`
         // writes the same run as before the split.
-        let span = spans.first().expect("the 5 h percent's value span");
+        let span = spans.first().expect("the 5h percent's value span");
         assert_eq!(span.text, "49");
         assert_eq!(span.fg, Some(Color::Named(GREEN)));
         assert_eq!(
@@ -1087,9 +1087,9 @@ mod tests {
         assert_eq!(
             visible_text(&line),
             format!(
-                "sam@atlas:{} Fable 5.2 high{}AC 12% 4h45m  48% 3d16h",
+                "sam@atlas:{} Fable 5.2 high{}AC 12% 4h 45min  48% 3d 17h",
                 crate::test_support::tilde("projects/seatswap/crates/app/ui"),
-                " ".repeat(35)
+                " ".repeat(31)
             )
         );
         assert_eq!(visible_width(&line), 116);
@@ -1121,7 +1121,7 @@ mod tests {
         assert_eq!(
             visible_text(&line),
             format!(
-                "sam@atlas:{} Fable 5.2 high  AC 12% 4h45m  48% 3d16h",
+                "sam@atlas:{} Fable 5.2 high  AC 12% 4h 45min  48% 3d 17h",
                 crate::test_support::tilde("projects/seatswap/crates/app/ui")
             )
         );
@@ -1155,21 +1155,21 @@ mod tests {
 
     #[test]
     fn an_empty_zone_needs_no_gap() {
-        // "Limits only" leaves the left zone empty; its right zone prints 23
-        // columns and its margin is 4, so 27 columns fit it exactly. The old
+        // "Limits only" leaves the left zone empty; its right zone prints 27
+        // columns and its margin is 4, so 31 columns fit it exactly. The old
         // rule reserved two more for the gap and dropped both reset times.
         let limits = StatuslineConfig::limits_only();
-        let (spans, dropped) = render_spans(&limits, &payload(), &facts(), Some(27), &offset());
+        let (spans, dropped) = render_spans(&limits, &payload(), &facts(), Some(31), &offset());
         assert!(dropped.is_empty(), "nothing is dropped while the line fits");
-        assert_eq!(visible_text(&ansi(&spans)), "AC 12% 4h45m  48% 3d16h");
+        assert_eq!(visible_text(&ansi(&spans)), "AC 12% 4h 45min  48% 3d 17h");
 
-        let (spans, dropped) = render_spans(&limits, &payload(), &facts(), Some(26), &offset());
+        let (spans, dropped) = render_spans(&limits, &payload(), &facts(), Some(30), &offset());
         assert_eq!(dropped, vec![1], "one column less drops the first segments");
         let text = visible_text(&ansi(&spans));
         assert!(text.ends_with("AC 12%  48%"), "{text}");
         assert_eq!(
             visible_width(&text),
-            22,
+            26,
             "the right zone is flush with the margin"
         );
 
@@ -1177,11 +1177,11 @@ mod tests {
         let mut mirrored = StatuslineConfig::limits_only();
         mirrored.left = mirrored.right;
         mirrored.right = Vec::new();
-        let (spans, dropped) = render_spans(&mirrored, &payload(), &facts(), Some(27), &offset());
+        let (spans, dropped) = render_spans(&mirrored, &payload(), &facts(), Some(31), &offset());
         assert!(dropped.is_empty(), "nothing is dropped while the line fits");
-        assert_eq!(visible_text(&ansi(&spans)), "AC 12% 4h45m  48% 3d16h");
+        assert_eq!(visible_text(&ansi(&spans)), "AC 12% 4h 45min  48% 3d 17h");
 
-        let (spans, dropped) = render_spans(&mirrored, &payload(), &facts(), Some(26), &offset());
+        let (spans, dropped) = render_spans(&mirrored, &payload(), &facts(), Some(30), &offset());
         assert_eq!(dropped, vec![1], "one column less drops the first segments");
         assert_eq!(visible_text(&ansi(&spans)), "AC 12%  48%");
     }
@@ -1473,15 +1473,15 @@ mod tests {
         assert_eq!(preview[1].note, "everything fits");
         assert_eq!(
             preview[2].note,
-            "5 h reset, week reset and 5 h percent are dropped"
+            "5h reset, week reset and 5h percent are dropped"
         );
         assert_eq!(preview[2].dropped, vec![1, 2]);
     }
 
     #[test]
     fn the_note_names_only_the_segments_the_fitting_dropped() {
-        // The 5 h percent has a value but its reset has none, so the reset is
-        // not a piece the fitting can drop. Only the 5 h percent and the week
+        // The 5h percent has a value but its reset has none, so the reset is
+        // not a piece the fitting can drop. Only the 5h percent and the week
         // reset were on the line and removed.
         let mut live_facts = facts();
         live_facts.five_hour = Some(Limit2 {
@@ -1499,14 +1499,10 @@ mod tests {
         .expect("a preview at 60 columns");
 
         assert_eq!(
-            preview[0].note, "week reset and 5 h percent are dropped",
-            "the absent 5 h reset is not named"
+            preview[0].note, "week reset and 5h percent are dropped",
+            "the absent 5h reset is not named"
         );
-        assert!(
-            !preview[0].note.contains("5 h reset"),
-            "{}",
-            preview[0].note
-        );
+        assert!(!preview[0].note.contains("5h reset"), "{}", preview[0].note);
     }
 
     #[test]

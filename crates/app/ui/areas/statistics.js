@@ -26,8 +26,8 @@ const TAB_KEY = "seatswap.stats.tab";
 const RANGES = [
   { id: "thisWeek", label: "This week" },
   { id: "lastWeek", label: "Last week" },
-  { id: "days30", label: "30 d" },
-  { id: "days90", label: "90 d" },
+  { id: "days30", label: "30d" },
+  { id: "days90", label: "90d" },
   { id: "months12", label: "12 mo" },
   { id: "all", label: "All" },
 ];

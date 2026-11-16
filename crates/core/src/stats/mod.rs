@@ -762,8 +762,14 @@ pub(crate) fn thousands(whole: i64) -> String {
     }
 }
 
-/// Hours with at most one decimal and no `.0`: `2 h`, `0.5 h`.
+/// An hour count as a duration, rounded to the whole minute: `2h`, `30min`,
+/// `0.5 h` becomes `30min` (review item 42). A negative or non-finite count is
+/// the callers' error, as before: it keeps the old one-decimal `h` text instead
+/// of being silently turned into a duration.
 pub(crate) fn hours_text(hours: f64) -> String {
+    if hours.is_finite() && hours >= 0.0 {
+        return crate::duration::duration_text((hours * 60.0).round() as u64 * 60);
+    }
     if (hours * 10.0).round() % 10.0 == 0.0 {
         format!("{} h", hours.round() as i64)
     } else {
@@ -1757,7 +1763,7 @@ pub(crate) mod tests {
         assert_eq!(
             weeks[0].week,
             utc("2026-11-02T00:00:00Z"),
-            "the midpoint (3 Nov) is in the week of 2 Nov, not the week of end - 84 h (1 Nov)"
+            "the midpoint (3 Nov) is in the week of 2 Nov, not the week of end - 84h (1 Nov)"
         );
         assert_eq!(weeks[0].window.end, utc("2026-11-05T00:00:00Z"));
     }
@@ -2273,5 +2279,19 @@ pub(crate) mod tests {
             },
             "a Codex record moved the start of the All range"
         );
+    }
+
+    /// An hour count is a duration of the one spelling, rounded to the minute;
+    /// a negative or non-finite count keeps the old one-decimal text, as before
+    /// review item 42 (callers never pass one).
+    #[test]
+    fn an_hour_count_is_the_one_duration_spelling() {
+        assert_eq!(hours_text(2.0), "2h");
+        assert_eq!(hours_text(0.5), "30min");
+        assert_eq!(hours_text(2.5), "2h 30min");
+        assert_eq!(hours_text(141.0), "5d 21h");
+        assert_eq!(hours_text(-2.0), "-2 h");
+        assert_eq!(hours_text(f64::INFINITY), "inf h");
+        assert_eq!(hours_text(f64::NAN), "NaN h");
     }
 }

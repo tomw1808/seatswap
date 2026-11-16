@@ -377,7 +377,7 @@ fn is_reset_drop(previous_percent: Option<f64>, view: &AccountView, blocker: &Bl
 fn limit_name(blocker: &Blocker) -> String {
     match blocker {
         Blocker::Week => "its week".to_string(),
-        Blocker::Session => "its 5 h window".to_string(),
+        Blocker::Session => "its 5h window".to_string(),
         Blocker::Model(model) => format!("its {model} week"),
     }
 }
@@ -1054,12 +1054,12 @@ mod tests {
         let mut deduper = Deduper::new();
         let now = utc("2026-11-10T12:00:00Z");
         let a_to_p = snapshot(
-            Some(suggestion("p", "Switch to P now: its 5 h window is open.")),
+            Some(suggestion("p", "Switch to P now: its 5h window is open.")),
             Vec::new(),
             LiveView::NoLogin,
         );
         let a_to_p_again = snapshot(
-            Some(suggestion("p", "Switch to P now: its 5 h window is open.")),
+            Some(suggestion("p", "Switch to P now: its 5h window is open.")),
             Vec::new(),
             LiveView::NoLogin,
         );
@@ -1098,7 +1098,7 @@ mod tests {
         let mut deduper = Deduper::new();
         let now = Utc::now();
         let to_p = snapshot(
-            Some(suggestion("p", "Switch to P now: its 5 h window is open.")),
+            Some(suggestion("p", "Switch to P now: its 5h window is open.")),
             Vec::new(),
             LiveView::NoLogin,
         );
@@ -1300,7 +1300,7 @@ mod tests {
         let blocked_until = Some(utc("2026-11-10T14:40:00Z"));
         for (blocker, reason) in [
             (Blocker::Week, "its week reset"),
-            (Blocker::Session, "its 5 h window reset"),
+            (Blocker::Session, "its 5h window reset"),
             (Blocker::Model("opus".to_string()), "its opus week reset"),
         ] {
             let mut deduper = Deduper::new();

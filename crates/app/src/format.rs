@@ -8,6 +8,7 @@ use chrono::Datelike;
 use chrono::{DateTime, FixedOffset, TimeZone, Utc};
 
 use seatswap_core::api::{LimitKind, LoadLevel, Usage};
+use seatswap_core::duration::duration_text;
 use seatswap_core::engine::AccountView;
 
 /// A percentage without the `%` sign, rounded to a whole number.
@@ -20,24 +21,26 @@ pub(crate) fn percent(value: f64) -> String {
     format!("{}%", integer_percent(value))
 }
 
-/// The age of a poll or a usage fetch: `12 s ago`, `5 min ago`, `2 h ago`,
-/// `3 d ago` (spec §11 mock-up). A time a little in the future (the clocks of
-/// this machine and the server differ) reads `0 s ago`.
+/// The age of a poll or a usage fetch: `12s ago`, `5min ago`, `2h ago`,
+/// `3d ago` (spec §11 mock-up). An age shows its largest unit only, so the
+/// floored amount of that unit is passed to [`duration_text`]. A time a little
+/// in the future (the clocks of this machine and the server differ) reads
+/// `0s ago`.
 /// The panel gets its texts from here too (`panel::time_texts`).
 pub(crate) fn format_age(fetched_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let seconds = (now - fetched_at).num_seconds().max(0);
     if seconds < 60 {
-        return format!("{seconds} s ago");
+        return format!("{} ago", duration_text(seconds as u64));
     }
     let minutes = seconds / 60;
     if minutes < 60 {
-        return format!("{minutes} min ago");
+        return format!("{} ago", duration_text((minutes * 60) as u64));
     }
     let hours = minutes / 60;
     if hours < 24 {
-        return format!("{hours} h ago");
+        return format!("{} ago", duration_text((hours * 3_600) as u64));
     }
-    format!("{} d ago", hours / 24)
+    format!("{} ago", duration_text((hours / 24 * 86_400) as u64))
 }
 
 /// A path with the home folder at its start shown as `~`
@@ -105,9 +108,10 @@ fn same_component(a: &std::path::Component<'_>, b: &std::path::Component<'_>) ->
 }
 
 /// Time to a reset (spec §11), the one rule for the panel, tray and CLI:
-/// under 24 h hours and minutes (`35m`, `1h05m`), up to 48 h days and hours
-/// (`1d18h`), beyond 48 h the local weekday and clock time (`Sun 02:00`).
-/// Minutes round up, so a reset 30 s away reads `1m`, not `0m`.
+/// under 24 h hours and minutes (`35min`, `1h 5min`), up to 48 h days and
+/// hours (`1d 18h`), beyond 48 h the local weekday and clock time
+/// (`Sun 02:00`). Minutes round up, so a reset 30 s away reads `1min`, not
+/// `0s`; it is [`compact_left`]'s rule, without the week's day/hour split.
 /// The panel gets its texts from here too (`panel::time_texts`).
 pub(crate) fn format_reset_at<Tz: TimeZone>(
     resets_at: DateTime<Utc>,
@@ -119,20 +123,10 @@ where
 {
     let resets_at = seatswap_core::history::reset_minute(resets_at);
     let seconds = resets_at.signed_duration_since(now).num_seconds();
-    if seconds <= 0 {
-        return "0m".to_string();
-    }
     if seconds > 48 * 60 * 60 {
         return resets_at.with_timezone(tz).format("%a %H:%M").to_string();
     }
-    let minutes = (seconds + 59) / 60;
-    if minutes < 60 {
-        format!("{minutes}m")
-    } else if minutes < 24 * 60 {
-        format!("{}h{:02}m", minutes / 60, minutes % 60)
-    } else {
-        format!("{}d{}h", minutes / (24 * 60), minutes % (24 * 60) / 60)
-    }
+    compact_left(seconds, false)
 }
 
 /// The tooltip's reset time is a local clock time as in the spec's example
@@ -229,34 +223,20 @@ where
     )
 }
 
-/// The compact duration of `seconds`: `35m`, `2h`, `2h05m`, `1d3h` (spec
-/// §7.4.5), the status line's compact time left too (spec §5.1). The larger
-/// unit only when it is not zero; minutes round up, so 30 s reads `1m`. `week`
-/// makes the larger unit a day and the smaller an hour; otherwise they are an
-/// hour and a minute.
+/// The compact duration of `seconds`: `35min`, `2h`, `2h 5min`, `3d 16h`
+/// (spec §7.4.5), the status line's compact time left too (spec §5.1). The
+/// larger unit only when it is not zero; minutes round up, so 30 s reads
+/// `1min`; a time that has passed reads `0s`. `week` makes the larger unit a
+/// day and the smaller an hour, rounded up to the whole hour; otherwise they
+/// are an hour and a minute.
 pub(crate) fn compact_left(seconds: i64, week: bool) -> String {
-    if seconds <= 0 {
-        return "0m".to_string();
-    }
-    let minutes = (seconds + 59) / 60;
+    let seconds = seconds.max(0);
     if week {
-        let days = minutes / (24 * 60);
-        let hours = minutes % (24 * 60) / 60;
-        if days == 0 {
-            format!("{hours}h")
-        } else {
-            format!("{days}d{hours}h")
-        }
+        let hours = (seconds + 3_599) / 3_600;
+        duration_text((hours * 3_600) as u64)
     } else {
-        let hours = minutes / 60;
-        let rest = minutes % 60;
-        if hours == 0 {
-            format!("{rest}m")
-        } else if rest == 0 {
-            format!("{hours}h")
-        } else {
-            format!("{hours}h{rest:02}m")
-        }
+        let minutes = (seconds + 59) / 60;
+        duration_text((minutes * 60) as u64)
     }
 }
 
@@ -375,28 +355,28 @@ mod tests {
 
         assert_eq!(
             format_reset_at(now + Duration::minutes(35), now, &tz),
-            "35m"
+            "35min"
         );
         assert_eq!(
             format_reset_at(now + Duration::minutes(72), now, &tz),
-            "1h12m"
+            "1h 12min"
         );
         assert_eq!(
             format_reset_at(now + Duration::minutes(65), now, &tz),
-            "1h05m"
+            "1h 5min"
         );
-        assert_eq!(
-            format_reset_at(now + Duration::hours(23), now, &tz),
-            "23h00m"
-        );
+        assert_eq!(format_reset_at(now + Duration::hours(23), now, &tz), "23h");
         // Minutes round up: 30 s left is still a minute to wait.
-        assert_eq!(format_reset_at(now + Duration::seconds(30), now, &tz), "1m");
+        assert_eq!(
+            format_reset_at(now + Duration::seconds(30), now, &tz),
+            "1min"
+        );
         assert_eq!(
             format_reset_at(now + Duration::seconds(4 * 3600 + 59 * 60 + 30), now, &tz),
-            "5h00m"
+            "5h"
         );
-        assert_eq!(format_reset_at(now, now, &tz), "0m");
-        assert_eq!(format_reset_at(now - Duration::minutes(5), now, &tz), "0m");
+        assert_eq!(format_reset_at(now, now, &tz), "0s");
+        assert_eq!(format_reset_at(now - Duration::minutes(5), now, &tz), "0s");
     }
 
     /// The server's reset times sit just before the boundary (as seen in a real
@@ -417,10 +397,10 @@ mod tests {
             format_reset_clock(utc("2026-11-10T13:39:59.591674Z"), now, &tz),
             "14:40"
         );
-        // 1h39m59.59s away is 1h40m.
+        // 1h39m59.59s away is 1h 40min.
         assert_eq!(
             format_reset_at(utc("2026-11-10T13:39:59.591674Z"), now, &tz),
-            "1h40m"
+            "1h 40min"
         );
         // An exact minute stays as it is.
         assert_eq!(
@@ -433,14 +413,14 @@ mod tests {
     fn reset_times_between_one_and_two_days_use_days_and_hours() {
         let now = utc("2026-11-10T12:00:00Z");
         let tz = FixedOffset::east_opt(2 * 60 * 60).expect("offset");
-        assert_eq!(format_reset_at(now + Duration::hours(24), now, &tz), "1d0h");
+        assert_eq!(format_reset_at(now + Duration::hours(24), now, &tz), "1d");
         assert_eq!(
             format_reset_at(now + Duration::hours(42) + Duration::minutes(50), now, &tz),
-            "1d18h"
+            "1d 18h"
         );
         // Exactly 48 h is still days and hours; one second more is a weekday
         // (shown rounded up to the full minute).
-        assert_eq!(format_reset_at(now + Duration::hours(48), now, &tz), "2d0h");
+        assert_eq!(format_reset_at(now + Duration::hours(48), now, &tz), "2d");
         assert_eq!(
             format_reset_at(now + Duration::hours(48) + Duration::seconds(1), now, &tz),
             "Thu 14:01"
@@ -482,11 +462,11 @@ mod tests {
     #[test]
     fn ages_are_human_readable() {
         let now = utc("2026-11-10T12:00:00Z");
-        assert_eq!(format_age(now - Duration::seconds(10), now), "10 s ago");
-        assert_eq!(format_age(now + Duration::seconds(3), now), "0 s ago");
-        assert_eq!(format_age(now - Duration::minutes(5), now), "5 min ago");
-        assert_eq!(format_age(now - Duration::hours(2), now), "2 h ago");
-        assert_eq!(format_age(now - Duration::days(3), now), "3 d ago");
+        assert_eq!(format_age(now - Duration::seconds(10), now), "10s ago");
+        assert_eq!(format_age(now + Duration::seconds(3), now), "0s ago");
+        assert_eq!(format_age(now - Duration::minutes(5), now), "5min ago");
+        assert_eq!(format_age(now - Duration::hours(2), now), "2h ago");
+        assert_eq!(format_age(now - Duration::days(3), now), "3d ago");
     }
 
     #[cfg(feature = "gui")]

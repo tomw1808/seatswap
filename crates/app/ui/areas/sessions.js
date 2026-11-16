@@ -9,6 +9,7 @@
 import {
   accountName,
   clear,
+  durationText,
   errorMessage,
   h,
   isActiveView,
@@ -29,9 +30,9 @@ const ALL_HOSTS = "*";
 
 const CLOSED_CHOICES = [
   { id: "none", label: "None" },
-  { id: "day", label: "24 h" },
-  { id: "week", label: "7 d" },
-  { id: "month", label: "30 d" },
+  { id: "day", label: "24h" },
+  { id: "week", label: "7d" },
+  { id: "month", label: "30d" },
 ];
 const GROUPINGS = [
   { id: "project", label: "By project" },
@@ -337,18 +338,13 @@ function lastHourCell(row) {
   return node;
 }
 
-function durationText(since, now) {
+// A session's or an agent's elapsed time: the seconds since `since` in the one
+// duration spelling of common.js. An unreadable time shows nothing.
+function sinceText(since, now) {
   if (typeof since !== "string") return "";
   const start = Date.parse(since);
   if (!Number.isFinite(start)) return "";
-  const minutes = Math.max(0, Math.floor((now - start) / 60000));
-  if (minutes < 60) return `${minutes} min`;
-  const hours = Math.floor(minutes / 60);
-  const rest = minutes % 60;
-  if (hours < 24) return rest ? `${hours} h ${rest} min` : `${hours} h`;
-  const days = Math.floor(hours / 24);
-  const left = hours % 24;
-  return left ? `${days} d ${left} h` : `${days} d`;
+  return durationText(Math.max(0, Math.floor((now - start) / 1000)));
 }
 
 function isToday(iso) {
@@ -1343,10 +1339,10 @@ function statusNode(row, now) {
       isObject(row.status) && typeof row.status.other === "string" ? row.status.other : "no report";
     return h("span", { class: "sw" }, text);
   }
-  if (status === "busy") return h("span", { class: "sw pri" }, `busy ${durationText(row.since, now)}`);
-  if (status === "idle") return h("span", { class: "sw" }, `idle ${durationText(row.since, now)}`);
+  if (status === "busy") return h("span", { class: "sw pri" }, `busy ${sinceText(row.since, now)}`);
+  if (status === "idle") return h("span", { class: "sw" }, `idle ${sinceText(row.since, now)}`);
   if (status === "waiting") {
-    return h("span", { class: "sw warn" }, `waiting for you ${durationText(row.since, now)}`);
+    return h("span", { class: "sw warn" }, `waiting for you ${sinceText(row.since, now)}`);
   }
   return h("span", { class: "sw" }, status);
 }
@@ -1565,7 +1561,7 @@ function updateSessionItem(entry, row, options) {
 function agentStatus(agent, now) {
   if (agent.running) {
     const since = agent.first || agent.last;
-    const duration = since ? durationText(since, now) : "";
+    const duration = since ? sinceText(since, now) : "";
     return h("span", { class: "sw pri" }, duration ? `running ${duration}` : "running");
   }
   const span = h("span", { class: "sw ok" });

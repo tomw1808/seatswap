@@ -1375,7 +1375,7 @@ mod tests {
                 cw: 0,
                 cr: 6000,
             }),
-            "total(-5 min) - total(-90 min), the last total at or before -60 min"
+            "total(-5min) - total(-90min), the last total at or before -60min"
         );
     }
 
@@ -1672,7 +1672,7 @@ mod tests {
                 cw: 0,
                 cr: 2000,
             }),
-            "total(-5 min) - total(-90 min); the older drop changes nothing"
+            "total(-5min) - total(-90min); the older drop changes nothing"
         );
         assert_eq!(
             session.tokens,

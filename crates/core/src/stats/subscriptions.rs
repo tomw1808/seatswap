@@ -454,7 +454,7 @@ pub(crate) fn what_if_in<Tz: TimeZone + Copy>(
     let expired = expired_was.map(|was| was + expired_without - expired_with);
     let abbr = account_abbr(ctx, &without_ref);
     let more = hours_text(blocked_hours - blocked_hours_was);
-    let sentence = if more == "0 h" {
+    let sentence = if more == "0s" {
         format!("Dropping {abbr} would have cost no blocked hour in this range.")
     } else {
         format!("Without {abbr} you would have been blocked {more} more.")
@@ -1260,7 +1260,7 @@ mod tests {
         let hours: f64 = what.weekly.iter().map(|(_, _, hours)| *hours).sum();
         assert!(
             close(hours, what.blocked_hours.expect("the replays ran")),
-            "the weeks add up to {hours} h, the page says {:?} h",
+            "the weeks add up to {hours} hours, the page says {:?} hours",
             what.blocked_hours
         );
     }

@@ -737,7 +737,7 @@ mod tests {
             Some("high".to_string())
         );
         let rate_limits = payload.rate_limits.expect("the payload has rate limits");
-        let five_hour = rate_limits.five_hour.expect("the payload has a 5 h limit");
+        let five_hour = rate_limits.five_hour.expect("the payload has a 5h limit");
         assert_eq!(five_hour.used_percentage, 12.0);
         assert_eq!(five_hour.resets_at, 1794490200);
         let seven_day = rate_limits.seven_day.expect("the payload has a week limit");
@@ -1123,7 +1123,7 @@ mod tests {
         };
         assert_eq!(
             render::ansi(&render::render_spans(&config, &payload, &facts, None, &Utc).0),
-            "AC 2h05m"
+            "AC 2h 5min"
         );
     }
 

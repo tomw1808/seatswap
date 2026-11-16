@@ -13,10 +13,10 @@ import {
   contrastText,
   dateText,
   dateTimeText,
+  durationText,
   emptyLine,
   errorMessage,
   h,
-  hoursText,
   isColor,
   percentText,
   shortDate,
@@ -151,7 +151,10 @@ export async function show(container, env) {
     kpis.appendChild(
       h("div", { class: "stats-mini-kpi" }, [
         h("span", { class: "stats-kpi-label", text: "Blocked" }),
-        h("span", { class: "stats-kpi-value", text: hoursText(summary.blockedHours) }),
+        h("span", {
+          class: "stats-kpi-value",
+          text: durationText(Math.round(summary.blockedHours * 3600)),
+        }),
         h("span", {
           class: "stats-kpi-sub",
           text: `${summary.switchesTotal} ${summary.switchesTotal === 1 ? "switch" : "switches"}`,
@@ -260,14 +263,14 @@ export async function show(container, env) {
         "Reached 100 %",
         detail.reached100At === null
           ? "not reached"
-          : `${dateTimeText(detail.reached100At)} · blocked ${hoursText(
-              detail.blockedHoursAfter
+          : `${dateTimeText(detail.reached100At)} · blocked ${durationText(
+              Math.round(detail.blockedHoursAfter * 3600)
             )} after that`,
       ],
     ];
     if (detail.sessionWindowsUsed !== null) {
       rows.push([
-        "5 h windows",
+        "5h windows",
         typeof detail.possibleSessionWindows === "number"
           ? detail.usedMoreThanPossible
             ? `${detail.sessionWindowsUsed} used, more than the about ${detail.possibleSessionWindows} your usual working hours hold`
@@ -282,7 +285,7 @@ export async function show(container, env) {
       ],
       [
         "Last reading",
-        `${Math.round(detail.lastSampleBeforeEndSecs / 60)} min before the reset`,
+        `${durationText(detail.lastSampleBeforeEndSecs)} before the reset`,
       ],
       ["Note", detail.note === null || detail.note === undefined ? "—" : detail.note]
     );
@@ -439,7 +442,7 @@ export async function show(container, env) {
     const blocked = {
       label: h("span", { class: "stats-row-label", text: "Blocked" }),
       cells: data.blocked.map((value) => ({
-        text: hoursText(value),
+        text: durationText(Math.round(value * 3600)),
         tip: "working hours blocked in this week",
       })),
     };

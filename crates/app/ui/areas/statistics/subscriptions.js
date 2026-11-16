@@ -11,10 +11,10 @@ import {
   amountTip,
   banner,
   clear,
+  durationText,
   emptyLine,
   errorMessage,
   h,
-  hoursText,
   isColor,
   kpi,
   percentText,
@@ -250,7 +250,12 @@ export async function show(container, env) {
       node.appendChild(h("span", { class: "n" }, [amountNode(row.expired, currency)]));
     }
     node.appendChild(h("span", { class: "n", text: `${row.fullWeeks} of ${row.weeks}` }));
-    node.appendChild(h("span", { class: "n", text: hoursText(row.blockedHoursOnIt) }));
+    node.appendChild(
+      h("span", {
+        class: "n",
+        text: durationText(Math.round(row.blockedHoursOnIt * 3600)),
+      })
+    );
     const times = typeof row.timesPaid === "number" ? row.timesPaid.toFixed(1) : "—";
     const timesReason =
       typeof row.timesPaidMissing === "string" ? ` (${row.timesPaidMissing})` : "";
@@ -313,8 +318,10 @@ export async function show(container, env) {
     kpis.appendChild(
       kpi(
         "Blocked",
-        what.blockedHours === null ? "—" : hoursText(what.blockedHours),
-        `instead of ${hoursText(what.blockedHoursWas)}`,
+        what.blockedHours === null
+          ? "—"
+          : durationText(Math.round(what.blockedHours * 3600)),
+        `instead of ${durationText(Math.round(what.blockedHoursWas * 3600))}`,
         "Blocked | the hours without this account, replayed with the same working hours; never below the recorded hours",
         what.blockedHours === null ? null : "stats-kpi-value-bad"
       )
@@ -356,16 +363,17 @@ export async function show(container, env) {
               name: "as it was",
               color: "var(--muted)",
               values: what.weekly.map(([, was]) => was),
-              unit: " h",
-              tip: (category, value) => `${category} | as it was: ${hoursText(value)} blocked`,
+              unit: "h",
+              tip: (category, value) =>
+                `${category} | as it was: ${durationText(Math.round(value * 3600))} blocked`,
             },
             {
               name: h("span", {}, ["without ", accountName(env.accounts, row.id)]),
               color: "var(--danger)",
               values: what.weekly.map(([, , without]) => without),
-              unit: " h",
+              unit: "h",
               tip: (category, value) =>
-                `${category} | without ${name}: ${hoursText(value)} blocked`,
+                `${category} | without ${name}: ${durationText(Math.round(value * 3600))} blocked`,
             },
           ],
         })

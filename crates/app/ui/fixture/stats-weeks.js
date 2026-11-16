@@ -1,6 +1,7 @@
 // The statistics Weeks page's fixture: `stats_weeks`, `stats_week_summary`
 // and `stats_window_detail`.
 
+import { durationText } from "../common.js";
 import {
   ACCOUNTS,
   API_PER_M,
@@ -12,7 +13,6 @@ import {
   accountOut,
   chosenAccounts,
   expiredMoney,
-  fixtureHours,
   fixtureMoney,
   fixtureValues,
   fixtureWholePercent,
@@ -133,7 +133,11 @@ export function weekSummary(query, week) {
     if (before > 0) usedChangePercent = ((used - before) / before) * 100;
   }
   const conclusion = [];
-  conclusion.push(switchesOf([index]) && BLOCKED[index] > 0 ? `${fixtureHours(BLOCKED[index])} blocked.` : "No hour blocked.");
+  conclusion.push(
+    switchesOf([index]) && BLOCKED[index] > 0
+      ? `${durationText(Math.round(BLOCKED[index] * 3600))} blocked.`
+      : "No hour blocked."
+  );
   let closest = null;
   for (const account of chosen) {
     if (account.used[index] === null) continue;
@@ -209,7 +213,7 @@ const NOTES = {
   "LB:11": "Second week with auto-burn. 3 % expired at the reset on Monday 17:00.",
   "AC:8": "51 % expired. All work that week went to PR and LB; AC was opened on two days only.",
   "PR:5": "First week of this subscription.",
-  "LB:1": "AC was full that week too: 14 h with no usable account.",
+  "LB:1": "AC was full that week too: 14h with no usable account.",
 };
 
 function noteFor(account, index) {

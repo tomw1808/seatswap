@@ -1751,7 +1751,7 @@ mod tests {
         assert!(day.sessions.iter().any(|row| row.session == CLOSED_RECENT));
         assert!(
             !day.sessions.iter().any(|row| row.session == CLOSED_OLD),
-            "a session closed 30 h ago is not in the day"
+            "a session closed 30h ago is not in the day"
         );
         assert_eq!(day.sessions[0].status, LiveStatus::Closed);
 

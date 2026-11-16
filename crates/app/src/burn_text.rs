@@ -205,11 +205,16 @@ pub fn policy_name(policy: Policy) -> &'static str {
     }
 }
 
-/// A work-unit figure as the hours it takes at `typical_wu` work units per
-/// typical working hour. A typical hour of 0 means the hours are not known:
-/// they are said so, never divided by zero.
+/// A work-unit figure as the duration it takes at `typical_wu` work units per
+/// typical working hour, in the one spelling of review item 42 (`2h 30min`). A
+/// typical hour of 0 means the hours are not known: they are said so, never
+/// divided by zero. A negative or non-finite figure is the callers' error and
+/// keeps the old one-decimal text, as before.
 fn hours(wu: f64, typical_wu: f64) -> String {
     match seatswap_core::burn::wu_hours(wu, typical_wu) {
+        Some(hours) if hours.is_finite() && hours >= 0.0 => {
+            seatswap_core::duration::duration_text((hours * 3_600.0).round() as u64)
+        }
         Some(hours) => format!("{hours:.1} h"),
         None => "not known".to_string(),
     }
@@ -265,7 +270,7 @@ pub fn reason(
             }
         }
         Reason::WindowOpen => Ok(format!(
-            "its 5 h window is open and its week resets on {}",
+            "its 5h window is open and its week resets on {}",
             format::weekday_clock(weekly_reset(views, target)?, offset)
         )),
         Reason::ResetNear => Ok(format!(
@@ -353,7 +358,7 @@ pub fn line(
                 })?;
             let limit = match fill {
                 Fill::Week => "week",
-                Fill::Window => "5 h window",
+                Fill::Window => "5h window",
             };
             Ok(Some(vec![
                 BurnPart::Text("On ".to_string()),
@@ -668,7 +673,7 @@ mod tests {
         assert_eq!(
             plain(&line),
             "On PR until its week is full, about 2h. Then AC.",
-            "PR has a 5 h limit, but the plan records its week as what fills first"
+            "PR has a 5h limit, but the plan records its week as what fills first"
         );
     }
 
@@ -709,7 +714,7 @@ mod tests {
         .expect("a switch suggests");
         assert_eq!(
             suggestion.text,
-            "Switch to AC now: its 5 h window is open and its week resets on Mon 02:00."
+            "Switch to AC now: its 5h window is open and its week resets on Mon 02:00."
         );
         assert_eq!(suggestion.to, "ac");
     }
@@ -735,7 +740,7 @@ mod tests {
         .expect("a wait suggests");
         assert_eq!(
             suggestion.text,
-            "Switch to AC now: its 5 h window is open and its week resets on Mon 02:00.",
+            "Switch to AC now: its 5h window is open and its week resets on Mon 02:00.",
             "AC has no session limit in its view; the decision's reason wins"
         );
     }

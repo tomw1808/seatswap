@@ -676,13 +676,25 @@ function weekdayTimeText(value) {
   return `${weekday} ${time}`;
 }
 
-// "2 h" or "1.5 h", one decimal only when the value has one.
-function hoursText(value) {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
-    throw new Error(`invalid hour count ${String(value)}: use a finite number of 0 or more`);
+// "12s", "12min", "2h 31min", "3d 4h": the one duration spelling (review item
+// 42). No space between a number and its unit, one space between the two units,
+// at most two units; from a day on the minutes are left out. The caller rounds;
+// this function floors the seconds it is given.
+function durationText(seconds) {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 0) {
+    throw new Error(`invalid number of seconds ${String(seconds)}: use a finite number of 0 or more`);
   }
-  const rounded = Math.round(value * 10) / 10;
-  return Number.isInteger(rounded) ? `${rounded} h` : `${rounded.toFixed(1)} h`;
+  const total = Math.floor(seconds);
+  if (total < 60) return `${total}s`;
+  if (total < 3600) return `${Math.floor(total / 60)}min`;
+  if (total < 86400) {
+    const hours = Math.floor(total / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    return minutes === 0 ? `${hours}h` : `${hours}h ${minutes}min`;
+  }
+  const days = Math.floor(total / 86400);
+  const hours = Math.floor((total % 86400) / 3600);
+  return hours === 0 ? `${days}d` : `${days}d ${hours}h`;
 }
 
 // The switches of a span by who made them, the one text of the statistics
@@ -1083,7 +1095,7 @@ export {
   dateText,
   dateTimeText,
   weekdayTimeText,
-  hoursText,
+  durationText,
   switchText,
   percentText,
   amountText,

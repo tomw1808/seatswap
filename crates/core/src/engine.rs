@@ -3864,7 +3864,7 @@ mod tests {
         assert_eq!(
             session.resets_at,
             Some(ts("2026-11-14T19:30:00.336716Z")),
-            "the cached 5 h window stays"
+            "the cached 5h window stays"
         );
         assert_eq!(entry.fed_at, None);
         let samples = root.join("vega/samples-2026-11.jsonl");

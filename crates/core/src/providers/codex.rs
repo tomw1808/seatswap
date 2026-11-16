@@ -90,7 +90,7 @@ fn string_field<'a>(tokens: &'a Map<String, Value>, name: &str) -> Result<&'a st
 /// [`LimitKind::WeeklyAll`] (604800 s). An entry of `additional_rate_limits`
 /// never gives the account's session: 604800 s is
 /// [`LimitKind::WeeklyScoped`], every other length keeps its own label
-/// (`Other("5 h limit")` and so on), and the entry's `limit_name` is the
+/// (`Other("5h limit")` and so on), and the entry's `limit_name` is the
 /// limit's model.
 pub fn usage_from(answer: &Value) -> Result<(Usage, Option<String>, AccountRef), ProviderError> {
     let object = answer
@@ -268,7 +268,7 @@ fn limit_from_window(
             }
         };
     Ok(Limit {
-        kind: window_kind(seconds, additional),
+        kind: window_kind(seconds as u64, additional),
         percent,
         severity: Severity::Normal,
         resets_at,
@@ -279,15 +279,13 @@ fn limit_from_window(
 
 /// Codex's window lengths: `rate_limit`'s own 5 h and week have names; an
 /// additional limit's week is scoped to its model, and every other length keeps
-/// its own, in whole hours, else whole minutes, else seconds.
-fn window_kind(seconds: i64, additional: bool) -> LimitKind {
+/// its own duration (review item 42): `24h limit`, `1h 30min limit`.
+fn window_kind(seconds: u64, additional: bool) -> LimitKind {
     match (seconds, additional) {
         (18_000, false) => LimitKind::Session,
         (604_800, false) => LimitKind::WeeklyAll,
         (604_800, true) => LimitKind::WeeklyScoped,
-        _ if seconds % 3_600 == 0 => LimitKind::Other(format!("{} h limit", seconds / 3_600)),
-        _ if seconds % 60 == 0 => LimitKind::Other(format!("{} min limit", seconds / 60)),
-        _ => LimitKind::Other(format!("{seconds} s limit")),
+        _ => LimitKind::Other(format!("{} limit", crate::duration::duration_text(seconds))),
     }
 }
 
@@ -562,8 +560,8 @@ mod tests {
         let weekly = usage
             .limits
             .iter()
-            .find(|limit| limit.kind == LimitKind::Other("24 h limit".to_string()))
-            .expect("a 24 h limit");
+            .find(|limit| limit.kind == LimitKind::Other("1d limit".to_string()))
+            .expect("a 1d limit");
         assert_eq!(weekly.percent, 48.0);
         assert_eq!(
             weekly.resets_at,
@@ -618,7 +616,7 @@ mod tests {
         assert!(usage
             .limits
             .iter()
-            .any(|limit| limit.kind == LimitKind::Other("90 min limit".to_string())));
+            .any(|limit| limit.kind == LimitKind::Other("1h 30min limit".to_string())));
     }
 
     #[test]
@@ -873,7 +871,7 @@ mod tests {
         assert_eq!(usage.limits.len(), 1);
         assert_eq!(
             usage.limits[0].kind,
-            LimitKind::Other("5 h limit".to_string())
+            LimitKind::Other("5h limit".to_string())
         );
         assert_eq!(usage.limits[0].model.as_deref(), Some("gpt-6-astra"));
     }

@@ -4479,7 +4479,7 @@ mod tests {
                 cw: 0,
                 cr: 0,
             },
-            "the two answers inside the hour, not the one at −90 min"
+            "the two answers inside the hour, not the one at −90min"
         );
         assert_eq!(row.tokens.out, 105, "the row's own total is unchanged");
         assert!(

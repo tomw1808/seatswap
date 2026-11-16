@@ -1927,7 +1927,11 @@ fn active_view(views: &[AccountView]) -> Option<&AccountView> {
 fn login_ends_text(days: Option<i64>) -> Option<String> {
     match days {
         Some(days) if days < 0 => Some("login ended".to_string()),
-        Some(days) => Some(format!("login ends in {days} d")),
+        Some(0) => Some("login ends today".to_string()),
+        Some(days) => Some(format!(
+            "login ends in {}",
+            seatswap_core::duration::duration_text(days.unsigned_abs() * 86_400)
+        )),
         None => None,
     }
 }
@@ -4148,7 +4152,7 @@ pub(crate) mod tests {
             burn_simulate(context, "2026-10-24", "2026-10-25", &[]).expect("the replay runs");
         println!("SEATSWAP-TZ-CHILD-RAN");
         assert!(
-            text.contains("Lazy: worked 1.0 h"),
+            text.contains("Lazy: worked 1h"),
             "the last hour of the local day belongs to the day: {text}"
         );
     }
@@ -4202,5 +4206,21 @@ pub(crate) mod tests {
             fetched_at: None,
             last_error: None,
         }
+    }
+
+    /// The login's end in the one duration spelling (review item 42); 0 days is
+    /// today, as the pop-up says it.
+    #[test]
+    fn the_login_end_is_said_in_days() {
+        assert_eq!(
+            login_ends_text(Some(3)).as_deref(),
+            Some("login ends in 3d")
+        );
+        assert_eq!(
+            login_ends_text(Some(0)).as_deref(),
+            Some("login ends today")
+        );
+        assert_eq!(login_ends_text(Some(-1)).as_deref(), Some("login ended"));
+        assert_eq!(login_ends_text(None), None);
     }
 }

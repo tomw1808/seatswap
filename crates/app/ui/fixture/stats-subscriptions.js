@@ -32,7 +32,7 @@ const WHAT_IF = {
     blocked: 141,
     expired: 121,
     saved: 498,
-    sentence: "Without LB you would have been blocked 84 h more. Keep it.",
+    sentence: "Without LB you would have been blocked 3d 12h more. Keep it.",
     weekly: [22, 26, 19, 24, 21, 6, 4, 5, 3, 6, 3, 2],
   },
   AC: {
@@ -40,14 +40,14 @@ const WHAT_IF = {
     expired: 164,
     saved: 388,
     sentence:
-      "Before PR was added AC saved you 31 h. In the 7 weeks since, dropping it would have cost 8 h.",
+      "Before PR was added AC saved you 1d 7h. In the 7 weeks since, dropping it would have cost 8h.",
     weekly: [17, 21, 14, 18, 15, 3, 1, 1.5, 1, 2.5, 1, 1],
   },
   PR: {
     blocked: 111,
     expired: 114,
     saved: 582,
-    sentence: "Without PR the blocked hours of August come back: 54 h more in 7 weeks.",
+    sentence: "Without PR the blocked hours of August come back: 2d 6h more in 7 weeks.",
     weekly: [11, 14, 8, 12, 9, 9, 7, 8, 6, 9, 9, 9],
   },
 };

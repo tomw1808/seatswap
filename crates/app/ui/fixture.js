@@ -473,7 +473,7 @@ function makeFixture() {
       line: [
         { text: "On " },
         { account: acmeId, abbr: "AC" },
-        { text: " until its 5 h window is full, about 2h. Then " },
+        { text: " until its 5h window is full, about 2h. Then " },
         { account: labId, abbr: "LB" },
         { text: "." },
       ],

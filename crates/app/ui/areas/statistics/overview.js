@@ -10,9 +10,9 @@ import {
   amountTip,
   clear,
   dateText,
+  durationText,
   emptyLine,
   h,
-  hoursText,
   isColor,
   kpi,
   legendItem,
@@ -74,7 +74,7 @@ export async function show(container, env) {
   if (expiredRows.length === 0) expiredRows.push("— · no account expired money in the range");
   const cost =
     typeof data.kpis.switchCostPercentOfWindow === "number"
-      ? ` · a switch costs ${percentText(data.kpis.switchCostPercentOfWindow)} of its 5 h window`
+      ? ` · a switch costs ${percentText(data.kpis.switchCostPercentOfWindow)} of its 5h window`
       : " · switch cost —";
   const weeks = data.kpis.weeks === 1 ? "week" : "weeks";
   kpis.appendChild(
@@ -100,7 +100,7 @@ export async function show(container, env) {
   const blockedBefore = data.kpis.blockedBeforeAdded;
   const blockedSub = blockedBefore
     ? [
-        hoursText(blockedBefore.hours),
+        durationText(Math.round(blockedBefore.hours * 3600)),
         " of them before ",
         blockedBefore.name,
         " was added",
@@ -109,7 +109,7 @@ export async function show(container, env) {
   kpis.appendChild(
     kpi(
       "Blocked",
-      hoursText(data.kpis.blockedHours),
+      durationText(Math.round(data.kpis.blockedHours * 3600)),
       blockedSub,
       "Blocked | working hours in which the active account was at 100 %"
     )
@@ -117,7 +117,7 @@ export async function show(container, env) {
   kpis.appendChild(
     kpi(
       "Avoidable",
-      hoursText(data.kpis.avoidableHours),
+      durationText(Math.round(data.kpis.avoidableHours * 3600)),
       "blocked while other quota expired",
       "Avoidable | blocked hours in a week in which another account's quota expired",
       data.kpis.avoidableHours > 0 ? "stats-kpi-value-bad" : null
@@ -198,7 +198,7 @@ export async function show(container, env) {
     return {
       label,
       at: week.week,
-      sub: `${hoursText(week.blockedHours)} blocked`,
+      sub: `${durationText(Math.round(week.blockedHours * 3600))} blocked`,
       stacks: [expiredStack.concat(usedStack), projectStack],
     };
   });

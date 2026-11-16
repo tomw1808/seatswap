@@ -19,8 +19,8 @@ import { SEPARATOR_CHARS } from "../areas/statusline.js";
 export const FIXTURE_KINDS = [
   { "kind": "account", "label": "account", "group": "seatswap", "colors": ["none", "account", "fixed"], "time": false, "text": false, "repeatable": false },
   { "kind": "plan", "label": "plan", "group": "seatswap", "colors": ["none", "fixed"], "time": false, "text": false, "repeatable": false },
-  { "kind": "fiveHourPercent", "label": "5 h percent", "group": "seatswap", "colors": ["none", "byLoad", "fixed"], "time": false, "text": false, "repeatable": false },
-  { "kind": "fiveHourReset", "label": "5 h reset", "group": "seatswap", "colors": ["none", "fixed"], "time": true, "text": false, "repeatable": false },
+  { "kind": "fiveHourPercent", "label": "5h percent", "group": "seatswap", "colors": ["none", "byLoad", "fixed"], "time": false, "text": false, "repeatable": false },
+  { "kind": "fiveHourReset", "label": "5h reset", "group": "seatswap", "colors": ["none", "fixed"], "time": true, "text": false, "repeatable": false },
   { "kind": "weekPercent", "label": "week percent", "group": "seatswap", "colors": ["none", "byLoad", "fixed"], "time": false, "text": false, "repeatable": false },
   { "kind": "weekReset", "label": "week reset", "group": "seatswap", "colors": ["none", "fixed"], "time": true, "text": false, "repeatable": false },
   { "kind": "modelPercent", "label": "per-model %", "group": "seatswap", "colors": ["none", "byLoad", "fixed"], "time": false, "text": false, "repeatable": false },
@@ -81,11 +81,11 @@ function fixtureResetText(kind, segment) {
       ? segment.timeFormat
       : "seatswap";
   if (kind === "fiveHourReset") {
-    return format === "clock" ? "19:30" : "4h45m";
+    return format === "clock" ? "19:30" : "4h 45min";
   }
   if (format === "clock") return "Mon 02:00";
-  if (format === "compactLeft") return "3d16h";
-  return "1d18h";
+  if (format === "compactLeft") return "3d 16h";
+  return "1d 18h";
 }
 
 // One segment's made-up text for the browser preview. The shapes follow the

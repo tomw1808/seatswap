@@ -11,10 +11,10 @@ import {
   accountView,
   amountNode,
   clear,
+  durationText,
   emptyLine,
   errorMessage,
   h,
-  hoursText,
   isColor,
   kpi,
   percentText,
@@ -124,7 +124,7 @@ export async function show(container, env) {
   kpis.appendChild(
     kpi(
       "Hours with no usable account",
-      hoursText(data.kpis.blockedHours),
+      durationText(Math.round(data.kpis.blockedHours * 3600)),
       "working hours with no usable account in the next 7 days",
       "Hours with no usable account | the hours the plan has no usable account, in your usual working hours"
     )

@@ -1175,7 +1175,7 @@ mod tests {
             .expect("a suggestion");
         assert_eq!(
             suggestion.text,
-            "Switch to AC now: its 5 h window is open and its week resets on Mon 02:00. \
+            "Switch to AC now: its 5h window is open and its week resets on Mon 02:00. \
              Staying on PR is expected to let 16 % of AC expire.",
             "the suggestion's staying sentence is the lazy plan's, not the followed plan's"
         );
@@ -1237,7 +1237,7 @@ mod tests {
                 assert_eq!(by, By::Auto);
                 assert_eq!(
                     reason.as_deref(),
-                    Some("its 5 h window is open and its week resets on Mon 02:00")
+                    Some("its 5h window is open and its week resets on Mon 02:00")
                 );
             }
             _ => panic!("not a switch"),

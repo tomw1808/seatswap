@@ -1683,12 +1683,12 @@ mod tests {
         assert_eq!(
             time_texts_at(&times, now, &Utc),
             vec![
-                "1h05m",
+                "1h 5min",
                 "14:40",
                 "Sun 02:00",
                 "Sun 02:00",
-                "12 s ago",
-                "5 min ago"
+                "12s ago",
+                "5min ago"
             ]
         );
     }

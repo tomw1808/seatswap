@@ -56,7 +56,7 @@ const SCENARIOS = [
   ["live", "Live data"],
   ["nearFull", "Test: 97 %"],
   ["blocked", "Test: account blocked"],
-  ["noSessionLimit", "Test: no 5 h limit"],
+  ["noSessionLimit", "Test: no 5h limit"],
 ];
 
 const PREVIEW_DELAY_MS = 150;

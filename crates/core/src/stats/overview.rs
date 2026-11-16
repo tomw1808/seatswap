@@ -884,7 +884,7 @@ mod tests {
         );
         assert!(
             page.findings.iter().any(|text| text
-                == "You were blocked 2 h in 2 weeks; 2 h of them while other quota expired."),
+                == "You were blocked 2h in 2 weeks; 2h of them while other quota expired."),
             "findings: {:#?}",
             page.findings
         );
@@ -1267,7 +1267,7 @@ mod tests {
         let shown: f64 = page.weeks.iter().map(|week| week.blocked_hours).sum();
         assert!(
             close(shown, page.kpis.blocked_hours),
-            "the weeks show {shown} h, the page says {} h",
+            "the weeks show {shown} hours, the page says {} hours",
             page.kpis.blocked_hours
         );
     }
