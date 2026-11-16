@@ -562,27 +562,34 @@ mod tests {
 
     #[test]
     fn codex_paths_resolve_order() {
+        // Absolute on the platform the test runs on: `/x` is not absolute on
+        // Windows, where a folder needs a drive.
+        let root = Path::new(if cfg!(windows) { r"C:\" } else { "/" });
+        let explicit = root.join("x").join("codex");
+        let variable = root.join("y").join("codex");
+        let home = root.join("home").join("u");
+
         // An explicit folder wins over the variable.
         let p = CodexPaths::resolve_with(
-            Some(Path::new("/x/codex")),
-            Some("/y/codex".into()),
-            Path::new("/home/u"),
+            Some(&explicit),
+            Some(variable.clone().into_os_string()),
+            &home,
         )
         .expect("an explicit absolute folder is fine");
-        assert_eq!(p.home, Path::new("/x/codex"));
-        assert_eq!(p.auth_file, Path::new("/x/codex/auth.json"));
+        assert_eq!(p.home, explicit);
+        assert_eq!(p.auth_file, explicit.join("auth.json"));
 
         // A non-empty variable wins over the home folder.
-        let p = CodexPaths::resolve_with(None, Some("/y/codex".into()), Path::new("/home/u"))
+        let p = CodexPaths::resolve_with(None, Some(variable.clone().into_os_string()), &home)
             .expect("an absolute variable is fine");
-        assert_eq!(p.home, Path::new("/y/codex"));
-        assert_eq!(p.auth_file, Path::new("/y/codex/auth.json"));
+        assert_eq!(p.home, variable);
+        assert_eq!(p.auth_file, variable.join("auth.json"));
 
         // An empty variable is ignored.
-        let p = CodexPaths::resolve_with(None, Some("".into()), Path::new("/home/u"))
+        let p = CodexPaths::resolve_with(None, Some("".into()), &home)
             .expect("an empty variable falls back to the home folder");
-        assert_eq!(p.home, Path::new("/home/u/.codex"));
-        assert_eq!(p.auth_file, Path::new("/home/u/.codex/auth.json"));
+        assert_eq!(p.home, home.join(".codex"));
+        assert_eq!(p.auth_file, home.join(".codex").join("auth.json"));
     }
 
     /// A relative `$CODEX_HOME` must not become a folder relative to the

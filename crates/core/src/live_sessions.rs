@@ -2344,7 +2344,7 @@ mod tests {
         assert_eq!(other.hosts[0].host, "vega");
         assert_eq!(other.warnings.len(), 1, "{:?}", other.warnings);
         assert!(
-            other.warnings[0].contains("ledger/sessions-now.json"),
+            other.warnings[0].contains(&ledger.sessions_now_file("ledger").display().to_string()),
             "the warning names the file: {}",
             other.warnings[0]
         );
