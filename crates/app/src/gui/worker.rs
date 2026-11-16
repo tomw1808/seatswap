@@ -2189,7 +2189,10 @@ mod tests {
                 "warnings",
             ]
         );
-        assert_eq!(object["claudeConfigDir"], "~/claude");
+        assert_eq!(
+            object["claudeConfigDir"],
+            crate::test_support::tilde("claude")
+        );
         assert_eq!(object["live"]["kind"], "known");
         assert_eq!(object["live"]["accountId"], fixture.account.id.as_str());
         assert_eq!(object["views"][0]["isActive"], true);
@@ -2413,44 +2416,45 @@ mod tests {
 
     #[test]
     fn merge_setting_expands_a_tilde_in_the_two_path_settings() {
-        let home = Path::new("/home/sam");
-        let history = merge_setting(&Settings::default(), "historyDir", json!("~/hist"), home)
-            .expect("the history folder is a path");
-        assert_eq!(
-            history.history_dir,
-            Some(std::path::PathBuf::from("/home/sam/hist"))
-        );
+        let home = crate::test_support::home();
+        let history = merge_setting(
+            &Settings::default(),
+            "historyDir",
+            json!(crate::test_support::tilde("hist")),
+            home,
+        )
+        .expect("the history folder is a path");
+        assert_eq!(history.history_dir, Some(home.join("hist")));
         let config = merge_setting(
             &Settings::default(),
             "claudeConfigDir",
-            json!("~/claude"),
+            json!(crate::test_support::tilde("claude")),
             home,
         )
         .expect("the config folder is a path");
-        assert_eq!(
-            config.claude_config_dir,
-            Some(std::path::PathBuf::from("/home/sam/claude"))
-        );
+        assert_eq!(config.claude_config_dir, Some(home.join("claude")));
         // Only the path settings expand: the host name stays "~x" and is
         // refused by its own rule, exactly as it would be without this merge.
         let error = merge_setting(&Settings::default(), "hostName", json!("~x"), home)
             .expect_err("a host name may not start with ~");
         assert!(error.contains("host name \"~x\""), "{error}");
         assert!(
-            !error.contains("/home/sam"),
+            !error.contains(&home.display().to_string()),
             "the host name is not a path: {error}"
         );
     }
 
     #[test]
     fn merge_setting_expands_a_tilde_in_the_codex_folder() {
-        let home = Path::new("/home/sam");
-        let merged = merge_setting(&Settings::default(), "codexHome", json!("~/codex"), home)
-            .expect("the Codex folder is a path");
-        assert_eq!(
-            merged.codex_home,
-            Some(std::path::PathBuf::from("/home/sam/codex"))
-        );
+        let home = crate::test_support::home();
+        let merged = merge_setting(
+            &Settings::default(),
+            "codexHome",
+            json!(crate::test_support::tilde("codex")),
+            home,
+        )
+        .expect("the Codex folder is a path");
+        assert_eq!(merged.codex_home, Some(home.join("codex")));
     }
 
     #[test]
@@ -2967,10 +2971,16 @@ mod tests {
 
     #[test]
     fn an_agent_switch_is_announced_with_the_folder() {
-        let home = std::path::Path::new("/home/sam");
+        let home = crate::test_support::home();
+        let folder = crate::test_support::at_home("projects/atlas")
+            .display()
+            .to_string();
         assert_eq!(
-            agent_switch_message("PR", Some("/home/sam/projects/atlas"), home),
-            "An agent switched to PR (from ~/projects/atlas)."
+            agent_switch_message("PR", Some(&folder), home),
+            format!(
+                "An agent switched to PR (from {}).",
+                crate::test_support::tilde("projects/atlas")
+            )
         );
         assert_eq!(
             agent_switch_message("PR", None, home),

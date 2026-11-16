@@ -1302,7 +1302,11 @@ mod tests {
                         .with_timezone(&Utc),
                     EventKind::AgentCall {
                         command: command.to_string(),
-                        cwd: Some("/home/sam/projects/ledger".to_string()),
+                        cwd: Some(
+                            crate::test_support::at_home("projects/ledger")
+                                .display()
+                                .to_string(),
+                        ),
                         allowed,
                     },
                 )
@@ -1325,12 +1329,13 @@ mod tests {
             )
             .expect("another host's agent call");
 
-        let home = Path::new("/home/sam");
+        let home = crate::test_support::home();
         let rows = agent_calls_from(&history, home, 20).expect("the agent calls are read");
         let commands: Vec<&str> = rows.iter().map(|row| row.command.as_str()).collect();
         assert_eq!(commands, ["next", "use PR", "status --json"]);
         assert!(!rows[1].allowed, "use PR was refused");
-        assert_eq!(rows[0].cwd.as_deref(), Some("~/projects/ledger"));
+        let expected = crate::test_support::tilde("projects/ledger");
+        assert_eq!(rows[0].cwd.as_deref(), Some(expected.as_str()));
 
         let two = agent_calls_from(&history, home, 2).expect("two agent calls are read");
         assert_eq!(two.len(), 2);
@@ -1414,7 +1419,9 @@ mod tests {
             .append(&seatswap_core::history::SessionRecord {
                 t: at,
                 session: "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34".to_string(),
-                cwd: "/home/sam/projects/atlas".to_string(),
+                cwd: crate::test_support::at_home("projects/atlas")
+                    .display()
+                    .to_string(),
                 project: ProjectKey::Repo("github.com/sam/atlas".to_string()),
                 entrypoint: Some("cli".to_string()),
                 first: at,
@@ -1424,13 +1431,13 @@ mod tests {
                 closed: false,
             })
             .expect("a session line");
-        let (projects, warnings) =
-            projects_from(&history, Path::new("/home/sam"), &[]).expect("the projects resolve");
+        let (projects, warnings) = projects_from(&history, crate::test_support::home(), &[])
+            .expect("the projects resolve");
         assert!(warnings.is_empty(), "a clean history has no warning");
         assert_eq!(projects.projects.len(), 1);
         assert_eq!(
             projects.projects[0].folders.get("atlas"),
-            Some(&vec!["~/projects/atlas".to_string()])
+            Some(&vec![crate::test_support::tilde("projects/atlas")])
         );
     }
 

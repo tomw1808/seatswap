@@ -4,7 +4,7 @@
 
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
@@ -55,10 +55,25 @@ fn locations(claude: &ClaudePaths) -> (PathBuf, PathBuf) {
     (folder, path)
 }
 
+/// Refuse a folder path that runs through a file, on every platform. A read
+/// below such a file is `NotFound` on Windows and "not a directory" on Unix, so
+/// one check before the read keeps `status`, `install` and `uninstall` saying
+/// the same thing on both.
+fn ensure_folder_path_is_folders(folder: &Path) -> Result<(), SkillError> {
+    match folder.ancestors().find(|part| part.is_file()) {
+        Some(file) => Err(SkillError::io(
+            file.to_path_buf(),
+            io::Error::new(io::ErrorKind::NotADirectory, "is a file, not a folder"),
+        )),
+        None => Ok(()),
+    }
+}
+
 /// What the skill file is now. A missing file is `installed: false`, not an
 /// error; any other read failure names the path.
 pub fn status(claude: &ClaudePaths) -> Result<SkillStatus, SkillError> {
-    let (_, path) = locations(claude);
+    let (folder, path) = locations(claude);
+    ensure_folder_path_is_folders(&folder)?;
     match fs::read(&path) {
         Ok(bytes) => Ok(SkillStatus {
             path,
@@ -78,6 +93,7 @@ pub fn status(claude: &ClaudePaths) -> Result<SkillStatus, SkillError> {
 /// untouched; one that differs is an error unless `force`.
 pub fn install(claude: &ClaudePaths, force: bool) -> Result<SkillStatus, SkillError> {
     let (folder, path) = locations(claude);
+    ensure_folder_path_is_folders(&folder)?;
     let bundled = AGENT_SKILL.as_bytes();
     match fs::read(&path) {
         Ok(existing) if existing == bundled => {
@@ -107,6 +123,7 @@ pub fn install(claude: &ClaudePaths, force: bool) -> Result<SkillStatus, SkillEr
 /// `force`.
 pub fn uninstall(claude: &ClaudePaths, force: bool) -> Result<SkillStatus, SkillError> {
     let (folder, path) = locations(claude);
+    ensure_folder_path_is_folders(&folder)?;
     let existing = match fs::read(&path) {
         Ok(existing) => existing,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {

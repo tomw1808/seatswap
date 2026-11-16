@@ -3250,7 +3250,7 @@ pub(crate) mod tests {
     #[test]
     fn skill_install_writes_the_bundled_text() {
         let fixture = Fixture::new();
-        let path = fixture.claude().skills_dir().join("seatswap/SKILL.md");
+        let path = crate::test_support::under(&fixture.claude().skills_dir(), "seatswap/SKILL.md");
 
         fixture
             .run(
@@ -3415,7 +3415,7 @@ pub(crate) mod tests {
 
         // `SKILL.md` is a folder, not a file.
         let fixture = Fixture::new();
-        let path = fixture.claude().skills_dir().join("seatswap/SKILL.md");
+        let path = crate::test_support::under(&fixture.claude().skills_dir(), "seatswap/SKILL.md");
         fs::create_dir_all(&path).expect("a folder where the skill goes");
         for action in [
             SkillAction::Install { force: false },

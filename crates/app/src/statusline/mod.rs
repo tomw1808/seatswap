@@ -1278,7 +1278,10 @@ mod tests {
         assert!(text.contains("$3.20"), "{text}");
         assert!(text.contains("+120 -8"), "{text}");
         assert!(text.contains("main"), "{text}");
-        assert!(text.contains("~/projects/atlas"), "{text}");
+        assert!(
+            text.contains(&crate::test_support::tilde("projects/atlas")),
+            "{text}"
+        );
         assert_eq!(preview[0].note, "everything fits");
     }
 

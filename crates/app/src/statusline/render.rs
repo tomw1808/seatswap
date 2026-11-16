@@ -799,10 +799,6 @@ mod tests {
     use chrono::FixedOffset;
     use seatswap_core::store::StatuslineConfig;
 
-    /// The status line payload of `specs/plan/README.md` §5, with the folder the
-    /// Task 2 tests name.
-    const PAYLOAD: &str = r#"{"workspace":{"current_dir":"/home/sam/projects/seatswap/crates/app/ui"},"model":{"id":"claude-fable-5-2","display_name":"Fable 5.2"},"effort":{"level":"high"},"rate_limits":{"five_hour":{"used_percentage":12,"resets_at":1794490200},"seven_day":{"used_percentage":48,"resets_at":1794790800}}}"#;
-
     /// 4 h 45 min before the 5 h reset, 3 d 16 h before the weekly one.
     const NOW: i64 = 1_794_473_100;
 
@@ -810,15 +806,30 @@ mod tests {
         DateTime::<Utc>::from_timestamp(seconds, 0).expect("a valid test timestamp")
     }
 
+    /// The status line payload of `specs/plan/README.md` §5, with the folder the
+    /// Task 2 tests name, below the platform's made-up home folder.
     fn payload() -> Payload {
-        super::super::parse(PAYLOAD.as_bytes())
+        let raw = serde_json::json!({
+            "workspace": {
+                "current_dir": crate::test_support::at_home("projects/seatswap/crates/app/ui")
+                    .display()
+                    .to_string()
+            },
+            "model": {"id": "claude-fable-5-2", "display_name": "Fable 5.2"},
+            "effort": {"level": "high"},
+            "rate_limits": {
+                "five_hour": {"used_percentage": 12, "resets_at": 1794490200},
+                "seven_day": {"used_percentage": 48, "resets_at": 1794790800}
+            }
+        });
+        super::super::parse(raw.to_string().as_bytes())
     }
 
     fn facts() -> Facts {
         Facts {
             user: "sam".to_string(),
             host: "atlas".to_string(),
-            home: "/home/sam".to_string(),
+            home: crate::test_support::home().display().to_string(),
             now: at(NOW),
             account: Some(AccountFacts {
                 abbr: "AC".to_string(),
@@ -871,7 +882,8 @@ mod tests {
         assert_eq!(
             visible_text(&line),
             format!(
-                "sam@atlas:~/projects/seatswap/crates/app/ui Fable 5.2 high{}AC 12% 4h45m  48% 3d16h",
+                "sam@atlas:{} Fable 5.2 high{}AC 12% 4h45m  48% 3d16h",
+                crate::test_support::tilde("projects/seatswap/crates/app/ui"),
                 " ".repeat(35)
             )
         );
@@ -917,7 +929,10 @@ mod tests {
         );
         assert_eq!(
             visible_text(&line),
-            "sam@atlas:~/projects/seatswap/crates/app/ui Fable 5.2 high  AC 12% 4h45m  48% 3d16h"
+            format!(
+                "sam@atlas:{} Fable 5.2 high  AC 12% 4h45m  48% 3d16h",
+                crate::test_support::tilde("projects/seatswap/crates/app/ui")
+            )
         );
     }
 
@@ -1016,7 +1031,8 @@ mod tests {
         assert_eq!(
             visible_text(&line),
             format!(
-                "sam@atlas:~/projects/seatswap/crates/app/ui Fable 5.2 high{}AC 12% 4h45m  48% 3d16h",
+                "sam@atlas:{} Fable 5.2 high{}AC 12% 4h45m  48% 3d16h",
+                crate::test_support::tilde("projects/seatswap/crates/app/ui"),
                 " ".repeat(35)
             )
         );
@@ -1048,7 +1064,10 @@ mod tests {
         );
         assert_eq!(
             visible_text(&line),
-            "sam@atlas:~/projects/seatswap/crates/app/ui Fable 5.2 high  AC 12% 4h45m  48% 3d16h"
+            format!(
+                "sam@atlas:{} Fable 5.2 high  AC 12% 4h45m  48% 3d16h",
+                crate::test_support::tilde("projects/seatswap/crates/app/ui")
+            )
         );
 
         let line = rendered(

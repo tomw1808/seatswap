@@ -501,12 +501,17 @@ mod tests {
     #[cfg(feature = "gui")]
     #[test]
     fn a_home_folder_becomes_a_tilde() {
-        let home = std::path::Path::new("/home/sam");
+        let home = crate::test_support::home();
         assert_eq!(
-            with_tilde("/home/sam/projects/atlas", home),
-            "~/projects/atlas"
+            with_tilde(
+                &crate::test_support::at_home("projects/atlas")
+                    .display()
+                    .to_string(),
+                home
+            ),
+            crate::test_support::tilde("projects/atlas")
         );
-        assert_eq!(with_tilde("/home/sam", home), "~");
+        assert_eq!(with_tilde(&home.display().to_string(), home), "~");
         assert_eq!(with_tilde("/home/samuel", home), "/home/samuel");
         assert_eq!(
             with_tilde("/home/samuel/projects", home),
@@ -519,10 +524,12 @@ mod tests {
         #[cfg(windows)]
         assert_eq!(
             with_tilde(
-                r"C:\Users\sam\projects",
-                std::path::Path::new(r"C:\Users\sam")
+                &crate::test_support::at_home("projects")
+                    .display()
+                    .to_string(),
+                home
             ),
-            r"~\projects"
+            crate::test_support::tilde("projects")
         );
     }
 

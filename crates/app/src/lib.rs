@@ -10,6 +10,9 @@ mod ops;
 // No `gui` gate: the status line command runs in the CLI-only build too.
 mod statusline;
 
+#[cfg(test)]
+mod test_support;
+
 #[cfg(feature = "gui")]
 mod icon;
 
