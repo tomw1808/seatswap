@@ -1,0 +1,381 @@
+/* The Status line area (ui/areas/statusline.js). */
+/* ---------- the Status line area (spec §5.4) ---------- */
+
+.sl {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.sl-errors {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.sl-head {
+  flex-shrink: 0;
+  flex-wrap: wrap;
+  gap: 12px;
+  min-height: 32px;
+}
+
+.sl-head-sub {
+  flex: 1 1 360px;
+  min-width: 0;
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+}
+
+.sl-preset {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sl-grid {
+  display: grid;
+  grid-template-columns: 264px minmax(0, 1fr) 380px;
+  gap: 12px;
+  align-items: start;
+}
+
+.sl-preview,
+.sl-fields {
+  grid-column: 1 / -1;
+}
+
+.sl-card {
+  min-width: 0;
+  min-height: 0;
+}
+
+.sl-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  padding: 8px 10px 12px;
+}
+
+.sl-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.sl-lab {
+  font-size: 10px;
+  line-height: 14px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.sl-zone {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 44px;
+  padding: 7px 8px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 9px;
+  background: var(--input);
+}
+
+.sl-zone.over {
+  border-color: var(--focus);
+  background: var(--focus-soft);
+}
+
+.sl-zone-palette {
+  min-height: 32px;
+  padding: 5px;
+}
+
+.sl-chip {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background: var(--button-bg);
+  color: var(--text);
+  font-size: 11.5px;
+  line-height: 20px;
+  white-space: nowrap;
+  cursor: grab;
+  user-select: none;
+}
+
+.sl-chip:hover {
+  border-color: var(--focus);
+}
+
+.sl-chip:focus-visible,
+.sl-chip.sel {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+.sl-chip.sel {
+  border-color: var(--focus);
+}
+
+.sl-chip.over {
+  border-color: var(--focus);
+  background: var(--focus-soft);
+}
+
+.sl-chip-palette {
+  background: var(--card-raised);
+  color: var(--muted);
+}
+
+.sl-chip-palette:hover {
+  color: var(--text);
+}
+
+.sl-chip.sl-unknown {
+  border-color: var(--error-border);
+  color: var(--danger);
+}
+
+.sl-chip.sl-missing::after {
+  content: "!";
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 13px;
+  height: 13px;
+  margin-left: 5px;
+  border-radius: 50%;
+  background: var(--warn);
+  color: var(--surface);
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.sl-repeatable::after {
+  content: "+";
+  margin-left: 5px;
+  color: var(--muted);
+}
+
+.sl-empty {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 26px;
+}
+
+.sl-line .sl-card-body {
+  gap: 6px;
+}
+
+.sl-foot {
+  flex-wrap: wrap;
+  gap: 14px;
+  margin-top: auto;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.sl-margin-row {
+  gap: 6px;
+}
+
+.sl-margin {
+  width: 56px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.sl-options .sl-card-body {
+  gap: 0;
+  padding: 0 0 6px;
+}
+
+.sl-options .set {
+  grid-template-columns: 118px minmax(0, 1fr);
+}
+
+.sl-option-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.sl-option-note {
+  font-size: 11px;
+}
+
+.sl-hex {
+  width: 110px;
+}
+
+.sl-thresholds {
+  gap: 6px;
+}
+
+.sl-threshold {
+  width: 54px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.sl-prefix .inp {
+  width: 90px;
+}
+
+.sl-preview .ch {
+  gap: 10px;
+}
+
+.sl-prev-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 12px 12px;
+  overflow-x: auto;
+}
+
+.sl-prev-errors {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.sl-prev-row {
+  display: grid;
+  grid-template-columns: 144px max-content 200px;
+  gap: 10px;
+  align-items: center;
+  width: max-content;
+  min-width: 100%;
+}
+
+.sl-width-cell {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.sl-width {
+  width: 84px;
+  flex: 0 0 auto;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.sl-term {
+  width: max-content;
+  min-height: 28px;
+  padding: 3px 8px;
+  border-radius: 7px;
+  background: #0b0d10;
+  color: #e7e9ee;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 10.5px;
+  line-height: 18px;
+  white-space: pre;
+  overflow-x: auto;
+}
+
+.sl-term.light {
+  background: #f8fafc;
+  color: #0f1115;
+}
+
+.sl-term-missing {
+  color: var(--muted);
+}
+
+.sl-note {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 15px;
+}
+
+.sl-record {
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.sl-keys {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 4px 16px;
+  max-height: 240px;
+  overflow: auto;
+}
+
+.sl-key {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  padding: 3px 2px;
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+}
+
+.sl-key code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sl-key .mf {
+  flex: 0 0 auto;
+}
+
+.sl-install-path {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.sl-install-path code {
+  overflow-wrap: anywhere;
+}
+
+.sl-json-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.sl-json-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.sl-json {
+  max-height: 150px;
+  margin: 0;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--input);
+  font-size: 11px;
+  line-height: 1.4;
+  overflow: auto;
+}
+
+.sl-sentence {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.sl-actions {
+  gap: 8px;
+}

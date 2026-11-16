@@ -1,0 +1,115 @@
+/* Statistics: the Forecast page (ui/areas/statistics/forecast.js). */
+/* ---------- Forecast ---------- */
+
+.stats-forecast {
+  flex: 1;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto auto auto;
+  gap: 12px;
+}
+
+.stats-forecast > .stats-note {
+  grid-column: 1;
+  padding: 0 2px;
+  flex: 0 0 auto;
+}
+
+.stats-forecast-noplan {
+  padding: 2px;
+}
+
+.stats-forecast-accounts {
+  display: flex;
+  flex-direction: column;
+  padding: 0 12px 6px;
+}
+
+.stats-fc-arrow {
+  color: var(--muted);
+  text-align: center;
+}
+
+.stats-fc-row {
+  display: grid;
+  grid-template-columns:
+    132px minmax(120px, 1.4fr) 48px 14px 52px
+    minmax(168px, 1fr) minmax(150px, 1fr);
+  column-gap: 8px;
+  align-items: center;
+  min-height: 30px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+}
+
+.stats-fc-row:first-child {
+  border-top: 0;
+}
+
+.stats-fc-account {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.stats-fc-bar {
+  position: relative;
+  height: 10px;
+  border-radius: 5px;
+  background: var(--track);
+}
+
+.stats-fc-now {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  border-radius: 5px;
+}
+
+.stats-fc-expected {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  width: 2px;
+  background: var(--text);
+  opacity: 0.65;
+}
+
+.stats-fc-low {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  width: 0;
+  border-left: 2px dashed var(--warn);
+}
+
+.stats-fc-now-text,
+.stats-fc-expected-text {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.stats-fc-times,
+.stats-fc-lazy {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stats-forecast-lanes-card {
+  min-height: 0;
+}
+
+.stats-forecast-lanes {
+  flex: 0 0 auto;
+  min-height: 0;
+  padding: 2px 12px 6px;
+}
+

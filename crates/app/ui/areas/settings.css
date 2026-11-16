@@ -1,0 +1,661 @@
+/* The Settings area: groups, controls, money, history and hosts (ui/areas/settings.js). */
+/* ---------- the Settings area (spec §3.7) ---------- */
+
+.settings-area {
+  grid-template-columns: 220px minmax(0, 1fr);
+  align-items: start;
+  height: 100%;
+}
+
+.settings-col {
+  min-height: 0;
+}
+
+.settings-card {
+  min-height: 0;
+}
+
+.settings-body {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding-bottom: 8px;
+}
+
+/* One setting row and the error text under it; the rows keep the mock-up's
+   dense 28 px height. */
+.set-row {
+  border-top: 1px solid var(--border);
+}
+
+.set-row .set {
+  border-top: 0;
+}
+
+.settings-body .set {
+  grid-template-columns: 250px minmax(0, 1fr);
+}
+
+.set-row .row-error {
+  padding: 0 12px 6px;
+  color: var(--danger);
+  font-size: 12px;
+  line-height: 16px;
+  white-space: normal;
+}
+
+.cfoot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.note b {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.settings-body .ok {
+  color: #22c55e;
+}
+
+.settings-body .note {
+  margin: 8px 12px 2px;
+  padding: 9px 11px;
+  border: 1px solid var(--warn-border);
+  border-radius: 9px;
+  background: var(--warn-bg);
+}
+
+.settings-card .calls {
+  min-height: 0;
+}
+
+.settings-card .calls .lr:first-child {
+  border-top: 1px solid var(--border);
+}
+
+/* ---------- the Accounts group ---------- */
+
+.acc-grid {
+  grid-template-columns: 62px 128px minmax(0, 1fr) 60px 178px 132px 138px 70px;
+}
+
+.acc-wrap {
+  border-top: 1px solid var(--border);
+}
+
+.acc-wrap .lr {
+  border-top: 0;
+  height: 40px;
+}
+
+.acc-wrap.selected {
+  background: var(--hover);
+}
+
+.acc-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  width: 40px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.acc-chip i {
+  font-style: normal;
+  font-size: 9px;
+  opacity: 0.6;
+}
+
+.acc-chip:hover {
+  border-color: var(--border-strong);
+}
+
+.acc-chip.open {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+.acc-text {
+  color: var(--muted);
+}
+
+.acc-label {
+  width: 100%;
+}
+
+.price-cell {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.acc-price {
+  width: 70px;
+  min-width: 70px;
+  flex: 0 0 70px;
+  font-variant-numeric: tabular-nums;
+}
+
+.currency-hint {
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.acc-switch {
+  display: flex;
+  align-items: center;
+}
+
+.acc-add {
+  height: 34px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+}
+
+.acc-wrap .row-error {
+  padding: 0 12px 6px 74px;
+  color: var(--danger);
+  font-size: 12px;
+  line-height: 16px;
+  white-space: normal;
+}
+
+.acc-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0 12px 9px 74px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+
+.acc-editor .editor-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 18px;
+  flex-wrap: wrap;
+}
+
+.acc-editor .editor-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.acc-editor .confirm {
+  margin: 0;
+}
+
+.acc-editor .field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.acc-editor .field-label {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.abbr-boxes {
+  display: flex;
+  gap: 4px;
+}
+
+.abbr-box {
+  width: 27px;
+  min-width: 27px;
+  padding: 4px 0;
+  text-align: center;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.color-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.hex-input {
+  width: 84px;
+  min-width: 84px;
+  font-variant-numeric: tabular-nums;
+  text-transform: lowercase;
+}
+
+.swatches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.swatch {
+  width: 17px;
+  height: 17px;
+  padding: 0;
+  border: 1px solid rgba(0, 0, 0, 0.18);
+  border-radius: 5px;
+}
+
+.swatch.selected {
+  box-shadow: 0 0 0 2px var(--surface), 0 0 0 3px var(--text);
+}
+
+.swatch:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+.previews {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  padding: 2px 0;
+}
+
+.preview-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+}
+
+.preview-cell canvas {
+  display: block;
+  image-rendering: pixelated;
+}
+
+.preview-size {
+  color: var(--muted);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+
+.confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0 12px 9px;
+  padding: 8px 10px;
+  border: 1px solid var(--danger);
+  border-radius: 9px;
+}
+
+.confirm-text {
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.confirm-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.hbtn.danger {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.hbtn.ghost {
+  border-color: transparent;
+  background: transparent;
+  color: var(--muted);
+}
+
+/* ---------- the Projects group (spec §3.6) ---------- */
+
+.proj-grid {
+  grid-template-columns: 150px minmax(120px, 204px) minmax(0, 1fr) 190px 66px;
+}
+
+.proj-wrap {
+  border-top: 1px solid var(--border);
+}
+
+.proj-wrap .lr {
+  border-top: 0;
+}
+
+.proj-wrap .row-error {
+  padding: 0 12px 6px;
+  color: var(--danger);
+  font-size: 12px;
+  line-height: 16px;
+  white-space: normal;
+}
+
+.proj-name {
+  width: 100%;
+  font-weight: 600;
+}
+
+.proj-org {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.proj-org > select {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.proj-new-org {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.proj-new-input {
+  width: 110px;
+  min-width: 0;
+}
+
+.proj-joined {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 12px;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.proj-join {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.proj-join select.inp {
+  max-width: 200px;
+}
+
+.org-chips {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.acc-chip.org-chip {
+  width: 30px;
+  min-width: 30px;
+  height: 22px;
+  border-radius: 7px;
+  font-size: 11px;
+}
+
+.org-name {
+  width: 100%;
+  max-width: 220px;
+}
+
+.acc-grid select.inp {
+  width: 100%;
+}
+
+/* ---------- the settings controls ---------- */
+
+.inp {
+  height: 28px;
+  min-width: 0;
+  padding: 0 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background: var(--input);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+}
+
+.inp:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+select.inp {
+  padding-right: 4px;
+}
+
+.inp.tall {
+  height: 26px;
+}
+
+.number-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.number-control .inp {
+  width: 82px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The Settings groups use the mock-up's `.sws`: a 28×16 track, a knob and the
+   On/Off word beside it. The pop-up keeps its own `.switch` in panel.css. */
+.sws {
+  position: relative;
+  flex: 0 0 auto;
+  width: 28px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: var(--track);
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+
+.sws::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--surface);
+  transition: left 120ms ease;
+}
+
+.sws.ison {
+  background: var(--focus);
+}
+
+.sws.ison::after {
+  left: 14px;
+}
+
+.sws:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+.sws:disabled {
+  cursor: default;
+}
+
+.sws-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sws-word {
+  width: 22px;
+  font-size: 13px;
+  line-height: 18px;
+}
+
+/* The note rows are flex containers; the separator keeps the spaces the
+   mock-up writes around its "·" (`checked 09:00 · last change 9 Nov`). */
+.middot-sep {
+  white-space: pre;
+}
+
+button.link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--focus);
+  font: inherit;
+  font-size: 12px;
+}
+
+button.link:hover {
+  text-decoration: underline;
+}
+
+/* ---------- the General group's Money section (spec §1.4, §1.4.1) ---------- */
+
+.money-currency,
+.money-prices-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.money-other {
+  display: inline-flex;
+}
+
+.money-other-input {
+  width: 72px;
+  text-transform: uppercase;
+}
+
+.money-rate {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.money-api-note {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0;
+  white-space: normal;
+}
+
+.price-list {
+  display: flex;
+  flex-direction: column;
+  padding: 0 0 6px;
+}
+
+.price-grid {
+  grid-template-columns: minmax(170px, 1fr) 74px 74px 86px 86px minmax(110px, auto);
+}
+
+.price-value {
+  display: flex;
+  min-width: 0;
+}
+
+.price-field {
+  width: 100%;
+  min-width: 0;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.price-add-key {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px 0;
+}
+
+.price-marks {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.price-own-line {
+  display: flex;
+  justify-content: flex-end;
+  padding: 0 12px 4px;
+}
+
+.price-wrap .row-error,
+.price-list-error {
+  padding: 2px 12px 6px;
+  color: var(--danger);
+  font-size: 12px;
+  line-height: 16px;
+  white-space: normal;
+}
+
+.price-list-note {
+  padding-top: 6px;
+}
+
+/* ---------- the History and hosts group (spec §1.5, §3.7) ---------- */
+
+.hist-hosts {
+  padding-bottom: 2px;
+}
+
+.hist-grid {
+  grid-template-columns: 120px 150px minmax(0, 1fr) 90px;
+}
+
+.hist-size {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.hist-export,
+.hist-import {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.hist-buttons {
+  display: inline-flex;
+  gap: 6px;
+}
+
+.hist-export .inp,
+.hist-import .inp {
+  width: 250px;
+  min-width: 0;
+}
+

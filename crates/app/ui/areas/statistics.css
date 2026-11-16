@@ -1,0 +1,186 @@
+/* The Statistics area's frame and shared cards (ui/areas/statistics.js). */
+/* ---------- the Statistics area (spec §3.1, §3.2, §3.6; step C3 Task 8) ---------- */
+
+.stats {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+}
+
+.stats-head {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+  min-width: 0;
+}
+
+.stats-meta {
+  margin: 0;
+  flex-shrink: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 16px;
+  white-space: nowrap;
+}
+
+.stats-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex: 1;
+  flex-wrap: nowrap;
+  min-width: 0;
+}
+
+.stats-chips {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.stats-account {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 30px;
+  height: 24px;
+  padding: 0 7px;
+  border: 1px solid var(--muted);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.stats-account:hover {
+  box-shadow: 0 0 0 2px var(--border-strong);
+}
+
+.stats-account-off {
+  border-style: dashed;
+  opacity: 0.55;
+}
+
+.stats-account:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+
+.stats-host {
+  height: 26px;
+  min-width: 105px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--input);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.stats-tabs {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 9px;
+  background: var(--button-bg);
+  align-self: flex-start;
+  flex-shrink: 0;
+}
+
+.stats-tab {
+  height: 24px;
+  padding: 0 9px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: none;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.stats-tab:hover {
+  color: var(--text);
+  background: var(--hover);
+}
+
+.stats-tab-on {
+  background: var(--card-raised);
+  border-color: var(--border);
+  color: var(--text);
+  box-shadow: 0 1px 2px var(--border);
+}
+
+.stats-tabrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  min-width: 0;
+}
+
+.stats-tabrow .sp {
+  flex: 1;
+}
+
+.stats-export {
+  display: inline-flex;
+  align-items: center;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--button-bg);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 500;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.stats-export:hover {
+  background: var(--hover);
+}
+
+.stats-errors:empty {
+  display: none;
+}
+
+.stats-empty {
+  margin: 0;
+  padding: 14px 12px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 19px;
+}
+
+.stats-page {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.stats-page-stage {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  max-height: 602px; /* the page's height at 1280 x 800: a taller window stays empty under it */
+  display: flex;
+  flex-direction: column;
+}
+

@@ -1,0 +1,237 @@
+/* Statistics: the Projects page (ui/areas/statistics/projects.js). */
+/* ---------- Projects ---------- */
+
+.stats-projects {
+  flex: 1;
+  grid-template-columns: minmax(0, 13fr) minmax(0, 7fr);
+  grid-template-rows: minmax(0, 0.75fr) minmax(0, 1.25fr);
+  gap: 12px;
+}
+
+.stats-projects-tree {
+  grid-row: 1 / span 2;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.stats-projects-matrix {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.stats-projects-detail {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.stats-mode {
+  background: var(--input);
+  border: 1px solid var(--border);
+}
+
+.stats-tree-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.stats-tree {
+  display: flex;
+  flex-direction: column;
+  padding: 0 8px;
+}
+
+.stats-tree-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 64px 44px 50px 76px 74px 86px 42px;
+  column-gap: 6px;
+  align-items: center;
+  min-height: 27px;
+  padding: 0 4px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+}
+
+.stats-tree-row-head {
+  height: 20px;
+  min-height: 20px;
+  border-top: 0;
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.stats-tree-row > * {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stats-tree-row-org {
+  background: var(--hover);
+}
+
+.stats-tree-row-click {
+  cursor: pointer;
+}
+
+.stats-tree-row-click:hover {
+  background: var(--hover);
+}
+
+.stats-tree-row-selected {
+  background: var(--info-bg);
+  box-shadow: inset 2px 0 0 var(--focus);
+}
+
+.stats-tree-name {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.stats-caret {
+  width: 14px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 18px;
+  flex-shrink: 0;
+}
+
+.stats-caret-space {
+  width: 14px;
+  flex-shrink: 0;
+}
+
+.stats-tree-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.stats-ubar {
+  display: block;
+  height: 8px;
+  border-radius: 4px;
+  background: var(--track);
+  overflow: hidden;
+}
+
+.stats-ubar i {
+  display: block;
+  height: 100%;
+  background: var(--focus);
+}
+
+.stats-split {
+  display: flex;
+  height: 8px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--track);
+}
+
+.stats-split i {
+  display: block;
+  height: 100%;
+}
+
+.stats-tree-none {
+  margin-left: 5px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.stats-tree-notes {
+  margin-top: auto;
+  padding: 4px 8px 8px;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.stats-tree-notes .stats-note {
+  padding: 2px 4px;
+}
+
+.stats-matrix-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 2px 12px 10px;
+}
+
+.stats-matrix {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+}
+
+.stats-matrix-row {
+  display: grid;
+  grid-template-columns: var(--stats-matrix-columns);
+  column-gap: 3px;
+  align-items: center;
+  min-height: 24px;
+}
+
+.stats-matrix-row-head {
+  min-height: 18px;
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.stats-matrix-org {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stats-matrix-head-cell {
+  display: flex;
+  justify-content: center;
+}
+
+.stats-matrix-cell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 22px;
+  border-radius: 5px;
+  background: color-mix(in oklab, var(--stats-matrix-color) 18%, transparent);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.stats-matrix-sentences {
+  margin-top: 10px;
+}
+
+.stats-model-chart {
+  height: 170px;
+}
+
+.stats-host-share {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr) 44px;
+  gap: 6px;
+  align-items: center;
+  min-width: 150px;
+  font-size: 11px;
+}
+

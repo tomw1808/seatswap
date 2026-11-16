@@ -1,0 +1,40 @@
+/* Statistics: the Rhythm page (ui/areas/statistics/rhythm.js). */
+/* ---------- Rhythm ---------- */
+
+.stats-rhythm {
+  flex: 1;
+  grid-template-columns: minmax(0, 13fr) minmax(0, 7fr);
+  grid-template-rows: minmax(0, 1fr);
+  gap: 12px;
+}
+
+.stats-rhythm-heat-card {
+  min-height: 0;
+}
+
+.stats-rhythm-heat-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  padding: 2px 12px 10px;
+}
+
+.stats-rhythm-side {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+}
+
+.stats-rhythm-side > .hcard {
+  flex: 1;
+  min-height: 0;
+}
+
+.stats-rhythm-bars-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  padding: 0 12px 8px;
+}
+

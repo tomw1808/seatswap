@@ -1,0 +1,228 @@
+/* Statistics: the Subscriptions page (ui/areas/statistics/subscriptions.js). */
+/* ---------- Subscriptions ---------- */
+
+.stats-subscriptions {
+  flex: 1;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 12px;
+}
+
+.stats-subscriptions > .stats-note {
+  grid-column: 1;
+  padding: 0 2px;
+}
+
+.stats-periods-card,
+.stats-sub-rows-card {
+  min-width: 0;
+}
+
+.stats-periods-body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 0 12px 8px;
+}
+
+.stats-gantt-axis,
+.stats-gantt-row {
+  display: grid;
+  grid-template-columns: 260px minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+}
+
+.stats-gantt-axis {
+  min-height: 14px;
+  font-size: 9px;
+  color: var(--muted);
+}
+
+.stats-gantt-row {
+  min-height: 20px;
+}
+
+.stats-gantt-label {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 5px;
+  min-width: 0;
+  white-space: normal;
+  font-size: 11px;
+}
+
+.stats-gantt-label .stats-plan {
+  color: var(--muted);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.stats-gantt-track {
+  position: relative;
+  height: 100%;
+  min-height: 16px;
+  border-radius: 5px;
+  background: var(--track);
+}
+
+.stats-gantt-axis .stats-gantt-track {
+  min-height: 14px;
+  background: none;
+}
+
+.stats-gantt-row .stats-gantt-track i {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  min-width: 3px;
+  border-radius: 4px;
+}
+
+.stats-gantt-tick {
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
+  font-size: 9px;
+  line-height: 14px;
+  white-space: nowrap;
+}
+
+.stats-sub-rows-body {
+  padding: 0 12px 8px;
+  overflow-x: auto;
+}
+
+.stats-subrow {
+  display: grid;
+  grid-template-columns:
+    52px 62px 84px 62px 46px minmax(84px, 1fr) 50px
+    112px 62px 80px 128px 92px;
+  column-gap: 6px;
+  align-items: center;
+  min-height: 26px;
+  padding: 0 6px;
+  border-top: 1px solid var(--border);
+  border-radius: 5px;
+  font-size: 12px;
+}
+
+.stats-subrow > * {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stats-subrow-head {
+  min-height: 18px;
+  border-top: 0;
+  color: var(--muted);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.stats-subrow[role="button"] {
+  cursor: pointer;
+}
+
+.stats-subrow[role="button"]:hover,
+.stats-subrow[role="button"]:focus-visible {
+  background: var(--hover);
+}
+
+.stats-subrow-selected {
+  background: var(--info-bg);
+  box-shadow: inset 2px 0 0 var(--focus);
+}
+
+.stats-sub-cell-account {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.stats-sub-cell-wide {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.stats-sub-cell-wide .stats-ubar {
+  flex: 1;
+  min-width: 20px;
+}
+
+.stats-tag-good {
+  color: var(--pill-text);
+  background: var(--pill-bg);
+  border: 1px solid var(--border);
+}
+
+.stats-tag-focus {
+  color: var(--focus);
+  background: var(--info-bg);
+  border: 1px solid var(--info-border);
+}
+
+.stats-tag-plain {
+  color: var(--muted);
+  background: var(--button-bg);
+  border: 1px solid var(--border);
+}
+
+.stats-whatif-card {
+  min-height: 0;
+}
+
+.stats-whatif-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 0 12px 8px;
+  overflow: hidden;
+}
+
+.stats-whatif-kpis {
+  padding: 2px 0 2px;
+}
+
+.stats-kpi-value-small {
+  font-size: 13px;
+  line-height: 17px;
+}
+
+.stats-kpi-sentence .stats-kpi-value {
+  font-size: 12px;
+  line-height: 16px;
+  white-space: normal;
+  overflow: visible;
+}
+
+.stats-whatif-charts {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  gap: 12px;
+}
+
+.stats-whatif-chart {
+  flex: 2 1 0;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.stats-whatif-tokens {
+  flex: 1 1 0;
+}
+
+.stats-whatif-chart .chart {
+  min-height: 92px;
+}
+

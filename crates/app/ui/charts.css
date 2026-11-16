@@ -1,0 +1,673 @@
+/* Charts drawn by ui/charts.js and used by the statistics pages. */
+/* ---------- charts (ui/charts.js) ---------- */
+
+.chart {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  font-size: 11px;
+}
+
+.chart-tip {
+  position: fixed;
+  z-index: 100;
+  max-width: 290px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--card-raised);
+  color: var(--text);
+  box-shadow: 0 6px 20px var(--border);
+  pointer-events: none;
+  font-size: 11px;
+  line-height: 15px;
+}
+
+.chart-tip-title {
+  font-weight: 600;
+}
+
+.chart-tip-line {
+  color: var(--muted);
+}
+
+.chart-click {
+  cursor: pointer;
+}
+
+.chart-cols {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+.chart-marks {
+  position: absolute;
+  top: 16px;
+  bottom: 30px;
+  left: 0;
+  right: 0;
+  pointer-events: none;
+}
+
+.chart-marks-lines {
+  top: 0;
+  bottom: 0;
+}
+
+.chart-mark {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-left: 1px dashed var(--border-strong);
+}
+
+.chart-mark-label {
+  position: absolute;
+  top: 0;
+  padding-left: 4px;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 13px;
+  white-space: nowrap;
+  transform: translateX(-50%);
+}
+
+.chart-cols-body {
+  flex: 1;
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  min-height: 0;
+  /* the band above the tallest column: its mark labels sit at 15px and end at
+     28px, so no label touches a column (the labels of "PR added" and
+     "auto-burn on" in the All range). */
+  padding: 34px 4px 0;
+}
+
+.chart-col {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 2px;
+  min-width: 0;
+  height: 100%;
+}
+
+.chart-pair {
+  flex: 1;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  gap: 3px;
+  width: 100%;
+  min-height: 0;
+}
+
+.chart-stack {
+  width: 100%;
+  max-width: 42px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  border-radius: 5px;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.chart-stack-seg {
+  display: block;
+  width: 100%;
+  min-height: 0;
+  border-top: 1px solid var(--card);
+}
+
+.chart-col-label {
+  max-width: 100%;
+  font-size: 10px;
+  line-height: 13px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chart-col-sub {
+  max-width: 100%;
+  font-size: 9px;
+  line-height: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chart-stack-seg:focus-visible,
+.chart-point:focus-visible,
+.chart-cell:focus-visible,
+.chart-grid-head:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+.chart-lines {
+  display: flex;
+  flex-direction: column;
+}
+
+.chart-plot {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  margin-top: 6px;
+  margin-left: 34px;
+  margin-right: 4px;
+  border-left: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.chart-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.chart-gridline {
+  position: absolute;
+  left: 0;
+  right: 0;
+  border-top: 1px solid var(--border);
+  opacity: 0.55;
+}
+
+.chart-y {
+  position: absolute;
+  left: -32px;
+  width: 28px;
+  text-align: right;
+  font-size: 9px;
+  line-height: 11px;
+  color: var(--muted);
+  transform: translateY(50%);
+}
+
+.chart-point {
+  position: absolute;
+  width: 7px;
+  height: 7px;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--card);
+  border-radius: 50%;
+  background: var(--chart-point-color, var(--focus));
+  transform: translate(-50%, 50%);
+  z-index: 1;
+}
+
+.chart-xaxis {
+  display: flex;
+  justify-content: space-between;
+  margin-left: 34px;
+  margin-right: 4px;
+  padding-top: 3px;
+  font-size: 9px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.chart-bars {
+  display: flex;
+  flex-direction: column;
+}
+
+.chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding: 0 0 4px;
+}
+
+.chart-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.chart-legend-box {
+  width: 12px;
+  height: 10px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
+.chart-bars-body {
+  flex: 1;
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  min-height: 0;
+  padding: 8px 4px 0;
+}
+
+.chart-bar-col {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 2px;
+  height: 100%;
+  min-width: 0;
+}
+
+.chart-bar-group {
+  flex: 1;
+  width: 100%;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  gap: 3px;
+  min-height: 0;
+}
+
+.chart-bar {
+  width: 100%;
+  max-width: 22px;
+  border-radius: 4px 4px 0 0;
+  min-height: 0;
+}
+
+.chart-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+}
+
+.chart-grid-row {
+  display: grid;
+  grid-template-columns: var(--chart-grid-columns);
+  gap: 3px;
+  align-items: center;
+  min-width: 0;
+}
+
+.chart-grid-corner {
+  min-height: 18px;
+}
+
+.chart-grid-headrow {
+  min-height: 16px;
+}
+
+.chart-grid-head {
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 9px;
+  line-height: 12px;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chart-grid-head-selected {
+  color: var(--focus);
+  font-weight: 600;
+}
+
+.chart-grid-head-current {
+  color: var(--text);
+}
+
+.chart-grid-label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.chart-cell {
+  position: relative;
+  height: 42px;
+  border-radius: 6px;
+  overflow: hidden;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  background: var(--track);
+  box-shadow: inset 0 0 0 1px var(--border);
+  color: var(--chart-cell-text, var(--text));
+  font-size: 10px;
+  min-width: 0;
+}
+
+.chart-cell-plain {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+
+.chart-cell-hatch {
+  background: repeating-linear-gradient(
+    135deg,
+    color-mix(in oklab, var(--chart-cell-color, var(--muted)) 50%, transparent) 0 2px,
+    transparent 2px 5px
+  );
+  box-shadow: inset 0 0 0 1px var(--chart-cell-color, var(--muted));
+}
+
+.chart-cell-fill {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: var(--chart-cell-color, var(--focus));
+}
+
+.chart-cell-text {
+  position: relative;
+  z-index: 1;
+  padding-bottom: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+.chart-cell-empty {
+  background: none;
+  box-shadow: inset 0 0 0 1px var(--border);
+  opacity: 0.5;
+}
+
+.chart-cell-current {
+  outline: 1px dashed var(--border-strong);
+  outline-offset: -1px;
+}
+
+.chart-cell-current .chart-cell-fill {
+  opacity: 0.55;
+}
+
+.chart-cell-uncertain {
+  outline: 2px solid color-mix(in oklab, var(--text) 45%, transparent);
+  outline-offset: 1px;
+}
+
+.chart-cell-full {
+  box-shadow: inset 0 0 0 1px var(--focus);
+}
+
+/* The columns chart's mark labels sit above the columns, never behind them. */
+.chart-marks-cols {
+  top: 0;
+  z-index: 2;
+}
+
+.chart-marks-cols .chart-mark {
+  top: 15px;
+}
+
+.chart-heat {
+  gap: 3px;
+}
+
+.chart-heat-axis {
+  flex: 0 0 14px;
+}
+
+.chart-heat-row {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 34px var(--chart-heat-columns, repeat(24, minmax(0, 1fr)));
+  gap: 2px;
+  align-items: stretch;
+}
+
+.chart-heat-day {
+  display: flex;
+  align-items: center;
+  font-size: 10px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.chart-heat-hour {
+  font-size: 9px;
+  line-height: 14px;
+  color: var(--muted);
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.chart-heat-cell {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  border-radius: 3px;
+  background: color-mix(in oklab, var(--focus) var(--chart-heat-strength, 0%), var(--track));
+}
+
+.chart-lanes {
+  gap: 2px;
+}
+
+.chart-lanes-row {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  gap: 8px;
+  align-items: stretch;
+  height: 34px;
+  min-height: 0;
+}
+
+.chart-lanes-axis {
+  height: 16px;
+}
+
+.chart-lanes-label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  font-size: 11px;
+}
+
+.chart-lanes-track {
+  position: relative;
+  min-width: 0;
+  background: var(--track);
+  border-radius: 5px;
+}
+
+.chart-lanes-axis .chart-lanes-track {
+  background: none;
+}
+
+.chart-lanes-row i {
+  position: absolute;
+  top: 7px;
+  bottom: 7px;
+  min-width: 3px;
+  border-radius: 4px;
+}
+
+.chart-lanes-row u {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  width: 0;
+  border-left: 1px dashed var(--text);
+  opacity: 0.55;
+}
+
+.chart-lanes-tick {
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 14px;
+  white-space: nowrap;
+}
+
+.chart-mark[data-align="start"] .chart-mark-label {
+  transform: none;
+}
+
+.chart-mark[data-align="end"] .chart-mark-label {
+  padding-left: 0;
+  padding-right: 4px;
+  transform: translateX(-100%);
+}
+
+.stats-fc-none .chart-lanes-label {
+  color: var(--danger);
+}
+
+.chart-hours {
+  gap: 3px;
+}
+
+.chart-hours-row {
+  display: grid;
+  grid-template-columns: 46px minmax(0, 1fr);
+  gap: 6px;
+  align-items: stretch;
+}
+
+.chart-hours-axis {
+  flex: 0 0 14px;
+}
+
+.chart-hours-label {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.chart-hours-track {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  min-height: 0;
+}
+
+.chart-hours-dayaxis {
+  display: flex;
+  gap: 1px;
+  height: 14px;
+}
+
+.chart-hours-day {
+  min-width: 0;
+  font-size: 9px;
+  line-height: 14px;
+  color: var(--muted);
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.chart-hours-cells {
+  display: flex;
+  gap: 1px;
+  flex: 1;
+  min-height: 44px;
+}
+
+.chart-hours-strip {
+  display: flex;
+  gap: 1px;
+  height: 8px;
+}
+
+.chart-hours-cell {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 1px;
+  border-radius: 2px;
+  overflow: hidden;
+  background: var(--track);
+}
+
+.chart-hours-cell.chart-hours-work {
+  background: transparent;
+}
+
+.chart-hours-cell.chart-hours-idle {
+  background: color-mix(in oklab, var(--muted) 30%, transparent);
+}
+
+.chart-hours-cell.chart-hours-off {
+  background: repeating-linear-gradient(
+    135deg,
+    color-mix(in oklab, var(--muted) 45%, transparent) 0 1px,
+    transparent 1px 3px
+  );
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+
+.chart-hours-cell.chart-hours-unknown {
+  background: none;
+  box-shadow: none;
+  opacity: 0.6;
+}
+
+.chart-hours-stack {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column-reverse;
+}
+
+.chart-hours-stack i {
+  display: block;
+  width: 100%;
+  min-height: 0;
+}
+
+.chart-hours-stripcell {
+  flex: 1 1 0;
+  min-width: 1px;
+  height: 100%;
+  display: flex;
+  align-items: flex-end;
+  border-radius: 2px;
+  background: var(--track);
+}
+
+.chart-hours-stripcell i {
+  display: block;
+  width: 100%;
+  background: var(--muted);
+  border-radius: 2px 2px 0 0;
+}
+
