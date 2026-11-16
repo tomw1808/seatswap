@@ -6,17 +6,17 @@
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
 
-use crate::api::{Api, ApiError, Limit, LimitKind, Severity, Usage};
+use crate::api::{mark_highest_active, Api, ApiError, Limit, LimitKind, Severity, Usage};
 use crate::history::AccountRef;
 
-use super::{mark_highest_active, Credits, ProviderError, ProviderReading, OLLAMA_ORG};
+use super::{Credits, ProviderError, ProviderReading, OLLAMA_ORG};
 
 /// Read Ollama's cloud balance and the spend of the last 24 hours.
 ///
 /// The configured base URL is checked first: a URL the settings refuse never
 /// reaches the server. The balance is what the card needs: a failed or
-/// incomplete usage answer only leaves [`ProviderReading::spend_24h`] empty and
-/// the reading is still `Ok`.
+/// incomplete usage answer is recorded in [`ProviderReading::spend_24h`] as an
+/// `Err` with its reason, and the reading is still `Ok`.
 pub fn read(base_url: &str, api: &Api) -> Result<ProviderReading, ProviderError> {
     crate::store::validate_ollama_url(base_url)
         .map_err(|error| ProviderError::Setting(error.to_string()))?;
@@ -24,15 +24,28 @@ pub fn read(base_url: &str, api: &Api) -> Result<ProviderReading, ProviderError>
         ApiError::NoConnection(_) => ProviderError::NotRunning {
             url: base_url.to_string(),
         },
+        ApiError::Unauthorized => ProviderError::OllamaRefused {
+            url: base_url.to_string(),
+            status: 401,
+        },
+        ApiError::Http { status: 403, .. } => ProviderError::OllamaRefused {
+            url: base_url.to_string(),
+            status: 403,
+        },
         other => ProviderError::Api(other),
     })?;
     let (usage, credits) = balance_reading(&balance)?;
-    let spend_24h = api.ollama_usage_24h(base_url).ok().and_then(|answer| {
-        answer
+    let spend_24h = match api.ollama_usage_24h(base_url) {
+        Ok(answer) => match answer
             .get("totals")
             .and_then(|totals| totals.get("usage_usd"))
             .and_then(amount)
-    });
+        {
+            Some(value) => Ok(value),
+            None => Err("the usage answer has no number at totals.usage_usd".to_string()),
+        },
+        Err(error) => Err(error.to_string()),
+    };
     Ok(ProviderReading {
         account: AccountRef {
             acc: OLLAMA_ORG.to_string(),
@@ -41,7 +54,7 @@ pub fn read(base_url: &str, api: &Api) -> Result<ProviderReading, ProviderError>
         plan: None,
         usage,
         credits,
-        spend_24h,
+        spend_24h: Some(spend_24h),
     })
 }
 
@@ -457,7 +470,7 @@ mod tests {
         assert_eq!(limit.model, None);
         assert!(limit.is_active);
         assert!(!usage.extra_usage_enabled);
-        assert_eq!(reading.spend_24h, Some(3.18));
+        assert_eq!(reading.spend_24h, Some(Ok(3.18)));
         assert_eq!(reading.plan, None);
         assert_eq!(
             reading.account,
@@ -525,7 +538,7 @@ mod tests {
         assert_eq!(weekly.resets_at, Some(at("2026-11-16T02:00:00Z")));
         assert!(weekly.is_active);
 
-        assert_eq!(reading.spend_24h, Some(3.18));
+        assert_eq!(reading.spend_24h, Some(Ok(3.18)));
     }
 
     #[test]
@@ -546,7 +559,7 @@ mod tests {
         let reading = read(&base, &Api::new()).unwrap();
         let _ = captured(&receiver, handle);
 
-        assert_eq!(reading.spend_24h, None);
+        assert_eq!(reading.spend_24h, Some(Err("server error 500".to_string())));
         assert_eq!(
             reading.credits,
             Some(Credits {
@@ -556,6 +569,64 @@ mod tests {
                 purchased: Some(0.0),
             })
         );
+    }
+
+    #[test]
+    fn a_usage_answer_without_totals_says_so() {
+        let (base, receiver, handle) =
+            start_ollama(Reply::ok(NEW_PLAN_BALANCE), Reply::ok(r#"{"buckets": []}"#));
+        let reading = read(&base, &Api::new()).unwrap();
+        let _ = captured(&receiver, handle);
+
+        assert_eq!(
+            reading.spend_24h,
+            Some(Err(
+                "the usage answer has no number at totals.usage_usd".to_string()
+            ))
+        );
+        assert!(reading.credits.is_some(), "the balance is still read");
+    }
+
+    #[test]
+    fn a_usage_answer_without_a_number_at_usage_usd_says_so() {
+        let (base, receiver, handle) = start_ollama(
+            Reply::ok(NEW_PLAN_BALANCE),
+            Reply::ok(r#"{"totals":{"usage_usd":"3.18"}}"#),
+        );
+        let reading = read(&base, &Api::new()).unwrap();
+        let _ = captured(&receiver, handle);
+
+        assert_eq!(
+            reading.spend_24h,
+            Some(Err(
+                "the usage answer has no number at totals.usage_usd".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_refused_ollama_request_names_no_token() {
+        for status in [401, 403] {
+            let (base, receiver, handle) = start_one(Reply::status(status, "no"));
+            let error = read(&base, &Api::new()).unwrap_err();
+            let request = receiver
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the fake Ollama received no request");
+            handle.join().unwrap();
+
+            assert_eq!(request.path, "/api/balance");
+            match &error {
+                ProviderError::OllamaRefused { url, status: got } => {
+                    assert_eq!(url, &base);
+                    assert_eq!(*got, status);
+                }
+                other => panic!("expected OllamaRefused for {status}, got {other:?}"),
+            }
+            assert_eq!(
+                error.to_string(),
+                format!("Ollama on {base} refused the request (HTTP {status}). Is it signed in?")
+            );
+        }
     }
 
     #[test]

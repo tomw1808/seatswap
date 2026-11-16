@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::api::{ApiError, Limit, Usage};
+use crate::api::{ApiError, Usage};
 use crate::history::AccountRef;
 
 pub mod codex;
@@ -23,7 +23,7 @@ pub const OLLAMA_ORG: &str = "ollama";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
-    #[error("No Codex login found in {path}.")]
+    #[error("No Codex login found in {path}. If Codex keeps its login in the system keyring, seatswap cannot read it.")]
     NoLogin { path: PathBuf },
     #[error("Codex keeps its login in the system keyring. seatswap reads the login file only.")]
     KeyringLogin,
@@ -31,6 +31,8 @@ pub enum ProviderError {
     LoginExpired,
     #[error("Ollama is not running on {url}.")]
     NotRunning { url: String },
+    #[error("Ollama on {url} refused the request (HTTP {status}). Is it signed in?")]
+    OllamaRefused { url: String, status: u16 },
     #[error("{0}")]
     Setting(String),
     #[error(transparent)]
@@ -62,20 +64,8 @@ pub struct ProviderReading {
     pub plan: Option<String>,
     pub usage: Option<Usage>,
     pub credits: Option<Credits>,
-    pub spend_24h: Option<f64>,
-}
-
-/// Exactly one limit is active: the one with the highest percent, the first of
-/// equals.
-pub(crate) fn mark_highest_active(limits: &mut [Limit]) {
-    let mut highest: Option<usize> = None;
-    for (index, limit) in limits.iter().enumerate() {
-        match highest {
-            Some(best) if limits[best].percent >= limit.percent => {}
-            _ => highest = Some(index),
-        }
-    }
-    if let Some(index) = highest {
-        limits[index].is_active = true;
-    }
+    /// The spend of the last 24 hours, when the provider has such a reading:
+    /// `None` for Codex, `Some(Err)` when Ollama's usage answer could not be
+    /// read (the balance is still in the reading).
+    pub spend_24h: Option<Result<f64, String>>,
 }

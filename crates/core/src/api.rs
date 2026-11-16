@@ -81,7 +81,8 @@ impl ApiError {
 
 pub struct Api {
     agent: ureq::Agent,
-    /// models.dev and Frankfurter: redirects are not followed.
+    /// The provider GETs, models.dev and Frankfurter: redirects are not
+    /// followed.
     lookup_agent: ureq::Agent,
     usage_url: String,
     token_url: String,
@@ -149,30 +150,30 @@ impl Api {
         account_id: &str,
     ) -> Result<serde_json::Value, ApiError> {
         let request = self
-            .agent
+            .lookup_agent
             .get(&self.codex_usage_url)
             .set("User-Agent", USER_AGENT)
             .set("Authorization", &format!("Bearer {access_token}"))
             .set("chatgpt-account-id", account_id);
-        get_json(request)
+        get_json_no_redirect(request)
     }
 
     /// GET Ollama's cloud balance from the server at `base_url`.
     pub fn ollama_balance(&self, base_url: &str) -> Result<serde_json::Value, ApiError> {
         let request = self
-            .agent
+            .lookup_agent
             .get(&ollama_url(base_url, "/api/balance"))
             .set("User-Agent", USER_AGENT);
-        get_json(request)
+        get_json_no_redirect(request)
     }
 
     /// GET Ollama's usage over the last 24 hours from the server at `base_url`.
     pub fn ollama_usage_24h(&self, base_url: &str) -> Result<serde_json::Value, ApiError> {
         let request = self
-            .agent
+            .lookup_agent
             .get(&ollama_url(base_url, "/api/usage?range=24h"))
             .set("User-Agent", USER_AGENT);
-        get_json(request)
+        get_json_no_redirect(request)
     }
 
     /// Exchange a login's refresh token for a new access token. `expected` is the
@@ -263,21 +264,8 @@ impl Api {
             )));
         }
         let url = format!("{}?base=USD&symbols={}", self.frankfurter_url, currency);
-        let response = match self
-            .lookup_agent
-            .get(&url)
-            .set("User-Agent", USER_AGENT)
-            .call()
-        {
-            Ok(response) => no_redirect(response)?,
-            Err(ureq::Error::Status(status, response)) => {
-                return Err(status_error(status, response))
-            }
-            Err(ureq::Error::Transport(error)) => return Err(transport_error(error)),
-        };
-        let body = read_body(response)?;
-        let value: Value =
-            serde_json::from_str(&body).map_err(|error| ApiError::Decode(error.to_string()))?;
+        let request = self.lookup_agent.get(&url).set("User-Agent", USER_AGENT);
+        let value = get_json_no_redirect(request)?;
         let date = value
             .get("date")
             .and_then(Value::as_str)
@@ -298,14 +286,28 @@ impl Api {
 }
 
 /// Send one GET and read its JSON answer. The status, body and decode handling
-/// of every plain GET lives here; a look-up with its own redirect rule reads
-/// its answer itself.
+/// of every plain GET lives here; a GET that follows no redirect goes through
+/// [`get_json_no_redirect`].
 fn get_json(request: ureq::Request) -> Result<Value, ApiError> {
-    let response = match request.call() {
-        Ok(response) => response,
-        Err(ureq::Error::Status(status, response)) => return Err(status_error(status, response)),
-        Err(ureq::Error::Transport(error)) => return Err(transport_error(error)),
-    };
+    read_json(call(request)?)
+}
+
+/// Send one GET that follows no redirect and read its JSON answer. A redirect
+/// answer is an error ([`no_redirect`]).
+fn get_json_no_redirect(request: ureq::Request) -> Result<Value, ApiError> {
+    read_json(no_redirect(call(request)?)?)
+}
+
+/// Send one request and map a status or transport failure.
+fn call(request: ureq::Request) -> Result<ureq::Response, ApiError> {
+    match request.call() {
+        Ok(response) => Ok(response),
+        Err(ureq::Error::Status(status, response)) => Err(status_error(status, response)),
+        Err(ureq::Error::Transport(error)) => Err(transport_error(error)),
+    }
+}
+
+fn read_json(response: ureq::Response) -> Result<Value, ApiError> {
     let body = read_body(response)?;
     serde_json::from_str(&body).map_err(|error| ApiError::Decode(error.to_string()))
 }
@@ -366,9 +368,10 @@ fn build_agent() -> ureq::Agent {
     ureq::AgentBuilder::new().timeout(TIMEOUT).build()
 }
 
-/// The agent of the two look-ups: no redirect is followed, so each request goes
-/// to the host its URL names and to no other (spec §1.4.1, "no other host is
-/// contacted"). A redirect answer is an error ([`no_redirect`]).
+/// The agent of the provider GETs and the two look-ups: no redirect is
+/// followed, so each request goes to the host its URL names and to no other
+/// (spec §1.4.1, "no other host is contacted"). A redirect answer is an error
+/// ([`no_redirect`]).
 fn build_lookup_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout(TIMEOUT)
@@ -376,8 +379,8 @@ fn build_lookup_agent() -> ureq::Agent {
         .build()
 }
 
-/// A look-up's answer, unless it is a redirect: that is an error naming where it
-/// pointed, and nothing is asked there.
+/// A no-redirect GET's answer, unless it is a redirect: that is an error naming
+/// where it pointed, and nothing is asked there.
 fn no_redirect(response: ureq::Response) -> Result<ureq::Response, ApiError> {
     let status = response.status();
     if (300..400).contains(&status) {
@@ -682,6 +685,26 @@ pub struct Usage {
     pub extra_usage_enabled: bool,
 }
 
+/// The index of the limit with the highest percent, the first of equals.
+fn highest_limit_index(limits: &[Limit]) -> Option<usize> {
+    let mut highest: Option<usize> = None;
+    for (index, limit) in limits.iter().enumerate() {
+        match highest {
+            Some(best) if limits[best].percent >= limit.percent => {}
+            _ => highest = Some(index),
+        }
+    }
+    highest
+}
+
+/// Exactly one limit is active: the one with the highest percent, the first of
+/// equals. The one rule both a provider reading and [`Usage::binding`] use.
+pub(crate) fn mark_highest_active(limits: &mut [Limit]) {
+    if let Some(index) = highest_limit_index(limits) {
+        limits[index].is_active = true;
+    }
+}
+
 impl Usage {
     /// Read a usage reply. `limits[]` wins when it is an array (even empty);
     /// only a missing or null `limits` falls back to `five_hour` / `seven_day`.
@@ -732,15 +755,12 @@ impl Usage {
     }
 
     /// The active limit, else the one with the highest percentage, else none.
+    /// The highest is the first of equals, as [`mark_highest_active`] chooses.
     pub fn binding(&self) -> Option<&Limit> {
         self.limits
             .iter()
             .find(|limit| limit.is_active)
-            .or_else(|| {
-                self.limits
-                    .iter()
-                    .max_by(|left, right| left.percent.total_cmp(&right.percent))
-            })
+            .or_else(|| highest_limit_index(&self.limits).map(|index| &self.limits[index]))
     }
 }
 
@@ -1158,6 +1178,24 @@ mod tests {
 
         let binding = usage.binding().unwrap();
         assert_eq!(binding.kind, LimitKind::WeeklyAll);
+        assert_eq!(binding.percent, 48.0);
+    }
+
+    #[test]
+    fn binding_without_an_active_limit_is_the_first_of_equals() {
+        let body = r#"{
+          "limits": [
+            { "kind": "weekly_scoped", "percent": 48, "severity": "normal",
+              "scope": { "model": { "display_name": "Fable" } }, "is_active": false },
+            { "kind": "weekly_all", "percent": 48, "severity": "normal", "is_active": false }
+          ]
+        }"#;
+        let (base, receiver, handle) = start_server(Reply::ok(body));
+        let usage = api_for(&base).usage(&usage_token()).unwrap();
+        let _ = captured(&receiver, handle);
+
+        let binding = usage.binding().unwrap();
+        assert_eq!(binding.kind, LimitKind::WeeklyScoped);
         assert_eq!(binding.percent, 48.0);
     }
 
@@ -1656,6 +1694,64 @@ mod tests {
             matches!(error, ApiError::Http { status: 301, .. }),
             "{error:?}"
         );
+    }
+
+    #[test]
+    fn the_provider_gets_never_follow_a_redirect() {
+        // A second server that reports whether anything reached the address the
+        // redirect names.
+        let target = Server::http("127.0.0.1:0").unwrap();
+        let target_address = target.server_addr().to_ip().unwrap();
+        let location = format!("http://{target_address}/elsewhere");
+        let (sender, receiver) = mpsc::channel();
+        let target_handle = thread::spawn(move || {
+            let got = target
+                .recv_timeout(Duration::from_millis(500))
+                .unwrap()
+                .is_some();
+            sender.send(got).unwrap();
+        });
+
+        let (base, requests, handle) =
+            start_server(Reply::status(302, "").header("Location", &location));
+        let error = Api::new()
+            .with_codex_url(&format!("{base}/backend-api/wham/usage"))
+            .codex_usage("token", "account")
+            .expect_err("a redirect is an error");
+        let _ = captured(&requests, handle);
+        assert_redirect_error(error, &location);
+
+        let (base, requests, handle) =
+            start_server(Reply::status(302, "").header("Location", &location));
+        let error = Api::new()
+            .ollama_balance(&base)
+            .expect_err("a redirect is an error");
+        let _ = captured(&requests, handle);
+        assert_redirect_error(error, &location);
+
+        let (base, requests, handle) =
+            start_server(Reply::status(302, "").header("Location", &location));
+        let error = Api::new()
+            .ollama_usage_24h(&base)
+            .expect_err("a redirect is an error");
+        let _ = captured(&requests, handle);
+        assert_redirect_error(error, &location);
+
+        let got = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the second server did not report");
+        target_handle.join().unwrap();
+        assert!(!got, "a provider GET asked the address a redirect named");
+    }
+
+    fn assert_redirect_error(error: ApiError, location: &str) {
+        match error {
+            ApiError::Http { status, body } => {
+                assert_eq!(status, 302);
+                assert!(body.contains(location), "{body}");
+            }
+            other => panic!("expected the redirect as an HTTP error, got {other:?}"),
+        }
     }
 
     #[test]

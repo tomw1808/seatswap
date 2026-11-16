@@ -5,11 +5,11 @@
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
 
-use crate::api::{Api, ApiError, Limit, LimitKind, Severity, Usage};
+use crate::api::{mark_highest_active, Api, ApiError, Limit, LimitKind, Severity, Usage};
 use crate::history::AccountRef;
 use crate::paths::CodexPaths;
 
-use super::{mark_highest_active, ProviderError, ProviderReading, CODEX_ORG};
+use super::{ProviderError, ProviderReading, CODEX_ORG};
 
 /// Read Codex's login and ask its usage endpoint for the account's limits.
 pub fn read(paths: &CodexPaths, api: &Api) -> Result<ProviderReading, ProviderError> {
@@ -533,6 +533,25 @@ mod tests {
     }
 
     #[test]
+    fn two_limits_at_the_same_percent_mark_the_first() {
+        let mut answer = answer();
+        answer["rate_limit"]["primary_window"]["used_percent"] = json!(48);
+
+        let (usage, _, _) = usage_from(&answer).unwrap();
+
+        assert_eq!(usage.limits.len(), 2);
+        assert!(
+            usage.session().expect("a session limit").is_active,
+            "the first of equals is the active one"
+        );
+        assert!(!usage.weekly_all().expect("a weekly limit").is_active);
+        assert_eq!(
+            usage.binding().map(|limit| &limit.kind),
+            Some(&LimitKind::Session)
+        );
+    }
+
+    #[test]
     fn a_window_of_another_length_keeps_its_length() {
         let mut answer = answer();
         answer["rate_limit"]["secondary_window"]["limit_window_seconds"] = json!(86_400);
@@ -888,7 +907,7 @@ mod tests {
                 path: std::path::PathBuf::from("/tmp/codex/auth.json"),
             }
             .to_string(),
-            "No Codex login found in /tmp/codex/auth.json."
+            "No Codex login found in /tmp/codex/auth.json. If Codex keeps its login in the system keyring, seatswap cannot read it."
         );
         assert_eq!(
             ProviderError::KeyringLogin.to_string(),

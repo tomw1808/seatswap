@@ -44,6 +44,7 @@ pub(crate) struct ProviderView {
     pub usage: Option<Usage>,
     pub credits: Option<Credits>,
     pub spend_24h: Option<f64>,
+    pub spend_24h_error: Option<String>,
     pub fetched_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
 }
@@ -482,13 +483,19 @@ impl ProvidersRuntime {
 
 /// A reading's card: its numbers, the moment it was read, and no error.
 fn success(provider: Provider, reading: ProviderReading, now: DateTime<Utc>) -> ProviderView {
+    let (spend_24h, spend_24h_error) = match reading.spend_24h {
+        Some(Ok(spend)) => (Some(spend), None),
+        Some(Err(error)) => (None, Some(error)),
+        None => (None, None),
+    };
     ProviderView {
         provider: provider.name().to_string(),
         title: provider.title().to_string(),
         plan: reading.plan,
         usage: reading.usage,
         credits: reading.credits,
-        spend_24h: reading.spend_24h,
+        spend_24h,
+        spend_24h_error,
         fetched_at: Some(now),
         error: None,
     }
@@ -504,6 +511,7 @@ fn failure(provider: Provider, last: Option<&ProviderView>, error: String) -> Pr
         usage: last.and_then(|view| view.usage.clone()),
         credits: last.and_then(|view| view.credits.clone()),
         spend_24h: last.and_then(|view| view.spend_24h),
+        spend_24h_error: last.and_then(|view| view.spend_24h_error.clone()),
         fetched_at: last.and_then(|view| view.fetched_at),
         error: Some(error),
     }
@@ -533,6 +541,7 @@ mod tests {
   "spend_control":{"reached":false,"individual_limit":null},"rate_limit_reached_type":null}"#;
 
     const BALANCE_ZERO: &str = r#"{"included":{"balance_usd":0,"allowance_usd":0}}"#;
+    const BALANCE: &str = r#"{"included":{"balance_usd":212.4,"allowance_usd":300,"period":{"until":"2026-12-03T00:00:00Z"}},"purchased":{"balance_usd":0}}"#;
     const USAGE_ANSWER: &str = r#"{"totals":{"request_count":412,"usage_usd":3.18,"input_tokens":5120000,"cached_input_tokens":3900000,"output_tokens":640000}}"#;
 
     fn utc(text: &str) -> DateTime<Utc> {
@@ -797,7 +806,7 @@ mod tests {
         let mut runtime = test_runtime(dir.path(), Api::new(), &codex_home);
         let view = only_view(runtime.poll_round(&codex_on(), utc("2026-11-14T09:00:00Z")));
         let expected = format!(
-            "No Codex login found in {}.",
+            "No Codex login found in {}. If Codex keeps its login in the system keyring, seatswap cannot read it.",
             codex_home.join("auth.json").display()
         );
         assert_eq!(view.error.as_deref(), Some(expected.as_str()));
@@ -906,7 +915,7 @@ mod tests {
         let _ = server.finish();
 
         let expected = format!(
-            "No Codex login found in {}.",
+            "No Codex login found in {}. If Codex keeps its login in the system keyring, seatswap cannot read it.",
             folder_b.join("auth.json").display()
         );
         assert_eq!(second.error.as_deref(), Some(expected.as_str()));
@@ -952,6 +961,8 @@ mod tests {
 
         assert_eq!(view.provider, "ollama");
         assert_eq!(view.usage, None);
+        assert_eq!(view.spend_24h, Some(3.18));
+        assert_eq!(view.spend_24h_error, None);
         assert_eq!(
             view.credits,
             Some(Credits {
@@ -974,6 +985,31 @@ mod tests {
         assert!(
             read.records.is_empty(),
             "a reading without a usage wrote a sample line"
+        );
+    }
+
+    /// A 24 h spend that could not be read is its own view field; the balance
+    /// reading itself stays and the card's error stays empty.
+    #[test]
+    fn a_spend_that_could_not_be_read_has_its_own_view_field() {
+        let dir = tempdir().expect("tempdir");
+        let server = Fake::start(vec![(200, BALANCE.to_string()), (500, String::new())]);
+        let mut runtime = test_runtime(dir.path(), Api::new(), &dir.path().join("codex"));
+
+        let view =
+            only_view(runtime.poll_round(&ollama_on(&server.base), utc("2026-11-14T09:00:00Z")));
+        let paths = server.finish();
+
+        assert_eq!(view.error, None, "the reading itself is Ok");
+        assert_eq!(view.spend_24h, None);
+        assert_eq!(view.spend_24h_error.as_deref(), Some("server error 500"));
+        assert!(view.credits.is_some(), "the balance is still the card's");
+        assert_eq!(
+            paths,
+            vec![
+                "/api/balance".to_string(),
+                "/api/usage?range=24h".to_string()
+            ]
         );
     }
 

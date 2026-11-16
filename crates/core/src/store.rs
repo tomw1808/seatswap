@@ -1048,15 +1048,16 @@ impl Settings {
 }
 
 /// Check an `ollamaUrl`: it must start with `http://` or `https://`, name a
-/// host — the text after the scheme, up to the first `/`, `?` or `#`, must not
-/// be empty and must have a non-empty part before a port colon — and contain no
-/// whitespace or control character anywhere: no HTTP client can use such a
-/// URL, so it is refused here and not at the request. It must have no query
-/// string (`?…`), no fragment (`#…`) and no empty path segment (`//` after the
-/// host): the reader appends `/api/…` to the base, which such a URL would
-/// mangle. A port (`:8443`), a path (`/base`), an IPv6 host (`[::1]`) and a
-/// single trailing slash are fine. Anything else is [`StoreError::InvalidSetting`]
-/// naming the field and the value, never a fallback.
+/// host — a DNS name, an IPv4 address or a bracketed IPv6 address — and contain
+/// no whitespace or control character anywhere: no HTTP client can use such a
+/// URL, so it is refused here and not at the request. User info (`user:pass@`)
+/// is refused without quoting the URL, which may hold a password. It must have
+/// no query string (`?…`), no fragment (`#…`) and no empty path segment (`//`
+/// after the host): the reader appends `/api/…` to the base, which such a URL
+/// would mangle. A port (`:8443`), a path (`/base`), an IPv6 host (`[::1]`) and
+/// a single trailing slash are fine. Anything else is
+/// [`StoreError::InvalidSetting`] naming the field and the value, never a
+/// fallback.
 pub fn validate_ollama_url(url: &str) -> Result<(), StoreError> {
     if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err(StoreError::InvalidSetting(format!(
@@ -1075,10 +1076,14 @@ pub fn validate_ollama_url(url: &str) -> Result<(), StoreError> {
         }
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host = authority.split(':').next().unwrap_or("");
-    if host.is_empty() {
+    if authority.contains('@') {
+        return Err(StoreError::InvalidSetting(
+            "ollamaUrl must not contain a user name or password".to_string(),
+        ));
+    }
+    if !host_is_real(authority) {
         return Err(StoreError::InvalidSetting(format!(
-            "ollamaUrl must name a host after http:// or https://, got {url:?}"
+            "ollamaUrl must name a host: a name, an IPv4 address or a bracketed IPv6 address, got {url:?}"
         )));
     }
     if url.contains('?') {
@@ -1098,6 +1103,37 @@ pub fn validate_ollama_url(url: &str) -> Result<(), StoreError> {
         )));
     }
     Ok(())
+}
+
+/// Whether a URL's authority part starts with a real host: a DNS name, an IPv4
+/// address or a bracketed IPv6 address, followed by nothing or by `:port`.
+fn host_is_real(authority: &str) -> bool {
+    if let Some(inside) = authority.strip_prefix('[') {
+        let Some((address, after)) = inside.split_once(']') else {
+            return false;
+        };
+        return address.parse::<std::net::Ipv6Addr>().is_ok()
+            && (after.is_empty() || (after.starts_with(':') && after.len() > 1));
+    }
+    let host = authority.split(':').next().unwrap_or("");
+    is_host_name(host)
+}
+
+/// Whether `host` is a DNS host name: dot-separated labels of letters, digits
+/// and inner hyphens, each 1 to 63 bytes, at most 253 bytes in all. An IPv4
+/// address is a name by this rule too.
+fn is_host_name(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        })
 }
 
 /// The one currency rule (spec §1.4): three capital letters. Used by
@@ -2736,6 +2772,90 @@ mod tests {
                 }
                 other => panic!("expected InvalidSetting for {bad:?}, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn validate_rejects_an_ollama_url_with_user_info() {
+        let url = "http://sam:secret@vega:11434";
+        let settings = Settings {
+            ollama_url: url.to_string(),
+            ..Settings::default()
+        };
+        match settings.validate() {
+            Err(StoreError::InvalidSetting(message)) => {
+                assert_eq!(
+                    message,
+                    "ollamaUrl must not contain a user name or password"
+                );
+                assert!(!message.contains("secret"), "{message}");
+                assert!(!message.contains(url), "{message}");
+            }
+            other => panic!("expected InvalidSetting for {url:?}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_an_ollama_url_with_an_unclosed_bracket() {
+        let url = "http://[";
+        let settings = Settings {
+            ollama_url: url.to_string(),
+            ..Settings::default()
+        };
+        match settings.validate() {
+            Err(StoreError::InvalidSetting(message)) => {
+                assert!(message.contains("ollamaUrl"), "{message}");
+            }
+            other => panic!("expected InvalidSetting for {url:?}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_an_ollama_url_with_an_at_sign_and_no_host() {
+        let url = "http://@/";
+        let settings = Settings {
+            ollama_url: url.to_string(),
+            ..Settings::default()
+        };
+        match settings.validate() {
+            Err(StoreError::InvalidSetting(message)) => {
+                assert_eq!(
+                    message,
+                    "ollamaUrl must not contain a user name or password"
+                );
+                assert!(!message.contains(url), "{message}");
+            }
+            other => panic!("expected InvalidSetting for {url:?}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_an_ollama_url_with_a_port_but_no_host() {
+        let url = "http://:11434";
+        let settings = Settings {
+            ollama_url: url.to_string(),
+            ..Settings::default()
+        };
+        match settings.validate() {
+            Err(StoreError::InvalidSetting(message)) => {
+                assert!(message.contains("ollamaUrl"), "{message}");
+            }
+            other => panic!("expected InvalidSetting for {url:?}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_an_ollama_url_with_a_bracketed_non_ipv6_host() {
+        let url = "http://[abc]:11434";
+        let settings = Settings {
+            ollama_url: url.to_string(),
+            ..Settings::default()
+        };
+        match settings.validate() {
+            Err(StoreError::InvalidSetting(message)) => {
+                assert!(message.contains("ollamaUrl"), "{message}");
+            }
+            other => panic!("expected InvalidSetting for {url:?}, got {other:?}"),
         }
     }
 
