@@ -6298,7 +6298,10 @@ mod tests {
     }
 
     const HARNESS_JOB: &str = "flash-task-5c974a53-178a-4254-93b2-b804a111414a";
+    // Used only by the tests of the Linux process walk.
+    #[cfg(target_os = "linux")]
     const HARNESS_UNLINKED: &str = "flash-task-8d2f0e7c-6b1a-4c3d-9e0f-1a2b3c4d5e6f";
+    #[cfg(target_os = "linux")]
     const HARNESS_OTHER: &str = "8d2f0e7c-6b1a-4c3d-9e0f-1a2b3c4d5e6f";
     const HARNESS_KEY: &str = "--home-sam-projects-atlas--";
     const HARNESS_MODEL: &str = "deepseek-v4.1-flash:cloud";
@@ -6470,7 +6473,10 @@ mod tests {
             .expect("the session's row")
     }
 
+    // The process walk exists on Linux only (docs/windows.md, "The process
+    // link does not exist on Windows").
     #[test]
+    #[cfg(target_os = "linux")]
     fn run_pass_links_a_running_job_through_its_lock_holder() {
         let (tmp, claude, app) = fixture();
         let recorder = Recorder::new(history(&tmp.path().join("history")));
@@ -6639,7 +6645,10 @@ mod tests {
         );
     }
 
+    // The process walk exists on Linux only (docs/windows.md, "The process
+    // link does not exist on Windows").
     #[test]
+    #[cfg(target_os = "linux")]
     fn run_pass_reads_codex_sessions_from_their_folder() {
         let (tmp, claude, app) = fixture();
         let now = time("2026-11-16T14:00:00Z");
@@ -6748,7 +6757,10 @@ mod tests {
         assert_eq!(row.tokens.out, 700);
     }
 
+    // The process walk exists on Linux only (docs/windows.md, "The process
+    // link does not exist on Windows").
     #[test]
+    #[cfg(target_os = "linux")]
     fn a_transcript_owner_wins_over_a_process_owner() {
         let (tmp, claude, app) = fixture();
         let now = time("2026-11-16T14:00:00Z");
@@ -6872,7 +6884,10 @@ mod tests {
         assert_eq!(procs.walks.get(), 0, "no walk when every job is linked");
     }
 
+    // The process walk exists on Linux only (docs/windows.md, "The process
+    // link does not exist on Windows").
     #[test]
+    #[cfg(target_os = "linux")]
     fn a_quiet_unfinished_job_is_done_unless_its_lock_is_held() {
         let (tmp, claude, app) = fixture();
         let now = time("2026-11-16T14:00:00Z");
@@ -7172,7 +7187,10 @@ mod tests {
     /// A job a transcript names, quiet for 45 minutes, whose lock a process
     /// holds, is running; the lock set must not depend on another job being
     /// unlinked.
+    // The process walk exists on Linux only (docs/windows.md, "The process
+    // link does not exist on Windows").
     #[test]
+    #[cfg(target_os = "linux")]
     fn proof_a_linked_quiet_job_with_a_held_lock_is_running() {
         let (tmp, claude, app) = fixture();
         let now = time("2026-11-16T14:00:00Z");

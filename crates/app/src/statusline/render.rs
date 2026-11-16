@@ -1514,15 +1514,14 @@ mod tests {
 
     #[test]
     fn the_preview_says_what_was_dropped() {
-        // A home folder that is not the payload's prefix shows the folder in
-        // full, so 80 columns need the second drop number as well.
-        let mut live_facts = facts();
-        live_facts.home = "/home/samuel".to_string();
+        // The folder is shown below `~`, so the line is equally long on every
+        // system (a full Windows path is longer than a Unix one); 72 columns
+        // need the second drop number as well (69 to 74 do).
         let preview = super::super::preview_lines(
             &StatuslineConfig::current_line(),
             &payload(),
-            &live_facts,
-            &[120, 100, 80],
+            &facts(),
+            &[120, 100, 72],
             super::super::Scenario::Live,
             &offset(),
         )
