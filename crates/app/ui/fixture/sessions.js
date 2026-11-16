@@ -2,7 +2,7 @@
 // session the bench opens.
 
 import { isObject } from "../common.js";
-import { isoIn } from "../fixture.js";
+import { currentFixture, isoIn } from "../fixture.js";
 
 // ---------------------------------------------------------------------------
 // the Sessions area's made-up view (spec §3.8), shaped by gui/window.rs
@@ -10,6 +10,10 @@ import { isoIn } from "../fixture.js";
 
 const SESSION_SUBV = 1.4696153846153845; // EUR per million output tokens
 const SESSION_APIV = 20.357142857142858; // EUR at API prices
+// The reason live_sessions.rs gives an agent whose model is not known yet.
+const NO_AGENT_MODEL = "the agent's model is not known yet";
+// `?fixture=longorg`: the in-use account's 40-character organization name.
+const LONG_ORG_NAME = "Acme International Holdings and Partners";
 const SESSION_PROJECTS = {
   atlas: "github.com/sam/atlas",
   "acme-kb": "github.com/acme/acme-kb",
@@ -40,6 +44,33 @@ function fixtureSessionValues(million, currency = "EUR") {
     currency,
     subscriptionMissing: null,
   };
+}
+
+// A `Values` with both halves missing for one reason, as Values::missing does.
+function fixtureMissingValues(reason) {
+  return {
+    api: null,
+    apiCurrency: null,
+    apiMissing: reason,
+    subscription: null,
+    currency: "EUR",
+    subscriptionMissing: reason,
+  };
+}
+
+// The value of a row's done agents: the sum of their tokens at the same
+// per-million rate as the row's values. A done agent without a model keeps the
+// missing reason in the sum, never dropping that agent.
+function fixtureAgentsDoneValues(agents, currency = "EUR") {
+  const done = agents.filter((agent) => !agent.running);
+  if (done.some((agent) => agent.model === null || agent.model === undefined)) {
+    return { ...fixtureMissingValues(NO_AGENT_MODEL), currency };
+  }
+  const million = done.reduce(
+    (sum, agent) => sum + (agent.tokens && Number.isFinite(agent.tokens.out) ? agent.tokens.out : 0),
+    0
+  ) / 1000000;
+  return fixtureSessionValues(million, currency);
 }
 
 function fixtureTodayAt(hours, minutes) {
@@ -102,6 +133,34 @@ function fixtureWantsAgents400() {
     return new URLSearchParams(location.search).get("fixture") === "agents400";
   } catch {
     return false;
+  }
+}
+
+// `?fixture=longorg` makes the in-use account's organization name 40
+// characters long, so the "In use" KPI shows that it wraps inside its box.
+function fixtureWantsLongOrg() {
+  if (typeof location === "undefined" || typeof URLSearchParams !== "function") return false;
+  try {
+    return new URLSearchParams(location.search).get("fixture") === "longorg";
+  } catch {
+    return false;
+  }
+}
+
+// The window reads the fixture object itself, not a copy, so changing the
+// active view here reaches the KPI that shows the account in use.
+function fixtureApplyLongOrg() {
+  if (!fixtureWantsLongOrg()) return;
+  const snapshot = currentFixture();
+  if (!isObject(snapshot) || !Array.isArray(snapshot.views)) return;
+  const active = snapshot.views.find(
+    (view) => isObject(view) && (view.isActive === true || view.id === snapshot.activeId)
+  );
+  if (!isObject(active)) return;
+  active.label = LONG_ORG_NAME;
+  if (Array.isArray(snapshot.accounts)) {
+    const account = snapshot.accounts.find((entry) => isObject(entry) && entry.id === active.id);
+    if (isObject(account)) account.orgName = LONG_ORG_NAME;
   }
 }
 
@@ -249,6 +308,10 @@ function fixtureSessionRows() {
   staleSonnetAgents[0].running = true;
   staleSonnetAgents[0].last = null;
   const ledgerAgents = fixtureFinishedAgents("ledger-02", "vega", 1, () => 0.05);
+  // One done agent without a model, so its row's agentsDoneValues carries the
+  // missing reason (as Values::sum keeps it).
+  ledgerAgents[0].model = null;
+  ledgerAgents[0].values = fixtureMissingValues(NO_AGENT_MODEL);
   const s47Agents = fixtureFinishedAgents("notes-47", "atlas", 2, (index) =>
     index === 0 ? 0.6 : 0.5
   );
@@ -275,6 +338,8 @@ function fixtureSessionRows() {
     tokens: fixtureTokenCounts(million),
     lastHour: fixtureTokenCounts(lastHour),
     values: fixtureSessionValues(million, options.currency || "EUR"),
+    lastHourValues: fixtureSessionValues(lastHour, options.currency || "EUR"),
+    agentsDoneValues: fixtureAgentsDoneValues(agents, options.currency || "EUR"),
   });
 
   const rows = [
@@ -358,10 +423,12 @@ function fixtureSums(rows) {
   return Array.from(groups.values()).map((found) => ({
     ...found,
     values: fixtureSessionValues(found.tokens.out / 1000000),
+    lastHourValues: fixtureSessionValues(found.lastHour.out / 1000000),
   }));
 }
 
 export function fixtureSessionsView(args) {
+  fixtureApplyLongOrg();
   const options = isObject(args) && isObject(args.options) ? args.options : {};
   const closed = typeof options.closed === "string" ? options.closed : "none";
   if (!["none", "day", "week", "month"].includes(closed)) {

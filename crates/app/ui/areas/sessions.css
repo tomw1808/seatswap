@@ -7,7 +7,10 @@
   gap: 10px;
   height: 100%;
   min-height: 0;
-  padding: 0 12px 12px;
+  /* The window's 24 px padding is the mock-up's inset: the KPI box and the
+     tree start flush with the area tabs and end 24 px from the window edge
+     (item 2). An inset here made it 36 px. */
+  padding: 0;
 }
 
 .sess-head {
@@ -198,16 +201,21 @@
   vertical-align: -5px;
 }
 
+/* The account's name wraps inside the KPI box instead of overflowing or being
+   cut (item 13): a 40-character organization name still fits the box. */
 .sess-inuse {
-  display: inline-flex;
+  display: flex;
   align-items: center;
   gap: 5px;
   min-width: 0;
-  overflow: hidden;
   font-size: 12px;
   font-weight: 500;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
+}
+
+.sess-inuse-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .sess-body {
@@ -273,9 +281,12 @@
   white-space: nowrap;
 }
 
+/* A top-level group row's highlighted background, as the mock-up's `.lr.org`
+   (color-mix with its --fg, which common.css names --text). */
 .sess-group {
   min-height: 28px;
   border-top: 0;
+  background: color-mix(in oklab, var(--text) 4%, transparent);
   font-size: 12.5px;
 }
 
@@ -286,6 +297,11 @@
   color: var(--muted);
   font-size: 11px;
   line-height: 20px;
+}
+
+/* By model's sub-row carries `tiedNode`'s bubble after its text (item 1). */
+.sess-subrow .sess-tag {
+  margin-left: 6px;
 }
 
 .sess-name {
@@ -371,16 +387,6 @@ details[open] > summary .sess-car {
   font-weight: 600;
   letter-spacing: 0.03em;
   text-transform: uppercase;
-}
-
-.sess-tied-dot {
-  display: inline-block;
-  width: 6px;
-  height: 6px;
-  margin-left: 5px;
-  border-radius: 50%;
-  background: var(--warn);
-  vertical-align: 1px;
 }
 
 .sess-details {
@@ -481,6 +487,9 @@ details[open] > summary .sess-car {
 }
 
 .sess-mini-name {
+  display: flex;
+  align-items: center;
+  gap: 5px;
   font-weight: 500;
 }
 
@@ -518,7 +527,7 @@ details[open] > summary .sess-car {
 
 .sess-bar-row {
   display: grid;
-  grid-template-columns: 72px minmax(0, 1fr) 54px;
+  grid-template-columns: 72px minmax(0, 1fr) 100px;
   column-gap: 7px;
   align-items: center;
   min-height: 22px;
@@ -552,6 +561,8 @@ details[open] > summary .sess-car {
 
 .sess-bar-value {
   font-size: 10.5px;
+  text-align: right;
+  white-space: nowrap;
 }
 
 .b6 {

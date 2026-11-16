@@ -180,7 +180,8 @@ function indexSums(view) {
       !Number.isFinite(sum.sessions) ||
       !isObject(sum.tokens) ||
       !isObject(sum.lastHour) ||
-      !isObject(sum.values)
+      !isObject(sum.values) ||
+      (sum.lastHourValues !== undefined && !isObject(sum.lastHourValues))
     ) {
       throw new Error("a sum in the view is not a sum");
     }
@@ -958,7 +959,10 @@ function inUseNode() {
     weekly && typeof weekly.percent === "number" && Number.isFinite(weekly.percent)
       ? ` · week ${weekly.percent} %`
       : "";
-  state.accountValue = h("span", { class: "sess-inuse" }, [chip, ` ${label}${percent}`]);
+  state.accountValue = h("span", { class: "sess-inuse" }, [
+    chip,
+    h("span", { class: "sess-inuse-text" }, ` ${label}${percent}`),
+  ]);
   return state.accountValue;
 }
 
@@ -1021,7 +1025,15 @@ function renderKpis() {
     all ? `${tokens(all.tokens.out)} tokens` : "no sum in the view",
     all ? valueSummary(all.values) : ""
   );
-  kpis[4].update("Last hour", all ? tokens(all.lastHour.out) : "no sum in the view", "");
+  // The last hour's two values come from the same `sums` the tree reads: the
+  // fixture carries `lastHourValues` beside `lastHour`, summed like `values`.
+  const lastHourValues =
+    all && isObject(all.lastHourValues) ? all.lastHourValues : null;
+  kpis[4].update(
+    "Last hour",
+    all ? tokens(all.lastHour.out) : "no sum in the view",
+    lastHourValues ? valueSummary(lastHourValues) : ""
+  );
   kpis[5].update(
     "Thinking tied to the account",
     String(tied.length),
@@ -1059,24 +1071,36 @@ function groupSubText(rows) {
 
 // A model group's own row. Its counts are the listed rows only; when every row
 // of the group has left, the grey rows still keep the group on screen and the
-// text comes from them (with nothing counted). "Thinking tied" follows the rows'
-// `tied` flag and nothing else.
-function modelSubText(rows, model, sampleRows) {
+// text comes from them (with nothing counted). By model already groups by the
+// provider above, so the sub-row does not repeat it (item 23). "Thinking tied"
+// is the one bubble `tiedNode` draws, not a text (item 1).
+function modelRowsForText(rows, model, sampleRows) {
   const rowsForText = rows.length ? rows : sampleRows || [];
   if (rowsForText.length === 0) {
     throw new Error(`the model group ${String(model)} has no row`);
   }
+  return rowsForText;
+}
+
+function modelSubText(rows, model, sampleRows) {
+  modelRowsForText(rows, model, sampleRows);
   const running = rows.filter(isRunning);
-  const provider = rowsForText[0].provider;
   const parts =
     model === null
       ? ["no answers yet", plural(running.length, "session", "sessions")]
-      : [provider, modelName(model), plural(running.length, "session", "sessions")];
-  if (model !== null) {
-    const tied = rowsForText.some((row) => isReported(row) && row.tied === true);
-    parts.push(tied ? "thinking tied to the account" : "thinking survives a switch");
+      : [modelName(model), plural(running.length, "session", "sessions")];
+  // A tied model's phrase is the one bubble beside the text, not a second
+  // wording of the same fact (item 1).
+  if (model !== null && !modelSubTied(rows, model, sampleRows)) {
+    parts.push("thinking survives a switch");
   }
   return parts.join(" · ");
+}
+
+function modelSubTied(rows, model, sampleRows) {
+  if (model === null) return false;
+  const rowsForText = modelRowsForText(rows, model, sampleRows);
+  return rowsForText.some((row) => isReported(row) && row.tied === true);
 }
 
 function setValueText(node, values, kind, currency, className) {
@@ -1150,28 +1174,53 @@ function updateGroupItem(entry, item) {
 }
 
 function createSubItem(item) {
-  const textNode = h("span", {
-    class: "mf",
-    style: { paddingLeft: `${Math.max(0, item.depth * 14 - 2)}px` },
-  }, item.text);
-  return {
+  const textNode = h("span", { class: "mf" }, item.text);
+  const node = h("div", { class: "sess-row sess-subrow" }, textNode);
+  const entry = {
     type: "sub",
-    node: h("div", { class: "sess-row sess-subrow" }, textNode),
+    node,
     textNode,
-    text: item.text,
-    depth: item.depth,
+    text: null,
+    depth: -1,
+    tied: false,
+    tiedMark: null,
   };
+  updateSubItem(entry, item);
+  return entry;
 }
 
 function updateSubItem(entry, item) {
-  if (entry.text === item.text && entry.depth === item.depth) return;
+  const tied = item.tied === true;
+  if (entry.text === item.text && entry.depth === item.depth && entry.tied === tied) return;
   entry.text = item.text;
   entry.depth = item.depth;
+  entry.tied = tied;
   entry.textNode.style.paddingLeft = `${Math.max(0, item.depth * 14 - 2)}px`;
   if (entry.textNode.textContent !== item.text) entry.textNode.textContent = item.text;
+  if (tied && !entry.tiedMark) {
+    entry.tiedMark = tiedNode({ tied: true });
+    entry.node.appendChild(entry.tiedMark);
+  } else if (!tied && entry.tiedMark) {
+    entry.node.removeChild(entry.tiedMark);
+    entry.tiedMark = null;
+  }
 }
 
-function agentsCell(running, done) {
+// A session with no running and no done agent and no agent list has no agent
+// data at all: it says "—", never "0 · 0" (item 24). A session with no running
+// agent but a done one still says "0 · 3".
+function hasAgentData(row) {
+  return (
+    (Number.isFinite(row.agentsRunning) && row.agentsRunning > 0) ||
+    (Number.isFinite(row.agentsDone) && row.agentsDone > 0) ||
+    sessionHasAgents(row)
+  );
+}
+
+function agentsCell(running, done, hasData) {
+  if (!hasData) {
+    return h("span", { class: "sess-agents" }, [h("span", { class: "mf" }, "—")]);
+  }
   return h("span", { class: "sess-agents" }, [
     h(
       "span",
@@ -1269,7 +1318,7 @@ function sessionCells(row, options, now) {
     ),
     model,
     statusNode(row, now),
-    agentsCell(row.agentsRunning, row.agentsDone),
+    agentsCell(row.agentsRunning, row.agentsDone, hasAgentData(row)),
     tokenNode(row.tokens ? row.tokens.out : 0),
     lastHour,
     valueNode(row.values, "subscription", currency),
@@ -1306,7 +1355,9 @@ function sessionSignature(row, options, nowMinute) {
     row.agentsDone,
     row.tokens ? row.tokens.out : null,
     row.lastHour ? row.lastHour.out : null,
+    row.lastHourValues,
     row.values,
+    row.agentsDoneValues,
     row.host,
     options.wide,
     options.depth,
@@ -1322,7 +1373,7 @@ function agentSignature(row) {
   const minute = agents.some((agent) => agent.running === true)
     ? String(Math.floor(Date.now() / 60000))
     : "";
-  return minute + "\u0002" + agents
+  return JSON.stringify(row.agentsDoneValues) + "\u0003" + minute + "\u0002" + agents
     .map((agent) =>
       JSON.stringify([
         agent.agent,
@@ -1447,7 +1498,7 @@ function agentCells(agent, children, depth) {
     ),
     h("span", {}, ""),
     agentStatus(agent, now),
-    children.length ? agentsCell(running, done) : h("span", {}, ""),
+    children.length ? agentsCell(running, done, true) : h("span", {}, ""),
     tokenNode(agent.tokens ? agent.tokens.out : 0),
     h("span", { class: "n" }, ""),
     valueNode(agent.values, "subscription", view.currency),
@@ -1487,13 +1538,21 @@ function agentNode(session, agent, children, depth) {
   return container;
 }
 
-function completedNode(session, agents, depth, parentKey) {
+function completedNode(session, agents, depth, parentKey, values) {
   const key = `${parentKey}\u0000completed`;
   const open = state.openAgents.has(key);
   const total = agents.reduce(
     (count, agent) => count + (agent.tokens && Number.isFinite(agent.tokens.out) ? agent.tokens.out : 0),
     0
   );
+  // `values` is the view's `agentsDoneValues`, or a reason why this line has
+  // none; either way the cell says "—" with the reason rather than nothing.
+  const lineValues =
+    typeof values === "string"
+      ? { subscription: null, subscriptionMissing: values, api: null, apiMissing: values }
+      : values;
+  const subscription = valueNode(lineValues, "subscription", state.view.currency, "n");
+  const api = valueNode(lineValues, "api", state.view.currency, "n");
   const row = h("div", { class: "sess-row sess-agent sess-completed" }, [
     h(
       "span",
@@ -1505,8 +1564,8 @@ function completedNode(session, agents, depth, parentKey) {
     h("span", {}, ""),
     tokenNode(total),
     h("span", { class: "n" }, ""),
-    h("span", { class: "n" }, ""),
-    h("span", { class: "n" }, ""),
+    subscription,
+    api,
     h("span", {}, ""),
   ]);
   const container = h("details", { class: "sess-details", open });
@@ -1566,7 +1625,23 @@ function renderAgentList(container, session, parentId, depth, parentKey) {
       );
     }
   }
-  if (done.length) container.appendChild(completedNode(session, done, depth, parentKey));
+  // The view carries one summed value for all of a session's done agents. Only
+  // the session's own completed line can show it, and only when that line holds
+  // exactly those agents; otherwise the line says why it has no value. A view
+  // row without the field (a host's report from an older seatswap) shows "—"
+  // with the view's own reason.
+  if (done.length) {
+    const allDone = agents.filter((agent) => !agent.running);
+    let values;
+    if (parentId !== null) {
+      values = "the view has no value per parent agent";
+    } else if (allDone.length !== done.length) {
+      values = "the value of the done agents includes agents started by other agents; it is in the session's value";
+    } else {
+      values = session.agentsDoneValues;
+    }
+    container.appendChild(completedNode(session, done, depth, parentKey, values));
+  }
 }
 
 // Where a row sat when it left: its group's order and its index in the group
@@ -1741,6 +1816,7 @@ function modelTreeItems() {
         type: "sub",
         key: `model\u0000${group.provider}\u0000${modelKey(model)}`,
         text: modelSubText(viewLeafRows, model, leaf.map((entry) => entry.row)),
+        tied: modelSubTied(viewLeafRows, model, leaf.map((entry) => entry.row)),
         depth: 1,
       });
       for (const entry of leaf) items.push(sessionTreeItem(entry));
@@ -1905,15 +1981,13 @@ function modelCard() {
     const busy = running.filter((row) => statusName(row) === "busy").length;
     const sum = sumFor("model", model);
     const last = sum ? sum.lastHour.out : null;
-    const dot = group.some((row) => isReported(row) && row.tied === true)
-      ? h("span", {
-          class: "sess-tied-dot",
-          title: "Thinking tied to the account",
-        })
-      : null;
+    const tied = group.some((row) => isReported(row) && row.tied === true);
     body.appendChild(
       h("div", { class: "sess-mini-row" }, [
-        h("span", { class: "sess-mini-name" }, [model === null ? "none yet" : modelName(model), dot]),
+        h("span", { class: "sess-mini-name" }, [
+          model === null ? "none yet" : modelName(model),
+          tied ? tiedNode({ tied: true }) : null,
+        ]),
         h("span", { class: "n" }, String(running.length)),
         h("span", { class: "n" }, String(busy)),
         sum
@@ -1925,7 +1999,7 @@ function modelCard() {
   if (rows.some((row) => isReported(row) && row.tied === true)) {
     body.appendChild(
       h("p", { class: "sess-card-note mf" }, [
-        h("span", { class: "sess-tied-dot" }),
+        tiedNode({ tied: true }),
         " thinking tied to the account",
       ])
     );
@@ -2014,6 +2088,7 @@ function lastHourCard() {
       name: group[0].project || "unassigned",
       count: sum ? sum.lastHour.out : 0,
       hasSum: Boolean(sum),
+      values: sum && isObject(sum.lastHourValues) ? sum.lastHourValues : null,
     };
   });
   bars.sort((one, other) => other.count - one.count);
@@ -2024,6 +2099,10 @@ function lastHourCard() {
   const max = bars.reduce((top, bar) => Math.max(top, bar.count), 0);
   for (const bar of bars) {
     const width = max > 0 ? Math.round((bar.count / max) * 100) : 0;
+    // The mock-up's second figure after the tokens: the last hour's
+    // subscription value, with its currency (there is no currency header here).
+    const value = bar.values ? valueText(bar.values, "subscription", null) : null;
+    const text = bar.hasSum ? tokens(bar.count) : "";
     body.appendChild(
       h("div", { class: "sess-bar-row" }, [
         h("span", { class: "sess-bar-name" }, bar.name),
@@ -2035,8 +2114,8 @@ function lastHourCard() {
         ]),
         h(
           "span",
-          { class: "n sess-bar-value" },
-          bar.hasSum ? tokens(bar.count) : ""
+          { class: "n sess-bar-value", title: value && value.title ? value.title : null },
+          value ? `${text} · ${value.text}` : text
         ),
       ])
     );
@@ -2096,6 +2175,7 @@ function renderSide() {
       name: group[0].project || "unassigned",
       count: sum ? sum.lastHour.out : 0,
       hasSum: Boolean(sum),
+      values: sum && isObject(sum.lastHourValues) ? sum.lastHourValues : null,
     };
   });
   bars.sort((one, other) => other.count - one.count);
