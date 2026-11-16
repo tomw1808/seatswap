@@ -602,6 +602,16 @@ impl LimitKind {
         }
     }
 
+    /// Whether a limit of this kind blocks the whole account at 100 %, without
+    /// knowing its sessions (spec §7.2, "Usable"): the 5 h session and the week
+    /// of all models do; a per-model weekly limit blocks only while a session on
+    /// that model runs (`engine::blocking_limit`), and any other limit never
+    /// blocks. The history still records every kind's 100 % moment, so a reader
+    /// that asks whether an *account* was blocked uses this.
+    pub fn blocks_whole_account(&self) -> bool {
+        matches!(self, LimitKind::Session | LimitKind::WeeklyAll)
+    }
+
     /// The text the server uses for this kind, the inverse of [`from_api`](Self::from_api).
     pub fn as_api(&self) -> &str {
         match self {
@@ -1483,6 +1493,16 @@ mod tests {
         assert_eq!(LoadLevel::Close.color(), "#f59e0b");
         assert_eq!(LoadLevel::Critical.color(), "#ef4444");
         assert_eq!(LoadLevel::Locked.color(), "#ef4444");
+    }
+
+    /// Only the 5 h session and the week of all models block the whole account;
+    /// a per-model weekly limit and any other kind do not (spec §7.2, "Usable").
+    #[test]
+    fn only_session_and_weekly_all_block_the_whole_account() {
+        assert!(LimitKind::Session.blocks_whole_account());
+        assert!(LimitKind::WeeklyAll.blocks_whole_account());
+        assert!(!LimitKind::WeeklyScoped.blocks_whole_account());
+        assert!(!LimitKind::Other("monthly_extra".to_string()).blocks_whole_account());
     }
 
     #[test]

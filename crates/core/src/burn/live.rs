@@ -324,8 +324,11 @@ fn last_switch_at(learned: &Learned, now: DateTime<Utc>) -> Option<DateTime<Utc>
 /// pause, less the manual hold that ended because its account was blocked.
 /// Any switch auto-burn did not make starts the hold (`by` other than `Auto`).
 /// A hold ends at the first time its account is blocked after the switch — the
-/// history's [`EventKind::Blocked`] of that account, or its state now when that
-/// is already past — and stays ended. A resume (`paused_until: None`) ends a
+/// history's [`EventKind::Blocked`] of that account whose kind
+/// `LimitKind::blocks_whole_account` names (the 5 h session or the week of all
+/// models; a per-model weekly limit at 100 % is not an account block, spec §7.2),
+/// or its state now when that is already past — and stays ended. A resume
+/// (`paused_until: None`) ends a
 /// manual hold that came before it. An `AutoBurnSet` (a settings toggle) is not
 /// a pause or a resume and changes neither.
 fn manual_hold_until(
@@ -369,7 +372,11 @@ fn manual_hold_until(
             .filter(|hosted| hosted.host == learned.host && hosted.record.t > at)
             .filter(|hosted| hosted.record.t <= now)
             .filter_map(|hosted| match &hosted.record.kind {
-                EventKind::Blocked { account, .. } if *account == to => Some(hosted.record.t),
+                EventKind::Blocked { account, k, .. }
+                    if *account == to && k.blocks_whole_account() =>
+                {
+                    Some(hosted.record.t)
+                }
                 _ => None,
             })
             .min();
@@ -522,15 +529,21 @@ mod tests {
         }
     }
 
-    fn blocked_event(host: &str, at: DateTime<Utc>, account: AccountRef) -> Hosted<Event> {
+    fn blocked_event(
+        host: &str,
+        at: DateTime<Utc>,
+        account: AccountRef,
+        kind: LimitKind,
+        model: Option<&str>,
+    ) -> Hosted<Event> {
         Hosted {
             host: host.to_string(),
             record: Event {
                 t: at,
                 kind: EventKind::Blocked {
                     account,
-                    k: LimitKind::WeeklyAll,
-                    m: None,
+                    k: kind,
+                    m: model.map(str::to_string),
                 },
             },
         }
@@ -687,6 +700,72 @@ mod tests {
         assert_eq!(situation.last_switch_at, Some(now - Duration::hours(1)));
     }
 
+    /// AC's per-model Sonnet week crosses 100 % while all work runs on Opus: the
+    /// account is not blocked, so a manual switch to AC keeps its hold (spec
+    /// §7.2, "Usable").
+    #[test]
+    fn a_per_model_weekly_block_keeps_the_manual_hold() {
+        let now = utc("2026-11-10T12:00:00Z");
+        let pr = account("pr", "PR", PR_ACC, true);
+        let ac = account("ac", "AC", AC_ACC, true);
+        let switch = switch_event(
+            "atlas",
+            now - Duration::hours(1),
+            AccountRef::of(&ac),
+            By::User,
+        );
+        let blocked = blocked_event(
+            "atlas",
+            now - Duration::minutes(30),
+            AccountRef::of(&ac),
+            LimitKind::WeeklyScoped,
+            Some("sonnet"),
+        );
+        let learned = learned("atlas", vec![switch, blocked]);
+        let views = vec![
+            view("pr", "PR", 10.0, None, now - Duration::minutes(1)),
+            view("ac", "AC", 10.0, Some(10.0), now - Duration::minutes(1)),
+        ];
+        let situation = ready(&learned, &views, &[pr, ac], Some("ac"), now);
+        assert_eq!(
+            situation.manual_hold_until,
+            Some(now + Duration::hours(3)),
+            "a per-model weekly limit is not an account block"
+        );
+    }
+
+    /// AC's 5 h session is full after the manual switch: that is an account
+    /// block, so the hold ends at the event.
+    #[test]
+    fn a_session_block_ends_the_manual_hold() {
+        let now = utc("2026-11-10T12:00:00Z");
+        let pr = account("pr", "PR", PR_ACC, true);
+        let ac = account("ac", "AC", AC_ACC, true);
+        let switch = switch_event(
+            "atlas",
+            now - Duration::hours(1),
+            AccountRef::of(&ac),
+            By::User,
+        );
+        let blocked = blocked_event(
+            "atlas",
+            now - Duration::minutes(30),
+            AccountRef::of(&ac),
+            LimitKind::Session,
+            None,
+        );
+        let learned = learned("atlas", vec![switch, blocked]);
+        let views = vec![
+            view("pr", "PR", 10.0, None, now - Duration::minutes(1)),
+            view("ac", "AC", 10.0, Some(10.0), now - Duration::minutes(1)),
+        ];
+        let situation = ready(&learned, &views, &[pr, ac], Some("ac"), now);
+        assert_eq!(
+            situation.manual_hold_until, None,
+            "a full session ends the hold"
+        );
+    }
+
     #[test]
     fn a_hold_ended_by_a_full_account_does_not_come_back() {
         let now = utc("2026-11-10T12:00:00Z");
@@ -701,7 +780,13 @@ mod tests {
             AccountRef::of(&ac),
             By::User,
         );
-        let blocked = blocked_event("atlas", now - Duration::hours(1), AccountRef::of(&ac));
+        let blocked = blocked_event(
+            "atlas",
+            now - Duration::hours(1),
+            AccountRef::of(&ac),
+            LimitKind::WeeklyAll,
+            None,
+        );
         let learned = learned("atlas", vec![switch, blocked]);
         let views = vec![
             view("pr", "PR", 10.0, None, now - Duration::minutes(1)),

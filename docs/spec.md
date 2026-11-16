@@ -519,7 +519,7 @@ With `readSessions` off there is no session count and S2 does not wait.
 
 - **Manual switch while auto-burn is on.** A switch auto-burn did not make — by a person
   (`seatswap use`, `next` or the pop-up), the CLI, an agent, or Claude Code's `/login` — holds S2
-  back for 4 hours, or until the account switched to is blocked, whichever comes first. The hold
+  back for 4 hours, or until the account switched to is blocked, whichever comes first. Blocked means what "Usable" (§7.2) means: the week or the 5 h session at 100 % ends the hold from the history's record of it; a per-model limit at 100 % ends it only while it blocks the account when the hold is checked (the history does not know which models ran). The hold
   ends for good at that first block and does not come back. S1 is not held back.
 - **Pause.** "Pause 4 h" in the pop-up writes an `autoBurn` event with `pausedUntil`; "Resume"
   writes one with no end. The pop-up shows `Auto-burn paused until 18:10 · Resume`. A pause holds
