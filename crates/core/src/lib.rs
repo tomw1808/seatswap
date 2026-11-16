@@ -18,8 +18,9 @@
 //! - `live_sessions` the rows of the Sessions area: running and closed sessions, their agents and values
 //! - `money`    API prices with their dates, the dollar rate, the value of tokens
 //! - `projects` projects and organizations: names, joins, the shared log (spec §3.6)
+//! - `providers` one reader per other provider (Codex, Ollama), read-only, into the usage types here
 //! - `store`    accounts.json (no secrets) + secrets (OS keyring, or 0600 files)
-//! - `api`      the two HTTP endpoints: usage and token refresh
+//! - `api`      the HTTP endpoints: usage, token refresh, Codex, prices, the dollar rate
 //! - `switcher` the switch algorithm (spec §6.2) and saving the current login
 //! - `engine`   usage polling, refreshing inactive logins, usage cache (spec §6.3, §7)
 //! - `watcher`  noticing changes Claude Code makes to the live login (spec §6.4)
@@ -38,6 +39,7 @@ pub mod money;
 pub mod paths;
 pub mod project;
 pub mod projects;
+pub mod providers;
 pub mod sessions;
 pub mod stats;
 pub mod store;

@@ -1,7 +1,8 @@
 //! The HTTP endpoints seatswap uses: an account's usage, the OAuth token
-//! refresh (spec §3, §6.3, §7.2, §7.3), models.dev's prices and Frankfurter's
-//! dollar rate (spec §1.4.1). The first two are undocumented, so their URLs,
-//! headers and reply shapes live here and nowhere else.
+//! refresh (spec §3, §6.3, §7.2, §7.3), Codex's usage (spec §7.2), models.dev's
+//! prices and Frankfurter's dollar rate (spec §1.4.1). The first three are
+//! undocumented, so their URLs, headers and reply shapes live here and nowhere
+//! else.
 
 use std::io::Read;
 use std::time::Duration;
@@ -14,6 +15,9 @@ use crate::types::Login;
 
 pub const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 pub const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+/// Codex's own usage endpoint (spec §7.2); the token and account id come from
+/// Codex's `auth.json` and are only read by `providers::codex`.
+pub const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 pub const OAUTH_BETA: &str = "oauth-2025-04-20";
 pub const MODELS_DEV_URL: &str = "https://models.dev/api.json";
@@ -76,6 +80,7 @@ pub struct Api {
     lookup_agent: ureq::Agent,
     usage_url: String,
     token_url: String,
+    codex_usage_url: String,
     models_dev_url: String,
     frankfurter_url: String,
 }
@@ -87,6 +92,7 @@ impl Api {
             lookup_agent: build_lookup_agent(),
             usage_url: USAGE_URL.to_string(),
             token_url: TOKEN_URL.to_string(),
+            codex_usage_url: CODEX_USAGE_URL.to_string(),
             models_dev_url: MODELS_DEV_URL.to_string(),
             frankfurter_url: FRANKFURTER_URL.to_string(),
         }
@@ -99,9 +105,16 @@ impl Api {
             lookup_agent: build_lookup_agent(),
             usage_url: usage_url.to_string(),
             token_url: token_url.to_string(),
+            codex_usage_url: CODEX_USAGE_URL.to_string(),
             models_dev_url: MODELS_DEV_URL.to_string(),
             frankfurter_url: FRANKFURTER_URL.to_string(),
         }
+    }
+
+    /// The Codex usage URL pointed at a local fake server (tests).
+    pub fn with_codex_url(mut self, url: &str) -> Api {
+        self.codex_usage_url = url.to_string();
+        self
     }
 
     /// The two look-up URLs pointed at a local fake server (tests).
@@ -113,24 +126,30 @@ impl Api {
 
     /// GET the account's usage with its access token.
     pub fn usage(&self, access_token: &str) -> Result<Usage, ApiError> {
-        let response = self
+        let request = self
             .agent
             .get(&self.usage_url)
             .set("User-Agent", USER_AGENT)
             .set("Authorization", &format!("Bearer {access_token}"))
-            .set("anthropic-beta", OAUTH_BETA)
-            .call();
-        let response = match response {
-            Ok(response) => response,
-            Err(ureq::Error::Status(status, response)) => {
-                return Err(status_error(status, response))
-            }
-            Err(ureq::Error::Transport(error)) => return Err(ApiError::Network(error.to_string())),
-        };
-        let body = read_body(response)?;
-        let value: Value =
-            serde_json::from_str(&body).map_err(|error| ApiError::Decode(error.to_string()))?;
-        Usage::from_json(&value)
+            .set("anthropic-beta", OAUTH_BETA);
+        Usage::from_json(&get_json(request)?)
+    }
+
+    /// GET Codex's usage with the access token and account id from its
+    /// `auth.json`. Only the parsed answer leaves this method; reading it is
+    /// `providers::codex`'s job.
+    pub fn codex_usage(
+        &self,
+        access_token: &str,
+        account_id: &str,
+    ) -> Result<serde_json::Value, ApiError> {
+        let request = self
+            .agent
+            .get(&self.codex_usage_url)
+            .set("User-Agent", USER_AGENT)
+            .set("Authorization", &format!("Bearer {access_token}"))
+            .set("chatgpt-account-id", account_id);
+        get_json(request)
     }
 
     /// Exchange a login's refresh token for a new access token. `expected` is the
@@ -162,7 +181,7 @@ impl Api {
             Err(ureq::Error::Status(status, response)) => {
                 return Err(status_error(status, response))
             }
-            Err(ureq::Error::Transport(error)) => return Err(ApiError::Network(error.to_string())),
+            Err(ureq::Error::Transport(error)) => return Err(transport_error(error)),
         };
         let body = read_body(response)?;
         let reply: Value =
@@ -188,7 +207,7 @@ impl Api {
             Err(ureq::Error::Status(status, response)) => {
                 return Err(status_error(status, response))
             }
-            Err(ureq::Error::Transport(error)) => return Err(ApiError::Network(error.to_string())),
+            Err(ureq::Error::Transport(error)) => return Err(transport_error(error)),
         };
 
         if let Some(length) = response.header("Content-Length") {
@@ -231,7 +250,7 @@ impl Api {
             Err(ureq::Error::Status(status, response)) => {
                 return Err(status_error(status, response))
             }
-            Err(ureq::Error::Transport(error)) => return Err(ApiError::Network(error.to_string())),
+            Err(ureq::Error::Transport(error)) => return Err(transport_error(error)),
         };
         let body = read_body(response)?;
         let value: Value =
@@ -252,6 +271,31 @@ impl Api {
                 ApiError::Decode(format!("the rate reply has no rate for {currency}"))
             })?;
         Ok((date, rate))
+    }
+}
+
+/// Send one GET and read its JSON answer. The status, body and decode handling
+/// of every plain GET lives here; a look-up with its own redirect rule reads
+/// its answer itself.
+fn get_json(request: ureq::Request) -> Result<Value, ApiError> {
+    let response = match request.call() {
+        Ok(response) => response,
+        Err(ureq::Error::Status(status, response)) => return Err(status_error(status, response)),
+        Err(ureq::Error::Transport(error)) => return Err(transport_error(error)),
+    };
+    let body = read_body(response)?;
+    serde_json::from_str(&body).map_err(|error| ApiError::Decode(error.to_string()))
+}
+
+/// A transport failure. ureq's `BadHeader` text is the whole header line, which
+/// for `Authorization` carries the token; that kind keeps no text of ours that
+/// names a header value (rule: no error text may contain a token).
+fn transport_error(error: ureq::Transport) -> ApiError {
+    match error.kind() {
+        ureq::ErrorKind::BadHeader => {
+            ApiError::Network("a request header holds a character that is not allowed".to_string())
+        }
+        _ => ApiError::Network(error.to_string()),
     }
 }
 
