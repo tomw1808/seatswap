@@ -41,6 +41,10 @@ pub struct Forecast {
     pub accounts: Vec<ForecastAccount>,
     /// One lane per account, in the same order.
     pub lanes: Vec<Lane>,
+    /// The order the page draws its rows in: one `Some(account id)` per lane in
+    /// [`Forecast::lanes`] order, then `None` for the "none usable" row, which
+    /// is always last (spec §3.4).
+    pub lane_order: Vec<Option<String>>,
     /// The plan's stretches in which no account is usable.
     pub blocked: Vec<(DateTime<Utc>, DateTime<Utc>)>,
     /// The plan's first step.
@@ -63,6 +67,9 @@ pub struct ForecastKpis {
     /// regime's plan; never converted a second time.
     pub blocked_hours: f64,
     pub switches: u32,
+    /// The planned plan's switches per day of the forecast's [`HORIZON_H`]
+    /// hours: the "about N a day" under the switch count.
+    pub switches_per_day: f64,
     pub switches_only_when_full: u32,
 }
 
@@ -281,6 +288,7 @@ pub fn forecast<Tz: TimeZone + Copy>(
         // (see `burn::decide::regime`).
         blocked_hours: wu_hours(planned.blocked_wu, inputs.rhythm.typical_hour()).unwrap_or(0.0),
         switches: planned.switches,
+        switches_per_day: crate::burn::switches_per_day(planned.switches),
         switches_only_when_full: lazy.switches,
     };
 
@@ -305,6 +313,11 @@ pub fn forecast<Tz: TimeZone + Copy>(
         .filter(|segment| segment.account.is_none())
         .map(|segment| (segment.from, segment.to))
         .collect();
+    let lane_order: Vec<Option<String>> = lanes
+        .iter()
+        .map(|lane| Some(lane.id.clone()))
+        .chain(std::iter::once(None))
+        .collect();
 
     let learning: Vec<String> = inputs
         .accounts
@@ -328,6 +341,7 @@ pub fn forecast<Tz: TimeZone + Copy>(
         kpis,
         accounts,
         lanes,
+        lane_order,
         blocked,
         from,
         to,
@@ -521,7 +535,7 @@ mod tests {
     use super::*;
 
     use crate::burn::decide::RegimeWhy;
-    use crate::burn::plan::testkit::inputs;
+    use crate::burn::plan::testkit::{inputs, week};
     use crate::burn::{wu_hours, Rates, HORIZON_H};
     use crate::history::{LimitSample, Source};
     use crate::store::Account;
@@ -669,6 +683,141 @@ mod tests {
         assert_eq!(forecast.kpis.blocked_hours, blocked_hours);
         assert_eq!(forecast.kpis.switches, planned.switches);
         assert_eq!(forecast.kpis.switches_only_when_full, lazy.switches);
+    }
+
+    /// "about N a day" is the switch count of the plan the page shows, not
+    /// another plan's: N = `kpis.switches` divided by the forecast's seven days
+    /// (`HORIZON_H / 24`). With the lazy plan as the page's plan it is the lazy
+    /// count, even though auto-burn's eager plan switches more.
+    #[test]
+    fn about_n_a_day_is_counted_from_the_plan() {
+        let tiny = tiny();
+        let accounts = stored_accounts(&tiny);
+        let ctx = context(&tiny, &accounts);
+        let inputs = inputs();
+        let lazy = follow(&inputs, Policy::Lazy);
+        let eager = follow(&inputs, Policy::Eager);
+        assert_ne!(
+            lazy.switches, eager.switches,
+            "the test needs the two plans to switch a different number of times"
+        );
+
+        let lazy_page = forecast(&ctx, &inputs, &regime(false)).expect("the lazy plan");
+        assert_eq!(lazy_page.kpis.switches, lazy.switches);
+        assert!(
+            close(lazy_page.kpis.switches_per_day, lazy.switches as f64 / 7.0),
+            "the lazy plan says {} switches a day, not {}",
+            lazy_page.kpis.switches_per_day,
+            lazy.switches as f64 / 7.0
+        );
+
+        let eager_page = forecast(&ctx, &inputs, &regime(true)).expect("the eager plan");
+        assert_eq!(eager_page.kpis.switches, eager.switches);
+        assert!(
+            close(
+                eager_page.kpis.switches_per_day,
+                eager.switches as f64 / 7.0
+            ),
+            "the eager plan says {} switches a day, not {}",
+            eager_page.kpis.switches_per_day,
+            eager.switches as f64 / 7.0
+        );
+    }
+
+    /// The page's rows: every account's lane in the plan's order, then the row
+    /// for the stretches with no usable account. That row is last even when the
+    /// plan has such stretches and stays last when it has none.
+    #[test]
+    fn the_none_usable_lane_is_last() {
+        let tiny = tiny();
+        let accounts = stored_accounts(&tiny);
+        let ctx = context(&tiny, &accounts);
+        let mut inputs = inputs();
+        let to = inputs.now + Duration::hours(HORIZON_H);
+        for state in &mut inputs.accounts {
+            state.week_percent = 100.0;
+            state.week_resets_at = to + Duration::days(1);
+        }
+
+        let page = forecast(&ctx, &inputs, &regime(false)).expect("the forecast");
+        assert!(
+            !page.blocked.is_empty(),
+            "the test needs a stretch with no usable account"
+        );
+        let ids: Vec<&str> = page
+            .lane_order
+            .iter()
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        let lanes: Vec<&str> = page.lanes.iter().map(|lane| lane.id.as_str()).collect();
+        assert_eq!(ids, lanes, "the account rows keep the lanes' order");
+        assert!(
+            page.lane_order.last().is_some_and(Option::is_none),
+            "the 'none usable' row is not last: {:?}",
+            page.lane_order
+        );
+        assert!(
+            page.lane_order[..page.lane_order.len() - 1]
+                .iter()
+                .all(Option::is_some),
+            "a row before the last one is the 'none usable' row: {:?}",
+            page.lane_order
+        );
+    }
+
+    /// The same row in a plan without a stretch with no usable account: an
+    /// empty week (no working hours) gives a plan without work, without a
+    /// switch and without a blocked stretch. The "none usable" row is still the
+    /// last one, and the plan's "about N a day" is 0, not a division by zero.
+    #[test]
+    fn the_none_usable_lane_is_last_without_a_blocked_stretch() {
+        let tiny = tiny();
+        let accounts = stored_accounts(&tiny);
+        let ctx = context(&tiny, &accounts);
+        let mut inputs = inputs();
+        inputs.rhythm = week(0);
+
+        let planned = follow(&inputs, Policy::Lazy);
+        assert_eq!(
+            planned.switches, 0,
+            "the test needs a plan without switches"
+        );
+        assert_eq!(
+            planned.blocked_wu, 0.0,
+            "the test needs a plan without blocked work"
+        );
+        assert!(
+            planned
+                .segments
+                .iter()
+                .all(|segment| segment.account.is_some()),
+            "the test needs a plan without a blocked segment"
+        );
+
+        let page = forecast(&ctx, &inputs, &regime(false)).expect("the forecast");
+        assert!(
+            page.blocked.is_empty(),
+            "the test needs a plan without a stretch with no usable account"
+        );
+        assert_eq!(
+            page.lane_order.len(),
+            page.lanes.len() + 1,
+            "the 'none usable' row is missing: {:?}",
+            page.lane_order
+        );
+        assert!(
+            page.lane_order.last().is_some_and(Option::is_none),
+            "the 'none usable' row is not last: {:?}",
+            page.lane_order
+        );
+        assert_eq!(page.kpis.switches, 0);
+        assert_eq!(page.kpis.switches_per_day, 0.0);
+        assert!(
+            page.kpis.switches_per_day.is_finite(),
+            "the plan's switches a day is not a number: {:?}",
+            page.kpis.switches_per_day
+        );
     }
 
     #[test]

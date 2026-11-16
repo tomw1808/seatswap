@@ -24,6 +24,12 @@ pub const RATES_DAYS: i64 = 14;
 pub const STEP_MIN: i64 = 15;
 /// The plan's horizon (spec §2.4).
 pub const HORIZON_H: i64 = 168;
+
+/// A plan's switches as switches per day of its [`HORIZON_H`] hours: the
+/// "about N a day" of Settings → Auto-burn and of the Forecast page.
+pub fn switches_per_day(switches: u32) -> f64 {
+    f64::from(switches) / (HORIZON_H as f64 / 24.0)
+}
 /// The shortest time between two switches (spec §2.5).
 pub const MIN_DWELL_MIN: i64 = 30;
 /// The margin of S2, in typical working hours (spec §2.5).

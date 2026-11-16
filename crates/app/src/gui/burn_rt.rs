@@ -14,8 +14,7 @@ use seatswap_core::burn::decide::{Decision, Regime, RegimeWhy, Situation};
 use seatswap_core::burn::live::{self, Learned, Readiness};
 use seatswap_core::burn::plan::{follow, rates_known, Inputs, Plan, Policy};
 use seatswap_core::burn::{
-    FRESH_MIN, HORIZON_H, LEARN_RETRY_MIN, MANUAL_HOLD_H, STALE_ASK_SECS, SWITCH_RELEARN_MIN,
-    SWITCH_RETRY_MIN,
+    FRESH_MIN, LEARN_RETRY_MIN, MANUAL_HOLD_H, STALE_ASK_SECS, SWITCH_RELEARN_MIN, SWITCH_RETRY_MIN,
 };
 use seatswap_core::engine::{AccountView, PollReason};
 use seatswap_core::history::{AccountRef, By, EventKind, HistoryDir};
@@ -706,8 +705,7 @@ fn measured(situation: &Situation, regime: &Regime) -> Measured {
         Some(cost.wu * account.rates?.s?)
     });
     let switches_per_day = regime.early.then(|| {
-        let switches = follow(&situation.inputs, Policy::Eager).switches;
-        switches as f64 / (HORIZON_H as f64 / 24.0)
+        seatswap_core::burn::switches_per_day(follow(&situation.inputs, Policy::Eager).switches)
     });
     Measured {
         window_percent_of_week,

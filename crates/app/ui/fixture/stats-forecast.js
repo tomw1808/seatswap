@@ -29,6 +29,11 @@ const FORECAST_FULL = {
   PR: "2026-11-14T11:30:00.000Z",
 };
 const FORECAST_LOW = { LB: 86, AC: 90, PR: 97 };
+// The slack plan's switches and the same when switching only at 100 %
+// (data.py's forecast('slack') and forecast('stay')); "about N a day" is the
+// plan's own count over the forecast's seven days.
+const FORECAST_SWITCHES = 42;
+const FORECAST_SWITCHES_ONLY_WHEN_FULL = 11;
 // The slack plan's percent at each reset, and the same when switching only at
 // 100 % (data.py's forecast('slack') and forecast('stay')).
 const FORECAST_PLANNED_AT_RESET = { LB: 100, AC: 100, PR: 100 };
@@ -129,11 +134,13 @@ export function forecastPage() {
       expirePlanned: expire(FORECAST_PLANNED_AT_RESET),
       expireOnlyWhenFull: expire(FORECAST_LAZY_AT_RESET),
       blockedHours: 0,
-      switches: 42,
-      switchesOnlyWhenFull: 11,
+      switches: FORECAST_SWITCHES,
+      switchesPerDay: FORECAST_SWITCHES / 7,
+      switchesOnlyWhenFull: FORECAST_SWITCHES_ONLY_WHEN_FULL,
     },
     accounts,
     lanes,
+    laneOrder: [...viewOrder(), null],
     blocked: [],
     from: FORECAST_FROM,
     to: FORECAST_TO,

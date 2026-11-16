@@ -18,6 +18,7 @@ import {
   isColor,
   kpi,
   percentText,
+  shortPercent,
   weekdayIndex,
   weekdayTimeText,
 } from "../../common.js";
@@ -100,37 +101,40 @@ export async function show(container, env) {
   // the four numbers and the sentence
   // -------------------------------------------------------------------------
   const kpisCard = h("div", { class: "hcard" });
+  if (!Number.isFinite(data.kpis.switchesPerDay)) {
+    throw new Error(`the forecast's switches a day is not a number: ${JSON.stringify(data.kpis.switchesPerDay)}`);
+  }
   const kpis = h("div", { class: "stats-kpis" });
   kpis.appendChild(
     kpi(
-      "Expire this week",
+      "Expected to expire this week",
       amountNode(data.kpis.expirePlanned, currency),
       "with auto-burn's plan, as it is set now",
-      "Expire this week | the money of the percent each account is planned to leave unused at its reset"
+      "Expected to expire this week | the money of the percent each account is planned to leave unused at its reset"
     )
   );
   kpis.appendChild(
     kpi(
-      "Only when full",
+      "With “only when full”",
       amountNode(data.kpis.expireOnlyWhenFull, currency),
       "if switching waits until an account is at 100 %",
-      "Only when full | the same money when every switch waits for a full account"
+      "With “only when full” | the same money when every switch waits for a full account"
     )
   );
   kpis.appendChild(
     kpi(
-      "Blocked",
+      "Hours with no usable account",
       hoursText(data.kpis.blockedHours),
       "working hours with no usable account in the next 7 days",
-      "Blocked | the hours the plan has no usable account, in your usual working hours"
+      "Hours with no usable account | the hours the plan has no usable account, in your usual working hours"
     )
   );
   kpis.appendChild(
     kpi(
-      "Switches",
+      "Switches planned",
       String(data.kpis.switches),
-      `${data.kpis.switchesOnlyWhenFull} with “only when full”`,
-      "Switches | the switches the plan makes in the next 7 days"
+      `about ${shortPercent(data.kpis.switchesPerDay)} a day · ${data.kpis.switchesOnlyWhenFull} with “only when full”`,
+      "Switches planned | the switches the plan makes in the next 7 days"
     )
   );
   const sentence = kpi(
@@ -266,7 +270,7 @@ export async function show(container, env) {
   const lanesCard = h("div", { class: "hcard stats-forecast-lanes-card" });
   lanesCard.appendChild(
     h("div", { class: "ch" }, [
-      h("span", { class: "t", text: "The plan, next 7 days" }),
+      h("span", { class: "t", text: "Burn plan, next 7 days" }),
       h("span", {
         class: "s",
         text: "one lane per account in its colour · a line is its weekly reset",
@@ -277,17 +281,37 @@ export async function show(container, env) {
   lanesCard.appendChild(lanesBody);
   root.appendChild(lanesCard);
 
-  const planned = [];
-  if (data.blocked.length > 0) {
-    planned.push({
-      label: "none usable",
-      color: "var(--danger)",
-      blocks: data.blocked,
-      blockTips: data.blocked.map(([from, to]) => `No account usable | ${spanText(from, to)}`),
-      className: "stats-fc-none",
-    });
+  // The rows come in Rust's order: every account's lane, then the "none usable"
+  // row, which is always last (`forecast.rs`'s `laneOrder`).
+  const order = data.laneOrder;
+  if (!Array.isArray(order) || order[order.length - 1] !== null) {
+    throw new Error("the forecast's lane order does not end with the 'none usable' row");
   }
-  for (const lane of data.lanes) {
+  if (order.filter((id) => id === null).length !== 1) {
+    throw new Error("the forecast's lane order has more than one 'none usable' row");
+  }
+  const lanesById = new Map(data.lanes.map((lane) => [lane.id, lane]));
+  const seen = new Set();
+  const planned = [];
+  for (const id of order) {
+    if (id === null) {
+      planned.push({
+        label: "none usable",
+        color: "var(--danger)",
+        blocks: data.blocked,
+        blockTips: data.blocked.map(([from, to]) => `No account usable | ${spanText(from, to)}`),
+        className: "stats-fc-none",
+      });
+      continue;
+    }
+    if (seen.has(id)) {
+      throw new Error(`the forecast's lane order names account ${JSON.stringify(id)} twice`);
+    }
+    seen.add(id);
+    const lane = lanesById.get(id);
+    if (!lane) {
+      throw new Error(`the forecast has no lane for account ${JSON.stringify(id)}`);
+    }
     const view = accountView(env.accounts, lane.id);
     const color = view && isColor(view.color) ? view.color : "var(--muted)";
     planned.push({
@@ -304,7 +328,10 @@ export async function show(container, env) {
       ),
     });
   }
-  if (planned.length === 0) {
+  if (seen.size !== data.lanes.length) {
+    throw new Error("the forecast's lane order leaves out a lane");
+  }
+  if (data.lanes.length === 0) {
     lanesBody.appendChild(emptyLine("no plan yet"));
   } else {
     lanesBody.appendChild(
