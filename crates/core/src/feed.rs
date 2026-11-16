@@ -33,6 +33,16 @@ pub struct FeedLimit {
 }
 
 /// What Claude Code's status line payload says about the session's account.
+///
+/// `session` and `cost_usd` are item 6's provider cost: the Claude Code session
+/// the numbers come from and its own `cost.total_cost_usd`. The file holds the
+/// last session that wrote it, so a session's cost can be some seconds old; the
+/// sessions thread keeps the last cost it read per session while that session
+/// is a row (spec §3.8). Both are `None` when the payload has neither, and a
+/// feed written before 1.2 has neither key: the `serde` defaults make an old
+/// `feed.json` read, and the fields are left out of the file while they are
+/// `None`. `cost_problem` is the reason a cost was not stored, absent when the
+/// cost is fine or absent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Feed {
@@ -40,6 +50,18 @@ pub struct Feed {
     pub five_hour: Option<FeedLimit>,
     pub seven_day: Option<FeedLimit>,
     pub model: Option<String>,
+    /// Claude Code's `session_id`: the session whose cost this is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// Claude Code's `cost.total_cost_usd`, in US dollars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    /// Why the payload's cost is not stored: the session and the reason, when
+    /// `cost.total_cost_usd` is not a finite cost of 0 or more. The feed is
+    /// still written, with `cost_usd` `None`, so the status line and the
+    /// sessions thread can say why; the key is absent when the cost is fine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_problem: Option<String>,
 }
 
 /// Write `<data>/feed.json` when its numbers differ from the file's or the
@@ -257,6 +279,9 @@ mod tests {
             five_hour,
             seven_day,
             model: Some("claude-fable-5-2".to_string()),
+            session: None,
+            cost_usd: None,
+            cost_problem: None,
         }
     }
 
@@ -479,6 +504,9 @@ mod tests {
             }),
             seven_day: None,
             model: None,
+            session: None,
+            cost_usd: None,
+            cost_problem: None,
         };
 
         let merged = merged(&usage, &numbers);
@@ -550,5 +578,47 @@ mod tests {
         );
         let stored = read(&app).expect("the feed file").expect("the feed");
         assert_eq!(stored.at, earlier.at);
+    }
+
+    #[test]
+    fn a_feed_file_from_before_the_cost_reads_and_a_cost_is_written() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let app = AppPaths::at(&tmp.path().join("data"));
+        std::fs::create_dir_all(&app.data_dir).expect("the data folder");
+        // A 1.1.0 file: no `session`, no `costUsd`.
+        std::fs::write(
+            app.feed_file(),
+            r#"{"at":"2026-11-14T12:00:00Z","fiveHour":null,"sevenDay":{"percent":48.0,"resetsAt":"2026-11-16T02:00:00Z"},"model":"claude-fable-5-2"}"#,
+        )
+        .expect("an old feed file");
+        let old = read(&app)
+            .expect("an old feed file reads")
+            .expect("the old feed");
+        assert_eq!(old.session, None);
+        assert_eq!(old.cost_usd, None);
+
+        let mut numbers = feed(None, None);
+        numbers.session = Some("7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34".to_string());
+        numbers.cost_usd = Some(1.47);
+        assert!(write_if_due(&app, &numbers).expect("the feed with a cost is written"));
+        let stored = read(&app).expect("the feed file").expect("the feed");
+        assert_eq!(
+            stored.session.as_deref(),
+            Some("7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34")
+        );
+        assert_eq!(stored.cost_usd, Some(1.47));
+
+        // Without a cost the two keys are left out of the file, as 1.1.0 wrote it.
+        let plain = feed(
+            Some(FeedLimit {
+                percent: 48.0,
+                resets_at: weekday(16, 2, 0),
+            }),
+            None,
+        );
+        assert!(write_if_due(&app, &plain).expect("a feed without a cost"));
+        let text = std::fs::read_to_string(app.feed_file()).expect("the feed file");
+        assert!(!text.contains("session"), "{text}");
+        assert!(!text.contains("costUsd"), "{text}");
     }
 }

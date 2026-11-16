@@ -12,6 +12,10 @@ const SESSION_SUBV = 1.4696153846153845; // EUR per million output tokens
 const SESSION_APIV = 20.357142857142858; // EUR at API prices
 // The reason live_sessions.rs gives an agent whose model is not known yet.
 const NO_AGENT_MODEL = "the agent's model is not known yet";
+// The reason live_sessions.rs gives a Codex row whose last hour is not known.
+const CODEX_LAST_HOUR_UNKNOWN =
+  "the Codex session's token total went down, so its last hour is not known";
+const DEEPSEEK_MODEL = "deepseek-v4.1-flash:cloud";
 // `?fixture=longorg`: the in-use account's 40-character organization name.
 const LONG_ORG_NAME = "Acme International Holdings and Partners";
 const SESSION_PROJECTS = {
@@ -25,15 +29,18 @@ function fixtureTokenCounts(million) {
   return { input: 0, out: Math.round(million * 1000000), cw: 0, cr: 0 };
 }
 
+// Nothing used is a known 0, as `Values::of(&[])` says: a session without
+// answers and an hour without tokens are worth 0 in both halves, never "no
+// tokens yet".
 function fixtureSessionValues(million, currency = "EUR") {
   if (!(million > 0)) {
     return {
-      api: null,
-      apiCurrency: null,
-      apiMissing: "no tokens yet",
-      subscription: null,
+      api: 0,
+      apiCurrency: currency,
+      apiMissing: null,
+      subscription: 0,
       currency,
-      subscriptionMissing: "no tokens yet",
+      subscriptionMissing: null,
     };
   }
   return {
@@ -318,6 +325,87 @@ function fixtureSessionRows() {
   s47Agents[0].task = "research a usage endpoint";
   s47Agents[1].task = "research a second provider";
 
+  // A Claude session with a flash job (kind "flash") and its two workers: the
+  // job is one agent of the session and the workers hang under it (S-3).
+  const flashAgents = [
+    fixtureAgent(
+      "notes-62",
+      "flash",
+      null,
+      "flash",
+      "patch the release notes",
+      "deepseek-v4.1-flash:cloud",
+      true,
+      isoIn(-9 * 60000),
+      null,
+      0.3
+    ),
+    fixtureAgent(
+      "notes-62",
+      "flash-worker-1",
+      "flash",
+      null,
+      "collect the changed pages",
+      "deepseek-v4.1-flash:cloud",
+      true,
+      isoIn(-7 * 60000),
+      null,
+      0.2
+    ),
+    fixtureAgent(
+      "notes-62",
+      "flash-worker-2",
+      "flash",
+      null,
+      "write the summary",
+      "deepseek-v4.1-flash:cloud",
+      true,
+      isoIn(-8 * 60000),
+      null,
+      0.1
+    ),
+  ];
+  // A Harness session of its own (no Claude session owns it): its agents are
+  // its workers, not flash jobs.
+  const harnessAgents = [
+    fixtureAgent(
+      "dsh-b7",
+      "worker-1",
+      null,
+      null,
+      "index the ledger",
+      "deepseek-v4.1-flash:cloud",
+      true,
+      isoIn(-11 * 60000),
+      null,
+      0.4
+    ),
+    fixtureAgent(
+      "dsh-b7",
+      "worker-2",
+      null,
+      null,
+      "check the totals",
+      "deepseek-v4.1-flash:cloud",
+      true,
+      isoIn(-6 * 60000),
+      null,
+      0.2
+    ),
+    fixtureAgent(
+      "dsh-b7",
+      "worker-3",
+      null,
+      null,
+      "read the old entries",
+      "deepseek-v4.1-flash:cloud",
+      false,
+      isoIn(-20 * 60000),
+      isoIn(-12 * 60000),
+      0.1
+    ),
+  ];
+
   const make = (name, project, host, status, model, since, million, lastHour, running, done, agents, options = {}) => ({
     session: name,
     host,
@@ -338,7 +426,9 @@ function fixtureSessionRows() {
     tokens: fixtureTokenCounts(million),
     lastHour: fixtureTokenCounts(lastHour),
     values: fixtureSessionValues(million, options.currency || "EUR"),
-    lastHourValues: fixtureSessionValues(lastHour, options.currency || "EUR"),
+    lastHourValues: options.lastHourMissing
+      ? fixtureMissingValues(options.lastHourMissing)
+      : fixtureSessionValues(lastHour, options.currency || "EUR"),
     agentsDoneValues: fixtureAgentsDoneValues(agents, options.currency || "EUR"),
   });
 
@@ -357,7 +447,12 @@ function fixtureSessionRows() {
     make("ledger-9e", "ledger", "vega", "closed", "claude-opus-5-5", fixtureDaysAgoAt(3, 22, 5), 1.6, 0, 0, 3, []),
     make("ledger-c1", "ledger", "atlas", "idle", "gpt-6-astra", isoIn(-35 * 60000), 0.4, 0, 0, 0, [], {
       provider: "Codex",
+      lastHourMissing: CODEX_LAST_HOUR_UNKNOWN,
     }),
+    make("dsh-b7", "atlas", "atlas", "busy", DEEPSEEK_MODEL, isoIn(-11 * 60000), 0.7, 0.6, 2, 1, harnessAgents, {
+      provider: "DeepSeek Harness",
+    }),
+    make("notes-62", "notes", "atlas", "busy", "claude-fable-5-2", isoIn(-9 * 60000), 1.8, 0.5, 3, 0, flashAgents),
     make("notes-47", "notes", "atlas", "busy", "claude-fable-5-2", isoIn(-6 * 60000), 5.3, 1.2, 0, 2, s47Agents, { tied: true }),
     make("notes-b9", "notes", "atlas", "idle", null, isoIn(-19 * 3600000), 0, 0, 0, 0, []),
   ];
@@ -390,6 +485,17 @@ function fixtureAddTokens(one, other) {
   };
 }
 
+// The values of a group: a missing half of any row makes the sum missing with
+// that reason, as `Values::sum` does; the made-up rows are all priced at the
+// same rate, so the amounts add up.
+function fixtureSumValues(rows, field, million, of) {
+  for (const row of rows) {
+    const values = row[field];
+    if (isObject(values) && typeof values.apiMissing === "string") return { ...values };
+  }
+  return of(million);
+}
+
 function fixtureSums(rows) {
   const groups = new Map();
   const group = (of) => {
@@ -398,8 +504,11 @@ function fixtureSums(rows) {
       groups.set(key, {
         of,
         sessions: 0,
+        agentsRunning: 0,
+        agentsDone: 0,
         tokens: fixtureTokenCounts(0),
         lastHour: fixtureTokenCounts(0),
+        rows: [],
       });
     }
     return groups.get(key);
@@ -410,20 +519,34 @@ function fixtureSums(rows) {
       { kind: "all" },
       { kind: "provider", provider: row.provider },
       { kind: "project", project: row.projectId },
-      { kind: "projectModel", project: row.projectId, model: row.model },
+      { kind: "projectModel", project: row.projectId, provider: row.provider, model: row.model },
+      { kind: "providerModel", provider: row.provider, model: row.model },
       { kind: "model", model: row.model },
     ];
     for (const key of keys) {
       const found = group(key);
       found.sessions += 1;
+      found.agentsRunning += row.agentsRunning;
+      found.agentsDone += row.agentsDone;
       found.tokens = fixtureAddTokens(found.tokens, row.tokens);
       found.lastHour = fixtureAddTokens(found.lastHour, row.lastHour);
+      found.rows.push(row);
     }
   }
   return Array.from(groups.values()).map((found) => ({
-    ...found,
-    values: fixtureSessionValues(found.tokens.out / 1000000),
-    lastHourValues: fixtureSessionValues(found.lastHour.out / 1000000),
+    of: found.of,
+    sessions: found.sessions,
+    agentsRunning: found.agentsRunning,
+    agentsDone: found.agentsDone,
+    tokens: found.tokens,
+    lastHour: found.lastHour,
+    values: fixtureSumValues(found.rows, "values", found.tokens.out / 1000000, fixtureSessionValues),
+    lastHourValues: fixtureSumValues(
+      found.rows,
+      "lastHourValues",
+      found.lastHour.out / 1000000,
+      fixtureSessionValues
+    ),
   }));
 }
 

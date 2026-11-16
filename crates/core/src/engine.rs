@@ -3771,6 +3771,9 @@ mod tests {
                 resets_at: weekly_reset(),
             }),
             model: Some("claude-fable-5-2".to_string()),
+            session: None,
+            cost_usd: None,
+            cost_problem: None,
         }
     }
 
@@ -3844,6 +3847,9 @@ mod tests {
                 resets_at: weekly_reset(),
             }),
             model: Some("claude-fable-5-2".to_string()),
+            session: None,
+            cost_usd: None,
+            cost_problem: None,
         };
 
         assert_eq!(engine.apply_feed(&feed, feed.at).unwrap(), None);
@@ -3888,6 +3894,9 @@ mod tests {
                 resets_at: weekly_reset(),
             }),
             model: Some("claude-fable-5-2".to_string()),
+            session: None,
+            cost_usd: None,
+            cost_problem: None,
         };
 
         assert_eq!(engine.apply_feed(&feed, feed.at).unwrap(), None);

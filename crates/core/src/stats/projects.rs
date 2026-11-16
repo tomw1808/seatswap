@@ -1857,8 +1857,12 @@ mod tests {
         assert_eq!(page.matrix.total, Some(0.0), "no cell, no money");
 
         let detail = project_detail_in(&tiny.ctx(), &empty, &all(), &atlas()).unwrap();
-        assert_eq!(detail.values.api, None, "no record, no value");
-        assert_eq!(detail.share, None, "no record, no share");
+        assert_eq!(
+            detail.values.api,
+            Some(0.0),
+            "no record is a known 0, not an unknown value"
+        );
+        assert_eq!(detail.share, None, "no use in the range, no share");
         assert_eq!(detail.sessions, 0);
     }
 
@@ -1890,10 +1894,10 @@ mod tests {
         assert_eq!(detail.sessions, 1);
     }
 
-    /// A project with no record in the range has no value and no share of the
-    /// use that is there.
+    /// A project with no record in the range is worth a known 0 and has a 0
+    /// share of the use that is there.
     #[test]
-    fn a_project_without_use_in_the_range_has_no_share() {
+    fn a_project_without_use_in_the_range_has_a_zero_share() {
         let tiny = tiny();
         // Only the record of 8 Nov is in this range; it is of acme-kb.
         let day = Range {
@@ -1902,8 +1906,16 @@ mod tests {
         };
 
         let detail = project_detail_in(&tiny.ctx(), &day, &all(), &atlas()).unwrap();
-        assert_eq!(detail.values.api, None, "no record, no value");
-        assert_eq!(detail.share, None, "no record, no share");
+        assert_eq!(
+            detail.values.api,
+            Some(0.0),
+            "no record is a known 0, not an unknown value"
+        );
+        assert_eq!(
+            detail.share,
+            Some(0.0),
+            "no use in the range is a known 0 share"
+        );
         assert_eq!(detail.sessions, 0);
     }
 

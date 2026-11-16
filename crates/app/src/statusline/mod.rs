@@ -142,21 +142,79 @@ pub(crate) fn preview_payload(home: &std::path::Path) -> Payload {
     parse(raw.to_string().as_bytes())
 }
 
-/// The feed a payload carries: its 5 h and weekly numbers and its model, at
-/// `now`. `None` when the payload has no `rate_limits` at all (before a
-/// session's first answer there is nothing to feed), or when it has no
-/// `seven_day`: a feed without a week cannot be matched to an account and would
-/// replace a complete `feed.json` with a partial one.
+/// The feed a payload carries: its 5 h and weekly numbers, its model, its
+/// session and that session's own cost, at `now`. `None` when the payload has no
+/// `rate_limits` at all (before a session's first answer there is nothing to
+/// feed), or when it has no `seven_day`: a feed without a week cannot be matched
+/// to an account and would replace a complete `feed.json` with a partial one.
+///
+/// A cost that cannot be stored does not cost the status line: the feed is still
+/// written with `cost_usd` `None` and a `cost_problem` naming the session and the
+/// reason (item 6), so `publish_feed` and `facts_from_source` read the one feed
+/// and the window's preview sees the same text.
 pub(crate) fn feed_from_payload(payload: &Payload, now: DateTime<Utc>) -> Option<Feed> {
     let limits = payload.rate_limits.as_ref()?;
     let seven_day = limits.seven_day.as_ref().and_then(feed_limit)?;
     let five_hour = limits.five_hour.as_ref().and_then(feed_limit);
+    let session = payload_session(payload);
+    let (cost_usd, cost_problem) = payload_cost(payload, session.as_deref());
     Some(Feed {
         at: now,
         five_hour,
         seven_day: Some(seven_day),
         model: payload.model.as_ref().and_then(|model| model.id.clone()),
+        session,
+        cost_usd,
+        cost_problem,
     })
+}
+
+/// Claude Code's `session_id`: the session the payload's numbers come from.
+/// Absent, `null` or not a text is `None`; a cost without a session has no row
+/// to belong to and is reported by [`payload_cost`], never guessed.
+fn payload_session(payload: &Payload) -> Option<String> {
+    match payload.raw.get("session_id") {
+        Some(serde_json::Value::String(session)) => Some(session.clone()),
+        _ => None,
+    }
+}
+
+/// Claude Code's `cost.total_cost_usd`, in US dollars. Absent or `null` is no
+/// cost and no problem. A cost that is not a number, negative or not finite is
+/// no cost either, but its reason is returned for the feed's `cost_problem`; a
+/// cost without a session id is not stored, since no row could own it.
+fn payload_cost(payload: &Payload, session: Option<&str>) -> (Option<f64>, Option<String>) {
+    let Some(cost) = payload.raw.get("cost").filter(|cost| !cost.is_null()) else {
+        return (None, None);
+    };
+    let Some(value) = cost.get("total_cost_usd") else {
+        return (None, None);
+    };
+    let named = match session {
+        Some(session) => format!(" for session {session}"),
+        None => String::new(),
+    };
+    match value.as_f64() {
+        Some(usd) if usd.is_finite() && usd >= 0.0 && session.is_some() => (Some(usd), None),
+        Some(usd) if usd.is_finite() && usd >= 0.0 => (
+            None,
+            Some(format!(
+                "Claude Code's cost.total_cost_usd {usd} has no session_id, so no session can own it; it is not stored"
+            )),
+        ),
+        Some(usd) => (
+            None,
+            Some(format!(
+                "Claude Code's cost.total_cost_usd{named} is {usd}; only a finite cost of 0 or more is stored"
+            )),
+        ),
+        None => (
+            None,
+            Some(format!(
+                "Claude Code's cost.total_cost_usd{named} is not a number: {value}; it is not stored"
+            )),
+        ),
+    }
 }
 
 /// One payload limit as a feed limit. A reset time chrono cannot represent is
@@ -501,6 +559,9 @@ pub(crate) fn facts_from_source<S: FactsSource>(
     now: DateTime<Utc>,
 ) -> Result<Facts, String> {
     let host = paths::host_name(source.host_name()).map_err(|error| error.to_string())?;
+    // The feed's numbers for the account. A cost that cannot be stored is the
+    // feed's own `cost_problem`, so the preview reads the same feed the status
+    // line writes instead of dropping the reason.
     let feed = feed_from_payload(payload, now);
     let (account, shown, live_id) = match live {
         LiveState::Known { account_id } => {
@@ -869,6 +930,85 @@ mod tests {
             feed_from_payload(&payload, at("2026-11-14T14:00:00.336716Z")).is_none(),
             "a feed without a week cannot be placed on an account"
         );
+    }
+
+    #[test]
+    fn the_feed_carries_the_session_and_its_cost() {
+        let payload = parse(
+            br#"{"session_id":"7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34","model":{"id":"claude-fable-5-2"},"rate_limits":{"five_hour":{"used_percentage":12,"resets_at":1794490200},"seven_day":{"used_percentage":48,"resets_at":1794790800}},"cost":{"total_cost_usd":1.47}}"#,
+        );
+
+        let feed = feed_from_payload(&payload, at("2026-11-14T14:00:00.336716Z")).expect("a feed");
+        assert_eq!(
+            feed.session.as_deref(),
+            Some("7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34")
+        );
+        assert_eq!(feed.cost_usd, Some(1.47));
+        assert_eq!(feed.cost_problem, None);
+    }
+
+    /// A cost that cannot be stored still writes the feed, with its reason, so
+    /// the tray app and the status line's preview can say it (item 6).
+    #[test]
+    fn a_cost_problem_is_written_to_the_feed() {
+        let now = at("2026-11-14T14:00:00.336716Z");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let app = AppPaths::at(&tmp.path().join("data"));
+        let payload = parse(
+            br#"{"session_id":"7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34","rate_limits":{"seven_day":{"used_percentage":48,"resets_at":1794790800}},"cost":{"total_cost_usd":-0.5}}"#,
+        );
+
+        publish_feed(&app, &Settings::default(), &payload, now)
+            .expect("a bad cost does not cost the status line");
+        let stored = feed::read(&app)
+            .expect("the feed file")
+            .expect("the feed is written");
+        assert_eq!(stored.cost_usd, None);
+        let problem = stored.cost_problem.expect("the reason is written");
+        assert!(
+            problem.contains("7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34"),
+            "{problem}"
+        );
+    }
+
+    #[test]
+    fn a_cost_that_is_negative_or_not_a_number_is_a_cost_problem() {
+        let now = at("2026-11-14T14:00:00.336716Z");
+        let negative = parse(
+            br#"{"session_id":"7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34","rate_limits":{"seven_day":{"used_percentage":48,"resets_at":1794790800}},"cost":{"total_cost_usd":-0.5}}"#,
+        );
+        let feed = feed_from_payload(&negative, now).expect("the feed is still written");
+        assert_eq!(feed.cost_usd, None, "a negative cost is never stored");
+        let problem = feed.cost_problem.expect("a cost problem says why");
+        assert!(problem.contains("total_cost_usd"), "{problem}");
+        assert!(
+            problem.contains("7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34"),
+            "the problem names the session: {problem}"
+        );
+
+        let text = parse(
+            br#"{"rate_limits":{"seven_day":{"used_percentage":48,"resets_at":1794790800}},"cost":{"total_cost_usd":"1.47"}}"#,
+        );
+        let feed = feed_from_payload(&text, now).expect("the feed is still written");
+        assert_eq!(feed.cost_usd, None);
+        let problem = feed.cost_problem.expect("a cost problem says why");
+        assert!(problem.contains("total_cost_usd"), "{problem}");
+        assert!(problem.contains("not a number"), "{problem}");
+    }
+
+    /// A cost that is not there is no cost, not an error: the status line's own
+    /// segment reads a null cost as "nothing to print" (`render.rs`'s
+    /// `number_at`), and the feed must not turn that shape into a failed status
+    /// line.
+    #[test]
+    fn a_null_cost_is_no_cost_and_not_an_error() {
+        let now = at("2026-11-14T14:00:00.336716Z");
+        let payload = parse(
+            br#"{"rate_limits":{"seven_day":{"used_percentage":48,"resets_at":1794790800}},"cost":{"total_cost_usd":null}}"#,
+        );
+
+        let feed = feed_from_payload(&payload, now).expect("a null cost is no cost, not an error");
+        assert_eq!(feed.cost_usd, None);
     }
 
     #[test]

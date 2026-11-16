@@ -194,6 +194,12 @@ impl Prices {
         save_json(app, &path, self.version, self)
     }
 
+    /// The price of a model as the valuer looks it up: every model is keyed
+    /// under models.dev's `anthropic` list, whoever runs it.
+    pub fn of_model(&self, model: &str, at: DateTime<Utc>) -> Option<&ModelPrice> {
+        self.at(&price_key("anthropic", model), at)
+    }
+
     /// The price of `key` at `at`: the last point at or before `at`, else the
     /// first point. `None` when there is no price at all.
     pub fn at(&self, key: &str, at: DateTime<Utc>) -> Option<&ModelPrice> {
@@ -518,9 +524,29 @@ pub fn price_key(provider: &str, model_id: &str) -> String {
 /// gives one, else models.dev's price. `None` when neither has one: there is
 /// never a guessed or zero API value (spec §1.4).
 ///
-/// No caller yet: S-3 uses it for Claude Code's session cost (item 6).
 pub fn api_value(provider_usd: Option<f64>, models_dev_usd: Option<f64>) -> Option<f64> {
     provider_usd.or(models_dev_usd)
+}
+
+/// An API value in US dollars in the API column's currency at `date`, with
+/// that currency's code: the one conversion of every API value (models.dev's
+/// and a provider's own cost). With the look-ups off it stays in US dollars,
+/// whatever currency the settings keep; without a currency it is not known;
+/// a currency without a stored rate yet leaves it in US dollars.
+pub fn api_in_currency(
+    usd: f64,
+    settings: &Settings,
+    fx: &Fx,
+    date: NaiveDate,
+) -> Result<(f64, String), Missing> {
+    if !settings.look_up_prices {
+        return Ok((usd, "USD".to_string()));
+    }
+    match (&settings.currency, usd_rate(settings, fx, date)) {
+        (None, _) => Err(Missing::NoCurrency),
+        (Some(currency), Some(rate)) => Ok((usd * rate.value, currency.clone())),
+        (Some(_), None) => Ok((usd, "USD".to_string())),
+    }
 }
 
 /// The dollar rate used at a date (spec §1.4).
@@ -712,8 +738,7 @@ pub fn api_usd(record: &TokenRecord, prices: &Prices) -> Option<f64> {
     if record.input == 0 && record.out == 0 && record.cw == 0 && record.cr == 0 {
         return Some(0.0);
     }
-    let key = price_key("anthropic", &record.model);
-    let price = prices.at(&key, record.t)?;
+    let price = prices.of_model(&record.model, record.t)?;
     Some(price.usd(record.input, record.out, record.cw, record.cr))
 }
 
@@ -1038,40 +1063,41 @@ impl Valuer {
             .and_then(|timeline| timeline.at(record.t))
             .cloned();
         let usd = api_usd(record, &self.prices);
-        let rate = usd_rate(&self.settings, &self.fx, record.t.date_naive());
-        let (api, api_currency, api_missing) = match (usd, rate) {
-            (None, _) => (
+        let (api, api_currency, api_missing) = match usd {
+            None => (
                 None,
                 None,
                 Some(Missing::NoPrice {
                     model: record.model.clone(),
                 }),
             ),
-            // With the look-ups off, money is shown in US dollars: no stored
-            // rate is applied, whatever currency the settings keep.
-            (Some(usd), _) if !self.settings.look_up_prices => {
-                (Some(usd), Some("USD".to_string()), None)
+            Some(usd) => {
+                match api_in_currency(usd, &self.settings, &self.fx, record.t.date_naive()) {
+                    Ok((amount, currency)) => (Some(amount), Some(currency), None),
+                    Err(missing) => (None, None, Some(missing)),
+                }
             }
-            (Some(_), None) if self.settings.currency.is_none() => {
-                (None, None, Some(Missing::NoCurrency))
-            }
-            (Some(usd), Some(rate)) => {
-                (Some(usd * rate.value), self.settings.currency.clone(), None)
-            }
-            (Some(usd), None) => (Some(usd), Some("USD".to_string()), None),
         };
-        let (subscription, subscription_missing) = match (usd, &account) {
-            (None, _) => (
-                None,
-                Some(Missing::NoPrice {
-                    model: record.model.clone(),
-                }),
-            ),
-            (Some(_), None) => (None, Some(Missing::NoAccount)),
-            (Some(usd), Some(account)) => match self.subscription(account, record.t, usd) {
-                Ok(value) => (Some(value), None),
-                Err(missing) => (None, Some(missing)),
-            },
+        // A record without tokens uses no share of any subscription, whether or
+        // not an account was live: both halves are a known 0 (`api_usd` gives
+        // its 0 US dollars), never NoAccount.
+        let no_tokens = record.input == 0 && record.out == 0 && record.cw == 0 && record.cr == 0;
+        let (subscription, subscription_missing) = if no_tokens {
+            (Some(0.0), None)
+        } else {
+            match (usd, &account) {
+                (None, _) => (
+                    None,
+                    Some(Missing::NoPrice {
+                        model: record.model.clone(),
+                    }),
+                ),
+                (Some(_), None) => (None, Some(Missing::NoAccount)),
+                (Some(usd), Some(account)) => match self.subscription(account, record.t, usd) {
+                    Ok(value) => (Some(value), None),
+                    Err(missing) => (None, Some(missing)),
+                },
+            }
         };
         Valued {
             api,

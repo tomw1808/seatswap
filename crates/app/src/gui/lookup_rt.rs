@@ -97,8 +97,7 @@ enum LookupCommand {
     Now {
         reply: Sender<Result<MoneyView, String>>,
     },
-    /// A session met a model without a price (S-3 sends this; no caller yet).
-    #[allow(dead_code)]
+    /// A session met a model without a price (the sessions thread sends it).
     PriceWanted(String),
     Stop,
 }
@@ -134,9 +133,8 @@ impl LookupClient {
     }
 
     /// A session met `model` without a price: ask models.dev at once. The
-    /// thread answers at most once per model per hour. S-3 adds the call where
-    /// the sessions code meets an unknown model; nothing calls it yet.
-    #[allow(dead_code)]
+    /// thread answers at most once per model per hour; the sessions thread
+    /// calls it for every listed model without a price.
     pub(crate) fn want_price(&self, model: &str) {
         let _ = self
             .commands

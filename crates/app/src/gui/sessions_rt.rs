@@ -18,10 +18,11 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 
 use seatswap_core::codex_sessions::{self, CodexSession};
+use seatswap_core::feed;
 use seatswap_core::harness::{self, HarnessPaths, HarnessSession};
 use seatswap_core::history::{EventKind, HistoryDir, Range, Recorder, SessionRecord, TokenRecord};
 use seatswap_core::live_sessions::{self, LiveSession, LiveStatus, OtherHost, Rows};
-use seatswap_core::money::Valuer;
+use seatswap_core::money::{Fx, Prices, Valuer};
 use seatswap_core::paths::{AppPaths, ClaudePaths, CodexPaths};
 use seatswap_core::project::{self, ProjectKey};
 use seatswap_core::projects;
@@ -30,6 +31,7 @@ use seatswap_core::store::{self, Settings};
 use seatswap_core::transcripts::{self, HarnessRecorded, RecordedSession, ScanState, SessionSeen};
 use seatswap_core::watcher::{watch_folder, FolderWatch, WatchError};
 
+use super::lookup_rt::LookupClient;
 use super::window::{view_of, ClosedSince, SessionsOptions, SessionsView};
 use super::worker::{EngineCommand, SessionsSummary, UiEvent, Waiting};
 use crate::ops;
@@ -205,8 +207,18 @@ struct ProjectsBuilt {
 struct PricingBuilt {
     valuer: Valuer,
     settings: Settings,
+    /// The prices as they were read, so a model without one can be asked for
+    /// ([`want_missing_prices`]).
+    prices: Prices,
+    /// The dollar rates the provider cost is converted with.
+    fx: Fx,
     built: DateTime<Utc>,
 }
+
+/// Ask the look-up thread for a model's price (see
+/// [`LookupClient::want_price`]). A type of its own so the memory's field stays
+/// readable.
+type WantPrice = Box<dyn Fn(&str)>;
 
 struct ContextFailure {
     text: String,
@@ -279,6 +291,17 @@ pub(crate) struct SessionMemory {
     /// The agents' transcript ends, remembered per path with the file's length
     /// and modified time, so an unchanged transcript is not read again.
     agent_ends: transcripts::AgentEnds,
+    /// Claude Code's own cost of each session, in US dollars, as the status
+    /// line's feed last said it (item 6). A cost is kept while its session is a
+    /// row; the feed holds the last writer, so it can be some seconds old.
+    feed_costs: BTreeMap<String, f64>,
+    /// Ask the look-up thread for a model's price ([`LookupClient::want_price`]);
+    /// `None` when no look-up runs (the CLI's tests, or a thread started
+    /// without one).
+    want_price: Option<WantPrice>,
+    /// The models already asked for in this run, so an unpriced model is asked
+    /// for once while that stays so.
+    wanted_models: BTreeSet<String>,
 }
 
 impl SessionMemory {
@@ -313,6 +336,9 @@ impl SessionMemory {
             throttle: ViewThrottle::default(),
             transcript_folders: BTreeSet::new(),
             agent_ends: transcripts::AgentEnds::default(),
+            feed_costs: BTreeMap::new(),
+            want_price: None,
+            wanted_models: BTreeSet::new(),
         }
     }
 
@@ -480,10 +506,12 @@ fn prepare_rows_context<'a>(
                     },
                     file,
                 ) {
-                    Ok((valuer, settings)) => {
+                    Ok((valuer, settings, prices, fx)) => {
                         context.pricing = Some(PricingBuilt {
                             valuer,
                             settings,
+                            prices,
+                            fx,
                             built: now,
                         });
                         context.pricing_failure = None;
@@ -545,7 +573,7 @@ fn build_pricing(
     history: &HistoryDir,
     range: &Range,
     file: &store::AccountsFile,
-) -> Result<(Valuer, Settings), String> {
+) -> Result<(Valuer, Settings, Prices, Fx), String> {
     let (prices, fx) = super::window::load_prices_and_fx(app)?;
     let valuer = Valuer::build(
         history,
@@ -557,7 +585,7 @@ fn build_pricing(
         &RefCell::new(Vec::new()),
     )
     .map_err(|error| format!("the values cannot be read: {error}"))?;
-    Ok((valuer, file.settings.clone()))
+    Ok((valuer, file.settings.clone(), prices, fx))
 }
 
 struct WaitingMemory {
@@ -605,12 +633,14 @@ impl Drop for SessionsHandle {
 /// Start the sessions thread. `settings.read_sessions` must already be on; the
 /// caller only starts it then. `history` is the folder the worker opened at
 /// start, shared with the engine and action runtimes.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn(
     app: AppPaths,
     claude: ClaudePaths,
     history: Result<HistoryDir, String>,
     harness: Result<HarnessPaths, String>,
     codex: Result<CodexPaths, String>,
+    lookup: Option<LookupClient>,
     ui: Sender<UiEvent>,
     engine: Sender<EngineCommand>,
 ) -> Result<SessionsHandle, String> {
@@ -632,6 +662,7 @@ pub(crate) fn spawn(
                 history,
                 harness,
                 codex,
+                lookup,
                 ui,
                 engine,
                 thread_stop,
@@ -657,6 +688,7 @@ fn run(
     history: Result<HistoryDir, String>,
     harness: Result<HarnessPaths, String>,
     codex: Result<CodexPaths, String>,
+    lookup: Option<LookupClient>,
     ui: Sender<UiEvent>,
     engine: Sender<EngineCommand>,
     stop: Arc<AtomicBool>,
@@ -680,6 +712,10 @@ fn run(
         Err(error) => memory.codex_error = Some(error),
     }
     memory.ui = Some(ui.clone());
+    // A model without a price is asked for through the look-up thread, which
+    // limits itself to one ask an hour per model (G-1).
+    memory.want_price =
+        lookup.map(|lookup| Box::new(move |model: &str| lookup.want_price(model)) as WantPrice);
     let mut watch: Option<FolderWatch> = None;
     let mut last_watch_error: Option<String> = None;
     let mut transcript_watches: BTreeMap<PathBuf, FolderWatch> = BTreeMap::new();
@@ -903,6 +939,119 @@ fn save_state(
             summary,
             format!("the transcript state cannot be written: {error}"),
         );
+    }
+}
+
+/// Item 6: Claude Code's own cost from the status line's feed becomes the API
+/// value of its session's row, and a model without a price is asked for. The
+/// feed is read on every pass: it holds the last session that wrote it, so a
+/// cost can be some seconds old, and the last cost read for a session is kept
+/// while that session is a row.
+fn apply_provider_costs(
+    app: &AppPaths,
+    rows: &mut Rows,
+    memory: &mut SessionMemory,
+    now: DateTime<Utc>,
+    summary: &mut SessionsSummary,
+) {
+    // A broken feed or a cost it cannot use is said on every pass while it
+    // lasts, not once and then gone: the warning is on the pass's own summary,
+    // so a user who opens the window later still sees it.
+    let problem = match feed::read(app) {
+        Ok(Some(feed)) => {
+            if let Some(problem) = feed.cost_problem {
+                Some(problem)
+            } else {
+                match (feed.session, feed.cost_usd) {
+                    (Some(session), Some(cost)) if cost.is_finite() && cost >= 0.0 => {
+                        memory.feed_costs.insert(session, cost);
+                        None
+                    }
+                    (Some(session), Some(cost)) => Some(format!(
+                        "the status line's feed holds a cost for session {session} that is not a finite cost of 0 or more ({cost}); it is not used"
+                    )),
+                    _ => None,
+                }
+            }
+        }
+        Ok(None) => None,
+        Err(error) => Some(format!(
+            "the status line's feed cannot be read, so Claude Code's own costs are not used: {error}"
+        )),
+    };
+    if let Some(text) = problem {
+        add_warning(summary, text);
+    }
+    let listed: BTreeSet<&str> = rows
+        .sessions
+        .iter()
+        .map(|row| row.session.as_str())
+        .collect();
+    memory
+        .feed_costs
+        .retain(|session, _| listed.contains(session.as_str()));
+    let Some(built) = memory
+        .rows_context
+        .as_ref()
+        .and_then(|context| context.pricing.as_ref())
+    else {
+        return;
+    };
+    for row in &mut rows.sessions {
+        if row.provider != live_sessions::CLAUDE_PROVIDER {
+            continue;
+        }
+        let cost = memory.feed_costs.get(&row.session).copied();
+        if let Some(problem) = live_sessions::take_provider_cost(
+            &mut row.values,
+            cost,
+            &built.settings,
+            &built.fx,
+            now,
+        ) {
+            add_warning(summary, format!("session {}: {problem}", row.session));
+        }
+    }
+    want_missing_prices(memory, &rows.sessions, now);
+}
+
+/// Ask the look-up thread for a price for every listed Claude Code model that
+/// has none (item 4). The valuer prices models under models.dev's `anthropic`
+/// list, so only a Claude Code row's model can get a price this way: a Codex or
+/// Harness model never can, and asking would be a useless look-up. The thread
+/// limits itself to one ask an hour per model; the set here keeps a pass every
+/// second from sending the same ask again, and a model that gets a price is
+/// dropped from it so a later loss of the price asks again.
+fn want_missing_prices(memory: &mut SessionMemory, rows: &[LiveSession], now: DateTime<Utc>) {
+    let unpriced: BTreeSet<String> = {
+        let Some(prices) = memory
+            .rows_context
+            .as_ref()
+            .and_then(|context| context.pricing.as_ref())
+            .map(|built| &built.prices)
+        else {
+            return;
+        };
+        rows.iter()
+            .filter(|row| row.provider == live_sessions::CLAUDE_PROVIDER)
+            .filter_map(|row| row.model.as_deref())
+            .filter(|model| prices.of_model(model, now).is_none())
+            .map(str::to_string)
+            .collect()
+    };
+    let mut ask = Vec::new();
+    for model in &unpriced {
+        if memory.wanted_models.insert(model.clone()) {
+            ask.push(model.clone());
+        }
+    }
+    memory
+        .wanted_models
+        .retain(|model| unpriced.contains(model));
+    if let Some(want) = &memory.want_price {
+        for model in &ask {
+            want(model);
+        }
     }
 }
 
@@ -1491,7 +1640,7 @@ pub(crate) fn run_pass(
     // the projects' default names and says why the values are missing, so a
     // waiting session still notifies.
     let mut currency = None;
-    let (rows, (harness_tokens, harness_recorded)) = match recorder {
+    let (mut rows, (harness_tokens, harness_recorded)) = match recorder {
         Some(recorder) => {
             let mut context = memory.rows_context.take().unwrap_or_default();
             let (rows, tokens, recorded) = {
@@ -1545,6 +1694,11 @@ pub(crate) fn run_pass(
             (Some(rows), (tokens, recorded))
         }
     };
+    // Item 6: the status line's cost of a Claude Code session is its API value,
+    // and a model without a price is asked for (items 4 and 6).
+    if let Some(rows) = rows.as_mut() {
+        apply_provider_costs(app, rows, memory, now, &mut summary);
+    }
     // The Harness tokens reach the history like an agent's: only what grew.
     // The totals are saved before the lines are written, as S-1 saves its scan
     // state before writing: a crash between the two loses a delta, never counts
@@ -1878,7 +2032,7 @@ fn closed_rows_for(
         }
     };
     let (failure, rows) = match build_pricing(app, history, &range, &file) {
-        Ok((valuer, settings)) => (
+        Ok((valuer, settings, _, _)) => (
             None,
             live_sessions::closed(
                 history,
@@ -5080,6 +5234,518 @@ mod tests {
         );
     }
 
+    /// A settings file with the euro as its currency, and a dollar rate.
+    fn write_eur_settings(app: &AppPaths) {
+        fs::write(
+            app.accounts_file(),
+            serde_json::json!({
+                "version": 1,
+                "settings": { "currency": "EUR" },
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    /// A `prices.json` with one price for `models` and nothing else.
+    fn write_prices(app: &AppPaths, models: &[&str]) {
+        let mut prices = Prices::default();
+        let list = models
+            .iter()
+            .map(|model| {
+                (
+                    seatswap_core::money::price_key("anthropic", model),
+                    seatswap_core::money::ModelPrice {
+                        input: 4.0,
+                        output: 20.0,
+                        cache_write: 5.0,
+                        cache_read: 0.2,
+                        tiered: false,
+                    },
+                )
+            })
+            .collect();
+        prices.take(list, time("2026-01-01T00:00:00Z"));
+        prices.save(app).unwrap();
+    }
+
+    /// An `fx.json` for the euro with `rate` dollars to the euro.
+    fn write_fx(app: &AppPaths, rate: f64) {
+        let mut fx = Fx {
+            currency: "EUR".to_string(),
+            ..Fx::default()
+        };
+        fx.take(time("2026-01-01T00:00:00Z").date_naive(), rate);
+        fx.save(app).unwrap();
+    }
+
+    /// A running session of the atlas project with one answer of `model`.
+    fn write_running_answer(claude: &ClaudePaths, pid: u32, session: &str, model: &str) {
+        let folder = claude.projects_dir().join("-home-sam-projects-atlas");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(
+            folder.join(format!("{session}.jsonl")),
+            format!(
+                "{}\n",
+                transcript_line(
+                    session,
+                    "msg_01",
+                    time("2026-11-14T09:41:00Z"),
+                    "/home/sam/projects/atlas",
+                    model,
+                    (2, 166, 26_173, 28_126),
+                )
+            ),
+        )
+        .unwrap();
+        write_session(
+            claude,
+            pid,
+            &session_json(
+                pid,
+                session,
+                "/home/sam/projects/atlas",
+                Some("atlas-a6"),
+                "busy",
+                time("2026-11-14T09:41:00Z").timestamp_millis(),
+            ),
+        );
+    }
+
+    /// A `feed.json` as the status line writes it: a session and its cost.
+    fn write_feed(app: &AppPaths, session: &str, cost: f64) {
+        fs::write(
+            app.feed_file(),
+            serde_json::json!({
+                "at": "2026-11-14T09:59:59Z",
+                "fiveHour": null,
+                "sevenDay": null,
+                "model": "claude-opus-5-5",
+                "session": session,
+                "costUsd": cost,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    /// A `feed.json` whose cost the status line could not store: it wrote the
+    /// reason instead.
+    fn write_feed_problem(app: &AppPaths, problem: &str) {
+        fs::write(
+            app.feed_file(),
+            serde_json::json!({
+                "at": "2026-11-14T09:59:59Z",
+                "fiveHour": null,
+                "sevenDay": null,
+                "model": "claude-opus-5-5",
+                "costProblem": problem,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    /// Item 6: Claude Code's own cost of a session is the row's API value, in the
+    /// API column's currency, and the last cost read is kept while the session is
+    /// a row — the feed holds only the last writer.
+    #[test]
+    fn the_status_lines_cost_is_the_claude_rows_api_value() {
+        let (tmp, claude, app) = fixture();
+        write_eur_settings(&app);
+        write_prices(&app, &["claude-opus-5-5"]);
+        write_fx(&app, 2.0);
+        let recorder = Recorder::new(history(&tmp.path().join("history")));
+        write_running_answer(&claude, 400, SESSION, "claude-opus-5-5");
+        write_feed(&app, SESSION, 1.5);
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[400]),
+            &NoProc,
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            time("2026-11-14T10:00:00Z"),
+            None,
+        );
+        let api_of = |memory: &SessionMemory| {
+            memory
+                .rows
+                .as_ref()
+                .expect("rows after a pass")
+                .sessions
+                .iter()
+                .find(|row| row.session == SESSION)
+                .expect("the session's row")
+                .values
+                .api
+        };
+        assert_eq!(
+            api_of(&memory),
+            Some(3.0),
+            "1.50 US dollars at the stored rate of 2.0"
+        );
+
+        // The status line wrote no new feed: the cost read before is kept while
+        // the session is a row, never dropped to models.dev's value.
+        fs::remove_file(app.feed_file()).unwrap();
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[400]),
+            &NoProc,
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            time("2026-11-14T10:00:05Z"),
+            None,
+        );
+        assert_eq!(api_of(&memory), Some(3.0), "the remembered cost stays");
+        assert_eq!(memory.feed_costs.len(), 1);
+
+        // The session ended: its cost is forgotten.
+        fs::remove_file(claude.sessions_dir().join("400.json")).unwrap();
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            &NoProc,
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            time("2026-11-14T10:00:10Z"),
+            None,
+        );
+        assert!(
+            memory.feed_costs.is_empty(),
+            "a cost is kept only while its session is a row"
+        );
+    }
+
+    /// A cost the feed cannot mean is said once and never used, not even as 0.
+    #[test]
+    fn a_cost_that_is_not_a_finite_cost_is_not_used() {
+        let (tmp, claude, app) = fixture();
+        write_eur_settings(&app);
+        write_prices(&app, &["claude-opus-5-5"]);
+        write_fx(&app, 2.0);
+        let recorder = Recorder::new(history(&tmp.path().join("history")));
+        write_session(
+            &claude,
+            401,
+            &session_json(
+                401,
+                SESSION,
+                "/home/sam/projects/atlas",
+                None,
+                "busy",
+                time("2026-11-14T09:41:00Z").timestamp_millis(),
+            ),
+        );
+        write_feed(&app, SESSION, -1.5);
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+
+        let outcome = run_pass(
+            &app,
+            &claude,
+            &probe(&[401]),
+            &NoProc,
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            time("2026-11-14T10:00:00Z"),
+            None,
+        );
+        let warning = outcome.summary.warning.expect("a warning says why");
+        assert!(
+            warning.contains("not a finite cost of 0 or more"),
+            "{warning}"
+        );
+        let row = memory
+            .rows
+            .as_ref()
+            .expect("rows")
+            .sessions
+            .iter()
+            .find(|row| row.session == SESSION)
+            .expect("the row");
+        assert_eq!(
+            row.values.api,
+            Some(0.0),
+            "the bad cost is not shown; the row's own empty value is the known 0"
+        );
+        assert_eq!(row.values.api_missing, None);
+        assert!(memory.feed_costs.is_empty(), "the bad cost is not kept");
+
+        // A pass every second over the same bad feed says it on every pass while
+        // it lasts, not once and then gone.
+        let again = run_pass(
+            &app,
+            &claude,
+            &probe(&[401]),
+            &NoProc,
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            time("2026-11-14T10:00:01Z"),
+            None,
+        );
+        let warning = again.summary.warning.expect("the warning still says why");
+        assert!(
+            warning.contains("not a finite cost of 0 or more"),
+            "{warning}"
+        );
+        assert!(memory.feed_costs.is_empty());
+    }
+
+    /// A `costProblem` the status line wrote is a warning on every pass too.
+    #[test]
+    fn a_feeds_cost_problem_is_said_on_every_pass() {
+        let (tmp, claude, app) = fixture();
+        write_eur_settings(&app);
+        write_prices(&app, &["claude-opus-5-5"]);
+        write_fx(&app, 2.0);
+        let recorder = Recorder::new(history(&tmp.path().join("history")));
+        write_session(
+            &claude,
+            403,
+            &session_json(
+                403,
+                SESSION,
+                "/home/sam/projects/atlas",
+                None,
+                "busy",
+                time("2026-11-14T09:41:00Z").timestamp_millis(),
+            ),
+        );
+        let problem = format!("Claude Code's cost for session {SESSION} is not a number: null");
+        write_feed_problem(&app, &problem);
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+
+        for offset in [0, 1, 2] {
+            let outcome = run_pass(
+                &app,
+                &claude,
+                &probe(&[403]),
+                &NoProc,
+                Some(&recorder),
+                &mut state,
+                &mut memory,
+                time("2026-11-14T10:00:00Z") + chrono::Duration::seconds(offset),
+                None,
+            );
+            assert_eq!(
+                outcome.summary.warning.as_deref(),
+                Some(problem.as_str()),
+                "the feed's cost problem is said on every pass"
+            );
+        }
+    }
+
+    /// A converted cost that is not finite is not used: the row keeps the
+    /// valuer's value and the warning names the session (item 2).
+    #[test]
+    fn a_converted_cost_that_is_not_finite_keeps_the_valuer_value() {
+        let (tmp, claude, app) = fixture();
+        write_eur_settings(&app);
+        write_prices(&app, &["claude-opus-5-5"]);
+        write_fx(&app, 2.0);
+        let recorder = Recorder::new(history(&tmp.path().join("history")));
+        write_running_answer(&claude, 404, SESSION, "claude-opus-5-5");
+        let now = time("2026-11-14T10:00:00Z");
+        // The huge rate makes the valuer's own conversion huge (but finite);
+        // the cost's conversion overflows, and that is the one not used.
+        write_fx(&app, f64::MAX);
+        let mut state = ScanState::default();
+        let mut plain = SessionMemory::new(tmp.path().to_path_buf());
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[404]),
+            &NoProc,
+            Some(&recorder),
+            &mut state,
+            &mut plain,
+            now,
+            None,
+        );
+        let valued = plain
+            .rows
+            .as_ref()
+            .expect("rows")
+            .sessions
+            .iter()
+            .find(|row| row.session == SESSION)
+            .expect("the row")
+            .values
+            .api;
+        assert!(
+            valued.is_some_and(f64::is_finite),
+            "the valuer prices the session's tokens: {valued:?}"
+        );
+
+        write_feed(&app, SESSION, f64::MAX);
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        let outcome = run_pass(
+            &app,
+            &claude,
+            &probe(&[404]),
+            &NoProc,
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            now,
+            None,
+        );
+        let warning = outcome.summary.warning.expect("a warning says why");
+        assert!(
+            warning.contains(SESSION) && warning.contains("not used"),
+            "the warning names the session: {warning}"
+        );
+        let row = memory
+            .rows
+            .as_ref()
+            .expect("rows")
+            .sessions
+            .iter()
+            .find(|row| row.session == SESSION)
+            .expect("the row");
+        assert_eq!(
+            row.values.api, valued,
+            "the non-finite conversion is not used; the valuer's value stays"
+        );
+    }
+
+    /// Item 4: a model without a price is asked for once, and not at all when it
+    /// has a price.
+    #[test]
+    fn a_model_without_a_price_is_asked_for_once() {
+        let (tmp, claude, app) = fixture();
+        write_eur_settings(&app);
+        write_prices(&app, &["claude-opus-5-5"]);
+        write_fx(&app, 1.0);
+        let recorder = Recorder::new(history(&tmp.path().join("history")));
+        write_running_answer(&claude, 402, SESSION, "claude-fable-5-2");
+        let now = time("2026-11-14T10:00:00Z");
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        let asked: std::rc::Rc<RefCell<Vec<String>>> = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let seen = std::rc::Rc::clone(&asked);
+        memory.want_price = Some(Box::new(move |model: &str| {
+            seen.borrow_mut().push(model.to_string());
+        }));
+
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[402]),
+            &NoProc,
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            now,
+            None,
+        );
+        assert_eq!(
+            *asked.borrow(),
+            vec!["claude-fable-5-2".to_string()],
+            "the unpriced model is asked for; the priced one is not"
+        );
+
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[402]),
+            &NoProc,
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            now + chrono::Duration::seconds(1),
+            None,
+        );
+        assert_eq!(
+            asked.borrow().len(),
+            1,
+            "a pass every second does not ask again: {:?}",
+            asked.borrow()
+        );
+
+        // A store where the model has a price asks for nothing.
+        let mut priced = SessionMemory::new(tmp.path().to_path_buf());
+        let none: std::rc::Rc<RefCell<Vec<String>>> = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let seen = std::rc::Rc::clone(&none);
+        priced.want_price = Some(Box::new(move |model: &str| {
+            seen.borrow_mut().push(model.to_string());
+        }));
+        write_prices(&app, &["claude-opus-5-5", "claude-fable-5-2"]);
+        let mut fresh = ScanState::default();
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[402]),
+            &NoProc,
+            Some(&recorder),
+            &mut fresh,
+            &mut priced,
+            now,
+            None,
+        );
+        assert!(
+            none.borrow().is_empty(),
+            "a priced model is not asked for: {:?}",
+            none.borrow()
+        );
+    }
+
+    /// Item 5: only a Claude Code row's model can get a price from models.dev's
+    /// `anthropic` list, so an unpriced Harness model is not asked for.
+    #[test]
+    fn a_harness_model_without_a_price_is_not_asked_for() {
+        let (tmp, claude, app) = fixture();
+        write_eur_settings(&app);
+        write_prices(&app, &[]);
+        write_fx(&app, 1.0);
+        let recorder = Recorder::new(history(&tmp.path().join("history")));
+        let paths = harness_paths(&tmp);
+        let now = time("2026-11-14T10:00:00Z");
+        write_harness(&paths, HARNESS_JOB, None, 0, 1, now, false);
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        memory.harness_paths = Some(paths);
+        let asked: std::rc::Rc<RefCell<Vec<String>>> = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let seen = std::rc::Rc::clone(&asked);
+        memory.want_price = Some(Box::new(move |model: &str| {
+            seen.borrow_mut().push(model.to_string());
+        }));
+
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            &NoProc,
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            now,
+            None,
+        );
+        let row = harness_row(&memory, HARNESS_JOB);
+        assert_eq!(row.provider, "DeepSeek Harness");
+        assert_eq!(row.model.as_deref(), Some(HARNESS_MODEL));
+        assert!(
+            asked.borrow().is_empty(),
+            "a Harness model is never asked for through the anthropic list: {:?}",
+            asked.borrow()
+        );
+    }
+
     /// The commands must not starve the thread: after a command the thread has
     /// to wait out the *rest* of its window, not a whole window again. With a
     /// window that is over and over again, the passes (and with them the
@@ -5102,6 +5768,7 @@ mod tests {
                 tmp.path().join("reports"),
             )),
             Ok(CodexPaths::at(&tmp.path().join("codex"))),
+            None,
             ui,
             engine,
         )

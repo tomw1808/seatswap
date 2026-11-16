@@ -330,15 +330,19 @@ pub(crate) struct SwitchEffect {
 
 /// Which group a [`Sum`] belongs to (spec §3.8). The page looks a row's or a
 /// card's numbers up by this key; it never adds values itself. The page shows
-/// the provider group too, so a provider key is here beside the brief's four
-/// (`All`, `Project`, `ProjectModel`, `Model`).
+/// the provider group and the provider's model rows too, so those keys are here
+/// beside the brief's four (`All`, `Project`, `ProjectModel`, `Model`).
 #[cfg(feature = "gui")]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum SumOf {
     All,
     Provider(String),
     Project(ProjectId),
-    ProjectModel(ProjectId, Option<String>),
+    /// One project's provider and model: the project's model row (item 43).
+    ProjectModel(ProjectId, String, Option<String>),
+    /// One provider's model: the total row of "By model" (item 43). `Model`
+    /// stays the Models card's total over every provider.
+    ProviderModel(String, Option<String>),
     Model(Option<String>),
 }
 
@@ -357,9 +361,15 @@ impl Serialize for SumOf {
                 map.serialize_entry("kind", "project")?;
                 map.serialize_entry("project", project)?;
             }
-            SumOf::ProjectModel(project, model) => {
+            SumOf::ProjectModel(project, provider, model) => {
                 map.serialize_entry("kind", "projectModel")?;
                 map.serialize_entry("project", project)?;
+                map.serialize_entry("provider", provider)?;
+                map.serialize_entry("model", model)?;
+            }
+            SumOf::ProviderModel(provider, model) => {
+                map.serialize_entry("kind", "providerModel")?;
+                map.serialize_entry("provider", provider)?;
                 map.serialize_entry("model", model)?;
             }
             SumOf::Model(model) => {
@@ -372,15 +382,21 @@ impl Serialize for SumOf {
 }
 
 /// One group's numbers, built over the listed sessions only (spec §3.8): every
-/// total counts exactly what the page lists, and the page adds nothing.
+/// total counts exactly what the page lists, and the page adds nothing. Agents
+/// are summed like the tokens; `last_hour_values` values exactly the last hour
+/// (so a row whose hour is not known names its reason in every sum over it),
+/// and `values` the rows' whole tokens.
 #[cfg(feature = "gui")]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Sum {
     pub of: SumOf,
     pub sessions: u32,
+    pub agents_running: u32,
+    pub agents_done: u32,
     pub tokens: Tokens,
     pub last_hour: Tokens,
+    pub last_hour_values: Values,
     pub values: Values,
 }
 
@@ -512,43 +528,61 @@ pub(crate) fn view_of(
 }
 
 /// Every group's numbers over exactly `sessions`: all listed, each provider,
-/// each project, each project's model, each model. A key exists when it has a
-/// session; `All` exists even for an empty list, so the page always has the
-/// total to look up.
+/// each project, each project's model, each provider's model and each model
+/// (item 43: a model row is a total row, so it has a sum of its own). A key
+/// exists when it has a session; `All` exists even for an empty list, so the
+/// page always has the total to look up.
 #[cfg(feature = "gui")]
 fn sums_of(sessions: &[LiveSession]) -> Vec<Sum> {
-    type Group<'a> = (u32, Tokens, Tokens, Vec<&'a Values>);
+    /// One group's numbers while they are added up.
+    #[derive(Default)]
+    struct Group<'a> {
+        sessions: u32,
+        agents_running: u32,
+        agents_done: u32,
+        tokens: Tokens,
+        last_hour: Tokens,
+        values: Vec<&'a Values>,
+        last_hour_values: Vec<&'a Values>,
+    }
+
     let mut groups: BTreeMap<SumOf, Group<'_>> = BTreeMap::new();
-    groups.insert(
-        SumOf::All,
-        (0, Tokens::default(), Tokens::default(), Vec::new()),
-    );
+    groups.insert(SumOf::All, Group::default());
     for row in sessions {
         let keys = [
             SumOf::All,
             SumOf::Provider(row.provider.clone()),
             SumOf::Project(row.project_id.clone()),
-            SumOf::ProjectModel(row.project_id.clone(), row.model.clone()),
+            SumOf::ProjectModel(
+                row.project_id.clone(),
+                row.provider.clone(),
+                row.model.clone(),
+            ),
+            SumOf::ProviderModel(row.provider.clone(), row.model.clone()),
             SumOf::Model(row.model.clone()),
         ];
         for key in keys {
-            let group = groups
-                .entry(key)
-                .or_insert_with(|| (0, Tokens::default(), Tokens::default(), Vec::new()));
-            group.0 += 1;
-            group.1 += row.tokens;
-            group.2 += row.last_hour;
-            group.3.push(&row.values);
+            let group = groups.entry(key).or_default();
+            group.sessions += 1;
+            group.agents_running += row.agents_running;
+            group.agents_done += row.agents_done;
+            group.tokens += row.tokens;
+            group.last_hour += row.last_hour;
+            group.values.push(&row.values);
+            group.last_hour_values.push(&row.last_hour_values);
         }
     }
     groups
         .into_iter()
-        .map(|(of, (sessions, tokens, last_hour, values))| Sum {
+        .map(|(of, group)| Sum {
             of,
-            sessions,
-            tokens,
-            last_hour,
-            values: Values::sum(&values),
+            sessions: group.sessions,
+            agents_running: group.agents_running,
+            agents_done: group.agents_done,
+            tokens: group.tokens,
+            last_hour: group.last_hour,
+            last_hour_values: Values::sum(&group.last_hour_values),
+            values: Values::sum(&group.values),
         })
         .collect()
 }
@@ -2115,7 +2149,7 @@ mod tests {
             &SessionsOptions::default(),
         );
 
-        assert_eq!(view.sums.len(), 12, "{:?}", view.sums);
+        assert_eq!(view.sums.len(), 15, "{:?}", view.sums);
         assert_eq!(find(&view, &SumOf::All).sessions, 4);
         assert_eq!(find(&view, &SumOf::All).tokens.out, 15_000_000);
         assert_eq!(
@@ -2145,7 +2179,11 @@ mod tests {
         assert_eq!(
             find(
                 &view,
-                &SumOf::ProjectModel(first.clone(), Some("claude-opus-5-5".to_string()))
+                &SumOf::ProjectModel(
+                    first.clone(),
+                    "Claude Code".to_string(),
+                    Some("claude-opus-5-5".to_string())
+                )
             )
             .tokens
             .out,
@@ -2154,22 +2192,33 @@ mod tests {
         assert_eq!(
             find(
                 &view,
-                &SumOf::ProjectModel(first.clone(), Some("claude-fable-5-2".to_string()))
+                &SumOf::ProjectModel(
+                    first.clone(),
+                    "Claude Code".to_string(),
+                    Some("claude-fable-5-2".to_string())
+                )
             )
             .tokens
             .out,
             4_000_000
         );
         assert_eq!(
-            find(&view, &SumOf::ProjectModel(first.clone(), None))
-                .tokens
-                .out,
+            find(
+                &view,
+                &SumOf::ProjectModel(first.clone(), "Codex".to_string(), None)
+            )
+            .tokens
+            .out,
             8_000_000
         );
         assert_eq!(
             find(
                 &view,
-                &SumOf::ProjectModel(second.clone(), Some("claude-opus-5-5".to_string()))
+                &SumOf::ProjectModel(
+                    second.clone(),
+                    "Claude Code".to_string(),
+                    Some("claude-opus-5-5".to_string())
+                )
             )
             .tokens
             .out,
@@ -2188,6 +2237,36 @@ mod tests {
             4_000_000
         );
         assert_eq!(find(&view, &SumOf::Model(None)).tokens.out, 8_000_000);
+        assert_eq!(
+            find(
+                &view,
+                &SumOf::ProviderModel(
+                    "Claude Code".to_string(),
+                    Some("claude-opus-5-5".to_string())
+                )
+            )
+            .sessions,
+            2,
+            "both projects' opus sessions are one provider model"
+        );
+        assert_eq!(
+            find(
+                &view,
+                &SumOf::ProviderModel(
+                    "Claude Code".to_string(),
+                    Some("claude-opus-5-5".to_string())
+                )
+            )
+            .tokens
+            .out,
+            3_000_000
+        );
+        assert_eq!(
+            find(&view, &SumOf::ProviderModel("Codex".to_string(), None))
+                .tokens
+                .out,
+            8_000_000
+        );
     }
 
     #[cfg(feature = "gui")]
@@ -2315,6 +2394,472 @@ mod tests {
         assert_eq!(all.sessions, 4);
         assert_eq!(all.tokens.out, 6_500_000);
         assert_eq!(all.last_hour.out, 650_000);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn sums_carry_last_hour_and_agents() {
+        use seatswap_core::project::ProjectKey;
+
+        fn find<'a>(view: &'a SessionsView, of: &SumOf) -> &'a Sum {
+            view.sums
+                .iter()
+                .find(|sum| &sum.of == of)
+                .unwrap_or_else(|| panic!("no sum for {of:?}"))
+        }
+
+        fn valued(subscription: f64, api: f64, currency: &str) -> Values {
+            Values {
+                api: Some(api),
+                api_currency: Some(currency.to_string()),
+                api_missing: None,
+                subscription: Some(subscription),
+                currency: Some(currency.to_string()),
+                subscription_missing: None,
+            }
+        }
+
+        let now = time("2026-11-14T10:00:00Z");
+        let acme = ProjectId::of(
+            &ProjectKey::Repo("github.com/acme/acme-kb".to_string()),
+            "atlas",
+        );
+        let mut first = row(
+            ATLAS,
+            "atlas",
+            LiveStatus::Busy,
+            Some("claude-opus-5-5"),
+            now,
+        );
+        first.project_id = acme.clone();
+        first.agents_running = 2;
+        first.agents_done = 3;
+        first.last_hour.out = 100_000;
+        first.last_hour_values = valued(2.0, 20.0, "EUR");
+        first.values = valued(7.0, 70.0, "EUR");
+        let mut second = row(
+            "aaaa1111-1111-4111-8111-111111111111",
+            "atlas",
+            LiveStatus::Idle,
+            Some("claude-opus-5-5"),
+            now,
+        );
+        second.project_id = acme.clone();
+        second.agents_running = 1;
+        second.agents_done = 0;
+        second.last_hour.out = 200_000;
+        second.last_hour_values = valued(4.0, 40.0, "EUR");
+        second.values = valued(9.0, 90.0, "EUR");
+        let view = view_of(
+            now,
+            Some("atlas".to_string()),
+            &[first, second],
+            &[],
+            &[],
+            &BTreeMap::new(),
+            None,
+            Some("EUR"),
+            &SessionsOptions::default(),
+        );
+
+        let project = find(&view, &SumOf::Project(acme.clone()));
+        assert_eq!(project.sessions, 2);
+        assert_eq!(project.agents_running, 3, "2 running plus 1 running");
+        assert_eq!(project.agents_done, 3, "3 done plus none done");
+        assert_eq!(
+            project.last_hour.out, 300_000,
+            "the last hour is the two sessions' hours added"
+        );
+        assert_eq!(
+            project.last_hour_values.subscription,
+            Some(6.0),
+            "the hour's values are added, not the sessions' totals"
+        );
+        assert_eq!(project.last_hour_values.api, Some(60.0));
+        assert_eq!(
+            project.values.subscription,
+            Some(16.0),
+            "the sessions' own totals are valued separately from their hour"
+        );
+        assert_eq!(project.values.api, Some(160.0));
+
+        let all = find(&view, &SumOf::All);
+        assert_eq!(all.agents_running, 3);
+        assert_eq!(all.agents_done, 3);
+        assert_eq!(all.last_hour.out, 300_000);
+    }
+
+    /// Nothing used is a known 0 (fix 1): a project with one session that has no
+    /// answers and one with tokens sums to the second session's values, not to a
+    /// missing value with "no tokens yet".
+    #[cfg(feature = "gui")]
+    #[test]
+    fn a_project_sum_skips_a_session_without_answers_as_a_known_zero() {
+        fn find<'a>(view: &'a SessionsView, of: &SumOf) -> &'a Sum {
+            view.sums
+                .iter()
+                .find(|sum| &sum.of == of)
+                .unwrap_or_else(|| panic!("no sum for {of:?}"))
+        }
+
+        let now = time("2026-11-14T10:00:00Z");
+        let project = ProjectId::of(
+            &seatswap_core::project::ProjectKey::Repo("github.com/acme/acme-kb".to_string()),
+            "atlas",
+        );
+        let mut silent = row(
+            ATLAS,
+            "atlas",
+            LiveStatus::Idle,
+            None,
+            now - Duration::minutes(10),
+        );
+        silent.project_id = project.clone();
+        assert_eq!(silent.values.api, Some(0.0), "no answers is a known 0");
+        assert_eq!(silent.values.api_missing, None);
+        let mut speaking = row(
+            "aaaa1111-1111-4111-8111-111111111111",
+            "atlas",
+            LiveStatus::Busy,
+            Some("claude-opus-5-5"),
+            now,
+        );
+        speaking.project_id = project.clone();
+        speaking.tokens.out = 1_000_000;
+        speaking.values = Values {
+            api: Some(20.357),
+            api_currency: Some("EUR".to_string()),
+            api_missing: None,
+            subscription: Some(1.47),
+            currency: Some("EUR".to_string()),
+            subscription_missing: None,
+        };
+        let view = view_of(
+            now,
+            Some("atlas".to_string()),
+            &[silent, speaking.clone()],
+            &[],
+            &[],
+            &BTreeMap::new(),
+            None,
+            Some("EUR"),
+            &SessionsOptions::default(),
+        );
+
+        let sum = find(&view, &SumOf::Project(project));
+        assert_eq!(sum.sessions, 2);
+        assert_eq!(
+            sum.values, speaking.values,
+            "the sum is the speaking session's values; the silent one adds a known 0"
+        );
+        assert_eq!(sum.values.api_missing, None);
+        assert_eq!(sum.values.subscription_missing, None);
+    }
+
+    /// A Codex row whose token total went down has no last hour; the sum over
+    /// it carries the reason instead of a 0 (item 7), so every total row that
+    /// covers the row says why its hour is not known.
+    #[cfg(feature = "gui")]
+    #[test]
+    fn a_sum_carries_an_unknown_last_hour_as_its_reason() {
+        const REASON: &str =
+            "the Codex session's token total went down, so its last hour is not known";
+
+        fn find<'a>(view: &'a SessionsView, of: &SumOf) -> &'a Sum {
+            view.sums
+                .iter()
+                .find(|sum| &sum.of == of)
+                .unwrap_or_else(|| panic!("no sum for {of:?}"))
+        }
+
+        let now = time("2026-11-14T10:00:00Z");
+        let mut codex = row(
+            ATLAS,
+            "atlas",
+            LiveStatus::Idle,
+            Some("gpt-6-astra"),
+            now - Duration::minutes(35),
+        );
+        codex.provider = "Codex".to_string();
+        codex.tokens.out = 400_000;
+        codex.last_hour = Tokens::default();
+        codex.last_hour_values = Values {
+            api: None,
+            api_currency: None,
+            api_missing: Some(REASON.to_string()),
+            subscription: None,
+            currency: Some("EUR".to_string()),
+            subscription_missing: Some(REASON.to_string()),
+        };
+        let view = view_of(
+            now,
+            Some("atlas".to_string()),
+            &[codex],
+            &[],
+            &[],
+            &BTreeMap::new(),
+            None,
+            Some("EUR"),
+            &SessionsOptions::default(),
+        );
+
+        for of in [
+            SumOf::All,
+            SumOf::Provider("Codex".to_string()),
+            SumOf::Project(view.sessions[0].project_id.clone()),
+            SumOf::ProviderModel("Codex".to_string(), Some("gpt-6-astra".to_string())),
+            SumOf::Model(Some("gpt-6-astra".to_string())),
+        ] {
+            let sum = find(&view, &of);
+            assert_eq!(sum.last_hour.out, 0);
+            assert_eq!(
+                sum.last_hour_values.api_missing.as_deref(),
+                Some(REASON),
+                "{of:?} keeps the unknown hour's reason"
+            );
+            assert_eq!(
+                sum.last_hour_values.subscription_missing.as_deref(),
+                Some(REASON)
+            );
+        }
+    }
+
+    /// The brief's test line for item 7 has a project with a Codex row of an
+    /// unknown last hour **and** a Claude Code row: the sum's hour names the
+    /// reason, but the row whose hour is known still counts its tokens.
+    #[cfg(feature = "gui")]
+    #[test]
+    fn a_sum_over_an_unknown_hour_counts_the_known_rows() {
+        const REASON: &str =
+            "the Codex session's token total went down, so its last hour is not known";
+
+        fn find<'a>(view: &'a SessionsView, of: &SumOf) -> &'a Sum {
+            view.sums
+                .iter()
+                .find(|sum| &sum.of == of)
+                .unwrap_or_else(|| panic!("no sum for {of:?}"))
+        }
+
+        fn valued(subscription: f64, api: f64, currency: &str) -> Values {
+            Values {
+                api: Some(api),
+                api_currency: Some(currency.to_string()),
+                api_missing: None,
+                subscription: Some(subscription),
+                currency: Some(currency.to_string()),
+                subscription_missing: None,
+            }
+        }
+
+        let now = time("2026-11-14T10:00:00Z");
+        let mut claude = row(
+            ATLAS,
+            "atlas",
+            LiveStatus::Idle,
+            Some("claude-opus-5-5"),
+            now,
+        );
+        claude.tokens.out = 1_000_000;
+        claude.last_hour.out = 100_000;
+        claude.last_hour_values = valued(2.0, 20.0, "EUR");
+        claude.values = valued(7.0, 70.0, "EUR");
+        let mut codex = row(
+            "aaaa1111-1111-4111-8111-111111111111",
+            "atlas",
+            LiveStatus::Idle,
+            Some("gpt-6-astra"),
+            now - Duration::minutes(35),
+        );
+        codex.provider = "Codex".to_string();
+        codex.tokens.out = 400_000;
+        codex.last_hour = Tokens::default();
+        codex.last_hour_values = Values {
+            api: None,
+            api_currency: None,
+            api_missing: Some(REASON.to_string()),
+            subscription: None,
+            currency: Some("EUR".to_string()),
+            subscription_missing: Some(REASON.to_string()),
+        };
+        codex.values = valued(1.0, 10.0, "EUR");
+        let view = view_of(
+            now,
+            Some("atlas".to_string()),
+            &[claude, codex],
+            &[],
+            &[],
+            &BTreeMap::new(),
+            None,
+            Some("EUR"),
+            &SessionsOptions::default(),
+        );
+
+        let project = find(&view, &SumOf::Project(view.sessions[0].project_id.clone()));
+        assert_eq!(project.sessions, 2);
+        assert_eq!(
+            project.last_hour.out, 100_000,
+            "the row whose hour is known still counts"
+        );
+        assert_eq!(
+            project.last_hour_values.api_missing.as_deref(),
+            Some(REASON),
+            "the hour's value names the reason"
+        );
+        assert_eq!(project.values.subscription, Some(8.0));
+        assert_eq!(project.values.api, Some(80.0));
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn a_model_under_two_providers_has_one_sum_per_provider() {
+        const FLASH: &str = "deepseek-v4.1-flash:cloud";
+
+        fn sums_for<'a>(view: &'a SessionsView, provider: &str, model: &str) -> Vec<&'a Sum> {
+            view.sums
+                .iter()
+                .filter(|sum| {
+                    matches!(
+                        &sum.of,
+                        SumOf::ProviderModel(of_provider, of_model)
+                            if of_provider == provider && of_model.as_deref() == Some(model)
+                    )
+                })
+                .collect()
+        }
+
+        let now = time("2026-11-14T10:00:00Z");
+        let claude = row(
+            ATLAS,
+            "atlas",
+            LiveStatus::Busy,
+            Some(FLASH),
+            now - Duration::minutes(2),
+        );
+        let mut harness = row(
+            "aaaa1111-1111-4111-8111-111111111111",
+            "atlas",
+            LiveStatus::Idle,
+            Some(FLASH),
+            now - Duration::minutes(1),
+        );
+        harness.provider = "DeepSeek Harness".to_string();
+        let project = claude.project_id.clone();
+        let view = view_of(
+            now,
+            Some("atlas".to_string()),
+            &[claude, harness],
+            &[],
+            &[],
+            &BTreeMap::new(),
+            None,
+            Some("EUR"),
+            &SessionsOptions::default(),
+        );
+
+        // The project's provider · model rows are two sums too, one per
+        // provider, each over its own session.
+        let project_sums: Vec<&Sum> = view
+            .sums
+            .iter()
+            .filter(|sum| {
+                matches!(
+                    &sum.of,
+                    SumOf::ProjectModel(of_project, of_provider, of_model)
+                        if of_project == &project
+                            && of_provider == "Claude Code"
+                            && of_model.as_deref() == Some(FLASH)
+                )
+            })
+            .collect();
+        assert_eq!(project_sums.len(), 1, "{:?}", view.sums);
+        assert_eq!(project_sums[0].sessions, 1);
+        let harness_project_sums: Vec<&Sum> = view
+            .sums
+            .iter()
+            .filter(|sum| {
+                matches!(
+                    &sum.of,
+                    SumOf::ProjectModel(of_project, of_provider, of_model)
+                        if of_project == &project
+                            && of_provider == "DeepSeek Harness"
+                            && of_model.as_deref() == Some(FLASH)
+                )
+            })
+            .collect();
+        assert_eq!(harness_project_sums.len(), 1, "{:?}", view.sums);
+        assert_eq!(harness_project_sums[0].sessions, 1);
+
+        let under_claude = sums_for(&view, "Claude Code", FLASH);
+        let under_harness = sums_for(&view, "DeepSeek Harness", FLASH);
+        assert_eq!(under_claude.len(), 1, "{:?}", view.sums);
+        assert_eq!(under_harness.len(), 1, "{:?}", view.sums);
+        assert_eq!(under_claude[0].sessions, 1);
+        assert_eq!(under_harness[0].sessions, 1);
+        let model = view
+            .sums
+            .iter()
+            .find(|sum| sum.of == SumOf::Model(Some(FLASH.to_string())))
+            .expect("one sum over both providers");
+        assert_eq!(model.sessions, 2);
+
+        assert_eq!(
+            serde_json::to_value(SumOf::ProviderModel(
+                "DeepSeek Harness".to_string(),
+                Some(FLASH.to_string())
+            ))
+            .expect("a sum key as JSON"),
+            serde_json::json!({
+                "kind": "providerModel",
+                "provider": "DeepSeek Harness",
+                "model": FLASH,
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(Sum {
+                of: SumOf::ProviderModel("Codex".to_string(), None),
+                sessions: 1,
+                agents_running: 2,
+                agents_done: 3,
+                tokens: Tokens {
+                    input: 1,
+                    out: 2,
+                    cw: 3,
+                    cr: 4
+                },
+                last_hour: Tokens {
+                    input: 5,
+                    out: 6,
+                    cw: 7,
+                    cr: 8
+                },
+                last_hour_values: Values::sum(&[]),
+                values: Values::sum(&[]),
+            })
+            .expect("a sum as JSON")["agentsRunning"],
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            serde_json::to_value(SumOf::ProviderModel("Codex".to_string(), None))
+                .expect("a key as JSON"),
+            serde_json::json!({"kind": "providerModel", "provider": "Codex", "model": null})
+        );
+        assert_eq!(
+            serde_json::to_value(SumOf::ProjectModel(
+                project,
+                "DeepSeek Harness".to_string(),
+                Some(FLASH.to_string())
+            ))
+            .expect("a project model key as JSON"),
+            serde_json::json!({
+                "kind": "projectModel",
+                "project": {
+                    "kind": "repo",
+                    "id": "github.com/acme/acme-kb",
+                },
+                "provider": "DeepSeek Harness",
+                "model": FLASH,
+            })
+        );
     }
 
     #[cfg(feature = "gui")]

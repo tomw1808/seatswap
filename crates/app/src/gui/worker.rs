@@ -457,6 +457,7 @@ pub(crate) fn spawn(
                 .map_err(|error| format!("the Harness folders cannot be found: {error}")),
             seatswap_core::paths::CodexPaths::resolve(settings.codex_home.as_deref())
                 .map_err(|error| format!("the Codex folder cannot be found: {error}")),
+            lookup.as_ref().map(LookupHandle::client),
             ui,
             engine_tx.clone(),
         )?),

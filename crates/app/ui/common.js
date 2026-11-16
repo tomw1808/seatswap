@@ -770,19 +770,23 @@ function valueText(values, unit, viewCurrency) {
   return { text, title: "" };
 }
 
-// Both halves of `Values` as one line for a KPI's sub-line: "1.23 EUR
-// subscription · 4.56 USD at API prices"; a missing half carries its reason.
+// Both halves of `Values` for a KPI's sub-line: "1.23 EUR subscription · 4.56
+// USD at API prices", as nodes. A missing half is "—" with its reason as that
+// "—"'s tooltip, never as text, so the KPI keeps its line and the reason is
+// where a pointer can find it.
 function valueSummary(values) {
   if (!isObject(values)) return "no values in the view";
-  const parts = [];
+  const nodes = [];
   for (const [unit, label] of [
     ["subscription", "subscription"],
     ["api", "at API prices"],
   ]) {
     const value = valueText(values, unit, null);
-    parts.push(`${value.text}${value.title ? ` (${value.title})` : ""} ${label}`);
+    if (nodes.length > 0) nodes.push(document.createTextNode(" · "));
+    nodes.push(h("span", { title: value.title || null }, value.text));
+    nodes.push(document.createTextNode(` ${label}`));
   }
-  return parts.join(" · ");
+  return nodes;
 }
 
 // The tip of one `Values` half. `scope` names the span the number covers ("in

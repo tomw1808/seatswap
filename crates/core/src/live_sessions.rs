@@ -15,7 +15,7 @@ use crate::burn::tied::thinking_tied;
 use crate::codex_sessions::CodexSession;
 use crate::harness::{self, HarnessSession};
 use crate::history::{HistoryDir, HistoryError, Hosted, Hosts, Range, SessionRecord, TokenRecord};
-use crate::money::{Valued, Valuer};
+use crate::money::{self, Fx, Valued, Valuer};
 use crate::project::ProjectKey;
 use crate::projects::{ProjectId, Projects};
 use crate::sessions::{SessionFile, SessionStatus};
@@ -31,11 +31,12 @@ pub const REPORT_EVERY_SECS: i64 = 30;
 /// A report older than this many minutes is stale (spec §3.8).
 pub const REPORT_STALE_MIN: i64 = 15;
 
-/// What the provider of every row is today (spec §3.8).
-const PROVIDER: &str = "Claude Code";
+/// What the provider of every Claude Code row is today (spec §3.8). The status
+/// line's feed names a Claude Code session, so its cost belongs to these rows.
+pub const CLAUDE_PROVIDER: &str = "Claude Code";
 
-/// The reason both values have when a session or an agent has no token record.
-const NO_TOKENS: &str = "no tokens yet";
+/// A row's provider (the constant the rows are built with).
+const PROVIDER: &str = CLAUDE_PROVIDER;
 
 /// The reason both values have while an agent's model is not known.
 const NO_AGENT_MODEL: &str = "the agent's model is not known yet";
@@ -79,9 +80,25 @@ pub struct Values {
 
 impl Values {
     /// The one way a list of [`Valued`] becomes what a page shows: one
-    /// [`Values`] per record, then [`Values::sum`]. An empty list has both
-    /// reasons "no tokens yet" and the settings' currency.
+    /// [`Values`] per record, then [`Values::sum`]. Nothing used is a known 0,
+    /// not an unknown value: an empty list is worth 0 in both halves, in the
+    /// settings' currency (the API half in the API column's currency, as
+    /// [`money::api_in_currency`] says for 0 US dollars).
     pub fn of(valued: &[Valued], settings: &Settings) -> Values {
+        if valued.is_empty() {
+            return Values {
+                api: Some(0.0),
+                api_currency: if settings.look_up_prices {
+                    settings.currency.clone()
+                } else {
+                    Some("USD".to_string())
+                },
+                api_missing: None,
+                subscription: Some(0.0),
+                currency: settings.currency.clone(),
+                subscription_missing: None,
+            };
+        }
         let parts: Vec<Values> = valued
             .iter()
             .map(|part| Values {
@@ -95,8 +112,7 @@ impl Values {
             .collect();
         let parts: Vec<&Values> = parts.iter().collect();
         let mut sum = Values::sum(&parts);
-        // Every part was built with the settings' currency; an empty list has
-        // no part to take it from.
+        // Every part was built with the settings' currency.
         sum.currency = settings.currency.clone();
         sum
     }
@@ -106,7 +122,7 @@ impl Values {
     /// unknown with the first part's reason; parts whose `api_currency` or
     /// `currency` differ are not added. The currency is the first part's; the
     /// view is built with one settings' currency, so all parts agree. An empty
-    /// list has both reasons "no tokens yet".
+    /// list is a known 0 in both halves, with no currency of its own.
     pub fn sum(parts: &[&Values]) -> Values {
         let mut api = Some(0.0);
         let mut api_currency: Option<String> = None;
@@ -171,12 +187,6 @@ impl Values {
                 subscription_missing = Some(TWO_SUBSCRIPTION_CURRENCIES.to_string());
             }
             currency = None;
-        }
-        if parts.is_empty() {
-            api = None;
-            subscription = None;
-            api_missing = Some(NO_TOKENS.to_string());
-            subscription_missing = Some(NO_TOKENS.to_string());
         }
         Values {
             api,
@@ -701,6 +711,20 @@ pub fn harness_rows(
                     Values::sum(&done_values)
                 };
                 let values = harness_values(root, &cwd, &project, pricing, host);
+                // The last hour of a Harness row is known from its answers'
+                // times, never a silent 0 (S-3): the messages inside the window,
+                // valued like the row's tokens at the newest of them, or at the
+                // row's last event when the window holds none (a known 0).
+                let (last_hour, last_hour_at) = harness_last_hour(root, now);
+                let last_hour_values = harness_values_at(
+                    root,
+                    last_hour,
+                    last_hour_at.unwrap_or(root.last),
+                    &cwd,
+                    &project,
+                    pricing,
+                    host,
+                );
                 let root_running = harness::is_running(root, locks.contains(&root.id), now);
                 out.rows.sessions.push(LiveSession {
                     session: root.id.clone(),
@@ -724,8 +748,8 @@ pub fn harness_rows(
                     agents_done: done,
                     agents,
                     tokens: root.tokens,
-                    last_hour: Tokens::default(),
-                    last_hour_values: pricing.of(&[]),
+                    last_hour,
+                    last_hour_values,
                     agents_done_values,
                     values,
                 });
@@ -820,6 +844,51 @@ pub fn add_agents(session: &mut LiveSession, agents: Vec<LiveAgent>) {
     session.agents_done_values = Values::sum(&done);
 }
 
+/// Item 6 (spec §1.4, §3.8): Claude Code's own cost of a session becomes its API
+/// value, through [`money::api_value`]: the provider's number when the status
+/// line's feed gave one for that session, else models.dev's value of its tokens.
+/// The subscription side is not touched.
+///
+/// `cost_usd` is the feed's `cost.total_cost_usd`, in US dollars, put in the API
+/// column's currency by [`money::api_in_currency`]: with the look-ups off the
+/// cost stays in USD; a settings currency without a stored dollar rate also
+/// stays USD; a stored rate converts it; and no settings currency makes the API
+/// value missing with that reason.
+///
+/// A converted value that is not finite (a huge cost times the rate) is not
+/// used: the row keeps the valuer's value and the returned warning says why, so
+/// the caller can name the session.
+pub fn take_provider_cost(
+    values: &mut Values,
+    cost_usd: Option<f64>,
+    settings: &Settings,
+    fx: &Fx,
+    at: DateTime<Utc>,
+) -> Option<String> {
+    let cost_usd = cost_usd?;
+    match money::api_in_currency(cost_usd, settings, fx, at.date_naive()) {
+        Ok((provider, currency)) => {
+            if !provider.is_finite() {
+                return Some(format!(
+                    "Claude Code's own cost {cost_usd} US dollars is {provider} in {currency} at the stored rate; it is not used, so the valuer's API value stays"
+                ));
+            }
+            if let Some(api) = money::api_value(Some(provider), values.api) {
+                values.api = Some(api);
+                values.api_currency = Some(currency);
+                values.api_missing = None;
+            }
+            None
+        }
+        Err(missing) => {
+            values.api = None;
+            values.api_currency = None;
+            values.api_missing = Some(missing.to_string());
+            None
+        }
+    }
+}
+
 /// The folder and project of a Harness session: the Claude Code session's for a
 /// linked job, else its own. A folder that is not text leaves the session out
 /// with a warning.
@@ -879,21 +948,63 @@ fn harness_values(
     pricing: &Pricing,
     host: &str,
 ) -> Values {
+    harness_values_at(
+        session,
+        session.tokens,
+        session.last,
+        cwd,
+        project,
+        pricing,
+        host,
+    )
+}
+
+/// The values of some of a Harness session's tokens at its reported model,
+/// dated at `at` (spec §3.8): the row's own totals at its last event, its last
+/// hour at the newest message inside the hour. The one valuer call both use.
+#[allow(clippy::too_many_arguments)]
+fn harness_values_at(
+    session: &HarnessSession,
+    tokens: Tokens,
+    at: DateTime<Utc>,
+    cwd: &str,
+    project: &ProjectKey,
+    pricing: &Pricing,
+    host: &str,
+) -> Values {
     let Some(model) = session.model.as_deref() else {
         return pricing.missing(NO_AGENT_MODEL);
     };
-    let record = token_record(
-        &session.id,
-        cwd,
-        project,
-        model,
-        session.last,
-        session.tokens,
-    );
+    let record = token_record(&session.id, cwd, project, model, at, tokens);
     match pricing {
         Pricing::Known { valuer, .. } => pricing.of(&[valuer.value(host, &record)]),
         Pricing::Unknown { .. } => pricing.of(&[]),
     }
+}
+
+/// A Harness session's tokens in the last hour (spec §3.8), and the newest
+/// message time they are valued at: every `assistant/message` after
+/// `now - 60 min`, the window [`transcripts::last_hour_by_model`] uses. The hour
+/// is known from the answers' own times, so an empty window is a known 0, not
+/// an unknown hour.
+fn harness_last_hour(
+    session: &HarnessSession,
+    now: DateTime<Utc>,
+) -> (Tokens, Option<DateTime<Utc>>) {
+    let after = now - Duration::minutes(60);
+    let mut tokens = Tokens::default();
+    let mut newest: Option<DateTime<Utc>> = None;
+    for message in &session.messages_detail {
+        if message.at <= after {
+            continue;
+        }
+        tokens += message.usage.unwrap_or_default();
+        newest = Some(match newest {
+            Some(at) if at >= message.at => at,
+            _ => message.at,
+        });
+    }
+    (tokens, newest)
 }
 
 /// One token line for what a Harness session gained since `recorded`, or a
@@ -1723,9 +1834,9 @@ mod tests {
             agents: Vec::new(),
             tokens: Tokens::default(),
             last_hour: Tokens::default(),
-            last_hour_values: Values::missing(NO_TOKENS, &Settings::default()),
+            last_hour_values: Values::sum(&[]),
             agents_done_values: Values::sum(&[]),
-            values: Values::missing(NO_TOKENS, &Settings::default()),
+            values: Values::sum(&[]),
         }
     }
 
@@ -2551,10 +2662,12 @@ mod tests {
         assert_eq!(values.currency.as_deref(), Some("EUR"));
 
         let empty = Values::of(&[], &settings_eur());
-        assert_eq!(empty.api, None);
-        assert_eq!(empty.api_missing.as_deref(), Some("no tokens yet"));
-        assert_eq!(empty.subscription, None);
-        assert_eq!(empty.subscription_missing.as_deref(), Some("no tokens yet"));
+        assert_eq!(empty.api, Some(0.0), "nothing used is a known 0");
+        assert_eq!(empty.api_currency.as_deref(), Some("EUR"));
+        assert_eq!(empty.api_missing, None);
+        assert_eq!(empty.subscription, Some(0.0));
+        assert_eq!(empty.currency.as_deref(), Some("EUR"));
+        assert_eq!(empty.subscription_missing, None);
     }
 
     #[test]
@@ -2899,8 +3012,10 @@ mod tests {
 
         let row = &rows.sessions[0];
         assert_eq!(row.tokens, Tokens::default());
-        assert_eq!(row.values.api, None);
-        assert_eq!(row.values.api_missing.as_deref(), Some("no tokens yet"));
+        assert_eq!(row.values.api, Some(0.0), "nothing used is a known 0");
+        assert_eq!(row.values.api_currency.as_deref(), Some("EUR"));
+        assert_eq!(row.values.api_missing, None);
+        assert_eq!(row.values.subscription, Some(0.0));
         assert_eq!(row.model, None);
         assert!(!row.tied);
     }
@@ -3016,8 +3131,10 @@ mod tests {
 
         let row = &rows.sessions[0];
         assert_eq!(row.tokens, Tokens::default());
-        assert_eq!(row.values.api, None);
-        assert_eq!(row.values.api_missing.as_deref(), Some("no tokens yet"));
+        assert_eq!(row.values.api, Some(0.0), "nothing used is a known 0");
+        assert_eq!(row.values.api_currency.as_deref(), Some("EUR"));
+        assert_eq!(row.values.api_missing, None);
+        assert_eq!(row.values.subscription, Some(0.0));
         assert_eq!(row.model, None);
         assert!(!row.tied);
     }
@@ -3143,7 +3260,7 @@ mod tests {
 
     #[test]
     /// A sum is all or nothing per half, never adds two API currencies, and
-    /// keeps the first missing part's reason. An empty sum says "no tokens yet".
+    /// keeps the first missing part's reason. An empty sum is a known 0.
     fn a_sum_of_values_is_all_or_nothing() {
         let eur = Values {
             api: Some(1.0),
@@ -3188,10 +3305,11 @@ mod tests {
         assert_eq!(sum.currency.as_deref(), Some("EUR"));
 
         let empty = Values::sum(&[]);
-        assert_eq!(empty.api, None);
-        assert_eq!(empty.subscription, None);
-        assert_eq!(empty.api_missing.as_deref(), Some(NO_TOKENS));
-        assert_eq!(empty.subscription_missing.as_deref(), Some(NO_TOKENS));
+        assert_eq!(empty.api, Some(0.0), "nothing used is a known 0");
+        assert_eq!(empty.api_currency, None);
+        assert_eq!(empty.api_missing, None);
+        assert_eq!(empty.subscription, Some(0.0));
+        assert_eq!(empty.subscription_missing, None);
         assert_eq!(empty.currency, None);
     }
 
@@ -3327,7 +3445,7 @@ mod tests {
             first: Some(at),
             last: Some(at),
             tokens: Tokens::default(),
-            values: Values::missing(NO_TOKENS, &Settings::default()),
+            values: Values::sum(&[]),
         });
 
         let report = write_report(&history, &[session], at).expect("the report");
@@ -4295,5 +4413,246 @@ mod tests {
         assert_eq!(second.tokens.len(), 1);
         assert_eq!(second.tokens[0].agent_answers, 1);
         assert_eq!(second.tokens[0].input, 100);
+    }
+
+    #[test]
+    fn a_harness_rows_last_hour_counts_the_last_sixty_minutes() {
+        let (dir, paths) = harness_store();
+        let now = utc("2026-11-14T19:00:00Z");
+        write_harness_answers(
+            &paths,
+            JOB_B,
+            &[
+                (
+                    (now - Duration::minutes(90)).timestamp_millis(),
+                    Some((1_000, 100)),
+                ),
+                (
+                    (now - Duration::minutes(30)).timestamp_millis(),
+                    Some((20, 2)),
+                ),
+                (
+                    (now - Duration::minutes(5)).timestamp_millis(),
+                    Some((30, 3)),
+                ),
+            ],
+        );
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let settings = settings_eur();
+        let mut priced = prices();
+        priced.take(
+            std::collections::BTreeMap::from([(
+                format!("anthropic/{FLASH_MODEL}"),
+                ModelPrice {
+                    input: 4.0,
+                    output: 20.0,
+                    cache_write: 5.0,
+                    cache_read: 0.2,
+                    tiered: false,
+                },
+            )]),
+            utc("2026-01-01T00:00:00Z"),
+        );
+        let valuer = valuer_with(&history, &settings, &[], &priced);
+        let harness = crate::harness::sessions(&paths, utc("2026-11-01T00:00:00Z"));
+
+        let out = harness_rows(
+            &harness.sessions,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &known_pricing(&valuer, &settings),
+            "atlas",
+            now,
+            &|_| project_key(),
+        );
+
+        assert_eq!(out.rows.sessions.len(), 1);
+        let row = &out.rows.sessions[0];
+        assert_eq!(
+            row.last_hour,
+            Tokens {
+                input: 50,
+                out: 5,
+                cw: 0,
+                cr: 0,
+            },
+            "the two answers inside the hour, not the one at −90 min"
+        );
+        assert_eq!(row.tokens.out, 105, "the row's own total is unchanged");
+        assert!(
+            row.last_hour_values.api.is_some(),
+            "the known hour is valued, never left missing: {:?}",
+            row.last_hour_values
+        );
+        assert_eq!(row.last_hour_values.api_missing, None);
+    }
+
+    #[test]
+    fn a_last_hour_without_tokens_is_a_known_zero() {
+        let (dir, paths) = harness_store();
+        let now = utc("2026-11-14T19:00:00Z");
+        write_harness_answers(
+            &paths,
+            JOB_B,
+            &[(
+                (now - Duration::minutes(90)).timestamp_millis(),
+                Some((1_000, 100)),
+            )],
+        );
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let settings = settings_eur();
+        let mut priced = prices();
+        priced.take(
+            std::collections::BTreeMap::from([(
+                format!("anthropic/{FLASH_MODEL}"),
+                ModelPrice {
+                    input: 4.0,
+                    output: 20.0,
+                    cache_write: 5.0,
+                    cache_read: 0.2,
+                    tiered: false,
+                },
+            )]),
+            utc("2026-01-01T00:00:00Z"),
+        );
+        let valuer = valuer_with(&history, &settings, &[], &priced);
+        let harness = crate::harness::sessions(&paths, utc("2026-11-01T00:00:00Z"));
+
+        let out = harness_rows(
+            &harness.sessions,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &known_pricing(&valuer, &settings),
+            "atlas",
+            now,
+            &|_| project_key(),
+        );
+
+        let row = &out.rows.sessions[0];
+        assert_eq!(
+            row.last_hour,
+            Tokens::default(),
+            "the only answer is outside the hour"
+        );
+        assert_eq!(
+            row.last_hour_values.api,
+            Some(0.0),
+            "an hour without tokens is a known 0, not an unknown value: {:?}",
+            row.last_hour_values
+        );
+        assert_eq!(row.last_hour_values.api_currency.as_deref(), Some("EUR"));
+        assert_eq!(row.last_hour_values.api_missing, None);
+        assert_eq!(row.last_hour_values.subscription, Some(0.0));
+        assert_eq!(row.last_hour_values.subscription_missing, None);
+    }
+
+    #[test]
+    fn the_provider_cost_becomes_the_api_value() {
+        let now = utc("2026-11-14T10:00:00Z");
+        let settings = settings_eur();
+        let mut fx = Fx {
+            currency: "EUR".to_string(),
+            ..Fx::default()
+        };
+        fx.take(now.date_naive(), 2.0);
+        let mut values = Values {
+            api: Some(9.0),
+            api_currency: Some("EUR".to_string()),
+            api_missing: None,
+            subscription: Some(2.0),
+            currency: Some("EUR".to_string()),
+            subscription_missing: None,
+        };
+        assert_eq!(
+            take_provider_cost(&mut values, Some(1.5), &settings, &fx, now),
+            None
+        );
+        assert_eq!(
+            values.api,
+            Some(3.0),
+            "the provider's dollars are converted at the stored rate and beat models.dev's value"
+        );
+        assert_eq!(values.api_currency.as_deref(), Some("EUR"));
+        assert_eq!(
+            values.subscription,
+            Some(2.0),
+            "the subscription side is not touched"
+        );
+        assert_eq!(values.api_missing, None);
+
+        let mut unpriced = Values::missing("no price for claude-x", &settings);
+        assert_eq!(
+            take_provider_cost(&mut unpriced, Some(1.5), &settings, &fx, now),
+            None
+        );
+        assert_eq!(unpriced.api, Some(3.0), "a provider cost needs no price");
+        assert_eq!(unpriced.api_missing, None);
+        assert_eq!(
+            unpriced.subscription, None,
+            "models.dev's missing subscription stays"
+        );
+
+        let mut kept = Values::missing("no price for claude-x", &settings);
+        assert_eq!(
+            take_provider_cost(&mut kept, None, &settings, &fx, now),
+            None
+        );
+        assert_eq!(
+            kept.api_missing.as_deref(),
+            Some("no price for claude-x"),
+            "without a cost the reason stays"
+        );
+
+        // With the look-ups off the cost stays in US dollars, as models.dev's
+        // values do.
+        let mut off = settings.clone();
+        off.look_up_prices = false;
+        let mut usd = values.clone();
+        assert_eq!(
+            take_provider_cost(&mut usd, Some(1.5), &off, &fx, now),
+            None
+        );
+        assert_eq!(usd.api, Some(1.5));
+        assert_eq!(usd.api_currency.as_deref(), Some("USD"));
+
+        // No currency in the settings: the API value is missing with that
+        // reason, never a number in an unnamed currency.
+        let mut bare = settings.clone();
+        bare.currency = None;
+        let mut none = values.clone();
+        assert_eq!(
+            take_provider_cost(&mut none, Some(1.5), &bare, &fx, now),
+            None
+        );
+        assert_eq!(none.api, None);
+        assert_eq!(none.api_currency, None);
+        assert_eq!(
+            none.api_missing.as_deref(),
+            Some("set a currency in Settings → General")
+        );
+        assert_eq!(
+            none.subscription,
+            Some(2.0),
+            "the subscription half is not touched either"
+        );
+
+        // A huge cost times the rate overflows: the conversion is not used and
+        // the row keeps the valuer's value; the caller names the session.
+        let mut huge_fx = Fx {
+            currency: "EUR".to_string(),
+            ..Fx::default()
+        };
+        huge_fx.take(now.date_naive(), f64::MAX);
+        let before = values.clone();
+        let warning = take_provider_cost(&mut values, Some(f64::MAX), &settings, &huge_fx, now)
+            .expect("a non-finite conversion says why");
+        assert!(warning.contains("not used"), "{warning}");
+        assert_eq!(values, before, "the valuer's value stays");
     }
 }

@@ -1320,7 +1320,11 @@ mod tests {
         assert!(summary.per_account_percent.is_empty());
         assert!(summary.top_projects.is_empty());
         assert_eq!(summary.tokens, Tokens::default());
-        assert_eq!(summary.values.api, None);
+        assert_eq!(
+            summary.values.api,
+            Some(0.0),
+            "no record is a known 0, not an unknown value"
+        );
         assert_eq!(summary.used_change_percent, None);
         assert_eq!(summary.conclusion, vec!["No hour blocked.".to_string()]);
     }
@@ -2221,7 +2225,11 @@ mod tests {
             Tokens::default(),
             "atlas's tokens of the week are not vega's"
         );
-        assert_eq!(summary.values.api, None);
+        assert_eq!(
+            summary.values.api,
+            Some(0.0),
+            "no record is a known 0, not an unknown value"
+        );
         assert!(summary.top_projects.is_empty());
         assert!(
             summary.used.is_some(),
