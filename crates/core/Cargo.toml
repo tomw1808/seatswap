@@ -1,6 +1,6 @@
 [package]
 name = "seatswap-core"
-description = "Core of seatswap: Claude Code login files, locks, account store, usage API, switching"
+description = "Core of seatswap: Claude Code login files, locks, account store, usage API, switching, history, auto-burn and statistics"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

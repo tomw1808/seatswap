@@ -38,16 +38,25 @@ cargo clippy -p seatswap --no-default-features --all-targets -- -D warnings   # 
 cargo fmt --check
 ```
 
-## Looking at the pop-up
+CI runs these on Linux and Windows. To catch a Windows-only break on Linux before you push, with
+a toolchain that has the target `x86_64-pc-windows-gnu` (`rustup target add x86_64-pc-windows-gnu`):
 
-The pop-up's page runs in a normal browser with built-in demo data:
+```sh
+cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings
+```
+
+## Looking at the pop-up and the large window
+
+Both pages run in a normal browser with built-in demo data:
 
 ```sh
 cd crates/app/ui && python3 -m http.server 8765
-# open http://127.0.0.1:8765/index.html#main  (or #settings, #add)
+# the pop-up:       http://127.0.0.1:8765/index.html#main  (or #add)
+# the large window: http://127.0.0.1:8765/window.html#sessions
+#                   (or #statistics, #statusline, #settings)
 ```
 
-Screenshots for the docs come from that demo data only.
+Screenshots for the docs come from that demo data only; every name in it is made up.
 
 ## Rules the code follows
 

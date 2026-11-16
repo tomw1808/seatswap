@@ -87,9 +87,18 @@ All notable changes to this project are documented here. The format follows
 - Settings `suggestAt` and `suggestTargetBelow`: the fixed 90 % / 50 % suggestion is replaced by
   auto-burn. An older `accounts.json` with them still loads; the keys are ignored.
 
+- A reset time in Claude's usage reply that seatswap cannot read is no longer dropped without a
+  word: the limit is shown without it and the account's card says why.
+- Once a settings file uses the new status line segments (context used, session cost, lines
+  changed), a seatswap older than 1.1.0 cannot read it: going back below 1.1.0 then means removing
+  those segments first.
+
 ### Fixed
 - `seatswap status --help` names the JSON fields `views`, `active` and `suggestion` as they are; it
   said "the active id", which is not a field.
+- With early switching on, the pop-up, `burn-next.json` and the status line could name a switch for
+  "now" within 30 minutes of the last switch or during a manual hold or pause, although auto-burn
+  waits then; the plan now starts from the last switch and the hold.
 
 ## [1.0.6] - 2026-11-14
 
@@ -165,6 +174,7 @@ All notable changes to this project are documented here. The format follows
   the pop-up meanwhile.
 
 [Unreleased]: https://github.com/ymihere/seatswap/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/ymihere/seatswap/releases/tag/v1.1.0
 [1.1.0]: https://github.com/ymihere/seatswap/releases/tag/v1.1.0
 [1.0.6]: https://github.com/ymihere/seatswap/releases/tag/v1.0.6
 [1.0.5]: https://github.com/ymihere/seatswap/releases/tag/v1.0.5

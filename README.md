@@ -9,14 +9,25 @@ the same for every account: memory, skills, plugins, hooks, settings and history
 
 The tray icon shows the active account's abbreviation with a ring for how much of its limit is
 used. A click opens a pop-up with the session and weekly usage of every stored account, so you can
-see at a glance which one still has room.
+see at a glance which one still has room. Beyond that, seatswap can switch by itself so that as
+little quota as possible expires (auto-burn), shows the running Claude Code sessions, keeps a
+history with statistics of what each subscription was used for, and builds Claude Code's status
+line.
 
 <p>
-  <img src="docs/images/panel-dark.png" alt="The pop-up in the dark theme: three accounts with usage rings, bars and reset times, and a suggestion to switch" width="380">
+  <img src="docs/images/panel-dark.png" alt="The pop-up in the dark theme: auto-burn's plan and a waiting switch, three accounts with usage rings, bars and reset times, and the Codex and Ollama cards" width="380">
   <img src="docs/images/panel-light.png" alt="The same pop-up in the light theme" width="380">
 </p>
 
-*Screenshots show the pop-up's built-in demo data.*
+<p>
+  <img src="docs/images/window-sessions.png" alt="The large window's Sessions area: running sessions grouped by project, with model, status, agents, tokens and their value, and a card for what a switch would cost them" width="760">
+</p>
+
+<p>
+  <img src="docs/images/window-statusline.png" alt="The large window's Status line area: a palette of segments, the two zones of the line, and a preview at three terminal widths" width="760">
+</p>
+
+*Screenshots show the app's built-in demo data; every name in them is made up.*
 
 > **Not affiliated with Anthropic.** seatswap works with Claude Code's own login files and
 > the same endpoints Claude Code uses. They are undocumented and can change with any Claude Code
@@ -25,10 +36,11 @@ see at a glance which one still has room.
 ## Status
 
 Built and used daily on **Linux Mint 22 Cinnamon (X11)**. On Windows 11 it builds
-and passes its tests (Claude Code keeps its login in the same file there), and the tray app had
-its first run there on 2026-11-11; not every check of that run is done yet. macOS is
-not supported yet: Claude Code keeps its login in the Keychain there, and seatswap does not
-read or write that yet.
+and passes its tests (Claude Code keeps its login in the same file there), and the tray app of
+1.0 had its first run there on 2026-11-11. The parts new in 1.1 (sessions, history, statistics,
+auto-burn, the status line, the large window) have passed their tests on Windows but have not run
+on a Windows desktop yet. macOS is not supported yet: Claude Code keeps its login in the Keychain
+there, and seatswap does not read or write that yet.
 
 ## Features
 
@@ -232,8 +244,9 @@ builder edits.
 - Every account has "Auto-burn may use this account"; off, it is never a target. Each switch is
   written to the history with its reason.
 
-The plan is visible before it runs: `seatswap burn plan` prints the regime and the lazy plan as
-time ranges, and `seatswap burn plan --json` prints the same as one object.
+The plan is visible before it runs: `seatswap burn plan` prints the regime and the plan auto-burn
+follows (the eager one while early switching is on, otherwise the lazy one) as time ranges, and
+`seatswap burn plan --json` prints the same as one object.
 
 **The status in JSON.** `seatswap status --json` prints one object for scripts: `views` (every
 account, each with `usable` and, while it is known, `slackHours`), `active` (the id in use, or
@@ -264,7 +277,7 @@ seatswap edit <account> [--label TEXT] [--abbr XY] [--color '#rrggbb']
 seatswap rm <account>           remove an account and its stored login
 seatswap status [--json | --waybar | --i3blocks] [--refresh]
 seatswap statusline             Claude Code's status line (reads its JSON from stdin)
-seatswap burn plan [--json]     the early-switching regime and the lazy plan
+seatswap burn plan [--json]     the early-switching regime and the plan auto-burn follows
 seatswap burn simulate --from YYYY-MM-DD --to YYYY-MM-DD [--without ABBR]
                                 replay the recorded work for the lazy and eager policies
 seatswap panel [main|add|settings]   open the running app's pop-up; settings opens the large window
@@ -316,6 +329,14 @@ the tray app, and `seatswap.exe` for everything you want to read in a terminal.
   `api.frankfurter.dev` for the dollar rate; those two send a User-Agent and nothing about you, your
   accounts or this machine. Nothing else.
 - **Logs and output** never contain a token; at most the last four characters of a refresh token.
+- **What it records:** the history (every usage reading, finished window, switch and agent call,
+  and the tokens each session used per project folder, hour and model) and, for your other hosts,
+  a live report of this host's running sessions (`sessions-now.json`: session names, folders,
+  models and token counts, never an agent's task text). Both go into the history folder: by
+  default `history` in the data folder; the setting `historyDir` can point it at a synced folder
+  so several hosts share it, and then these records travel with that service. From the
+  transcripts seatswap keeps only numbers and names; it never stores message text. *Read Claude
+  Code's session files* off stops reading sessions and transcripts.
 - **Locks:** a switch holds Claude Code's own lock files (the renewal locks of the main and the two
   secondary logins, credentials write, identity write) and its own app lock, so it never
   overwrites a login Claude Code is writing.
@@ -331,7 +352,7 @@ Whether using a subscription login this way is within Anthropic's terms is for y
 | KDE Plasma, Xfce, MATE | Expected to work (StatusNotifierItem) |
 | GNOME | Needs the AppIndicator extension |
 | Wayland sessions | Expected to work; the pop-up is centred, the compositor places it |
-| Windows 11 | Builds and passes its tests; first run on 2026-11-11 (tray app, start at login); a switch and the notifications are not confirmed yet. `seatswap.exe` is the CLI, `seatswap-tray.exe` the same program without a console window (autostart, Start menu). Works while Claude Code keeps its login in `.credentials.json`; a newer Claude Code can move it into Windows Credential Manager, which is not supported yet |
+| Windows 11 | Builds and passes its tests; 1.0's first run on 2026-11-11 (tray app, start at login); a switch and the notifications are not confirmed yet, and the parts new in 1.1 have not run on a desktop yet. `seatswap.exe` is the CLI, `seatswap-tray.exe` the same program without a console window (autostart, Start menu). Works while Claude Code keeps its login in `.credentials.json`; a newer Claude Code can move it into Windows Credential Manager, which is not supported yet |
 | Windows 10 (1803 or later) | Expected to work; not run yet |
 | macOS | Not yet: needs Keychain support for Claude Code's login |
 
@@ -340,6 +361,7 @@ Whether using a subscription login this way is within Anthropic's terms is for y
 ```sh
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy -p seatswap --no-default-features --all-targets -- -D warnings   # CLI only
 cargo fmt --check
 ```
 

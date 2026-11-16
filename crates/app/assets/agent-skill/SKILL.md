@@ -38,7 +38,7 @@ seatswap use PR      # to a named account, by abbreviation or id
 Rules:
 
 1. If `autoBurn.on` is true, do not switch: auto-burn decides.
-2. A switch moves every Claude Code session on the machine, not only yours. They continue on the new account with their following request. Sessions on Fable 5.2, Sonnet 5.5 or Haiku 5.5 then work without their earlier reasoning until someone switches back.
+2. A switch moves every Claude Code session on the machine, not only yours. They continue on the new account with their following request. Sessions on Fable 5.2, Mythos 5.2, Sonnet 5.5 or Haiku 5.5 then work without their earlier reasoning until someone switches back.
 3. Switch only when the active account is blocked or will be before your task ends, and another account is `usable`.
 4. After a switch, say in your answer which account is in use now and why you switched.
 5. Never run `seatswap add`, `rm` or `edit`, never change seatswap's settings, and never read or write seatswap's data folder or Claude Code's login files yourself.

@@ -19,6 +19,8 @@ body:
         - label: Right click opens the menu
         - label: The pop-up closes on Esc and on a click elsewhere
         - label: Switching works with a Claude Code session running
+        - label: The large window opens (gear in the pop-up, or `seatswap window`)
+        - label: Notifications appear (e.g. "waiting for you")
   - type: textarea
     id: notes
     attributes:
