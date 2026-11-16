@@ -4,8 +4,10 @@
 //! A Harness session is one folder below `<sessions>/<cwd-key>/<id>` with a
 //! zstd-compressed JSON-lines file and an empty `session.lock` beside it. The
 //! header names the session, its parent and its delegation depth; the events
-//! give its turns, tokens, model and title. Only numbers and names leave this
-//! module: a title is kept in memory for the live rows and is never written.
+//! give its turns, tokens, model and title. Only numbers, names and a title
+//! leave this module. A Harness session that is its own row is named by its
+//! title, which the live report keeps; a flash job's or worker's title is a
+//! task text, shown live and never written. No title reaches a history record.
 //!
 //! A job started by a flash tool is linked to the Claude Code session whose
 //! transcript names it. On Linux a running job that no transcript names yet is
@@ -24,6 +26,12 @@ use serde::Deserialize;
 
 use crate::paths::PathsError;
 use crate::transcripts::{ClosedJob, SessionSeen, Tokens};
+
+/// Whether a Harness session id is a flash job's (`flash-task-<uuid>`); a
+/// worker's id is a plain UUID.
+pub fn is_flash_job(id: &str) -> bool {
+    id.starts_with("flash-task-")
+}
 
 /// The file that holds a Harness session's events.
 const SESSION_FILE: &str = "session.v4.jsonl.zstd";
@@ -110,7 +118,9 @@ pub struct HarnessSession {
     pub messages_detail: Vec<HarnessMessage>,
     /// A `turn/end` after the last `turn/start`.
     pub finished: bool,
-    /// The last `session/title`; kept in memory only.
+    /// The `title` of the last `session/title` event, as written; an empty or
+    /// all-space title, or a last event without one, is no title. A Harness row is named by it, like a
+    /// Claude Code row by its `ai-title`; a linked worker shows it as its task.
     pub title: Option<String>,
 }
 
@@ -378,9 +388,11 @@ fn read_one(file: &Path) -> Result<Option<HarnessSession>, String> {
                     .push(HarnessMessage { at, model, usage });
             }
             "session/title" => {
-                if let Some(title) = event.data.and_then(|data| data.title) {
-                    session.title = Some(title);
-                }
+                // The last event wins; one without a title clears it.
+                session.title = event
+                    .data
+                    .and_then(|data| data.title)
+                    .and_then(crate::transcripts::session_title);
             }
             // Every other event type is skipped unread except for its time.
             _ => {}
@@ -511,7 +523,7 @@ fn name_job(
     links: &mut HarnessLinks,
     owner_at: &mut BTreeMap<String, DateTime<Utc>>,
 ) {
-    let job = if id.starts_with("flash-task-") {
+    let job = if is_flash_job(id) {
         Some(id.to_string())
     } else if id.starts_with("job-") {
         report_session(paths, id, &mut links.warnings)

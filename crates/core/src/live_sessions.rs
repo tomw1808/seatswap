@@ -732,10 +732,15 @@ pub fn harness_rows(
                     session: root.id.clone(),
                     host: host.to_string(),
                     label: session_label(&project_name, &root.id),
-                    // A Harness session's own title is an agent task, not
-                    // Claude Code's `ai-title`: it is shown on the agent, never
-                    // as the row's title.
-                    title: None,
+                    // A Harness session that is its own row is named by its
+                    // last `session/title`, as a Claude Code row by its
+                    // `ai-title`. A flash job's title is a worker's task text:
+                    // it never names a row and never reaches the report.
+                    title: if harness::is_flash_job(&root.id) {
+                        None
+                    } else {
+                        root.title.clone()
+                    },
                     project_id,
                     project: project_name,
                     org,
@@ -4577,6 +4582,78 @@ mod tests {
         collect_text(&dir.path().join("history"), &mut found, &mut files);
         assert!(files > 0, "a token line was written");
         assert!(!found.contains(title), "no history file holds the title");
+    }
+
+    #[test]
+    fn a_harness_row_is_named_by_its_session_title() {
+        let (dir, paths) = harness_store();
+        // A DeepSeek Harness session of its own (a plain UUID), one with an
+        // all-space title, and an unlinked flash job, whose title is a
+        // worker's task text.
+        let own = "3f9a1c2e-7b4d-4e8a-9c1f-5d2e6a7b8c90";
+        let blank = "6c2d8e1f-4a3b-4c5d-8e9f-0a1b2c3d4e5f";
+        write_harness_session(
+            &paths,
+            own,
+            None,
+            0,
+            true,
+            10516,
+            3585,
+            Some("atlas link test"),
+        );
+        write_harness_session(&paths, blank, None, 0, true, 2200, 1100, Some("   "));
+        write_harness_session(
+            &paths,
+            JOB_A,
+            None,
+            0,
+            false,
+            900,
+            400,
+            Some("Fix the invoice export"),
+        );
+        let harness = crate::harness::sessions(&paths, utc("2026-11-01T00:00:00Z"));
+
+        let out = harness_rows(
+            &harness.sessions,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            &unknown_pricing(),
+            "atlas",
+            utc("2026-11-14T19:00:00Z"),
+            &|_| project_key(),
+        );
+
+        let row = |id: &str| {
+            out.rows
+                .sessions
+                .iter()
+                .find(|row| row.session == id)
+                .expect("the Harness row")
+        };
+        assert_eq!(row(own).title.as_deref(), Some("atlas link test"));
+        assert_eq!(row(blank).title, None, "an all-space title is no title");
+        assert_eq!(row(JOB_A).title, None, "a flash job's title names no row");
+
+        let history = HistoryDir::at(&dir.path().join("history"), "atlas");
+        write_report(&history, &out.rows.sessions, utc("2026-11-14T19:00:00Z"))
+            .expect("the sessions report");
+        let mut found = String::new();
+        let mut files = 0;
+        collect_text(&dir.path().join("history"), &mut found, &mut files);
+        assert!(files > 0, "the report was written");
+        assert!(
+            found.contains("atlas link test"),
+            "a Harness row's title is in the report"
+        );
+        assert!(
+            !found.contains("Fix the invoice export"),
+            "a flash job's task text never reaches the report"
+        );
     }
 
     fn collect_text(dir: &std::path::Path, text: &mut String, files: &mut usize) {

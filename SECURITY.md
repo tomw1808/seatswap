@@ -41,7 +41,9 @@ seatswap handles Claude login tokens, so it is built to keep them where they bel
   session id, its parent, folder, model, token counts and times; from a job report only the job's
   `sessionId`, to link the job to its Claude Code session; from a Codex rollout the session id,
   folder, model, token counts and times. A Claude Code session's title (the `aiTitle` of its
-  transcript's `ai-title` lines) is stored in the history and the live report. Message text and a
+  transcript's `ai-title` lines) is stored in the history and the live report; a DeepSeek Harness
+  session that is a row of its own (not a flash job) carries its last `session/title` in the live
+  report. Message text and a
   worker's title or task text are never
   stored, logged or sent; a worker's title is shown in the window and cleared before
   the report other hosts read. No file among them is ever written. It never opens the secret `.key`

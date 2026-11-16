@@ -1225,7 +1225,7 @@ provider do not repeat it; a model total row carries the `tied` bubble, and a to
 
 | Column | Content |
 |---|---|
-| Name | Claude Code's own title of the session (the one VS Code and `/resume` show), with the session's label (`atlas-a6`) as a small grey tag after it; the label alone when the session has no title, and always for a Codex or DeepSeek Harness row. A long title is cut with `…` and its whole text is the hover text. Opens to its agents |
+| Name | Claude Code's own title of the session (the one VS Code and `/resume` show), with the session's label (`atlas-a6`) as a small grey tag after it; a DeepSeek Harness row likewise by the title of its last `session/title` event, except a flash job's row, whose title is a worker's task text; the label alone when the session has no title, and always for a Codex row. A long title is cut with `…` and its whole text is the hover text. Opens to its agents |
 | Model | the model of its last answer, with the `tied` bubble when its thinking is tied to the account |
 | Status | busy · idle · waiting for you, with how long; for a closed session, when it closed |
 | Agents | running · completed, the running number in the busy colour (grey at zero), completed always grey; `—` when a session has no agent data |
@@ -2047,9 +2047,10 @@ the past too, because the history stores the repository's identity, not the show
   (`$CODEX_HOME` or `~/.codex`: session id, model, token totals, event times). None of these files is
   written or created. A Claude Code session's title (the `aiTitle` of its transcript's `ai-title`
   lines, the one VS Code and `/resume` show) is stored in its session records and the live report, so
-  it travels with a shared history folder; a flash worker's task text and all message text are never
-  stored; a worker's title is shown in the window and is cleared before the report
-  other hosts read is written. None of what is read is sent anywhere.
+  it travels with a shared history folder; a DeepSeek Harness session that is a row of its own, not
+  a flash job, carries its title (its last `session/title` event) in the live report too. A flash worker's task
+  text and all message text are never stored; a worker's title, shown in the window as a linked
+  agent's task, is cleared before the report other hosts read is written. None of what is read is sent anywhere.
 - **The history folder suggestion.** Only while the saved settings name no history folder, seatswap
   reads Dropbox's own `info.json` (macOS and Linux `~/.dropbox/info.json`; Windows
   `%APPDATA%\Dropbox\info.json`, then `%LOCALAPPDATA%\Dropbox\info.json`: `personal.path`, else

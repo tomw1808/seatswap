@@ -1814,11 +1814,7 @@ impl ScanRun<'_> {
             file.unreadable += 1;
             return;
         };
-        file.title = Some(if title.trim().is_empty() {
-            None
-        } else {
-            Some(title)
-        });
+        file.title = Some(session_title(title));
     }
 
     fn assistant(&mut self, reading: &Reading, line: &Line, file: &mut FileScan) {
@@ -2408,6 +2404,17 @@ fn answer_cwd(answer: &Answer, state: &ScanState) -> String {
 struct LineType {
     #[serde(rename = "type")]
     kind: String,
+}
+
+/// A session's title as written, or none when it is empty or all-space: the
+/// one rule for Claude Code's `ai-title` and DeepSeek Harness's
+/// `session/title`.
+pub fn session_title(title: String) -> Option<String> {
+    if title.trim().is_empty() {
+        None
+    } else {
+        Some(title)
+    }
 }
 
 /// An `ai-title` line: only its `aiTitle` is read; every other field and text

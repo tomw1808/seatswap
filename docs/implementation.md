@@ -2698,7 +2698,7 @@ impl Values { pub fn of(valued: &[Valued], settings: &Settings, fx: &Fx, at: Dat
     pub model: Option<String>, pub running: bool, pub first: Option<DateTime<Utc>>,
     pub last: Option<DateTime<Utc>>, pub tokens: Tokens, pub values: Values }
 #[serde(rename_all = "camelCase")] pub struct LiveSession { pub session: String, pub host: String,
-    pub label: String, #[serde(default)] pub title: Option<String> /* None for Codex and Harness */,
+    pub label: String, #[serde(default)] pub title: Option<String> /* None for Codex */,
     pub project_id: ProjectId, pub project: String, pub org: Option<String>,
     pub cwd: String, pub provider: String, pub model: Option<String>, pub tied: bool,
     pub status: LiveStatus, pub since: DateTime<Utc>, pub started: DateTime<Utc>,
@@ -2802,7 +2802,10 @@ the Claude Code session in the history. A job first seen unlinked is recorded un
 id and folder; once it is linked its tokens go under the Claude Code session, and the total recorded
 so far is kept while its session file exists (`transcripts::prune_harness_recorded` drops it only
 when the file is gone). Another top-level Harness session is a row of its own, with the provider
-`DeepSeek Harness` and the status Busy or Idle; its agents are its workers. A worker's title is shown
+`DeepSeek Harness` and the status Busy or Idle, named by its `HarnessSession::title` (`LiveSession.title`,
+which the live report keeps) unless it is a flash job (`harness::is_flash_job`, a `flash-task-` id):
+an unlinked job's row has no title, because its title is a worker's task text; its agents are its
+workers. A worker's title is shown
 live as that agent's `task`; it is never written to the history, and `write_report` sets every
 agent's `task` to `None` before the host report is written, so other hosts never see it. A session, agent or hour without any
 token line is a known 0; a sum is unknown only when a part of it is unknown, and a missing value is
@@ -4624,7 +4627,7 @@ it; `sessions` lists every cwd key, opens only files whose last write is at or a
 reads the header and the events. A file still being written ends mid-frame: the bytes decoded so far
 are used up to the last whole line, and that is not a warning. A store that does not exist is no
 session and no warning. A missing `assistant/message` usage is an answer with no tokens; a message's
-`time` names the hour its tokens belong to. A `session/title` is kept in memory only.
+`time` names the hour its tokens belong to. The last `session/title` is the session's `title`; an empty or all-space one is no title. It names a Harness row that is not a flash job (and goes into the live report with it), or is a flash job's or worker's task (shown live, cleared before the report); it never reaches a history record. The empty-title rule is `transcripts::session_title`, shared with `ai-title`; a last `session/title` without a title clears it.
 
 `links` puts a job id named by a transcript under that transcript's Claude Code session. A
 `flash-task-<uuid>` names itself; a `job-<8hex>` is resolved through its report's `sessionId`. A

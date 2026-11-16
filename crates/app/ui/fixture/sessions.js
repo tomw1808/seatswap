@@ -490,6 +490,7 @@ function fixtureSessionRows() {
     }),
     make("dsh-b7", "atlas", "atlas", "busy", DEEPSEEK_MODEL, isoIn(-11 * 60000), 0.7, 0.6, 2, 1, harnessAgents, {
       provider: "DeepSeek Harness",
+      title: "Atlas link test",
     }),
     make("notes-62", "notes", "atlas", "busy", "claude-fable-5-2", isoIn(-20 * 1000), 1.8, 0.5, 3, 0, flashAgents, {
       title: "Patch the release notes",

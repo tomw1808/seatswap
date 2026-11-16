@@ -350,9 +350,9 @@ the tray app, and `seatswap.exe` for everything you want to read in a terminal.
   `%APPDATA%\Dropbox\info.json`, then `%LOCALAPPDATA%\Dropbox\info.json`) only to suggest
   `<Dropbox>/seatswap` as the history folder; a file it cannot read is shown with its path and why.
   All of these are read only and never written. seatswap keeps ids, folders, model names, token counts,
-  times and a Claude Code session's title (the one VS Code and `/resume` show); message text is never
-  stored, and neither are a worker's title or task text (the worker's title is shown in the window and
-  cleared before the report other hosts read).
+  times, a Claude Code session's title (the one VS Code and `/resume` show) and a DeepSeek Harness
+  session's own title; message text is never stored, and neither are a flash job's or worker's
+  title or task text (shown in the window and cleared before the report other hosts read).
 - **Network:** the usage endpoint (`api.anthropic.com/api/oauth/usage`) and Claude Code's token
   endpoint (`platform.claude.com/v1/oauth/token`, with Claude Code's own client id) to refresh
   stored logins. While the Codex card is on, `chatgpt.com/backend-api/wham/usage` with Codex's own
