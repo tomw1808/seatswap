@@ -107,6 +107,17 @@ impl Provider {
             Provider::Ollama => ollama,
         }
     }
+
+    fn tried_mut<'a>(
+        self,
+        codex: &'a mut Option<DateTime<Utc>>,
+        ollama: &'a mut Option<DateTime<Utc>>,
+    ) -> &'a mut Option<DateTime<Utc>> {
+        match self {
+            Provider::Codex => codex,
+            Provider::Ollama => ollama,
+        }
+    }
 }
 
 /// The commands the window and the settings save send to the provider thread.
@@ -170,6 +181,11 @@ impl Drop for ProvidersHandle {
 pub(crate) type CodexPathsLookup =
     Box<dyn Fn(Option<&Path>) -> Result<CodexPaths, PathsError> + Send>;
 
+/// The way to read the settings now. The app loads `accounts.json`; a test
+/// answers with its own. The settings the request used are passed in, so the
+/// app can ignore them and a test can answer "the same".
+pub(crate) type SettingsLookup = Box<dyn Fn(&Settings) -> Result<Settings, String> + Send>;
+
 /// The way the runtime reports a history write failure: in the app this is
 /// [`report_history_error`] (a notification and one line on stderr); a test
 /// counts the calls instead.
@@ -205,11 +221,17 @@ fn run(
     stop: Arc<AtomicBool>,
     commands: Receiver<ProvidersCommand>,
 ) {
+    let app_for_lookup = app.clone();
     let mut runtime = ProvidersRuntime::new(
         history,
         api,
         Some(ui),
         Box::new(CodexPaths::resolve),
+        Box::new(move |_| {
+            store::load_accounts(&app_for_lookup)
+                .map(|file| file.settings)
+                .map_err(|error| error.to_string())
+        }),
         Box::new(report_history_error),
     );
     // The first round is at the start, before the first five minutes passed.
@@ -259,6 +281,8 @@ pub(crate) struct ProvidersRuntime {
     api: Api,
     ui: Option<Sender<UiEvent>>,
     codex_paths: CodexPathsLookup,
+    /// The way the current settings are read once a request has ended.
+    settings_lookup: SettingsLookup,
     /// The recorder, or the sentence that says why there is none.
     recorder: Result<Recorder, String>,
     /// The way a history write failure is reported.
@@ -282,12 +306,14 @@ impl ProvidersRuntime {
         api: Api,
         ui: Option<Sender<UiEvent>>,
         codex_paths: CodexPathsLookup,
+        settings_lookup: SettingsLookup,
         report: ReportError,
     ) -> ProvidersRuntime {
         ProvidersRuntime {
             api,
             ui,
             codex_paths,
+            settings_lookup,
             recorder: history.map(Recorder::new),
             report,
             last_reported: None,
@@ -318,8 +344,8 @@ impl ProvidersRuntime {
         settings: &Settings,
         now: DateTime<Utc>,
     ) -> Vec<ProviderView> {
-        self.settings = Some(settings.clone());
-        self.settle(settings);
+        let previous = self.settings.replace(settings.clone());
+        self.settle(settings, previous.as_ref());
         let mut due = Vec::new();
         for provider in [Provider::Codex, Provider::Ollama] {
             if provider.is_on(settings) {
@@ -333,11 +359,15 @@ impl ProvidersRuntime {
 
     /// The pop-up opened: a card whose last attempt is older than a minute.
     pub(crate) fn opened(&mut self, settings: &Settings, now: DateTime<Utc>) -> Vec<ProviderView> {
-        self.settings = Some(settings.clone());
-        self.settle(settings);
+        let previous = self.settings.replace(settings.clone());
+        let changed = self.settle(settings, previous.as_ref());
         let mut due = Vec::new();
         for provider in [Provider::Codex, Provider::Ollama] {
             if !provider.is_on(settings) {
+                continue;
+            }
+            if changed.contains(&provider) {
+                due.push(provider);
                 continue;
             }
             let tried = match provider {
@@ -364,7 +394,7 @@ impl ProvidersRuntime {
         now: DateTime<Utc>,
     ) -> Vec<ProviderView> {
         let previous = self.settings.replace(settings.clone());
-        self.settle(settings);
+        let changed = self.settle(settings, previous.as_ref());
         let mut due = Vec::new();
         for provider in [Provider::Codex, Provider::Ollama] {
             if !provider.is_on(settings) {
@@ -373,15 +403,7 @@ impl ProvidersRuntime {
             let was_on = previous
                 .as_ref()
                 .is_some_and(|previous| provider.is_on(previous));
-            let changed = previous
-                .as_ref()
-                .is_some_and(|previous| provider.setting_changed(previous, settings));
-            if !was_on || changed {
-                if changed {
-                    // The new folder or URL makes the old numbers another
-                    // account's or server's, so the card starts empty.
-                    *provider.view_mut(&mut self.codex, &mut self.ollama) = None;
-                }
+            if !was_on || changed.contains(&provider) {
                 due.push(provider);
             }
         }
@@ -390,16 +412,22 @@ impl ProvidersRuntime {
         self.views()
     }
 
-    /// Drop the view of a card that is now off, before anything is read.
-    fn settle(&mut self, settings: &Settings) {
-        if !settings.codex_card {
-            self.codex = None;
-            self.codex_tried = None;
+    /// Drop the view of a card that is now off, and of one whose folder or URL
+    /// changed since `previous`: the old numbers belong to another account or
+    /// server. Returns the cards whose folder or URL changed.
+    fn settle(&mut self, settings: &Settings, previous: Option<&Settings>) -> Vec<Provider> {
+        let mut changed = Vec::new();
+        for provider in [Provider::Codex, Provider::Ollama] {
+            if !provider.is_on(settings) {
+                *provider.view_mut(&mut self.codex, &mut self.ollama) = None;
+                *provider.tried_mut(&mut self.codex_tried, &mut self.ollama_tried) = None;
+            } else if previous.is_some_and(|previous| provider.setting_changed(previous, settings))
+            {
+                *provider.view_mut(&mut self.codex, &mut self.ollama) = None;
+                changed.push(provider);
+            }
         }
-        if !settings.ollama_card {
-            self.ollama = None;
-            self.ollama_tried = None;
-        }
+        changed
     }
 
     fn poll(&mut self, due: &[Provider], settings: &Settings, now: DateTime<Utc>) {
@@ -411,6 +439,23 @@ impl ProvidersRuntime {
             match provider {
                 Provider::Codex => self.codex_tried = Some(now),
                 Provider::Ollama => self.ollama_tried = Some(now),
+            }
+            // A save that switches this card off or moves it is a queued
+            // command, so the request has ended before that save ran. Read the
+            // settings again: an answer for a card that is now off or sits
+            // elsewhere leaves no trace. A failed read is reported and drops
+            // the answer too; nothing is recorded on a guess.
+            let keep = match (self.settings_lookup)(settings) {
+                Ok(current) => {
+                    provider.is_on(&current) && !provider.setting_changed(settings, &current)
+                }
+                Err(text) => {
+                    self.report_error(&text);
+                    false
+                }
+            };
+            if !keep {
+                continue;
             }
             let view = match result {
                 Ok(reading) => {
@@ -435,24 +480,26 @@ impl ProvidersRuntime {
 
     /// Record a reading that carries a usage; one without a usage records
     /// nothing. A recording error is reported the one way the app reports a
-    /// history write, and never changes the card.
+    /// history write, and never changes the card. A history that could not be
+    /// opened at start is already in the snapshot's error and was notified
+    /// there, so this thread records nothing and reports nothing for it.
     fn record(&mut self, reading: &ProviderReading, now: DateTime<Utc>) {
         let Some(usage) = &reading.usage else {
             return;
         };
-        let failure = match &mut self.recorder {
-            Ok(recorder) => recorder
-                .reading(
-                    &reading.account,
-                    reading.plan.as_deref(),
-                    usage,
-                    now,
-                    Source::Poll,
-                )
-                .err()
-                .map(|error| ops::history_unwritable(&error)),
-            Err(error) => Some(error.clone()),
+        let Ok(recorder) = &mut self.recorder else {
+            return;
         };
+        let failure = recorder
+            .reading(
+                &reading.account,
+                reading.plan.as_deref(),
+                usage,
+                now,
+                Source::Poll,
+            )
+            .err()
+            .map(|error| ops::history_unwritable(&error));
         match failure {
             Some(text) => self.report_error(&text),
             None => self.last_reported = None,
@@ -582,17 +629,32 @@ mod tests {
             dir,
             api,
             Box::new(move |_| Ok(CodexPaths::at(&codex_home))),
+            same_settings(),
             Box::new(|_| {}),
         )
+    }
+
+    /// A settings lookup that answers the settings the request used: the tests
+    /// that do not change anything during the request.
+    fn same_settings() -> SettingsLookup {
+        Box::new(|used| Ok(used.clone()))
     }
 
     fn test_runtime_with(
         dir: &Path,
         api: Api,
         codex_paths: CodexPathsLookup,
+        settings_lookup: SettingsLookup,
         report: ReportError,
     ) -> ProvidersRuntime {
-        ProvidersRuntime::new(Ok(history(dir)), api, None, codex_paths, report)
+        ProvidersRuntime::new(
+            Ok(history(dir)),
+            api,
+            None,
+            codex_paths,
+            settings_lookup,
+            report,
+        )
     }
 
     /// A Codex lookup that honours the `codexHome` setting, as
@@ -606,6 +668,15 @@ mod tests {
 
     fn codex_api(base: &str) -> Api {
         Api::new().with_codex_url(&format!("{base}/backend-api/wham/usage"))
+    }
+
+    /// A Codex URL on a local port that has just closed: a test that expects no
+    /// request can never reach chatgpt.com if it is wrong.
+    fn offline_api() -> Api {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a local port");
+        let url = format!("http://{}", listener.local_addr().expect("a local address"));
+        drop(listener);
+        Api::new().with_codex_url(&format!("{url}/backend-api/wham/usage"))
     }
 
     /// A local server that answers with `replies` in order (the last one again
@@ -721,8 +792,14 @@ mod tests {
         let server = Fake::start(vec![(200, PLUS_ANSWER.to_string())]);
         let api = codex_api(&server.base);
         let mut runtime = test_runtime(dir.path(), api, &codex_home);
+        // The default Ollama URL is this machine's real server; point it at the
+        // test server so a broken off-rule is a request the test sees.
+        let both_off = Settings {
+            ollama_url: server.base.clone(),
+            ..settings()
+        };
 
-        let views = runtime.poll_round(&settings(), utc("2026-11-14T09:00:00Z"));
+        let views = runtime.poll_round(&both_off, utc("2026-11-14T09:00:00Z"));
 
         assert!(views.is_empty(), "both cards are off");
         let paths = server.finish();
@@ -803,7 +880,7 @@ mod tests {
         // No Codex login: auth.json does not exist.
         let dir = tempdir().expect("tempdir");
         let codex_home = dir.path().join("codex");
-        let mut runtime = test_runtime(dir.path(), Api::new(), &codex_home);
+        let mut runtime = test_runtime(dir.path(), offline_api(), &codex_home);
         let view = only_view(runtime.poll_round(&codex_on(), utc("2026-11-14T09:00:00Z")));
         let expected = format!(
             "No Codex login found in {}. If Codex keeps its login in the system keyring, seatswap cannot read it.",
@@ -820,7 +897,7 @@ mod tests {
             r#"{"auth_mode":"chatgpt","tokens":null}"#,
         )
         .expect("auth.json");
-        let mut runtime = test_runtime(dir.path(), Api::new(), &codex_home);
+        let mut runtime = test_runtime(dir.path(), offline_api(), &codex_home);
         let view = only_view(runtime.poll_round(&codex_on(), utc("2026-11-14T09:00:00Z")));
         assert_eq!(
             view.error.as_deref(),
@@ -847,7 +924,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a local port");
         let url = format!("http://{}", listener.local_addr().expect("a local address"));
         drop(listener);
-        let mut runtime = test_runtime(dir.path(), Api::new(), &dir.path().join("codex"));
+        let mut runtime = test_runtime(dir.path(), offline_api(), &dir.path().join("codex"));
         let view = only_view(runtime.poll_round(&ollama_on(&url), utc("2026-11-14T09:00:00Z")));
         let expected = format!("Ollama is not running on {url}.");
         assert_eq!(view.error.as_deref(), Some(expected.as_str()));
@@ -896,6 +973,7 @@ mod tests {
             dir.path(),
             codex_api(&server.base),
             explicit_codex_paths(),
+            same_settings(),
             Box::new(|_| {}),
         );
         let on_a = Settings {
@@ -953,7 +1031,11 @@ mod tests {
             (200, BALANCE_ZERO.to_string()),
             (200, USAGE_ANSWER.to_string()),
         ]);
-        let mut runtime = test_runtime(dir.path(), Api::new(), &dir.path().join("codex"));
+        let mut runtime = test_runtime(
+            dir.path(),
+            codex_api(&server.base),
+            &dir.path().join("codex"),
+        );
 
         let view =
             only_view(runtime.poll_round(&ollama_on(&server.base), utc("2026-11-14T09:00:00Z")));
@@ -994,7 +1076,11 @@ mod tests {
     fn a_spend_that_could_not_be_read_has_its_own_view_field() {
         let dir = tempdir().expect("tempdir");
         let server = Fake::start(vec![(200, BALANCE.to_string()), (500, String::new())]);
-        let mut runtime = test_runtime(dir.path(), Api::new(), &dir.path().join("codex"));
+        let mut runtime = test_runtime(
+            dir.path(),
+            codex_api(&server.base),
+            &dir.path().join("codex"),
+        );
 
         let view =
             only_view(runtime.poll_round(&ollama_on(&server.base), utc("2026-11-14T09:00:00Z")));
@@ -1033,6 +1119,7 @@ mod tests {
             codex_api(&server.base),
             None,
             Box::new(move |_| Ok(CodexPaths::at(&codex_home))),
+            same_settings(),
             report,
         );
 
@@ -1046,6 +1133,206 @@ mod tests {
             1,
             "the same history error was reported again: {texts:?}"
         );
+    }
+
+    // ---- the second review round ----
+
+    /// A save is queued behind the running request: the settings read after the
+    /// request says the card is off, so that request leaves nothing behind.
+    #[test]
+    fn a_card_switched_off_during_its_request_leaves_no_trace() {
+        let dir = tempdir().expect("tempdir");
+        let codex_home = dir.path().join("codex");
+        write_auth(&codex_home);
+        let server = Fake::start(vec![(200, PLUS_ANSWER.to_string())]);
+        let off = settings();
+        let lookup: SettingsLookup = Box::new(move |_| Ok(off.clone()));
+        let folder = codex_home.clone();
+        let mut runtime = test_runtime_with(
+            dir.path(),
+            codex_api(&server.base),
+            Box::new(move |_| Ok(CodexPaths::at(&folder))),
+            lookup,
+            Box::new(|_| {}),
+        );
+
+        let views = runtime.poll_round(&codex_on(), utc("2026-11-14T09:00:00Z"));
+        let paths = server.finish();
+
+        assert!(
+            views.is_empty(),
+            "the dropped reading made a card: {views:?}"
+        );
+        assert_eq!(
+            paths,
+            vec!["/backend-api/wham/usage".to_string()],
+            "the request ran before the switch"
+        );
+        let read = history(dir.path())
+            .read::<Sample>(&Range::ALL, &Hosts::All)
+            .expect("the samples");
+        assert!(
+            read.records.is_empty(),
+            "the dropped reading wrote a sample line"
+        );
+    }
+
+    /// A URL changed while its request runs drops the answer the same way.
+    #[test]
+    fn a_url_changed_during_its_request_leaves_no_trace() {
+        let dir = tempdir().expect("tempdir");
+        let server = Fake::start(vec![
+            (200, BALANCE.to_string()),
+            (200, USAGE_ANSWER.to_string()),
+        ]);
+        let elsewhere = ollama_on("http://127.0.0.1:1");
+        let lookup: SettingsLookup = Box::new(move |_| Ok(elsewhere.clone()));
+        let mut runtime = test_runtime_with(
+            dir.path(),
+            codex_api(&server.base),
+            Box::new(|_| Ok(CodexPaths::at(Path::new("unused-codex-home")))),
+            lookup,
+            Box::new(|_| {}),
+        );
+
+        let views = runtime.poll_round(&ollama_on(&server.base), utc("2026-11-14T09:00:00Z"));
+        let paths = server.finish();
+
+        assert!(
+            views.is_empty(),
+            "the dropped reading made a card: {views:?}"
+        );
+        assert_eq!(
+            paths,
+            vec![
+                "/api/balance".to_string(),
+                "/api/usage?range=24h".to_string()
+            ],
+            "the request ran before the URL changed"
+        );
+        let read = history(dir.path())
+            .read::<Sample>(&Range::ALL, &Hosts::All)
+            .expect("the samples");
+        assert!(
+            read.records.is_empty(),
+            "the dropped reading wrote a sample line"
+        );
+    }
+
+    /// A settings read that fails after the request reports once and records
+    /// nothing on a guess.
+    #[test]
+    fn a_settings_read_that_fails_drops_the_reading_and_reports_it() {
+        let dir = tempdir().expect("tempdir");
+        let codex_home = dir.path().join("codex");
+        write_auth(&codex_home);
+        let server = Fake::start(vec![(200, PLUS_ANSWER.to_string())]);
+        let (sender, reports) = mpsc::channel();
+        let report: ReportError = Box::new(move |text: &str| {
+            let _ = sender.send(text.to_string());
+        });
+        let lookup: SettingsLookup = Box::new(|_| Err("accounts.json is unreadable".to_string()));
+        let folder = codex_home.clone();
+        let mut runtime = test_runtime_with(
+            dir.path(),
+            codex_api(&server.base),
+            Box::new(move |_| Ok(CodexPaths::at(&folder))),
+            lookup,
+            report,
+        );
+
+        let first = runtime.poll_round(&codex_on(), utc("2026-11-14T09:00:00Z"));
+        let second = runtime.poll_round(&codex_on(), utc("2026-11-14T09:05:00Z"));
+        let _ = server.finish();
+
+        assert!(
+            first.is_empty(),
+            "the dropped reading made a card: {first:?}"
+        );
+        assert!(
+            second.is_empty(),
+            "the dropped reading made a card: {second:?}"
+        );
+        let texts: Vec<String> = reports.try_iter().collect();
+        assert_eq!(
+            texts,
+            vec!["accounts.json is unreadable".to_string()],
+            "the same settings error was not reported once: {texts:?}"
+        );
+        let read = history(dir.path())
+            .read::<Sample>(&Range::ALL, &Hosts::All)
+            .expect("the samples");
+        assert!(
+            read.records.is_empty(),
+            "the dropped reading wrote a sample line"
+        );
+    }
+
+    /// A URL changed by hand in `accounts.json` drops the numbers before the
+    /// next round polls: the failing new server's error comes with no credits.
+    #[test]
+    fn a_url_changed_by_hand_drops_the_old_numbers_before_polling() {
+        let dir = tempdir().expect("tempdir");
+        let server = Fake::start(vec![
+            (200, BALANCE.to_string()),
+            (200, USAGE_ANSWER.to_string()),
+        ]);
+        let mut runtime = test_runtime(
+            dir.path(),
+            codex_api(&server.base),
+            &dir.path().join("codex"),
+        );
+
+        let first =
+            only_view(runtime.poll_round(&ollama_on(&server.base), utc("2026-11-14T09:00:00Z")));
+        assert!(first.credits.is_some(), "the first server gave credits");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a local port");
+        let url = format!("http://{}", listener.local_addr().expect("a local address"));
+        drop(listener);
+        let second = only_view(runtime.poll_round(&ollama_on(&url), utc("2026-11-14T09:10:00Z")));
+        let _ = server.finish();
+
+        let expected = format!("Ollama is not running on {url}.");
+        assert_eq!(second.error.as_deref(), Some(expected.as_str()));
+        assert_eq!(second.credits, None, "the old server's credits stay");
+        assert_eq!(second.usage, None, "the old server's usage stays");
+        assert_eq!(second.fetched_at, None, "the old reading's time stays");
+    }
+
+    /// The history error at startup is already in the snapshot and was notified
+    /// there; the provider thread must stay silent for it.
+    #[test]
+    fn a_startup_history_error_is_not_reported_again() {
+        let dir = tempdir().expect("tempdir");
+        let codex_home = dir.path().join("codex");
+        write_auth(&codex_home);
+        let server = Fake::start(vec![(200, PLUS_ANSWER.to_string())]);
+        let (sender, reports) = mpsc::channel();
+        let report: ReportError = Box::new(move |text: &str| {
+            let _ = sender.send(text.to_string());
+        });
+        let folder = codex_home.clone();
+        let mut runtime = ProvidersRuntime::new(
+            Err("the history folder could not be opened".to_string()),
+            codex_api(&server.base),
+            None,
+            Box::new(move |_| Ok(CodexPaths::at(&folder))),
+            same_settings(),
+            report,
+        );
+
+        let first = only_view(runtime.poll_round(&codex_on(), utc("2026-11-14T09:00:00Z")));
+        let second = only_view(runtime.poll_round(&codex_on(), utc("2026-11-14T09:05:00Z")));
+        let _ = server.finish();
+
+        let texts: Vec<String> = reports.try_iter().collect();
+        assert!(
+            texts.is_empty(),
+            "the startup history error was reported again: {texts:?}"
+        );
+        assert!(first.usage.is_some(), "the first view lost its numbers");
+        assert!(second.usage.is_some(), "the view lost its numbers");
     }
 
     // ---- proof tests of the review ----
