@@ -122,6 +122,8 @@ pub struct ActivityWeek {
     /// The (project, folder) with the most output tokens; `None` without
     /// tokens.
     pub top: Option<(String, String)>,
+    /// Whether this is the week that holds [`Ctx::now`], the unfinished week.
+    pub running: bool,
 }
 
 /// One session of the range, largest by output tokens.
@@ -159,6 +161,17 @@ pub struct ActivityPage {
     /// The tokens of the hour with the most output tokens, all chosen hosts
     /// together; `Tokens::default()` when the range has no record.
     pub peak_hour: Tokens,
+    /// The tokens of the whole range, summed over all chosen hosts.
+    pub total_tokens: Tokens,
+    /// The two values of the whole range, summed over all chosen hosts. A sum
+    /// is all or nothing, like every [`Values::sum`].
+    pub total_values: Values,
+    /// All chosen hosts' output tokens of the last 7 days over their working
+    /// hours of those days; `None` without a working hour in the lanes.
+    pub per_working_hour: Option<f64>,
+    /// The "What it shows" sentence, computed from the lanes: a night run and
+    /// a host used in the evening and at the weekend.
+    pub what_it_shows: String,
 }
 
 /// The Rhythm page of the range the query names.
@@ -269,6 +282,8 @@ pub(crate) fn activity_in<Tz: TimeZone + Copy>(
     let largest = largest_sessions(ctx, &entries)?;
     let waited = waited_minutes(ctx, range, q)?;
     let peak_hour = peak_hour(ctx, &entries);
+    let (total_tokens, total_values, per_working_hour) = lane_totals(&lanes);
+    let what_it_shows = what_it_shows_text(ctx, &lanes);
 
     Ok(ActivityPage {
         lanes,
@@ -277,7 +292,130 @@ pub(crate) fn activity_in<Tz: TimeZone + Copy>(
         largest,
         waited,
         peak_hour,
+        total_tokens,
+        total_values,
+        per_working_hour,
+        what_it_shows,
     })
+}
+
+/// The sums over the lanes: the whole range's tokens and values, and the last
+/// 7 days' output tokens over the lanes' working hours.
+fn lane_totals(lanes: &[HostLane]) -> (Tokens, Values, Option<f64>) {
+    let mut tokens = Tokens::default();
+    let mut values = Vec::with_capacity(lanes.len());
+    let mut lane_out = 0u64;
+    let mut working = 0u32;
+    for lane in lanes {
+        tokens += lane.tokens;
+        values.push(&lane.values);
+        lane_out += lane
+            .hours
+            .iter()
+            .flat_map(|cell| cell.by_model.iter().map(|(_, out)| *out))
+            .sum::<u64>();
+        working += lane.working;
+    }
+    let per_working_hour = if working > 0 {
+        Some(lane_out as f64 / working as f64)
+    } else {
+        None
+    };
+    (tokens, Values::sum(&values), per_working_hour)
+}
+
+/// "What it shows": the work the lanes show. A night is an hour of work before
+/// 05:00 local time, and one host is named for its nights; every other host is
+/// named for its evening work (a weekday from 19:00 on) and its weekend use.
+/// The lanes carry no agent data, so the sentence never claims an agent ran.
+fn what_it_shows_text<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, lanes: &[HostLane]) -> String {
+    let mut parts = Vec::new();
+    let mut night_host: Option<&str> = None;
+    for lane in lanes {
+        let mut nights: BTreeSet<NaiveDate> = BTreeSet::new();
+        for cell in &lane.hours {
+            if cell.state != HourState::Work {
+                continue;
+            }
+            let local = cell.t.with_timezone(&ctx.zone);
+            if local.hour() < 5 {
+                nights.insert(local.date_naive());
+            }
+        }
+        if !nights.is_empty() {
+            let count = nights.len();
+            parts.push(format!(
+                "{} night{} with work on {}.",
+                count_word(count, true),
+                if count == 1 { "" } else { "s" },
+                lane.host
+            ));
+            night_host = Some(lane.host.as_str());
+            break;
+        }
+    }
+    for lane in lanes {
+        if night_host == Some(lane.host.as_str()) {
+            continue;
+        }
+        let mut evenings: BTreeSet<usize> = BTreeSet::new();
+        let mut weekend = false;
+        for cell in &lane.hours {
+            if cell.state != HourState::Work {
+                continue;
+            }
+            let local = cell.t.with_timezone(&ctx.zone);
+            let weekday = local.weekday().num_days_from_monday() as usize;
+            if weekday >= 5 {
+                weekend = true;
+            } else if local.hour() >= 19 {
+                evenings.insert(weekday);
+            }
+        }
+        let evenings_text = match evenings.len() {
+            0 => None,
+            count => Some(format!(
+                "on {} evening{}",
+                count_word(count, false),
+                if count == 1 { "" } else { "s" }
+            )),
+        };
+        match (evenings_text, weekend) {
+            (Some(evenings), true) => parts.push(format!(
+                "{} is used {} and at the weekend.",
+                lane.host, evenings
+            )),
+            (Some(evenings), false) => parts.push(format!("{} is used {}.", lane.host, evenings)),
+            (None, true) => parts.push(format!("{} is used at the weekend.", lane.host)),
+            (None, false) => {}
+        }
+    }
+    if parts.is_empty() {
+        return "No night work, evening or weekend use stands out in the last 7 days.".to_string();
+    }
+    parts.join(" ")
+}
+
+/// A small count as a word, so the sentence reads like the mock-up's; bigger
+/// counts keep their digits.
+fn count_word(count: usize, capital: bool) -> String {
+    const WORDS: [&str; 10] = [
+        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    ];
+    let word = if count < WORDS.len() {
+        WORDS[count].to_string()
+    } else {
+        count.to_string()
+    };
+    if capital {
+        let mut chars = word.chars();
+        match chars.next() {
+            Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+            None => word,
+        }
+    } else {
+        word
+    }
 }
 
 fn valuer<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, range: &Range) -> Result<Valuer, StatsError> {
@@ -584,6 +722,7 @@ fn activity_weeks<Tz: TimeZone + Copy>(
             values: Values::of(&valued, ctx.settings),
             sessions: sessions.len() as u32,
             top,
+            running: week == week_start(ctx.now, &ctx.zone),
         });
     }
     weeks
@@ -779,6 +918,15 @@ mod tests {
             .unwrap_or_else(|| panic!("the hour {t}"))
     }
 
+    /// A query for one host: the sentence test reads only that host's lane.
+    fn host_query(host: &str) -> Query {
+        Query {
+            range: RangeKey::All,
+            accounts: Vec::new(),
+            host: Some(host.to_string()),
+        }
+    }
+
     #[test]
     fn hour_states_on_3_nov() {
         let tiny = tiny();
@@ -898,6 +1046,116 @@ mod tests {
         let vega = lane(&page, "vega");
         assert_eq!(vega.working, 0, "vega has no token record in the lane");
         assert_eq!(vega.per_working_hour, None);
+    }
+
+    /// The page's total is the sum of every chosen host's tokens and values,
+    /// and a total has its own number in the view: the page never adds two
+    /// hosts itself.
+    #[test]
+    fn the_total_is_the_sum_over_hosts() {
+        let tiny = tiny();
+        let vega = HistoryDir::at(tiny.dir.path(), "vega");
+        vega.append(&record(
+            "2026-11-14T10:00:00Z",
+            "v-1",
+            "/home/sam/projects/atlas/engine",
+            atlas(),
+            2_000_000,
+        ))
+        .expect("the vega record");
+        fs::write(
+            tiny.dir.path().join("vega/host.json"),
+            "{\"machineId\":\"0b4e7c22-6a1d-4e3f-8c59-2d7a9e1b4f60\"}",
+        )
+        .expect("the vega marker");
+
+        let page = activity_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        assert_eq!(page.lanes.len(), 2, "the page sums over both hosts");
+
+        let mut tokens = Tokens::default();
+        let mut lane_out = 0u64;
+        let mut working = 0u32;
+        for lane in &page.lanes {
+            tokens += lane.tokens;
+            lane_out += lane
+                .hours
+                .iter()
+                .flat_map(|cell| cell.by_model.iter().map(|(_, out)| *out))
+                .sum::<u64>();
+            working += lane.working;
+        }
+        // A `Values` sum is all or nothing: a half one host misses makes the
+        // total unknown with that reason.
+        let subscription = page
+            .lanes
+            .iter()
+            .map(|lane| lane.values.subscription)
+            .try_fold(0.0, |sum, value| value.map(|value| sum + value));
+        let api = page
+            .lanes
+            .iter()
+            .map(|lane| lane.values.api)
+            .try_fold(0.0, |sum, value| value.map(|value| sum + value));
+        assert_eq!(page.total_tokens, tokens);
+        assert_eq!(
+            page.total_tokens.out,
+            lane(&page, "atlas").tokens.out + lane(&page, "vega").tokens.out
+        );
+        match (page.total_values.subscription, subscription) {
+            (Some(total), Some(sum)) => assert!(
+                close(total, sum),
+                "the subscription total {total} is the sum over hosts {sum}"
+            ),
+            (None, None) => {}
+            (total, sum) => {
+                panic!("the subscription total {total:?} must be the sum over hosts {sum:?}")
+            }
+        }
+        match (page.total_values.api, api) {
+            (Some(total), Some(sum)) => {
+                assert!(
+                    close(total, sum),
+                    "the API total {total} is the sum over hosts {sum}"
+                )
+            }
+            (None, None) => {}
+            (total, sum) => panic!("the API total {total:?} must be the sum over hosts {sum:?}"),
+        }
+        assert!(
+            close(
+                page.per_working_hour.expect("a working hour in the lanes"),
+                lane_out as f64 / working as f64
+            ),
+            "the per-working-hour total is all hosts' lane output over their working hours"
+        );
+    }
+
+    /// The unfinished week is the one that holds `Ctx::now`; an earlier week
+    /// of the same page is not running.
+    #[test]
+    fn the_current_week_is_marked_running() {
+        let tiny = tiny();
+        let range = Range {
+            from: utc("2026-11-02T00:00:00Z"),
+            to: tiny.now,
+        };
+        let page = activity_in(&tiny.ctx(), &range, &all()).unwrap();
+        let current = page
+            .weeks
+            .iter()
+            .find(|week| week.week == utc("2026-11-16T00:00:00Z"))
+            .expect("the week that holds now");
+        assert!(current.running, "the unfinished week is running");
+        for week in &page.weeks {
+            if week.week == current.week {
+                continue;
+            }
+            assert!(
+                !week.running,
+                "the finished week {} is not running",
+                week.week
+            );
+        }
     }
 
     #[test]
@@ -1280,6 +1538,294 @@ mod tests {
         assert_eq!(
             page.days.last().map(|day| day.date.to_string()),
             Some("2026-11-08".to_string())
+        );
+    }
+
+    /// A second host that runs the same account: its records share the account's
+    /// week, so the week's used money is split between the hosts and the sum
+    /// over the hosts counts it once.
+    #[test]
+    fn the_total_over_hosts_counts_the_used_money_of_a_week_once() {
+        let tiny = tiny();
+        // vega runs the same account (LB) as atlas and adds one record to the
+        // same week (9 Nov 17:00 .. 16 Nov 17:00, 80 % used).
+        let vega = HistoryDir::at(tiny.dir.path(), "vega");
+        vega.append(&Event {
+            t: utc("2026-11-10T08:00:00Z"),
+            kind: EventKind::Live {
+                account: Some(tiny.lb_ref()),
+            },
+        })
+        .expect("the vega live event");
+        vega.append(&record(
+            "2026-11-12T09:00:00Z",
+            "s5",
+            "/home/sam/projects/atlas/engine",
+            atlas(),
+            1_000_000,
+        ))
+        .expect("the vega record");
+        fs::write(
+            tiny.dir.path().join("vega/host.json"),
+            "{\"machineId\":\"0b4e7c22-6a1d-4e3f-8c59-2d7a9e1b4f60\"}",
+        )
+        .expect("the vega marker");
+
+        let range = Range {
+            from: utc("2026-11-10T00:00:00Z"),
+            to: utc("2026-11-12T12:00:00Z"),
+        };
+        let page = activity_in(&tiny.ctx(), &range, &all()).unwrap();
+        // The week's used money: 80 % of the week's price of 180 EUR a month.
+        let week = 80.0 * 180.0 * 12.0 / 52.0 / 100.0;
+        let total = page
+            .total_values
+            .subscription
+            .expect("a subscription value");
+        assert!(
+            close(total, week),
+            "the total over the hosts is {total}, the week's used money is {week}"
+        );
+        // The API value of the two records of the week: 20 + 20.
+        assert!(close(page.total_values.api.expect("an API value"), 40.0));
+        // Each host's share is a part of that one week's money.
+        let atlas = lane(&page, "atlas")
+            .values
+            .subscription
+            .expect("the atlas value");
+        let vega = lane(&page, "vega")
+            .values
+            .subscription
+            .expect("the vega value");
+        assert!(
+            close(atlas + vega, week),
+            "the two hosts' values add up to {} , not to {week}",
+            atlas + vega
+        );
+        assert!(close(atlas, 0.5 * week), "atlas's share is {atlas}");
+        assert!(close(vega, 0.5 * week), "vega's share is {vega}");
+    }
+
+    /// The totals follow the range: the lanes are the same 168 hours for every
+    /// range, but the tokens and values of the range are not.
+    #[test]
+    fn the_totals_follow_the_range() {
+        let tiny = tiny();
+        let week = Range {
+            from: utc("2026-11-09T00:00:00Z"),
+            to: utc("2026-11-16T00:00:00Z"),
+        };
+        let wider = Range {
+            from: utc("2026-11-02T00:00:00Z"),
+            to: utc("2026-11-16T00:00:00Z"),
+        };
+        let one = activity_in(&tiny.ctx(), &week, &all()).unwrap();
+        let two = activity_in(&tiny.ctx(), &wider, &all()).unwrap();
+        assert!(
+            one.total_tokens.out < two.total_tokens.out,
+            "the wider range holds more tokens: {} and {}",
+            one.total_tokens.out,
+            two.total_tokens.out
+        );
+        assert!(
+            one.total_values.subscription.expect("a value")
+                < two.total_values.subscription.expect("a value"),
+            "the wider range holds more value"
+        );
+        // The lanes are the same 168 hours for both ranges.
+        assert_eq!(one.lanes[0].hours[0].t, two.lanes[0].hours[0].t);
+    }
+
+    /// The "What it shows" sentence: two nights on atlas, and vega's evenings
+    /// and weekend use.
+    #[test]
+    fn the_what_it_shows_sentence_names_the_lanes() {
+        let tiny = tiny();
+        // atlas works before 05:00 on two days.
+        tiny.history
+            .append(&record(
+                "2026-11-12T02:00:00Z",
+                "s7",
+                "/home/sam/projects/atlas/engine",
+                atlas(),
+                1_000_000,
+            ))
+            .expect("the first night");
+        tiny.history
+            .append(&record(
+                "2026-11-13T03:00:00Z",
+                "s8",
+                "/home/sam/projects/atlas/engine",
+                atlas(),
+                1_000_000,
+            ))
+            .expect("the second night");
+        // vega runs the same account and works on three evenings and at the
+        // weekend.
+        let vega = HistoryDir::at(tiny.dir.path(), "vega");
+        vega.append(&Event {
+            t: utc("2026-11-10T08:00:00Z"),
+            kind: EventKind::Live {
+                account: Some(tiny.lb_ref()),
+            },
+        })
+        .expect("the vega live event");
+        for (at, session) in [
+            ("2026-11-10T19:00:00Z", "s10"),
+            ("2026-11-11T19:00:00Z", "s11"),
+            ("2026-11-12T19:00:00Z", "s12"),
+            ("2026-11-14T13:00:00Z", "s13"),
+        ] {
+            vega.append(&record(
+                at,
+                session,
+                "/home/sam/projects/atlas/engine",
+                atlas(),
+                1_000_000,
+            ))
+            .expect("the vega record");
+        }
+        fs::write(
+            tiny.dir.path().join("vega/host.json"),
+            "{\"machineId\":\"0b4e7c22-6a1d-4e3f-8c59-2d7a9e1b4f60\"}",
+        )
+        .expect("the vega marker");
+
+        let page = activity_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        assert_eq!(
+            page.what_it_shows,
+            "Two nights with work on atlas. vega is used on three evenings and at the weekend."
+        );
+    }
+
+    /// A host without weekend work still gets its evenings named: work from
+    /// 19:00 on a weekday is what the sentence shows.
+    #[test]
+    fn the_what_it_shows_sentence_names_evenings_without_a_weekend() {
+        let tiny = tiny();
+        tiny.history
+            .append(&record(
+                "2026-11-12T02:00:00Z",
+                "s7",
+                "/home/sam/projects/atlas/engine",
+                atlas(),
+                1_000_000,
+            ))
+            .expect("the night record");
+        let vega = HistoryDir::at(tiny.dir.path(), "vega");
+        vega.append(&UpRecord {
+            t: utc("2026-11-10T08:00:00Z"),
+        })
+        .expect("the vega up record");
+        for (at, session) in [
+            ("2026-11-10T19:00:00Z", "s10"),
+            ("2026-11-11T19:00:00Z", "s11"),
+            ("2026-11-12T19:00:00Z", "s12"),
+        ] {
+            vega.append(&record(
+                at,
+                session,
+                "/home/sam/projects/atlas/engine",
+                atlas(),
+                1_000_000,
+            ))
+            .expect("the vega record");
+        }
+        fs::write(
+            tiny.dir.path().join("vega/host.json"),
+            "{\"machineId\":\"0b4e7c22-6a1d-4e3f-8c59-2d7a9e1b4f60\"}",
+        )
+        .expect("the vega marker");
+
+        let page = activity_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        assert_eq!(
+            page.what_it_shows,
+            "One night with work on atlas. vega is used on three evenings."
+        );
+    }
+
+    /// Weekend work without an evening is named on its own.
+    #[test]
+    fn the_what_it_shows_sentence_names_weekend_use_without_evenings() {
+        let tiny = tiny();
+        let vega = HistoryDir::at(tiny.dir.path(), "vega");
+        vega.append(&UpRecord {
+            t: utc("2026-11-14T08:00:00Z"),
+        })
+        .expect("the vega up record");
+        vega.append(&record(
+            "2026-11-14T13:00:00Z",
+            "s13",
+            "/home/sam/projects/atlas/engine",
+            atlas(),
+            1_000_000,
+        ))
+        .expect("the vega record");
+        fs::write(
+            tiny.dir.path().join("vega/host.json"),
+            "{\"machineId\":\"0b4e7c22-6a1d-4e3f-8c59-2d7a9e1b4f60\"}",
+        )
+        .expect("the vega marker");
+
+        let page = activity_in(&tiny.ctx(), &two_weeks(), &host_query("vega")).unwrap();
+        assert_eq!(page.what_it_shows, "vega is used at the weekend.");
+    }
+
+    /// A host with neither a night, an evening nor weekend work is not named.
+    #[test]
+    fn the_what_it_shows_sentence_leaves_out_a_host_with_neither() {
+        let tiny = tiny();
+        let vega = HistoryDir::at(tiny.dir.path(), "vega");
+        vega.append(&UpRecord {
+            t: utc("2026-11-11T08:00:00Z"),
+        })
+        .expect("the vega up record");
+        vega.append(&record(
+            "2026-11-11T10:00:00Z",
+            "s14",
+            "/home/sam/projects/atlas/engine",
+            atlas(),
+            1_000_000,
+        ))
+        .expect("the vega record");
+        fs::write(
+            tiny.dir.path().join("vega/host.json"),
+            "{\"machineId\":\"0b4e7c22-6a1d-4e3f-8c59-2d7a9e1b4f60\"}",
+        )
+        .expect("the vega marker");
+
+        let page = activity_in(&tiny.ctx(), &two_weeks(), &host_query("vega")).unwrap();
+        assert_eq!(
+            page.what_it_shows,
+            "No night work, evening or weekend use stands out in the last 7 days."
+        );
+        assert!(
+            !page.what_it_shows.contains("vega"),
+            "a host with neither is not named: {}",
+            page.what_it_shows
+        );
+    }
+
+    /// The lanes carry no agent data: an hour is "work" when it has tokens.
+    /// The sentence names work, never an agent run.
+    #[test]
+    fn the_what_it_shows_sentence_names_work_not_an_agent_run() {
+        let tiny = tiny();
+        tiny.history
+            .append(&record(
+                "2026-11-12T02:00:00Z",
+                "s7",
+                "/home/sam/projects/atlas/engine",
+                atlas(),
+                1_000_000,
+            ))
+            .expect("the night record");
+        let page = activity_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        assert_eq!(page.what_it_shows, "One night with work on atlas.");
+        assert!(
+            !page.what_it_shows.contains("agent"),
+            "the lanes have no agent data, so the sentence must not claim one: {}",
+            page.what_it_shows
         );
     }
 }

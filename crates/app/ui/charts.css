@@ -671,3 +671,12 @@
   border-radius: 2px 2px 0 0;
 }
 
+/* The hours chart's history mark: over the lanes, to the right of the host
+   names (52px column + 6px gap). Its label sits at the top of the hour cells. */
+.chart-marks-hours {
+  top: 17px;
+  bottom: 0;
+  left: 58px;
+  z-index: 2;
+}
+

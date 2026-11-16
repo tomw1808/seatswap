@@ -666,14 +666,17 @@ export function lanes({ lanes, from, to, ticks } = {}) {
 // hours — the Activity page's hour-per-host lanes
 // ---------------------------------------------------------------------------
 
-// One lane per host; `cells` is one per hour, oldest first. A cell's `state` is
-// "work", "idle", "off" or "unknown". Its `stack` (a list of { value, color })
-// is the bar of that hour, and `strip` the number of sessions working in it.
-// `days` is the axis: { label, span } per day boundary.
-export function hours({ lanes, days } = {}) {
+// One lane per host; `cells` is one per hour, oldest first, and each carries
+// its time `t`. A cell's `state` is "work", "idle", "off" or "unknown". Its
+// `stack` (a list of { value, color }) is the bar of that hour, and `strip` the
+// number of sessions working in it. `days` is the axis: { label, span } per day
+// boundary. A `mark` is placed at the left edge of the first hour column after
+// its time.
+export function hours({ lanes, days, marks } = {}) {
   if (!Array.isArray(lanes)) throw new Error("hours needs a list of lanes");
   const firstCells = lanes.length > 0 && Array.isArray(lanes[0].cells) ? lanes[0].cells : [];
   const count = firstCells.length;
+  const columnTimes = firstCells.map((cell) => timeOf(cell && cell.t));
 
   let maxStack = 0;
   let maxStrip = 0;
@@ -759,6 +762,12 @@ export function hours({ lanes, days } = {}) {
     row.appendChild(track);
     root.appendChild(row);
   }
+  const layer = markLayer(
+    marks,
+    (at) => markPosition(at, columnTimes),
+    "chart-marks chart-marks-hours"
+  );
+  if (layer) root.appendChild(layer);
   return root;
 }
 

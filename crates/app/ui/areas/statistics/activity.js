@@ -8,7 +8,6 @@
 import {
   WEEKDAYS,
   amountNode,
-  amountTip,
   clear,
   dateText,
   emptyLine,
@@ -24,6 +23,7 @@ import {
   shortDate,
   tokens,
   valueTip,
+  valueText,
   weekdayIndex,
   writeChoice,
 } from "../../common.js";
@@ -158,56 +158,77 @@ export async function show(container, env) {
     kpis.appendChild(emptyLine("no host recorded in the range"));
   }
 
-  const valueParts = [];
-  const apiParts = [];
-  const valueTips = [];
-  const apiTips = [];
-  for (const lane of lanes) {
-    valueParts.push(
-      `${lane.host} ${amountTip(lane.values.subscription, lane.values.currency)}`
-    );
-    apiParts.push(`${lane.host} ${amountTip(lane.values.api, lane.values.apiCurrency)}`);
-    valueTips.push(`${lane.host}: ${valueTip(lane.values, "subscription", "in the range")}`);
-    apiTips.push(`${lane.host}: ${valueTip(lane.values, "api", "in the range")}`);
+  if (!isObject(data.totalValues)) {
+    throw new Error("the activity view has no total values");
   }
-  if (lanes.length > 0) {
-    kpis.appendChild(
-      kpi(
-        "Their value",
-        valueParts.join(" · "),
-        `at API prices in the range: ${apiParts.join(" · ")}`,
-        `Value of the subscriptions | per host, never added across hosts | ${valueTips.join(
-          " | "
-        )} | at API prices | ${apiTips.join(" | ")}`,
-        "stats-kpi-value-small"
-      )
-    );
+  if (typeof data.whatItShows !== "string" || data.whatItShows === "") {
+    throw new Error("the activity view has no What it shows sentence");
+  }
 
-    const perHour = lanes.map((lane) => {
-      if (lane.perWorkingHour === null || lane.perWorkingHour === undefined) {
-        return `${lane.host} — (no working hour in the last 7 days)`;
-      }
-      return `${lane.host} ${tokens(lane.perWorkingHour)}`;
-    });
-    kpis.appendChild(
-      kpi(
-        "Per working hour · last 7 days",
-        perHour.join(" · "),
-        "output tokens of the last 7 days in the working hours of those days",
-        "Per working hour · last 7 days | each host's output tokens of the last 7 days over its working hours of those days",
-        "stats-kpi-value-small"
-      )
-    );
+  const perHostTokens = lanes.map((lane) => `${lane.host} ${tokenText(lane.tokens)}`);
+  const perHostTokenTips = lanes.map((lane) => `${lane.host}: ${tokensTip(lane.tokens)}`);
+  kpis.appendChild(
+    kpi(
+      "Tokens",
+      tokenText(data.totalTokens),
+      perHostTokens.join(" · "),
+      `Tokens in the range, summed over hosts | ${tokensTip(
+        data.totalTokens
+      )} | per host | ${perHostTokenTips.join(" | ")}`
+    )
+  );
+
+  const valueParts = [];
+  const valueTips = [];
+  for (const lane of lanes) {
+    valueParts.push(`${lane.host}: ${valueTip(lane.values, "subscription", "in the range")}`);
+    valueTips.push(`${lane.host}: ${valueTip(lane.values, "api", "in the range")}`);
   }
+  const subscription = valueText(data.totalValues, "subscription", null);
+  const subscriptionNode = h("span", {
+    text: subscription.text,
+    title: subscription.title || undefined,
+  });
+  const api = valueText(data.totalValues, "api", null);
+  kpis.appendChild(
+    kpi(
+      "Their value",
+      subscriptionNode,
+      `of the subscriptions · ${api.text}${api.title ? ` (${api.title})` : ""} at API prices`,
+      `Value of the subscriptions, summed over hosts in the range | ${valueTip(
+        data.totalValues,
+        "subscription",
+        "in the range"
+      )} | at API prices | ${valueTip(
+        data.totalValues,
+        "api",
+        "in the range"
+      )} | per host | ${valueParts.join(" | ")} | ${valueTips.join(" | ")}`
+    )
+  );
 
   kpis.appendChild(
     kpi(
-      "Highest hour",
-      tokenText(data.peakHour),
-      "output tokens in one hour, all hosts together",
-      `Highest hour | ${tokensTip(data.peakHour)}`
+      "Per working hour",
+      data.perWorkingHour === null || data.perWorkingHour === undefined
+        ? "—"
+        : tokens(data.perWorkingHour),
+      `highest hour ${tokenText(data.peakHour)}`,
+      `Per working hour · last 7 days | all hosts' output tokens of the last 7 days over their working hours of those days | highest hour | ${tokensTip(
+        data.peakHour
+      )}`
     )
   );
+
+  const whatItShows = kpi(
+    "What it shows",
+    data.whatItShows,
+    null,
+    "What the last 7 days' lanes show",
+    "stats-act-what-text"
+  );
+  whatItShows.classList.add("stats-act-what");
+  kpis.appendChild(whatItShows);
 
   // -------------------------------------------------------------------------
   // the last 7 days, hour by hour
@@ -239,6 +260,25 @@ export async function show(container, env) {
 
   const firstLane = lanes.find((lane) => lane.hours.length > 0);
   const hourTimes = firstLane ? firstLane.hours.map((cell) => new Date(cell.t)) : [];
+
+  // The history's start marks the first hour a subscription value can exist:
+  // a record's account is the last live or switch event at or before it, and
+  // the history starts with the first one. The chart's API values and tokens
+  // need no account, so they exist before it and are not marked.
+  const historyMarks = [];
+  if (typeof env.historyStart === "string" && env.historyStart !== "" && hourTimes.length > 0) {
+    const at = new Date(env.historyStart);
+    if (Number.isNaN(at.getTime())) {
+      throw new Error(`invalid history start ${JSON.stringify(env.historyStart)}`);
+    }
+    if (at >= hourTimes[0]) {
+      historyMarks.push({
+        at,
+        label: `history from ${shortDate(at)} · no subscription value before`,
+      });
+    }
+  }
+
   const days = [];
   if (hourTimes.length > 0) {
     let start = 0;
@@ -309,6 +349,7 @@ export async function show(container, env) {
     const hourLanes = lanes.map((lane) => ({
       label: h("span", { text: lane.host }),
       cells: lane.hours.map((cell) => ({
+        t: cell.t,
         state: stateOf(cell.state),
         stack: hourStack(cell, state.unit),
         strip: cell.sessions,
@@ -318,7 +359,13 @@ export async function show(container, env) {
     if (hourLanes.every((lane) => lane.cells.length === 0)) {
       hoursBody.appendChild(emptyLine("no hour recorded on this host"));
     } else {
-      hoursBody.appendChild(hours({ lanes: hourLanes, days }));
+      hoursBody.appendChild(
+        hours({
+          lanes: hourLanes,
+          days,
+          marks: state.unit === "subscription" ? historyMarks : [],
+        })
+      );
       for (const [index, lane] of lanes.entries()) {
         if (lane.hours.length === 0) {
           hoursBody.appendChild(
@@ -451,9 +498,13 @@ export async function show(container, env) {
 
   function weeksView() {
     const view = h("div", { class: "stats-act-table" });
+    // The fixed columns shrink at 1000 px so the last one keeps the room the
+    // top project and its "running" tag need; the tag may take its own line.
     view.style.setProperty(
       "--stats-act-columns",
-      `62px ${hosts.map(() => "54px").join(" ")} 62px 76px 70px 46px minmax(0, 1fr)`
+      `minmax(44px, 62px) ${hosts
+        .map(() => "minmax(38px, 54px)")
+        .join(" ")} minmax(40px, 62px) minmax(52px, 76px) minmax(48px, 70px) minmax(34px, 46px) minmax(78px, 1fr)`
     );
     const head = h("div", { class: "stats-act-row stats-act-row-head" });
     head.appendChild(h("span", { text: "Week" }));
@@ -494,13 +545,20 @@ export async function show(container, env) {
         ])
       );
       row.appendChild(h("span", { class: "n", text: String(week.sessions) }));
-      row.appendChild(
-        h("span", {
-          class: "stats-act-top",
-          text: week.top ? `${week.top[0]} · ${week.top[1]}` : "—",
-          title: week.top ? `${week.top[0]} · ${week.top[1]}` : "no output tokens this week",
-        })
+      const top = h("span", {
+        class: "stats-act-top",
+        title: week.top ? `${week.top[0]} · ${week.top[1]}` : "no output tokens this week",
+      });
+      top.appendChild(
+        document.createTextNode(week.top ? `${week.top[0]} · ${week.top[1]}` : "—")
       );
+      if (typeof week.running !== "boolean") {
+        throw new Error(`the week ${week.week} has no running flag`);
+      }
+      if (week.running) {
+        top.appendChild(h("span", { class: "stats-act-running", text: "running" }));
+      }
+      row.appendChild(top);
       view.appendChild(row);
     }
     return view;

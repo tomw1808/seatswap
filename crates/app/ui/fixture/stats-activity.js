@@ -5,12 +5,12 @@ import {
   DAY,
   HOUR,
   TOK_TOTAL,
+  WEEKS,
   allUsedMoney,
   chosenAccounts,
   chosenHosts,
   round2,
   tokenCounts,
-  weekIso,
   weekTime,
 } from "./stats-frame.js";
 import { ACT_PATTERN } from "./stats-rhythm.js";
@@ -183,12 +183,13 @@ function activityWeek(index, hosts) {
     }
   }
   return {
-    week: weekIso(index),
+    week: new Date(weekTime(index)).toISOString(),
     workingHours: hosts.map((host) => [host, hours.get(host).size]),
     tokens: tokenCounts(out),
     values: valuesOfMillion(out / 1000000),
     sessions,
     top,
+    running: from <= ACT_NOW && ACT_NOW < from + 7 * DAY,
   };
 }
 
@@ -242,15 +243,120 @@ function activityWaited(indexes) {
   return rows;
 }
 
-export function activity(query) {
-  const { indexes } = chosenAccounts(query);
-  const hosts = chosenHosts(query);
+// The mock-up's "What it shows" sentence: the page shows it, the fixture names
+// its words; the numbers in it are the mock-up's, not the page's. The lanes
+// carry no agent data, so the sentence names the work, not an agent run.
+const ACT_WHAT_IT_SHOWS =
+  "Two nights with work on atlas. vega is used on three evenings and at the weekend.";
+
+// A 30-character host name for the wrapping check (`?fixture=longhost`).
+const ACT_LONG_HOSTS = {
+  atlas: "atlas-sam-workstation-nov-2026",
+  vega: "vega-sam-laptop-workstation-01",
+};
+
+function longHostsWanted() {
+  if (typeof location === "undefined" || typeof URLSearchParams !== "function") return false;
+  try {
+    return new URLSearchParams(location.search).get("fixture") === "longhost";
+  } catch {
+    return false;
+  }
+}
+
+function addTokens(one, other) {
   return {
-    lanes: hosts.map(hostLane),
-    days: activityDays(hosts),
-    weeks: indexes.map((index) => activityWeek(index, hosts)),
-    largest: activityLargest(),
-    waited: activityWaited(indexes),
-    peakHour: activityPeak(),
+    input: one.input + other.input,
+    out: one.out + other.out,
+    cw: one.cw + other.cw,
+    cr: one.cr + other.cr,
   };
+}
+
+function sumValues(values) {
+  const total = {
+    api: 0,
+    apiCurrency: values.length > 0 ? values[0].apiCurrency : null,
+    apiMissing: null,
+    subscription: 0,
+    currency: values.length > 0 ? values[0].currency : null,
+    subscriptionMissing: null,
+  };
+  for (const value of values) {
+    total.api += value.api;
+    total.subscription += value.subscription;
+  }
+  return total;
+}
+
+function renameHosts(answer) {
+  if (!longHostsWanted()) return answer;
+  const name = (host) => ACT_LONG_HOSTS[host] || host;
+  for (const lane of answer.lanes) lane.host = name(lane.host);
+  for (const day of answer.days) day.out = day.out.map(([host, out]) => [name(host), out]);
+  for (const week of answer.weeks) {
+    week.workingHours = week.workingHours.map(([host, hours]) => [name(host), hours]);
+  }
+  for (const session of answer.largest) session.host = name(session.host);
+  answer.whatItShows = answer.whatItShows
+    .replace(/\batlas\b/g, name("atlas"))
+    .replace(/\bvega\b/g, name("vega"));
+  return answer;
+}
+
+// The weeks the Activity page shows. The last week of `WEEKS` is finished;
+// the week after it is the one ACT_NOW lies in, so it is the running week.
+function activityWeekIndexes(range, indexes) {
+  const current = WEEKS.length;
+  if (range === "thisWeek") return [current];
+  if (range === "lastWeek") return [WEEKS.length - 1];
+  return indexes.includes(current) ? indexes : [...indexes, current];
+}
+
+export function activity(query) {
+  const { indexes: rangeIndexes } = chosenAccounts(query);
+  const indexes = activityWeekIndexes(query.range, rangeIndexes);
+  const hosts = chosenHosts(query);
+  const lanes = hosts.map(hostLane);
+  let laneOut = 0;
+  let working = 0;
+  for (const lane of lanes) {
+    for (const hour of lane.hours) {
+      for (const [, out] of hour.byModel) laneOut += out;
+    }
+    working += lane.working;
+  }
+  // A host's tokens and values follow the range, as the Rust's do: they are the
+  // sums over the weeks the Per week table lists, not over the 7-day lane. The
+  // totals are the sums over the hosts.
+  const weeks = indexes.map((index) => activityWeek(index, hosts));
+  for (const lane of lanes) {
+    const own = indexes.map((index) => activityWeek(index, [lane.host]));
+    lane.tokens = own.reduce((total, week) => addTokens(total, week.tokens), {
+      input: 0,
+      out: 0,
+      cw: 0,
+      cr: 0,
+    });
+    lane.values = sumValues(own.map((week) => week.values));
+  }
+  return renameHosts(
+    {
+      lanes,
+      days: activityDays(hosts),
+      weeks,
+      largest: activityLargest(),
+      waited: activityWaited(indexes),
+      peakHour: activityPeak(),
+      totalTokens: lanes.reduce((total, lane) => addTokens(total, lane.tokens), {
+        input: 0,
+        out: 0,
+        cw: 0,
+        cr: 0,
+      }),
+      totalValues: sumValues(lanes.map((lane) => lane.values)),
+      perWorkingHour: working > 0 ? laneOut / working : null,
+      whatItShows: ACT_WHAT_IT_SHOWS,
+    }
+  );
 }

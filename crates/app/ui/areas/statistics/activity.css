@@ -2,9 +2,13 @@
 /* ---------- Activity ---------- */
 
 .stats-activity {
-  flex: 1;
+  flex: 1 0 auto;
+  align-content: start;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  grid-template-rows: auto auto minmax(0, 1fr);
+  /* The bottom row takes at least the height its two charts need, so the taller
+     hour chart above never squeezes the waited chart's date labels out of the
+     card. */
+  grid-template-rows: auto auto minmax(min-content, 1fr);
   gap: 12px;
 }
 
@@ -14,7 +18,9 @@
 }
 
 .stats-activity-hours-card {
-  min-height: 0;
+  /* The card's height at 1000 px, where its legend wraps: the KPI row and the
+     bottom row may not squeeze the mock-up's 213 px hour chart. */
+  min-height: 286.5px;
 }
 
 .stats-act-legend {
@@ -59,9 +65,35 @@
 
 .stats-act-hours-body {
   flex: 1;
-  min-height: 0;
+  /* The chart's 213 px plus its 8 px bottom padding: the row above cannot
+     squeeze the hour chart below the mock-up's height. */
+  min-height: 221px;
   display: flex;
   padding: 0 12px 8px;
+}
+
+/* As tall as mock-up 3's chart (213 layout pixels: two lanes of 86.5px cells
+   and an 8px strip with the 3px gaps, plus the 14px day axis), so the last 7
+   days get the same room. The host name beside a lane wraps instead of being
+   cut off. */
+.stats-act-hours-body .chart-hours-cells {
+  min-height: 86.5px;
+}
+
+.stats-act-hours-body .chart-hours {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 213px;
+}
+
+.stats-act-hours-body .chart-hours-row {
+  grid-template-columns: 52px minmax(0, 1fr);
+}
+
+.stats-act-hours-body .chart-hours-label {
+  overflow: visible;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .stats-act-days-card {
@@ -101,7 +133,7 @@
 }
 
 .stats-act-tabs-card > .stats-tabs {
-  padding: 0 12px 6px;
+  margin: 6px 12px 0;
   flex: 0 0 auto;
 }
 
@@ -110,6 +142,45 @@
   min-height: 0;
   overflow: auto;
   padding: 0 12px 8px;
+}
+
+/* The KPI row wraps when its boxes do not fit (1000 px), so no label or value
+   is clipped and no label runs into the next box. "What it shows" is a
+   sentence, so its box takes more room than the number boxes beside it. */
+.stats-activity-kpis-card .stats-kpis {
+  flex-wrap: wrap;
+}
+
+.stats-activity-kpis-card .stats-kpi {
+  flex: 1 1 150px;
+}
+
+.stats-activity-kpis-card .stats-kpi.stats-act-what {
+  flex: 2 1 240px;
+}
+
+.stats-kpi-value.stats-act-what-text {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  font-size: 13px;
+  line-height: 18px;
+  font-weight: 400;
+}
+
+.stats-act-running {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 5px;
+  background: var(--track);
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 14px;
+  vertical-align: middle;
+  white-space: nowrap;
 }
 
 .stats-act-table {
@@ -163,7 +234,15 @@
 }
 
 .stats-act-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  min-width: 0;
   color: var(--muted);
+}
+
+.stats-act-top .stats-act-running {
+  flex: 0 0 auto;
 }
 
 
