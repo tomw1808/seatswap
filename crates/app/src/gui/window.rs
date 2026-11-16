@@ -1568,6 +1568,8 @@ mod tests {
             agents: Vec::new(),
             tokens: Tokens::default(),
             last_hour: Tokens::default(),
+            last_hour_values: Values::of(&[], &Settings::default()),
+            agents_done_values: Values::sum(&[]),
             values: Values::of(&[], &Settings::default()),
         }
     }

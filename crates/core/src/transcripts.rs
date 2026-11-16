@@ -15,6 +15,7 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use chrono::{DateTime, Duration, Timelike, Utc};
 use serde::de::{SeqAccess, Visitor};
@@ -26,7 +27,11 @@ use crate::paths::{AppPaths, ClaudePaths};
 use crate::project::{self, ProjectKey};
 
 /// The version of the state files this module writes and reads.
-const STATE_VERSION: u32 = 1;
+///
+/// Version 2 keeps the last hour's tokens per model. The state is a cache: a
+/// file of another version is discarded and the transcripts are read again
+/// (the sessions thread says so once).
+const STATE_VERSION: u32 = 2;
 /// How many message ids a growing transcript keeps, so that an answer is
 /// counted once even when its lines arrive far apart.
 const RECENT_IDS: usize = 500;
@@ -56,8 +61,6 @@ pub enum TranscriptError {
         #[source]
         source: serde_json::Error,
     },
-    #[error("{path}: transcripts state version {found} is not version {STATE_VERSION}")]
-    Version { path: PathBuf, found: u32 },
 }
 
 /// One answer of a transcript, counted once by its message id.
@@ -128,6 +131,22 @@ pub struct AgentMeta {
     pub tool_use_id: Option<String>,
     /// The agent that made the call; `None` when the session made it.
     pub parent: Option<String>,
+    /// Whether [`agent_ended`] says the agent's own transcript ends with an
+    /// assistant entry whose `stop_reason` is `"end_turn"`. Read for every
+    /// listed agent whose meta does not say `finished`, whether or not its meta
+    /// file could be read; an agent marked `finished` keeps `false` here
+    /// without its transcript being read, so read the done state only through
+    /// [`AgentMeta::is_done`].
+    pub transcript_ended: bool,
+}
+
+impl AgentMeta {
+    /// Whether the agent is done under the one rule the Sessions row and the
+    /// session record both use: Claude Code marked it `finished`, or its own
+    /// transcript ends with the agent's final `end_turn` answer.
+    pub fn is_done(&self) -> bool {
+        self.finished || self.transcript_ended
+    }
 }
 
 /// How far a transcript was read, and the ids of the answers it gave.
@@ -178,9 +197,10 @@ pub struct SessionSeen {
     #[serde(default)]
     pub spawns: BTreeMap<String, Option<String>>,
     /// The answers of the last 60 minutes: one entry per minute (its start in
-    /// UTC) with the minute's tokens, oldest first.
+    /// UTC) with the minute's tokens per model, oldest first. The key is the
+    /// answer's model string, exactly as [`Self::by_model`] keys it.
     #[serde(default)]
-    pub recent: Vec<(DateTime<Utc>, Tokens)>,
+    pub recent: Vec<(DateTime<Utc>, BTreeMap<String, Tokens>)>,
     /// The session record last written from this session, so a restart does not
     /// write the same record again. Absent in an old state file means none.
     #[serde(default)]
@@ -233,10 +253,18 @@ pub struct ScanState {
     /// The project folders whose state changed since the last save.
     #[serde(skip)]
     changed: BTreeSet<String>,
+    /// Whether the last load discarded state files of another version. Not
+    /// saved: it only tells the caller to say so once.
+    #[serde(skip)]
+    rebuilt: bool,
 }
 
 impl ScanState {
     /// Read the state of every project folder. A missing folder is the default.
+    ///
+    /// The state is a cache. A file of another version is not an error: every
+    /// state file is removed, an empty state is returned with
+    /// [`Self::was_rebuilt`] set, and the transcripts are read again.
     pub fn load(app: &AppPaths) -> Result<ScanState, TranscriptError> {
         let dir = app.transcripts_state_dir();
         let mut state = ScanState {
@@ -267,26 +295,40 @@ impl ScanState {
             }
         }
         paths.sort();
-        for path in paths {
-            let bytes = fs::read(&path).map_err(|source| TranscriptError::Io {
+        for path in &paths {
+            let bytes = fs::read(path).map_err(|source| TranscriptError::Io {
                 path: path.clone(),
                 source,
             })?;
+            // Read the version before the rest: a state file of an older version
+            // has shapes this version no longer parses, and the state is a cache.
+            let header: StateVersion =
+                serde_json::from_slice(&bytes).map_err(|source| TranscriptError::State {
+                    path: path.clone(),
+                    source,
+                })?;
+            if header.version != STATE_VERSION {
+                return discard_state(&paths);
+            }
             let file: StateFile =
                 serde_json::from_slice(&bytes).map_err(|source| TranscriptError::State {
                     path: path.clone(),
                     source,
                 })?;
             if file.version != STATE_VERSION {
-                return Err(TranscriptError::Version {
-                    path,
-                    found: file.version,
-                });
+                // The file changed between the two reads: it is still a cache.
+                return discard_state(&paths);
             }
             state.files.extend(file.files);
             state.sessions.extend(file.sessions);
         }
         Ok(state)
+    }
+
+    /// Whether [`load`](Self::load) discarded a state file of another version,
+    /// so this state is empty and every transcript must be read again.
+    pub fn was_rebuilt(&self) -> bool {
+        self.rebuilt
     }
 
     /// The one way to remember the session record written from `session`: it
@@ -469,6 +511,30 @@ impl ScanState {
     }
 }
 
+/// Discard every state file and return the empty state that says so: the state
+/// is a cache, so a file of another version is rebuilt from the transcripts
+/// instead of being an error. Removing every file leaves no old-version file
+/// behind to rebuild from on the next start.
+fn discard_state(paths: &[PathBuf]) -> Result<ScanState, TranscriptError> {
+    for path in paths {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(TranscriptError::Io {
+                    path: path.clone(),
+                    source,
+                })
+            }
+        }
+    }
+    Ok(ScanState {
+        version: STATE_VERSION,
+        rebuilt: true,
+        ..ScanState::default()
+    })
+}
+
 /// What one scan found, including the state it read into. The state is staged:
 /// [`commit`](Scan::commit) moves it into the caller's [`ScanState`] once the
 /// answers' token lines were written. A scan that is dropped leaves the old
@@ -646,8 +712,17 @@ fn sum_answers(state: &mut ScanState, answers: &[Answer]) {
             .recent
             .binary_search_by_key(&minute, |(start, _)| *start)
         {
-            Ok(index) => seen.recent[index].1 += tokens,
-            Err(index) => seen.recent.insert(index, (minute, tokens)),
+            Ok(index) => {
+                *seen.recent[index]
+                    .1
+                    .entry(answer.model.clone())
+                    .or_default() += tokens
+            }
+            Err(index) => {
+                let mut of_minute = BTreeMap::new();
+                of_minute.insert(answer.model.clone(), tokens);
+                seen.recent.insert(index, (minute, of_minute));
+            }
         }
         touched.insert(answer.session.clone());
     }
@@ -660,22 +735,45 @@ fn sum_answers(state: &mut ScanState, answers: &[Answer]) {
 
 /// Keep only the minutes within 60 minutes of the newest answer: at most 60.
 fn prune_recent(seen: &mut SessionSeen) {
-    let Some((newest, _)) = seen.recent.last().copied() else {
+    let Some((newest, _)) = seen.recent.last() else {
         return;
     };
-    let oldest = newest - Duration::minutes(60);
+    let oldest = *newest - Duration::minutes(60);
     seen.recent.retain(|(minute, _)| *minute > oldest);
 }
 
-/// The tokens of the answers in the 60 minutes before `now`: the sum of
-/// [`SessionSeen::recent`]'s minutes whose start is after `now - 60 min`.
-pub fn last_hour(seen: &SessionSeen, now: DateTime<Utc>) -> Tokens {
+/// The tokens of the last 60 minutes per model, with each model's newest minute
+/// in the window: the one way the hour is valued per model (spec §3.8). A
+/// minute starting exactly at `now - 60 min` is not in the window.
+pub fn last_hour_by_model(
+    seen: &SessionSeen,
+    now: DateTime<Utc>,
+) -> BTreeMap<String, (DateTime<Utc>, Tokens)> {
     let after = now - Duration::minutes(60);
-    let mut tokens = Tokens::default();
+    let mut by_model: BTreeMap<String, (DateTime<Utc>, Tokens)> = BTreeMap::new();
     for (minute, of_minute) in &seen.recent {
-        if *minute > after {
-            tokens += *of_minute;
+        if *minute <= after {
+            continue;
         }
+        for (model, tokens) in of_minute {
+            let entry = by_model
+                .entry(model.clone())
+                .or_insert((*minute, Tokens::default()));
+            if *minute > entry.0 {
+                entry.0 = *minute;
+            }
+            entry.1 += *tokens;
+        }
+    }
+    by_model
+}
+
+/// The tokens of the answers in the 60 minutes before `now`: the sum over all
+/// models of [`last_hour_by_model`], so both readers use the same window.
+pub fn last_hour(seen: &SessionSeen, now: DateTime<Utc>) -> Tokens {
+    let mut tokens = Tokens::default();
+    for (_, (_, of_model)) in last_hour_by_model(seen, now) {
+        tokens += of_model;
     }
     tokens
 }
@@ -694,11 +792,14 @@ pub struct Agents {
 /// A meta file that cannot be read or parsed is a warning naming the file and
 /// the reason, and its agent is still listed, as running: a meta without
 /// `finished` means a running agent, and an unreadable meta cannot say it
-/// finished.
+/// finished. An agent whose meta already says `finished` does not read its
+/// transcript: the end-turn rule cannot change that answer. [`AgentEnds`]
+/// remembers the other agents' transcript ends between passes.
 pub fn agents_of(
     claude: &ClaudePaths,
     session: &str,
     spawns: &BTreeMap<String, Option<String>>,
+    ends: &mut AgentEnds,
 ) -> Agents {
     let mut out = Agents {
         metas: Vec::new(),
@@ -732,12 +833,16 @@ pub fn agents_of(
                 continue;
             };
             let path = entry.path();
+            // The transcript beside the meta file; the end-turn rule is about
+            // the agent's own lines, whether or not its meta can be read.
+            let transcript = path.with_file_name(format!("agent-{agent}.jsonl"));
             let bytes = match fs::read(&path) {
                 Ok(bytes) => bytes,
                 Err(source) => {
                     out.warnings
                         .push(format!("agent meta {}: {source}", path.display()));
-                    out.metas.push(unread_agent(session, agent));
+                    out.metas
+                        .push(unread_agent(session, agent, ends.ended(&transcript)));
                     continue;
                 }
             };
@@ -751,7 +856,8 @@ pub fn agents_of(
                         error.line(),
                         error.column()
                     ));
-                    out.metas.push(unread_agent(session, agent));
+                    out.metas
+                        .push(unread_agent(session, agent, ends.ended(&transcript)));
                     continue;
                 }
             };
@@ -761,15 +867,24 @@ pub fn agents_of(
                 .and_then(|id| spawns.get(id))
                 .cloned()
                 .flatten();
+            let finished = meta.finished.unwrap_or(false);
+            // A finished meta already says the agent is done: reading its
+            // transcript could not change the rule's answer.
+            let transcript_ended = if finished {
+                false
+            } else {
+                ends.ended(&transcript)
+            };
             out.metas.push(AgentMeta {
                 session: session.to_string(),
                 agent: agent.to_string(),
                 agent_type: meta.agent_type,
                 description: meta.description,
-                finished: meta.finished.unwrap_or(false),
+                finished,
                 spawn_depth: Some(meta.spawn_depth),
                 tool_use_id: meta.tool_use_id,
                 parent,
+                transcript_ended,
             });
         }
     }
@@ -779,7 +894,7 @@ pub fn agents_of(
 
 /// The agent entry of a meta file that could not be read: still running (a
 /// meta without `finished` is a running agent), with everything else unknown.
-fn unread_agent(session: &str, agent: &str) -> AgentMeta {
+fn unread_agent(session: &str, agent: &str, transcript_ended: bool) -> AgentMeta {
     AgentMeta {
         session: session.to_string(),
         agent: agent.to_string(),
@@ -789,7 +904,144 @@ fn unread_agent(session: &str, agent: &str) -> AgentMeta {
         spawn_depth: None,
         tool_use_id: None,
         parent: None,
+        transcript_ended,
     }
+}
+
+/// One remembered answer: the file's length and modification time, and
+/// whether it ended.
+type EndEntry = ((u64, Option<SystemTime>), bool);
+
+/// The answers of [`agent_ended`], remembered per transcript path with the
+/// file's length and modification time: a pass that sees an unchanged file does
+/// not read it again. The sessions thread keeps one of these between passes and
+/// calls [`AgentEnds::start_pass`] at the start of each, so an answer lives only
+/// while its agent is still asked about: a closed session's agents are dropped
+/// one pass after they were last asked, and a long day does not grow the cache.
+#[derive(Debug, Default, Clone)]
+pub struct AgentEnds {
+    /// The answers asked for in this pass.
+    ends: HashMap<PathBuf, EndEntry>,
+    /// The answers of the pass before, not asked for again yet.
+    previous: HashMap<PathBuf, EndEntry>,
+}
+
+impl AgentEnds {
+    /// Begin a pass: the answers no one asked for during the last pass are
+    /// forgotten.
+    pub fn start_pass(&mut self) {
+        self.previous = std::mem::take(&mut self.ends);
+    }
+
+    /// How many transcript answers are remembered.
+    pub fn len(&self) -> usize {
+        self.ends.len() + self.previous.len()
+    }
+
+    /// Whether no transcript answer is remembered.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Whether the agent's transcript at `path` ended, reading it only when it
+    /// is new or changed since this cache's last answer.
+    pub fn ended(&mut self, path: &Path) -> bool {
+        self.ended_by(path, agent_ended)
+    }
+
+    /// [`Self::ended`] with the reader passed in, so a test can count the
+    /// reads. A path whose metadata cannot be read has no length or time to
+    /// remember, so it is read every time.
+    fn ended_by<F>(&mut self, path: &Path, read: F) -> bool
+    where
+        F: FnOnce(&Path) -> bool,
+    {
+        let Some(key) = fs::metadata(path)
+            .ok()
+            .map(|metadata| (metadata.len(), metadata.modified().ok()))
+        else {
+            return read(path);
+        };
+        if let Some((stored, ended)) = self.ends.get(path) {
+            if *stored == key {
+                return *ended;
+            }
+        }
+        if let Some((stored, ended)) = self.previous.remove(path) {
+            if stored == key {
+                self.ends.insert(path.to_path_buf(), (stored, ended));
+                return ended;
+            }
+        }
+        let ended = read(path);
+        self.ends.insert(path.to_path_buf(), (key, ended));
+        ended
+    }
+}
+
+/// Whether an agent's transcript ends with the agent's final answer: its last
+/// whole non-blank line is an `assistant` entry whose `message.stop_reason` is
+/// `"end_turn"`.
+///
+/// Only the end of the file is read. A torn last line (no newline yet, because
+/// the file is still being written) is ignored, and the line before it decides.
+/// Blank lines at the end are not entries either, so the last non-blank whole
+/// line decides. A missing or unreadable file is `false`.
+pub fn agent_ended(path: &Path) -> bool {
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let Ok(mut end) = last_whole_line_end(&mut file, path) else {
+        return false;
+    };
+    loop {
+        // `end` is just after a '\n'; the line before it ends at that '\n'.
+        let Some(line_end) = end.checked_sub(1) else {
+            return false;
+        };
+        let start = match newline_before(&mut file, line_end, path) {
+            Ok(Some(index)) => index + 1,
+            Ok(None) => 0,
+            Err(_) => return false,
+        };
+        let Ok(len) = usize::try_from(line_end - start) else {
+            return false;
+        };
+        let Ok(mut bytes) = read_at(&mut file, start, len, path) else {
+            return false;
+        };
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+        if bytes.iter().all(u8::is_ascii_whitespace) {
+            // A blank line is not an entry: the line before it decides.
+            end = start;
+            continue;
+        }
+        let Ok(line) = serde_json::from_slice::<EndLine>(&bytes) else {
+            return false;
+        };
+        return line.kind.as_deref() == Some("assistant")
+            && line
+                .message
+                .and_then(|message| message.stop_reason)
+                .as_deref()
+                == Some("end_turn");
+    }
+}
+
+/// The last line's `type` and `message.stop_reason`; every other field is
+/// ignored, and message text is never read into a value.
+#[derive(Deserialize)]
+struct EndLine {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    message: Option<EndMessage>,
+}
+
+#[derive(Deserialize)]
+struct EndMessage {
+    stop_reason: Option<String>,
 }
 
 /// One [`TokenRecord`] per (session, hour, model).
@@ -852,6 +1104,13 @@ pub fn token_records(answers: &[Answer], state: &ScanState, home: &Path) -> Vec<
 }
 
 // ---- the implementation ----
+
+/// The first field of a state file, read before the rest so a file of an older
+/// version is discarded without parsing the shapes this version no longer has.
+#[derive(Debug, Deserialize)]
+struct StateVersion {
+    version: u32,
+}
 
 /// The state file of one project folder: `<folder name>.json`.
 #[derive(Debug, Serialize, Deserialize)]
@@ -1604,6 +1863,47 @@ fn last_whole_line_end(file: &mut File, path: &Path) -> Result<u64, TranscriptEr
     Ok(0)
 }
 
+/// The offset of the last '\n' before `before`, or `None` when there is none.
+/// Only the bytes before `before` are read.
+fn newline_before(
+    file: &mut File,
+    before: u64,
+    path: &Path,
+) -> Result<Option<u64>, TranscriptError> {
+    let mut end = before;
+    while end > 0 {
+        let take = end.min(CHUNK_BYTES as u64) as usize;
+        let from = end - take as u64;
+        let buffer = read_at(file, from, take, path)?;
+        if let Some(index) = buffer.iter().rposition(|byte| *byte == b'\n') {
+            return Ok(Some(from + index as u64));
+        }
+        end = from;
+    }
+    Ok(None)
+}
+
+/// Read exactly `len` bytes at `from`.
+fn read_at(
+    file: &mut File,
+    from: u64,
+    len: usize,
+    path: &Path,
+) -> Result<Vec<u8>, TranscriptError> {
+    let mut buffer = vec![0u8; len];
+    file.seek(SeekFrom::Start(from))
+        .map_err(|source| TranscriptError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    file.read_exact(&mut buffer)
+        .map_err(|source| TranscriptError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(buffer)
+}
+
 /// The start of the hour `at` falls in, in UTC.
 pub(crate) fn hour_start(at: DateTime<Utc>) -> DateTime<Utc> {
     at - Duration::minutes(i64::from(at.minute()))
@@ -1886,6 +2186,14 @@ mod tests {
 
     fn answer(id: &str, at: &str) -> String {
         assistant_line(id, at, ENGINE, OPUS, &["thinking"], USAGE)
+    }
+
+    /// An answer that is the agent's final one: `stop_reason` is `end_turn`.
+    fn assistant_ending(id: &str, at: &str) -> String {
+        assistant_line(id, at, ENGINE, OPUS, &["text"], USAGE).replace(
+            "\"stop_reason\":\"tool_use\"",
+            "\"stop_reason\":\"end_turn\"",
+        )
     }
 
     /// An answer whose `requestId` is padded so that the line is `len` bytes.
@@ -2396,7 +2704,12 @@ mod tests {
         .unwrap();
 
         // No scan state here, so no call is known: no agent has a parent.
-        let agents = agents_of(&claude, SESSION, &BTreeMap::new());
+        let agents = agents_of(
+            &claude,
+            SESSION,
+            &BTreeMap::new(),
+            &mut AgentEnds::default(),
+        );
 
         assert!(agents.warnings.is_empty(), "{:?}", agents.warnings);
         assert_eq!(
@@ -2410,6 +2723,7 @@ mod tests {
                 spawn_depth: Some(1),
                 tool_use_id: Some("toolu_01Nkn4".to_string()),
                 parent: None,
+                transcript_ended: false,
             }]
         );
     }
@@ -2421,7 +2735,12 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("agent-a875.meta.json"), "{\"agentType\": ").unwrap();
 
-        let agents = agents_of(&claude, SESSION, &BTreeMap::new());
+        let agents = agents_of(
+            &claude,
+            SESSION,
+            &BTreeMap::new(),
+            &mut AgentEnds::default(),
+        );
 
         assert_eq!(agents.metas.len(), 1, "{:?}", agents.warnings);
         assert!(
@@ -2449,10 +2768,236 @@ mod tests {
         .unwrap();
 
         // No scan state here, so no call is known: no agent has a parent.
-        let agents = agents_of(&claude, SESSION, &BTreeMap::new());
+        let agents = agents_of(
+            &claude,
+            SESSION,
+            &BTreeMap::new(),
+            &mut AgentEnds::default(),
+        );
 
         assert_eq!(agents.metas.len(), 1);
         assert!(!agents.metas[0].finished);
+    }
+
+    /// An unreadable meta still cannot say the agent finished; the end flag
+    /// comes from the transcript beside it.
+    #[test]
+    fn an_unreadable_meta_gets_the_transcript_end_flag() {
+        let (_tmp, claude, _app) = fixture();
+        let dir = folder(&claude, FOLDER).join(SESSION).join("subagents");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("agent-a875.meta.json"), "{\"agentType\": ").unwrap();
+        write_lines(
+            &dir,
+            "agent-a875.jsonl",
+            &[user_string("fix the failing tests", AT)],
+        );
+
+        let agents = agents_of(
+            &claude,
+            SESSION,
+            &BTreeMap::new(),
+            &mut AgentEnds::default(),
+        );
+
+        assert_eq!(agents.metas.len(), 1, "{:?}", agents.warnings);
+        assert!(!agents.metas[0].finished);
+        assert!(
+            !agents.metas[0].transcript_ended,
+            "the last entry is a user turn, not an end_turn answer"
+        );
+        assert_eq!(agents.warnings.len(), 1, "the meta is still a warning");
+    }
+
+    #[test]
+    fn agent_ended_ignores_a_torn_last_line() {
+        let (_tmp, claude, _app) = fixture();
+        let dir = folder(&claude, FOLDER).join(SESSION).join("subagents");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent-a875.jsonl");
+        let mut text = format!("{}\n", assistant_ending("msg_agent", AT));
+        fs::write(&path, &text).unwrap();
+        assert!(
+            agent_ended(&path),
+            "the last whole line is the end_turn one"
+        );
+
+        // The file is being written: its last line has no newline yet, so the
+        // end_turn line before it decides.
+        text.push_str("{\"type\":\"assistant\"");
+        fs::write(&path, &text).unwrap();
+        assert!(
+            agent_ended(&path),
+            "a torn last line is ignored, the line before it decides"
+        );
+
+        // The torn line becomes whole: it is not a complete `end_turn` line, so
+        // the agent did not end.
+        text.push('\n');
+        fs::write(&path, &text).unwrap();
+        assert!(!agent_ended(&path));
+
+        write_lines(
+            &dir,
+            "agent-a875.jsonl",
+            &[
+                assistant_ending("msg_agent", AT),
+                user_string("fix the failing tests", AT),
+            ],
+        );
+        assert!(
+            !agent_ended(&path),
+            "a new user turn after the answer means the agent runs again"
+        );
+        assert!(
+            !agent_ended(&dir.join("agent-c222.jsonl")),
+            "a missing file"
+        );
+    }
+
+    #[test]
+    fn agent_ended_ignores_blank_lines_at_the_end() {
+        let (_tmp, claude, _app) = fixture();
+        let dir = folder(&claude, FOLDER).join(SESSION).join("subagents");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent-a875.jsonl");
+        fs::write(&path, format!("{}\n\n", assistant_ending("msg_agent", AT))).unwrap();
+
+        assert!(
+            agent_ended(&path),
+            "a blank line at the end is not an entry; the end_turn line decides"
+        );
+    }
+
+    #[test]
+    fn a_finished_meta_does_not_read_the_transcript() {
+        let (_tmp, claude, _app) = fixture();
+        let dir = folder(&claude, FOLDER).join(SESSION).join("subagents");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("agent-a875.meta.json"),
+            meta_of(Some(true), "toolu_01Nkn4", 1),
+        )
+        .unwrap();
+        // The transcript ends with an end_turn answer, so reading it would set
+        // the flag; the meta's `finished` already answers the rule, so it is not
+        // read and the flag stays false.
+        write_lines(
+            &dir,
+            "agent-a875.jsonl",
+            &[assistant_ending("msg_agent", AT)],
+        );
+
+        let agents = agents_of(
+            &claude,
+            SESSION,
+            &BTreeMap::new(),
+            &mut AgentEnds::default(),
+        );
+
+        assert!(agents.metas[0].finished);
+        assert!(
+            !agents.metas[0].transcript_ended,
+            "a finished meta is not read for its transcript's end"
+        );
+        assert!(agents.metas[0].is_done());
+    }
+
+    #[test]
+    fn an_unchanged_transcript_end_is_not_read_again() {
+        let (_tmp, claude, _app) = fixture();
+        let dir = folder(&claude, FOLDER).join(SESSION).join("subagents");
+        let path = write_lines(
+            &dir,
+            "agent-a875.jsonl",
+            &[assistant_ending("msg_agent", AT)],
+        );
+        let mut ends = AgentEnds::default();
+        let mut reads = 0;
+
+        assert!(ends.ended_by(&path, |path| {
+            reads += 1;
+            agent_ended(path)
+        }));
+        assert_eq!(reads, 1);
+        assert!(
+            ends.ended_by(&path, |path| {
+                reads += 1;
+                agent_ended(path)
+            }),
+            "the cached answer is the same"
+        );
+        assert_eq!(reads, 1, "an unchanged transcript is not read again");
+
+        append(&path, &user_string("fix the failing tests", AT));
+        assert!(!ends.ended_by(&path, |path| {
+            reads += 1;
+            agent_ended(path)
+        }));
+        assert_eq!(reads, 2, "a changed transcript is read again");
+    }
+
+    /// An answer asked for in a pass is kept into the next one; an answer no
+    /// one asked for during a whole pass is forgotten, so the cache holds only
+    /// the agents of the sessions still looked at.
+    #[test]
+    fn a_transcript_end_not_asked_for_in_a_pass_is_forgotten() {
+        let (_tmp, claude, _app) = fixture();
+        let dir = folder(&claude, FOLDER).join(SESSION).join("subagents");
+        let kept = write_lines(
+            &dir,
+            "agent-a875.jsonl",
+            &[assistant_ending("msg_agent", AT)],
+        );
+        let dropped = write_lines(
+            &dir,
+            "agent-b412.jsonl",
+            &[assistant_ending("msg_other", AT)],
+        );
+        let mut ends = AgentEnds::default();
+        let mut reads = 0;
+        let mut ask = |ends: &mut AgentEnds, path: &Path| {
+            ends.ended_by(path, |path| {
+                reads += 1;
+                agent_ended(path)
+            })
+        };
+
+        ends.start_pass();
+        assert!(ask(&mut ends, &kept));
+        assert!(ask(&mut ends, &dropped));
+        assert_eq!(ends.len(), 2);
+
+        ends.start_pass();
+        assert!(ask(&mut ends, &kept), "kept from the pass before");
+        assert_eq!(ends.len(), 2, "the other answer waits one pass");
+
+        ends.start_pass();
+        assert_eq!(ends.len(), 1, "only the answer asked for in the last pass");
+        assert!(ask(&mut ends, &kept));
+        drop(ask);
+        assert_eq!(reads, 2, "the kept transcript was read once");
+    }
+
+    #[test]
+    fn an_agent_is_done_when_finished_or_its_transcript_ended() {
+        let mut meta = AgentMeta {
+            session: SESSION.to_string(),
+            agent: "a875".to_string(),
+            agent_type: None,
+            description: None,
+            finished: true,
+            spawn_depth: None,
+            tool_use_id: None,
+            parent: None,
+            transcript_ended: false,
+        };
+        assert!(meta.is_done());
+        meta.finished = false;
+        meta.transcript_ended = true;
+        assert!(meta.is_done());
+        meta.transcript_ended = false;
+        assert!(!meta.is_done(), "neither mark says the agent is done");
     }
 
     #[test]
@@ -2528,7 +3073,7 @@ mod tests {
         // One file per project folder, with the short shape the plan gives.
         let written: serde_json::Value =
             serde_json::from_slice(&fs::read(&atlas_file).unwrap()).unwrap();
-        assert_eq!(written["version"], 1);
+        assert_eq!(written["version"], 2);
         assert!(written["files"][KEY]["offset"].is_u64());
         assert!(written["files"][KEY]["grew"].is_string());
         assert!(written["files"][KEY]["recent"].is_array());
@@ -3428,7 +3973,12 @@ mod tests {
         .unwrap();
 
         let (state, _scan) = scan_run(&claude);
-        let agents = agents_of(&claude, SESSION, &state.sessions[SESSION].spawns);
+        let agents = agents_of(
+            &claude,
+            SESSION,
+            &state.sessions[SESSION].spawns,
+            &mut AgentEnds::default(),
+        );
         let metas = agents.metas;
 
         let started_by_agent = metas
@@ -3553,8 +4103,10 @@ mod tests {
         let (_tmp, _claude, app) = fixture();
         let dir = app.transcripts_state_dir();
         fs::create_dir_all(&dir).unwrap();
+        // `version: 2` is the current version: this tests a missing field of the
+        // current shape (the sums), not a state file of an older version.
         let old = serde_json::json!({
-            "version": 1,
+            "version": 2,
             "files": {},
             "sessions": {
                 SESSION: {
@@ -3580,13 +4132,44 @@ mod tests {
         assert!(seen.recent.is_empty());
     }
 
+    /// REVIEW PROOF (S-1): a real 1.1.0 state file has per-minute counts without
+    /// a model in `recent`; it must be discarded and rebuilt, never an error.
+    #[test]
+    fn review_a_version_1_state_with_minutes_is_rebuilt() {
+        let (_tmp, _claude, app) = fixture();
+        let dir = app.transcripts_state_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let old = serde_json::json!({
+            "version": 1,
+            "files": {},
+            "sessions": {
+                SESSION: {
+                    "folder": FOLDER,
+                    "cwd": ENGINE,
+                    "first": "2026-11-12T09:41:07.412Z",
+                    "last": "2026-11-12T09:41:07.412Z",
+                    "lastModel": OPUS,
+                    "lastUserTurn": null,
+                    "recent": [["2026-11-12T09:41:00Z", {"input": 2, "out": 166, "cw": 26173, "cr": 28126}]]
+                }
+            }
+        });
+        fs::write(dir.join(format!("{FOLDER}.json")), old.to_string()).unwrap();
+
+        let state = ScanState::load(&app).expect("an old version is a cache, not an error");
+
+        assert!(state.was_rebuilt());
+    }
+
     #[test]
     fn a_state_file_without_thinking_holds_none() {
         let (_tmp, _claude, app) = fixture();
         let dir = app.transcripts_state_dir();
         fs::create_dir_all(&dir).unwrap();
+        // `version: 2` is the current version: this tests a missing field of the
+        // current shape (thinking), not a state file of an older version.
         let saved = serde_json::json!({
-            "version": 1,
+            "version": 2,
             "files": {},
             "sessions": {
                 SESSION: {

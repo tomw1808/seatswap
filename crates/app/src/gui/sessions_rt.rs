@@ -256,6 +256,9 @@ pub(crate) struct SessionMemory {
     /// The transcript folders of the running sessions and their agents, from
     /// the keys the `ScanState` knows.
     transcript_folders: BTreeSet<PathBuf>,
+    /// The agents' transcript ends, remembered per path with the file's length
+    /// and modified time, so an unchanged transcript is not read again.
+    agent_ends: transcripts::AgentEnds,
 }
 
 impl SessionMemory {
@@ -285,6 +288,7 @@ impl SessionMemory {
             last_pushed: None,
             throttle: ViewThrottle::default(),
             transcript_folders: BTreeSet::new(),
+            agent_ends: transcripts::AgentEnds::default(),
         }
     }
 
@@ -818,9 +822,20 @@ fn update_transcript_watches(
 
 /// The transcript state at start: the files saved by the last run, or the
 /// default with the error that keeps this pass from writing it back.
+///
+/// The state is a cache. A file of another version is not an error: the state
+/// starts empty, so every transcript is read again and the next save writes the
+/// new version; the thread says so once.
 fn load_state(app: &AppPaths) -> (ScanState, Option<String>) {
     match ScanState::load(app) {
-        Ok(state) => (state, None),
+        Ok(state) => {
+            if state.was_rebuilt() {
+                eprintln!(
+                    "seatswap: the transcript state was written by an older version; reading the transcripts again"
+                );
+            }
+            (state, None)
+        }
         Err(error) => (
             ScanState::default(),
             Some(format!(
@@ -1114,6 +1129,8 @@ pub(crate) fn run_pass(
         .map(|session| session.session_id.clone())
         .collect();
 
+    // The transcript ends no one asked for during the last pass are forgotten.
+    memory.agent_ends.start_pass();
     // One `agents_of` per running session per pass: the session record and the
     // rows use the same list, so the meta files are read once. Its warnings are
     // the pass's, whether or not the window is open.
@@ -1122,7 +1139,12 @@ pub(crate) fn run_pass(
         let Some(seen) = state.sessions.get(&session.session_id) else {
             continue;
         };
-        let agents = transcripts::agents_of(claude, &session.session_id, &seen.spawns);
+        let agents = transcripts::agents_of(
+            claude,
+            &session.session_id,
+            &seen.spawns,
+            &mut memory.agent_ends,
+        );
         for warning in agents.warnings {
             add_warning(&mut summary, warning);
         }
@@ -1205,7 +1227,8 @@ pub(crate) fn run_pass(
                 .records
                 .get(&session)
                 .and_then(|record| record.entrypoint.clone());
-            let agents = transcripts::agents_of(claude, &session, &seen.spawns);
+            let agents =
+                transcripts::agents_of(claude, &session, &seen.spawns, &mut memory.agent_ends);
             for warning in agents.warnings {
                 add_warning(&mut summary, warning);
             }
@@ -1795,7 +1818,7 @@ fn session_record(
         &format!("the number of agents started in session {session}"),
     )?;
     let finished = count_u32(
-        agents.iter().filter(|agent| agent.finished).count(),
+        agents.iter().filter(|agent| agent.is_done()).count(),
         &format!("the number of agents finished in session {session}"),
     )?;
     Ok(SessionRecord {
@@ -2966,6 +2989,99 @@ mod tests {
         assert_eq!(outcome.summary.warning.as_deref(), Some(state_error));
     }
 
+    /// The scan state is a cache: a file of another version is discarded, every
+    /// transcript is read again, and the next save writes the new version.
+    #[test]
+    fn an_old_scan_state_is_rebuilt() {
+        let (tmp, claude, app) = fixture();
+        let folder = claude.projects_dir().join("-home-sam-projects-atlas");
+        fs::create_dir_all(&folder).unwrap();
+        let transcript = folder.join(format!("{SESSION}.jsonl"));
+        let line = transcript_line(
+            SESSION,
+            "msg_01QmB7xT",
+            time("2026-11-14T09:41:07Z"),
+            "/home/sam/projects/atlas",
+            "claude-opus-5-5",
+            (2, 166, 26_173, 28_126),
+        );
+        fs::write(&transcript, format!("{line}\n")).unwrap();
+        let key = format!("-home-sam-projects-atlas/{SESSION}.jsonl");
+        let length = fs::metadata(&transcript).unwrap().len();
+
+        // A version 1 state file that claims the whole transcript was read.
+        let mut files = serde_json::Map::new();
+        files.insert(
+            key.clone(),
+            serde_json::json!({
+                "offset": length,
+                "grew": "2026-11-14T09:41:07.412Z",
+                "recent": [],
+                "lastAnswer": "2026-11-14T09:41:07.412Z"
+            }),
+        );
+        let mut sessions = serde_json::Map::new();
+        sessions.insert(
+            SESSION.to_string(),
+            serde_json::json!({
+                "folder": "-home-sam-projects-atlas",
+                "cwd": "/home/sam/projects/atlas",
+                "first": "2026-11-14T09:41:07.412Z",
+                "last": "2026-11-14T09:41:07.412Z",
+                "lastModel": "claude-opus-5-5",
+                "lastUserTurn": null,
+                // Version 1 kept one count per minute, without a model.
+                "recent": [["2026-11-14T09:41:00Z", {"input": 2, "out": 166, "cw": 26173, "cr": 28126}]]
+            }),
+        );
+        let old = serde_json::json!({
+            "version": 1,
+            "files": files,
+            "sessions": sessions
+        });
+        let state_dir = app.transcripts_state_dir();
+        fs::create_dir_all(&state_dir).unwrap();
+        let state_file = state_dir.join("-home-sam-projects-atlas.json");
+        fs::write(&state_file, old.to_string()).unwrap();
+
+        let (mut state, state_error) = load_state(&app);
+        assert_eq!(state_error, None, "another version is not an error");
+        assert!(state.was_rebuilt(), "the load says the state was discarded");
+        assert!(
+            !state_file.exists(),
+            "the old state file is discarded, not left for the next start"
+        );
+        assert!(state.files.is_empty(), "the old state is not read");
+        assert!(state.sessions.is_empty(), "the old sessions are not read");
+
+        // One pass reads the transcript again and writes the new state back.
+        let recorder = Recorder::new(history(&tmp.path().join("history")));
+        let mut memory = SessionMemory::new(claude.home().to_path_buf());
+        one_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            time("2026-11-14T10:00:00Z"),
+            None,
+            None,
+        );
+        assert_eq!(
+            state.sessions[SESSION].totals.out, 166,
+            "the transcript was read again"
+        );
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
+        assert_eq!(saved["version"], 2, "the new state is written back");
+        assert_eq!(
+            saved["files"][&key]["offset"].as_u64(),
+            Some(length),
+            "the rebuilt state read the whole transcript"
+        );
+    }
+
     #[test]
     fn a_short_session_gets_a_session_record() {
         let (tmp, claude, app) = fixture();
@@ -3888,6 +4004,8 @@ mod tests {
             agents: Vec::new(),
             tokens: Default::default(),
             last_hour: Default::default(),
+            last_hour_values: live_sessions::Values::sum(&[]),
+            agents_done_values: live_sessions::Values::sum(&[]),
             values: live_sessions::Values {
                 api: None,
                 api_currency: None,
@@ -4644,5 +4762,43 @@ mod tests {
             passes >= 2,
             "the thread must not starve its passes: {passes} passes in 3 s"
         );
+    }
+    /// REVIEW PROOF (S-1): the session record counts an agent finished by the
+    /// same rule as the Sessions row (`finished` or an ended transcript).
+    #[test]
+    fn review_the_record_counts_an_ended_agent_as_finished() {
+        let tmp = tempfile::tempdir().unwrap();
+        let seen: SessionSeen = serde_json::from_value(serde_json::json!({
+            "folder": "-home-sam-projects-atlas",
+            "cwd": "/home/sam/projects/atlas",
+            "first": "2026-11-14T09:41:07.412Z",
+            "last": "2026-11-14T09:41:07.412Z",
+            "lastModel": "claude-opus-5-5",
+            "lastUserTurn": null
+        }))
+        .unwrap();
+        let agent = transcripts::AgentMeta {
+            session: SESSION.to_string(),
+            agent: "a8751b20660a1de6".to_string(),
+            agent_type: None,
+            description: None,
+            finished: false,
+            spawn_depth: None,
+            tool_use_id: None,
+            parent: None,
+            transcript_ended: true,
+        };
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        let record = session_record(
+            &[agent],
+            SESSION,
+            &seen,
+            None,
+            true,
+            &mut memory,
+            time("2026-11-14T10:00:00Z"),
+        )
+        .unwrap();
+        assert_eq!(record.agents_finished, 1);
     }
 }

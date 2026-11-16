@@ -290,7 +290,21 @@ pub struct LiveSession {
     pub agents: Vec<LiveAgent>,
     pub tokens: Tokens,
     pub last_hour: Tokens,
+    /// The last hour's tokens valued per model, like `values` (spec §3.8).
+    /// Closed rows value the hourly records that overlap the last hour.
+    #[serde(default = "no_values")]
+    pub last_hour_values: Values,
+    /// [`Values::sum`] of the values of the agents counted done; the sum of an
+    /// empty list when no agent is done (a closed row lists no agents).
+    #[serde(default = "no_values")]
+    pub agents_done_values: Values,
     pub values: Values,
+}
+
+/// The values of a row whose report does not carry them (another host still on
+/// an older version): named as missing, never a made-up number.
+fn no_values() -> Values {
+    Values::unknown("the report has no such value")
 }
 
 /// The rows of the Sessions area, and the rows that were left out because
@@ -339,7 +353,9 @@ pub fn switch_kind(
 }
 
 /// The running sessions of this host (spec §3.8). An agent is running while its
-/// meta says `finished == false`.
+/// meta says `finished == false` and does not say its transcript ended with the
+/// agent's final `end_turn` answer (`AgentMeta::transcript_ended`). An agent
+/// seen only in the transcripts has no meta and keeps today's rule: done.
 ///
 /// `project_of` turns a session's `cwd` into its project key; the sessions
 /// thread already caches that look-up. `metas` returns the `AgentMeta` files of
@@ -353,7 +369,10 @@ pub fn switch_kind(
 /// record with its model, dated at its last answer; an agent without a model
 /// has both values missing. An agent that has not answered has no time at all.
 /// A session without a [`SessionSeen`] is a row with zero tokens and the values
-/// of an empty list.
+/// of an empty list. The last hour is valued per model: each model's tokens of
+/// the 60 minutes are one record dated at the newest minute of that model in
+/// the hour, through the same [`Valuer::value`] as `values`. `agents_done_values`
+/// is [`Values::sum`] over the values of the agents counted done.
 ///
 /// A session file whose `startedAt` or `statusUpdatedAt` is not a valid time is
 /// not a row: the reason goes into [`Rows::warnings`], never a default time.
@@ -398,6 +417,7 @@ pub fn running(
         let mut live_agents = Vec::new();
         let mut agents_running = 0u32;
         let mut agents_done = 0u32;
+        let mut done_values: Vec<Values> = Vec::new();
         let mut agents: BTreeMap<String, (Option<AgentMeta>, Option<&AgentSeen>)> = BTreeMap::new();
         for meta in metas(&file.session_id) {
             let agent = meta.agent.clone();
@@ -413,7 +433,7 @@ pub fn running(
             let last = agent_seen.map(|agent| agent.last);
             let model = agent_seen.and_then(|agent| agent.model.clone());
             let tokens = agent_seen.map(|agent| agent.tokens).unwrap_or_default();
-            let is_running = meta.as_ref().map(|meta| !meta.finished).unwrap_or(false);
+            let is_running = meta.as_ref().map(|meta| !meta.is_done()).unwrap_or(false);
             if is_running {
                 agents_running += 1;
             } else {
@@ -430,6 +450,9 @@ pub fn running(
                 },
                 Pricing::Unknown { reason } => Values::unknown(reason),
             };
+            if !is_running {
+                done_values.push(values.clone());
+            }
             live_agents.push(LiveAgent {
                 agent,
                 parent: meta.as_ref().and_then(|meta| meta.parent.clone()),
@@ -443,12 +466,34 @@ pub fn running(
                 values,
             });
         }
+        let done_values: Vec<&Values> = done_values.iter().collect();
+        let agents_done_values = Values::sum(&done_values);
 
         let model = seen.and_then(|seen| seen.last_model.clone());
         let tokens = seen.map(|seen| seen.totals).unwrap_or_default();
         let last_hour = seen
             .map(|seen| transcripts::last_hour(seen, now))
             .unwrap_or_default();
+        // Each model's tokens of the last 60 minutes, dated at the newest minute
+        // of that model in the hour, so the hour is valued per model; the one
+        // window rule is `transcripts::last_hour_by_model`.
+        let last_hour_by_model = seen
+            .map(|seen| transcripts::last_hour_by_model(seen, now))
+            .unwrap_or_default();
+        let last_hour_values = match pricing {
+            Pricing::Known { valuer, .. } => {
+                let valued: Vec<Valued> = last_hour_by_model
+                    .iter()
+                    .map(|(model, (at, tokens))| {
+                        let record =
+                            token_record(&file.session_id, &file.cwd, &key, model, *at, *tokens);
+                        valuer.value(host, &record)
+                    })
+                    .collect();
+                pricing.of(&valued)
+            }
+            Pricing::Unknown { reason } => Values::unknown(reason),
+        };
         let values = match pricing {
             Pricing::Known { valuer, .. } => match seen {
                 None => pricing.of(&[]),
@@ -496,6 +541,8 @@ pub fn running(
             agents: live_agents,
             tokens,
             last_hour,
+            last_hour_values,
+            agents_done_values,
             values,
         });
     }
@@ -509,8 +556,10 @@ pub fn running(
 /// `t` is the start of its hour), because one hour and model can have several
 /// lines. Its last hour sums the records whose hour `[t, t + 1 h)` overlaps
 /// `[now - 60 min, now)`: the history's records are hourly, so a record from
-/// the hour before the window still counts. Its agents list is empty; the
-/// counts come from the record. `label` is `<project>-<first 2 characters of
+/// the hour before the window still counts; those overlapping records are also
+/// its `last_hour_values`, each valued like `values`. Its agents list is empty,
+/// so its `agents_done_values` is the sum of an empty list; the counts come from
+/// the record. `label` is `<project>-<first 2 characters of
 /// the session id>`.
 ///
 /// The history read's warnings are passed on in [`Rows::warnings`]. `projects`
@@ -565,6 +614,7 @@ pub fn closed(
         let hour_ago = now - Duration::minutes(60);
         let mut out_by_model: BTreeMap<String, u64> = BTreeMap::new();
         let mut valued = Vec::with_capacity(of_session.len());
+        let mut last_hour_valued: Vec<Valued> = Vec::new();
         for token in of_session {
             let of_record = Tokens::from(*token);
             tokens += of_record;
@@ -572,6 +622,9 @@ pub fn closed(
             // counts, even when its start is before the window.
             if token.t < now && transcripts::hour_start(token.t) + Duration::hours(1) > hour_ago {
                 last_hour += of_record;
+                if let Pricing::Known { valuer, .. } = pricing {
+                    last_hour_valued.push(valuer.value(&hosted.host, token));
+                }
             }
             *out_by_model.entry(token.model.clone()).or_insert(0) += token.out;
             if let Pricing::Known { valuer, .. } = pricing {
@@ -601,6 +654,8 @@ pub fn closed(
             agents: Vec::new(),
             tokens,
             last_hour,
+            last_hour_values: pricing.of(&last_hour_valued),
+            agents_done_values: Values::sum(&[]),
             values: pricing.of(&valued),
         });
     }
@@ -1017,6 +1072,15 @@ mod tests {
     }
 
     fn valuer(history: &HistoryDir, settings: &Settings, accounts: &[Account]) -> Valuer {
+        valuer_with(history, settings, accounts, &prices())
+    }
+
+    fn valuer_with(
+        history: &HistoryDir,
+        settings: &Settings,
+        accounts: &[Account],
+        prices: &Prices,
+    ) -> Valuer {
         let range = Range::between(
             Some(utc("2026-11-10T00:00:00Z")),
             Some(utc("2026-11-15T00:00:00Z")),
@@ -1025,7 +1089,7 @@ mod tests {
         Valuer::build(
             history,
             &range,
-            &prices(),
+            prices,
             &Fx::default(),
             settings,
             accounts,
@@ -1054,6 +1118,8 @@ mod tests {
             agents: Vec::new(),
             tokens: Tokens::default(),
             last_hour: Tokens::default(),
+            last_hour_values: Values::missing(NO_TOKENS, &Settings::default()),
+            agents_done_values: Values::sum(&[]),
             values: Values::missing(NO_TOKENS, &Settings::default()),
         }
     }
@@ -1102,6 +1168,7 @@ mod tests {
                 spawn_depth: Some(1),
                 tool_use_id: Some(format!("toolu_{i:02}")),
                 parent: None,
+                transcript_ended: false,
             })
             .collect();
         let metas_of = |_: &str| metas.clone();
@@ -1125,6 +1192,398 @@ mod tests {
         assert_eq!(row.agents_running, 3);
         assert_eq!(row.agents_done, 38);
         assert_eq!(row.agents.len(), 41);
+    }
+
+    #[test]
+    fn last_hour_is_valued_per_model() {
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let settings = settings_eur();
+        // Two prices, so a sum of both models cannot be mistaken for one model's.
+        let mut prices = prices();
+        prices
+            .overrides
+            .get_mut("anthropic/claude-fable-5-2")
+            .expect("the fable price")
+            .output = 40.0;
+        let valuer = valuer_with(&history, &settings, &[], &prices);
+        let minute = utc("2026-11-14T18:30:00Z");
+        let mut seen = seen("claude-opus-5-5", 1_000_000);
+        let mut of_minute = BTreeMap::new();
+        of_minute.insert(
+            "claude-opus-5-5".to_string(),
+            Tokens {
+                out: 1_000_000,
+                ..Tokens::default()
+            },
+        );
+        of_minute.insert(
+            "claude-fable-5-2".to_string(),
+            Tokens {
+                out: 500_000,
+                ..Tokens::default()
+            },
+        );
+        seen.recent = vec![
+            // A minute starting exactly at `now - 60 min` is not in the hour.
+            (utc("2026-11-14T18:00:00Z"), {
+                let mut outside = BTreeMap::new();
+                outside.insert(
+                    "claude-opus-5-5".to_string(),
+                    Tokens {
+                        out: 9_000_000,
+                        ..Tokens::default()
+                    },
+                );
+                outside.insert(
+                    "claude-fable-5-2".to_string(),
+                    Tokens {
+                        out: 9_000_000,
+                        ..Tokens::default()
+                    },
+                );
+                outside
+            }),
+            (minute, of_minute),
+        ];
+        let now = utc("2026-11-14T19:00:00Z");
+
+        // Each model's own part: its tokens of the hour and its newest minute.
+        let by_model = transcripts::last_hour_by_model(&seen, now);
+        assert_eq!(by_model.len(), 2, "one part per model");
+        assert_eq!(
+            by_model["claude-opus-5-5"],
+            (
+                minute,
+                Tokens {
+                    out: 1_000_000,
+                    ..Tokens::default()
+                }
+            ),
+            "opus's own part"
+        );
+        assert_eq!(
+            by_model["claude-fable-5-2"],
+            (
+                minute,
+                Tokens {
+                    out: 500_000,
+                    ..Tokens::default()
+                }
+            ),
+            "fable's own part"
+        );
+
+        let rows = running(
+            &[session_file()],
+            &state_with(seen),
+            &|_: &str| Vec::new(),
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
+            "atlas",
+            now,
+            &|_: &str| project_key(),
+        );
+
+        let row = &rows.sessions[0];
+        assert_eq!(
+            row.last_hour.out, 1_500_000,
+            "both models' minutes; the boundary minute is not counted"
+        );
+        assert_eq!(
+            row.last_hour_values.api,
+            Some(40.0),
+            "20 for opus and 20 for fable, in two parts"
+        );
+        assert_eq!(row.last_hour_values.api_currency.as_deref(), Some("EUR"));
+    }
+
+    #[test]
+    fn completed_agents_have_a_summed_value() {
+        let mut seen = seen("claude-opus-5-5", 1_000_000);
+        let priced = AgentSeen {
+            first: utc("2026-11-14T18:10:00Z"),
+            last: utc("2026-11-14T18:21:00Z"),
+            model: Some("claude-opus-5-5".to_string()),
+            tokens: Tokens {
+                out: 1_000_000,
+                ..Tokens::default()
+            },
+            answers: 1,
+        };
+        let unpriced = AgentSeen {
+            first: utc("2026-11-14T18:00:00Z"),
+            last: utc("2026-11-14T18:20:00Z"),
+            model: Some("claude-x".to_string()),
+            tokens: Tokens {
+                out: 1_000_000,
+                ..Tokens::default()
+            },
+            answers: 1,
+        };
+        // Sorted by id, the unpriced agent's reason comes first in the sum.
+        seen.agents.insert("a1111b20660a1de6".to_string(), unpriced);
+        seen.agents.insert("a2221b20660a1de6".to_string(), priced);
+        let metas = vec![
+            AgentMeta {
+                session: SESSION.to_string(),
+                agent: "a1111b20660a1de6".to_string(),
+                agent_type: Some("general-purpose".to_string()),
+                description: Some("fix the failing tests".to_string()),
+                finished: true,
+                spawn_depth: Some(1),
+                tool_use_id: None,
+                parent: None,
+                transcript_ended: true,
+            },
+            AgentMeta {
+                session: SESSION.to_string(),
+                agent: "a2221b20660a1de6".to_string(),
+                agent_type: Some("general-purpose".to_string()),
+                description: Some("fix the failing tests".to_string()),
+                finished: true,
+                spawn_depth: Some(1),
+                tool_use_id: None,
+                parent: None,
+                transcript_ended: true,
+            },
+        ];
+        let metas_of = |_: &str| metas.clone();
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let settings = settings_eur();
+        let valuer = valuer(&history, &settings, &[]);
+        let rows = running(
+            &[session_file()],
+            &state_with(seen),
+            &metas_of,
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
+            "atlas",
+            utc("2026-11-14T19:00:00Z"),
+            &|_: &str| project_key(),
+        );
+
+        let row = &rows.sessions[0];
+        assert_eq!(row.agents_done, 2);
+        assert_eq!(row.agents_done_values.api, None);
+        assert_eq!(
+            row.agents_done_values.api_missing.as_deref(),
+            Some("no price for claude-x"),
+            "the unpriced agent's reason stays in the sum"
+        );
+        assert_eq!(
+            row.agents_done_values.subscription_missing.as_deref(),
+            Some("no price for claude-x")
+        );
+    }
+
+    #[test]
+    fn an_agent_without_finished_whose_last_entry_is_end_turn_is_done() {
+        let meta = AgentMeta {
+            session: SESSION.to_string(),
+            agent: AGENT.to_string(),
+            agent_type: Some("general-purpose".to_string()),
+            description: Some("fix the failing tests".to_string()),
+            finished: false,
+            spawn_depth: Some(1),
+            tool_use_id: None,
+            parent: None,
+            transcript_ended: true,
+        };
+        let metas_of = |_: &str| vec![meta.clone()];
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let settings = settings_eur();
+        let valuer = valuer(&history, &settings, &[]);
+        let rows = running(
+            &[session_file()],
+            &state_with(seen("claude-opus-5-5", 1_000_000)),
+            &metas_of,
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
+            "atlas",
+            utc("2026-11-14T19:00:00Z"),
+            &|_: &str| project_key(),
+        );
+
+        let row = &rows.sessions[0];
+        assert_eq!(row.agents_running, 0, "the transcript ended with end_turn");
+        assert_eq!(row.agents_done, 1);
+        assert!(!row.agents[0].running);
+    }
+
+    #[test]
+    fn a_resumed_agent_runs_again() {
+        let dir = tempdir().expect("tempdir");
+        let claude = crate::paths::ClaudePaths::for_config_dir(dir.path(), dir.path());
+        let subagents = claude
+            .projects_dir()
+            .join("-home-sam-projects-atlas")
+            .join(SESSION)
+            .join("subagents");
+        std::fs::create_dir_all(&subagents).expect("the subagents folder");
+        std::fs::write(
+            subagents.join(format!("agent-{AGENT}.meta.json")),
+            json!({
+                "agentType": "general-purpose",
+                "description": "fix the failing tests",
+                "spawnDepth": 1,
+                "toolUseId": null
+            })
+            .to_string(),
+        )
+        .expect("the meta file");
+        let transcript = subagents.join(format!("agent-{AGENT}.jsonl"));
+        let end_turn = json!({
+            "type": "assistant",
+            "timestamp": "2026-11-14T18:30:00Z",
+            "cwd": ATLAS_CWD,
+            "message": {
+                "id": "msg_agent_a",
+                "model": "claude-opus-5-5",
+                "content": [],
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 2,
+                    "output_tokens": 166,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0
+                }
+            }
+        })
+        .to_string();
+        std::fs::write(&transcript, format!("{end_turn}\n")).expect("the transcript");
+
+        let first = crate::transcripts::agents_of(
+            &claude,
+            SESSION,
+            &BTreeMap::new(),
+            &mut crate::transcripts::AgentEnds::default(),
+        );
+        assert_eq!(first.metas.len(), 1);
+        assert!(
+            first.metas[0].transcript_ended,
+            "the last entry is end_turn"
+        );
+        let metas = first.metas.clone();
+        let settings = settings_eur();
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let valuer = valuer(&history, &settings, &[]);
+        let first_rows = running(
+            &[session_file()],
+            &state_with(seen("claude-opus-5-5", 1_000_000)),
+            &|_: &str| metas.clone(),
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
+            "atlas",
+            utc("2026-11-14T19:00:00Z"),
+            &|_: &str| project_key(),
+        );
+        assert_eq!(first_rows.sessions[0].agents_done, 1);
+        assert_eq!(first_rows.sessions[0].agents_running, 0);
+
+        // The agent is resumed: a new user turn is the transcript's last entry.
+        let mut text = std::fs::read_to_string(&transcript).expect("the transcript");
+        text.push_str(
+            &json!({
+                "type": "user",
+                "timestamp": "2026-11-14T18:40:00Z",
+                "sessionId": SESSION,
+                "message": {"role": "user", "content": "fix the failing tests"}
+            })
+            .to_string(),
+        );
+        text.push('\n');
+        std::fs::write(&transcript, text).expect("the resumed transcript");
+
+        let again = crate::transcripts::agents_of(
+            &claude,
+            SESSION,
+            &BTreeMap::new(),
+            &mut crate::transcripts::AgentEnds::default(),
+        );
+        assert_eq!(again.metas.len(), 1);
+        assert!(
+            !again.metas[0].transcript_ended,
+            "a new user turn after end_turn means the agent runs again"
+        );
+        let metas = again.metas.clone();
+        let second_rows = running(
+            &[session_file()],
+            &state_with(seen("claude-opus-5-5", 1_000_000)),
+            &|_: &str| metas.clone(),
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
+            "atlas",
+            utc("2026-11-14T19:00:00Z"),
+            &|_: &str| project_key(),
+        );
+        assert_eq!(second_rows.sessions[0].agents_running, 1);
+        assert_eq!(second_rows.sessions[0].agents_done, 0);
+        assert!(second_rows.sessions[0].agents[0].running);
+    }
+
+    #[test]
+    fn an_unreadable_meta_still_counts_as_running() {
+        let dir = tempdir().expect("tempdir");
+        let claude = crate::paths::ClaudePaths::for_config_dir(dir.path(), dir.path());
+        let subagents = claude
+            .projects_dir()
+            .join("-home-sam-projects-atlas")
+            .join(SESSION)
+            .join("subagents");
+        std::fs::create_dir_all(&subagents).expect("the subagents folder");
+        std::fs::write(
+            subagents.join(format!("agent-{AGENT}.meta.json")),
+            "{\"agentType\": ",
+        )
+        .expect("the unreadable meta");
+        std::fs::write(
+            subagents.join(format!("agent-{AGENT}.jsonl")),
+            format!(
+                "{}\n",
+                json!({
+                    "type": "user",
+                    "timestamp": "2026-11-14T18:40:00Z",
+                    "sessionId": SESSION,
+                    "message": {"role": "user", "content": "fix the failing tests"}
+                })
+            ),
+        )
+        .expect("the transcript");
+
+        let agents = crate::transcripts::agents_of(
+            &claude,
+            SESSION,
+            &BTreeMap::new(),
+            &mut crate::transcripts::AgentEnds::default(),
+        );
+        assert_eq!(agents.metas.len(), 1);
+        assert_eq!(agents.warnings.len(), 1, "the unreadable meta is a warning");
+        assert!(!agents.metas[0].finished);
+        assert!(
+            !agents.metas[0].transcript_ended,
+            "the last entry is not an end_turn answer"
+        );
+        let metas = agents.metas.clone();
+        let settings = settings_eur();
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let valuer = valuer(&history, &settings, &[]);
+        let rows = running(
+            &[session_file()],
+            &state_with(seen("claude-opus-5-5", 1_000_000)),
+            &|_: &str| metas.clone(),
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
+            "atlas",
+            utc("2026-11-14T19:00:00Z"),
+            &|_: &str| project_key(),
+        );
+
+        assert_eq!(rows.sessions[0].agents_running, 1);
+        assert_eq!(rows.sessions[0].agents_done, 0);
+        assert!(rows.sessions[0].agents[0].running);
     }
 
     #[test]
@@ -1421,6 +1880,7 @@ mod tests {
             spawn_depth: Some(1),
             tool_use_id: Some("toolu_01Nkn4".to_string()),
             parent: None,
+            transcript_ended: false,
         };
         let metas_of = |_: &str| vec![meta.clone()];
         let dir = tempdir().expect("tempdir");
@@ -1788,6 +2248,7 @@ mod tests {
             spawn_depth: Some(2),
             tool_use_id: Some("toolu_01Nkn4".to_string()),
             parent: Some("a8751b20660a1de6b".to_string()),
+            transcript_ended: false,
         };
         let metas_of = |_: &str| vec![meta.clone()];
         let dir = tempdir().expect("tempdir");
@@ -2009,6 +2470,7 @@ mod tests {
                 spawn_depth: Some(1),
                 tool_use_id: Some(format!("toolu_{i:04}")),
                 parent: None,
+                transcript_ended: false,
             })
             .collect();
         let metas_of = |_: &str| metas.clone();
