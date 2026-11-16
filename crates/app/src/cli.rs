@@ -3808,9 +3808,8 @@ pub(crate) mod tests {
     fn status_json_suggestion_is_the_planners() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let now = Utc::now();
-        let reset = DateTime::parse_from_rfc3339("2026-11-16T02:00:00Z")
-            .expect("a test time")
-            .with_timezone(&Utc);
+        // The reset must lie ahead of the real clock the burn status runs on.
+        let reset = now + chrono::Duration::hours(3);
         let accounts = vec![
             burn_account("pr", "PR", FIRST_ACCOUNT_UUID),
             burn_account("ac", "AC", SECOND_ACCOUNT_UUID),
