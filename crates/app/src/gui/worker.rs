@@ -1058,7 +1058,7 @@ impl EngineRuntime {
         super::lock(&self.printed_warnings).print(&report.warnings);
         if let Some(text) = report.notification {
             if settings.notify_on_switch {
-                notify::send_switch(&text);
+                notify::send_switch(&self.app, &text);
             }
         }
     }
@@ -1241,7 +1241,7 @@ impl ActionRuntime {
                 ActionCommand::SyncLive => self.sync_live(),
                 ActionCommand::PauseBurn { hours } => {
                     if let Err(error) = self.pause_burn(hours) {
-                        notify::send_error(&error);
+                        notify::send_error(&self.app, &error);
                     }
                     let _ = self.engine.send(EngineCommand::HistoryChanged);
                 }
@@ -1368,8 +1368,8 @@ impl ActionRuntime {
                         // An automatic switch has its own text (spec §2.5); the
                         // engine thread sends it once the switch has landed.
                         SwitchNotice::Switched(_) if by == By::Auto => {}
-                        SwitchNotice::Switched(text) => notify::send_switch(&text),
-                        SwitchNotice::Error(text) => notify::send_error(&text),
+                        SwitchNotice::Switched(text) => notify::send_switch(&self.app, &text),
+                        SwitchNotice::Error(text) => notify::send_error(&self.app, &text),
                     }
                 }
                 let _ = self
@@ -1380,14 +1380,14 @@ impl ActionRuntime {
             Err(SwitchError::CurrentNotSaved { email }) => match self.pending_for(key, email) {
                 Ok(pending) => ActionReply::NotSaved(pending),
                 Err(message) => {
-                    notify::send_error(&message);
+                    notify::send_error(&self.app, &message);
                     ActionReply::Failed(message)
                 }
             },
             Err(error) => {
                 let message = error.to_string();
                 // A switch error is always shown, whatever notifyOnSwitch says.
-                notify::send_error(&message);
+                notify::send_error(&self.app, &message);
                 ActionReply::Failed(message)
             }
         }
@@ -1612,11 +1612,14 @@ impl ActionRuntime {
                                             if let Some(account) =
                                                 file.find_by_identity(&to.acc, &to.org)
                                             {
-                                                notify::send_switch(&agent_switch_message(
-                                                    &account.abbr,
-                                                    cwd.as_deref(),
-                                                    self.claude.home(),
-                                                ));
+                                                notify::send_switch(
+                                                    &self.app,
+                                                    &agent_switch_message(
+                                                        &account.abbr,
+                                                        cwd.as_deref(),
+                                                        self.claude.home(),
+                                                    ),
+                                                );
                                             }
                                         }
                                         Ok(_) => {}

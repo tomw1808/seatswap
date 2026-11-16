@@ -781,18 +781,6 @@ mod tests {
                     monochrome: true,
                 },
             ),
-            // The app's own icon (launcher, window): crates/app/icons/icon.png.
-            (
-                "app-256",
-                256,
-                IconSpec {
-                    abbr: "SC".to_string(),
-                    account_color: [0xd9, 0x77, 0x57],
-                    ring: Some((75.0, [0x22, 0xc5, 0x5e])),
-                    locked: false,
-                    monochrome: false,
-                },
-            ),
             (
                 "unknown-64",
                 64,

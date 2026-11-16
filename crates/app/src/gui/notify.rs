@@ -6,7 +6,10 @@
 //! "Switch" action waits on its own thread so no worker is blocked.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::thread;
+
+use seatswap_core::paths::AppPaths;
 
 #[cfg(all(unix, not(target_os = "macos")))]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -366,11 +369,38 @@ fn notify_in_background(job: impl FnOnce() + Send + 'static) {
     }
 }
 
-/// Every notification starts here: the summary, and on Windows the app id it
-/// is shown under. The only place that calls `DesktopNotification::new()`.
-fn base() -> DesktopNotification {
+/// The app icon (crates/app/icons/icon.png, 256 px): the toast image on Windows
+/// and the `image-path` hint on Linux.
+const APP_ICON: &[u8] = include_bytes!("../../icons/icon.png");
+
+/// The file a notification's icon is read from: `<data_dir>/notification-icon.png`,
+/// written when it is missing or holds another picture (a new data folder, one
+/// a cleaner emptied, or the icon of an older seatswap). The path comes from
+/// the app's [`AppPaths`], never from a shared temp folder. A write that fails
+/// returns an error naming the path, so the notification can still go out
+/// without an image and the failure is printed.
+fn notification_icon(paths: &AppPaths) -> Result<PathBuf, String> {
+    let path = paths.notification_icon();
+    if std::fs::read(&path).is_ok_and(|bytes| bytes == APP_ICON) {
+        return Ok(path);
+    }
+    seatswap_core::atomic::write_atomic(&path, APP_ICON, seatswap_core::atomic::Access::Shared)
+        .map_err(|error| format!("icon {}: {error}", path.display()))?;
+    Ok(path)
+}
+
+/// Every notification starts here: the summary, the app icon, and on Windows
+/// the app id it is shown under. The only place that calls
+/// `DesktopNotification::new()`.
+fn base(paths: &AppPaths) -> DesktopNotification {
     let mut notification = DesktopNotification::new();
     notification.summary("seatswap");
+    match notification_icon(paths) {
+        Ok(icon) => {
+            notification.image_path(&icon.to_string_lossy());
+        }
+        Err(error) => eprintln!("seatswap: notification: {error}"),
+    }
     #[cfg(windows)]
     notification.app_id(registry::APP_ID);
     notification
@@ -389,21 +419,23 @@ pub(crate) fn register_app_id() -> Result<(), String> {
     })
 }
 
-pub(crate) fn send_switch(message: &str) {
+pub(crate) fn send_switch(paths: &AppPaths, message: &str) {
     let body = message.to_string();
+    let paths = paths.clone();
     notify_in_background(move || {
-        let _ = base().body(&body).show();
+        let _ = base(&paths).body(&body).show();
     });
 }
 
-pub(crate) fn send_error(message: &str) {
+pub(crate) fn send_error(paths: &AppPaths, message: &str) {
     let body = message.to_string();
+    let paths = paths.clone();
     notify_in_background(move || {
-        let _ = base().body(&body).show();
+        let _ = base(&paths).body(&body).show();
     });
 }
 
-pub(crate) fn send_login_warning(warning: &LoginWarning, account: &str) {
+pub(crate) fn send_login_warning(paths: &AppPaths, warning: &LoginWarning, account: &str) {
     let body = match warning {
         LoginWarning::Soon { days_left, .. } => format!(
             "{account} — the login ends in {days_left} days. Run `claude` and `/login` to renew it."
@@ -415,8 +447,9 @@ pub(crate) fn send_login_warning(warning: &LoginWarning, account: &str) {
             format!("{account} — the login has ended. Run `claude` and `/login` to renew it.")
         }
     };
+    let paths = paths.clone();
     notify_in_background(move || {
-        let _ = base().body(&body).show();
+        let _ = base(&paths).body(&body).show();
     });
 }
 
@@ -445,8 +478,8 @@ fn click(response: &NotificationResponse, button: &str) -> Option<Click> {
 /// `default`, and only when the notification announces that action (it shows no
 /// button for it). Windows reports a body click by itself and would draw a
 /// button for the action, so it is announced on Linux only.
-fn clickable() -> DesktopNotification {
-    let mut notification = base();
+fn clickable(paths: &AppPaths) -> DesktopNotification {
+    let mut notification = base(paths);
     if cfg!(all(unix, not(target_os = "macos"))) {
         notification.action("default", "Open");
     }
@@ -455,12 +488,20 @@ fn clickable() -> DesktopNotification {
 
 /// A switch suggestion with a "Switch" action. Clicking the body opens the
 /// panel instead (spec §7.4).
-pub(crate) fn send_suggestion(app: tauri::AppHandle, suggestion: &SwitchSuggestion) {
+pub(crate) fn send_suggestion(
+    paths: &AppPaths,
+    app: tauri::AppHandle,
+    suggestion: &SwitchSuggestion,
+) {
     let body = suggestion.text.clone();
     let to_id = suggestion.to.clone();
+    let paths = paths.clone();
     // Waiting for an action blocks, so it gets its own thread.
     thread::spawn(move || {
-        let shown = clickable().body(&body).action("switch", "Switch").show();
+        let shown = clickable(&paths)
+            .body(&body)
+            .action("switch", "Switch")
+            .show();
         let answered = shown.and_then(|handle| {
             handle.wait_for_response(move |response: &NotificationResponse| {
                 match click(response, "switch") {
@@ -484,14 +525,16 @@ pub(crate) fn send_suggestion(app: tauri::AppHandle, suggestion: &SwitchSuggesti
 /// "New login found: <email>. Save it as an account?" — a click on the button
 /// or on the body opens the add view.
 pub(crate) fn send_unknown_login(
+    paths: &AppPaths,
     app: tauri::AppHandle,
     email: Option<&str>,
     org_name: Option<&str>,
 ) {
     let who = email.or(org_name).unwrap_or("unknown account");
     let body = format!("New login found: {who}. Save it as an account?");
+    let paths = paths.clone();
     thread::spawn(move || {
-        let shown = clickable()
+        let shown = clickable(&paths)
             .body(&body)
             .action("open", "Add account…")
             .show();
@@ -541,14 +584,19 @@ fn waiting_text(waiting: &Waiting, this_host: Option<&str>) -> String {
 /// "PR is usable again: its week reset." with a "Switch" action; a click on
 /// the text opens the pop-up (spec §4).
 pub(crate) fn send_usable_again(
+    paths: &AppPaths,
     account: &str,
     reason: &str,
     on_switch: impl FnOnce() + Send + 'static,
     on_open: impl FnOnce() + Send + 'static,
 ) {
     let body = usable_again_text(account, reason);
+    let paths = paths.clone();
     notify_in_background(move || {
-        let shown = clickable().body(&body).action("switch", "Switch").show();
+        let shown = clickable(&paths)
+            .body(&body)
+            .action("switch", "Switch")
+            .show();
         let answered = shown.and_then(|handle| {
             handle.wait_for_response(move |response: &NotificationResponse| {
                 match click(response, "switch") {
@@ -566,10 +614,11 @@ pub(crate) fn send_usable_again(
 
 /// "All accounts are full." plus the next reset when there is one. Not
 /// clickable (spec §4).
-pub(crate) fn send_all_full(next: Option<(&str, &str)>) {
+pub(crate) fn send_all_full(paths: &AppPaths, next: Option<(&str, &str)>) {
     let body = all_full_text(next);
+    let paths = paths.clone();
     notify_in_background(move || {
-        let _ = base().body(&body).show();
+        let _ = base(&paths).body(&body).show();
     });
 }
 
@@ -580,6 +629,7 @@ pub(crate) fn send_all_full(next: Option<(&str, &str)>) {
 /// (`None` in [`Waiting`]); another host's name is in the waiting session.
 #[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) fn send_waiting(
+    paths: &AppPaths,
     waiting: &Waiting,
     host: Option<&str>,
     on_open: impl FnOnce() + Send + 'static,
@@ -587,8 +637,13 @@ pub(crate) fn send_waiting(
     let body = waiting_text(waiting, host);
     let state = Arc::new(WaitingState::default());
     let thread_state = Arc::clone(&state);
-    notify_in_background(
-        move || match clickable().body(&body).timeout(Timeout::Never).show() {
+    let thread_paths = paths.clone();
+    notify_in_background(move || {
+        match clickable(&thread_paths)
+            .body(&body)
+            .timeout(Timeout::Never)
+            .show()
+        {
             Ok(handle) => {
                 let id = handle.id();
                 let withdrawn = {
@@ -600,7 +655,7 @@ pub(crate) fn send_waiting(
                     thread_state.withdrawn.load(Ordering::SeqCst)
                 };
                 if withdrawn {
-                    close_by_id(id);
+                    close_by_id(id, &thread_paths);
                     return;
                 }
                 let answered = handle.wait_for_response(move |response: &NotificationResponse| {
@@ -613,21 +668,26 @@ pub(crate) fn send_waiting(
                 }
             }
             Err(error) => eprintln!("seatswap: notification: {error}"),
-        },
-    );
-    WaitingHandle { state }
+        }
+    });
+    WaitingHandle {
+        state,
+        paths: paths.clone(),
+    }
 }
 
 /// On Windows a toast follows the system's rules: it is shown once, may time
 /// out, and the pop-up keeps the count (spec §4.1).
 #[cfg(windows)]
 pub(crate) fn send_waiting(
+    paths: &AppPaths,
     waiting: &Waiting,
     host: Option<&str>,
     on_open: impl FnOnce() + Send + 'static,
 ) -> WaitingHandle {
     let body = waiting_text(waiting, host);
-    notify_in_background(move || match clickable().body(&body).show() {
+    let paths = paths.clone();
+    notify_in_background(move || match clickable(&paths).body(&body).show() {
         Ok(handle) => {
             let answered = handle.wait_for_response(move |response: &NotificationResponse| {
                 if click(response, "default").is_some() {
@@ -648,6 +708,10 @@ pub(crate) fn send_waiting(
 pub(crate) struct WaitingHandle {
     #[cfg(all(unix, not(target_os = "macos")))]
     state: Arc<WaitingState>,
+    /// The paths the notification was shown with, so closing it can name the
+    /// same icon.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    paths: AppPaths,
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -676,7 +740,7 @@ impl WaitingHandle {
                 *slot
             };
             if let Some(id) = id {
-                close_by_id(id);
+                close_by_id(id, &self.paths);
             }
         }
         // Windows removes toasts by its own rules; notify-rust 4.19 gives no
@@ -691,9 +755,10 @@ impl WaitingHandle {
 /// built from [`base`] with the same id replaces that one, and the immediate
 /// `close` takes it away.
 #[cfg(all(unix, not(target_os = "macos")))]
-fn close_by_id(id: u32) {
+fn close_by_id(id: u32, paths: &AppPaths) {
+    let paths = paths.clone();
     notify_in_background(move || {
-        if let Ok(handle) = base().id(id).show() {
+        if let Ok(handle) = base(&paths).id(id).show() {
             handle.close();
         }
     });
@@ -1643,5 +1708,75 @@ mod tests {
 
     fn snapshot_of(views: Vec<AccountView>) -> Snapshot {
         with_views(views, None, Some(Settings::default()))
+    }
+
+    // ---- Proof tests from the review of Task I-1 ----
+
+    /// The reviewer's second proof test, replaced as the fix brief asks: a
+    /// link planted in the shared temp folder is no longer possible now that
+    /// the icon lives in the user's own data folder. The icon's path must be
+    /// `AppPaths::notification_icon()` under the data folder given to it.
+    #[test]
+    fn proof_the_notification_icon_lives_in_the_app_data_folder() {
+        let tmp = tempfile::tempdir().expect("a temp folder");
+        let paths = AppPaths::at(tmp.path());
+        let icon = notification_icon(&paths).expect("the icon is written");
+        assert_eq!(icon, paths.notification_icon());
+        assert_eq!(icon, tmp.path().join("notification-icon.png"));
+        assert!(icon.is_file(), "the icon file is there");
+    }
+
+    /// The icon step writes the embedded PNG into a data folder that has none
+    /// and returns that path.
+    #[test]
+    fn the_notification_icon_is_written_into_a_new_data_folder() {
+        let tmp = tempfile::tempdir().expect("a temp folder");
+        let paths = AppPaths::at(tmp.path());
+        assert!(
+            !paths.notification_icon().exists(),
+            "the new data folder holds no icon yet"
+        );
+        let icon = notification_icon(&paths).expect("the icon is written");
+        assert_eq!(icon, paths.notification_icon());
+        assert_eq!(std::fs::read(&icon).expect("the icon file"), APP_ICON);
+    }
+
+    /// A cleaner may delete the icon: the next notification writes it again.
+    #[test]
+    fn a_deleted_notification_icon_is_written_again() {
+        let tmp = tempfile::tempdir().expect("a temp folder");
+        let paths = AppPaths::at(tmp.path());
+        let first = notification_icon(&paths).expect("the icon is written");
+        std::fs::remove_file(&first).expect("the icon is removed");
+        let second = notification_icon(&paths).expect("the icon is written again");
+        assert_eq!(second, first);
+        assert_eq!(std::fs::read(&second).expect("the icon file"), APP_ICON);
+    }
+
+    /// An icon file that holds another picture (an older seatswap's icon) is
+    /// replaced by this version's icon.
+    #[test]
+    fn an_outdated_notification_icon_is_replaced() {
+        let tmp = tempfile::tempdir().expect("a temp folder");
+        let paths = AppPaths::at(tmp.path());
+        std::fs::write(paths.notification_icon(), b"an older icon").expect("an old icon");
+        let icon = notification_icon(&paths).expect("the icon is written");
+        assert_eq!(std::fs::read(&icon).expect("the icon file"), APP_ICON);
+    }
+
+    /// A failed write returns an error naming the icon's path, so the
+    /// notification that cannot show it still says where the icon should be.
+    #[test]
+    fn a_notification_icon_that_cannot_be_written_names_the_path() {
+        let tmp = tempfile::tempdir().expect("a temp folder");
+        let not_a_folder = tmp.path().join("data");
+        std::fs::write(&not_a_folder, b"a file where the data folder goes")
+            .expect("the file at the data folder's path");
+        let paths = AppPaths::at(&not_a_folder);
+        let error = notification_icon(&paths).expect_err("the write must fail");
+        assert!(
+            error.contains(&paths.notification_icon().display().to_string()),
+            "the error names the icon's path: {error}"
+        );
     }
 }

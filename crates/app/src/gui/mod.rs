@@ -416,14 +416,17 @@ fn setup(
             // duplicate every notification and fight over the same files.
             let message = listener_start_failure(&error);
             eprintln!("seatswap: {message}");
-            notify::send_error(&message);
+            notify::send_error(&app, &message);
             handle.exit(1);
             return Ok(());
         }
     };
 
     let (ui_tx, ui_rx) = mpsc::channel();
-    let reported_errors = Arc::new(ReportedErrors::new(Box::new(notify::send_error)));
+    let notified_paths = app.clone();
+    let reported_errors = Arc::new(ReportedErrors::new(Box::new(move |text: &str| {
+        notify::send_error(&notified_paths, text)
+    })));
     let printed_warnings = Arc::new(Mutex::new(PrintedWarnings::new()));
     let mut worker = worker::spawn(
         app.clone(),
@@ -636,15 +639,20 @@ fn apply_snapshot(app: &AppHandle, mut snapshot: Snapshot) {
     for notification in due {
         match notification {
             Notification::Suggestion(suggestion) => {
-                notify::send_suggestion(app.clone(), &suggestion);
+                notify::send_suggestion(&state.app, app.clone(), &suggestion);
             }
             Notification::LoginWarning(warning) => {
                 let id = notify::warning_id(&warning).to_string();
                 let name = view_name(&snapshot, &id);
-                notify::send_login_warning(&warning, &name);
+                notify::send_login_warning(&state.app, &warning, &name);
             }
             Notification::UnknownLogin { email, org_name } => {
-                notify::send_unknown_login(app.clone(), email.as_deref(), org_name.as_deref());
+                notify::send_unknown_login(
+                    &state.app,
+                    app.clone(),
+                    email.as_deref(),
+                    org_name.as_deref(),
+                );
             }
             Notification::UsableAgain { id, reason } => {
                 let abbr = view_abbr(&snapshot, &id);
@@ -658,15 +666,15 @@ fn apply_snapshot(app: &AppHandle, mut snapshot: Snapshot) {
                     let handle = open_app.clone();
                     let _ = open_app.run_on_main_thread(move || show_panel(&handle, "main"));
                 };
-                notify::send_usable_again(&abbr, &reason, on_switch, on_open);
+                notify::send_usable_again(&state.app, &abbr, &reason, on_switch, on_open);
             }
             Notification::AllFull { next } => match next {
                 Some((id, at)) => {
                     let abbr = view_abbr(&snapshot, &id);
                     let time = format::format_reset_clock(at, Utc::now(), &Local);
-                    notify::send_all_full(Some((&abbr, &time)));
+                    notify::send_all_full(&state.app, Some((&abbr, &time)));
                 }
-                None => notify::send_all_full(None),
+                None => notify::send_all_full(&state.app, None),
             },
             Notification::Waiting(waiting) => {
                 let this_host = state
@@ -681,7 +689,8 @@ fn apply_snapshot(app: &AppHandle, mut snapshot: Snapshot) {
                     let target = format!("sessions?{session}");
                     let _ = open_app.run_on_main_thread(move || show_window(&handle, &target));
                 };
-                let handle = notify::send_waiting(&waiting, this_host.as_deref(), on_open);
+                let handle =
+                    notify::send_waiting(&state.app, &waiting, this_host.as_deref(), on_open);
                 let previous = lock(&state.waiting).insert(waiting.session.clone(), handle);
                 if let Some(previous) = previous {
                     previous.withdraw();
@@ -862,6 +871,7 @@ pub(crate) fn request_switch(
 ) {
     let state = app.state::<GuiState>();
     let action = state.action.clone();
+    let paths = state.app.clone();
     let app = app.clone();
     thread::spawn(move || {
         let (reply, received) = mpsc::channel();
@@ -873,7 +883,7 @@ pub(crate) fn request_switch(
             reason: None,
             reply,
         })) {
-            notify::send_error(&error);
+            notify::send_error(&paths, &error);
             return;
         }
         match worker_reply(received.recv()) {
@@ -886,7 +896,7 @@ pub(crate) fn request_switch(
                 });
             }
             Ok(_) => {}
-            Err(error) => notify::send_error(&error),
+            Err(error) => notify::send_error(&paths, &error),
         }
     });
 }
@@ -899,6 +909,19 @@ mod tests {
 
     use seatswap_core::paths::ClaudePaths;
 
+    // Windows links the .ico resource into the binaries only, so the unit-test harness has no default window icon.
+    #[cfg(not(windows))]
+    #[test]
+    fn the_bundle_icon_is_the_default_window_icon() {
+        // Every window is built without its own icon, so Tauri's default window
+        // icon (the bundle's icons/icon.png) must be there.
+        let context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+        let icon = context
+            .default_window_icon()
+            .expect("the bundle icon is the default window icon");
+        assert_eq!((icon.width(), icon.height()), (256, 256));
+    }
+
     #[test]
     fn closing_a_window_keeps_the_app_running() {
         assert!(
@@ -906,6 +929,173 @@ mod tests {
             "closing a window must not end the tray app"
         );
         assert!(!keeps_running(Some(0)), "Quit seatswap still ends the app");
+    }
+
+    /// The windows show the app icon: the Swap S drawing of
+    /// `crates/app/icons/icon.png`. The default window icon is the bundle's
+    /// icon, so its picture must be that file's picture.
+    // Windows links the .ico resource into the binaries only, so the unit-test harness has no default window icon.
+    #[test]
+    #[cfg(not(windows))]
+    fn the_default_window_icon_is_the_app_icon() {
+        let context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+        let icon = context
+            .default_window_icon()
+            .expect("the bundle icon is the default window icon");
+        let app_icon = tauri::image::Image::from_bytes(include_bytes!("../../icons/icon.png"))
+            .expect("the app icon is a PNG");
+        assert_eq!((icon.width(), icon.height()), (256, 256));
+        assert_eq!(
+            icon.rgba(),
+            app_icon.rgba(),
+            "the window icon must be the app icon"
+        );
+    }
+
+    /// The `.ico` holds the six sizes the task names, each a PNG.
+    #[test]
+    fn the_icon_file_holds_the_sizes_the_icon_needs() {
+        let ico = include_bytes!("../../icons/icon.ico");
+        assert_eq!(&ico[..4], &[0, 0, 1, 0], "an ICO file");
+        let count = usize::from(u16::from_le_bytes([ico[4], ico[5]]));
+        assert_eq!(count, 6, "six sizes in the .ico");
+        let mut sizes = Vec::new();
+        for index in 0..count {
+            let entry = &ico[6 + index * 16..6 + (index + 1) * 16];
+            let width = if entry[0] == 0 {
+                256
+            } else {
+                u32::from(entry[0])
+            };
+            let height = if entry[1] == 0 {
+                256
+            } else {
+                u32::from(entry[1])
+            };
+            let length = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]) as usize;
+            let offset = u32::from_le_bytes([entry[12], entry[13], entry[14], entry[15]]) as usize;
+            let frame = &ico[offset..offset + length];
+            assert_eq!(
+                &frame[..8],
+                b"\x89PNG\r\n\x1a\n",
+                "the {width} px frame is a PNG"
+            );
+            sizes.push((width, height));
+        }
+        assert_eq!(
+            sizes,
+            vec![(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (256, 256)]
+        );
+    }
+
+    /// The arrow heads of the Swap S drawing at the small sizes: the pixels
+    /// that belong to an arrow head and not to the stroke of the "s". The
+    /// drawing is `crates/app/icons/icon.svg` (256 units): the top arrow head
+    /// is the triangle (164,50) (206,76) (164,102) and the bottom one the
+    /// triangle (92,154) (50,180) (92,206); the stroke is 26 units wide.
+    /// Measured today: 3 pixels per head at 16 px, 7 at 24 px.
+    #[test]
+    fn the_small_frames_keep_the_arrow_heads() {
+        const TOP_HEAD: [(f64, f64); 3] = [(164.0, 50.0), (206.0, 76.0), (164.0, 102.0)];
+        const TOP_BAR: [(f64, f64); 2] = [(168.0, 76.0), (104.0, 76.0)];
+        const BOTTOM_HEAD: [(f64, f64); 3] = [(92.0, 154.0), (50.0, 180.0), (92.0, 206.0)];
+        const BOTTOM_BAR: [(f64, f64); 2] = [(152.0, 180.0), (88.0, 180.0)];
+        /// Half the width of the "s" stroke.
+        const STROKE_HALF: f64 = 13.0;
+
+        for size in [16u32, 24] {
+            let frame = icon_frame(size);
+            let top = arrow_head_pixels(&frame, size, TOP_HEAD, TOP_BAR, STROKE_HALF);
+            let bottom = arrow_head_pixels(&frame, size, BOTTOM_HEAD, BOTTOM_BAR, STROKE_HALF);
+            assert!(top >= 2, "{size} px: {top} pixels of the top arrow head");
+            assert!(
+                bottom >= 2,
+                "{size} px: {bottom} pixels of the bottom arrow head"
+            );
+        }
+    }
+
+    /// The frame of the `.ico` with the wanted size, as RGBA.
+    fn icon_frame(size: u32) -> Vec<u8> {
+        let ico = include_bytes!("../../icons/icon.ico");
+        let count = usize::from(u16::from_le_bytes([ico[4], ico[5]]));
+        for index in 0..count {
+            let entry = &ico[6 + index * 16..6 + (index + 1) * 16];
+            let width = if entry[0] == 0 {
+                256
+            } else {
+                u32::from(entry[0])
+            };
+            if width != size {
+                continue;
+            }
+            let length = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]) as usize;
+            let offset = u32::from_le_bytes([entry[12], entry[13], entry[14], entry[15]]) as usize;
+            let image = tauri::image::Image::from_bytes(&ico[offset..offset + length])
+                .expect("the frame is a PNG");
+            return image.rgba().to_vec();
+        }
+        panic!("the .ico has no {size} px frame");
+    }
+
+    /// The pixels of `frame` that lie in the arrow head `head`, more than
+    /// `stroke_half` away from the bar `bar` the head covers, and carry the
+    /// drawing's ink.
+    fn arrow_head_pixels(
+        frame: &[u8],
+        size: u32,
+        head: [(f64, f64); 3],
+        bar: [(f64, f64); 2],
+        stroke_half: f64,
+    ) -> usize {
+        let scale = 256.0 / f64::from(size);
+        let mut count = 0;
+        for y in 0..size {
+            for x in 0..size {
+                let point = ((f64::from(x) + 0.5) * scale, (f64::from(y) + 0.5) * scale);
+                if !in_triangle(point, head) {
+                    continue;
+                }
+                if distance_to_segment(point, bar[0], bar[1]) <= stroke_half {
+                    continue;
+                }
+                let index = ((y * size + x) * 4) as usize;
+                let red = f64::from(frame[index]);
+                let green = f64::from(frame[index + 1]);
+                let blue = f64::from(frame[index + 2]);
+                let light = 0.299 * red + 0.587 * green + 0.114 * blue;
+                if light < 100.0 {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    /// Whether the point lies in the triangle.
+    fn in_triangle(point: (f64, f64), triangle: [(f64, f64); 3]) -> bool {
+        let side = |a: (f64, f64), b: (f64, f64), c: (f64, f64)| {
+            (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
+        };
+        let first = side(triangle[0], triangle[1], point);
+        let second = side(triangle[1], triangle[2], point);
+        let third = side(triangle[2], triangle[0], point);
+        let negative = first < 0.0 || second < 0.0 || third < 0.0;
+        let positive = first > 0.0 || second > 0.0 || third > 0.0;
+        !(negative && positive)
+    }
+
+    /// The distance from the point to the line through `a` and `b`.
+    fn distance_to_segment(point: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let length = dx * dx + dy * dy;
+        let along = if length == 0.0 {
+            0.0
+        } else {
+            (((point.0 - a.0) * dx + (point.1 - a.1) * dy) / length).clamp(0.0, 1.0)
+        };
+        let (x, y) = (a.0 + along * dx, a.1 + along * dy);
+        ((point.0 - x).powi(2) + (point.1 - y).powi(2)).sqrt()
     }
 
     #[test]

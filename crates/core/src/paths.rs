@@ -276,6 +276,12 @@ impl AppPaths {
     pub fn gui_lock(&self) -> PathBuf {
         self.data_dir.join("gui.lock")
     }
+    /// The app icon a desktop notification shows: `<data_dir>/notification-icon.png`.
+    /// Written from the embedded PNG when a notification needs it, so the file
+    /// lives in the user's own folder and never in a shared temp folder.
+    pub fn notification_icon(&self) -> PathBuf {
+        self.data_dir.join("notification-icon.png")
+    }
     /// The history folder when the setting names none: `<data_dir>/history`.
     pub fn history_dir(&self) -> PathBuf {
         self.data_dir.join("history")

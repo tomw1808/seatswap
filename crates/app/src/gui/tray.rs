@@ -7,6 +7,7 @@
 use chrono::{DateTime, Local, Utc};
 use seatswap_core::api::Usage;
 use seatswap_core::engine::AccountView;
+use seatswap_core::paths::AppPaths;
 use seatswap_core::store::{IconLimit, LoginState, Settings, TrayText};
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
@@ -191,7 +192,8 @@ pub(crate) fn start(app: &AppHandle) {
     if let Err(error) = try_build(app) {
         let message = no_tray_message(&error);
         eprintln!("seatswap: {message}");
-        wait_for_a_tray(app, message);
+        let paths = app.state::<GuiState>().app.clone();
+        wait_for_a_tray(app, &paths, message);
     }
 }
 
@@ -222,7 +224,7 @@ fn try_build(app: &AppHandle) -> Result<(), String> {
 /// first try often comes too early. The notification is therefore shown only
 /// when no tray has appeared after [`TRAY_GRACE`].
 #[cfg(target_os = "linux")]
-fn wait_for_a_tray(app: &AppHandle, message: String) {
+fn wait_for_a_tray(app: &AppHandle, paths: &AppPaths, message: String) {
     use gtk::{gio, glib};
     use std::sync::{Arc, Mutex};
 
@@ -248,12 +250,13 @@ fn wait_for_a_tray(app: &AppHandle, message: String) {
     *super::lock(&watch) = Some(id);
 
     let app = app.clone();
+    let paths = paths.clone();
     glib::timeout_add_local_once(TRAY_GRACE, move || {
         let shown = app
             .try_state::<GuiState>()
             .is_some_and(|state| super::lock(&state.tray).is_some());
         if !shown {
-            super::notify::send_error(&message);
+            super::notify::send_error(&paths, &message);
         }
     });
 }
@@ -261,8 +264,8 @@ fn wait_for_a_tray(app: &AppHandle, message: String) {
 /// Elsewhere the tray is part of the system; there is nothing to wait for, so
 /// the user is told at once.
 #[cfg(not(target_os = "linux"))]
-fn wait_for_a_tray(_app: &AppHandle, message: String) {
-    super::notify::send_error(&message);
+fn wait_for_a_tray(_app: &AppHandle, paths: &AppPaths, message: String) {
+    super::notify::send_error(paths, &message);
 }
 
 /// The D-Bus name of the tray host registry on Linux (StatusNotifierItem spec).

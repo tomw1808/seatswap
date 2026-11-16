@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Swap S icon">
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="#22c55e"/>
+  <path d="M168 76 H104 A26 26 0 0 0 104 128 H152 A26 26 0 0 1 152 180 H88" fill="none" stroke="#0f1115" stroke-width="26"/>
+  <path d="M164 50 L206 76 L164 102 Z" fill="#0f1115"/>
+  <path d="M92 154 L50 180 L92 206 Z" fill="#0f1115"/>
+</svg>
