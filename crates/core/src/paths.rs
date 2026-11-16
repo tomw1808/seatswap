@@ -988,7 +988,9 @@ mod tests {
         );
     }
 
+    // A file used as a parent folder is ENOTDIR on Unix; Windows reports it as not found.
     #[test]
+    #[cfg(unix)]
     fn an_info_json_that_cannot_be_checked_is_an_error_naming_the_file() {
         let tmp = tempfile::tempdir().unwrap();
         // A regular file cannot be the folder of `info.json`, so checking the

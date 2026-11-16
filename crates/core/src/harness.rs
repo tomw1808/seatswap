@@ -1104,11 +1104,14 @@ mod tests {
         }
     }
 
-    /// A process table that cannot be read, for the warning tests.
+    /// A process table that cannot be read, for the warning tests (Linux only,
+    /// where the walk exists).
+    #[cfg(target_os = "linux")]
     struct BrokenProc {
         pids: bool,
     }
 
+    #[cfg(target_os = "linux")]
     impl ProcSource for BrokenProc {
         fn pids(&self) -> io::Result<Vec<u32>> {
             if self.pids {
@@ -1127,7 +1130,9 @@ mod tests {
         }
     }
 
+    // The process walk exists on Linux only (docs/windows.md).
     #[test]
+    #[cfg(target_os = "linux")]
     fn an_unreadable_process_table_is_a_warning() {
         let (_tmp, paths) = store();
 
@@ -1142,7 +1147,9 @@ mod tests {
         );
     }
 
+    // The process walk exists on Linux only (docs/windows.md).
     #[test]
+    #[cfg(target_os = "linux")]
     fn an_unreadable_file_list_is_a_warning() {
         let (_tmp, paths) = store();
 
@@ -1157,7 +1164,9 @@ mod tests {
         );
     }
 
+    // A file used as a parent folder is ENOTDIR on Unix; Windows reports it as not found.
     #[test]
+    #[cfg(unix)]
     fn a_sessions_folder_that_cannot_be_resolved_is_a_warning() {
         let tmp = tempfile::tempdir().expect("tempdir");
         // A regular file cannot be a parent folder, so resolving below it fails
@@ -1202,7 +1211,9 @@ mod tests {
         assert!(warnings[0].contains("denied"));
     }
 
+    // The process walk exists on Linux only (docs/windows.md).
     #[test]
+    #[cfg(target_os = "linux")]
     fn a_running_job_is_linked_through_its_lock_holder() {
         let (_tmp, paths) = store();
         let lock = paths.sessions.join(KEY).join(JOB).join(SESSION_LOCK);
@@ -1241,7 +1252,9 @@ mod tests {
         assert!(owners.is_empty(), "{owners:?}");
     }
 
+    // The process walk exists on Linux only (docs/windows.md).
     #[test]
+    #[cfg(target_os = "linux")]
     fn one_walk_collects_the_locks_and_the_open_files() {
         let (tmp, paths) = store();
         let lock = paths.sessions.join(KEY).join(JOB).join(SESSION_LOCK);
