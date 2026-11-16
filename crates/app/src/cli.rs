@@ -638,7 +638,10 @@ fn statusline_output(cli: &Cli, stdin: &[u8], now: DateTime<Utc>) -> String {
 
 /// Everything the line needs, read without a lock, without the network and
 /// without opening a secret store: `accounts.json`, the usage cache and Claude
-/// Code's two files.
+/// Code's two files. The feed is published and the line built first; the
+/// recorder (`statusline-keys.json`) runs last, and its error does not change
+/// the printed line: the window's `statusline_keys` command reads the same file
+/// and shows that error on the page.
 fn statusline_line(cli: &Cli, stdin: &[u8], now: DateTime<Utc>) -> Result<String, String> {
     let app = AppPaths::resolve(cli.data_dir.as_deref()).map_err(|error| error.to_string())?;
     if !app.accounts_file().is_file() {
@@ -649,9 +652,6 @@ fn statusline_line(cli: &Cli, stdin: &[u8], now: DateTime<Utc>) -> Result<String
         .validate()
         .map_err(|error| error.to_string())?;
     let payload = statusline::parse(stdin);
-    if let Err(reason) = statusline::record_keys(&app, &file.settings, &payload, now) {
-        return Err(format!("keys: {reason}"));
-    }
     if let Err(reason) = statusline::publish_feed(&app, &file.settings, &payload, now) {
         return Err(format!("feed: {reason}"));
     }
@@ -674,7 +674,7 @@ fn statusline_line(cli: &Cli, stdin: &[u8], now: DateTime<Utc>) -> Result<String
         user_name()?,
         now,
     )?;
-    Ok(statusline::render::ansi(
+    let line = statusline::render::ansi(
         &statusline::render::render_spans(
             &file.settings.statusline,
             &payload,
@@ -683,7 +683,11 @@ fn statusline_line(cli: &Cli, stdin: &[u8], now: DateTime<Utc>) -> Result<String
             &Local,
         )
         .0,
-    ))
+    );
+    // The recorded field names are a diagnostic list, not the line: a broken
+    // keys file must not cost the line or the feed above.
+    let _ = statusline::record_keys(&app, &file.settings, &payload, now);
+    Ok(line)
 }
 
 /// The user name of the line's `user@host`: `$USER` on Unix, `%USERNAME%` on
@@ -2070,7 +2074,7 @@ pub(crate) mod tests {
     use seatswap_core::history::{LimitSample, Sample, Source, TokenRecord};
     use seatswap_core::paths::ClaudePaths;
     use seatswap_core::project::ProjectKey;
-    use seatswap_core::store::{FileSecrets, LoginState, Settings, Store};
+    use seatswap_core::store::{FileSecrets, LoginState, Settings, StatuslineConfig, Store};
     use seatswap_core::types::OAuthAccount;
 
     /// The status line of an explicit data and Claude config folder, for the
@@ -2817,6 +2821,61 @@ pub(crate) mod tests {
         let mut input: &[u8] = br#"{"model":{"id":"claude-fable-5-2","display_name":"Fable 5.2"}}"#;
         let line = statusline(&fixture.cli(Command::Statusline), &mut input);
         assert!(line.contains("Fable 5.2"), "{line}");
+    }
+
+    #[test]
+    fn a_broken_keys_file_keeps_the_line_and_the_feed() {
+        let fixture = Fixture::new();
+        fixture.add_account(0);
+        let app = AppPaths::at(&fixture.data_dir);
+        let now = Utc::now();
+        let payload = statusline::README_PAYLOAD.as_bytes();
+
+        let line_without_recording =
+            statusline_output(&fixture.cli(Command::Statusline), payload, now);
+
+        let store = fixture.store();
+        let mut file = store.load().expect("accounts");
+        file.settings.statusline_record_until = Some(now + Duration::minutes(1));
+        store.save(&file).expect("the recording setting");
+        if app.feed_file().exists() {
+            fs::remove_file(app.feed_file()).expect("the feed file of the first run");
+        }
+        let broken = b"not a recording";
+        fs::write(app.statusline_keys_file(), broken).expect("the broken keys file");
+
+        let line = statusline_output(&fixture.cli(Command::Statusline), payload, now);
+
+        assert_eq!(line, line_without_recording, "the line stays the same");
+        assert!(!line.starts_with("seatswap: keys: "), "{line}");
+        assert!(app.feed_file().is_file(), "the feed is still written");
+        assert_eq!(
+            fs::read(app.statusline_keys_file()).expect("the keys file"),
+            broken,
+            "the broken file is unchanged"
+        );
+    }
+
+    #[test]
+    fn an_empty_layout_prints_an_empty_line() {
+        let fixture = Fixture::new();
+        fixture.add_account(0);
+        let store = fixture.store();
+        let mut file = store.load().expect("accounts");
+        file.settings.statusline = StatuslineConfig {
+            left: Vec::new(),
+            right: Vec::new(),
+            margin: 4,
+        };
+        store.save(&file).expect("the empty layout");
+
+        let line = statusline_output(
+            &fixture.cli(Command::Statusline),
+            statusline::README_PAYLOAD.as_bytes(),
+            Utc::now(),
+        );
+
+        assert_eq!(line, "");
     }
 
     #[test]

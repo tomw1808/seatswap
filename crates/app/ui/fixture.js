@@ -1591,8 +1591,14 @@ function fixtureStatuslinePreview(config, widths, scenario) {
     throw new Error("the preview needs at least one width");
   }
   for (const width of widths) {
-    if (!Number.isInteger(width) || width < 1) {
-      throw new Error(`a preview width must be at least 1 column, got ${JSON.stringify(width)}`);
+    if (!Number.isInteger(width)) {
+      throw new Error(`a preview width must be a whole number of columns, got ${JSON.stringify(width)}`);
+    }
+    if (width === 0) {
+      throw new Error("a preview width must be at least 1 column; 0 cannot show a line");
+    }
+    if (width < 0 || width > 65535) {
+      throw new Error(`invalid value: integer \`${width}\`, expected u16`);
     }
   }
   if (!["live", "nearFull", "blocked", "noSessionLimit"].includes(scenario)) {
@@ -1608,8 +1614,11 @@ function fixtureStatuslinePreview(config, widths, scenario) {
       const right = rightPieces.filter((piece) => piece === null || piece.drop === null || piece.drop > level);
       const leftLength = left.reduce((sum, piece) => sum + (piece ? piece.text.length : 0), 0);
       const rightLength = right.reduce((sum, piece) => sum + (piece ? piece.text.length : 0), 0);
-      const gap = Math.max(2, width - config.margin - leftLength - rightLength);
-      const fits = leftLength + gap + rightLength <= width - config.margin;
+      // The same gap rule as render.rs: the two spaces belong between two zones
+      // that both print something; an empty zone needs none.
+      const gapRule = leftLength > 0 && rightLength > 0 ? 2 : 0;
+      const gap = Math.max(gapRule, width - config.margin - leftLength - rightLength);
+      const fits = leftLength + gapRule + rightLength <= width - config.margin;
       chosen = { left, right, gap, fits };
       if (fits || level >= 3) break;
       level += 1;
@@ -1633,7 +1642,10 @@ function fixtureStatuslinePreview(config, widths, scenario) {
         bold: false,
       });
     }
-    spans.push({ text: " ".repeat(chosen.gap), fg: null, bg: null, bold: false });
+    const rightPrints = chosen.right.some((piece) => piece !== null && piece.text.length > 0);
+    if (rightPrints && chosen.gap > 0) {
+      spans.push({ text: " ".repeat(chosen.gap), fg: null, bg: null, bold: false });
+    }
     for (const piece of chosen.right) {
       if (!piece) continue;
       spans.push({

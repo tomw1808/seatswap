@@ -826,6 +826,15 @@ async function installLine() {
   renderAll();
 }
 
+// Read Claude Code's current status line again, then show the card: the file
+// may have been changed by hand or by another window since the area opened.
+async function openInstallCard() {
+  await loadInstall();
+  if (!state.active) return;
+  state.cardOpen = state.install !== null;
+  renderAll();
+}
+
 async function restoreLine() {
   const before = state.install;
   try {
@@ -854,10 +863,7 @@ function head() {
   });
   useButton.disabled = install === null || install.installed;
   if (install === null) useButton.title = "the install state could not be read";
-  useButton.addEventListener("click", () => {
-    state.cardOpen = true;
-    renderAll();
-  });
+  useButton.addEventListener("click", () => void openInstallCard());
   const restoreButton = h("button", {
     type: "button",
     class: "hbtn",
@@ -1657,11 +1663,7 @@ function previewWidths() {
     if (!/^\d+$/.test(text)) {
       return { error: `preview width ${JSON.stringify(state.widths[index])} is not a whole number of columns` };
     }
-    const width = Number(text);
-    if (width < 1 || width > 65535) {
-      return { error: `preview width ${width} is outside 1 to 65535 columns` };
-    }
-    widths.push(width);
+    widths.push(Number(text));
   }
   return { widths };
 }
@@ -2062,16 +2064,31 @@ function focusedChip() {
   return null;
 }
 
-export function update(snapshot) {
+export async function update(snapshot) {
   if (!state.active) return;
   state.snapshot = isObject(snapshot) ? snapshot : {};
+  // Every snapshot can change the live numbers the preview shows, so the next
+  // request must not be skipped as unchanged. A layout change still waits for
+  // `schedulePreview`'s delay.
+  state.previewKey = null;
   if (focusInside(state.container)) {
     takeSettings(state.snapshot);
+    // Only the preview box is redrawn: the chip or field being typed in stays.
+    void requestPreview();
     return;
   }
   const focused = focusedChip();
   if (focused) state.focusTarget = focused;
   takeSettings(state.snapshot);
+  // Claude Code's settings file can change by hand or in another window: the
+  // head buttons and the install card read it again with every snapshot.
+  await loadInstall();
+  if (!state.active) return;
+  if (focusInside(state.container)) {
+    takeSettings(state.snapshot);
+    void requestPreview();
+    return;
+  }
   renderAll();
 }
 

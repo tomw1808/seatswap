@@ -1072,7 +1072,10 @@ fn live_state_of(live: &super::worker::LiveView) -> LiveState {
 }
 
 /// Render the builder's preview once per width: the given config, never the
-/// stored one, and README §5's payload for every scenario.
+/// stored one, and [`statusline::preview_payload`]'s made-up session — a folder
+/// under the live home, the sample branch, context, cost and lines — with the
+/// live account's numbers. `preview_lines` is the one place the widths are
+/// checked.
 #[cfg(feature = "gui")]
 #[tauri::command]
 pub(crate) fn statusline_preview(
@@ -1081,17 +1084,11 @@ pub(crate) fn statusline_preview(
     widths: Vec<u16>,
     scenario: Scenario,
 ) -> Result<Vec<PreviewLine>, String> {
-    if widths.is_empty() {
-        return Err("the preview needs at least one width".to_string());
-    }
-    if widths.contains(&0) {
-        return Err("a preview width must be at least 1 column; 0 cannot show a line".to_string());
-    }
     let snapshot = state.snapshot()?;
     if snapshot.settings.is_none() {
         return Err("accounts.json cannot be read; the preview has no data".to_string());
     }
-    let payload = statusline::parse(statusline::README_PAYLOAD.as_bytes());
+    let payload = statusline::preview_payload(state.claude.home());
     let now = Utc::now();
     let facts = statusline::facts_from_source(
         &SnapshotFacts {

@@ -231,11 +231,12 @@ pub(crate) struct FittedLine {
 }
 
 /// The fitted line as spans: left spans, one span of spaces for the gap, right
-/// spans. `width = None`: the right part follows the left after two spaces and
-/// nothing is dropped. With a width the right part is flush with `width -
-/// margin`, and segments are dropped by their `drop` number until the line
-/// fits; when nothing is left to drop it is printed anyway. The second value
-/// is the drop numbers removed.
+/// spans. `width = None`: the right part follows the left after the gap (two
+/// spaces when both zones print something, none when one is empty) and nothing
+/// is dropped. With a width the right part is flush with `width - margin`, and
+/// segments are dropped by their `drop` number until the line fits; when
+/// nothing is left to drop it is printed anyway. The second value is the drop
+/// numbers removed.
 pub(crate) fn render_spans<Tz: TimeZone>(
     config: &StatuslineConfig,
     payload: &Payload,
@@ -331,24 +332,15 @@ where
             dropped_kinds,
         };
     }
-    let mut spans = left_spans;
-    let gap = if spans.is_empty() {
-        match width {
-            Some(width) => {
-                let target = usize::from(width).saturating_sub(usize::from(config.margin));
-                target.saturating_sub(right_width)
-            }
-            None => 0,
+    let min_gap = zone_gap(left_width, right_width);
+    let gap = match width {
+        Some(width) => {
+            let target = usize::from(width).saturating_sub(usize::from(config.margin));
+            target.saturating_sub(left_width + right_width).max(min_gap)
         }
-    } else {
-        match width {
-            Some(width) => {
-                let target = usize::from(width).saturating_sub(usize::from(config.margin));
-                target.saturating_sub(left_width + right_width).max(2)
-            }
-            None => 2,
-        }
+        None => min_gap,
     };
+    let mut spans = left_spans;
     if gap > 0 {
         spans.push(Span {
             text: " ".repeat(gap),
@@ -394,12 +386,22 @@ fn spans_width(spans: &[Span]) -> usize {
     spans.iter().map(|span| visible_width(&span.text)).sum()
 }
 
+/// The two spaces between the zones, when there are two zones to separate. An
+/// empty zone takes no gap, so the other zone can sit flush against the margin.
+fn zone_gap(left_width: usize, right_width: usize) -> usize {
+    if left_width > 0 && right_width > 0 {
+        2
+    } else {
+        0
+    }
+}
+
 /// Whether the line built from the segments above `level` keeps the margin and
-/// the two spaces between the zones.
+/// the gap the two zones need.
 fn fits(left: &[Piece], right: &[Piece], level: Option<u8>, margin: u16, width: u16) -> bool {
-    let left = compose_zone(left, level);
-    let right = compose_zone(right, level);
-    spans_width(&left) + 2 + spans_width(&right) + usize::from(margin) <= usize::from(width)
+    let left = spans_width(&compose_zone(left, level));
+    let right = spans_width(&compose_zone(right, level));
+    left + zone_gap(left, right) + right + usize::from(margin) <= usize::from(width)
 }
 
 /// `text` without its ANSI escape sequences.
@@ -603,7 +605,11 @@ where
         SegmentKind::GitBranch => facts.git_branch.clone(),
         SegmentKind::UserHost => Some(format!("{}@{}", facts.user, facts.host)),
         SegmentKind::Clock => Some(facts.now.with_timezone(tz).format("%H:%M").to_string()),
-        SegmentKind::Text => segment.text.clone(),
+        SegmentKind::Text => segment
+            .text
+            .as_ref()
+            .filter(|text| !text.is_empty())
+            .cloned(),
         SegmentKind::Separator => Some("|".to_string()),
         SegmentKind::ContextUsed => field_paths(SegmentKind::ContextUsed)
             .first()
@@ -1055,6 +1061,60 @@ mod tests {
             assert!(dropped.is_empty(), "nothing was dropped");
             assert_eq!(ansi(&spans), "");
         }
+    }
+
+    #[test]
+    fn an_empty_zone_needs_no_gap() {
+        // "Limits only" leaves the left zone empty; its right zone prints 23
+        // columns and its margin is 4, so 27 columns fit it exactly. The old
+        // rule reserved two more for the gap and dropped both reset times.
+        let limits = StatuslineConfig::limits_only();
+        let (spans, dropped) = render_spans(&limits, &payload(), &facts(), Some(27), &offset());
+        assert!(dropped.is_empty(), "nothing is dropped while the line fits");
+        assert_eq!(visible_text(&ansi(&spans)), "AC 12% 4h45m  48% 3d16h");
+
+        let (spans, dropped) = render_spans(&limits, &payload(), &facts(), Some(26), &offset());
+        assert_eq!(dropped, vec![1], "one column less drops the first segments");
+        let text = visible_text(&ansi(&spans));
+        assert!(text.ends_with("AC 12%  48%"), "{text}");
+        assert_eq!(
+            visible_width(&text),
+            22,
+            "the right zone is flush with the margin"
+        );
+
+        // The same with an empty right zone and the same segments on the left.
+        let mut mirrored = StatuslineConfig::limits_only();
+        mirrored.left = mirrored.right;
+        mirrored.right = Vec::new();
+        let (spans, dropped) = render_spans(&mirrored, &payload(), &facts(), Some(27), &offset());
+        assert!(dropped.is_empty(), "nothing is dropped while the line fits");
+        assert_eq!(visible_text(&ansi(&spans)), "AC 12% 4h45m  48% 3d16h");
+
+        let (spans, dropped) = render_spans(&mirrored, &payload(), &facts(), Some(26), &offset());
+        assert_eq!(dropped, vec![1], "one column less drops the first segments");
+        assert_eq!(visible_text(&ansi(&spans)), "AC 12%  48%");
+    }
+
+    #[test]
+    fn an_empty_text_prints_nothing() {
+        let mut text = segment(SegmentKind::Text);
+        text.text = Some(String::new());
+        text.prefix = " | ".to_string();
+        text.suffix = "!".to_string();
+        let config = StatuslineConfig {
+            left: vec![text],
+            right: Vec::new(),
+            margin: 0,
+        };
+
+        let (spans, dropped) = render_spans(&config, &payload(), &facts(), None, &offset());
+        assert_eq!(
+            ansi(&spans),
+            "",
+            "an empty text prints no prefix and no suffix"
+        );
+        assert!(dropped.is_empty(), "nothing was dropped");
     }
 
     fn segment(kind: SegmentKind) -> Segment {

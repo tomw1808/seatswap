@@ -26,9 +26,13 @@ pub(crate) mod width;
 use render::{git_branch, AccountFacts, Facts, Limit2, Span};
 
 /// The status line payload of `specs/plan/README.md` §5, whole. The preview
-/// uses this one payload for every scenario.
+/// draws [`preview_payload`] instead; this is the tests' copy of README §5.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const README_PAYLOAD: &str = r#"{"workspace":{"current_dir":"/home/sam/projects/atlas"},"model":{"id":"claude-fable-5-2","display_name":"Fable 5.2"},"effort":{"level":"high"},"rate_limits":{"five_hour":{"used_percentage":12,"resets_at":1794490200},"seven_day":{"used_percentage":48,"resets_at":1794790800}}}"#;
+
+/// The branch the preview's made-up session is on. The preview's folder does
+/// not exist on the machine, so `.git/HEAD` has no branch to read.
+const PREVIEW_BRANCH: &str = "main";
 
 /// The parts of the payload seatswap reads. Unknown keys are ignored: Claude
 /// Code adds keys with new versions. A key that is missing or `null` is `None`.
@@ -101,6 +105,48 @@ pub(crate) fn parse(stdin: &[u8]) -> Payload {
     let mut payload: Payload = serde_json::from_value(raw.clone()).unwrap_or_default();
     payload.raw = raw;
     payload
+}
+
+/// The preview's made-up session: README §5's payload, with the folder
+/// `home/projects/atlas` and the keys Claude Code sends after a session's first
+/// answer (its context window, cost, lines and prompt). The numbers are the
+/// fixture's samples; only the account's numbers on the preview line are live.
+#[cfg_attr(not(any(feature = "gui", test)), allow(dead_code))]
+pub(crate) fn preview_payload(home: &std::path::Path) -> Payload {
+    let folder = home.join("projects").join("atlas");
+    let raw = serde_json::json!({
+        "workspace": {"current_dir": folder.display().to_string()},
+        "model": {"id": "claude-fable-5-2", "display_name": "Fable 5.2"},
+        "effort": {"level": "high"},
+        "rate_limits": {
+            "five_hour": {"used_percentage": 12, "resets_at": 1794490200},
+            "seven_day": {"used_percentage": 48, "resets_at": 1794790800}
+        },
+        "context_window": {
+            "context_window_size": 200000,
+            "total_input_tokens": 82000,
+            "total_output_tokens": 4100,
+            "used_percentage": 41,
+            "remaining_percentage": 59,
+            "current_usage": {
+                "input_tokens": 82000,
+                "output_tokens": 4100,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0
+            }
+        },
+        "cost": {
+            "total_cost_usd": 3.2,
+            "total_duration_ms": 300000,
+            "total_api_duration_ms": 210000,
+            "total_lines_added": 120,
+            "total_lines_removed": 8
+        },
+        "session_name": "atlas-a6",
+        "prompt_id": "0b6f3a1c-5d7e-4f2a-9c8b-7e6d5c4b3a21",
+        "prompt_cache": {}
+    });
+    parse(raw.to_string().as_bytes())
 }
 
 /// The feed a payload carries: its 5 h and weekly numbers and its model, at
@@ -549,8 +595,10 @@ pub(crate) struct PreviewLine {
     pub note: String,
 }
 
-/// Render `config` (never the stored one) once per width. A width of 0 or an
-/// empty list is an error: the preview must show a line, not silently skip it.
+/// Render `config` (never the stored one) once per width. The preview's session
+/// is made up: its folder is the payload's, its branch is [`PREVIEW_BRANCH`] and
+/// only the account's numbers come from `facts`. A width of 0 or an empty list
+/// is an error: the preview must show a line, not silently skip it.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn preview_lines<Tz: TimeZone>(
     config: &StatuslineConfig,
@@ -569,7 +617,9 @@ where
     if widths.contains(&0) {
         return Err("a preview width must be at least 1 column; 0 cannot show a line".to_string());
     }
-    let facts = scenario.facts(facts.clone());
+    let mut facts = facts.clone();
+    facts.git_branch = Some(PREVIEW_BRANCH.to_string());
+    let facts = scenario.facts(facts);
     let mut lines = Vec::with_capacity(widths.len());
     for &width in widths {
         let fitted = render::fitted_line(config, payload, &facts, Some(width), tz);
@@ -1146,7 +1196,10 @@ mod tests {
         let line =
             crate::cli::tests::statusline_output_at(&app, &claude, README_PAYLOAD.as_bytes(), now);
 
-        assert!(line.starts_with("seatswap: keys: "), "{line}");
+        assert!(
+            !line.starts_with("seatswap: keys: "),
+            "the broken file does not cost the line: {line}"
+        );
         assert_eq!(
             fs::read(app.statusline_keys_file()).expect("the keys file is still there"),
             broken,
@@ -1168,6 +1221,72 @@ mod tests {
             record_until(1, now).expect("one minute"),
             now + chrono::Duration::minutes(1)
         );
+    }
+
+    #[test]
+    fn the_preview_shows_the_optional_segments() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path();
+        let payload = preview_payload(home);
+        let facts = render::Facts {
+            user: "sam".to_string(),
+            host: "atlas".to_string(),
+            home: home.display().to_string(),
+            now: at("2026-11-14T14:00:00.336716Z"),
+            account: Some(render::AccountFacts {
+                abbr: "AC".to_string(),
+                color: "#3b82f6".to_string(),
+                plan: None,
+            }),
+            five_hour: Some(render::Limit2 {
+                percent: 12.0,
+                resets_at: Some(at("2026-11-14T19:30:00.336716Z")),
+            }),
+            week: Some(render::Limit2 {
+                percent: 48.0,
+                resets_at: Some(at("2026-11-16T02:00:00.336716Z")),
+            }),
+            model_limits: Vec::new(),
+            burn_next: None,
+            git_branch: None,
+        };
+        let part = |kind| Segment {
+            kind,
+            color: ColorRule::None,
+            prefix: " ".to_string(),
+            suffix: String::new(),
+            drop: None,
+            time_format: None,
+            text: None,
+        };
+        let mut folder = part(SegmentKind::Folder);
+        folder.prefix = String::new();
+        let config = StatuslineConfig {
+            left: vec![
+                part(SegmentKind::ContextUsed),
+                part(SegmentKind::SessionCost),
+                part(SegmentKind::LinesChanged),
+                part(SegmentKind::GitBranch),
+                folder,
+            ],
+            right: Vec::new(),
+            margin: 0,
+        };
+
+        let preview = preview_lines(&config, &payload, &facts, &[120], Scenario::Live, &Utc)
+            .expect("a preview at 120 columns");
+        let text: String = preview[0]
+            .spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect();
+
+        assert!(text.contains("41%"), "{text}");
+        assert!(text.contains("$3.20"), "{text}");
+        assert!(text.contains("+120 -8"), "{text}");
+        assert!(text.contains("main"), "{text}");
+        assert!(text.contains("~/projects/atlas"), "{text}");
+        assert_eq!(preview[0].note, "everything fits");
     }
 
     // ---- proof tests of the review ----
