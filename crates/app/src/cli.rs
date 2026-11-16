@@ -30,7 +30,9 @@ use seatswap_core::switcher::{self, LiveState, SwitchError, UnsavedPolicy};
 
 use crate::agent_skill::{self, SkillError};
 use crate::burn_text;
-use crate::format::{class_name, format_age, format_reset_at, integer_percent, percent, tooltip};
+use crate::format::{
+    class_name, format_age, format_reset_at, integer_percent, login_ends_text, percent, tooltip,
+};
 use crate::gui::ipc;
 use crate::ops;
 use crate::statusline;
@@ -1890,7 +1892,9 @@ fn list_line(view: &AccountView, now: DateTime<Utc>) -> String {
         view.plan.clone().unwrap_or_else(|| "-".to_string()),
         format!("session {session}"),
         format!("week {week}"),
-        login_ends_text(view.login_days_left).unwrap_or_else(|| "-".to_string()),
+        view.login_days_left
+            .map(login_ends_text)
+            .unwrap_or_else(|| "-".to_string()),
     ];
     if view.login_state == LoginState::LoggedOut {
         fields.push("LOGGED OUT".to_string());
@@ -1922,18 +1926,6 @@ fn status_line(view: &AccountView, now: DateTime<Utc>) -> String {
 
 fn active_view(views: &[AccountView]) -> Option<&AccountView> {
     views.iter().find(|view| view.is_active)
-}
-
-fn login_ends_text(days: Option<i64>) -> Option<String> {
-    match days {
-        Some(days) if days < 0 => Some("login ended".to_string()),
-        Some(0) => Some("login ends today".to_string()),
-        Some(days) => Some(format!(
-            "login ends in {}",
-            seatswap_core::duration::duration_text(days.unsigned_abs() * 86_400)
-        )),
-        None => None,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4206,21 +4198,5 @@ pub(crate) mod tests {
             fetched_at: None,
             last_error: None,
         }
-    }
-
-    /// The login's end in the one duration spelling (review item 42); 0 days is
-    /// today, as the pop-up says it.
-    #[test]
-    fn the_login_end_is_said_in_days() {
-        assert_eq!(
-            login_ends_text(Some(3)).as_deref(),
-            Some("login ends in 3d")
-        );
-        assert_eq!(
-            login_ends_text(Some(0)).as_deref(),
-            Some("login ends today")
-        );
-        assert_eq!(login_ends_text(Some(-1)).as_deref(), Some("login ended"));
-        assert_eq!(login_ends_text(None), None);
     }
 }

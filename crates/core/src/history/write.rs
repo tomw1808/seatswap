@@ -12,9 +12,9 @@ use crate::api::{LimitKind, Usage};
 
 use super::read::{month_start, months_of_kind};
 use super::{
-    reset_minute, same_reset, AccountRef, Event, EventKind, HistoryDir, HistoryError, Hosts, Kind,
-    LimitSample, OllamaHourRecord, Range, Sample, SessionRecord, Source, TokenRecord, UpRecord,
-    WindowRecord, RESET_DROP_POINTS, RESET_JITTER,
+    is_early_reset, reset_minute, same_reset, AccountRef, Event, EventKind, HistoryDir,
+    HistoryError, Hosts, Kind, LimitSample, OllamaHourRecord, Range, Sample, SessionRecord, Source,
+    TokenRecord, UpRecord, WindowRecord, RESET_DROP_POINTS, RESET_JITTER,
 };
 
 /// Turns usage answers into history lines. Per account it keeps the last written
@@ -58,16 +58,32 @@ struct AccountState {
 impl AccountState {
     /// Remember every limit of `line` that is not remembered yet, as read at
     /// `line.t`. The seeding walks lines newest first, so the newest reading of
-    /// a limit wins.
+    /// a limit wins; the newest poll reading of a limit is remembered as its
+    /// reset baseline even when a status-line line is newer.
     fn remember_newest(&mut self, line: &Sample) {
         for limit in &line.l {
-            self.limits
-                .entry(LimitKey::of(limit))
-                .or_insert_with(|| RememberedLimit {
+            let key = LimitKey::of(limit);
+            if let Some(remembered) = self.limits.get_mut(&key) {
+                if remembered.poll.is_none() && line.src == Source::Poll {
+                    remembered.poll = Some(RememberedPoll {
+                        limit: limit.clone(),
+                        t: line.t,
+                    });
+                }
+                continue;
+            }
+            self.limits.insert(
+                key,
+                RememberedLimit {
                     limit: limit.clone(),
                     t: line.t,
                     opened: None,
-                });
+                    poll: (line.src == Source::Poll).then(|| RememberedPoll {
+                        limit: limit.clone(),
+                        t: line.t,
+                    }),
+                },
+            );
         }
     }
 }
@@ -104,6 +120,18 @@ struct RememberedLimit {
     /// Where the open window began when a reset began it; `None` when it began
     /// at its usual start (its reset time minus its length).
     opened: Option<Opened>,
+    /// The newest reading of this limit that came from a poll. Only a poll can
+    /// show a reset: the status line's merged number never moves a percent
+    /// down, so a higher status-line reading followed by a lower poll is not a
+    /// drop of the usage.
+    poll: Option<RememberedPoll>,
+}
+
+/// The newest poll reading of a limit.
+#[derive(Debug, Clone, PartialEq)]
+struct RememberedPoll {
+    limit: LimitSample,
+    t: DateTime<Utc>,
 }
 
 /// A window that a reset began: the time of the first lower reading and that
@@ -216,8 +244,19 @@ impl Recorder {
                 src: next.src,
                 l: vec![remembered.limit.clone()],
             };
+            // A reset is measured against the newest poll reading, never a
+            // status-line reading: the feed's merged percent only moves up.
+            let poll_prev = remembered.poll.as_ref().map(|poll| Sample {
+                t: poll.t,
+                account: account.clone(),
+                src: Source::Poll,
+                l: vec![poll.limit.clone()],
+            });
             let current = find_limit(&next, &remembered.limit);
-            if let Some(mut window) = reset_window(&prev, &next, plan) {
+            if let Some(mut window) = poll_prev
+                .as_ref()
+                .and_then(|poll| reset_window(poll, &next, plan))
+            {
                 if let Some(began) = &remembered.opened {
                     began.mark(&mut window);
                 }
@@ -236,19 +275,26 @@ impl Recorder {
                 }
                 continue;
             }
-            let mut ended = closed_windows(&prev, &next, plan);
+            let mut ended = closed_windows_against(
+                &prev,
+                poll_prev.as_ref().and_then(|poll| poll.l.first()),
+                &next,
+                plan,
+            );
             if ended.is_empty() {
                 // A drop too small for a reset, before the reset time: kept
                 // as the reading, named once per window.
-                if let (Some(current), Some(reset_at)) = (current, remembered.limit.r) {
-                    let points = remembered.limit.p - current.p;
-                    let window = (account.clone(), key.clone(), reset_at);
-                    if points > 0.0 && self.small_drops.insert(window) {
-                        self.warnings.push(format!(
-                            "usage of account {} {} went down by {points:.1} points without a reset",
-                            account.acc,
-                            key.name()
-                        ));
+                if let (Some(current), Some(poll)) = (current, remembered.poll.as_ref()) {
+                    if let Some(reset_at) = poll.limit.r {
+                        let points = poll.limit.p - current.p;
+                        let window = (account.clone(), key.clone(), reset_at);
+                        if points > 0.0 && self.small_drops.insert(window) {
+                            self.warnings.push(format!(
+                                "usage of account {} {} went down by {points:.1} points without a reset",
+                                account.acc,
+                                key.name()
+                            ));
+                        }
                     }
                 }
                 continue;
@@ -340,12 +386,26 @@ impl Recorder {
                     .get(&key)
                     .and_then(|remembered| remembered.opened),
             };
+            // Only a poll replaces the reset baseline; a status-line reading
+            // updates the remembered reading but never becomes the baseline.
+            let poll = if next.src == Source::Poll {
+                Some(RememberedPoll {
+                    limit: limit.clone(),
+                    t: at,
+                })
+            } else {
+                state
+                    .limits
+                    .get(&key)
+                    .and_then(|remembered| remembered.poll.clone())
+            };
             state.limits.insert(
                 key,
                 RememberedLimit {
                     limit,
                     t: at,
                     opened: began,
+                    poll,
                 },
             );
         }
@@ -703,6 +763,19 @@ pub fn sample_of(account: &AccountRef, usage: &Usage, at: DateTime<Utc>, src: So
 /// weekly_scoped, `end - 5 h` for session, `None` otherwise.
 /// `lost = max(0, 100 - final)` for the two weekly kinds, `None` otherwise.
 pub fn closed_windows(prev: &Sample, next: &Sample, plan: Option<&str>) -> Vec<WindowRecord> {
+    closed_windows_against(prev, None, next, plan)
+}
+
+/// [`closed_windows`], with the drop at the reset time measured against
+/// `poll` (the last poll reading of `prev`'s limit) when there is one. The
+/// recorder passes it so a status-line reading cannot make an ordinary end
+/// look different from the poll's own reading.
+fn closed_windows_against(
+    prev: &Sample,
+    poll: Option<&LimitSample>,
+    next: &Sample,
+    plan: Option<&str>,
+) -> Vec<WindowRecord> {
     let mut windows = Vec::new();
     for limit in &prev.l {
         let Some(end) = limit.r else { continue };
@@ -711,8 +784,14 @@ pub fn closed_windows(prev: &Sample, next: &Sample, plan: Option<&str>) -> Vec<W
             .and_then(|current| current.r)
             .map(|new_end| new_end > end + Duration::seconds(RESET_JITTER))
             .unwrap_or(false);
-        let dropped_at_end =
-            current.is_some_and(|current| dropped(limit, current)) && same_reset(next.t, end);
+        let before = poll
+            .filter(|poll| poll.k == limit.k && poll.m == limit.m)
+            .unwrap_or(limit);
+        // The drop at the reset time is the window's ordinary end, not an
+        // early reset, so it uses the plain point threshold.
+        let dropped_at_end = current.is_some_and(|current| {
+            before.p - current.p >= RESET_DROP_POINTS && same_reset(next.t, end)
+        });
         if next.t >= end || same_later || dropped_at_end {
             windows.push(window_of(prev, limit, end, end, plan));
         }
@@ -720,20 +799,20 @@ pub fn closed_windows(prev: &Sample, next: &Sample, plan: Option<&str>) -> Vec<W
     windows
 }
 
-/// The window of `prev`'s one limit that a reset ended at `next`: `next`
-/// carries the limit at least [`RESET_DROP_POINTS`] lower while `next.t` is
-/// more than [`RESET_JITTER`] before `prev.r`, whether or not the reset time
-/// moved. `end = next.t`, `reset = true`, `lost = None` (the limit was given
-/// back, nothing expired); `start`, `final`, `lastSample`, `uncertain` and
-/// `plan` as [`closed_windows`] has them, `start` from `prev.r`. `None` when
-/// the limit did not drop that far, has no reset time, or the drop comes at
-/// or after the reset time.
+/// The window of `prev`'s one limit (the limit's last poll reading) that a
+/// reset ended at `next`: the shared [`is_early_reset`] rule says the limit
+/// fell at least [`RESET_DROP_POINTS`] while `next.t` is more than
+/// [`RESET_JITTER`] before `prev.r`, whether or not the reset time moved.
+/// `end = next.t`, `reset = true`, `lost = None` (the limit was given back,
+/// nothing expired); `start`, `final`, `lastSample`, `uncertain` and `plan` as
+/// [`closed_windows`] has them, `start` from `prev.r`. `None` when the limit
+/// did not drop that far, has no reset time, or the drop comes at or after the
+/// reset time.
 fn reset_window(prev: &Sample, next: &Sample, plan: Option<&str>) -> Option<WindowRecord> {
     let limit = prev.l.first()?;
     let reset_at = limit.r?;
     let current = find_limit(next, limit)?;
-    let early = reset_at.signed_duration_since(next.t) > Duration::seconds(RESET_JITTER);
-    if !early || !dropped(limit, current) {
+    if !dropped(limit, current, Some(reset_at), next.t) {
         return None;
     }
     let mut window = window_of(prev, limit, reset_at, next.t, plan);
@@ -742,9 +821,15 @@ fn reset_window(prev: &Sample, next: &Sample, plan: Option<&str>) -> Option<Wind
     Some(window)
 }
 
-/// Whether `current` is at least [`RESET_DROP_POINTS`] below `previous`.
-fn dropped(previous: &LimitSample, current: &LimitSample) -> bool {
-    previous.p - current.p >= RESET_DROP_POINTS
+/// Whether `current` is an early reset of `previous`: [`is_early_reset`]'s one
+/// rule, used by the recorder.
+fn dropped(
+    previous: &LimitSample,
+    current: &LimitSample,
+    reset_at: Option<DateTime<Utc>>,
+    at: DateTime<Utc>,
+) -> bool {
+    is_early_reset(previous.p, current.p, reset_at, at)
 }
 
 /// Whether `next` is a later answer for its hour: no count smaller than the
@@ -2212,6 +2297,68 @@ mod tests {
         );
         assert!(recorder.take_warnings().is_empty());
         assert_eq!(window_lines(dir.path()), 0);
+    }
+
+    #[test]
+    fn a_statusline_reading_is_not_a_reset_baseline() {
+        // The feed merges a status-line percent upward, so 62.0 (poll) → 64.0
+        // (status line) → 62.9 (poll) is not a drop of the usage. A reset is
+        // measured against the last poll reading, 62.0, not 64.0.
+        let dir = tempdir().unwrap();
+        let mut recorder = Recorder::new(history(dir.path()));
+        let reset = Some(utc("2026-11-20T10:00:00Z"));
+        for (at, percent, src) in [
+            ("2026-11-16T09:00:00Z", 62.0, Source::Poll),
+            ("2026-11-16T09:05:00Z", 64.0, Source::Statusline),
+            ("2026-11-16T09:10:00Z", 62.9, Source::Poll),
+        ] {
+            recorder
+                .reading(
+                    &atlas_account(),
+                    None,
+                    &weekly(percent, reset),
+                    utc(at),
+                    src,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(window_lines(dir.path()), 0, "a status line is no reset");
+        assert!(
+            recorder.take_warnings().is_empty(),
+            "a status line's higher reading is no drop to warn about"
+        );
+    }
+
+    #[test]
+    fn a_poll_drop_after_a_statusline_reading_is_a_reset_from_the_poll() {
+        let dir = tempdir().unwrap();
+        let mut recorder = Recorder::new(history(dir.path()));
+        let reset = Some(utc("2026-11-20T10:00:00Z"));
+        for (at, percent, src) in [
+            ("2026-11-16T09:00:00Z", 62.0, Source::Poll),
+            ("2026-11-16T09:05:00Z", 64.0, Source::Statusline),
+            ("2026-11-16T09:10:00Z", 40.0, Source::Poll),
+        ] {
+            recorder
+                .reading(
+                    &atlas_account(),
+                    None,
+                    &weekly(percent, reset),
+                    utc(at),
+                    src,
+                )
+                .unwrap();
+        }
+
+        let windows = windows_of(dir.path());
+        assert_eq!(windows.len(), 1, "{windows:?}");
+        assert!(windows[0].reset, "{:?}", windows[0]);
+        assert_eq!(
+            windows[0].final_percent, 62.0,
+            "the reset is measured from the poll's 62.0"
+        );
+        assert_eq!(windows[0].last_sample, utc("2026-11-16T09:00:00Z"));
     }
 
     #[test]

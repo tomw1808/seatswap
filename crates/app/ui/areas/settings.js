@@ -12,6 +12,7 @@ import {
   colorSwatches,
   contrastText,
   dateText,
+  durationText,
   errorMessage,
   focusInside,
   h,
@@ -19,6 +20,7 @@ import {
   iconPreview,
   isColor,
   isObject,
+  loginDaysLeft,
   message,
   panel,
   selectInput,
@@ -803,11 +805,13 @@ function lookUpRow() {
   );
 }
 
+// The row's own value only: the reason it is missing is said once, in the note
+// under it. A missing value is "—", never a sentence in the value's place
+// (review finding 15).
 function rateText(view, code) {
-  if (!code) return "set a currency first";
-  if (!view || !isObject(view.rate)) return "no rate yet: API values are shown in USD";
+  if (!code || !isObject(view) || !isObject(view.rate)) return "—";
   const value = Number(view.rate.value);
-  if (!Number.isFinite(value)) return "no rate yet: API values are shown in USD";
+  if (!Number.isFinite(value)) return "—";
   return `${value.toFixed(4)} ${code}`;
 }
 
@@ -831,19 +835,23 @@ function fetchedPart(times, fetchedAt) {
 
 // "ECB rate of Fri 13 Nov · European Central Bank via Frankfurter · fetched
 // today 10:10" for every currency (decision 4). USD itself needs no look-up;
-// with the look-ups off the API value is in US dollars (decision 3).
+// with the look-ups off the switch is the reason and the API value is in US
+// dollars (decisions 3 and 5, review finding 15).
 function rateRow(times) {
   const code = currencyCode();
   const view = isObject(state.money) ? state.money : null;
   const control = h("span", { class: "money-rate", text: rateText(view, code) });
   const note = h("span", { class: "mf money-rate-note" });
   const rate = view && isObject(view.rate) ? view.rate : null;
+  const hasRate = rate !== null && Number.isFinite(Number(rate.value));
   if (!code) {
     note.textContent = "set a currency first";
-  } else if (!rate || !Number.isFinite(Number(rate.value))) {
-    note.textContent = "no rate yet: API values are shown in USD";
   } else if (code === "USD") {
     note.textContent = "USD itself";
+  } else if (view && view.lookUp !== true) {
+    note.textContent = "look-ups are off: API values are shown in USD";
+  } else if (!hasRate) {
+    note.textContent = "no rate yet: API values are shown in USD";
   } else {
     if (typeof rate.date === "string" && rate.date !== "") {
       addNotePart(
@@ -873,15 +881,103 @@ function countText(count, singular, plural) {
   return `${count} ${count === 1 ? singular : plural}`;
 }
 
+// The stored list's last change, read once: a malformed record is an error the
+// page shows, never two zero counts hidden in a sentence (review finding 15).
+function lastChangeOf(view) {
+  if (!isObject(view) || view.lastChange === null || view.lastChange === undefined) {
+    return null;
+  }
+  const change = view.lastChange;
+  if (
+    !isObject(change) ||
+    typeof change.at !== "string" ||
+    change.at === "" ||
+    !Array.isArray(change.added) ||
+    !Array.isArray(change.changed)
+  ) {
+    return { error: `the last change could not be read: ${JSON.stringify(change)}` };
+  }
+  return { at: change.at, added: change.added.length, changed: change.changed.length };
+}
+
+// Everything the price look-up's view cannot say: the look-up's failure, a
+// missing source or count, an unreadable last change or left-out list. The one
+// builder both the API prices row and the Providers block use (finding 15).
+function priceProblems(view) {
+  const problems = [];
+  if (!isObject(view)) {
+    if (state.moneyError) problems.push(state.moneyError);
+    return problems;
+  }
+  if (typeof view.lastError === "string" && view.lastError !== "") {
+    problems.push(view.lastError);
+  }
+  if (state.moneyError) problems.push(state.moneyError);
+  if (typeof view.pricesSource !== "string" || view.pricesSource === "") {
+    problems.push(`the price list's source is missing: ${JSON.stringify(view.pricesSource)}`);
+  }
+  if (!Number.isInteger(view.modelsWithPrice) || view.modelsWithPrice < 0) {
+    problems.push(
+      `the API price count is not a whole number of 0 or more: ${JSON.stringify(view.modelsWithPrice)}`
+    );
+  }
+  const change = lastChangeOf(view);
+  if (change && change.error) problems.push(change.error);
+  if (view.leftOut !== undefined && view.leftOut !== null) {
+    if (
+      !Array.isArray(view.leftOut) ||
+      view.leftOut.some((entry) => typeof entry !== "string" || entry === "")
+    ) {
+      problems.push(
+        `the list of left-out models could not be read: ${JSON.stringify(view.leftOut)}`
+      );
+    }
+  }
+  return problems;
+}
+
+function priceProblemNode(view, times) {
+  const problems = priceProblems(view);
+  if (problems.length === 0) return null;
+  const node = h("div", { class: "row-error price-list-error" });
+  for (const text of problems) node.appendChild(h("div", { text }));
+  const stored = h("div");
+  if (!isObject(view)) {
+    stored.textContent = "the stored list is not known";
+  } else if (typeof view.pricesCheckedAt === "string" && view.pricesCheckedAt !== "") {
+    stored.appendChild(document.createTextNode("the stored list is from "));
+    const day = h("span");
+    stored.appendChild(day);
+    times.push({ node: day, style: "day", at: view.pricesCheckedAt });
+  } else {
+    stored.textContent = "nothing is stored yet";
+  }
+  node.appendChild(stored);
+  return node;
+}
+
+function leftOutLine(view) {
+  const leftOut =
+    isObject(view) && Array.isArray(view.leftOut)
+      ? view.leftOut.filter((entry) => typeof entry === "string" && entry !== "")
+      : [];
+  if (leftOut.length === 0) return null;
+  return h("div", {
+    class: "lr mf price-left-out",
+    text: `${countText(leftOut.length, "model", "models")} of models.dev's list ${leftOut.length === 1 ? "was" : "were"} left out`,
+    title: leftOut.join("\n"),
+  });
+}
+
 function apiPricesRow(times) {
   const view = isObject(state.money) ? state.money : null;
   const count =
-    view && Number.isFinite(view.modelsWithPrice)
-      ? Math.max(0, Math.round(view.modelsWithPrice))
+    isObject(view) && Number.isInteger(view.modelsWithPrice) && view.modelsWithPrice >= 0
+      ? view.modelsWithPrice
       : null;
   const text =
     count === null
-      ? state.moneyError
+      ? state.moneyError || isObject(view)
         ? "prices: not read"
         : "no prices yet"
       : `${count} models with a price`;
@@ -891,30 +987,29 @@ function apiPricesRow(times) {
 
   const note = h("span", { class: "mf money-api-note" });
   if (view) {
-    if (view.pricesCheckedAt) {
+    if (typeof view.pricesCheckedAt === "string" && view.pricesCheckedAt !== "") {
       const node = h("span");
       addNotePart(note, node);
       times.push({
         node,
-        style: "clock",
+        style: "dayClock",
         at: view.pricesCheckedAt,
         prefix: "checked ",
       });
     }
-    if (isObject(view.lastChange) && view.lastChange.at) {
-      const added = Array.isArray(view.lastChange.added) ? view.lastChange.added.length : 0;
-      const changed = Array.isArray(view.lastChange.changed)
-        ? view.lastChange.changed.length
-        : 0;
+    const change = lastChangeOf(view);
+    if (change && !change.error) {
       const parts = [];
-      if (added > 0) parts.push(countText(added, "new model", "new models"));
-      if (changed > 0) parts.push(countText(changed, "price", "prices"));
+      if (change.added > 0) {
+        parts.push(countText(change.added, "new model", "new models"));
+      }
+      if (change.changed > 0) parts.push(countText(change.changed, "price", "prices"));
       const node = h("span");
       addNotePart(note, node);
       times.push({
         node,
         style: "day",
-        at: view.lastChange.at,
+        at: change.at,
         prefix: "last change ",
         suffix: parts.length > 0 ? `: ${parts.join(", ")}` : "",
       });
@@ -923,39 +1018,10 @@ function apiPricesRow(times) {
   if (note.childNodes.length === 0) note.textContent = "not looked up yet";
 
   const row = setting("API prices", control, note, "prices");
-  const problem =
-    view && typeof view.lastError === "string" && view.lastError !== ""
-      ? view.lastError
-      : state.moneyError;
-  if (problem) {
-    const error = rowErrorNode(row);
-    error.hidden = false;
-    error.appendChild(document.createTextNode(problem));
-    if (view && view.pricesCheckedAt) {
-      error.appendChild(document.createTextNode(" · the stored list is from "));
-      const day = h("span");
-      error.appendChild(day);
-      times.push({
-        node: day,
-        style: "day",
-        at: view.pricesCheckedAt,
-      });
-    } else {
-      error.appendChild(document.createTextNode(" · nothing is stored yet"));
-    }
-  }
-  const leftOut =
-    view && Array.isArray(view.leftOut)
-      ? view.leftOut.filter((entry) => typeof entry === "string" && entry !== "")
-      : [];
-  if (leftOut.length > 0) {
-    const line = h("div", {
-      class: "lr mf price-left-out",
-      text: `${countText(leftOut.length, "model", "models")} of models.dev's list ${leftOut.length === 1 ? "was" : "were"} left out`,
-      title: leftOut.join("\n"),
-    });
-    row.appendChild(line);
-  }
+  const problem = priceProblemNode(view, times);
+  if (problem) row.appendChild(problem);
+  const leftOut = leftOutLine(view);
+  if (leftOut) row.appendChild(leftOut);
   return row;
 }
 
@@ -1008,30 +1074,37 @@ async function loadPriceList() {
 const MODELS_DEV_URL = "https://models.dev";
 
 // "API prices from models.dev · checked 11:11" (decision 7): the list's source
-// as a link, and when the look-up last answered.
+// as a link, and when the look-up last answered. A missing source is an error
+// below the line, never the words "models.dev" put there by the page (finding
+// 15).
 function pricesLine(times) {
   const view = isObject(state.money) ? state.money : null;
   const source =
     view && typeof view.pricesSource === "string" && view.pricesSource !== ""
       ? view.pricesSource
-      : "models.dev";
-  const line = h("div", { class: "price-line" }, [
-    h("span", { text: "API prices from " }),
-    h("a", {
-      class: "link",
-      href: MODELS_DEV_URL,
-      target: "_blank",
-      rel: "noreferrer noopener",
-      text: source,
-    }),
-  ]);
+      : null;
+  const line = h("div", { class: "price-line" });
+  if (source !== null) {
+    line.appendChild(h("span", { class: "price-from", text: "API prices from " }));
+    line.appendChild(
+      h("a", {
+        class: "link",
+        href: MODELS_DEV_URL,
+        target: "_blank",
+        rel: "noreferrer noopener",
+        text: source,
+      })
+    );
+  } else {
+    line.appendChild(h("span", { class: "price-from", text: "API prices" }));
+  }
   const checked = h("span", { class: "mf" });
   if (view && typeof view.pricesCheckedAt === "string" && view.pricesCheckedAt !== "") {
     line.appendChild(middotSeparator());
     addNotePart(checked, h("span", { text: "checked " }));
     const node = h("span");
     checked.appendChild(node);
-    times.push({ node, style: "clock", at: view.pricesCheckedAt });
+    times.push({ node, style: "dayClock", at: view.pricesCheckedAt });
   } else {
     line.appendChild(middotSeparator());
     checked.textContent = "not looked up yet";
@@ -1079,26 +1152,10 @@ function priceBlock() {
   const line = pricesLine(times);
   line.appendChild(toggle);
   const node = h("div", { class: "price-block" }, [line, body]);
-  const problem =
-    view && typeof view.lastError === "string" && view.lastError !== ""
-      ? view.lastError
-      : state.moneyError;
-  if (problem) {
-    node.appendChild(h("div", { class: "row-error price-list-error", text: problem }));
-  }
-  const leftOut =
-    view && Array.isArray(view.leftOut)
-      ? view.leftOut.filter((entry) => typeof entry === "string" && entry !== "")
-      : [];
-  if (leftOut.length > 0) {
-    node.appendChild(
-      h("div", {
-        class: "lr mf price-left-out",
-        text: `${countText(leftOut.length, "model", "models")} of models.dev's list ${leftOut.length === 1 ? "was" : "were"} left out`,
-        title: leftOut.join("\n"),
-      })
-    );
-  }
+  const problem = priceProblemNode(view, times);
+  if (problem) node.appendChild(problem);
+  const leftOut = leftOutLine(view);
+  if (leftOut) node.appendChild(leftOut);
   state.priceNode = node;
   state.priceKey = key;
   fillTimeNodes(times);
@@ -1211,15 +1268,14 @@ function accountEmail(row) {
   return typeof row.email === "string" && row.email !== "" ? row.email : "—";
 }
 
+// "in 4d", "today" or "ended": the same days-left rule and duration spelling
+// as the pop-up's "login ends in 4d" (review finding 20, fix point 3).
 function loginEndsText(row) {
-  let days = row.loginDaysLeft;
-  if (typeof days !== "number" && typeof row.loginEndsAtMs === "number") {
-    days = Math.floor((row.loginEndsAtMs - Date.now()) / 86400000);
-  }
-  if (typeof days !== "number" || !Number.isFinite(days)) return "—";
+  const days = loginDaysLeft(row);
+  if (days === null) return "—";
   if (days < 0) return "ended";
   if (days === 0) return "today";
-  return `in ${Math.round(days)} days`;
+  return `in ${durationText(days * 86400)}`;
 }
 
 function accountsCard() {

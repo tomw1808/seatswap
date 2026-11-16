@@ -15,7 +15,7 @@ use crate::burn::tied::thinking_tied;
 use crate::codex_sessions::CodexSession;
 use crate::harness::{self, HarnessSession};
 use crate::history::{HistoryDir, HistoryError, Hosted, Hosts, Range, SessionRecord, TokenRecord};
-use crate::money::{self, Fx, Valued, Valuer};
+use crate::money::{self, is_plan_model, Fx, Valued, Valuer};
 use crate::project::ProjectKey;
 use crate::projects::{ProjectId, Projects};
 use crate::sessions::{SessionFile, SessionStatus};
@@ -31,12 +31,9 @@ pub const REPORT_EVERY_SECS: i64 = 30;
 /// A report older than this many minutes is stale (spec §3.8).
 pub const REPORT_STALE_MIN: i64 = 15;
 
-/// What the provider of every Claude Code row is today (spec §3.8). The status
-/// line's feed names a Claude Code session, so its cost belongs to these rows.
+/// The provider of every Claude Code row (spec §3.8). The status line's feed
+/// names a Claude Code session, so its cost belongs to these rows.
 pub const CLAUDE_PROVIDER: &str = "Claude Code";
-
-/// A row's provider (the constant the rows are built with).
-const PROVIDER: &str = CLAUDE_PROVIDER;
 
 /// The reason both values have while an agent's model is not known.
 const NO_AGENT_MODEL: &str = "the agent's model is not known yet";
@@ -81,19 +78,25 @@ pub struct Values {
 impl Values {
     /// The one way a list of [`Valued`] becomes what a page shows: one
     /// [`Values`] per record, then [`Values::sum`]. Nothing used is a known 0,
-    /// not an unknown value: an empty list is worth 0 in both halves, in the
-    /// settings' currency (the API half in the API column's currency, as
-    /// [`money::api_in_currency`] says for 0 US dollars).
-    pub fn of(valued: &[Valued], settings: &Settings) -> Values {
+    /// not an unknown value: an empty list is worth 0 in both halves. The API
+    /// half takes the currency [`money::api_in_currency`] gives 0 US dollars at
+    /// the view's time: the settings' currency with a stored rate, USD while
+    /// no rate is stored, and no currency while none is set.
+    pub fn of(valued: &[Valued], settings: &Settings, fx: &Fx, at: DateTime<Utc>) -> Values {
         if valued.is_empty() {
-            return Values {
-                api: Some(0.0),
-                api_currency: if settings.look_up_prices {
-                    settings.currency.clone()
-                } else {
-                    Some("USD".to_string())
+            let (api, api_currency, api_missing) = match settings.currency.as_deref() {
+                // No currency is not a rate that is missing: nothing used is a
+                // known 0 with no currency of its own.
+                None => (Some(0.0), None, None),
+                Some(_) => match money::api_in_currency(0.0, settings, fx, at.date_naive()) {
+                    Ok((amount, currency)) => (Some(amount), Some(currency), None),
+                    Err(missing) => (None, None, Some(missing.to_string())),
                 },
-                api_missing: None,
+            };
+            return Values {
+                api,
+                api_currency,
+                api_missing,
                 subscription: Some(0.0),
                 currency: settings.currency.clone(),
                 subscription_missing: None,
@@ -243,7 +246,9 @@ impl Pricing<'_> {
     /// The values of a list of records for one row or agent.
     fn of(&self, valued: &[Valued]) -> Values {
         match self {
-            Pricing::Known { settings, .. } => Values::of(valued, settings),
+            Pricing::Known { valuer, settings } => {
+                Values::of(valued, settings, valuer.fx(), Utc::now())
+            }
             Pricing::Unknown { reason } => Values::unknown(reason),
         }
     }
@@ -290,7 +295,7 @@ pub struct LiveSession {
     pub project: String,
     pub org: Option<String>,
     pub cwd: String,
-    /// "Claude Code" today.
+    /// The row's provider: [`CLAUDE_PROVIDER`] for a Claude Code row.
     pub provider: String,
     pub model: Option<String>,
     pub tied: bool,
@@ -302,7 +307,9 @@ pub struct LiveSession {
     pub agents_done: u32,
     pub agents: Vec<LiveAgent>,
     pub tokens: Tokens,
-    pub last_hour: Tokens,
+    /// The last hour's tokens; `None` when the row cannot know them
+    /// (a Codex total that went down), so a sum over it is unknown too.
+    pub last_hour: Option<Tokens>,
     /// The last hour's tokens valued per model, like `values` (spec §3.8).
     /// Closed rows value the hourly records that overlap the last hour.
     #[serde(default = "no_values")]
@@ -543,7 +550,7 @@ pub fn running(
             project: project_name,
             org,
             cwd: file.cwd.clone(),
-            provider: PROVIDER.to_string(),
+            provider: CLAUDE_PROVIDER.to_string(),
             tied: model.as_deref().map(thinking_tied).unwrap_or(false),
             model,
             status: live_status(&file.status),
@@ -553,7 +560,7 @@ pub fn running(
             agents_done,
             agents: live_agents,
             tokens,
-            last_hour,
+            last_hour: Some(last_hour),
             last_hour_values,
             agents_done_values,
             values,
@@ -681,8 +688,6 @@ pub fn harness_rows(
                 let id = ProjectId::of(&project, host);
                 let (project_id, project_name, org) = named_project(projects, &id);
                 let mut agents = Vec::new();
-                let mut running = 0u32;
-                let mut done = 0u32;
                 for session in component.iter().filter(|session| session.id != root_id) {
                     let is_running = harness::is_running(session, locks.contains(&session.id), now);
                     let agent = harness_agent(
@@ -695,21 +700,8 @@ pub fn harness_rows(
                         pricing,
                         host,
                     );
-                    if agent.running {
-                        running += 1;
-                    } else {
-                        done += 1;
-                    }
                     agents.push(agent);
                 }
-                let agents_done_values = {
-                    let done_values: Vec<&Values> = agents
-                        .iter()
-                        .filter(|agent| !agent.running)
-                        .map(|agent| &agent.values)
-                        .collect();
-                    Values::sum(&done_values)
-                };
                 let values = harness_values(root, &cwd, &project, pricing, host);
                 // The last hour of a Harness row is known from its answers'
                 // times, never a silent 0 (S-3): the messages inside the window,
@@ -726,7 +718,7 @@ pub fn harness_rows(
                     host,
                 );
                 let root_running = harness::is_running(root, locks.contains(&root.id), now);
-                out.rows.sessions.push(LiveSession {
+                let mut row = LiveSession {
                     session: root.id.clone(),
                     host: host.to_string(),
                     label: session_label(&project_name, &root.id),
@@ -744,15 +736,19 @@ pub fn harness_rows(
                     },
                     since: root.last,
                     started: root.created,
-                    agents_running: running,
-                    agents_done: done,
-                    agents,
+                    agents_running: 0,
+                    agents_done: 0,
+                    agents: Vec::new(),
                     tokens: root.tokens,
-                    last_hour,
+                    last_hour: Some(last_hour),
                     last_hour_values,
-                    agents_done_values,
+                    agents_done_values: Values::sum(&[]),
                     values,
-                });
+                };
+                // A row of its own counts its workers too, not only the root
+                // session: the one function that adds a worker into a row.
+                add_agents(&mut row, agents);
+                out.rows.sessions.push(row);
                 for session in component {
                     harness_token_line(
                         session,
@@ -826,6 +822,9 @@ fn owner_of(
 }
 
 /// Add agents to a running row and recount its done totals and their values.
+/// Add a worker's tokens and values to its row, through [`Valuer::value`]'s
+/// [`Values::sum`], so a running Claude Code row shows the same numbers a
+/// closed row reads from the history.
 pub fn add_agents(session: &mut LiveSession, agents: Vec<LiveAgent>) {
     for agent in agents {
         if agent.running {
@@ -833,6 +832,8 @@ pub fn add_agents(session: &mut LiveSession, agents: Vec<LiveAgent>) {
         } else {
             session.agents_done += 1;
         }
+        session.tokens += agent.tokens;
+        session.values = Values::sum(&[&session.values, &agent.values]);
         session.agents.push(agent);
     }
     let done: Vec<&Values> = session
@@ -1093,8 +1094,8 @@ const CODEX_PROVIDER: &str = "Codex";
 
 /// Why a Codex row's last hour has no value: its newest token total is below the
 /// total the hour is measured from, which the read warns about and never turns
-/// into a number. The row carries that reason in `last_hour_values`; showing it
-/// in the row and in the sums is task S-3's.
+/// into a number. The row's `last_hour` is `None` and it carries that reason in
+/// `last_hour_values`, so the row and every sum over it say why.
 const CODEX_LAST_HOUR_UNKNOWN: &str =
     "the Codex session's token total went down, so its last hour is not known";
 
@@ -1114,9 +1115,8 @@ const CODEX_LAST_HOUR_UNKNOWN: &str =
 /// at the same model and time with the same valuer. A session without a model
 /// has both values missing with the same reason as an agent without one. A
 /// last hour that is not known has both values missing with
-/// [`CODEX_LAST_HOUR_UNKNOWN`] rather than a value of 0; the row carries that
-/// reason in `last_hour_values`, and showing it in the row and in the sums is
-/// task S-3's.
+/// [`CODEX_LAST_HOUR_UNKNOWN`] rather than a value of 0, and the row's
+/// `last_hour` is `None`, so every sum over it is unknown too.
 pub fn codex_rows(
     sessions: &[CodexSession],
     open_files: &BTreeSet<PathBuf>,
@@ -1174,10 +1174,9 @@ pub fn codex_rows(
             agents_done: 0,
             agents: Vec::new(),
             tokens: session.tokens,
-            // A row's tokens cannot say "not known"; its values carry the
-            // reason (`CODEX_LAST_HOUR_UNKNOWN`), which S-3 shows in the row
-            // and the sums.
-            last_hour: session.last_hour.unwrap_or_default(),
+            // An unknown hour is `null`, never 0 tokens; its values carry the
+            // reason (`CODEX_LAST_HOUR_UNKNOWN`) in the row and the sums.
+            last_hour: session.last_hour,
             last_hour_values,
             agents_done_values: Values::sum(&[]),
             values: codex_values(session, cwd, &project, pricing, host),
@@ -1317,7 +1316,6 @@ pub fn closed(
         let mut tokens = Tokens::default();
         let mut last_hour = Tokens::default();
         let hour_ago = now - Duration::minutes(60);
-        let mut out_by_model: BTreeMap<String, u64> = BTreeMap::new();
         let mut valued = Vec::with_capacity(of_session.len());
         let mut last_hour_valued: Vec<Valued> = Vec::new();
         for token in of_session {
@@ -1331,12 +1329,17 @@ pub fn closed(
                     last_hour_valued.push(valuer.value(&hosted.host, token));
                 }
             }
-            *out_by_model.entry(token.model.clone()).or_insert(0) += token.out;
             if let Pricing::Known { valuer, .. } = pricing {
                 valued.push(valuer.value(&hosted.host, token));
             }
         }
-        let model = most_output(&out_by_model);
+        // The Claude Code row keeps the Claude model of its newest plan-model
+        // record; a linked worker's model never becomes the row's model.
+        let model = of_session
+            .iter()
+            .filter(|token| is_plan_model(&token.model))
+            .max_by_key(|token| token.t)
+            .map(|token| token.model.clone());
         let id = ProjectId::of(&record.project, &hosted.host);
         let (project_id, project_name, org) = named_project(projects, &id);
         let label = session_label(&project_name, &record.session);
@@ -1348,7 +1351,7 @@ pub fn closed(
             project: project_name,
             org,
             cwd: record.cwd.clone(),
-            provider: PROVIDER.to_string(),
+            provider: CLAUDE_PROVIDER.to_string(),
             tied: model.as_deref().map(thinking_tied).unwrap_or(false),
             model,
             status: LiveStatus::Closed,
@@ -1358,7 +1361,7 @@ pub fn closed(
             agents_done: record.agents_finished,
             agents: Vec::new(),
             tokens,
-            last_hour,
+            last_hour: Some(last_hour),
             last_hour_values: pricing.of(&last_hour_valued),
             agents_done_values: Values::sum(&[]),
             values: pricing.of(&valued),
@@ -1668,6 +1671,28 @@ mod tests {
         }
     }
 
+    fn live_event(at: DateTime<Utc>, account: Option<AccountRef>) -> Event {
+        Event {
+            t: at,
+            kind: EventKind::Live { account },
+        }
+    }
+
+    fn price_changed_event(
+        at: DateTime<Utc>,
+        amount: Option<f64>,
+        currency: Option<&str>,
+    ) -> Event {
+        Event {
+            t: at,
+            kind: EventKind::PriceChanged {
+                account: ac(),
+                amount,
+                currency: currency.map(str::to_string),
+            },
+        }
+    }
+
     fn session_file() -> SessionFile {
         SessionFile {
             pid: 41822,
@@ -1823,7 +1848,7 @@ mod tests {
             project: "atlas".to_string(),
             org: Some("acme".to_string()),
             cwd: ATLAS_CWD.to_string(),
-            provider: PROVIDER.to_string(),
+            provider: CLAUDE_PROVIDER.to_string(),
             model: model.map(str::to_string),
             tied: model.map(thinking_tied).unwrap_or(false),
             status,
@@ -1833,7 +1858,7 @@ mod tests {
             agents_done: 0,
             agents: Vec::new(),
             tokens: Tokens::default(),
-            last_hour: Tokens::default(),
+            last_hour: Some(Tokens::default()),
             last_hour_values: Values::sum(&[]),
             agents_done_values: Values::sum(&[]),
             values: Values::sum(&[]),
@@ -2005,7 +2030,8 @@ mod tests {
 
         let row = &rows.sessions[0];
         assert_eq!(
-            row.last_hour.out, 1_500_000,
+            row.last_hour.expect("a known hour").out,
+            1_500_000,
             "both models' minutes; the boundary minute is not counted"
         );
         assert_eq!(
@@ -2378,7 +2404,12 @@ mod tests {
 
         let no_currency_settings = Settings::default();
         let no_currency = valuer(&history, &no_currency_settings, &accounts);
-        let no_currency = Values::of(&[no_currency.value("atlas", &opus)], &no_currency_settings);
+        let no_currency = Values::of(
+            &[no_currency.value("atlas", &opus)],
+            &no_currency_settings,
+            &Fx::default(),
+            Utc::now(),
+        );
         assert_eq!(no_currency.api, None);
         assert_eq!(
             no_currency.api_missing.as_deref(),
@@ -2393,7 +2424,12 @@ mod tests {
 
         let eur = settings_eur();
         let priced = valuer(&history, &eur, &accounts);
-        let no_price = Values::of(&[priced.value("atlas", &unknown)], &eur);
+        let no_price = Values::of(
+            &[priced.value("atlas", &unknown)],
+            &eur,
+            &Fx::default(),
+            Utc::now(),
+        );
         assert_eq!(no_price.api, None);
         assert_eq!(
             no_price.api_missing.as_deref(),
@@ -2406,7 +2442,12 @@ mod tests {
 
         let chf = settings_chf();
         let in_usd = valuer(&history, &chf, &accounts);
-        let in_usd = Values::of(&[in_usd.value("atlas", &opus)], &chf);
+        let in_usd = Values::of(
+            &[in_usd.value("atlas", &opus)],
+            &chf,
+            &Fx::default(),
+            Utc::now(),
+        );
         assert_eq!(in_usd.api, Some(4.0));
         assert_eq!(in_usd.api_currency.as_deref(), Some("USD"));
         assert_eq!(in_usd.api_missing, None);
@@ -2554,7 +2595,8 @@ mod tests {
 
         assert_eq!(rows.sessions.len(), 1);
         assert_eq!(
-            rows.sessions[0].last_hour.out, 3_000_000,
+            rows.sessions[0].last_hour.expect("a known hour").out,
+            3_000_000,
             "the 09:00 hour overlaps [09:20, 10:20)"
         );
     }
@@ -2653,7 +2695,7 @@ mod tests {
             api_missing: None,
             subscription_missing: None,
         };
-        let values = Values::of(&[eur, usd], &settings_eur());
+        let values = Values::of(&[eur, usd], &settings_eur(), &Fx::default(), Utc::now());
 
         assert_eq!(values.api, None);
         assert_eq!(values.api_currency, None);
@@ -2661,9 +2703,13 @@ mod tests {
         assert_eq!(values.subscription, Some(1.0));
         assert_eq!(values.currency.as_deref(), Some("EUR"));
 
-        let empty = Values::of(&[], &settings_eur());
+        let empty = Values::of(&[], &settings_eur(), &Fx::default(), Utc::now());
         assert_eq!(empty.api, Some(0.0), "nothing used is a known 0");
-        assert_eq!(empty.api_currency.as_deref(), Some("EUR"));
+        assert_eq!(
+            empty.api_currency.as_deref(),
+            Some("USD"),
+            "no rate is stored, so the API column is in USD"
+        );
         assert_eq!(empty.api_missing, None);
         assert_eq!(empty.subscription, Some(0.0));
         assert_eq!(empty.currency.as_deref(), Some("EUR"));
@@ -2716,6 +2762,285 @@ mod tests {
         let row = &rows.sessions[0];
         assert_eq!(row.tokens.out, 3_000_000);
         assert_eq!(row.values.api, Some(60.0));
+    }
+
+    #[test]
+    fn a_closed_claude_row_keeps_its_claude_model_over_a_worker() {
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        history
+            .append(&session_record(
+                SESSION_11,
+                utc("2026-11-14T09:20:00Z"),
+                utc("2026-11-14T08:00:00Z"),
+                utc("2026-11-14T09:20:00Z"),
+                true,
+                0,
+            ))
+            .expect("a session record");
+        history
+            .append(&token(
+                SESSION_11,
+                utc("2026-11-14T09:10:00Z"),
+                "claude-opus-5-5",
+                0,
+                100,
+            ))
+            .expect("the Claude record");
+        history
+            .append(&token(
+                SESSION_11,
+                utc("2026-11-14T09:20:00Z"),
+                "deepseek-v4.1-flash:cloud",
+                1_000_000,
+                5_000_000,
+            ))
+            .expect("the worker's record");
+        let settings = settings_eur();
+        let valuer = valuer(&history, &settings, &[]);
+        let rows = closed(
+            &history,
+            utc("2026-11-14T09:00:00Z"),
+            utc("2026-11-14T10:00:00Z"),
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
+        )
+        .expect("rows");
+
+        assert_eq!(
+            rows.sessions[0].model.as_deref(),
+            Some("claude-opus-5-5"),
+            "the worker's newer model never becomes the Claude Code row's model"
+        );
+    }
+
+    /// A running Claude Code row and the same closed row with a linked worker
+    /// show the same tokens and values: they do not jump when the session closes.
+    #[test]
+    fn a_running_and_closed_row_with_a_worker_have_the_same_numbers() {
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let settings = settings_eur();
+        history
+            .append(&live_event(utc("2026-11-14T00:00:00Z"), Some(ac())))
+            .expect("a live event");
+        history
+            .append(&price_changed_event(
+                utc("2026-11-14T00:00:00Z"),
+                Some(140.0),
+                Some("EUR"),
+            ))
+            .expect("the account's price");
+        let mut window = weekly_window();
+        window.start = Some(utc("2026-11-14T00:00:00Z"));
+        window.end = utc("2026-11-21T00:00:00Z");
+        window.last_sample = utc("2026-11-20T00:00:00Z");
+        history.append(&window).expect("a finished window");
+        let claude_tokens = Tokens {
+            input: 2_000_000,
+            out: 12_400_000,
+            cw: 26_173,
+            cr: 28_126,
+        };
+        let worker_tokens = Tokens {
+            input: 2_200,
+            out: 1_100,
+            cw: 0,
+            cr: 0,
+        };
+        history
+            .append(&TokenRecord {
+                t: utc("2026-11-14T18:30:00Z"),
+                session: SESSION.to_string(),
+                cwd: ATLAS_CWD.to_string(),
+                project: project_key(),
+                model: "claude-opus-5-5".to_string(),
+                input: claude_tokens.input,
+                out: claude_tokens.out,
+                cw: claude_tokens.cw,
+                cr: claude_tokens.cr,
+                answers: 1,
+                agent_answers: 0,
+            })
+            .expect("the Claude record");
+        history
+            .append(&token(
+                SESSION,
+                utc("2026-11-14T18:35:00Z"),
+                "deepseek-v4.1-flash:cloud",
+                worker_tokens.input,
+                worker_tokens.out,
+            ))
+            .expect("the worker's record");
+        history
+            .append(&session_record(
+                SESSION,
+                utc("2026-11-14T18:40:00Z"),
+                utc("2026-11-13T23:40:00Z"),
+                utc("2026-11-14T18:40:00Z"),
+                true,
+                0,
+            ))
+            .expect("the closed session");
+        let valuer = valuer(&history, &settings, &[]);
+        let pricing = known_pricing(&valuer, &settings);
+
+        let rows = running(
+            &[session_file()],
+            &state_with(seen("claude-opus-5-5", claude_tokens.out)),
+            &|_| Vec::new(),
+            Some(&projects()),
+            &pricing,
+            "atlas",
+            utc("2026-11-14T19:00:00Z"),
+            &|_| project_key(),
+        );
+        let mut running_row = rows.sessions[0].clone();
+        let worker_record = token(
+            SESSION,
+            utc("2026-11-14T18:35:00Z"),
+            "deepseek-v4.1-flash:cloud",
+            worker_tokens.input,
+            worker_tokens.out,
+        );
+        add_agents(
+            &mut running_row,
+            vec![LiveAgent {
+                agent: WORKER_A.to_string(),
+                parent: None,
+                kind: Some("flash".to_string()),
+                task: None,
+                model: Some("deepseek-v4.1-flash:cloud".to_string()),
+                running: true,
+                first: Some(utc("2026-11-14T18:30:00Z")),
+                last: Some(utc("2026-11-14T18:35:00Z")),
+                tokens: worker_tokens,
+                values: pricing.of(&[valuer.value("atlas", &worker_record)]),
+            }],
+        );
+
+        let closed_rows = closed(
+            &history,
+            utc("2026-11-14T09:00:00Z"),
+            utc("2026-11-14T19:00:00Z"),
+            Some(&projects()),
+            &pricing,
+        )
+        .expect("rows");
+        let closed_row = &closed_rows.sessions[0];
+
+        assert_eq!(running_row.tokens, closed_row.tokens);
+        assert_eq!(running_row.values, closed_row.values);
+    }
+
+    /// A Codex row's subscription is a known 0, so it never blanks the Claude
+    /// totals; its API half still says why it has no price.
+    #[test]
+    fn a_codex_row_does_not_blank_a_claude_total() {
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let settings = settings_eur();
+        history
+            .append(&live_event(utc("2026-11-14T00:00:00Z"), Some(ac())))
+            .expect("a live event");
+        history
+            .append(&price_changed_event(
+                utc("2026-11-14T00:00:00Z"),
+                Some(140.0),
+                Some("EUR"),
+            ))
+            .expect("the account's price");
+        let mut window = weekly_window();
+        window.start = Some(utc("2026-11-14T00:00:00Z"));
+        window.end = utc("2026-11-21T00:00:00Z");
+        window.last_sample = utc("2026-11-20T00:00:00Z");
+        history.append(&window).expect("a finished window");
+        let claude_record = token(
+            SESSION,
+            utc("2026-11-14T18:30:00Z"),
+            "claude-opus-5-5",
+            0,
+            1_000_000,
+        );
+        history.append(&claude_record).expect("the Claude record");
+        let valuer = valuer(&history, &settings, &[]);
+        let pricing = known_pricing(&valuer, &settings);
+
+        let mut claude = row(
+            LiveStatus::Busy,
+            Some("claude-opus-5-5"),
+            utc("2026-11-14T18:30:00Z"),
+        );
+        claude.values = pricing.of(&[valuer.value("atlas", &claude_record)]);
+        let now = utc("2026-11-14T19:00:00Z");
+        let session = crate::codex_sessions::CodexSession {
+            id: "3f7b2c1e-9a4d-4e8f-8b6a-2c5d9e1f7a30".to_string(),
+            cwd: PathBuf::from(ATLAS_CWD),
+            model: Some("gpt-6.1-sol".to_string()),
+            started: now - Duration::minutes(30),
+            last: now - Duration::minutes(5),
+            tokens: Tokens {
+                input: 1000,
+                out: 100,
+                cw: 0,
+                cr: 500,
+            },
+            last_hour: Some(Tokens::default()),
+            busy: false,
+            file: PathBuf::from("/home/sam/.codex/sessions/2026/11/14/rollout-now.jsonl"),
+        };
+        let codex = codex_rows(
+            &[session],
+            &BTreeSet::new(),
+            None,
+            &pricing,
+            "atlas",
+            now,
+            &|_| project_key(),
+        );
+        let codex = &codex.sessions[0];
+        assert_eq!(
+            codex.values.subscription,
+            Some(0.0),
+            "Codex uses no share of a Claude account's week"
+        );
+        assert_eq!(
+            codex.values.api_missing.as_deref(),
+            Some("no price for gpt-6.1-sol"),
+            "the API half keeps the price rule's reason"
+        );
+
+        let all = Values::sum(&[&claude.values, &codex.values]);
+        assert_eq!(all.subscription, claude.values.subscription);
+        assert_eq!(all.subscription_missing, None);
+        assert_eq!(all.api_missing.as_deref(), Some("no price for gpt-6.1-sol"));
+    }
+
+    /// A session without tokens beside one priced in USD adds no second
+    /// currency: its known 0 is in the API column's currency, USD without a
+    /// stored rate.
+    #[test]
+    fn a_session_without_tokens_sums_beside_a_usd_value() {
+        let settings = settings_eur();
+        let priced = Values::of(
+            &[Valued {
+                api: Some(20.0),
+                subscription: Some(1.25),
+                account: Some(ac()),
+                api_currency: Some("USD".to_string()),
+                api_missing: None,
+                subscription_missing: None,
+            }],
+            &settings,
+            &Fx::default(),
+            Utc::now(),
+        );
+        let silent = Values::of(&[], &settings, &Fx::default(), Utc::now());
+        assert_eq!(silent.api_currency.as_deref(), Some("USD"));
+        let sum = Values::sum(&[&priced, &silent]);
+        assert_eq!(sum.api, Some(20.0));
+        assert_eq!(sum.api_currency.as_deref(), Some("USD"));
+        assert_eq!(sum.api_missing, None);
     }
 
     #[test]
@@ -3176,7 +3501,8 @@ mod tests {
 
         let row = &rows.sessions[0];
         assert_eq!(
-            row.last_hour.out, 1_000_000,
+            row.last_hour.expect("a known hour").out,
+            1_000_000,
             "the row was closed ten minutes ago: its tokens are in the last hour"
         );
     }
@@ -3247,7 +3573,12 @@ mod tests {
             api_missing: None,
             subscription_missing: None,
         };
-        let values = Values::of(&[missing, priced], &settings_eur());
+        let values = Values::of(
+            &[missing, priced],
+            &settings_eur(),
+            &Fx::default(),
+            Utc::now(),
+        );
 
         assert_eq!(values.api, None);
         assert_eq!(values.api_missing.as_deref(), Some("no price for claude-x"));
@@ -3379,10 +3710,17 @@ mod tests {
             },
         ];
         let settings = settings_eur();
-        let of = Values::of(&records, &settings);
+        let of = Values::of(&records, &settings, &Fx::default(), Utc::now());
         let parts: Vec<Values> = records
             .iter()
-            .map(|record| Values::of(std::slice::from_ref(record), &settings))
+            .map(|record| {
+                Values::of(
+                    std::slice::from_ref(record),
+                    &settings,
+                    &Fx::default(),
+                    Utc::now(),
+                )
+            })
             .collect();
         let parts: Vec<&Values> = parts.iter().collect();
         assert_eq!(of, Values::sum(&parts));
@@ -3922,8 +4260,8 @@ mod tests {
         assert_eq!(row.session, JOB_A);
         assert_eq!(row.provider, "DeepSeek Harness");
         assert_eq!(row.model.as_deref(), Some(FLASH_MODEL));
-        assert_eq!(row.tokens.input, 10516);
-        assert_eq!(row.tokens.out, 3585);
+        assert_eq!(row.tokens.input, 12_716, "the root and its worker");
+        assert_eq!(row.tokens.out, 4_685, "the root and its worker");
         assert_eq!(row.agents.len(), 1);
         assert_eq!(row.agents[0].agent, WORKER_A);
         assert_eq!(row.agents[0].parent.as_deref(), Some(JOB_A));
@@ -4062,7 +4400,7 @@ mod tests {
         );
         assert_eq!(rows.sessions.len(), 1);
         let row = &rows.sessions[0];
-        assert_eq!(Some(row.last_hour), session.last_hour);
+        assert_eq!(row.last_hour, session.last_hour);
         assert!(
             row.last_hour_values.api.is_some(),
             "the last hour is valued like the tokens: {:?}",
@@ -4081,7 +4419,7 @@ mod tests {
             &|_| project_key(),
         );
         let row = &rows.sessions[0];
-        assert_eq!(row.last_hour, Tokens::default());
+        assert_eq!(row.last_hour, None);
         assert_eq!(
             row.last_hour_values.api_missing.as_deref(),
             Some(CODEX_LAST_HOUR_UNKNOWN),
@@ -4473,12 +4811,12 @@ mod tests {
         let row = &out.rows.sessions[0];
         assert_eq!(
             row.last_hour,
-            Tokens {
+            Some(Tokens {
                 input: 50,
                 out: 5,
                 cw: 0,
                 cr: 0,
-            },
+            }),
             "the two answers inside the hour, not the one at −90min"
         );
         assert_eq!(row.tokens.out, 105, "the row's own total is unchanged");
@@ -4537,7 +4875,7 @@ mod tests {
         let row = &out.rows.sessions[0];
         assert_eq!(
             row.last_hour,
-            Tokens::default(),
+            Some(Tokens::default()),
             "the only answer is outside the hour"
         );
         assert_eq!(

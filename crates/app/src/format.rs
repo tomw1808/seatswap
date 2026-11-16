@@ -21,6 +21,20 @@ pub(crate) fn percent(value: f64) -> String {
     format!("{}%", integer_percent(value))
 }
 
+/// A login's end in the one duration spelling, for the CLI and the
+/// notifications (the pop-up's common.js says it the same way): `login ends
+/// today` on the last day, `login ends in 3d` before it, `login ended` after.
+pub(crate) fn login_ends_text(days_left: i64) -> String {
+    match days_left {
+        days if days < 0 => "login ended".to_string(),
+        0 => "login ends today".to_string(),
+        days => format!(
+            "login ends in {}",
+            seatswap_core::duration::duration_text(days.unsigned_abs() * 86_400)
+        ),
+    }
+}
+
 /// The age of a poll or a usage fetch: `12s ago`, `5min ago`, `2h ago`,
 /// `3d ago` (spec §11 mock-up). An age shows its largest unit only, so the
 /// floored amount of that unit is passed to [`duration_text`]. A time a little
@@ -679,5 +693,15 @@ mod tests {
         // The same two colours `icon.rs` tests its letters with.
         assert_eq!(letter_color([0x1e, 0x3a, 0x8a]), [0xff, 0xff, 0xff]);
         assert_eq!(letter_color([0xfd, 0xe0, 0x47]), [0x0f, 0x11, 0x15]);
+    }
+
+    /// The login's end in the one duration spelling (review item 42); 0 days is
+    /// today, as the pop-up says it.
+    #[test]
+    fn the_login_end_is_said_in_days() {
+        assert_eq!(login_ends_text(3), "login ends in 3d");
+        assert_eq!(login_ends_text(1), "login ends in 1d");
+        assert_eq!(login_ends_text(0), "login ends today");
+        assert_eq!(login_ends_text(-1), "login ended");
     }
 }

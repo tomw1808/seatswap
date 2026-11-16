@@ -21,6 +21,7 @@ import {
   invoke,
   limitLevel,
   listen,
+  loginDaysLeft,
   mixHex,
   money,
   rgba,
@@ -136,7 +137,7 @@ function scopedLimits(view) {
 
 // Every limit that is neither the session nor a week: its own kind name, and
 // the model's name before it when the reply names one (a Codex per-model limit
-// of another length, e.g. "gpt-6-astra · 5 h limit").
+// of another length, e.g. "gpt-6-astra · 5h limit").
 function otherLimits(view) {
   const known = new Set(["session", "weekly_all", "weekly_scoped"]);
   return accountLimits(view)
@@ -725,14 +726,6 @@ function renderSwitchConfirmation() {
   ]);
 }
 
-function loginDaysLeftOf(view) {
-  if (view && typeof view.loginDaysLeft === "number") return view.loginDaysLeft;
-  if (view && typeof view.loginEndsAtMs === "number") {
-    return Math.floor((view.loginEndsAtMs - Date.now()) / 86400000);
-  }
-  return null;
-}
-
 // "next · about 12:00" or, when a switch waits for a quiet moment,
 // "waiting · latest 12:40" (spec §3.7.1). Only while auto-burn is on.
 function renderCardTag(view) {
@@ -808,10 +801,7 @@ function renderCard(view, index) {
   // The badge and the pencil open the large window on this account's row.
   const edit = (event) => {
     event.stopPropagation();
-    invoke("open_window", { target: `settings/accounts?${view.id}` }).catch((error) => {
-      state.errors.accounts[view.id] = errorMessage(error);
-      renderMain();
-    });
+    openWindowTarget(`settings/accounts?${view.id}`);
   };
   badge.addEventListener("click", edit);
   const pencil = h(
@@ -877,7 +867,7 @@ function renderCard(view, index) {
     main.appendChild(h("div", { class: "card-note", text: "Extra usage is enabled." }));
   }
 
-  const daysLeft = loginDaysLeftOf(view);
+  const daysLeft = loginDaysLeft(view);
   if (typeof daysLeft === "number" && view.loginState !== "loggedOut" && daysLeft <= 5) {
     let text;
     if (daysLeft < 0) text = "login ended — log in again";

@@ -193,8 +193,15 @@ fn finished_of(mut records: Vec<Hosted<WindowRecord>>) -> Vec<Hosted<WindowRecor
             continue;
         };
         let kept = &windows[index];
-        let later = hosted.record.last_sample > kept.record.last_sample
-            || (hosted.record.last_sample == kept.record.last_sample && hosted.host < kept.host);
+        let later = if kept.record.reset != hosted.record.reset {
+            // One host saw the drop (a reset record) and another wrote the same
+            // window as ordinary: the reset record wins, whatever its
+            // `last_sample`, because it saw more of the window.
+            hosted.record.reset
+        } else {
+            hosted.record.last_sample > kept.record.last_sample
+                || (hosted.record.last_sample == kept.record.last_sample && hosted.host < kept.host)
+        };
         if later {
             windows[index] = hosted;
         }
@@ -213,9 +220,15 @@ fn finished_of(mut records: Vec<Hosted<WindowRecord>>) -> Vec<Hosted<WindowRecor
 /// - two ordinary ends: their ends are within [`same_reset`];
 /// - two resets from different hosts: their spans `(lastSample, end]` overlap.
 ///   Each host records a reset at its own first lower reading, and each span
-///   holds the moment the limit dropped, so no tolerance is needed.
-///
-/// An ordinary end and a reset are never the same window.
+///   holds the moment the limit dropped, so no tolerance is needed;
+/// - a reset and an ordinary window: the ordinary end is the reset time the
+///   reset record's own start names (`start + 7 d`), and the ordinary window
+///   began before the reset's lower end. One host saw the drop and wrote a
+///   reset ending at that lower reading; another slept past the old reset time
+///   and wrote the ordinary window. An ordinary window that *begins* at the
+///   reset's end is the window after the reset, even when its end is that same
+///   reset time, so it stays a window of its own. The reset record wins
+///   ([`finished_of`]): it saw more of the same window.
 fn same_window(a: &Hosted<WindowRecord>, b: &Hosted<WindowRecord>) -> bool {
     let (x, y) = (&a.record, &b.record);
     if x.account != y.account || x.k != y.k || x.m != y.m {
@@ -224,7 +237,14 @@ fn same_window(a: &Hosted<WindowRecord>, b: &Hosted<WindowRecord>) -> bool {
     match (x.reset, y.reset) {
         (false, false) => same_reset(x.end, y.end),
         (true, true) => a.host != b.host && x.last_sample < y.end && y.last_sample < x.end,
-        _ => false,
+        _ => {
+            let (reset, ordinary) = if x.reset { (x, y) } else { (y, x) };
+            ordinary.weekly_start() < reset.end
+                && same_reset(
+                    reset.weekly_start() + chrono::Duration::days(7),
+                    ordinary.end,
+                )
+        }
     }
 }
 
@@ -1210,4 +1230,103 @@ fn time_text(time: DateTime<Utc>) -> String {
 /// A number in the export, without a trailing `.0` for a whole percentage.
 fn number_text(value: f64) -> String {
     format!("{value}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::fs;
+
+    use chrono::Duration;
+    use tempfile::tempdir;
+
+    use crate::api::LimitKind;
+    use crate::history::AccountRef;
+
+    fn utc(text: &str) -> DateTime<Utc> {
+        text.parse().expect("test date")
+    }
+
+    fn account() -> AccountRef {
+        AccountRef {
+            acc: "6f1c2a9e-1d4b-4c7f-9a3e-8b5d2e6f1c04".to_string(),
+            org: "a92d7b31-5c8e-4f2a-9d6b-1e3c5a7f9b20".to_string(),
+        }
+    }
+
+    fn host_folder(root: &Path, host: &str) {
+        let folder = root.join(host);
+        fs::create_dir_all(&folder).expect("the host folder");
+        fs::write(folder.join("host.json"), "{\"machineId\":\"test\"}").expect("the host marker");
+    }
+
+    /// Host atlas saw the drop before the reset time and wrote a reset window
+    /// ending at that lower reading; host vega slept past the old reset time and
+    /// wrote the same window as an ordinary one, with a later `last_sample`.
+    /// They are one window, and the reset record wins: it saw more.
+    #[test]
+    fn a_reset_seen_by_one_host_and_an_ordinary_window_by_another_are_one_window() {
+        let dir = tempdir().expect("a temp history");
+        let root = dir.path();
+        for host in ["atlas", "vega"] {
+            host_folder(root, host);
+        }
+        let reset = utc("2026-11-07T19:00:00Z");
+        let start = reset - Duration::days(7);
+        let atlas = HistoryDir::at(root, "atlas");
+        atlas
+            .append(&WindowRecord {
+                account: account(),
+                k: LimitKind::WeeklyAll,
+                m: None,
+                start: Some(start),
+                end: utc("2026-11-05T12:10:00Z"),
+                final_percent: 62.0,
+                lost: None,
+                last_sample: utc("2026-11-05T12:00:00Z"),
+                plan: Some("Max".to_string()),
+                uncertain: false,
+                reset: true,
+                from: None,
+            })
+            .expect("atlas's reset window");
+        let vega = HistoryDir::at(root, "vega");
+        vega.append(&WindowRecord {
+            account: account(),
+            k: LimitKind::WeeklyAll,
+            m: None,
+            start: Some(start),
+            end: reset,
+            final_percent: 80.0,
+            lost: Some(20.0),
+            last_sample: utc("2026-11-05T12:30:00Z"),
+            plan: Some("Max".to_string()),
+            uncertain: false,
+            reset: false,
+            from: None,
+        })
+        .expect("vega's ordinary window");
+
+        let windows = atlas
+            .finished_windows(&Range::ALL, &Hosts::All)
+            .expect("the windows");
+        let seen: Vec<(String, DateTime<Utc>, bool)> = windows
+            .records
+            .iter()
+            .map(|hosted| (hosted.host.clone(), hosted.record.end, hosted.record.reset))
+            .collect();
+        assert_eq!(
+            windows.records.len(),
+            1,
+            "the two hosts wrote one window, got {seen:?}"
+        );
+        let window = &windows.records[0].record;
+        assert!(window.reset, "the reset record wins");
+        assert_eq!(window.final_percent, 62.0, "atlas saw the window's own use");
+        assert_eq!(
+            window.lost, None,
+            "a reset window counts nothing as expired"
+        );
+    }
 }

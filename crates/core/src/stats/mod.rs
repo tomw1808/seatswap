@@ -612,11 +612,14 @@ pub(crate) fn money_at(price: f64, used: f64, expired: f64) -> WindowMoney {
 
 /// The money of one account week from its price and its windows: `paid` is one
 /// week's price, `used` is `week.used` percent of it (which may pass 100), and
-/// `expired` is the last window's `lost` percent. A reset window's absent
-/// `lost` means nothing expired. `None` without a price.
-pub(crate) fn money_of(week: &AccountWeek) -> Option<WindowMoney> {
-    week.price
-        .map(|price| money_at(price, week.used, week.window.lost.unwrap_or(0.0)))
+/// `expired` is every window's `lost` percent added ([`week_lost_percent`]).
+/// A reset window's absent `lost` means nothing expired. `None` without a price.
+pub(crate) fn money_of(week: &AccountWeek) -> Result<Option<WindowMoney>, StatsError> {
+    let Some(price) = week.price else {
+        return Ok(None);
+    };
+    let expired = week_lost_percent(week)?;
+    Ok(Some(money_at(price, week.used, expired)))
 }
 
 /// The `lost` percent of a weekly window. A reset window has no `lost` because
@@ -631,6 +634,30 @@ pub(crate) fn lost_percent(window: &WindowRecord) -> Result<f64, StatsError> {
             window.account.acc, window.end
         ))),
     }
+}
+
+/// The share of one account week that expired: every window's `lost` added, so
+/// a week with two ordinary windows counts both. A reset window counts nothing
+/// ([`lost_percent`]).
+pub(crate) fn week_lost_percent(week: &AccountWeek) -> Result<f64, StatsError> {
+    let mut expired = 0.0;
+    for window in &week.windows {
+        expired += lost_percent(window)?;
+    }
+    Ok(expired)
+}
+
+/// The money an account week's windows offered: one week's price for each
+/// window, so a week a reset split offers two. Every share of the offered weeks
+/// divides by this; a week's `paid` itself stays one week's price.
+pub(crate) fn offered_money(week: &AccountWeek, money: &WindowMoney) -> f64 {
+    money.paid * week.windows.len() as f64
+}
+
+/// `part` as a percent of `offered`: the one rule of the Used and Expired
+/// shares (`None` when nothing was offered).
+pub(crate) fn percent_of_offered(part: f64, offered: f64) -> Option<f64> {
+    (offered > 0.0).then_some(part / offered * 100.0)
 }
 
 /// The account week of `account` whose windows hold `t`: a record belongs to
@@ -1573,6 +1600,54 @@ pub(crate) mod tests {
         );
     }
 
+    /// Two ordinary windows in one calendar week (a model reset kept the reset
+    /// time, or the reset moved) count both windows' expired share: 20 % and
+    /// 10 % make 30 % of the week's price, not only the last window's 10 %.
+    #[test]
+    fn two_ordinary_windows_count_both_lost_percents() {
+        let tiny = tiny();
+        let dir = tempdir().expect("a temp history");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let window = |end: &str, final_percent: f64, lost: f64| WindowRecord {
+            account: tiny.lb_ref(),
+            k: LimitKind::WeeklyAll,
+            m: None,
+            start: Some(utc(end) - Duration::days(7)),
+            end: utc(end),
+            final_percent,
+            lost: Some(lost),
+            last_sample: utc(end) - Duration::minutes(2),
+            plan: Some("Max".to_string()),
+            uncertain: false,
+            reset: false,
+            from: None,
+        };
+        history
+            .append_many(&[
+                window("2026-11-06T12:00:00Z", 80.0, 20.0),
+                window("2026-11-09T12:00:00Z", 90.0, 10.0),
+            ])
+            .expect("the two ordinary windows");
+        let ctx = Ctx {
+            history: &history,
+            ..tiny.ctx()
+        };
+        let weeks = account_weeks(&ctx, &two_weeks(), &all()).unwrap();
+        assert_eq!(weeks.len(), 1, "both windows' midpoints fall in one week");
+        let week = &weeks[0];
+        assert_eq!(week.windows.len(), 2, "both ordinary windows are kept");
+        assert_eq!(week_lost_percent(week).expect("both lost percents"), 30.0);
+        let money = money_of(week)
+            .expect("both lost percents are written")
+            .expect("LB's price is known");
+        assert!(
+            close(money.expired, 0.30 * money.paid),
+            "expired money is both windows' lost: {} of {}",
+            money.expired,
+            money.paid
+        );
+    }
+
     #[test]
     fn windows_go_to_the_week_of_their_midpoint() {
         let tiny = tiny();
@@ -1639,7 +1714,9 @@ pub(crate) mod tests {
             "the last window's end and lost are shown"
         );
         assert_eq!(week.used, 92.0, "62 % then 30 % from 0");
-        let money = money_of(week).expect("LB's price is known");
+        let money = money_of(week)
+            .expect("the week's lost percent is written")
+            .expect("LB's price is known");
         assert!(
             close(money.paid, 180.0 * 12.0 / 52.0),
             "one week's price, not two: {}",
@@ -1647,7 +1724,7 @@ pub(crate) mod tests {
         );
         assert!(
             close(money.expired, 0.70 * money.paid),
-            "the expired part is the last window's lost: {}",
+            "the expired part is every window's lost (the second's 70): {}",
             money.expired
         );
         assert!(

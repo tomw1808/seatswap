@@ -22,7 +22,7 @@ use seatswap_core::feed;
 use seatswap_core::harness::{self, HarnessPaths, HarnessSession};
 use seatswap_core::history::{EventKind, HistoryDir, Range, Recorder, SessionRecord, TokenRecord};
 use seatswap_core::live_sessions::{self, LiveSession, LiveStatus, OtherHost, Rows};
-use seatswap_core::money::{Fx, Prices, Valuer};
+use seatswap_core::money::{is_plan_model, Fx, Prices, Valuer};
 use seatswap_core::paths::{AppPaths, ClaudePaths, CodexPaths};
 use seatswap_core::project::{self, ProjectKey};
 use seatswap_core::projects;
@@ -898,19 +898,12 @@ fn update_transcript_watches(
 /// The transcript state at start: the files saved by the last run, or the
 /// default with the error that keeps this pass from writing it back.
 ///
-/// The state is a cache. A file of another version is not an error: the state
-/// starts empty, so every transcript is read again and the next save writes the
-/// new version; the thread says so once.
+/// A version-1 state is migrated by `ScanState::load`; a state of any other
+/// version is an error. This pass then reads no transcript and writes no
+/// record, because rebuilding the state is what would write the history twice.
 fn load_state(app: &AppPaths) -> (ScanState, Option<String>) {
     match ScanState::load(app) {
-        Ok(state) => {
-            if state.was_rebuilt() {
-                eprintln!(
-                    "seatswap: the transcript state was written by an older version; reading the transcripts again"
-                );
-            }
-            (state, None)
-        }
+        Ok(state) => (state, None),
         Err(error) => (
             ScanState::default(),
             Some(format!(
@@ -1015,13 +1008,13 @@ fn apply_provider_costs(
     want_missing_prices(memory, &rows.sessions, now);
 }
 
-/// Ask the look-up thread for a price for every listed Claude Code model that
-/// has none (item 4). The valuer prices models under models.dev's `anthropic`
-/// list, so only a Claude Code row's model can get a price this way: a Codex or
-/// Harness model never can, and asking would be a useless look-up. The thread
-/// limits itself to one ask an hour per model; the set here keeps a pass every
-/// second from sending the same ask again, and a model that gets a price is
-/// dropped from it so a later loss of the price asks again.
+/// Ask the look-up thread for a price for every plan model that a listed row or
+/// one of its agents used and that has none (item 4, spec §1.5). A model outside
+/// the Claude plan (a Codex model, a Harness model) never gets a price from
+/// models.dev's `anthropic` list, and asking would be a useless look-up. The
+/// thread limits itself to one ask an hour per model; the set here keeps a pass
+/// every second from sending the same ask again, and a model that gets a price
+/// is dropped from it so a later loss of the price asks again.
 fn want_missing_prices(memory: &mut SessionMemory, rows: &[LiveSession], now: DateTime<Utc>) {
     let unpriced: BTreeSet<String> = {
         let Some(prices) = memory
@@ -1032,11 +1025,15 @@ fn want_missing_prices(memory: &mut SessionMemory, rows: &[LiveSession], now: Da
         else {
             return;
         };
-        rows.iter()
-            .filter(|row| row.provider == live_sessions::CLAUDE_PROVIDER)
-            .filter_map(|row| row.model.as_deref())
+        let mut models = BTreeSet::new();
+        for row in rows {
+            models.extend(row.model.iter().cloned());
+            models.extend(row.agents.iter().filter_map(|agent| agent.model.clone()));
+        }
+        models
+            .into_iter()
+            .filter(|model| is_plan_model(model))
             .filter(|model| prices.of_model(model, now).is_none())
-            .map(str::to_string)
             .collect()
     };
     let mut ask = Vec::new();
@@ -1342,149 +1339,27 @@ pub(crate) fn run_pass(
         agents_by_session.insert(session.session_id.clone(), agents.metas);
     }
 
-    // One record per running session whose summary changed and whose last
-    // record is old enough (or which has none yet).
-    for session in &running.sessions {
-        let Some(seen) = state.sessions.get(&session.session_id) else {
-            continue;
-        };
-        let agents = agents_by_session
-            .get(&session.session_id)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        let record = match session_record(
-            agents,
-            &session.session_id,
-            seen,
-            session.entrypoint.clone(),
-            false,
-            memory,
-            now,
-        ) {
-            Ok(record) => record,
-            Err(error) => {
-                add_warning(&mut summary, error);
-                continue;
-            }
-        };
-        if !record_is_due(memory, &record, now) {
-            continue;
-        }
-        if let Some(recorder) = recorder {
-            match recorder.session(&record) {
-                Ok(()) => {
-                    let last = record.last;
-                    memory.records.insert(record.session.clone(), record);
-                    memory.closed.remove(&session.session_id);
-                    state.set_recorded(
-                        &session.session_id,
-                        RecordedSession {
-                            last,
-                            closed: false,
-                        },
-                    );
-                }
-                Err(error) => add_history_error(&mut summary, error),
-            }
-        }
-    }
-
-    // Every session seen in a transcript whose session file is not running gets
-    // one closed record: a `claude -p` session that started and ended between
-    // two wakes, and every session the backfill read. `recorded` remembers what
-    // was written, so a restart writes no second record for an unchanged
-    // session. When a session file could not be read this pass, the thread
-    // cannot tell which session ended: write no closed record.
-    if running.skipped.is_empty() {
-        let stopped: Vec<String> = state
+    // The sessions that left the running list, kept until the rows give the
+    // agents linked to them: `forget_closed` removes them below, and their
+    // closed records then count the same flash/Harness workers the running row
+    // counted. Their `recorded` line says which already have their closing
+    // record.
+    let stopped: Vec<(String, SessionSeen)> = if running.skipped.is_empty() {
+        state
             .sessions
-            .keys()
-            .filter(|session| !running_ids.contains(*session))
-            .cloned()
-            .collect();
-        for session in stopped {
-            let Some(seen) = state.sessions.get(&session) else {
-                continue;
-            };
-            let last = seen.last;
-            if seen
-                .recorded
-                .as_ref()
-                .is_some_and(|recorded| recorded.closed && recorded.last == last)
-            {
-                continue;
-            }
-            let entrypoint = memory
-                .records
-                .get(&session)
-                .and_then(|record| record.entrypoint.clone());
-            let agents =
-                transcripts::agents_of(claude, &session, &seen.spawns, &mut memory.agent_ends);
-            for warning in agents.warnings {
-                add_warning(&mut summary, warning);
-            }
-            let record = match session_record(
-                &agents.metas,
-                &session,
-                seen,
-                entrypoint,
-                true,
-                memory,
-                now,
-            ) {
-                Ok(record) => record,
-                Err(error) => {
-                    add_warning(&mut summary, error);
-                    continue;
-                }
-            };
-            if let Some(recorder) = recorder {
-                match recorder.session(&record) {
-                    Ok(()) => {
-                        memory.records.insert(session.clone(), record);
-                        state.set_recorded(&session, RecordedSession { last, closed: true });
-                    }
-                    Err(error) => add_history_error(&mut summary, error),
-                }
-            }
-        }
-    }
-
-    // A session that left the running list whose transcript entry is already
-    // pruned still gets one closing record, with the values of its last record.
-    if running.skipped.is_empty() {
-        let gone: Vec<String> = memory
-            .records
-            .keys()
-            .filter(|session| {
-                !running_ids.contains(*session)
-                    && !state.sessions.contains_key(*session)
-                    && !memory.closed.contains(*session)
+            .iter()
+            .filter(|(session, _)| !running_ids.contains(*session))
+            .filter(|(_, seen)| {
+                !seen
+                    .recorded
+                    .as_ref()
+                    .is_some_and(|recorded| recorded.closed && recorded.last == seen.last)
             })
-            .cloned()
-            .collect();
-        for session in gone {
-            let Some(last) = memory.records.get(&session).cloned() else {
-                continue;
-            };
-            if last.closed {
-                memory.closed.insert(session);
-                continue;
-            }
-            let mut closed = last;
-            closed.t = now;
-            closed.closed = true;
-            if let Some(recorder) = recorder {
-                match recorder.session(&closed) {
-                    Ok(()) => {
-                        memory.records.insert(session.clone(), closed);
-                        memory.closed.insert(session);
-                    }
-                    Err(error) => add_history_error(&mut summary, error),
-                }
-            }
-        }
-    }
+            .map(|(session, seen)| (session.clone(), seen.clone()))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // A session that is not running and whose last answer is more than an hour
     // old leaves the state; its files' offsets stay, so its transcript is not
@@ -1623,6 +1498,9 @@ pub(crate) fn run_pass(
             Some(paths) => harness::proc_links(paths, procs, &claude_pids),
             None => harness::proc_links_in(None, procs, &claude_pids),
         };
+        for warning in &found.warnings {
+            add_warning(&mut summary, warning.clone());
+        }
         // A walk that Codex alone needed does not change a Harness row: its
         // links are used only when its own running rule asked for the walk.
         if harness_walk {
@@ -1640,10 +1518,10 @@ pub(crate) fn run_pass(
     // the projects' default names and says why the values are missing, so a
     // waiting session still notifies.
     let mut currency = None;
-    let (mut rows, (harness_tokens, harness_recorded)) = match recorder {
+    let (mut rows, live) = match recorder {
         Some(recorder) => {
             let mut context = memory.rows_context.take().unwrap_or_default();
-            let (rows, tokens, recorded) = {
+            let (rows, live) = {
                 let (projects, pricing, settings_currency) =
                     prepare_rows_context(&mut context, app, recorder.dir(), now, &mut summary);
                 currency = settings_currency;
@@ -1666,7 +1544,7 @@ pub(crate) fn run_pass(
                 )
             };
             memory.rows_context = Some(context);
-            (Some(rows), (tokens, recorded))
+            (Some(rows), live)
         }
         None => {
             let pricing = live_sessions::Pricing::Unknown {
@@ -1674,7 +1552,7 @@ pub(crate) fn run_pass(
                     "the history is not open, so the values are not known".to_string()
                 }),
             };
-            let (rows, tokens, recorded) = live_rows(
+            let (rows, live) = live_rows(
                 &running.sessions,
                 state,
                 memory,
@@ -1691,13 +1569,158 @@ pub(crate) fn run_pass(
                 &codex_sessions,
                 &codex_open_files,
             );
-            (Some(rows), (tokens, recorded))
+            (Some(rows), live)
         }
     };
+    let LiveParts {
+        tokens: harness_tokens,
+        recorded: harness_recorded,
+        linked: harness_agent_counts,
+    } = live;
     // Item 6: the status line's cost of a Claude Code session is its API value,
     // and a model without a price is asked for (items 4 and 6).
     if let Some(rows) = rows.as_mut() {
         apply_provider_costs(app, rows, memory, now, &mut summary);
+    }
+
+    // One record per running session whose summary changed and whose last
+    // record is old enough (or which has none yet). The linked flash/Harness
+    // agents are the ones `live_rows` just added to the running row.
+    for session in &running.sessions {
+        let Some(seen) = state.sessions.get(&session.session_id) else {
+            continue;
+        };
+        let agents = agents_by_session
+            .get(&session.session_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let linked = harness_agent_counts
+            .get(&session.session_id)
+            .copied()
+            .unwrap_or_default();
+        let record = match session_record(
+            SessionAgents {
+                metas: agents,
+                linked,
+            },
+            &session.session_id,
+            seen,
+            session.entrypoint.clone(),
+            false,
+            memory,
+            now,
+        ) {
+            Ok(record) => record,
+            Err(error) => {
+                add_warning(&mut summary, error);
+                continue;
+            }
+        };
+        if !record_is_due(memory, &record, now) {
+            continue;
+        }
+        if let Some(recorder) = recorder {
+            match recorder.session(&record) {
+                Ok(()) => {
+                    let last = record.last;
+                    memory.records.insert(record.session.clone(), record);
+                    memory.closed.remove(&session.session_id);
+                    state.set_recorded(
+                        &session.session_id,
+                        RecordedSession {
+                            last,
+                            closed: false,
+                        },
+                    );
+                }
+                Err(error) => add_history_error(&mut summary, error),
+            }
+        }
+    }
+
+    // Every session seen in a transcript whose session file is not running gets
+    // one closed record: a `claude -p` session that started and ended between
+    // two wakes, and every session the backfill read. `recorded` remembers what
+    // was written, so a restart writes no second record for an unchanged
+    // session. The `stopped` list was taken before `forget_closed` removed the
+    // sessions from the state.
+    for (session, seen) in &stopped {
+        let last = seen.last;
+        let entrypoint = memory
+            .records
+            .get(session)
+            .and_then(|record| record.entrypoint.clone());
+        let agents = transcripts::agents_of(claude, session, &seen.spawns, &mut memory.agent_ends);
+        for warning in agents.warnings {
+            add_warning(&mut summary, warning);
+        }
+        let linked = harness_agent_counts
+            .get(session)
+            .copied()
+            .unwrap_or_default();
+        let record = match session_record(
+            SessionAgents {
+                metas: &agents.metas,
+                linked,
+            },
+            session,
+            seen,
+            entrypoint,
+            true,
+            memory,
+            now,
+        ) {
+            Ok(record) => record,
+            Err(error) => {
+                add_warning(&mut summary, error);
+                continue;
+            }
+        };
+        if let Some(recorder) = recorder {
+            match recorder.session(&record) {
+                Ok(()) => {
+                    memory.records.insert(session.clone(), record);
+                    state.set_recorded(session, RecordedSession { last, closed: true });
+                }
+                Err(error) => add_history_error(&mut summary, error),
+            }
+        }
+    }
+
+    // A session that left the running list whose transcript entry is already
+    // pruned still gets one closing record, with the values of its last record.
+    if running.skipped.is_empty() {
+        let gone: Vec<String> = memory
+            .records
+            .keys()
+            .filter(|session| {
+                !running_ids.contains(*session)
+                    && !state.sessions.contains_key(*session)
+                    && !memory.closed.contains(*session)
+            })
+            .cloned()
+            .collect();
+        for session in gone {
+            let Some(last) = memory.records.get(&session).cloned() else {
+                continue;
+            };
+            if last.closed {
+                memory.closed.insert(session);
+                continue;
+            }
+            let mut closed = last;
+            closed.t = now;
+            closed.closed = true;
+            if let Some(recorder) = recorder {
+                match recorder.session(&closed) {
+                    Ok(()) => {
+                        memory.records.insert(session.clone(), closed);
+                        memory.closed.insert(session);
+                    }
+                    Err(error) => add_history_error(&mut summary, error),
+                }
+            }
+        }
     }
     // The Harness tokens reach the history like an agent's: only what grew.
     // The totals are saved before the lines are written, as S-1 saves its scan
@@ -2156,6 +2179,27 @@ fn same_pushed(first: &SessionsView, second: &SessionsView) -> bool {
             .all(|(a, b)| a.host == b.host && a.stale == b.stale && a.this == b.this)
 }
 
+/// The linked agents of one session: what `add_agents` counts on a running row.
+#[derive(Debug, Clone, Copy, Default)]
+struct AgentCounts {
+    started: usize,
+    finished: usize,
+}
+
+/// The parts of a pass's rows that are not the rows themselves.
+struct LiveParts {
+    tokens: Vec<TokenRecord>,
+    recorded: BTreeMap<String, HarnessRecorded>,
+    linked: BTreeMap<String, AgentCounts>,
+}
+
+/// What one session record counts: Claude Code's agent metas and the linked
+/// flash/Harness agents.
+struct SessionAgents<'a> {
+    metas: &'a [transcripts::AgentMeta],
+    linked: AgentCounts,
+}
+
 /// The rows of this host from the session files, with the project look-up the
 /// thread caches and the pricing that is known.
 #[allow(clippy::too_many_arguments)]
@@ -2175,11 +2219,7 @@ fn live_rows(
     harness_recorded: &BTreeMap<String, HarnessRecorded>,
     codex_sessions: &[CodexSession],
     codex_open_files: &BTreeSet<PathBuf>,
-) -> (
-    live_sessions::Rows,
-    Vec<TokenRecord>,
-    BTreeMap<String, HarnessRecorded>,
-) {
+) -> (live_sessions::Rows, LiveParts) {
     let metas = |session: &str| agents.get(session).cloned().unwrap_or_default();
     let project_of = {
         let memory = RefCell::new(memory);
@@ -2195,8 +2235,12 @@ fn live_rows(
         now,
         &project_of,
     );
-    let (harness_tokens, harness_recorded) = if harness_sessions.is_empty() {
-        (Vec::new(), harness_recorded.clone())
+    let parts = if harness_sessions.is_empty() {
+        LiveParts {
+            tokens: Vec::new(),
+            recorded: harness_recorded.clone(),
+            linked: BTreeMap::new(),
+        }
     } else {
         let harness = live_sessions::harness_rows(
             harness_sessions,
@@ -2210,14 +2254,24 @@ fn live_rows(
             now,
             &project_of,
         );
+        // The same agents `add_agents` puts on the running row: a session record
+        // counts them too, so its agent counts do not change when it closes.
+        let mut linked: BTreeMap<String, AgentCounts> = BTreeMap::new();
         for (session, agents) in harness.agents {
+            let started = agents.len();
+            let finished = agents.iter().filter(|agent| !agent.running).count();
+            linked.insert(session.clone(), AgentCounts { started, finished });
             if let Some(row) = rows.sessions.iter_mut().find(|row| row.session == session) {
                 live_sessions::add_agents(row, agents);
             }
         }
         rows.warnings.extend(harness.rows.warnings);
         rows.sessions.extend(harness.rows.sessions);
-        (harness.tokens, harness.recorded)
+        LiveParts {
+            tokens: harness.tokens,
+            recorded: harness.recorded,
+            linked,
+        }
     };
     if !codex_sessions.is_empty() {
         let codex = live_sessions::codex_rows(
@@ -2232,11 +2286,11 @@ fn live_rows(
         rows.warnings.extend(codex.warnings);
         rows.sessions.extend(codex.sessions);
     }
-    (rows, harness_tokens, harness_recorded)
+    (rows, parts)
 }
 
 fn session_record(
-    agents: &[transcripts::AgentMeta],
+    agents: SessionAgents<'_>,
     session: &str,
     seen: &SessionSeen,
     entrypoint: Option<String>,
@@ -2245,11 +2299,11 @@ fn session_record(
     now: DateTime<Utc>,
 ) -> Result<SessionRecord, String> {
     let started = count_u32(
-        agents.len(),
+        agents.metas.len() + agents.linked.started,
         &format!("the number of agents started in session {session}"),
     )?;
     let finished = count_u32(
-        agents.iter().filter(|agent| agent.is_done()).count(),
+        agents.metas.iter().filter(|agent| agent.is_done()).count() + agents.linked.finished,
         &format!("the number of agents finished in session {session}"),
     )?;
     Ok(SessionRecord {
@@ -2427,12 +2481,12 @@ mod tests {
     struct NoProc;
 
     impl harness::ProcSource for NoProc {
-        fn pids(&self) -> Vec<u32> {
-            Vec::new()
+        fn pids(&self) -> std::io::Result<Vec<u32>> {
+            Ok(Vec::new())
         }
 
-        fn open_files(&self, _pid: u32) -> Vec<PathBuf> {
-            Vec::new()
+        fn open_files(&self, _pid: u32) -> std::io::Result<Vec<PathBuf>> {
+            Ok(Vec::new())
         }
 
         fn parent(&self, _pid: u32) -> Option<u32> {
@@ -3460,73 +3514,106 @@ mod tests {
         assert_eq!(outcome.summary.warning.as_deref(), Some(state_error));
     }
 
-    /// The scan state is a cache: a file of another version is discarded, every
-    /// transcript is read again, and the next save writes the new version.
+    /// Review finding 1: upgrading from 1.1.0 must migrate its version-1 scan
+    /// state, not rebuild it. The test keeps its old name because
+    /// `specs/plan-1.2/PLAN.md` and `specs/plan/tests_audit.py` still list it;
+    /// it now proves the offsets are kept and no record is written twice.
     #[test]
     fn an_old_scan_state_is_rebuilt() {
         let (tmp, claude, app) = fixture();
+        let now = time("2026-11-16T10:00:00Z");
+        let first_at = time("2026-11-16T09:41:07.412Z");
         let folder = claude.projects_dir().join("-home-sam-projects-atlas");
         fs::create_dir_all(&folder).unwrap();
         let transcript = folder.join(format!("{SESSION}.jsonl"));
-        let line = transcript_line(
+        let first = transcript_line(
             SESSION,
             "msg_01QmB7xT",
-            time("2026-11-14T09:41:07Z"),
+            first_at,
             "/home/sam/projects/atlas",
             "claude-opus-5-5",
             (2, 166, 26_173, 28_126),
         );
-        fs::write(&transcript, format!("{line}\n")).unwrap();
+        fs::write(&transcript, format!("{first}\n")).unwrap();
         let key = format!("-home-sam-projects-atlas/{SESSION}.jsonl");
         let length = fs::metadata(&transcript).unwrap().len();
 
-        // A version 1 state file that claims the whole transcript was read.
+        // The history 1.1.0 left for this transcript: its token line and the
+        // closed SessionRecord it wrote when the session ended.
+        let history_root = tmp.path().join("history");
+        let recorder = Recorder::new(history(&history_root));
+        let project = ProjectKey::Folder("atlas".to_string());
+        let token = TokenRecord {
+            t: time("2026-11-16T09:00:00Z"),
+            session: SESSION.to_string(),
+            cwd: "/home/sam/projects/atlas".to_string(),
+            project: project.clone(),
+            model: "claude-opus-5-5".to_string(),
+            input: 2,
+            out: 166,
+            cw: 26_173,
+            cr: 28_126,
+            answers: 1,
+            agent_answers: 0,
+        };
+        recorder.tokens(std::slice::from_ref(&token)).unwrap();
+        let first_record = SessionRecord {
+            t: first_at,
+            session: SESSION.to_string(),
+            cwd: "/home/sam/projects/atlas".to_string(),
+            project,
+            entrypoint: Some("cli".to_string()),
+            first: first_at,
+            last: first_at,
+            agents_started: 0,
+            agents_finished: 0,
+            closed: true,
+        };
+        recorder.session(&first_record).unwrap();
+
+        // A state file exactly as 1.1.0 wrote it: the whole transcript was
+        // read, the session's sums and its written closing record are kept.
         let mut files = serde_json::Map::new();
         files.insert(
             key.clone(),
             serde_json::json!({
                 "offset": length,
-                "grew": "2026-11-14T09:41:07.412Z",
-                "recent": [],
-                "lastAnswer": "2026-11-14T09:41:07.412Z"
-            }),
-        );
-        let mut sessions = serde_json::Map::new();
-        sessions.insert(
-            SESSION.to_string(),
-            serde_json::json!({
-                "folder": "-home-sam-projects-atlas",
-                "cwd": "/home/sam/projects/atlas",
-                "first": "2026-11-14T09:41:07.412Z",
-                "last": "2026-11-14T09:41:07.412Z",
-                "lastModel": "claude-opus-5-5",
-                "lastUserTurn": null,
-                // Version 1 kept one count per minute, without a model.
-                "recent": [["2026-11-14T09:41:00Z", {"input": 2, "out": 166, "cw": 26173, "cr": 28126}]]
+                "grew": "2026-11-16T09:41:07.412Z",
+                "recent": ["msg_01QmB7xT"],
+                "lastAnswer": "2026-11-16T09:41:07.412Z"
             }),
         );
         let old = serde_json::json!({
             "version": 1,
             "files": files,
-            "sessions": sessions
+            "sessions": {
+                SESSION: {
+                    "folder": "-home-sam-projects-atlas",
+                    "cwd": "/home/sam/projects/atlas",
+                    "first": "2026-11-16T09:41:07.412Z",
+                    "last": "2026-11-16T09:41:07.412Z",
+                    "lastModel": "claude-opus-5-5",
+                    "lastUserTurn": null,
+                    "thinking": [],
+                    "totals": {"input": 2, "out": 166, "cw": 26173, "cr": 28126},
+                    "byModel": {"claude-opus-5-5": {"input": 2, "out": 166, "cw": 26173, "cr": 28126}},
+                    "agents": {},
+                    "spawns": {},
+                    // Version 1 kept one count per minute, without a model.
+                    "recent": [["2026-11-16T09:41:00Z", {"input": 2, "out": 166, "cw": 26173, "cr": 28126}]],
+                    "recorded": {"last": "2026-11-16T09:41:07.412Z", "closed": true}
+                }
+            }
         });
         let state_dir = app.transcripts_state_dir();
         fs::create_dir_all(&state_dir).unwrap();
         let state_file = state_dir.join("-home-sam-projects-atlas.json");
         fs::write(&state_file, old.to_string()).unwrap();
 
+        // One 1.2.0 pass through the thread's own entry point. Nothing already
+        // read by 1.1.0 may produce a record again.
         let (mut state, state_error) = load_state(&app);
-        assert_eq!(state_error, None, "another version is not an error");
-        assert!(state.was_rebuilt(), "the load says the state was discarded");
-        assert!(
-            !state_file.exists(),
-            "the old state file is discarded, not left for the next start"
-        );
-        assert!(state.files.is_empty(), "the old state is not read");
-        assert!(state.sessions.is_empty(), "the old sessions are not read");
-
-        // One pass reads the transcript again and writes the new state back.
-        let recorder = Recorder::new(history(&tmp.path().join("history")));
+        assert_eq!(state_error, None, "version 1 is migrated, not an error");
         let mut memory = SessionMemory::new(claude.home().to_path_buf());
         one_pass(
             &app,
@@ -3536,21 +3623,218 @@ mod tests {
             Some(&recorder),
             &mut state,
             &mut memory,
-            time("2026-11-14T10:00:00Z"),
+            now,
             None,
             None,
         );
         assert_eq!(
             state.sessions[SESSION].totals.out, 166,
-            "the transcript was read again"
+            "the already-read answer is not counted into the state again"
+        );
+        let tokens = recorder
+            .dir()
+            .read::<TokenRecord>(
+                &Range {
+                    from: time("2026-11-01T00:00:00Z"),
+                    to: time("2026-12-01T00:00:00Z"),
+                },
+                &Hosts::One("atlas".to_string()),
+            )
+            .unwrap();
+        assert_eq!(tokens.records.len(), 1, "no token line is written again");
+        assert_eq!(tokens.records[0].record.out, 166);
+        assert_eq!(
+            state.files[&key].offset, length,
+            "the state keeps 1.1.0's read offset"
+        );
+        let sessions = recorder
+            .dir()
+            .read::<SessionRecord>(
+                &Range {
+                    from: time("2026-11-01T00:00:00Z"),
+                    to: time("2026-12-01T00:00:00Z"),
+                },
+                &Hosts::One("atlas".to_string()),
+            )
+            .unwrap();
+        assert_eq!(
+            sessions.records.len(),
+            1,
+            "no session record is written again"
         );
         let saved: serde_json::Value =
             serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
-        assert_eq!(saved["version"], 2, "the new state is written back");
+        assert_eq!(saved["version"], 2, "the migrated state is written back");
+        assert_eq!(saved["files"][&key]["offset"].as_u64(), Some(length));
+
+        // An answer appended after the 1.1.0 state is read once.
+        let second_at = time("2026-11-16T09:50:00Z");
+        let second = transcript_line(
+            SESSION,
+            "msg_02QmB7xT",
+            second_at,
+            "/home/sam/projects/atlas",
+            "claude-opus-5-5",
+            (3, 200, 0, 0),
+        );
+        let mut text = fs::read_to_string(&transcript).unwrap();
+        text.push_str(&second);
+        text.push('\n');
+        fs::write(&transcript, text).unwrap();
+        let later = now + ChronoDuration::minutes(1);
+        let (mut state, state_error) = load_state(&app);
+        assert_eq!(state_error, None);
+        let mut memory = SessionMemory::new(claude.home().to_path_buf());
+        one_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            &NoProc,
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            later,
+            None,
+            None,
+        );
+        let tokens = recorder
+            .dir()
+            .read::<TokenRecord>(
+                &Range {
+                    from: time("2026-11-01T00:00:00Z"),
+                    to: time("2026-12-01T00:00:00Z"),
+                },
+                &Hosts::One("atlas".to_string()),
+            )
+            .unwrap();
+        assert_eq!(tokens.records.len(), 2, "the new answer is one new line");
         assert_eq!(
-            saved["files"][&key]["offset"].as_u64(),
-            Some(length),
-            "the rebuilt state read the whole transcript"
+            tokens
+                .records
+                .iter()
+                .map(|hosted| hosted.record.out)
+                .sum::<u64>(),
+            366,
+            "the old 166 is not written again"
+        );
+        assert_eq!(
+            tokens
+                .records
+                .iter()
+                .filter(|hosted| hosted.record.out == 200)
+                .count(),
+            1,
+            "the appended answer is recorded once"
+        );
+        let sessions = recorder
+            .dir()
+            .read::<SessionRecord>(
+                &Range {
+                    from: time("2026-11-01T00:00:00Z"),
+                    to: time("2026-12-01T00:00:00Z"),
+                },
+                &Hosts::One("atlas".to_string()),
+            )
+            .unwrap();
+        assert_eq!(
+            sessions
+                .records
+                .iter()
+                .filter(|hosted| hosted.record.last == first_at)
+                .count(),
+            1,
+            "the 1.1.0 closing record is not written again"
+        );
+        assert!(
+            sessions
+                .records
+                .iter()
+                .any(|hosted| hosted.record.closed && hosted.record.last == second_at),
+            "the appended answer gets its one closing record"
+        );
+    }
+
+    /// A newer state file is an error naming the file and both versions; the
+    /// pass writes nothing, because a rebuild is what doubles the history.
+    #[test]
+    fn a_state_file_of_a_newer_version_is_an_error_and_writes_no_record() {
+        let (tmp, claude, app) = fixture();
+        let now = time("2026-11-16T10:00:00Z");
+        let folder = claude.projects_dir().join("-home-sam-projects-atlas");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(
+            folder.join(format!("{SESSION}.jsonl")),
+            format!(
+                "{}\n",
+                transcript_line(
+                    SESSION,
+                    "msg_01QmB7xT",
+                    time("2026-11-16T09:41:07Z"),
+                    "/home/sam/projects/atlas",
+                    "claude-opus-5-5",
+                    (2, 166, 26_173, 28_126)
+                )
+            ),
+        )
+        .unwrap();
+        let state_dir = app.transcripts_state_dir();
+        fs::create_dir_all(&state_dir).unwrap();
+        let state_file = state_dir.join("-home-sam-projects-atlas.json");
+        let newer = serde_json::json!({
+            "version": 3,
+            "files": {},
+            "sessions": {}
+        });
+        fs::write(&state_file, newer.to_string()).unwrap();
+
+        let (mut state, error) = load_state(&app);
+        let error = error.expect("a version this build does not read is an error");
+        assert!(
+            error.contains(state_file.to_str().unwrap()),
+            "the file is named: {error}"
+        );
+        assert!(error.contains("version 3"), "the found version: {error}");
+        assert!(error.contains("version 2"), "this build's version: {error}");
+        assert!(
+            error.contains("newer seatswap"),
+            "a higher version says why: {error}"
+        );
+        assert!(state.files.is_empty(), "nothing is read from version 3");
+
+        let history_root = tmp.path().join("history");
+        let recorder = Recorder::new(history(&history_root));
+        let mut memory = SessionMemory::new(claude.home().to_path_buf());
+        one_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            &NoProc,
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            now,
+            Some(&error),
+            None,
+        );
+
+        assert!(
+            !history_root
+                .join("atlas")
+                .join("tokens-2026-11.jsonl")
+                .exists(),
+            "a state error writes no token line"
+        );
+        assert!(
+            !history_root
+                .join("atlas")
+                .join("sessions-2026-11.jsonl")
+                .exists(),
+            "a state error writes no session record"
+        );
+        assert_eq!(
+            fs::read_to_string(&state_file).unwrap(),
+            newer.to_string(),
+            "the state file is left as it was"
         );
     }
 
@@ -5746,6 +6030,75 @@ mod tests {
         );
     }
 
+    /// Item 5: a plan model one of a row's agents used is asked for too, not
+    /// only the row's own last model.
+    #[test]
+    fn an_agents_plan_model_without_a_price_is_asked_for() {
+        let (tmp, claude, app) = fixture();
+        write_eur_settings(&app);
+        write_prices(&app, &["claude-opus-5-5"]);
+        write_fx(&app, 1.0);
+        let recorder = Recorder::new(history(&tmp.path().join("history")));
+        write_running_answer(&claude, 402, SESSION, "claude-opus-5-5");
+        let subagents = claude
+            .projects_dir()
+            .join("-home-sam-projects-atlas")
+            .join(SESSION)
+            .join("subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        fs::write(
+            subagents.join("agent-a875.jsonl"),
+            format!(
+                "{}\n",
+                transcript_line(
+                    SESSION,
+                    "msg_agent",
+                    time("2026-11-14T09:42:00Z"),
+                    "/home/sam/projects/atlas",
+                    "claude-haiku-5-5",
+                    (2, 10, 0, 0),
+                )
+            ),
+        )
+        .unwrap();
+        let now = time("2026-11-14T10:00:00Z");
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        let asked: std::rc::Rc<RefCell<Vec<String>>> = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let seen = std::rc::Rc::clone(&asked);
+        memory.want_price = Some(Box::new(move |model: &str| {
+            seen.borrow_mut().push(model.to_string());
+        }));
+
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[402]),
+            &NoProc,
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            now,
+            None,
+        );
+
+        let row = harness_row(&memory, SESSION);
+        assert_eq!(row.model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(
+            row.agents
+                .iter()
+                .filter_map(|agent| agent.model.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["claude-haiku-5-5"],
+            "the row carries its agent's model"
+        );
+        assert_eq!(
+            *asked.borrow(),
+            vec!["claude-haiku-5-5".to_string()],
+            "the unpriced plan model of the agent is asked for; the priced row model is not"
+        );
+    }
+
     /// The commands must not starve the thread: after a command the thread has
     /// to wait out the *rest* of its window, not a whole window again. With a
     /// window that is over and over again, the passes (and with them the
@@ -5828,7 +6181,10 @@ mod tests {
         };
         let mut memory = SessionMemory::new(tmp.path().to_path_buf());
         let record = session_record(
-            &[agent],
+            SessionAgents {
+                metas: &[agent],
+                linked: AgentCounts::default(),
+            },
             SESSION,
             &seen,
             None,
@@ -5959,16 +6315,17 @@ mod tests {
     }
 
     impl harness::ProcSource for FakeProc {
-        fn pids(&self) -> Vec<u32> {
+        fn pids(&self) -> std::io::Result<Vec<u32>> {
             self.walks.set(self.walks.get() + 1);
-            self.processes.keys().copied().collect()
+            Ok(self.processes.keys().copied().collect())
         }
 
-        fn open_files(&self, pid: u32) -> Vec<PathBuf> {
-            self.processes
+        fn open_files(&self, pid: u32) -> std::io::Result<Vec<PathBuf>> {
+            Ok(self
+                .processes
                 .get(&pid)
                 .map(|(files, _)| files.clone())
-                .unwrap_or_default()
+                .unwrap_or_default())
         }
 
         fn parent(&self, pid: u32) -> Option<u32> {
@@ -6069,6 +6426,115 @@ mod tests {
         assert_eq!(job.kind.as_deref(), Some("flash"));
         assert!(job.running);
         assert_eq!(job.model.as_deref(), Some(HARNESS_MODEL));
+    }
+
+    /// Z-2 finding 20: a closed session used to count only Claude Code's agent
+    /// metas, so its "N done" dropped when it closed. The linked flash/Harness
+    /// agents are counted by the same rule as the running row.
+    #[test]
+    fn a_closed_session_keeps_its_flash_agents() {
+        let (tmp, claude, app) = fixture();
+        let recorder = Recorder::new(history(&tmp.path().join("history")));
+        let now = time("2026-11-16T14:00:00Z");
+        write_session(
+            &claude,
+            400,
+            &session_json(
+                400,
+                SESSION,
+                "/home/sam/projects/atlas",
+                None,
+                "busy",
+                now.timestamp_millis(),
+            ),
+        );
+        let subagents = claude
+            .projects_dir()
+            .join("-home-sam-projects-atlas")
+            .join(SESSION)
+            .join("subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        for agent in ["a111", "b222"] {
+            fs::write(
+                subagents.join(format!("agent-{agent}.meta.json")),
+                serde_json::json!({
+                    "agentType": "general-purpose",
+                    "description": "fix the failing tests",
+                    "isBuiltIn": true,
+                    "finished": true,
+                    "spawnDepth": 1,
+                    "toolUseId": format!("toolu_{agent}")
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        let paths = harness_paths(&tmp);
+        write_harness(&paths, HARNESS_JOB, None, 0, 1, now, true);
+        let mut state = ScanState::default();
+        state.sessions.insert(
+            SESSION.to_string(),
+            seen_with_jobs(
+                SESSION,
+                "/home/sam/projects/atlas",
+                now,
+                BTreeSet::from([HARNESS_JOB.to_string()]),
+            ),
+        );
+        let mut memory = SessionMemory::new(claude.home().to_path_buf());
+        memory.harness_paths = Some(paths);
+
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[400]),
+            &NoProc,
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            now,
+            None,
+        );
+        let running_done = harness_row(&memory, SESSION).agents_done;
+        assert_eq!(
+            running_done, 3,
+            "two Claude agents and the linked flash job are done"
+        );
+
+        fs::remove_file(claude.sessions_dir().join("400.json")).unwrap();
+        let later = now + ChronoDuration::minutes(1);
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            &NoProc,
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            later,
+            None,
+        );
+
+        let read = recorder
+            .dir()
+            .read::<SessionRecord>(
+                &Range {
+                    from: now - ChronoDuration::hours(1),
+                    to: later + ChronoDuration::hours(1),
+                },
+                &Hosts::One("atlas".to_string()),
+            )
+            .unwrap();
+        let closed = read
+            .records
+            .iter()
+            .filter(|hosted| hosted.record.session == SESSION && hosted.record.closed)
+            .max_by_key(|hosted| hosted.record.t)
+            .expect("the closing record");
+        assert_eq!(
+            closed.record.agents_finished, running_done,
+            "the closed record counts the flash agent too"
+        );
     }
 
     #[test]

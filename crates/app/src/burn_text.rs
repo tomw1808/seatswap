@@ -75,9 +75,9 @@ impl Serialize for BurnPart {
 /// text is the sentence the line said before it had parts.
 // No front end shows the line as text today (the pop-up draws the parts, the
 // tray menu, notifications and the CLI have texts of their own); the tests
-// use it to compare the sentence.
-#[cfg(feature = "gui")]
-#[cfg_attr(not(test), allow(dead_code))]
+// use it to compare the sentence. It is compiled for tests only: the app has
+// no production caller.
+#[cfg(all(feature = "gui", test))]
 pub fn plain(parts: &[BurnPart]) -> String {
     let mut text = String::new();
     for part in parts {

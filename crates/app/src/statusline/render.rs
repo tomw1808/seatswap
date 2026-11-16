@@ -370,9 +370,9 @@ where
 
 /// The spans as the terminal line: one SGR run per stretch of spans with the
 /// same style, closed by a reset. Neighbouring spans with the same style are
-/// written as one run, so a value and its suffix that share a foreground are
-/// one coloured run. A segment's prefix is always plain, and a suffix is plain
-/// when the value has a background, so a background covers the value only.
+/// written as one run, so a value and its prefix or suffix that share a
+/// foreground are one coloured run. A prefix and a suffix are plain when the
+/// value has a background, so a background covers the value only.
 pub(crate) fn ansi(spans: &[Span]) -> String {
     let mut out = String::new();
     let mut index = 0;
@@ -789,12 +789,12 @@ fn load_percent(kind: SegmentKind, facts: &Facts) -> Option<f64> {
 ///
 /// A segment becomes up to three spans: its prefix, its value and its suffix.
 /// Only the value carries the colour rule's background, so the account tag's
-/// background covers its letters and not the space after them. A prefix is
-/// plain. A suffix keeps the value's foreground when the rule paints no
-/// background (the unit "%" stays the value's colour, and `ansi` writes the
-/// same run as before); with a background, the suffix is plain too, so the
-/// colour stops at the value. The visible text and its width are the same as
-/// one span's would be.
+/// background covers its letters and not the space after them. A prefix and a
+/// suffix keep the value's foreground when the rule paints no background (a
+/// prefix such as "↑ " and the unit "%" stay the value's colour, and `ansi`
+/// writes the same run as before); with a background, both are plain, so the
+/// colour stops at the value. One helper decides it for both. The visible text
+/// and its width are the same as one span's would be.
 fn compose_zone(pieces: &[Piece], level: Option<u8>) -> Vec<Span> {
     let mut spans = Vec::new();
     let mut ends_space = false;
@@ -818,7 +818,7 @@ fn compose_zone(pieces: &[Piece], level: Option<u8>) -> Vec<Span> {
         if !prefix.is_empty() {
             spans.push(Span {
                 text: prefix.to_string(),
-                fg: None,
+                fg: edge_fg(piece),
                 bg: None,
                 bold: false,
             });
@@ -832,16 +832,26 @@ fn compose_zone(pieces: &[Piece], level: Option<u8>) -> Vec<Span> {
             });
         }
         if !piece.suffix.is_empty() {
-            let fg = if piece.bg.is_some() { None } else { piece.fg };
             spans.push(Span {
                 text: piece.suffix.clone(),
-                fg,
+                fg: edge_fg(piece),
                 bg: None,
                 bold: false,
             });
         }
     }
     spans
+}
+
+/// The foreground a segment's prefix or suffix gets: the value's colour when
+/// the colour rule paints no background, plain when it paints one, so the
+/// colour stops at the value.
+fn edge_fg(piece: &Piece) -> Option<Color> {
+    if piece.bg.is_some() {
+        None
+    } else {
+        piece.fg
+    }
 }
 
 #[cfg(test)]
@@ -1241,6 +1251,56 @@ mod tests {
             !line.contains(&format!("AC {RESET}")),
             "the suffix's space carries no background: {line:?}"
         );
+    }
+
+    /// Finding 17: the prefix follows the same colour rule as the suffix. With a
+    /// foreground-only rule it keeps the value's colour; with a background it
+    /// is plain, so the background covers the value only.
+    #[test]
+    fn a_prefix_follows_the_value_colour_unless_the_rule_paints_a_background() {
+        let mut foreground = segment(SegmentKind::Text);
+        foreground.text = Some("x".to_string());
+        foreground.prefix = "↑ ".to_string();
+        foreground.color = ColorRule::Fixed {
+            color: "#3b82f6".to_string(),
+        };
+        let config = StatuslineConfig {
+            left: vec![foreground],
+            right: Vec::new(),
+            margin: 0,
+        };
+
+        let (spans, dropped) = render_spans(&config, &payload(), &facts(), None, &offset());
+        assert!(dropped.is_empty(), "nothing was dropped");
+        assert_eq!(spans[0].text, "↑ ");
+        assert_eq!(
+            spans[0].fg, spans[1].fg,
+            "the prefix keeps the value's foreground when the rule paints no background"
+        );
+        assert!(
+            spans[0].fg.is_some(),
+            "the rule's colour reaches the prefix"
+        );
+        assert_eq!(spans[0].bg, None);
+
+        let mut background = segment(SegmentKind::Account);
+        background.prefix = "↑ ".to_string();
+        background.color = ColorRule::Account;
+        let config = StatuslineConfig {
+            left: Vec::new(),
+            right: vec![background],
+            margin: 0,
+        };
+
+        let (spans, dropped) = render_spans(&config, &payload(), &facts(), None, &offset());
+        assert!(dropped.is_empty(), "nothing was dropped");
+        assert_eq!(spans[0].text, "↑ ");
+        assert_eq!(
+            spans[0].fg, None,
+            "with a background the prefix is plain, like the suffix"
+        );
+        assert_eq!(spans[0].bg, None);
+        assert!(spans[1].fg.is_some() && spans[1].bg.is_some());
     }
 
     fn segment(kind: SegmentKind) -> Segment {

@@ -287,13 +287,21 @@ code,
   white-space: nowrap;
 }
 
+/* A row's control and note share the one content column and wrap: the note
+   drops under a control that does not fit beside it, and its own words wrap
+   inside the column, so no text is drawn over another (review finding 14). */
 .set > :last-child {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   min-width: 0;
-  white-space: nowrap;
+  white-space: normal;
 }
+
+/* A narrow Settings window leaves too little beside its 250 px label column
+   for a field or a line of note; areas/settings.css then puts the label on the
+   row's first line and the control on the second (finding 14, decision 29). */
 
 .lr {
   display: grid;

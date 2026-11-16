@@ -374,13 +374,22 @@
   box-shadow: inset 0 0 0 1px var(--border);
 }
 
+/* The share of a week that expired, hatched from the cell's top down; its
+   height is the cell's `expired` percent, set by charts.js. A reset week's
+   windows can expire more than 100 % together: the band then fills the cell
+   and the tooltip gives the share. */
 .chart-cell-hatch {
+  max-height: 100%;
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  pointer-events: none;
   background: repeating-linear-gradient(
     135deg,
     color-mix(in oklab, var(--chart-cell-color, var(--muted)) 50%, transparent) 0 2px,
     transparent 2px 5px
   );
-  box-shadow: inset 0 0 0 1px var(--chart-cell-color, var(--muted));
 }
 
 .chart-cell-fill {

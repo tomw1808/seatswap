@@ -383,10 +383,13 @@ fn expire_money(
 /// the last [`LOW_WINDOWS`] finished windows is its final percent minus the
 /// percent of the newest `weekly_all` sample at or before `end - d` that names
 /// the window's reset, where `d` is the time from now to the reset the plan
-/// plays the account to. A window without such a sample is left out; with
-/// fewer than four gains there is no low. The value is the percent the plan
-/// plays this week (0 after a passed reset) plus the second-lowest gain, at most
-/// 100 (the plan's rule of spec §3.4).
+/// plays the account to. A reset window names its reset by its start plus seven
+/// days, because it ends at the reading that showed the drop; an ordinary
+/// window names it by its end. A window without such a sample is left out, and
+/// so is a negative gain: a model reset's drop is not use. With fewer than four
+/// gains there is no low. The value is the percent the plan plays this week (0
+/// after a passed reset) plus the second-lowest gain, at most 100 (the plan's
+/// rule of spec §3.4).
 fn low_of(
     state: &AccountState,
     reset: DateTime<Utc>,
@@ -398,6 +401,15 @@ fn low_of(
     let d = reset - now;
     let mut gains = Vec::new();
     for window in windows {
+        // A reset record ends at the lower reading that showed the drop, not at
+        // its reset time; its own start is that reset time minus seven days, so
+        // this is the reset its samples name. An ordinary window ends at its
+        // reset time.
+        let window_reset = if window.reset {
+            window.weekly_start() + Duration::days(7)
+        } else {
+            window.end
+        };
         let cutoff = window.end - d;
         let mut newest: Option<(DateTime<Utc>, f64)> = None;
         for sample in samples {
@@ -410,7 +422,7 @@ fn low_of(
             let Some(reset) = limit.r else {
                 continue;
             };
-            if !same_reset(reset, window.end) {
+            if !same_reset(reset, window_reset) {
                 continue;
             }
             if newest.is_none_or(|(at, _)| sample.t >= at) {
@@ -418,7 +430,12 @@ fn low_of(
             }
         }
         if let Some((_, percent)) = newest {
-            gains.push(window.final_percent - percent);
+            let gain = window.final_percent - percent;
+            // A gain after a model reset can be negative: the drop gave quota
+            // back, and that is not use. Only real gains count.
+            if gain >= 0.0 {
+                gains.push(gain);
+            }
         }
     }
     if gains.len() < 4 {
@@ -942,41 +959,80 @@ mod tests {
         assert!(close(row.low.expect("eight gains"), 52.0), "{:?}", row.low);
     }
 
-    /// A week with a reset holds two windows, and the low forecast reads both:
-    /// the first window's 10 % gain is the lowest and the second-lowest gain is
-    /// therefore 50, not 55. Taking only the last window of the week would give
-    /// 55.
+    /// A week with a reset holds two windows, and the low forecast reads both
+    /// as the writer records them: the reset window ends at the lower reading
+    /// that showed the drop, its start is the reset time minus seven days, and
+    /// the window after it ends at the reset time. The first window's 10 % gain
+    /// is the lowest, so the second-lowest gain is 20, not 50.
     #[test]
     fn a_week_with_a_reset_gives_the_forecast_both_windows() {
         let tiny = tiny();
         let accounts = stored_accounts(&tiny);
         let pr = AccountRef::of(&accounts[0]);
-
-        let reset_week = [
-            ("2026-11-02T00:00:00Z", "2026-11-05T12:00:00Z", 10.0),
-            ("2026-11-05T12:00:00Z", "2026-11-09T12:00:00Z", 60.0),
-        ];
+        let now = utc("2026-11-16T08:00:00Z");
+        let plan_reset = utc("2026-11-21T19:00:00Z");
+        let week_reset = utc("2026-11-07T19:00:00Z");
+        let cutoff = |end: DateTime<Utc>| end - (plan_reset - now);
+        let window = |start: DateTime<Utc>,
+                      end: DateTime<Utc>,
+                      final_percent: f64,
+                      lost: Option<f64>,
+                      reset: bool,
+                      from: Option<f64>| WindowRecord {
+            account: pr.clone(),
+            k: LimitKind::WeeklyAll,
+            m: None,
+            start: Some(start),
+            end,
+            final_percent,
+            lost,
+            last_sample: end - Duration::minutes(2),
+            plan: Some("Max".to_string()),
+            uncertain: false,
+            reset,
+            from,
+        };
+        let sample = |t: DateTime<Utc>, percent: f64, reset: DateTime<Utc>| Sample {
+            t,
+            account: pr.clone(),
+            src: Source::Poll,
+            l: vec![LimitSample {
+                k: LimitKind::WeeklyAll,
+                m: None,
+                p: percent,
+                r: Some(reset),
+                b: false,
+            }],
+        };
+        // The reset window: it began at the old reset time minus seven days and
+        // ended at the reading that showed the drop, one day before that reset.
+        let reset_start = week_reset - Duration::days(7);
+        let reset_end = utc("2026-11-06T19:00:00Z");
+        // The window after the reset ends at its own next reset time.
+        let after_end = week_reset + Duration::days(7);
         let ordinary = [
-            ("2026-10-31T19:00:00Z", 50.0),
-            ("2026-10-24T19:00:00Z", 55.0),
-            ("2026-10-17T19:00:00Z", 65.0),
+            (utc("2026-10-31T19:00:00Z"), 50.0),
+            (utc("2026-10-24T19:00:00Z"), 55.0),
+            (utc("2026-10-17T19:00:00Z"), 65.0),
         ];
-        let mut windows = Vec::new();
-        let mut samples = Vec::new();
-        for (start, end, gain) in reset_week {
-            let (mut window, sample) = low_records(&pr, utc(end), gain);
-            window.start = Some(utc(start));
-            windows.push(window);
-            samples.push(sample);
-        }
-        windows[0].reset = true;
-        windows[0].lost = None;
-        windows[1].from = Some(0.0);
-        windows[1].lost = Some(40.0);
+        let mut windows = vec![
+            window(reset_start, reset_end, 30.0, None, true, None),
+            window(reset_end, after_end, 40.0, Some(60.0), false, Some(0.0)),
+        ];
+        let mut samples = vec![
+            sample(cutoff(reset_end), 20.0, week_reset),
+            sample(cutoff(after_end), 20.0, after_end),
+        ];
         for (end, gain) in ordinary {
-            let (window, sample) = low_records(&pr, utc(end), gain);
-            windows.push(window);
-            samples.push(sample);
+            windows.push(window(
+                end - Duration::days(7),
+                end,
+                100.0,
+                Some(0.0),
+                false,
+                None,
+            ));
+            samples.push(sample(cutoff(end), 100.0 - gain, end));
         }
         tiny.history.append_many(&windows).expect("five windows");
         tiny.history.append_many(&samples).expect("five samples");
@@ -989,8 +1045,88 @@ mod tests {
             .find(|account| account.id == "PR")
             .expect("PR's row");
         assert!(
-            close(row.low.expect("five gains"), 50.0),
-            "both windows of the reset week count, so the second-lowest gain is 50: {:?}",
+            close(row.low.expect("five gains"), 20.0),
+            "both windows of the reset week count, so the second-lowest gain is 20: {:?}",
+            row.low
+        );
+    }
+
+    /// A gain after a model reset can be negative: the sample before the reset
+    /// is higher than the window's final percent. That drop is not use, so the
+    /// negative gain is left out; the second-lowest real gain stays 20.
+    #[test]
+    fn a_model_reset_does_not_make_a_negative_gain() {
+        let tiny = tiny();
+        let accounts = stored_accounts(&tiny);
+        let pr = AccountRef::of(&accounts[0]);
+        let now = utc("2026-11-16T08:00:00Z");
+        let plan_reset = utc("2026-11-21T19:00:00Z");
+        let cutoff = |end: DateTime<Utc>| end - (plan_reset - now);
+        let window = |start: DateTime<Utc>, end: DateTime<Utc>, final_percent: f64| WindowRecord {
+            account: pr.clone(),
+            k: LimitKind::WeeklyAll,
+            m: None,
+            start: Some(start),
+            end,
+            final_percent,
+            lost: Some(0.0),
+            last_sample: end - Duration::minutes(2),
+            plan: Some("Max".to_string()),
+            uncertain: false,
+            reset: false,
+            from: None,
+        };
+        let sample = |t: DateTime<Utc>, percent: f64, reset: DateTime<Utc>| Sample {
+            t,
+            account: pr.clone(),
+            src: Source::Poll,
+            l: vec![LimitSample {
+                k: LimitKind::WeeklyAll,
+                m: None,
+                p: percent,
+                r: Some(reset),
+                b: false,
+            }],
+        };
+        // The week a model reset took from 70 % to 45 %, then up to 60 %.
+        let model_end = utc("2026-11-07T19:00:00Z");
+        let mut windows = vec![WindowRecord {
+            account: pr.clone(),
+            k: LimitKind::WeeklyAll,
+            m: None,
+            start: Some(utc("2026-11-03T10:00:00Z")),
+            end: model_end,
+            final_percent: 60.0,
+            lost: Some(40.0),
+            last_sample: model_end - Duration::minutes(2),
+            plan: Some("Max".to_string()),
+            uncertain: false,
+            reset: false,
+            from: Some(45.0),
+        }];
+        let mut samples = vec![sample(cutoff(model_end), 70.0, model_end)];
+        for (end, gain) in [
+            (utc("2026-10-31T19:00:00Z"), 10.0),
+            (utc("2026-10-24T19:00:00Z"), 20.0),
+            (utc("2026-10-17T19:00:00Z"), 30.0),
+            (utc("2026-10-10T19:00:00Z"), 40.0),
+        ] {
+            windows.push(window(end - Duration::days(7), end, 100.0));
+            samples.push(sample(cutoff(end), 100.0 - gain, end));
+        }
+        tiny.history.append_many(&windows).expect("five windows");
+        tiny.history.append_many(&samples).expect("five samples");
+
+        let ctx = context(&tiny, &accounts);
+        let page = forecast(&ctx, &inputs(), &regime(false)).expect("the forecast");
+        let row = page
+            .accounts
+            .iter()
+            .find(|account| account.id == "PR")
+            .expect("PR's row");
+        assert!(
+            close(row.low.expect("four real gains"), 20.0),
+            "the model reset's negative gain is not use, so the second-lowest gain is 20: {:?}",
             row.low
         );
     }

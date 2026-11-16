@@ -17,9 +17,10 @@ use crate::money::{window_money, Valuer};
 
 use super::{
     account_abbr, account_chosen, account_id, account_weeks_valued, accounts_without_price,
-    add_value, blocked_by_week, blocked_spans, hours_text, keep_warnings, lost_percent, money_of,
+    add_value, blocked_by_week, blocked_spans, hours_text, keep_warnings, money_of,
     next_week_start, output_by_account_week, range_of, stored_account, week_columns,
-    week_of_record, windows_span, working_rhythm, AccountWeek, Ctx, Query, StatsError,
+    week_lost_percent, week_of_record, windows_span, working_rhythm, AccountWeek, Ctx, Query,
+    StatsError,
 };
 
 /// One period of one account's subscription: from its `AccountAdded` (or its
@@ -212,7 +213,7 @@ pub(crate) fn subscriptions_in<Tz: TimeZone + Copy>(
         if week_of_record(&weeks, &account, hosted.record.t).is_none() {
             continue;
         }
-        let record_values = Values::of(std::slice::from_ref(&value), ctx.settings);
+        let record_values = Values::of(std::slice::from_ref(&value), ctx.settings, ctx.fx, ctx.now);
         add_value(&mut values_by_account, account.clone(), &record_values);
         record_refs.push((account, &hosted.record));
     }
@@ -355,7 +356,7 @@ pub(crate) fn what_if_in<Tz: TimeZone + Copy>(
 
     let mut expired_was = None;
     for week in &weeks {
-        if let Some(money) = money_of(week) {
+        if let Some(money) = money_of(week)? {
             *expired_was.get_or_insert(0.0) += money.expired;
         }
     }
@@ -524,11 +525,11 @@ fn row_for(facts: RowFacts<'_>) -> Result<SubRow, StatsError> {
     let mut full_weeks = 0;
     for week in &weeks {
         used_sum += week.used;
-        lost_sum += lost_percent(&week.window)?;
+        lost_sum += week_lost_percent(week)?;
         if week.used >= 100.0 {
             full_weeks += 1;
         }
-        match money_of(week) {
+        match money_of(week)? {
             Some(money) => {
                 *expired.get_or_insert(0.0) += money.expired;
                 if let Some(paid) = &mut paid {
@@ -676,7 +677,7 @@ fn blocked_hours_on(spans: &[super::BlockedSpan], reference: &AccountRef) -> f64
 fn saved_price(weeks: &[AccountWeek], reference: &AccountRef) -> Result<Option<f64>, StatsError> {
     let mut paid = Some(0.0);
     for week in weeks.iter().filter(|week| &week.account == reference) {
-        match money_of(week) {
+        match money_of(week)? {
             Some(money) => {
                 if let Some(paid) = &mut paid {
                     *paid += money.paid;

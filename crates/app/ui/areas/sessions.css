@@ -311,9 +311,10 @@
   font-size: 11.5px;
 }
 
-/* By model's sub-row carries `tiedNode`'s bubble after its text (item 1). */
-.sess-subrow .sess-tag {
-  margin-left: 6px;
+/* A sub-row that names an error of the view (a session without a provider):
+   the error's colour, never a silently made-up provider. */
+.sess-subrow-error {
+  color: var(--danger);
 }
 
 .sess-name {

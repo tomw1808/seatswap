@@ -33,10 +33,10 @@ use seatswap_core::feed::Feed;
 use seatswap_core::history::HistoryDir;
 #[cfg(feature = "gui")]
 use seatswap_core::live_sessions::{
-    switch_kind, LiveSession, LiveStatus, OtherHost, SwitchKind, Values,
+    switch_kind, LiveSession, LiveStatus, OtherHost, SwitchKind, Values, CLAUDE_PROVIDER,
 };
 #[cfg(feature = "gui")]
-use seatswap_core::money::{Fx, Prices};
+use seatswap_core::money::{is_plan_model, Fx, Prices};
 #[cfg(feature = "gui")]
 use seatswap_core::paths::{self, AppPaths, ClaudePaths};
 #[cfg(feature = "gui")]
@@ -395,7 +395,9 @@ pub(crate) struct Sum {
     pub agents_running: u32,
     pub agents_done: u32,
     pub tokens: Tokens,
-    pub last_hour: Tokens,
+    /// `None` when any listed row's last hour is unknown: a sum never hides an
+    /// unknown part.
+    pub last_hour: Option<Tokens>,
     pub last_hour_values: Values,
     pub values: Values,
 }
@@ -496,7 +498,12 @@ pub(crate) fn view_of(
     }
 
     let mut switch_effect = SwitchEffect::default();
-    for row in running {
+    // Only a Claude Code row on a Claude plan model (or with no model known
+    // yet) is touched by switching the Claude account; Codex, Harness and
+    // Claude Code rows on an Ollama model are not.
+    for row in running.iter().filter(|row| {
+        row.provider == CLAUDE_PROVIDER && row.model.as_deref().is_none_or(is_plan_model)
+    }) {
         match switch_kind(row, thinking.get(&row.session).copied().unwrap_or(0), at) {
             SwitchKind::LosesThinking => {
                 switch_effect.loses_thinking += 1;
@@ -542,6 +549,7 @@ fn sums_of(sessions: &[LiveSession]) -> Vec<Sum> {
         agents_done: u32,
         tokens: Tokens,
         last_hour: Tokens,
+        last_hour_unknown: bool,
         values: Vec<&'a Values>,
         last_hour_values: Vec<&'a Values>,
     }
@@ -567,7 +575,10 @@ fn sums_of(sessions: &[LiveSession]) -> Vec<Sum> {
             group.agents_running += row.agents_running;
             group.agents_done += row.agents_done;
             group.tokens += row.tokens;
-            group.last_hour += row.last_hour;
+            match row.last_hour {
+                Some(last_hour) => group.last_hour += last_hour,
+                None => group.last_hour_unknown = true,
+            }
             group.values.push(&row.values);
             group.last_hour_values.push(&row.last_hour_values);
         }
@@ -580,7 +591,11 @@ fn sums_of(sessions: &[LiveSession]) -> Vec<Sum> {
             agents_running: group.agents_running,
             agents_done: group.agents_done,
             tokens: group.tokens,
-            last_hour: group.last_hour,
+            last_hour: if group.last_hour_unknown {
+                None
+            } else {
+                Some(group.last_hour)
+            },
             last_hour_values: Values::sum(&group.last_hour_values),
             values: Values::sum(&group.values),
         })
@@ -1603,10 +1618,10 @@ mod tests {
             agents_done: 0,
             agents: Vec::new(),
             tokens: Tokens::default(),
-            last_hour: Tokens::default(),
-            last_hour_values: Values::of(&[], &Settings::default()),
+            last_hour: Some(Tokens::default()),
+            last_hour_values: Values::of(&[], &Settings::default(), &Fx::default(), Utc::now()),
             agents_done_values: Values::sum(&[]),
-            values: Values::of(&[], &Settings::default()),
+            values: Values::of(&[], &Settings::default(), &Fx::default(), Utc::now()),
         }
     }
 
@@ -2051,6 +2066,38 @@ mod tests {
 
     #[cfg(feature = "gui")]
     #[test]
+    fn codex_rows_do_not_count_in_the_switch_effect() {
+        let now = time("2026-11-14T10:00:00Z");
+        let mut busy = row(&id(20), "atlas", LiveStatus::Busy, Some("gpt-6.1-sol"), now);
+        busy.provider = "Codex".to_string();
+        let mut old = row(
+            &id(21),
+            "atlas",
+            LiveStatus::Idle,
+            Some("gpt-6.1-sol"),
+            now - Duration::minutes(61),
+        );
+        old.provider = "Codex".to_string();
+        let view = view_of(
+            now,
+            Some("atlas".to_string()),
+            &[busy, old],
+            &[],
+            &[],
+            &BTreeMap::new(),
+            None,
+            None,
+            &SessionsOptions::default(),
+        );
+        assert_eq!(
+            view.switch_effect,
+            SwitchEffect::default(),
+            "a switch of the Claude account touches neither Codex row"
+        );
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
     fn a_view_without_a_history_lists_this_hosts_sessions() {
         let now = time("2026-11-14T10:00:00Z");
         let view = view_of(
@@ -2313,7 +2360,7 @@ mod tests {
         );
         a.project_id = acme.clone();
         a.tokens.out = 1_000_000;
-        a.last_hour.out = 100_000;
+        a.last_hour.as_mut().expect("a known hour").out = 100_000;
         a.values = valued(2.0, 20.0, "EUR");
         let mut b = row(
             "aaaa1111-1111-4111-8111-111111111111",
@@ -2324,7 +2371,7 @@ mod tests {
         );
         b.project_id = acme.clone();
         b.tokens.out = 2_000_000;
-        b.last_hour.out = 200_000;
+        b.last_hour.as_mut().expect("a known hour").out = 200_000;
         b.values = valued(4.0, 40.0, "USD");
         let mut c = row(
             "bbbb1111-1111-4111-8111-111111111111",
@@ -2335,7 +2382,7 @@ mod tests {
         );
         c.project_id = ledger.clone();
         c.tokens.out = 3_000_000;
-        c.last_hour.out = 300_000;
+        c.last_hour.as_mut().expect("a known hour").out = 300_000;
         c.values = valued(6.0, 60.0, "EUR");
         let mut done = row(
             CLOSED_RECENT,
@@ -2346,7 +2393,7 @@ mod tests {
         );
         done.project_id = ledger.clone();
         done.tokens.out = 500_000;
-        done.last_hour.out = 50_000;
+        done.last_hour.as_mut().expect("a known hour").out = 50_000;
         done.values = valued(1.0, 10.0, "EUR");
 
         let view = view_of(
@@ -2365,7 +2412,7 @@ mod tests {
         let ledger_sum = find(&view, &SumOf::Project(ledger.clone()));
         assert_eq!(ledger_sum.sessions, 2, "the closed row is in the day");
         assert_eq!(ledger_sum.tokens.out, 3_500_000);
-        assert_eq!(ledger_sum.last_hour.out, 350_000);
+        assert_eq!(ledger_sum.last_hour.expect("a known hour").out, 350_000);
         assert_eq!(ledger_sum.values.subscription, Some(7.0));
         assert_eq!(ledger_sum.values.api, Some(70.0));
         assert_eq!(ledger_sum.values.currency.as_deref(), Some("EUR"));
@@ -2374,7 +2421,7 @@ mod tests {
         let acme_sum = find(&view, &SumOf::Project(acme.clone()));
         assert_eq!(acme_sum.sessions, 2);
         assert_eq!(acme_sum.tokens.out, 3_000_000);
-        assert_eq!(acme_sum.last_hour.out, 300_000);
+        assert_eq!(acme_sum.last_hour.expect("a known hour").out, 300_000);
         assert_eq!(acme_sum.values.subscription, None);
         assert_eq!(acme_sum.values.currency, None);
         assert_eq!(
@@ -2393,7 +2440,7 @@ mod tests {
         let all = find(&view, &SumOf::All);
         assert_eq!(all.sessions, 4);
         assert_eq!(all.tokens.out, 6_500_000);
-        assert_eq!(all.last_hour.out, 650_000);
+        assert_eq!(all.last_hour.expect("a known hour").out, 650_000);
     }
 
     #[cfg(feature = "gui")]
@@ -2434,7 +2481,7 @@ mod tests {
         first.project_id = acme.clone();
         first.agents_running = 2;
         first.agents_done = 3;
-        first.last_hour.out = 100_000;
+        first.last_hour.as_mut().expect("a known hour").out = 100_000;
         first.last_hour_values = valued(2.0, 20.0, "EUR");
         first.values = valued(7.0, 70.0, "EUR");
         let mut second = row(
@@ -2447,7 +2494,7 @@ mod tests {
         second.project_id = acme.clone();
         second.agents_running = 1;
         second.agents_done = 0;
-        second.last_hour.out = 200_000;
+        second.last_hour.as_mut().expect("a known hour").out = 200_000;
         second.last_hour_values = valued(4.0, 40.0, "EUR");
         second.values = valued(9.0, 90.0, "EUR");
         let view = view_of(
@@ -2467,7 +2514,8 @@ mod tests {
         assert_eq!(project.agents_running, 3, "2 running plus 1 running");
         assert_eq!(project.agents_done, 3, "3 done plus none done");
         assert_eq!(
-            project.last_hour.out, 300_000,
+            project.last_hour.expect("a known hour").out,
+            300_000,
             "the last hour is the two sessions' hours added"
         );
         assert_eq!(
@@ -2486,7 +2534,7 @@ mod tests {
         let all = find(&view, &SumOf::All);
         assert_eq!(all.agents_running, 3);
         assert_eq!(all.agents_done, 3);
-        assert_eq!(all.last_hour.out, 300_000);
+        assert_eq!(all.last_hour.expect("a known hour").out, 300_000);
     }
 
     /// Nothing used is a known 0 (fix 1): a project with one session that has no
@@ -2582,7 +2630,7 @@ mod tests {
         );
         codex.provider = "Codex".to_string();
         codex.tokens.out = 400_000;
-        codex.last_hour = Tokens::default();
+        codex.last_hour = None;
         codex.last_hour_values = Values {
             api: None,
             api_currency: None,
@@ -2611,7 +2659,7 @@ mod tests {
             SumOf::Model(Some("gpt-6-astra".to_string())),
         ] {
             let sum = find(&view, &of);
-            assert_eq!(sum.last_hour.out, 0);
+            assert_eq!(sum.last_hour, None);
             assert_eq!(
                 sum.last_hour_values.api_missing.as_deref(),
                 Some(REASON),
@@ -2629,7 +2677,7 @@ mod tests {
     /// reason, but the row whose hour is known still counts its tokens.
     #[cfg(feature = "gui")]
     #[test]
-    fn a_sum_over_an_unknown_hour_counts_the_known_rows() {
+    fn a_sum_over_an_unknown_hour_is_unknown() {
         const REASON: &str =
             "the Codex session's token total went down, so its last hour is not known";
 
@@ -2660,7 +2708,7 @@ mod tests {
             now,
         );
         claude.tokens.out = 1_000_000;
-        claude.last_hour.out = 100_000;
+        claude.last_hour.as_mut().expect("a known hour").out = 100_000;
         claude.last_hour_values = valued(2.0, 20.0, "EUR");
         claude.values = valued(7.0, 70.0, "EUR");
         let mut codex = row(
@@ -2672,7 +2720,7 @@ mod tests {
         );
         codex.provider = "Codex".to_string();
         codex.tokens.out = 400_000;
-        codex.last_hour = Tokens::default();
+        codex.last_hour = None;
         codex.last_hour_values = Values {
             api: None,
             api_currency: None,
@@ -2697,8 +2745,8 @@ mod tests {
         let project = find(&view, &SumOf::Project(view.sessions[0].project_id.clone()));
         assert_eq!(project.sessions, 2);
         assert_eq!(
-            project.last_hour.out, 100_000,
-            "the row whose hour is known still counts"
+            project.last_hour, None,
+            "the unknown part makes the sum unknown"
         );
         assert_eq!(
             project.last_hour_values.api_missing.as_deref(),
@@ -2826,12 +2874,12 @@ mod tests {
                     cw: 3,
                     cr: 4
                 },
-                last_hour: Tokens {
+                last_hour: Some(Tokens {
                     input: 5,
                     out: 6,
                     cw: 7,
                     cr: 8
-                },
+                }),
                 last_hour_values: Values::sum(&[]),
                 values: Values::sum(&[]),
             })

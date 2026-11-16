@@ -697,6 +697,17 @@ function durationText(seconds) {
   return hours === 0 ? `${days}d` : `${days}d ${hours}h`;
 }
 
+// The days left on an account's login, the one rule for the pop-up and Settings
+// (review finding 20): Rust's own count when the view carries it, else the end
+// time; `null` when neither is there, a negative count once it has ended.
+function loginDaysLeft(view) {
+  if (view && typeof view.loginDaysLeft === "number") return view.loginDaysLeft;
+  if (view && typeof view.loginEndsAtMs === "number") {
+    return Math.floor((view.loginEndsAtMs - Date.now()) / 86400000);
+  }
+  return null;
+}
+
 // The switches of a span by who made them, the one text of the statistics
 // pages (Overview's KPI and the Weeks summary).
 function switchText(switches) {
@@ -1096,6 +1107,7 @@ export {
   dateTimeText,
   weekdayTimeText,
   durationText,
+  loginDaysLeft,
   switchText,
   percentText,
   amountText,

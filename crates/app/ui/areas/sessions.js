@@ -89,6 +89,7 @@ const state = {
   marked: null,
   markTimer: null,
   minuteTimer: null,
+  secondTimer: null,
   departTimer: null,
   choiceToken: 0,
   ignoreDepartures: false,
@@ -184,12 +185,12 @@ function indexSums(view) {
       !Number.isFinite(sum.agentsRunning) ||
       !Number.isFinite(sum.agentsDone) ||
       !isObject(sum.tokens) ||
-      !isObject(sum.lastHour) ||
+      (sum.lastHour !== null && !isObject(sum.lastHour)) ||
       !isObject(sum.lastHourValues) ||
       !isObject(sum.values)
     ) {
       throw new Error(
-        "a sum in the view is not a sum: a group's row needs sessions, agentsRunning, agentsDone, tokens, lastHour, lastHourValues and values"
+        "a sum in the view is not a sum: a group's row needs sessions, agentsRunning, agentsDone, tokens, lastHour (a token count or null), lastHourValues and values"
       );
     }
     sums.set(sumKey(sum.of), sum);
@@ -290,27 +291,35 @@ function tokenNode(count, className) {
   return h("span", { class: className || "n" }, tokens(count));
 }
 
-// The reason a last hour is not known, or null (item 7). An hour is unknown
-// when its values are missing and it holds no tokens: the view then names the
-// reason and the row shows "—" with it, never a 0. A reason the row's own values
-// share is about the values and not the hour — a broken prices file, a model
-// without a price, a session without a model leaves every value of the row
-// missing while its hour's 0 is a known 0.
-function unknownHourReason(ownValues, lastHourValues, out) {
+// The reason a last hour is not known, or null when it is known. The view says
+// so with `lastHour: null`, and names the reason in `lastHourValues`; a null
+// without a reason is an error of the view, never a silent blank. A last hour
+// that is neither a token count nor null is an error too: the page never fills
+// one in (rule 2).
+function lastHourReason(lastHour, lastHourValues) {
   if (!isObject(lastHourValues)) return "the view has no value for the last hour";
-  if (Number.isFinite(out) && out > 0) return null;
-  const reason =
-    typeof lastHourValues.apiMissing === "string" ? lastHourValues.apiMissing : null;
-  if (reason === null) return null;
-  const own =
-    isObject(ownValues) && typeof ownValues.apiMissing === "string"
-      ? ownValues.apiMissing
-      : null;
-  return own === reason ? null : reason;
+  if (lastHour !== null) {
+    if (!isObject(lastHour) || !Number.isFinite(lastHour.out)) {
+      throw new Error("a row's lastHour is neither a token count nor null");
+    }
+    return null;
+  }
+  if (typeof lastHourValues.apiMissing === "string" && lastHourValues.apiMissing !== "") {
+    return lastHourValues.apiMissing;
+  }
+  if (
+    typeof lastHourValues.subscriptionMissing === "string" &&
+    lastHourValues.subscriptionMissing !== ""
+  ) {
+    return lastHourValues.subscriptionMissing;
+  }
+  return "the view does not say why the last hour is not known";
 }
 
-function fillLastHour(node, tokensOut, ownValues, lastHourValues) {
-  const reason = unknownHourReason(ownValues, lastHourValues, tokensOut);
+// A row or group cell: the hour's tokens, or "—" with the view's reason. A known
+// hour without tokens is an empty cell, as before S-3.
+function fillLastHour(node, lastHour, lastHourValues) {
+  const reason = lastHourReason(lastHour, lastHourValues);
   clear(node);
   if (reason) {
     node.className = "n";
@@ -319,23 +328,26 @@ function fillLastHour(node, tokensOut, ownValues, lastHourValues) {
     return;
   }
   node.removeAttribute("title");
-  if (!(Number.isFinite(tokensOut) && tokensOut > 0)) {
+  if (lastHour.out <= 0) {
     node.className = "n";
     return;
   }
   node.className = "n pri";
-  node.appendChild(document.createTextNode(tokens(tokensOut)));
+  node.appendChild(document.createTextNode(tokens(lastHour.out)));
 }
 
 function lastHourCell(row) {
   const node = h("span", { class: "n" });
-  fillLastHour(
-    node,
-    row.lastHour && Number.isFinite(row.lastHour.out) ? row.lastHour.out : 0,
-    row.values,
-    row.lastHourValues
-  );
+  fillLastHour(node, row.lastHour, row.lastHourValues);
   return node;
+}
+
+// The same hour as the KPI and the cards show it: a number, even a known 0, or
+// "—" with the view's reason.
+function lastHourSummary(sum) {
+  const reason = lastHourReason(sum.lastHour, sum.lastHourValues);
+  if (reason) return { text: "—", title: reason };
+  return { text: tokens(sum.lastHour.out), title: "" };
 }
 
 // A session's or an agent's elapsed time: the seconds since `since` in the one
@@ -471,9 +483,11 @@ export function unmount() {
   }
   if (state.markTimer) clearTimeout(state.markTimer);
   if (state.minuteTimer) clearInterval(state.minuteTimer);
+  if (state.secondTimer) clearInterval(state.secondTimer);
   if (state.departTimer) clearTimeout(state.departTimer);
   state.markTimer = null;
   state.minuteTimer = null;
+  state.secondTimer = null;
   state.departTimer = null;
   unmountControls();
   state.container = null;
@@ -1083,12 +1097,19 @@ function renderKpis() {
     all ? valueSummary(all.values) : ""
   );
   // The last hour's two values come from the same `sums` the tree reads, summed
-  // like `values`; a view whose sum has none is an error (indexSums).
+  // like `values`; a view whose sum has none is an error (indexSums). An hour
+  // the view does not know is "—" with the view's reason, never a 0 (finding
+  // 11).
   const lastHourValues = all ? all.lastHourValues : null;
+  const lastHour = all ? lastHourSummary(all) : null;
+  const lastHourValue = lastHour
+    ? h("span", { title: lastHour.title || null }, lastHour.text)
+    : "no sum in the view";
   kpis[4].update(
     "Last hour",
-    all ? tokens(all.lastHour.out) : "no sum in the view",
-    lastHourValues ? valueSummary(lastHourValues) : ""
+    lastHourValue,
+    lastHourValues ? valueSummary(lastHourValues) : "",
+    lastHour && lastHour.title ? lastHour.title : ""
   );
   kpis[5].update(
     "Thinking tied to the account",
@@ -1104,9 +1125,18 @@ function renderKpis() {
 // the tree
 // ---------------------------------------------------------------------------
 
+// The rows a group lists: the live view's rows, or the grey rows when every row
+// of the group has left. A group always has at least one row.
+function groupRows(rows, sampleRows) {
+  const listed = rows.length ? rows : sampleRows || [];
+  if (listed.length === 0) {
+    throw new Error("a group of the Sessions tree has no row");
+  }
+  return listed;
+}
+
 function groupSubText(rows) {
   const running = rows.filter(isRunning);
-  const closed = rows.filter(isClosed).length;
   const unreported = rows.filter((row) => !isReported(row)).length;
   const busy = running.filter((row) => statusName(row) === "busy").length;
   const waiting = running.filter((row) => statusName(row) === "waiting").length;
@@ -1114,50 +1144,31 @@ function groupSubText(rows) {
     (count, row) => count + (Number.isFinite(row.agentsRunning) ? row.agentsRunning : 0),
     0
   );
-  const parts = [];
-  if (running.length) parts.push(plural(running.length, "session", "sessions"));
-  if (closed) parts.push(`${closed} closed`);
+  // The count is the rows listed under the group, running and closed (finding
+  // 11), so it matches the tree below it; the rows without a report are named
+  // beside it, as before.
+  const parts = [plural(rows.length, "session", "sessions")];
   if (unreported) parts.push(`${unreported} without a report`);
-  if (!running.length && !closed && !unreported) parts.push("0 sessions");
   if (busy) parts.push(`${busy} busy`);
   if (waiting) parts.push(`${waiting} waiting for you`);
   if (agents) parts.push(`${plural(agents, "agent", "agents")} running`);
   return parts.join(" · ");
 }
 
-// A model group's own row. Its count is the number of session rows listed under
-// it, so a stale row with no live report still counts as one; when every row of
-// the group has left, the grey rows still keep the group on screen and the text
-// comes from them. By model already groups by the provider above, so the sub-row
-// does not repeat it (item 23). The group row keeps the mock-up's "thinking
-// tied" words; each listed session row draws the bubble `tiedNode` too (item 1).
-function modelRowsForText(rows, model, sampleRows) {
-  const rowsForText = rows.length ? rows : sampleRows || [];
-  if (rowsForText.length === 0) {
-    throw new Error(`the model group ${String(model)} has no row`);
-  }
-  return rowsForText;
-}
-
-// A model row's sub-line: its sessions, and what a switch does to the model's
-// thinking (item 1's fact in the mock-up's words). The model's own name is the
-// row's name, so it is not repeated here.
+// A model group's total row: the number of session rows listed under it, so a
+// stale row with no live report still counts as one; when every row of the group
+// has left, the grey rows keep the group on screen and the count comes from
+// them. By model already groups by the provider above, so the sub-row does not
+// repeat it (item 23). The tied mark is the bubble `tiedNode`, never a text
+// (item 1); the two provider rows say nothing about thinking.
 function modelSubDetail(rows, model, sampleRows) {
-  const listed = modelRowsForText(rows, model, sampleRows);
-  const parts = [plural(listed.length, "session", "sessions")];
-  if (model !== null) {
-    parts.push(
-      modelSubTied(rows, model, sampleRows)
-        ? "thinking tied to the account"
-        : "thinking survives a switch"
-    );
-  }
-  return parts.join(" · ");
+  const listed = groupRows(rows, sampleRows);
+  return plural(listed.length, "session", "sessions");
 }
 
 function modelSubTied(rows, model, sampleRows) {
   if (model === null) return false;
-  const rowsForText = modelRowsForText(rows, model, sampleRows);
+  const rowsForText = groupRows(rows, sampleRows);
   return rowsForText.some((row) => isReported(row) && row.tied === true);
 }
 
@@ -1214,6 +1225,7 @@ function createGroupItem(item) {
     tokensNode,
     lastNode,
     valueNodes,
+    tiedMark: null,
     signature: "",
   };
   updateGroupItem(entry, item);
@@ -1221,7 +1233,20 @@ function createGroupItem(item) {
 }
 
 function updateGroupItem(entry, item) {
-  const signature = JSON.stringify([item.name, item.sub, item.sum, item.depth, state.view.currency]);
+  if (!Array.isArray(item.rows)) {
+    throw new Error(`the group ${item.name} has no rows to follow`);
+  }
+  const tied = item.tied === true;
+  const agentData = item.rows.some(hasAgentData);
+  const signature = JSON.stringify([
+    item.name,
+    item.sub,
+    item.sum,
+    item.depth,
+    tied,
+    agentData,
+    state.view.currency,
+  ]);
   if (signature === entry.signature) return;
   entry.signature = signature;
   if (entry.nameNode.textContent !== item.name) entry.nameNode.textContent = item.name;
@@ -1232,6 +1257,14 @@ function updateGroupItem(entry, item) {
   nameCell.style.paddingLeft = `${item.depth * 14}px`;
   entry.node.className =
     item.depth === 0 ? "sess-row sess-group" : "sess-row sess-total";
+  // The tied model's one mark: the bubble beside its name, in either grouping.
+  if (tied && !entry.tiedMark) {
+    entry.tiedMark = tiedNode({ tied: true });
+    nameCell.insertBefore(entry.tiedMark, entry.subNode);
+  } else if (!tied && entry.tiedMark) {
+    entry.tiedMark.remove();
+    entry.tiedMark = null;
+  }
   const sum = item.sum;
   if (!sum) {
     const title = "this group has no sum in the view";
@@ -1243,16 +1276,19 @@ function updateGroupItem(entry, item) {
     }
     return;
   }
-  fillAgents(entry.agentsNode, sum.agentsRunning, sum.agentsDone, sum.sessions > 0);
+  // A total row whose rows all show "—" for agents shows "—" itself (item 24).
+  fillAgents(entry.agentsNode, sum.agentsRunning, sum.agentsDone, agentData);
   entry.tokensNode.className = "n b6";
   entry.tokensNode.removeAttribute("title");
   const tokenText = tokens(sum.tokens.out);
   if (entry.tokensNode.textContent !== tokenText) entry.tokensNode.textContent = tokenText;
-  fillLastHour(entry.lastNode, sum.lastHour.out, sum.values, sum.lastHourValues);
+  fillLastHour(entry.lastNode, sum.lastHour, sum.lastHourValues);
   setValueText(entry.valueNodes[0], sum.values, "subscription", state.view.currency, "n b6");
   setValueText(entry.valueNodes[1], sum.values, "api", state.view.currency, "n b6");
 }
 
+// A sub-row of an agent list (the running agents' provider · model line). It
+// carries text only; `error` marks a line that names an error of the view.
 function createSubItem(item) {
   const textNode = h("span", { class: "mf" }, item.text);
   const node = h("div", { class: "sess-row sess-subrow" }, textNode);
@@ -1262,28 +1298,21 @@ function createSubItem(item) {
     textNode,
     text: null,
     depth: -1,
-    tied: false,
-    tiedMark: null,
+    error: false,
   };
   updateSubItem(entry, item);
   return entry;
 }
 
 function updateSubItem(entry, item) {
-  const tied = item.tied === true;
-  if (entry.text === item.text && entry.depth === item.depth && entry.tied === tied) return;
+  const error = item.error === true;
+  if (entry.text === item.text && entry.depth === item.depth && entry.error === error) return;
   entry.text = item.text;
   entry.depth = item.depth;
-  entry.tied = tied;
+  entry.error = error;
   entry.textNode.style.paddingLeft = `${Math.max(0, item.depth * 14 - 2)}px`;
   if (entry.textNode.textContent !== item.text) entry.textNode.textContent = item.text;
-  if (tied && !entry.tiedMark) {
-    entry.tiedMark = tiedNode({ tied: true });
-    entry.node.appendChild(entry.tiedMark);
-  } else if (!tied && entry.tiedMark) {
-    entry.node.removeChild(entry.tiedMark);
-    entry.tiedMark = null;
-  }
+  entry.node.classList.toggle("sess-subrow-error", error);
 }
 
 // A session with no running and no done agent and no agent list has no agent
@@ -1433,19 +1462,29 @@ function sessionClasses(row, options) {
   return classes.join(" ");
 }
 
-function sessionSignature(row, options, nowMinute) {
+// The status duration the row shows (`busy 5s`), or "" for a status without
+// one. It is in the signature, so a changed second redraws the row; the minute
+// is not.
+function statusDurationText(row, now) {
+  const status = statusName(row);
+  if (status !== "busy" && status !== "idle" && status !== "waiting") return "";
+  return sinceText(row.since, now);
+}
+
+function sessionSignature(row, options, now) {
   return JSON.stringify([
     row.label,
     row.session,
     row.project,
     row.model,
     statusName(row),
+    statusDurationText(row, now),
     row.since,
     row.tied,
     row.agentsRunning,
     row.agentsDone,
     row.tokens ? row.tokens.out : null,
-    row.lastHour ? row.lastHour.out : null,
+    row.lastHour === null ? null : row.lastHour ? row.lastHour.out : undefined,
     row.lastHourValues,
     row.values,
     row.agentsDoneValues,
@@ -1453,18 +1492,15 @@ function sessionSignature(row, options, nowMinute) {
     options.wide,
     options.depth,
     options.departed === true,
-    nowMinute,
   ]);
 }
 
-// The agents of an open session are drawn again when one of them changed, and
-// every minute while one runs (its duration is counted from `first`).
-function agentSignature(row) {
+// The agents of an open session are drawn again when one of them changed or a
+// running one's shown duration changed. The signature holds the duration text,
+// so no minute is in it.
+function agentSignature(row, now) {
   const agents = Array.isArray(row.agents) ? row.agents : [];
-  const minute = agents.some((agent) => agent.running === true)
-    ? String(Math.floor(Date.now() / 60000))
-    : "";
-  return JSON.stringify(row.agentsDoneValues) + "\u0003" + minute + "\u0002" + agents
+  return JSON.stringify(row.agentsDoneValues) + "\u0003" + agents
     .map((agent) =>
       JSON.stringify([
         agent.agent,
@@ -1473,6 +1509,7 @@ function agentSignature(row) {
         agent.task,
         agent.model,
         agent.running === true,
+        agent.running === true ? sinceText(agent.first || agent.last, now) : "",
         agent.first,
         agent.last,
         agent.tokens ? agent.tokens.out : null,
@@ -1491,12 +1528,13 @@ function createSessionItem(row, options) {
   }
   rowNode.dataset.session = row.session;
   state.rowNodes.set(row.session, rowNode);
+  const now = Date.now();
   const entry = {
     type: "session",
     row,
     options,
     structure: sessionStructure(row, options),
-    signature: sessionSignature(row, options, Math.floor(Date.now() / 60000)),
+    signature: sessionSignature(row, options, now),
     agentsSignature: "",
     node: rowNode,
     rowNode,
@@ -1504,7 +1542,7 @@ function createSessionItem(row, options) {
     build: null,
   };
   if (!details) {
-    entry.agentsSignature = agentSignature(row);
+    entry.agentsSignature = agentSignature(row, now);
     return entry;
   }
 
@@ -1518,7 +1556,7 @@ function createSessionItem(row, options) {
     if (children.dataset.built === "1") return;
     renderAgentList(children, entry.row, null, 4, entry.row.session);
     children.dataset.built = "1";
-    entry.agentsSignature = agentSignature(entry.row);
+    entry.agentsSignature = agentSignature(entry.row, Date.now());
   };
   entry.build = build;
   if (open) build();
@@ -1538,17 +1576,18 @@ function createSessionItem(row, options) {
 function updateSessionItem(entry, row, options) {
   entry.row = row;
   entry.options = options;
-  const signature = sessionSignature(row, options, Math.floor(Date.now() / 60000));
+  const now = Date.now();
+  const signature = sessionSignature(row, options, now);
   if (signature !== entry.signature) {
     entry.signature = signature;
     entry.rowNode.className = sessionClasses(row, options);
     clear(entry.rowNode);
-    for (const cell of sessionCells(row, { ...options, details: entry.children !== null }, Date.now())) {
+    for (const cell of sessionCells(row, { ...options, details: entry.children !== null }, now)) {
       entry.rowNode.appendChild(cell);
     }
   }
   if (entry.children && entry.children.dataset.built === "1") {
-    const signatureOfAgents = agentSignature(row);
+    const signatureOfAgents = agentSignature(row, now);
     if (signatureOfAgents !== entry.agentsSignature) {
       entry.agentsSignature = signatureOfAgents;
       clear(entry.children);
@@ -1709,16 +1748,18 @@ function renderAgentList(container, session, parentId, depth, parentKey) {
   );
   const running = children.filter((agent) => agent.running);
   const done = children.filter((agent) => !agent.running);
+  const provider =
+    typeof session.provider === "string" && session.provider !== "" ? session.provider : null;
   for (const group of groupsOf(running, (agent) => modelKey(agent.model))) {
     const model = group[0].model;
+    const count = plural(group.length, "agent", "agents");
     container.appendChild(
       createSubItem({
-        text: `${session.provider || "Claude Code"} · ${modelName(model)} · ${plural(
-          group.length,
-          "agent",
-          "agents"
-        )}`,
+        text: provider
+          ? `${provider} · ${modelName(model)} · ${count}`
+          : `error: the session ${session.session} has no provider · ${modelName(model)} · ${count}`,
         depth,
+        error: provider === null,
       }).node
     );
     for (const agent of group) {
@@ -1843,6 +1884,8 @@ function projectTreeItems() {
       name: group.name,
       sub: groupSubText(viewRows),
       sum: sumFor("project", group.projectId),
+      rows: viewRows,
+      tied: false,
       depth: 0,
     });
     for (const providerRows of providerGroups(group.entries.map((entry) => entry.row))) {
@@ -1855,16 +1898,19 @@ function projectTreeItems() {
             modelKey(entry.row.model) === modelKey(model)
         );
         const viewLeafRows = leaf.filter((entry) => !entry.departed).map((entry) => entry.row);
+        const sampleLeafRows = leaf.map((entry) => entry.row);
         items.push({
           type: "group",
           key: `projectModel\u0000${group.key}\u0000${provider}\u0000${modelKey(model)}`,
           name: model === null ? "no answers yet" : `${provider} · ${modelName(model)}`,
-          sub: modelSubDetail(viewLeafRows, model, leaf.map((entry) => entry.row)),
+          sub: modelSubDetail(viewLeafRows, model, sampleLeafRows),
           sum: sumFor("projectModel", {
             project: group.projectId,
             provider,
             model,
           }),
+          rows: viewLeafRows.length ? viewLeafRows : sampleLeafRows,
+          tied: modelSubTied(viewLeafRows, model, sampleLeafRows),
           depth: 1,
         });
         for (const entry of group.entries) {
@@ -1917,6 +1963,8 @@ function modelTreeItems() {
       name: group.provider,
       sub: groupSubText(viewRows),
       sum: sumFor("provider", group.provider),
+      rows: viewRows,
+      tied: false,
       depth: 0,
     });
     for (const modelRows of modelGroups(group.entries.map((entry) => entry.row))) {
@@ -1925,12 +1973,15 @@ function modelTreeItems() {
         (entry) => modelKey(entry.row.model) === modelKey(model)
       );
       const viewLeafRows = leaf.filter((entry) => !entry.departed).map((entry) => entry.row);
+      const sampleLeafRows = leaf.map((entry) => entry.row);
       items.push({
         type: "group",
         key: `model\u0000${group.provider}\u0000${modelKey(model)}`,
         name: model === null ? "no answers yet" : modelName(model),
-        sub: modelSubDetail(viewLeafRows, model, leaf.map((entry) => entry.row)),
+        sub: modelSubDetail(viewLeafRows, model, sampleLeafRows),
         sum: sumFor("providerModel", { provider: group.provider, model }),
+        rows: viewLeafRows.length ? viewLeafRows : sampleLeafRows,
+        tied: modelSubTied(viewLeafRows, model, sampleLeafRows),
         depth: 1,
       });
       for (const entry of leaf) items.push(sessionTreeItem(entry));
@@ -2085,7 +2136,7 @@ function modelCard() {
     const running = group.filter(isRunning);
     const busy = running.filter((row) => statusName(row) === "busy").length;
     const sum = sumFor("model", model);
-    const last = sum ? sum.lastHour.out : null;
+    const last = sum ? lastHourSummary(sum) : { text: "", title: "" };
     const tied = group.some((row) => isReported(row) && row.tied === true);
     body.appendChild(
       h("div", { class: "sess-mini-row" }, [
@@ -2095,9 +2146,7 @@ function modelCard() {
         ]),
         h("span", { class: "n" }, String(running.length)),
         h("span", { class: "n" }, String(busy)),
-        sum
-          ? h("span", { class: "n" }, tokens(last))
-          : h("span", { class: "n" }, ""),
+        h("span", { class: "n", title: last.title || null }, last.text),
       ])
     );
   }
@@ -2182,46 +2231,59 @@ function switchCard() {
   return card;
 }
 
-function lastHourCard() {
-  const { card, body } = sideCard("Last hour", "by project");
-  const rows = state.view.sessions;
-  const groups = groupsOf(rows, (row) => projectKey(row.projectId));
-  const bars = groups.map((group) => {
-    const id = group[0].projectId;
-    const sum = sumFor("project", id);
+// A project's last hour for the side card: the sum's hour (null when the view
+// does not know it) and the two figures of the mock-up. The card and its rebuild
+// key read the same shape.
+function lastHourBars(rows) {
+  return groupsOf(rows, (row) => projectKey(row.projectId)).map((group) => {
+    const sum = sumFor("project", group[0].projectId);
     return {
       name: group[0].project || "unassigned",
-      count: sum ? sum.lastHour.out : 0,
+      lastHour: sum ? sum.lastHour : null,
       hasSum: Boolean(sum),
       values: sum ? sum.lastHourValues : null,
     };
   });
-  bars.sort((one, other) => other.count - one.count);
+}
+
+function lastHourCard() {
+  const { card, body } = sideCard("Last hour", "by project");
+  const bars = lastHourBars(state.view.sessions);
+  const countOf = (bar) => (bar.lastHour ? bar.lastHour.out : null);
+  bars.sort((one, other) => {
+    const a = Number.isFinite(countOf(one)) ? countOf(one) : -1;
+    const b = Number.isFinite(countOf(other)) ? countOf(other) : -1;
+    return b - a;
+  });
   if (bars.length === 0) {
     body.appendChild(h("p", { class: "sess-empty mf" }, "No sessions."));
     return card;
   }
-  const max = bars.reduce((top, bar) => Math.max(top, bar.count), 0);
+  const max = bars.reduce(
+    (top, bar) => (Number.isFinite(countOf(bar)) ? Math.max(top, countOf(bar)) : top),
+    0
+  );
   for (const bar of bars) {
-    const width = max > 0 ? Math.round((bar.count / max) * 100) : 0;
+    const count = countOf(bar);
+    const width = Number.isFinite(count) && max > 0 ? Math.round((count / max) * 100) : 0;
     // The mock-up's second figure after the tokens: the last hour's
     // subscription value, with its currency (there is no currency header here).
     const value = bar.values ? valueText(bar.values, "subscription", null) : null;
-    const text = bar.hasSum ? tokens(bar.count) : "";
+    const summary = bar.hasSum
+      ? lastHourSummary({ lastHour: bar.lastHour, lastHourValues: bar.values })
+      : { text: "", title: "" };
+    const title = summary.title || (value && value.title ? value.title : "");
+    const text = summary.title || !value ? summary.text : `${summary.text} · ${value.text}`;
     body.appendChild(
       h("div", { class: "sess-bar-row" }, [
         h("span", { class: "sess-bar-name" }, bar.name),
         h("span", { class: "sess-bar" }, [
           h("i", {
             style: { width: `${width}%` },
-            class: bar.count > 0 ? "is-on" : "",
+            class: Number.isFinite(count) && count > 0 ? "is-on" : "",
           }),
         ]),
-        h(
-          "span",
-          { class: "n sess-bar-value", title: value && value.title ? value.title : null },
-          value ? `${text} · ${value.text}` : text
-        ),
+        h("span", { class: "n sess-bar-value", title: title || null }, text),
       ])
     );
   }
@@ -2264,7 +2326,7 @@ function renderSide() {
       model,
       running.length,
       running.filter((row) => statusName(row) === "busy").length,
-      sum ? sum.lastHour.out : null,
+      sum ? sum.lastHour : null,
       group.some((row) => isReported(row) && row.tied === true),
     ];
   });
@@ -2274,16 +2336,13 @@ function renderSide() {
     modelCard
   );
   setSideCard("switch", JSON.stringify(state.view.switchEffect), switchCard);
-  const bars = groupsOf(rows, (row) => projectKey(row.projectId)).map((group) => {
-    const sum = sumFor("project", group[0].projectId);
-    return {
-      name: group[0].project || "unassigned",
-      count: sum ? sum.lastHour.out : 0,
-      hasSum: Boolean(sum),
-      values: sum ? sum.lastHourValues : null,
-    };
+  const bars = lastHourBars(rows);
+  const countOf = (bar) => (bar.lastHour ? bar.lastHour.out : null);
+  bars.sort((one, other) => {
+    const a = Number.isFinite(countOf(one)) ? countOf(one) : -1;
+    const b = Number.isFinite(countOf(other)) ? countOf(other) : -1;
+    return b - a;
   });
-  bars.sort((one, other) => other.count - one.count);
   setSideCard("last", JSON.stringify(bars), lastHourCard);
 }
 
@@ -2301,6 +2360,32 @@ function renderView() {
   renderTree();
   renderSide();
   fillTimes(token);
+  updateSecondTimer();
+}
+
+// Is a shown duration under a minute ("busy 5s", "running 5s")? Only the rows
+// on screen count; the timer exists while one of them does.
+function showsSeconds() {
+  if (!state.treeScroll) return false;
+  return Array.from(state.treeScroll.querySelectorAll(".sw")).some(
+    (node) => /\b\d+s\b/.test(node.textContent || "") && node.getClientRects().length > 0
+  );
+}
+
+// A duration under a minute is redrawn every second; while every shown duration
+// is a minute or longer no one-second timer runs (finding 16). The minute timer
+// above still redraws a row when its "2h 31min" changes.
+function updateSecondTimer() {
+  if (!state.active) return;
+  const needed = showsSeconds();
+  if (needed && !state.secondTimer) {
+    state.secondTimer = setInterval(() => {
+      if (state.active && state.view) renderView();
+    }, 1000);
+  } else if (!needed && state.secondTimer) {
+    clearInterval(state.secondTimer);
+    state.secondTimer = null;
+  }
 }
 
 async function fillTimes(token) {

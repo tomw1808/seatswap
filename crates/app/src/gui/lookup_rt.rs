@@ -48,8 +48,6 @@ pub(crate) struct MoneyView {
     pub rate_source: &'static str,
     pub prices_source: &'static str,
     pub look_up: bool,
-    /// The providers a model key may name, from `money::PRICE_PROVIDERS`.
-    pub providers: Vec<String>,
     pub models_with_price: u32,
     pub prices_checked_at: Option<DateTime<Utc>>,
     pub last_change: Option<PriceChange>,
@@ -71,7 +69,6 @@ impl Default for MoneyView {
             rate_source: RATE_SOURCE,
             prices_source: PRICES_SOURCE,
             look_up: false,
-            providers: Vec::new(),
             models_with_price: 0,
             prices_checked_at: None,
             last_change: None,
@@ -489,7 +486,6 @@ impl LookupRuntime {
             rate_source: RATE_SOURCE,
             prices_source: PRICES_SOURCE,
             look_up: settings.look_up_prices,
-            providers: providers(),
             models_with_price,
             prices_checked_at: prices.checked_at,
             last_change: prices.last_change,
@@ -516,14 +512,6 @@ impl LookupRuntime {
     }
 }
 
-/// The providers a model key may name, as the page lists them.
-fn providers() -> Vec<String> {
-    money::PRICE_PROVIDERS
-        .iter()
-        .map(|name| (*name).to_string())
-        .collect()
-}
-
 /// The view from what is stored, before the first round: no request is sent and
 /// nothing is invented. The currency and the switch are known only after the
 /// settings are read, so they stay missing here.
@@ -546,7 +534,6 @@ fn stored_view(app: &AppPaths) -> MoneyView {
         rate_source: RATE_SOURCE,
         prices_source: PRICES_SOURCE,
         look_up: false,
-        providers: providers(),
         models_with_price: prices.current().len() as u32,
         prices_checked_at: prices.checked_at,
         last_change: prices.last_change,
@@ -896,10 +883,6 @@ mod tests {
             rate_source: RATE_SOURCE,
             prices_source: PRICES_SOURCE,
             look_up: true,
-            providers: money::PRICE_PROVIDERS
-                .iter()
-                .map(|name| (*name).to_string())
-                .collect(),
             models_with_price: 3,
             prices_checked_at: Some(utc("2026-11-14T09:00:00Z")),
             last_change: Some(PriceChange {
@@ -913,9 +896,11 @@ mod tests {
             last_error: None,
         };
         let json = serde_json::to_value(view).expect("the event's JSON");
-        assert_eq!(
-            json["providers"],
-            json!(["anthropic", "openai", "ollama-cloud"])
+        // Nothing reads a provider list from the view since the "add a model"
+        // control is gone (review left-over; fix point 5).
+        assert!(
+            json.get("providers").is_none(),
+            "the view carries no providers"
         );
         assert_eq!(json["modelsWithPrice"], json!(3));
         assert_eq!(json["rate"]["value"], json!(0.9048));
@@ -1382,5 +1367,34 @@ mod tests {
             wake.last_error.is_some(),
             "the rate wake wiped the models.dev error from the view"
         );
+    }
+
+    /// The rate error says no rate arrived: it stays on the view until an ask
+    /// is answered, also after the afternoon retry's window (fix point 5,
+    /// review finding 15). A failed ask does not count as an answer, so the
+    /// next round asks again and the reason stays.
+    #[test]
+    fn proof_a_rate_error_stays_after_the_afternoon_window() {
+        let dir = tempdir().expect("tempdir");
+        let app = AppPaths::at(&dir.path().join("data"));
+        let (base, paths, _handle) = path_server(200, 500, "");
+        let mut runtime = runtime(app, lookup_api(&base));
+        let settings = Settings {
+            currency: Some("EUR".to_string()),
+            look_up_prices: true,
+            ..Settings::default()
+        };
+
+        // Fri 13 Nov 2026, 09:00 in Frankfurt: the rate ask fails.
+        let first = runtime.round(&settings, utc("2026-11-13T08:00:00Z"));
+        assert!(first.rate_error.is_some(), "the failed rate is remembered");
+        // 19:00 in Frankfurt: the afternoon retry's window is over, but the
+        // rate never arrived, so the page keeps its reason.
+        let later = runtime.round(&settings, utc("2026-11-13T18:00:00Z"));
+        assert!(
+            later.rate_error.is_some(),
+            "the rate never arrived; its error must stay after 18:00"
+        );
+        assert_eq!(rate_asks(&paths), 2, "a failed rate is asked again");
     }
 }

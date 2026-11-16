@@ -34,6 +34,11 @@ pub enum PathsError {
     HistoryDir(String),
     #[error("the Codex folder (codexHome or $CODEX_HOME) must be an absolute path, got {0}")]
     RelativeCodexHome(PathBuf),
+    #[error("${variable} must be an absolute path, got {value}")]
+    RelativeHarnessFolder {
+        variable: &'static str,
+        value: PathBuf,
+    },
     #[error("Dropbox's info file {path}: {detail}")]
     DropboxInfo { path: PathBuf, detail: String },
 }
@@ -190,14 +195,13 @@ impl CodexPaths {
         env_codex_home: Option<OsString>,
         home: &Path,
     ) -> Result<CodexPaths, PathsError> {
-        let dir = match (explicit, env_codex_home) {
-            (Some(p), _) => p.to_path_buf(),
-            (None, Some(v)) if !v.is_empty() => PathBuf::from(v),
-            _ => return Ok(Self::at(&home.join(".codex"))),
-        };
-        if !dir.is_absolute() {
-            return Err(PathsError::RelativeCodexHome(dir));
-        }
+        let dir = folder_from(
+            explicit,
+            env_codex_home,
+            home,
+            &[".codex"],
+            FolderSource::Codex,
+        )?;
         Ok(Self::at(&dir))
     }
 
@@ -208,6 +212,78 @@ impl CodexPaths {
             auth_file: home.join("auth.json"),
         }
     }
+}
+
+/// The DeepSeek Harness sessions folder and the flash-agents reports folder,
+/// from values given explicitly (for tests): `$DSH_HOME/sessions` or
+/// `<home>/.dsh/sessions`, and `$XDG_STATE_HOME/flash-agents` or
+/// `<home>/.local/state/flash-agents`. A relative `$DSH_HOME` or
+/// `$XDG_STATE_HOME` is [`PathsError::RelativeHarnessFolder`], never resolved
+/// against the current folder.
+pub fn harness_folders(
+    env_dsh_home: Option<OsString>,
+    env_xdg_state_home: Option<OsString>,
+    home: &Path,
+) -> Result<(PathBuf, PathBuf), PathsError> {
+    let dsh = folder_from(None, env_dsh_home, home, &[".dsh"], FolderSource::DshHome)?;
+    let state = folder_from(
+        None,
+        env_xdg_state_home,
+        home,
+        &[".local", "state"],
+        FolderSource::XdgStateHome,
+    )?;
+    Ok((dsh.join("sessions"), state.join("flash-agents")))
+}
+
+/// The variable or setting a folder comes from, so a relative folder names it.
+#[derive(Debug, Clone, Copy)]
+enum FolderSource {
+    Codex,
+    DshHome,
+    XdgStateHome,
+}
+
+impl FolderSource {
+    fn relative(self, value: PathBuf) -> PathsError {
+        match self {
+            FolderSource::Codex => PathsError::RelativeCodexHome(value),
+            FolderSource::DshHome => PathsError::RelativeHarnessFolder {
+                variable: "DSH_HOME",
+                value,
+            },
+            FolderSource::XdgStateHome => PathsError::RelativeHarnessFolder {
+                variable: "XDG_STATE_HOME",
+                value,
+            },
+        }
+    }
+}
+
+/// `explicit` (a setting) or `env` names the folder, else `home` joined with
+/// `default`. A named folder that is relative is an error naming its source and
+/// the value, never resolved against the current folder. The one resolver for
+/// Codex's folder, the Harness's sessions folder and flash-agents' state folder.
+fn folder_from(
+    explicit: Option<&Path>,
+    env: Option<OsString>,
+    home: &Path,
+    default: &[&str],
+    source: FolderSource,
+) -> Result<PathBuf, PathsError> {
+    let folder = match (explicit, env) {
+        (Some(folder), _) => folder.to_path_buf(),
+        (None, Some(value)) if !value.is_empty() => PathBuf::from(value),
+        _ => {
+            return Ok(default
+                .iter()
+                .fold(home.to_path_buf(), |folder, part| folder.join(part)))
+        }
+    };
+    if !folder.is_absolute() {
+        return Err(source.relative(folder));
+    }
+    Ok(folder)
 }
 
 /// seatswap's own files (spec §5).
@@ -353,9 +429,23 @@ pub fn history_root(explicit: Option<&Path>, app: &AppPaths) -> Result<PathBuf, 
 /// object nor `null`, or a path that is not a non-empty string is
 /// [`PathsError::DropboxInfo`], never a made-up folder.
 pub fn dropbox_folder() -> Result<Option<PathBuf>, PathsError> {
-    for info_json in dropbox_info_files()? {
-        if info_json.exists() {
-            return dropbox_folder_in(&info_json);
+    dropbox_folder_in_files(&dropbox_info_files()?)
+}
+
+/// The first of Dropbox's candidate files that exists, or `Ok(None)` when none
+/// does. A file whose existence cannot be checked is
+/// [`PathsError::DropboxInfo`], never treated as absent.
+fn dropbox_folder_in_files(files: &[PathBuf]) -> Result<Option<PathBuf>, PathsError> {
+    for info_json in files {
+        match info_json.try_exists() {
+            Ok(true) => return dropbox_folder_in(info_json),
+            Ok(false) => {}
+            Err(source) => {
+                return Err(dropbox_error(
+                    info_json,
+                    format!("cannot check whether the file exists: {source}"),
+                ))
+            }
         }
     }
     Ok(None)
@@ -891,6 +981,35 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let info = tmp.path().join("info.json");
         assert_eq!(dropbox_folder_in(&info).unwrap(), None);
+        assert_eq!(
+            dropbox_folder_in_files(&[info]).unwrap(),
+            None,
+            "a missing file is no suggestion"
+        );
+    }
+
+    #[test]
+    fn an_info_json_that_cannot_be_checked_is_an_error_naming_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A regular file cannot be the folder of `info.json`, so checking the
+        // path is an error, not "not there".
+        let not_a_folder = tmp.path().join("not-a-folder");
+        std::fs::write(&not_a_folder, b"x").unwrap();
+        let info = not_a_folder.join("info.json");
+        let named = info.display().to_string();
+
+        let error = dropbox_folder_in_files(&[info]).unwrap_err();
+        assert!(
+            error.to_string().contains(&named),
+            "the error must name {named}, got {error}"
+        );
+        assert!(matches!(&error, PathsError::DropboxInfo { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("cannot check whether the file exists"),
+            "the error says a metadata check failed: {error}"
+        );
     }
 
     #[test]

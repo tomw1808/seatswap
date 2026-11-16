@@ -47,6 +47,18 @@
   grid-template-columns: 250px minmax(0, 1fr);
 }
 
+/* Below this width the 250 px label column leaves too little for a field or a
+   line of note: the label takes the row's first line and the control the
+   second, one rule for every row (finding 14, decision 29). */
+@media (max-width: 1100px) {
+  .settings-body .set {
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: 2px;
+    padding-top: 4px;
+    padding-bottom: 4px;
+  }
+}
+
 .set-row .row-error {
   padding: 0 12px 6px;
   color: var(--danger);
@@ -410,12 +422,8 @@
   min-width: 0;
 }
 
-/* The row's note is a long sentence; give the join line its own full row so
-   the text and the button wrap beside each other instead of being squeezed
-   into the note's nowrap width (item 29). */
-.set-row[data-field="project:join"] .set > :last-child {
-  flex-wrap: wrap;
-}
+/* The join line is one control among the others: the generic row rule in
+   window.css wraps it, so it needs no rule of its own (item 29, finding 14). */
 
 .proj-join select.inp {
   max-width: 200px;
@@ -667,6 +675,12 @@ button.link {
   border-top: 1px solid var(--border);
   font-size: 13px;
   line-height: 18px;
+}
+
+/* "API prices from models.dev" is one sentence: a flex item would drop the
+   trailing space before the link, so the words before it keep it (finding 15). */
+.price-line .price-from {
+  white-space: pre;
 }
 
 .price-toggle {

@@ -520,6 +520,15 @@ pub fn price_key(provider: &str, model_id: &str) -> String {
     format!("{provider}/{model_id}")
 }
 
+/// Whether `model` is a Claude Code model, so its tokens use the Claude plan
+/// (spec §1.4, §3.8): the one rule. Claude Code's own model ids start with
+/// `claude-`; a DeepSeek Harness or flash worker (`deepseek-v4.1-flash:cloud`),
+/// a Codex model (`gpt-6.1-sol`) and an Ollama model (`glm-5:cloud`) do not, so
+/// their tokens take no share of any Claude account's week.
+pub fn is_plan_model(model: &str) -> bool {
+    model.starts_with("claude-")
+}
+
 /// The value of a token or session cost: the provider's own number when it
 /// gives one, else models.dev's price. `None` when neither has one: there is
 /// never a guessed or zero API value (spec §1.4).
@@ -837,6 +846,9 @@ struct WeekWindow {
     end: DateTime<Utc>,
     /// The finished window's final percent, or a running window's last sample.
     used: Option<f64>,
+    /// A running window's first percent when a reset began it: its use is
+    /// `used − from`, the rule of `stats::window_used`. Absent means 0.
+    from: Option<f64>,
     /// Whether `used` came from a finished [`WindowRecord`].
     finished: bool,
     last_sample: Option<DateTime<Utc>>,
@@ -856,6 +868,9 @@ type PriceChanges = BTreeMap<AccountRef, Vec<(DateTime<Utc>, Option<f64>, Option
 pub struct Valuer {
     timelines: HashMap<String, Timeline>,
     windows: Vec<WeekWindow>,
+    /// For each reset window, the reading it began at, keyed by the account and
+    /// that reading's time: the `from` of the running window it opened.
+    window_starts: BTreeMap<(AccountRef, DateTime<Utc>), f64>,
     price_changes: PriceChanges,
     /// The price as `accounts.json` has it now and the currency it was entered
     /// in, for an account without changes.
@@ -863,6 +878,33 @@ pub struct Valuer {
     prices: Prices,
     fx: Fx,
     settings: Settings,
+}
+
+/// The use of a running window: `percent − from`, through the one rule
+/// [`window_used`] (a window that ends below its start has no use). The record
+/// only carries the two values that rule reads.
+fn open_window_used(
+    account: &AccountRef,
+    end: DateTime<Utc>,
+    at: DateTime<Utc>,
+    percent: f64,
+    from: Option<f64>,
+) -> Option<f64> {
+    let record = WindowRecord {
+        account: account.clone(),
+        k: crate::api::LimitKind::WeeklyAll,
+        m: None,
+        start: Some(end - Duration::days(7)),
+        end,
+        final_percent: percent,
+        lost: None,
+        last_sample: at,
+        plan: None,
+        uncertain: false,
+        reset: false,
+        from,
+    };
+    window_used(&record)
 }
 
 impl Valuer {
@@ -902,9 +944,48 @@ impl Valuer {
             history.read::<TokenRecord>(&widened, &Hosts::All)
         })?;
 
+        // A reset window says where the window that began at the reset started:
+        // the first weekly reading at or after the reset. That reading is the
+        // running window's `from`, so its use follows `stats::window_used`
+        // (`final − from`) instead of counting the tokens from before the reset.
+        let mut window_starts = BTreeMap::new();
+        for hosted in &windows.records {
+            let record = &hosted.record;
+            if record.k != crate::api::LimitKind::WeeklyAll || !record.reset {
+                continue;
+            }
+            // The reset kept the window's reset time: the window it began ends
+            // one week after the reset record's start.
+            let Some(reset_end) = record.start.map(|start| start + Duration::days(7)) else {
+                continue;
+            };
+            let weekly = |sample: &&Hosted<Sample>| {
+                sample.record.l.iter().any(|limit| {
+                    limit.k == crate::api::LimitKind::WeeklyAll
+                        && limit.r.is_some_and(|end| same_reset(end, reset_end))
+                })
+            };
+            let first = samples
+                .records
+                .iter()
+                .filter(|sample| sample.record.account == record.account)
+                .filter(|sample| sample.record.t >= record.end)
+                .filter(weekly)
+                .min_by_key(|sample| sample.record.t);
+            if let Some(first) = first {
+                if let Some(limit) = first.record.l.iter().find(|limit| {
+                    limit.k == crate::api::LimitKind::WeeklyAll
+                        && limit.r.is_some_and(|end| same_reset(end, reset_end))
+                }) {
+                    window_starts.insert((record.account.clone(), first.record.t), limit.p);
+                }
+            }
+        }
+
         let mut valuer = Valuer {
             timelines: timelines(&events.records),
             windows: Vec::new(),
+            window_starts,
             price_changes: BTreeMap::new(),
             stored_prices: accounts
                 .iter()
@@ -979,6 +1060,7 @@ impl Valuer {
             start,
             end,
             used: None,
+            from: None,
             finished: false,
             last_sample: None,
             api_sum: 0.0,
@@ -1019,14 +1101,28 @@ impl Valuer {
             }
             let newer = window.last_sample.is_none_or(|last| sample.t >= last);
             if newer {
+                if let Some(from) = self
+                    .window_starts
+                    .get(&(sample.account.clone(), sample.t))
+                    .copied()
+                {
+                    window.from = Some(from);
+                }
                 window.last_sample = Some(sample.t);
-                window.used = Some(limit.p);
+                window.used =
+                    open_window_used(&sample.account, end, sample.t, limit.p, window.from);
             }
         }
     }
 
     fn add_to_window(&mut self, hosted: &Hosted<TokenRecord>, prices: &Prices) {
         let record = &hosted.record;
+        // A model outside the Claude plan (a flash worker, Codex, Ollama) uses no
+        // share of a Claude account's week: it adds no API money to the window
+        // and never makes the week's subscription value unknown.
+        if !is_plan_model(&record.model) {
+            return;
+        }
         let Some(account) = self
             .timelines
             .get(&hosted.host)
@@ -1055,6 +1151,12 @@ impl Valuer {
         }
     }
 
+    /// The dollar rate this valuer was built with: the API column's rate at a
+    /// record's day, and at the view's day for a list without records.
+    pub fn fx(&self) -> &Fx {
+        &self.fx
+    }
+
     /// The money value of one token record of `host`.
     pub fn value(&self, host: &str, record: &TokenRecord) -> Valued {
         let account = self
@@ -1080,9 +1182,11 @@ impl Valuer {
         };
         // A record without tokens uses no share of any subscription, whether or
         // not an account was live: both halves are a known 0 (`api_usd` gives
-        // its 0 US dollars), never NoAccount.
+        // its 0 US dollars), never NoAccount. A model outside the Claude plan
+        // uses no share of any Claude account's week either: its subscription is
+        // a known 0; only its API half follows the price rule.
         let no_tokens = record.input == 0 && record.out == 0 && record.cw == 0 && record.cr == 0;
-        let (subscription, subscription_missing) = if no_tokens {
+        let (subscription, subscription_missing) = if no_tokens || !is_plan_model(&record.model) {
             (Some(0.0), None)
         } else {
             match (usd, &account) {
@@ -3281,5 +3385,148 @@ mod tests {
             "a Codex window changed the Claude windows"
         );
         assert_eq!(after.price_changes, before.price_changes);
+    }
+
+    #[test]
+    fn plan_models_are_the_claude_models() {
+        assert!(is_plan_model("claude-opus-5-5"));
+        assert!(is_plan_model("claude-fable-5-2"));
+        assert!(!is_plan_model("deepseek-v4.1-flash:cloud"));
+        assert!(!is_plan_model("gpt-6.1-sol"));
+        assert!(!is_plan_model("glm-5:cloud"));
+    }
+
+    /// A flash worker's records never touch the Claude account's week: they add
+    /// no API money and never make the week's subscription value unknown.
+    #[test]
+    fn a_worker_record_never_touches_the_claude_week() {
+        let (history, _dir, opus, haiku, prices) = two_records();
+        history
+            .append(&price_changed(
+                utc("2026-11-06T00:00:00Z"),
+                Some(140.0),
+                Some("EUR"),
+            ))
+            .expect("the account's price");
+        history
+            .append(&weekly_window(
+                utc("2026-11-07T00:00:00Z"),
+                utc("2026-11-14T00:00:00Z"),
+                80.0,
+            ))
+            .expect("a finished window");
+        let worker = token(
+            utc("2026-11-10T12:00:00Z"),
+            "deepseek-v4.1-flash:cloud",
+            1_000_000,
+            1_000_000,
+            0,
+            0,
+        );
+        history.append(&worker).expect("a worker record");
+
+        let valuer = Valuer::build(
+            &history,
+            &range("2026-11-10T00:00:00Z", "2026-11-11T00:00:00Z"),
+            &prices,
+            &empty_fx(),
+            &settings_eur(),
+            &[account_with_price(Some(140.0))],
+            &RefCell::new(Vec::new()),
+        )
+        .expect("a valuer");
+
+        for record in [&opus, &haiku] {
+            let value = valuer.value("atlas", record);
+            assert!(
+                value.subscription.is_some(),
+                "a Claude record lost its week's value: {value:?}"
+            );
+            assert_eq!(value.subscription_missing, None);
+        }
+        let worker_value = valuer.value("atlas", &worker);
+        assert_eq!(
+            worker_value.subscription,
+            Some(0.0),
+            "a worker uses no share of the Claude account's week"
+        );
+        assert_eq!(worker_value.subscription_missing, None);
+
+        let api_sum: f64 = valuer.windows.iter().map(|window| window.api_sum).sum();
+        assert!(
+            (api_sum - 40.0).abs() < 1e-9,
+            "the week's API sum is the Claude records' alone, got {api_sum}"
+        );
+        assert!(
+            valuer
+                .windows
+                .iter()
+                .all(|window| window.unpriced.is_none()),
+            "a worker record made the week unpriced"
+        );
+    }
+
+    /// After a model reset that keeps the reset time, the running window holds
+    /// tokens from after the reset: its use is `p − from`, not `p`.
+    #[test]
+    fn a_running_week_after_a_reset_uses_the_percent_minus_from() {
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let reset_at = utc("2026-11-20T10:00:00Z");
+        let before = utc("2026-11-16T09:00:00Z");
+        let reset_reading = utc("2026-11-18T08:30:00Z");
+        let later = utc("2026-11-19T12:00:00Z");
+        history
+            .append(&live(utc("2026-11-16T00:00:00Z"), Some(ac())))
+            .expect("a live event");
+        history
+            .append(&price_changed(
+                utc("2026-11-06T00:00:00Z"),
+                Some(140.0),
+                Some("EUR"),
+            ))
+            .expect("the account's price");
+        for (at, percent) in [(before, 70.0), (reset_reading, 45.0), (later, 60.0)] {
+            history
+                .append(&weekly_sample(at, reset_at, percent))
+                .expect("a weekly sample");
+        }
+        let mut reset = weekly_window(reset_at - Duration::days(7), reset_reading, 70.0);
+        reset.reset = true;
+        reset.last_sample = before;
+        history.append(&reset).expect("the reset window");
+        let opus = token(later, "claude-opus-5-5", 1_000_000, 0, 0, 0);
+        history.append(&opus).expect("a token record");
+
+        let valuer = Valuer::build(
+            &history,
+            &range("2026-11-19T00:00:00Z", "2026-11-20T00:00:00Z"),
+            &priced_prices(utc("2026-11-01T00:00:00Z")),
+            &empty_fx(),
+            &settings_eur(),
+            &[account_with_price(Some(140.0))],
+            &RefCell::new(Vec::new()),
+        )
+        .expect("a valuer");
+
+        let open = valuer
+            .windows
+            .iter()
+            .find(|window| !window.finished && same_reset(window.end, reset_at))
+            .expect("the running window");
+        assert_eq!(
+            open.used,
+            Some(15.0),
+            "the running window's use is 60 − 45, not 60"
+        );
+        let value = valuer
+            .value("atlas", &opus)
+            .subscription
+            .expect("a subscription value");
+        let expected = 15.0 * percent_value(140.0);
+        assert!(
+            (value - expected).abs() < 1e-9,
+            "the record's subscription uses 15 %, got {value} instead of {expected}"
+        );
     }
 }

@@ -28,10 +28,12 @@ use crate::project::{self, ProjectKey};
 
 /// The version of the state files this module writes and reads.
 ///
-/// Version 2 keeps the last hour's tokens per model. The state is a cache: a
-/// file of another version is discarded and the transcripts are read again
-/// (the sessions thread says so once).
+/// Version 2 keeps the last hour's tokens per model. A version-1 file is
+/// migrated: its offsets are kept, so no byte already read is recorded again.
+/// A file of any other version is an error, never a silent rebuild.
 const STATE_VERSION: u32 = 2;
+/// The version 1.1.0 wrote, and the one this module migrates.
+const STATE_VERSION_1: u32 = 1;
 /// How many message ids a growing transcript keeps, so that an answer is
 /// counted once even when its lines arrive far apart.
 const RECENT_IDS: usize = 500;
@@ -70,6 +72,19 @@ pub enum TranscriptError {
         path: PathBuf,
         #[source]
         source: serde_json::Error,
+    },
+    /// A state file of a version this module cannot read. Rebuilding would read
+    /// every transcript again and write its records a second time, so this is an
+    /// error, not a cache miss.
+    #[error(
+        "{path}: state version {found} is not supported; this seatswap reads version 1 and version {current}{newer}"
+    )]
+    UnsupportedStateVersion {
+        path: PathBuf,
+        found: u32,
+        current: u32,
+        /// `" (the file was written by a newer seatswap)"` for a higher version.
+        newer: &'static str,
     },
 }
 
@@ -313,18 +328,16 @@ pub struct ScanState {
     /// Whether `harness_recorded` changed since the last save.
     #[serde(skip)]
     harness_changed: bool,
-    /// Whether the last load discarded state files of another version. Not
-    /// saved: it only tells the caller to say so once.
-    #[serde(skip)]
-    rebuilt: bool,
 }
 
 impl ScanState {
     /// Read the state of every project folder. A missing folder is the default.
     ///
-    /// The state is a cache. A file of another version is not an error: every
-    /// state file is removed, an empty state is returned with
-    /// [`Self::was_rebuilt`] set, and the transcripts are read again.
+    /// A version-1 file is read with the 1.1.0 shape and migrated: its offsets
+    /// stay, so no byte already read is recorded again. The migrated folders are
+    /// marked changed, so the next [`save`](Self::save) writes them as version 2.
+    /// Any other version is an error: rebuilding a state would append the
+    /// records it already wrote to the history a second time.
     pub fn load(app: &AppPaths) -> Result<ScanState, TranscriptError> {
         let dir = app.transcripts_state_dir();
         let mut state = ScanState {
@@ -348,7 +361,7 @@ impl ScanState {
             }
             if path.file_name().and_then(|name| name.to_str()) == Some(HARNESS_STATE_FILE) {
                 // The Harness token memory is read on its own, and a transcript
-                // rebuild must not delete it.
+                // load must not delete it.
                 continue;
             }
             let kind = entry.file_type().map_err(|source| TranscriptError::Io {
@@ -371,39 +384,26 @@ impl ScanState {
                     path: harness_path.clone(),
                     source,
                 })?;
-            if header.version != STATE_VERSION {
-                // This file is a cache of its own: an old one is removed without
-                // touching the transcript state or the transcript rebuild.
-                match fs::remove_file(&harness_path) {
-                    Ok(()) => {}
-                    Err(source) if source.kind() == io::ErrorKind::NotFound => {}
-                    Err(source) => {
-                        return Err(TranscriptError::Io {
-                            path: harness_path,
+            match header.version {
+                // `harness.json` came with version 2 (1.1.0 had none), so
+                // version 2 is the only one it can hold.
+                STATE_VERSION => {
+                    let file: HarnessState = serde_json::from_slice(&bytes).map_err(|source| {
+                        TranscriptError::State {
+                            path: harness_path.clone(),
                             source,
-                        })
-                    }
-                }
-            } else {
-                let file: HarnessState =
-                    serde_json::from_slice(&bytes).map_err(|source| TranscriptError::State {
-                        path: harness_path.clone(),
-                        source,
-                    })?;
-                if file.version != STATE_VERSION {
-                    match fs::remove_file(&harness_path) {
-                        Ok(()) => {}
-                        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
-                        Err(source) => {
-                            return Err(TranscriptError::Io {
-                                path: harness_path,
-                                source,
-                            })
                         }
-                    }
-                } else {
+                    })?;
                     state.harness_recorded = file.recorded;
                     state.closed_flash_jobs = file.closed_flash_jobs;
+                }
+                found => {
+                    return Err(TranscriptError::UnsupportedStateVersion {
+                        path: harness_path,
+                        found,
+                        current: STATE_VERSION,
+                        newer: newer_version(found),
+                    })
                 }
             }
         }
@@ -413,35 +413,23 @@ impl ScanState {
                 path: path.clone(),
                 source,
             })?;
-            // Read the version before the rest: a state file of an older version
-            // has shapes this version no longer parses, and the state is a cache.
-            let header: StateVersion =
-                serde_json::from_slice(&bytes).map_err(|source| TranscriptError::State {
-                    path: path.clone(),
-                    source,
-                })?;
-            if header.version != STATE_VERSION {
-                return discard_state(&paths, &state.harness_recorded, &state.closed_flash_jobs);
-            }
-            let file: StateFile =
-                serde_json::from_slice(&bytes).map_err(|source| TranscriptError::State {
-                    path: path.clone(),
-                    source,
-                })?;
-            if file.version != STATE_VERSION {
-                // The file changed between the two reads: it is still a cache.
-                return discard_state(&paths, &state.harness_recorded, &state.closed_flash_jobs);
+            let (file, migrated) = parse_state_file(path, &bytes)?;
+            if migrated {
+                // A migrated file must reach the disk as version 2, even when
+                // this pass reads no new bytes from its transcripts.
+                for key in file.files.keys() {
+                    if let Some((folder, _)) = key.split_once('/') {
+                        state.changed.insert(folder.to_string());
+                    }
+                }
+                for seen in file.sessions.values() {
+                    state.changed.insert(seen.folder.clone());
+                }
             }
             state.files.extend(file.files);
             state.sessions.extend(file.sessions);
         }
         Ok(state)
-    }
-
-    /// Whether [`load`](Self::load) discarded a state file of another version,
-    /// so this state is empty and every transcript must be read again.
-    pub fn was_rebuilt(&self) -> bool {
-        self.rebuilt
     }
 
     /// The one way to remember the session record written from `session`: it
@@ -723,37 +711,48 @@ impl ScanState {
     }
 }
 
-/// Discard every state file and return the empty state that says so: the state
-/// is a cache, so a file of another version is rebuilt from the transcripts
-/// instead of being an error. Removing every file leaves no old-version file
-/// behind to rebuild from on the next start.
-fn discard_state(
-    paths: &[PathBuf],
-    harness_recorded: &BTreeMap<String, HarnessRecorded>,
-    closed_flash_jobs: &BTreeMap<String, ClosedJob>,
-) -> Result<ScanState, TranscriptError> {
-    // The Harness totals and the closed sessions' job links live in
-    // `harness.json`, which `paths` does not list: rebuilding the transcript
-    // state must not forget what was already counted.
-    for path in paths {
-        match fs::remove_file(path) {
-            Ok(()) => {}
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(TranscriptError::Io {
-                    path: path.clone(),
+/// Read one project folder's state file, migrating a version-1 file and
+/// refusing a version this module does not know. Returns the file and whether
+/// it was migrated (and must be written back as version 2).
+fn parse_state_file(path: &Path, bytes: &[u8]) -> Result<(StateFile, bool), TranscriptError> {
+    let header: StateVersion =
+        serde_json::from_slice(bytes).map_err(|source| TranscriptError::State {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    match header.version {
+        STATE_VERSION_1 => {
+            let old: StateFileV1 =
+                serde_json::from_slice(bytes).map_err(|source| TranscriptError::State {
+                    path: path.to_path_buf(),
                     source,
-                })
-            }
+                })?;
+            Ok((old.into(), true))
         }
+        STATE_VERSION => {
+            let file: StateFile =
+                serde_json::from_slice(bytes).map_err(|source| TranscriptError::State {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+            Ok((file, false))
+        }
+        found => Err(TranscriptError::UnsupportedStateVersion {
+            path: path.to_path_buf(),
+            found,
+            current: STATE_VERSION,
+            newer: newer_version(found),
+        }),
     }
-    Ok(ScanState {
-        version: STATE_VERSION,
-        harness_recorded: harness_recorded.clone(),
-        closed_flash_jobs: closed_flash_jobs.clone(),
-        rebuilt: true,
-        ..ScanState::default()
-    })
+}
+
+/// The hint an unsupported version's error carries.
+fn newer_version(found: u32) -> &'static str {
+    if found > STATE_VERSION {
+        " (the file was written by a newer seatswap)"
+    } else {
+        ""
+    }
 }
 
 /// What one scan found, including the state it read into. The state is staged:
@@ -1346,8 +1345,8 @@ pub fn token_records(answers: &[Answer], state: &ScanState, home: &Path) -> Vec<
 
 // ---- the implementation ----
 
-/// The first field of a state file, read before the rest so a file of an older
-/// version is discarded without parsing the shapes this version no longer has.
+/// The first field of a state file, read before the rest so a version-1 file
+/// can use the 1.1.0 shape and any other unsupported version is an error.
 #[derive(Debug, Deserialize)]
 struct StateVersion {
     version: u32,
@@ -1360,6 +1359,109 @@ struct StateFile {
     version: u32,
     files: BTreeMap<String, FileState>,
     sessions: BTreeMap<String, SessionSeen>,
+}
+
+/// The 1.1.0 shape of a project folder's state file (version 1), read only to
+/// migrate it. Its `recent` entries have no model, so they cannot become the
+/// version-2 per-model entries; [`From`] drops them, which leaves only the last
+/// hour unknown.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StateFileV1 {
+    files: BTreeMap<String, FileStateV1>,
+    sessions: BTreeMap<String, SessionSeenV1>,
+}
+
+/// The 1.1.0 shape of one transcript's state.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileStateV1 {
+    offset: u64,
+    grew: DateTime<Utc>,
+    recent: Vec<String>,
+    #[serde(default)]
+    last_answer: Option<DateTime<Utc>>,
+}
+
+/// The 1.1.0 shape of one session's state.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionSeenV1 {
+    folder: String,
+    cwd: String,
+    first: DateTime<Utc>,
+    last: DateTime<Utc>,
+    last_model: Option<String>,
+    last_user_turn: Option<DateTime<Utc>>,
+    #[serde(default)]
+    thinking: Vec<(DateTime<Utc>, u32)>,
+    #[serde(default)]
+    totals: Tokens,
+    #[serde(default)]
+    by_model: BTreeMap<String, Tokens>,
+    #[serde(default)]
+    agents: BTreeMap<String, AgentSeen>,
+    #[serde(default)]
+    spawns: BTreeMap<String, Option<String>>,
+    #[serde(default)]
+    recent: Vec<(DateTime<Utc>, Tokens)>,
+    #[serde(default)]
+    recorded: Option<RecordedSession>,
+}
+
+impl From<StateFileV1> for StateFile {
+    /// Keep every offset and every field the version-2 state still has. The
+    /// fields version 1 lacks start empty; they only concern flash links and
+    /// the per-model last hour, never which bytes were already recorded.
+    fn from(old: StateFileV1) -> StateFile {
+        StateFile {
+            version: STATE_VERSION,
+            files: old
+                .files
+                .into_iter()
+                .map(|(key, file)| {
+                    (
+                        key,
+                        FileState {
+                            offset: file.offset,
+                            grew: file.grew,
+                            recent: file.recent,
+                            last_answer: file.last_answer,
+                            flash_tools: BTreeSet::new(),
+                        },
+                    )
+                })
+                .collect(),
+            sessions: old
+                .sessions
+                .into_iter()
+                .map(|(session, seen)| {
+                    // Version 1's per-minute counts have no model: read them so
+                    // the 1.1.0 shape parses, then drop them on purpose.
+                    let _no_model = seen.recent;
+                    (
+                        session,
+                        SessionSeen {
+                            folder: seen.folder,
+                            cwd: seen.cwd,
+                            first: seen.first,
+                            last: seen.last,
+                            last_model: seen.last_model,
+                            last_user_turn: seen.last_user_turn,
+                            thinking: seen.thinking,
+                            totals: seen.totals,
+                            by_model: seen.by_model,
+                            agents: seen.agents,
+                            spawns: seen.spawns,
+                            recent: Vec::new(),
+                            recorded: seen.recorded,
+                            flash_jobs: BTreeSet::new(),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
 }
 
 /// `harness.json`: the Harness sessions' tokens already in the history, and the
@@ -4692,10 +4794,124 @@ mod tests {
         assert!(seen.recent.is_empty());
     }
 
-    /// REVIEW PROOF (S-1): a real 1.1.0 state file has per-minute counts without
-    /// a model in `recent`; it must be discarded and rebuilt, never an error.
+    /// REVIEW PROOF (Z-2, finding 1): a real 1.1.0 state file has per-minute
+    /// counts without a model in `recent`. It is migrated: the offsets stay, so
+    /// the answers it already recorded are not read again, and only the last
+    /// hour (the one thing version 2 cannot derive) starts empty.
     #[test]
-    fn review_a_version_1_state_with_minutes_is_rebuilt() {
+    fn review_a_version_1_state_with_minutes_is_migrated() {
+        let (_tmp, _claude, app) = fixture();
+        let dir = app.transcripts_state_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let old = serde_json::json!({
+            "version": 1,
+            "files": {
+                KEY: {
+                    "offset": 987_u64,
+                    "grew": "2026-11-12T09:41:07.412Z",
+                    "recent": ["msg_01QmB7xT"],
+                    "lastAnswer": "2026-11-12T09:41:07.412Z"
+                }
+            },
+            "sessions": {
+                SESSION: {
+                    "folder": FOLDER,
+                    "cwd": ENGINE,
+                    "first": "2026-11-12T09:41:07.412Z",
+                    "last": "2026-11-12T09:41:07.412Z",
+                    "lastModel": OPUS,
+                    "lastUserTurn": null,
+                    "thinking": [["2026-11-12T09:41:00Z", 1]],
+                    "totals": {"input": 2, "out": 166, "cw": 26173, "cr": 28126},
+                    "byModel": {OPUS: {"input": 2, "out": 166, "cw": 26173, "cr": 28126}},
+                    "agents": {},
+                    "spawns": {},
+                    "recent": [["2026-11-12T09:41:00Z", {"input": 2, "out": 166, "cw": 26173, "cr": 28126}]],
+                    "recorded": {"last": "2026-11-12T09:41:07.412Z", "closed": true}
+                }
+            }
+        });
+        let path = dir.join(format!("{FOLDER}.json"));
+        fs::write(&path, old.to_string()).unwrap();
+
+        let state = ScanState::load(&app).expect("version 1 is migrated, not an error");
+
+        assert_eq!(state.version, STATE_VERSION);
+        assert_eq!(state.files[KEY].offset, 987, "the read offset is kept");
+        assert_eq!(state.files[KEY].recent, vec!["msg_01QmB7xT".to_string()]);
+        assert!(
+            state.files[KEY].flash_tools.is_empty(),
+            "version 1 named no flash tools"
+        );
+        let seen = &state.sessions[SESSION];
+        assert_eq!(seen.totals.out, 166, "the sums are kept");
+        assert_eq!(seen.by_model[OPUS].out, 166);
+        assert_eq!(seen.thinking_since_user(), 1);
+        assert_eq!(
+            seen.recorded,
+            Some(RecordedSession {
+                last: "2026-11-12T09:41:07.412Z".parse().unwrap(),
+                closed: true,
+            }),
+            "the record already written is still remembered"
+        );
+        assert!(
+            seen.recent.is_empty(),
+            "the per-minute tokens have no model and cannot become version 2's"
+        );
+        assert!(seen.flash_jobs.is_empty(), "version 1 named no flash jobs");
+        assert!(
+            state.changed.contains(FOLDER),
+            "the migrated folder is written back as version 2"
+        );
+    }
+
+    /// A state file of a version this build does not read is an error naming the
+    /// file and both versions, never a silent rebuild: a rebuild is what writes
+    /// the history a second time.
+    #[test]
+    fn a_state_file_of_a_newer_version_is_an_error() {
+        let (_tmp, _claude, app) = fixture();
+        let dir = app.transcripts_state_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let newer = serde_json::json!({
+            "version": 3,
+            "files": {},
+            "sessions": {}
+        });
+        let path = dir.join(format!("{FOLDER}.json"));
+        fs::write(&path, newer.to_string()).unwrap();
+
+        let error = ScanState::load(&app).expect_err("version 3 is not read");
+
+        let text = error.to_string();
+        assert!(
+            text.contains(path.to_str().unwrap()),
+            "the file is named: {text}"
+        );
+        assert!(
+            text.contains("version 3"),
+            "the found version is named: {text}"
+        );
+        assert!(
+            text.contains("version 2"),
+            "this build's version is named: {text}"
+        );
+        assert!(
+            text.contains("newer seatswap"),
+            "a higher version says why: {text}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            newer.to_string(),
+            "the unsupported file is left as it was"
+        );
+    }
+
+    /// A transcript state of version 1 is migrated beside the Harness totals,
+    /// which live in their own file and must survive the migration.
+    #[test]
+    fn a_version_1_migration_keeps_the_harness_totals() {
         let (_tmp, _claude, app) = fixture();
         let dir = app.transcripts_state_dir();
         fs::create_dir_all(&dir).unwrap();
@@ -4710,26 +4926,9 @@ mod tests {
                     "last": "2026-11-12T09:41:07.412Z",
                     "lastModel": OPUS,
                     "lastUserTurn": null,
-                    "recent": [["2026-11-12T09:41:00Z", {"input": 2, "out": 166, "cw": 26173, "cr": 28126}]]
+                    "totals": {"input": 2, "out": 166, "cw": 26173, "cr": 28126}
                 }
             }
-        });
-        fs::write(dir.join(format!("{FOLDER}.json")), old.to_string()).unwrap();
-
-        let state = ScanState::load(&app).expect("an old version is a cache, not an error");
-
-        assert!(state.was_rebuilt());
-    }
-
-    #[test]
-    fn a_transcript_state_rebuild_keeps_the_harness_totals() {
-        let (_tmp, _claude, app) = fixture();
-        let dir = app.transcripts_state_dir();
-        fs::create_dir_all(&dir).unwrap();
-        let old = serde_json::json!({
-            "version": 1,
-            "files": {},
-            "sessions": {},
         });
         fs::write(dir.join(format!("{FOLDER}.json")), old.to_string()).unwrap();
         let harness = serde_json::json!({
@@ -4743,18 +4942,21 @@ mod tests {
         });
         fs::write(dir.join("harness.json"), harness.to_string()).unwrap();
 
-        let state = ScanState::load(&app).expect("an old transcript state is a cache");
+        let state = ScanState::load(&app).expect("a version-1 state is migrated");
 
-        assert!(state.was_rebuilt());
+        assert_eq!(
+            state.sessions[SESSION].totals.out, 166,
+            "the version-1 session is migrated too"
+        );
         let recorded = state
             .harness_recorded
             .get(SESSION)
-            .expect("the Harness totals survive the rebuild");
+            .expect("the Harness totals are kept");
         assert_eq!(recorded.messages, 2);
         assert_eq!(recorded.tokens.input, 10);
         assert!(
             dir.join("harness.json").exists(),
-            "the rebuild must not delete the Harness totals"
+            "a transcript migration must not delete the Harness totals"
         );
     }
 

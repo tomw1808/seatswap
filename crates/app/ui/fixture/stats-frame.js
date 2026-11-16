@@ -11,9 +11,9 @@ export const HOUR = 3600000;
 // the pages see this order too.
 const VIEW_ABBRS = ["PR", "LB", "AC"];
 
-// The frame's made-up answer: the first day of the fixture's weeks (2 Nov) and
+// The frame's made-up answer: the first week of the fixture's data (17 Aug) and
 // its history size in bytes (4.6 MB, one decimal).
-export const HISTORY_START = "2026-11-02T08:14:00Z";
+export const HISTORY_START = "2026-08-17T08:14:00Z";
 export const HISTORY_BYTES = 4_812_288;
 
 export function statsFrame() {
@@ -203,10 +203,77 @@ export function usedMoney(account, index) {
   return (used / 100) * weeklyPrice(account);
 }
 
-export function expiredMoney(account, index) {
+// The windows of one account week, oldest first, in the shape the history
+// writes them: a reset window ends at the lower reading and counts nothing as
+// expired; every other window's `lost` is its expired share. One made-up week
+// has a reset: LB's 2 Nov week is 62 % then 35 % from 0, 97 % in total and 65 %
+// expired (the reset window's own share is nothing). LB's 26 Oct week holds a
+// window that used nothing, so the pages must not draw a 1 px part for it while
+// its total and tooltip still count it.
+const WEEK_WINDOWS = {
+  "LB:11": [
+    {
+      used: 62,
+      start: "2026-11-02T17:00:00.000Z",
+      end: "2026-11-06T17:00:00.000Z",
+      expired: 0,
+      reset: true,
+    },
+    {
+      used: 35,
+      start: "2026-11-06T17:00:00.000Z",
+      end: "2026-11-09T17:00:00.000Z",
+      expired: 65,
+      reset: false,
+    },
+  ],
+  "LB:10": [
+    {
+      used: 94,
+      start: "2026-10-26T17:00:00.000Z",
+      end: "2026-10-30T17:00:00.000Z",
+      expired: 6,
+      reset: false,
+    },
+    {
+      used: 0,
+      start: "2026-10-30T17:00:00.000Z",
+      end: "2026-11-02T17:00:00.000Z",
+      expired: 0,
+      reset: false,
+    },
+  ],
+};
+
+export function windowsOfWeek(account, index) {
   const used = account.used[index];
-  if (used === null) return 0;
-  return ((100 - used) / 100) * weeklyPrice(account);
+  if (used === null) return [];
+  const end = resetEnd(account, index);
+  const special = WEEK_WINDOWS[`${account.abbr}:${index}`];
+  if (special !== undefined) return special;
+  return [
+    {
+      used,
+      start: new Date(Date.parse(end) - 7 * DAY).toISOString(),
+      end,
+      expired: 100 - used,
+      reset: false,
+    },
+  ];
+}
+
+export function weekExpiredPercent(account, index) {
+  return sum(windowsOfWeek(account, index).map((window) => window.expired));
+}
+
+export function weekExpiredMoney(account, index) {
+  return sum(
+    windowsOfWeek(account, index).map((window) => (window.expired / 100) * weeklyPrice(account))
+  );
+}
+
+export function expiredMoney(account, index) {
+  return weekExpiredMoney(account, index);
 }
 
 export function resetEnd(account, index) {
@@ -313,8 +380,8 @@ export function weekAccounts(index, chosen) {
       id: account.id,
       usedPercent: account.used[index],
       used: usedMoney(account, index),
-      expiredPercent: 100 - account.used[index],
-      expired: expiredMoney(account, index),
+      expiredPercent: weekExpiredPercent(account, index),
+      expired: weekExpiredMoney(account, index),
       uncertain: false,
     }));
 }
@@ -361,8 +428,8 @@ function weekMoney(week, chosen) {
   for (const account of chosen) {
     if (account.used[week] === null) continue;
     used += usedMoney(account, week);
-    expired += expiredMoney(account, week);
-    paid += weeklyPrice(account);
+    expired += weekExpiredMoney(account, week);
+    paid += weeklyPrice(account) * windowsOfWeek(account, week).length;
   }
   return { used, expired, paid };
 }

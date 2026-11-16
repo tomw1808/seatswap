@@ -12,7 +12,6 @@ import {
   SW_AUTO,
   accountOut,
   chosenAccounts,
-  expiredMoney,
   fixtureMoney,
   fixtureValues,
   fixtureWholePercent,
@@ -24,8 +23,12 @@ import {
   topProjects,
   usedMoney,
   weekAccounts,
+  weekExpiredMoney,
+  weekExpiredPercent,
   weekIso,
   weekTime,
+  weeklyPrice,
+  windowsOfWeek,
 } from "./stats-frame.js";
 
 function recentCurve(account) {
@@ -62,18 +65,6 @@ function recentCurve(account) {
     .map(([time, value]) => [new Date(time).toISOString(), value]);
 }
 
-// The windows of one account week, oldest first. One made-up week has a reset:
-// LB's 2 Nov week is 62 % then 35 % from 0, 97 % in total. LB's 26 Oct week
-// holds a window that used nothing, so the page must not draw a 1 px part for
-// it while its total and tooltip still count it.
-function partsFor(account, index) {
-  const used = account.used[index];
-  if (used === null) return [];
-  if (account.abbr === "LB" && index === 11) return [62, 35];
-  if (account.abbr === "LB" && index === 10) return [94, 0];
-  return [used];
-}
-
 export function weeks(query) {
   const { indexes, chosen } = chosenAccounts(query);
   return {
@@ -86,15 +77,16 @@ export function weeks(query) {
       id: account.id,
       plan: account.plan,
       cells: indexes.map((index) => {
-        if (account.used[index] === null) return null;
-        const used = account.used[index];
+        const windows = windowsOfWeek(account, index);
+        if (windows.length === 0) return null;
+        const used = sum(windows.map((window) => window.used));
         return {
-          end: resetEnd(account, index),
+          end: windows[windows.length - 1].end,
           used,
-          total: used,
-          parts: partsFor(account, index),
-          expired: 100 - used,
-          expiredMoney: expiredMoney(account, index),
+          parts: windows.map((window) => window.used),
+          windowEnds: windows.map((window) => window.end),
+          expired: weekExpiredPercent(account, index),
+          expiredMoney: weekExpiredMoney(account, index),
           full: used >= 100,
           uncertain: false,
         };
@@ -116,9 +108,13 @@ export function weekSummary(query, week) {
   const index = indexes.find((candidate) => weekIso(candidate) === week);
   if (index === undefined) throw new Error(`week ${JSON.stringify(week)} is not in the chosen range`);
   const accounts = weekAccounts(index, chosen);
-  const used = sum(accounts.map((account) => account.used ?? 0));
-  const expired = sum(accounts.map((account) => account.expired ?? 0));
-  const paid = used + expired;
+  const priced = chosen.filter((account) => account.used[index] !== null);
+  const used = sum(priced.map((account) => usedMoney(account, index)));
+  const expired = sum(priced.map((account) => weekExpiredMoney(account, index)));
+  // Every window the week offered offers one week's price, as Overview counts.
+  const offered = sum(
+    priced.map((account) => weeklyPrice(account) * windowsOfWeek(account, index).length)
+  );
   const switches = switchesOf([index]);
   const out = sum(chosen.map((account) => accountOut(account, index)));
   const tokens = tokenCounts(out);
@@ -141,7 +137,7 @@ export function weekSummary(query, week) {
   let closest = null;
   for (const account of chosen) {
     if (account.used[index] === null) continue;
-    const expiredPercent = 100 - account.used[index];
+    const expiredPercent = weekExpiredPercent(account, index);
     if (closest === null || expiredPercent > closest.expiredPercent) {
       closest = { account, expiredPercent };
     }
@@ -156,7 +152,7 @@ export function weekSummary(query, week) {
     } else {
       conclusion.push(
         `${fixtureWholePercent(closest.expiredPercent)} of ${closest.account.abbr}'s week expired, ${fixtureMoney(
-          expiredMoney(closest.account, index),
+          weekExpiredMoney(closest.account, index),
           "EUR"
         )}.`
       );
@@ -173,16 +169,16 @@ export function weekSummary(query, week) {
   }
   return {
     week: weekIso(index),
-    usedPercentOfPaid: paid > 0 ? (used / paid) * 100 : null,
-    used: paid > 0 ? used : null,
-    expired: paid > 0 ? expired : null,
-    moneyMissing: paid > 0 ? null : "no finished, priced weekly window in this week",
+    usedPercentOfPaid: offered > 0 ? (used / offered) * 100 : null,
+    used: offered > 0 ? used : null,
+    expired: offered > 0 ? expired : null,
+    moneyMissing: offered > 0 ? null : "no finished, priced weekly window in this week",
     blockedHours: BLOCKED[index],
     switches,
     switchesTotal:
       switches.user + switches.cli + switches.auto + switches.agent + switches.external,
     perAccountPercent: accounts.map((account) => [account.id, account.usedPercent]),
-    expiredPercentOfPaid: paid > 0 ? (expired / paid) * 100 : null,
+    expiredPercentOfPaid: offered > 0 ? (expired / offered) * 100 : null,
     topProjects: topProjects(index, used, true),
     tokens,
     values: fixtureValues(out > 0 ? (out / 1000000) * API_PER_M : null, null),
@@ -191,15 +187,14 @@ export function weekSummary(query, week) {
   };
 }
 
-function windowCurve(account, index, reachedAt) {
-  const end = Date.parse(resetEnd(account, index));
-  const start = end - 7 * DAY;
-  const used = account.used[index];
+function windowCurve(window, reachedAt) {
+  const start = Date.parse(window.start);
+  const end = Date.parse(window.end);
   const points = [];
   for (let time = start; time <= end; time += 4 * HOUR) {
     let value;
     if (reachedAt !== null && time >= reachedAt) value = 100;
-    else value = Math.min(100, used * ((time - start) / (7 * DAY)));
+    else value = Math.min(100, window.used * ((time - start) / (end - start)));
     points.push([new Date(time).toISOString(), round1(value)]);
   }
   if (reachedAt !== null) points.push([new Date(reachedAt).toISOString(), 100]);
@@ -210,18 +205,20 @@ function windowCurve(account, index, reachedAt) {
 // The mock-up's notes for the weeks its detail card shows; every other week
 // gets the note its numbers state.
 const NOTES = {
-  "LB:11": "Second week with auto-burn. 3 % expired at the reset on Monday 17:00.",
+  "LB:11": "Second week with auto-burn. 65 % expired at the reset on Monday 17:00.",
   "AC:8": "51 % expired. All work that week went to PR and LB; AC was opened on two days only.",
   "PR:5": "First week of this subscription.",
   "LB:1": "AC was full that week too: 14h with no usable account.",
 };
 
-function noteFor(account, index) {
+function noteFor(account, index, window) {
+  if (window.reset) {
+    return "The week's limit was given back before its reset, so the use before it stays counted.";
+  }
   const note = NOTES[`${account.abbr}:${index}`];
   if (note !== undefined) return note;
-  const expiredPercent = 100 - account.used[index];
-  return expiredPercent > 0
-    ? `${fixtureWholePercent(expiredPercent)} expired at its reset.`
+  return window.expired > 0
+    ? `${fixtureWholePercent(window.expired)} expired at its reset.`
     : "Nothing expired at its reset.";
 }
 
@@ -229,15 +226,25 @@ export function windowDetail(query, accountId, end) {
   const { indexes, chosen } = chosenAccounts(query);
   const account = chosen.find((candidate) => candidate.id === accountId);
   if (!account) throw new Error(`unknown account ${JSON.stringify(accountId)}`);
-  const index = indexes.find((candidate) => Date.parse(resetEnd(account, candidate)) === Date.parse(end));
-  if (index === undefined) throw new Error(`no window of ${account.abbr} ends at ${JSON.stringify(end)}`);
-  const used = account.used[index];
+  let found = null;
+  for (const index of indexes) {
+    for (const window of windowsOfWeek(account, index)) {
+      if (Date.parse(window.end) === Date.parse(end)) found = { index, window };
+    }
+  }
+  if (found === null) {
+    throw new Error(`no window of ${account.abbr} ends at ${JSON.stringify(end)}`);
+  }
+  const { index, window } = found;
+  const price = weeklyPrice(account);
+  const used = window.used;
   let reached100At = null;
-  if (used !== null && used >= 100) {
-    reached100At = new Date(weekTime(index) + 4 * DAY + 10 * HOUR).toISOString();
+  if (used >= 100) {
+    reached100At = new Date(
+      Math.min(Date.parse(window.end), Date.parse(window.start) + 4 * DAY + 10 * HOUR)
+    ).toISOString();
   }
   const switches = switchesOf([index]);
-  const windowEnd = Date.parse(resetEnd(account, index));
   // A typical week holds 24 windows; LB's 26 Oct week is the demo of a week
   // that used more windows (12) than its usual working hours hold (8).
   const possibleSessionWindows =
@@ -252,25 +259,25 @@ export function windowDetail(query, accountId, end) {
           : 0;
   return {
     id: account.id,
-    start: new Date(windowEnd - 7 * DAY).toISOString(),
-    end: resetEnd(account, index),
+    start: window.start,
+    end: window.end,
     plan: account.plan,
-    weeklyPrice: (account.price * 12) / 52,
+    weeklyPrice: price,
     used,
-    usedMoney: usedMoney(account, index),
-    expired: 100 - used,
-    expiredMoney: expiredMoney(account, index),
+    usedMoney: (used / 100) * price,
+    expired: window.expired,
+    expiredMoney: (window.expired / 100) * price,
     reached100At,
     blockedHoursAfter: reached100At !== null ? BLOCKED[index] : 0,
     sessionWindowsUsed,
     possibleSessionWindows,
     usedMoreThanPossible:
       possibleSessionWindows !== null && sessionWindowsUsed > possibleSessionWindows,
-    note: noteFor(account, index),
+    note: noteFor(account, index, window),
     switchesInOut: switches.user + switches.cli + switches.auto + switches.agent + switches.external,
     switchesAuto: switches.auto,
     lastSampleBeforeEndSecs: 120,
     uncertain: false,
-    curve: windowCurve(account, index, reached100At === null ? null : Date.parse(reached100At)),
+    curve: windowCurve(window, reached100At === null ? null : Date.parse(reached100At)),
   };
 }

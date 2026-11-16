@@ -654,7 +654,7 @@ fn host_lanes<Tz: TimeZone + Copy>(
                 by_model,
                 sessions: sessions.len() as u32,
                 top_project: most_output(&by_project).map(|key| ctx.projects.of(&key).name),
-                values: Values::of(&valued, ctx.settings),
+                values: Values::of(&valued, ctx.settings, ctx.fx, ctx.now),
             });
         }
 
@@ -673,7 +673,7 @@ fn host_lanes<Tz: TimeZone + Copy>(
             off,
             unknown,
             tokens,
-            values: Values::of(&valued, ctx.settings),
+            values: Values::of(&valued, ctx.settings, ctx.fx, ctx.now),
         });
     }
     lanes
@@ -777,7 +777,7 @@ fn activity_weeks<Tz: TimeZone + Copy>(
             week,
             working_hours,
             tokens,
-            values: Values::of(&valued, ctx.settings),
+            values: Values::of(&valued, ctx.settings, ctx.fx, ctx.now),
             sessions: sessions.len() as u32,
             top,
             running: week == week_start(ctx.now, &ctx.zone),
@@ -851,7 +851,7 @@ fn largest_sessions<Tz: TimeZone + Copy>(
                 model: most_output(&sum.by_model),
                 worked_hours: sum.hours.len() as u32,
                 tokens: sum.tokens,
-                values: Values::of(&sum.valued, ctx.settings),
+                values: Values::of(&sum.valued, ctx.settings, ctx.fx, ctx.now),
                 agents: agents_started,
             }
         })

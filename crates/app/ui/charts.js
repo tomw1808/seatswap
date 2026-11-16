@@ -549,7 +549,6 @@ export function grid({ rows, headers } = {}) {
       }
       const classes = ["chart-cell"];
       if (!finite(cell.fill)) classes.push("chart-cell-plain");
-      if (cell.hatch) classes.push("chart-cell-hatch");
       if (cell.full) classes.push("chart-cell-full");
       if (cell.uncertain) classes.push("chart-cell-uncertain");
       if (cell.current) classes.push("chart-cell-current");
@@ -577,16 +576,24 @@ export function grid({ rows, headers } = {}) {
           class: "chart-cell-bar",
           style: { height: `${total}%` },
         });
-        for (const part of parts) {
+        const partClick =
+          typeof cell.partClick === "function" && parts.length > 1 ? cell.partClick : null;
+        for (const [index, part] of parts.entries()) {
           // A 0 % window used nothing: do not draw a 1 px part for it. The
           // cell's total and tooltip still count it.
           if (part === 0) continue;
-          bar.appendChild(
-            h("div", {
-              class: "chart-cell-part",
-              style: { height: `${total === 0 ? 0 : (part / total) * 100}%` },
-            })
-          );
+          const partNode = h("div", {
+            class: "chart-cell-part",
+            style: { height: `${total === 0 ? 0 : (part / total) * 100}%` },
+          });
+          if (partClick !== null) {
+            // A click on one part opens that window, not the cell's last one.
+            clickable(partNode, (event) => {
+              event.stopPropagation();
+              partClick(index);
+            });
+          }
+          bar.appendChild(partNode);
         }
         node.appendChild(bar);
         // The 100 % line stays at the top of the cell; the bar may pass it.
@@ -599,6 +606,25 @@ export function grid({ rows, headers } = {}) {
           })
         );
         if (over) node.appendChild(h("div", { class: "chart-cell-limit" }));
+      }
+      if (cell.expired !== undefined && cell.expired !== null) {
+        if (!finite(cell.expired)) {
+          throw new Error(`a cell's expired share must be a finite percent, not ${JSON.stringify(cell.expired)}`);
+        }
+        if (cell.expired < 0) {
+          throw new Error(`a cell's expired share must be 0 or more, not ${JSON.stringify(cell.expired)}`);
+        }
+        if (cell.expired > 0) {
+          // The hatched part is the share that expired, from the cell's top
+          // down (charts.css stops the band at the cell's height; the tooltip
+          // gives a share above 100 %).
+          node.appendChild(
+            h("div", {
+              class: "chart-cell-hatch",
+              style: { height: `${cell.expired}%` },
+            })
+          );
+        }
       }
       if (cell.text !== undefined && cell.text !== null && cell.text !== "") {
         node.appendChild(h("span", { class: "chart-cell-text", text: String(cell.text) }));

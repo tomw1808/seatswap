@@ -23,7 +23,7 @@ use notify_rust::NotificationResponse;
 use notify_rust::Timeout;
 
 use seatswap_core::engine::{all_blocked, AccountView, Blocker, LoginWarning};
-use seatswap_core::history::RESET_DROP_POINTS;
+use seatswap_core::history::is_early_reset;
 use seatswap_core::store::{LoginState, Settings, WaitingHosts};
 use seatswap_core::switcher::UnsavedPolicy;
 
@@ -260,7 +260,7 @@ impl Deduper {
             let Some(reset) = previous.blocked_until else {
                 continue;
             };
-            let early = reset > now && is_reset_drop(previous.blocker_percent, view, blocker);
+            let early = is_reset_drop(previous.blocker_percent, view, blocker, reset, now);
             if reset > now && !early {
                 continue;
             }
@@ -362,15 +362,23 @@ fn blocker_percent(view: &AccountView, blocker: &Blocker) -> Option<f64> {
     blocker.limit_in(usage).map(|limit| limit.percent)
 }
 
-/// Whether `view`'s limit that `blocker` names is at least
-/// [`RESET_DROP_POINTS`] below `previous_percent`: a reset before the reset
-/// time (decision 12, the history's rule).
-fn is_reset_drop(previous_percent: Option<f64>, view: &AccountView, blocker: &Blocker) -> bool {
-    let Some(previous_percent) = previous_percent else {
+/// Whether `view`'s limit that `blocker` names was reset early at `now`:
+/// [`is_early_reset`]'s one rule (decision 12), the history's. A drop in the
+/// last [`RESET_JITTER`](seatswap_core::history::RESET_JITTER) before the reset time is not early: the block ends at
+/// its reset time a moment later, as any block does.
+fn is_reset_drop(
+    previous_percent: Option<f64>,
+    view: &AccountView,
+    blocker: &Blocker,
+    reset: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> bool {
+    let (Some(previous_percent), Some(current)) =
+        (previous_percent, blocker_percent(view, blocker))
+    else {
         return false;
     };
-    blocker_percent(view, blocker)
-        .is_some_and(|current| previous_percent - current >= RESET_DROP_POINTS)
+    is_early_reset(previous_percent, current, Some(reset), now)
 }
 
 /// The limit a [`Blocker`] names, worded as "usable again" uses it.
@@ -482,18 +490,18 @@ pub(crate) fn send_error(paths: &AppPaths, message: &str) {
     });
 }
 
-pub(crate) fn send_login_warning(paths: &AppPaths, warning: &LoginWarning, account: &str) {
-    let body = match warning {
-        LoginWarning::Soon { days_left, .. } => format!(
-            "{account} — the login ends in {days_left} days. Run `claude` and `/login` to renew it."
-        ),
-        LoginWarning::Tomorrow { .. } => {
-            format!("{account} — the login ends tomorrow. Run `claude` and `/login` to renew it.")
-        }
-        LoginWarning::Ended { .. } => {
-            format!("{account} — the login has ended. Run `claude` and `/login` to renew it.")
-        }
+/// The body of a login warning's notification.
+fn login_warning_text(account: &str, warning: &LoginWarning) -> String {
+    let ends = match warning {
+        LoginWarning::Soon { days_left, .. } => crate::format::login_ends_text(*days_left),
+        LoginWarning::Tomorrow { .. } => "login ends tomorrow".to_string(),
+        LoginWarning::Ended { .. } => "login has ended".to_string(),
     };
+    format!("{account} — the {ends}. Run `claude` and `/login` to renew it.")
+}
+
+pub(crate) fn send_login_warning(paths: &AppPaths, warning: &LoginWarning, account: &str) {
+    let body = login_warning_text(account, warning);
     let paths = paths.clone();
     notify_in_background(move || {
         let _ = base(&paths).body(&body).show();
@@ -1146,6 +1154,28 @@ mod tests {
         };
         let other = snapshot(None, vec![other], LiveView::NoLogin);
         assert_eq!(deduper.due(&other, now).len(), 1);
+    }
+
+    #[test]
+    fn a_login_warning_speaks_days_as_the_cli_does() {
+        // The 5-day warning: `ends in 5d`, not "5 days". The 1-day warning is
+        // `Tomorrow`, which carries no day count and keeps its word.
+        let soon = LoginWarning::Soon {
+            id: "lb".to_string(),
+            days_left: 5,
+        };
+        assert_eq!(
+            login_warning_text("LB", &soon),
+            "LB — the login ends in 5d. Run `claude` and `/login` to renew it."
+        );
+
+        let tomorrow = LoginWarning::Tomorrow {
+            id: "ac".to_string(),
+        };
+        assert_eq!(
+            login_warning_text("AC", &tomorrow),
+            "AC — the login ends tomorrow. Run `claude` and `/login` to renew it."
+        );
     }
 
     #[test]

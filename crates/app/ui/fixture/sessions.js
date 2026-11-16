@@ -143,6 +143,17 @@ function fixtureWantsAgents400() {
   }
 }
 
+// `?fixture=noprovider` takes the provider away from the session with the flash
+// job, so the page's "a missing provider is an error on the row" can be seen.
+function fixtureWantsNoProvider() {
+  if (typeof location === "undefined" || typeof URLSearchParams !== "function") return false;
+  try {
+    return new URLSearchParams(location.search).get("fixture") === "noprovider";
+  } catch {
+    return false;
+  }
+}
+
 // `?fixture=longorg` makes the in-use account's organization name 40
 // characters long, so the "In use" KPI shows that it wraps inside its box.
 function fixtureWantsLongOrg() {
@@ -424,7 +435,7 @@ function fixtureSessionRows() {
     agentsDone: done,
     agents,
     tokens: fixtureTokenCounts(million),
-    lastHour: fixtureTokenCounts(lastHour),
+    lastHour: options.lastHourMissing ? null : fixtureTokenCounts(lastHour),
     values: fixtureSessionValues(million, options.currency || "EUR"),
     lastHourValues: options.lastHourMissing
       ? fixtureMissingValues(options.lastHourMissing)
@@ -452,7 +463,7 @@ function fixtureSessionRows() {
     make("dsh-b7", "atlas", "atlas", "busy", DEEPSEEK_MODEL, isoIn(-11 * 60000), 0.7, 0.6, 2, 1, harnessAgents, {
       provider: "DeepSeek Harness",
     }),
-    make("notes-62", "notes", "atlas", "busy", "claude-fable-5-2", isoIn(-9 * 60000), 1.8, 0.5, 3, 0, flashAgents),
+    make("notes-62", "notes", "atlas", "busy", "claude-fable-5-2", isoIn(-20 * 1000), 1.8, 0.5, 3, 0, flashAgents),
     make("notes-47", "notes", "atlas", "busy", "claude-fable-5-2", isoIn(-6 * 60000), 5.3, 1.2, 0, 2, s47Agents, { tied: true }),
     make("notes-b9", "notes", "atlas", "idle", null, isoIn(-19 * 3600000), 0, 0, 0, 0, []),
   ];
@@ -508,6 +519,7 @@ function fixtureSums(rows) {
         agentsDone: 0,
         tokens: fixtureTokenCounts(0),
         lastHour: fixtureTokenCounts(0),
+        lastHourUnknown: false,
         rows: [],
       });
     }
@@ -529,7 +541,8 @@ function fixtureSums(rows) {
       found.agentsRunning += row.agentsRunning;
       found.agentsDone += row.agentsDone;
       found.tokens = fixtureAddTokens(found.tokens, row.tokens);
-      found.lastHour = fixtureAddTokens(found.lastHour, row.lastHour);
+      if (row.lastHour === null) found.lastHourUnknown = true;
+      else found.lastHour = fixtureAddTokens(found.lastHour, row.lastHour);
       found.rows.push(row);
     }
   }
@@ -539,7 +552,7 @@ function fixtureSums(rows) {
     agentsRunning: found.agentsRunning,
     agentsDone: found.agentsDone,
     tokens: found.tokens,
-    lastHour: found.lastHour,
+    lastHour: found.lastHourUnknown ? null : found.lastHour,
     values: fixtureSumValues(found.rows, "values", found.tokens.out / 1000000, fixtureSessionValues),
     lastHourValues: fixtureSumValues(
       found.rows,
@@ -561,6 +574,11 @@ export function fixtureSessionsView(args) {
   const now = Date.now();
   const days = closed === "day" ? 1 : closed === "week" ? 7 : closed === "month" ? 30 : 0;
   let rows = fixtureSessionRows();
+  if (fixtureWantsNoProvider()) {
+    const row = rows.find((candidate) => candidate.session === "notes-62");
+    if (!row) throw new Error("the no-provider fixture row is missing");
+    row.provider = null;
+  }
   if (closed === "none") {
     rows = rows.filter((row) => row.status !== "closed");
   } else {

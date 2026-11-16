@@ -6,7 +6,9 @@ use std::collections::HashMap;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 
 use crate::api::LimitKind;
-use crate::history::{same_reset, AccountRef, Event, EventKind, Hosted, Sample, TokenRecord};
+use crate::history::{
+    is_early_reset, same_reset, AccountRef, Event, EventKind, Hosted, Sample, TokenRecord,
+};
 
 use crate::stats::{local_hour_of_week, local_hour_start};
 
@@ -153,7 +155,9 @@ struct Pair {
 /// The pairs of the account's samples of every host in the last [`RATES_DAYS`]
 /// days, sorted by time: consecutive, at most 6 h apart, the same weekly reset
 /// ([`same_reset`]). A pair whose earlier sample is already at 100 % cannot rise
-/// and is left out. A pair whose percent goes down stays in, so the sum of the
+/// and is left out. A pair whose weekly percent fell by the reset rule
+/// ([`is_early_reset`]) is a reset and is left out too, as a changed reset time
+/// already is. A pair that goes down by less stays in, so the sum of the
 /// differences is the last percent minus the first.
 fn pairs(account: &AccountRef, samples: &[Hosted<Sample>], now: DateTime<Utc>) -> Vec<Pair> {
     let from = now - Duration::days(RATES_DAYS);
@@ -185,7 +189,15 @@ fn pairs(account: &AccountRef, samples: &[Hosted<Sample>], now: DateTime<Utc>) -
         let (Some(reset_before), Some(reset_after)) = (week_before.r, week_after.r) else {
             continue;
         };
-        if !same_reset(reset_before, reset_after) || week_before.p >= 100.0 {
+        if !same_reset(reset_before, reset_after)
+            || week_before.p >= 100.0
+            || is_early_reset(
+                week_before.p,
+                week_after.p,
+                Some(reset_before),
+                after.record.t,
+            )
+        {
             continue;
         }
         pairs.push(Pair {
@@ -200,12 +212,16 @@ fn pairs(account: &AccountRef, samples: &[Hosted<Sample>], now: DateTime<Utc>) -
 
 /// The session percent a pair gained, when both samples carry a session limit in
 /// one 5 h window (the same reset, [`same_reset`]) and the earlier one is below
-/// 100 %; otherwise no session pair.
+/// 100 %; otherwise no session pair. A session that fell by the reset rule
+/// ([`is_early_reset`]) was reset early and gives no session gain either.
 fn session_gain(before: &Sample, after: &Sample) -> Option<f64> {
     let limit_before = before.limit(&LimitKind::Session)?;
     let limit_after = after.limit(&LimitKind::Session)?;
     let (reset_before, reset_after) = (limit_before.r?, limit_after.r?);
-    if !same_reset(reset_before, reset_after) || limit_before.p >= 100.0 {
+    if !same_reset(reset_before, reset_after)
+        || limit_before.p >= 100.0
+        || is_early_reset(limit_before.p, limit_after.p, Some(reset_before), after.t)
+    {
         return None;
     }
     Some(limit_after.p - limit_before.p)
@@ -660,6 +676,91 @@ mod tests {
         )
         .expect("the valid pair carries 25 wu");
         assert!((rates.c - 0.32).abs() < EPS, "c = {}", rates.c);
+    }
+
+    #[test]
+    fn a_reset_that_keeps_its_reset_time_is_left_out_of_the_rates() {
+        // The review's case: 40 → 48 → 0 at 09:00, 13:00 and 15:00 with the
+        // same reset time. The 13:00 → 15:00 pair is an early reset, not -48
+        // points of usage; keeping it would make c (8 - 48) / 50 = -0.8 and
+        // `rates` None. The rising pair's 25 wu gives c = 8 / 25 = 0.32.
+        let samples = vec![
+            sample(
+                "atlas",
+                "2026-11-14T09:00:00Z",
+                ac(),
+                vec![weekly(40.0, WEEK_RESET)],
+            ),
+            sample(
+                "atlas",
+                "2026-11-14T13:00:00Z",
+                ac(),
+                vec![weekly(48.0, WEEK_RESET)],
+            ),
+            sample(
+                "atlas",
+                "2026-11-14T15:00:00Z",
+                ac(),
+                vec![weekly(0.0, WEEK_RESET)],
+            ),
+        ];
+        let tokens = vec![
+            token("atlas", "2026-11-14T10:00:00Z", 25_000_000),
+            token("atlas", "2026-11-14T14:00:00Z", 25_000_000),
+        ];
+        let events = vec![live("atlas", "2026-11-14T08:00:00Z", Some(ac()))];
+
+        let rates = rates(
+            &ac(),
+            &samples,
+            &tokens,
+            &events,
+            utc("2026-11-14T18:00:00Z"),
+        )
+        .expect("the rising pair carries 25 wu");
+        assert!((rates.c - 0.32).abs() < EPS, "c = {}", rates.c);
+    }
+
+    #[test]
+    fn a_model_reset_that_keeps_its_reset_time_is_left_out() {
+        // A model reset takes the week from 70 % to 45 % with the reset time
+        // unchanged. The pair is a reset: with it c would be (30 - 25) / 50 =
+        // 0.1; without it the rising pair's 30 points over 25 wu give 1.2.
+        let samples = vec![
+            sample(
+                "atlas",
+                "2026-11-14T09:00:00Z",
+                ac(),
+                vec![weekly(40.0, WEEK_RESET)],
+            ),
+            sample(
+                "atlas",
+                "2026-11-14T13:00:00Z",
+                ac(),
+                vec![weekly(70.0, WEEK_RESET)],
+            ),
+            sample(
+                "atlas",
+                "2026-11-14T15:00:00Z",
+                ac(),
+                vec![weekly(45.0, WEEK_RESET)],
+            ),
+        ];
+        let tokens = vec![
+            token("atlas", "2026-11-14T10:00:00Z", 25_000_000),
+            token("atlas", "2026-11-14T14:00:00Z", 25_000_000),
+        ];
+        let events = vec![live("atlas", "2026-11-14T08:00:00Z", Some(ac()))];
+
+        let rates = rates(
+            &ac(),
+            &samples,
+            &tokens,
+            &events,
+            utc("2026-11-14T18:00:00Z"),
+        )
+        .expect("the rising pair carries 25 wu");
+        assert!((rates.c - 1.2).abs() < EPS, "c = {}", rates.c);
     }
 
     #[test]

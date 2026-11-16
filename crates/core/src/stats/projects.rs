@@ -91,7 +91,7 @@ pub struct ProjectsPage {
 pub struct UsdRate {
     /// Units of [`UsdRate::currency`] per 1 USD, rounded to four decimals.
     pub value: f64,
-    /// The day the looked-up rate is from; `None` for a rate entered by hand.
+    /// The day the looked-up rate is from.
     pub date: Option<NaiveDate>,
     /// The currency the rate converts into: the settings' currency the rate is
     /// for. The page writes this one, never another view's currency.
@@ -194,7 +194,7 @@ pub(crate) fn projects_page_in<Tz: TimeZone + Copy>(
         if !account_chosen(ctx, q, value.account.as_ref()) {
             continue;
         }
-        let values = Values::of(std::slice::from_ref(&value), ctx.settings);
+        let values = Values::of(std::slice::from_ref(&value), ctx.settings, ctx.fx, ctx.now);
         let project = ctx
             .projects
             .of(&ProjectId::of(&hosted.record.project, &hosted.host));
@@ -499,27 +499,32 @@ fn round_rate(value: f64) -> f64 {
     (value * 10_000.0).round() / 10_000.0
 }
 
-/// Whether the rate of the range's days is not one value all along. It asks the
-/// same `usd_rate` source the valuer asks: a looked-up rate changes when the
-/// range's days do not all fall on the same `fx` point. Days are `range.from` ..
-/// `range.to` (the range's end is exclusive), so a point on the end's midnight is
-/// not in the range.
+/// Whether the rate of the range's days is not one value all along. Every day
+/// asks [`crate::money::usd_rate`] — the same source the valuer asks — so a
+/// looked-up rate changes when the days do not all use the same `fx` point.
+/// Days are `range.from` .. `range.to` (the range's end is exclusive), so a
+/// point on the end's midnight is not in the range.
 fn rate_varies(settings: &Settings, fx: &Fx, range: &Range) -> bool {
-    let Some(currency) = settings.currency.as_deref() else {
-        return false;
-    };
-    if fx.currency != currency {
-        return false;
-    }
     let from = range.from.date_naive();
     let to = last_day(range);
-    let Some(first) = fx.at(from) else {
+    let Some(first) = usd_rate(settings, fx, from) else {
         return false;
     };
-    fx.points
-        .iter()
-        .filter(|point| point.date > from && point.date <= to)
-        .any(|point| point.rate != first)
+    let mut day = from;
+    loop {
+        match usd_rate(settings, fx, day) {
+            Some(rate) if rate.value != first.value => return true,
+            Some(_) => {}
+            None => return false,
+        }
+        if day >= to {
+            return false;
+        }
+        let Some(next) = day.succ_opt() else {
+            return false;
+        };
+        day = next;
+    }
 }
 
 /// The last calendar day a record of `range` can have: `to` itself, or the day
@@ -621,7 +626,7 @@ pub(crate) fn project_detail_in<Tz: TimeZone + Copy>(
         if !account_chosen(ctx, q, value.account.as_ref()) {
             continue;
         }
-        let values = Values::of(std::slice::from_ref(&value), ctx.settings);
+        let values = Values::of(std::slice::from_ref(&value), ctx.settings, ctx.fx, ctx.now);
         add_opt_value(&mut page_values, &values);
         if !in_project(&hosted) {
             continue;
@@ -2019,6 +2024,25 @@ mod tests {
 
         let json = serde_json::to_value(&page).expect("the page's JSON shape");
         assert_eq!(json["usdRate"]["varies"], true);
+    }
+
+    /// With look-ups off the page has no rate at all, so `rate_varies` asks the
+    /// one `usd_rate` source (which answers `None`) instead of reading the stored
+    /// points itself.
+    #[test]
+    fn a_rate_is_not_read_when_look_ups_are_off() {
+        let mut tiny = tiny();
+        tiny.fx.take(
+            NaiveDate::from_ymd_opt(2026, 11, 5).expect("the first rate's date"),
+            0.9000,
+        );
+        tiny.fx.take(
+            NaiveDate::from_ymd_opt(2026, 11, 10).expect("the second rate's date"),
+            0.9500,
+        );
+        tiny.settings.look_up_prices = false;
+
+        assert!(!rate_varies(&tiny.settings, &tiny.fx, &two_weeks()));
     }
 
     /// A range inside one stored rate uses that one rate all along.

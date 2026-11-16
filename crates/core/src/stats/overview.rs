@@ -19,9 +19,10 @@ use crate::projects::ProjectId;
 
 use super::{
     account_abbr, account_id, account_position, account_weeks_valued, accounts_without_price,
-    blocked_by_week, blocked_spans, date_text, hours_text, keep_warnings, lost_percent, money_of,
-    money_text, percent_text, range_of, switch_counts, top_three, week_columns, week_of_record,
-    week_span, week_start, working_rhythm, AccountWeek, Ctx, Query, StatsError, SwitchCounts,
+    blocked_by_week, blocked_spans, date_text, hours_text, keep_warnings, money_of, money_text,
+    offered_money, percent_of_offered, percent_text, range_of, switch_counts, top_three,
+    week_columns, week_lost_percent, week_of_record, week_span, week_start, working_rhythm,
+    AccountWeek, Ctx, Query, StatsError, SwitchCounts,
 };
 
 /// The Overview page's numbers for one range (spec §3.1).
@@ -58,8 +59,8 @@ pub struct Kpis {
     /// whole use, so the two shares can then pass 100 % together (nothing is
     /// cut). `None` when no account week has a price.
     pub used_percent: Option<f64>,
-    /// The expired part of the offered weeks, in percent: each week's last
-    /// window's `lost` over the same offered windows. `None` without a price.
+    /// The expired part of the offered weeks, in percent: every window's
+    /// `lost`, over the same offered windows. `None` without a price.
     pub expired_percent: Option<f64>,
     /// The expired money per account id, largest first.
     pub expired_by_account: Vec<(String, f64)>,
@@ -193,12 +194,12 @@ pub(crate) fn overview_in<Tz: TimeZone + Copy>(
     let mut money: BTreeMap<DateTime<Utc>, WindowMoney> = BTreeMap::new();
     let mut offered_by_week: BTreeMap<DateTime<Utc>, f64> = BTreeMap::new();
     for week in &finished {
-        let week_money = money_of(week);
+        let week_money = money_of(week)?;
         if let Some(week_money) = week_money {
             used += week_money.used;
             paid += week_money.paid;
             expired += week_money.expired;
-            let week_offered = week_money.paid * week.windows.len() as f64;
+            let week_offered = offered_money(week, &week_money);
             offered += week_offered;
             *offered_by_week.entry(week.week).or_insert(0.0) += week_offered;
             used_part += week_money.used;
@@ -224,7 +225,7 @@ pub(crate) fn overview_in<Tz: TimeZone + Copy>(
                 id: account_id(ctx, &week.account),
                 used_percent: week.used,
                 used: week_money.map(|money| money.used),
-                expired_percent: lost_percent(&week.window)?,
+                expired_percent: week_lost_percent(week)?,
                 expired: week_money.map(|money| money.expired),
                 uncertain: week.window.uncertain,
             });
@@ -238,8 +239,8 @@ pub(crate) fn overview_in<Tz: TimeZone + Copy>(
         used,
         paid,
         expired,
-        used_percent: (offered > 0.0).then_some(used_part / offered * 100.0),
-        expired_percent: (offered > 0.0).then_some(expired_part / offered * 100.0),
+        used_percent: percent_of_offered(used_part, offered),
+        expired_percent: percent_of_offered(expired_part, offered),
         expired_by_account: expired_by_account
             .into_iter()
             .map(|(reference, expired)| (account_id(ctx, &reference), expired))
@@ -276,9 +277,7 @@ pub(crate) fn overview_in<Tz: TimeZone + Copy>(
 
     for (start, week) in weeks_by_start.iter_mut() {
         if let (Some(week_money), Some(offered)) = (money.get(start), offered_by_week.get(start)) {
-            if *offered > 0.0 {
-                week.expired_share = Some(week_money.expired / offered * 100.0);
-            }
+            week.expired_share = percent_of_offered(week_money.expired, *offered);
         }
     }
 
@@ -344,7 +343,14 @@ pub(crate) fn overview_in<Tz: TimeZone + Copy>(
     if let Some(text) = finding_blocked(&kpis, &weeks) {
         findings.push(text);
     }
-    if let Some(text) = finding_auto_burn(ctx, range, &events.records, &weeks, &money) {
+    if let Some(text) = finding_auto_burn(
+        ctx,
+        range,
+        &events.records,
+        &weeks,
+        &money,
+        &offered_by_week,
+    ) {
         findings.push(text);
     }
     if let Some(text) = finding_full(ctx, &finished) {
@@ -528,6 +534,7 @@ fn finding_auto_burn<Tz: TimeZone + Copy>(
     events: &[Hosted<Event>],
     weeks: &[OverviewWeek],
     money: &BTreeMap<DateTime<Utc>, WindowMoney>,
+    offered_by_week: &BTreeMap<DateTime<Utc>, f64>,
 ) -> Option<String> {
     let at = auto_burn_start(range, events)?;
     let before: Vec<&OverviewWeek> = weeks
@@ -539,8 +546,8 @@ fn finding_auto_burn<Tz: TimeZone + Copy>(
         })
         .collect();
     let after: Vec<&OverviewWeek> = weeks.iter().filter(|week| week.week >= at).collect();
-    let (blocked_before, expired_before) = week_averages(&before, money)?;
-    let (blocked_after, expired_after) = week_averages(&after, money)?;
+    let (blocked_before, expired_before) = week_averages(&before, money, offered_by_week)?;
+    let (blocked_after, expired_after) = week_averages(&after, money, offered_by_week)?;
     Some(format!(
         "Since auto-burn ({}): {} blocked a week, {} expired. Before: {}, {}.",
         date_text(at, &ctx.zone),
@@ -578,28 +585,32 @@ fn auto_burn_start(range: &Range, events: &[Hosted<Event>]) -> Option<DateTime<U
 }
 
 /// The blocked hours a week and the expired share of some weeks; `None` when a
-/// week list is empty or none of its weeks has a price.
+/// week list is empty or none of its weeks has a price. The share divides by the
+/// windows the weeks offered, as the page's KPI does.
 fn week_averages(
     weeks: &[&OverviewWeek],
     money: &BTreeMap<DateTime<Utc>, WindowMoney>,
+    offered_by_week: &BTreeMap<DateTime<Utc>, f64>,
 ) -> Option<(f64, f64)> {
     if weeks.is_empty() {
         return None;
     }
     let mut blocked = 0.0;
-    let mut paid = 0.0;
+    let mut offered = 0.0;
     let mut expired = 0.0;
     for week in weeks {
         blocked += week.blocked_hours;
         if let Some(week_money) = money.get(&week.week) {
-            paid += week_money.paid;
             expired += week_money.expired;
         }
+        if let Some(value) = offered_by_week.get(&week.week) {
+            offered += value;
+        }
     }
-    if paid <= 0.0 {
+    if offered <= 0.0 {
         return None;
     }
-    Some((blocked / weeks.len() as f64, expired / paid * 100.0))
+    Some((blocked / weeks.len() as f64, expired / offered * 100.0))
 }
 
 /// 4. The account with the most full weeks.
@@ -1110,6 +1121,7 @@ mod tests {
     /// part (the reset gave that quota back). The page's percentages count each
     /// offered window (see `the_overview_percentages_are_shares_of_the_offered_weeks`),
     /// so this week is 46 % used and 35 % expired of the two weeks it offered.
+    /// Every window's `lost` counts; the reset window has none.
     #[test]
     fn used_counts_every_window_of_a_week_with_a_reset() {
         let tiny = tiny();
@@ -1160,7 +1172,10 @@ mod tests {
             .find(|account| account.id == tiny.lb().id)
             .expect("LB's week");
         assert_eq!(lb.used_percent, 92.0, "62 % then 30 % from 0");
-        assert_eq!(lb.expired_percent, 70.0, "only the last window's lost");
+        assert_eq!(
+            lb.expired_percent, 70.0,
+            "every window's lost; the reset window has none"
+        );
         let weekly = tiny.lb().price.expect("LB's price") * 12.0 / 52.0;
         assert!(
             close(lb.used.expect("LB's price"), 0.92 * weekly),
@@ -1197,7 +1212,7 @@ mod tests {
     /// Used and Expired are shares of the offered weeks. Every finished weekly
     /// window offers one week of its account's price; a week that a reset split
     /// offers each of its windows. Used is the weeks' use (Σ final − from),
-    /// expired is each week's last window's lost, and the rest is still open, so
+    /// expired is every window's lost, and the rest is still open, so
     /// used + expired + still open make 100 % of the windows counted. With one
     /// window per week this is the mock-up's `used / paid` and `expired / paid`.
     #[test]

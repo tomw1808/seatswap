@@ -50,30 +50,34 @@ pub struct HarnessPaths {
 
 impl HarnessPaths {
     /// Resolve from the real environment. Only the app calls this; tests build
-    /// their own folders with [`HarnessPaths::at`].
+    /// their own folders with [`HarnessPaths::at`] or pass the variables to
+    /// [`HarnessPaths::resolve_with`].
     pub fn resolve() -> Result<HarnessPaths, PathsError> {
         let home = dirs::home_dir().ok_or(PathsError::NoHome)?;
-        let dsh = env_folder("DSH_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".dsh"));
-        let state = env_folder("XDG_STATE_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".local").join("state"));
-        Ok(HarnessPaths {
-            sessions: dsh.join("sessions"),
-            reports: state.join("flash-agents"),
-        })
+        Self::resolve_with(
+            std::env::var_os("DSH_HOME"),
+            std::env::var_os("XDG_STATE_HOME"),
+            &home,
+        )
+    }
+
+    /// Same as [`resolve`](Self::resolve) without reading the process
+    /// environment (for tests). The folder rules live in
+    /// [`crate::paths::harness_folders`], beside Codex's resolver.
+    pub fn resolve_with(
+        env_dsh_home: Option<OsString>,
+        env_xdg_state_home: Option<OsString>,
+        home: &Path,
+    ) -> Result<HarnessPaths, PathsError> {
+        let (sessions, reports) =
+            crate::paths::harness_folders(env_dsh_home, env_xdg_state_home, home)?;
+        Ok(HarnessPaths { sessions, reports })
     }
 
     /// The folders of a test, never read from the environment.
     pub fn at(sessions: PathBuf, reports: PathBuf) -> HarnessPaths {
         HarnessPaths { sessions, reports }
     }
-}
-
-/// A non-empty environment folder, if the variable is set.
-fn env_folder(name: &str) -> Option<OsString> {
-    std::env::var_os(name).filter(|value| !value.is_empty())
 }
 
 /// One Harness session, as its file gives it.
@@ -137,6 +141,25 @@ pub struct HarnessLinks {
     pub warnings: Vec<String>,
 }
 
+/// Whether a directory entry is a folder. A type that cannot be read is a
+/// warning naming the entry and the error, never silently "not a folder".
+fn entry_is_dir(
+    file_type: io::Result<fs::FileType>,
+    path: &Path,
+    warnings: &mut Vec<String>,
+) -> bool {
+    match file_type {
+        Ok(kind) => kind.is_dir(),
+        Err(source) => {
+            warnings.push(format!(
+                "{}: the file type cannot be read: {source}",
+                path.display()
+            ));
+            false
+        }
+    }
+}
+
 /// Every Harness session whose file was written at or after `since`. A store
 /// that does not exist is no session and no warning. A file still being written
 /// ends mid-frame: the bytes decoded so far are used up to their last whole
@@ -161,7 +184,7 @@ pub fn sessions(paths: &HarnessPaths, since: DateTime<Utc>) -> HarnessRead {
                 continue;
             }
         };
-        if !key.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+        if !entry_is_dir(key.file_type(), &key.path(), &mut read.warnings) {
             continue;
         }
         let entries = match fs::read_dir(key.path()) {
@@ -181,7 +204,7 @@ pub fn sessions(paths: &HarnessPaths, since: DateTime<Utc>) -> HarnessRead {
                     continue;
                 }
             };
-            if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            if !entry_is_dir(entry.file_type(), &entry.path(), &mut read.warnings) {
                 continue;
             }
             let file = entry.path().join(SESSION_FILE);
@@ -525,7 +548,7 @@ fn report_session(paths: &HarnessPaths, job: &str, warnings: &mut Vec<String>) -
                 continue;
             }
         };
-        if !key.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+        if !entry_is_dir(key.file_type(), &key.path(), warnings) {
             continue;
         }
         let path = key
@@ -563,32 +586,31 @@ fn report_session(paths: &HarnessPaths, job: &str, warnings: &mut Vec<String>) -
     None
 }
 
-/// The processes a [`running_owners`] walk can read. The app uses [`RealProc`];
-/// a test builds its own table.
+/// The processes a [`proc_links`] walk can read. The app uses [`RealProc`]; a
+/// test builds its own table.
 pub trait ProcSource {
-    /// Every pid the system lists.
-    fn pids(&self) -> Vec<u32>;
-    /// The files `pid` holds open.
-    fn open_files(&self, pid: u32) -> Vec<PathBuf>;
+    /// Every pid the system lists, or why the table cannot be read.
+    fn pids(&self) -> io::Result<Vec<u32>>;
+    /// The files `pid` holds open, or why its list cannot be read.
+    fn open_files(&self, pid: u32) -> io::Result<Vec<PathBuf>>;
     /// The pid's parent, when the system says.
     fn parent(&self, pid: u32) -> Option<u32>;
 }
 
 /// The real `/proc` on Linux; elsewhere it has no processes to walk, and
-/// [`running_owners`] returns no link (the documented rule: on Windows a
-/// running job appears once its result is collected in a transcript).
+/// [`proc_links`] returns no link (the documented rule: on Windows a running
+/// job appears once its result is collected in a transcript).
 #[cfg(target_os = "linux")]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RealProc;
 
 #[cfg(target_os = "linux")]
 impl ProcSource for RealProc {
-    fn pids(&self) -> Vec<u32> {
-        let Ok(entries) = fs::read_dir("/proc") else {
-            return Vec::new();
-        };
+    fn pids(&self) -> io::Result<Vec<u32>> {
+        let entries = fs::read_dir("/proc")?;
         let mut pids = Vec::new();
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = entry?;
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
                 continue;
@@ -597,20 +619,19 @@ impl ProcSource for RealProc {
                 pids.push(pid);
             }
         }
-        pids
+        Ok(pids)
     }
 
-    fn open_files(&self, pid: u32) -> Vec<PathBuf> {
-        let Ok(entries) = fs::read_dir(format!("/proc/{pid}/fd")) else {
-            return Vec::new();
-        };
+    fn open_files(&self, pid: u32) -> io::Result<Vec<PathBuf>> {
+        let entries = fs::read_dir(format!("/proc/{pid}/fd"))?;
         let mut files = Vec::new();
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = entry?;
             if let Ok(path) = fs::read_link(entry.path()) {
                 files.push(path);
             }
         }
-        files
+        Ok(files)
     }
 
     fn parent(&self, pid: u32) -> Option<u32> {
@@ -624,12 +645,12 @@ pub struct RealProc;
 
 #[cfg(not(target_os = "linux"))]
 impl ProcSource for RealProc {
-    fn pids(&self) -> Vec<u32> {
-        Vec::new()
+    fn pids(&self) -> io::Result<Vec<u32>> {
+        Ok(Vec::new())
     }
 
-    fn open_files(&self, _pid: u32) -> Vec<PathBuf> {
-        Vec::new()
+    fn open_files(&self, _pid: u32) -> io::Result<Vec<PathBuf>> {
+        Ok(Vec::new())
     }
 
     fn parent(&self, _pid: u32) -> Option<u32> {
@@ -638,7 +659,8 @@ impl ProcSource for RealProc {
 }
 
 /// What one walk of the process table found: the locks held, the Claude Code
-/// sessions their holders hang under, and every file a process holds open.
+/// sessions their holders hang under, every file a process holds open, and what
+/// could not be read.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProcLinks {
     /// Harness session id → Claude Code session id.
@@ -649,20 +671,36 @@ pub struct ProcLinks {
     /// find their rollout files (C-1); the set is empty where there is no
     /// `/proc`.
     pub files: BTreeSet<PathBuf>,
+    /// A process table, a file list or the sessions folder that could not be
+    /// read, naming the path and the error.
+    pub warnings: Vec<String>,
 }
 
 /// Walk the process table once: every Harness lock held, the Claude Code
 /// session of a lock holder's parent when there is one, and every file a
 /// process holds open. The sessions folder is resolved once, because the kernel
-/// reports an open file by its resolved path; a folder that cannot be resolved
-/// (it does not exist) has no lock to find.
+/// reports an open file by its resolved path; a folder that does not exist has
+/// no lock to find and is no warning. Any other `canonicalize` error is a
+/// warning naming the folder and the error, never a silent empty walk.
 pub fn proc_links(
     paths: &HarnessPaths,
     procs: &dyn ProcSource,
     claude_pids: &BTreeMap<u32, String>,
 ) -> ProcLinks {
-    let sessions = fs::canonicalize(&paths.sessions).ok();
-    proc_links_in(sessions.as_deref(), procs, claude_pids)
+    match fs::canonicalize(&paths.sessions) {
+        Ok(sessions) => proc_links_in(Some(&sessions), procs, claude_pids),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            proc_links_in(None, procs, claude_pids)
+        }
+        Err(source) => {
+            let mut links = proc_links_in(None, procs, claude_pids);
+            links.warnings.push(format!(
+                "{}: the folder cannot be resolved: {source}",
+                paths.sessions.display()
+            ));
+            links
+        }
+    }
 }
 
 /// The same one walk with the Harness sessions folder already resolved;
@@ -675,8 +713,21 @@ pub fn proc_links_in(
     claude_pids: &BTreeMap<u32, String>,
 ) -> ProcLinks {
     let mut links = ProcLinks::default();
-    for pid in procs.pids() {
-        let files = procs.open_files(pid);
+    let pids = match procs.pids() {
+        Ok(pids) => pids,
+        Err(source) => {
+            links.warnings.push(format!("/proc: {source}"));
+            return links;
+        }
+    };
+    for pid in pids {
+        let files = match procs.open_files(pid) {
+            Ok(files) => files,
+            Err(source) => {
+                links.warnings.push(format!("/proc/{pid}/fd: {source}"));
+                continue;
+            }
+        };
         let ids: BTreeSet<String> = match sessions {
             Some(sessions) => files
                 .iter()
@@ -702,17 +753,6 @@ pub fn proc_links_in(
     _claude_pids: &BTreeMap<u32, String>,
 ) -> ProcLinks {
     ProcLinks::default()
-}
-
-/// The Harness sessions whose `session.lock` a process holds open, linked to
-/// the Claude Code session of a parent process (`pid → session id`). On a
-/// system without `/proc` the map is empty.
-pub fn running_owners(
-    paths: &HarnessPaths,
-    procs: &dyn ProcSource,
-    claude_pids: &BTreeMap<u32, String>,
-) -> BTreeMap<String, String> {
-    proc_links(paths, procs, claude_pids).owners
 }
 
 /// Whether a Harness session is working now: it has no `turn/end` after its
@@ -779,6 +819,72 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = HarnessPaths::at(tmp.path().join("sessions"), tmp.path().join("flash-agents"));
         (tmp, paths)
+    }
+
+    #[test]
+    fn a_relative_dsh_home_is_an_error_naming_the_variable_and_the_value() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        let error = HarnessPaths::resolve_with(Some("dsh".into()), None, tmp.path())
+            .expect_err("a relative DSH_HOME is refused");
+
+        assert!(
+            matches!(
+                &error,
+                PathsError::RelativeHarnessFolder { variable: "DSH_HOME", value }
+                    if value == Path::new("dsh")
+            ),
+            "expected a relative DSH_HOME error, got {error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "$DSH_HOME must be an absolute path, got dsh"
+        );
+    }
+
+    #[test]
+    fn a_relative_xdg_state_home_is_an_error_naming_the_variable_and_the_value() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        let error = HarnessPaths::resolve_with(None, Some("state".into()), tmp.path())
+            .expect_err("a relative XDG_STATE_HOME is refused");
+
+        assert!(
+            matches!(
+                &error,
+                PathsError::RelativeHarnessFolder { variable: "XDG_STATE_HOME", value }
+                    if value == Path::new("state")
+            ),
+            "expected a relative XDG_STATE_HOME error, got {error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "$XDG_STATE_HOME must be an absolute path, got state"
+        );
+    }
+
+    #[test]
+    fn absolute_harness_folders_are_used_and_the_default_follows_the_home_folder() {
+        let root = Path::new(if cfg!(windows) { r"C:\" } else { "/" });
+        let home = root.join("home").join("sam");
+        let dsh = root.join("state").join("dsh");
+        let state = root.join("state").join("xdg");
+
+        let paths = HarnessPaths::resolve_with(
+            Some(dsh.clone().into_os_string()),
+            Some(state.clone().into_os_string()),
+            &home,
+        )
+        .expect("absolute folders are fine");
+        assert_eq!(paths.sessions, dsh.join("sessions"));
+        assert_eq!(paths.reports, state.join("flash-agents"));
+
+        let paths = HarnessPaths::resolve_with(None, None, &home).expect("the defaults");
+        assert_eq!(paths.sessions, home.join(".dsh").join("sessions"));
+        assert_eq!(
+            paths.reports,
+            home.join(".local").join("state").join("flash-agents")
+        );
     }
 
     fn header(id: &str, parent: Option<&str>, depth: u32, created: i64) -> String {
@@ -981,20 +1087,119 @@ mod tests {
     }
 
     impl ProcSource for FakeProc {
-        fn pids(&self) -> Vec<u32> {
-            self.processes.keys().copied().collect()
+        fn pids(&self) -> io::Result<Vec<u32>> {
+            Ok(self.processes.keys().copied().collect())
         }
 
-        fn open_files(&self, pid: u32) -> Vec<PathBuf> {
-            self.processes
+        fn open_files(&self, pid: u32) -> io::Result<Vec<PathBuf>> {
+            Ok(self
+                .processes
                 .get(&pid)
                 .map(|(files, _)| files.clone())
-                .unwrap_or_default()
+                .unwrap_or_default())
         }
 
         fn parent(&self, pid: u32) -> Option<u32> {
             self.processes.get(&pid).and_then(|(_, parent)| *parent)
         }
+    }
+
+    /// A process table that cannot be read, for the warning tests.
+    struct BrokenProc {
+        pids: bool,
+    }
+
+    impl ProcSource for BrokenProc {
+        fn pids(&self) -> io::Result<Vec<u32>> {
+            if self.pids {
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
+            } else {
+                Ok(vec![500])
+            }
+        }
+
+        fn open_files(&self, _pid: u32) -> io::Result<Vec<PathBuf>> {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
+        }
+
+        fn parent(&self, _pid: u32) -> Option<u32> {
+            None
+        }
+    }
+
+    #[test]
+    fn an_unreadable_process_table_is_a_warning() {
+        let (_tmp, paths) = store();
+
+        let links = proc_links(&paths, &BrokenProc { pids: true }, &BTreeMap::new());
+
+        assert!(links.owners.is_empty());
+        assert_eq!(links.warnings.len(), 1, "{:?}", links.warnings);
+        assert!(
+            links.warnings[0].contains("/proc") && links.warnings[0].contains("denied"),
+            "the warning names the path and the error: {}",
+            links.warnings[0]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_file_list_is_a_warning() {
+        let (_tmp, paths) = store();
+
+        let links = proc_links(&paths, &BrokenProc { pids: false }, &BTreeMap::new());
+
+        assert!(links.owners.is_empty());
+        assert_eq!(links.warnings.len(), 1, "{:?}", links.warnings);
+        assert!(
+            links.warnings[0].contains("/proc/500/fd") && links.warnings[0].contains("denied"),
+            "the warning names the path and the error: {}",
+            links.warnings[0]
+        );
+    }
+
+    #[test]
+    fn a_sessions_folder_that_cannot_be_resolved_is_a_warning() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // A regular file cannot be a parent folder, so resolving below it fails
+        // with more than "not found".
+        let not_a_folder = tmp.path().join("store");
+        fs::write(&not_a_folder, []).expect("a file");
+        let paths = HarnessPaths::at(
+            not_a_folder.join("sessions"),
+            tmp.path().join("flash-agents"),
+        );
+        let procs = FakeProc {
+            processes: BTreeMap::new(),
+        };
+
+        let links = proc_links(&paths, &procs, &BTreeMap::new());
+
+        assert_eq!(links.warnings.len(), 1, "{:?}", links.warnings);
+        assert!(
+            links.warnings[0].contains(&paths.sessions.display().to_string()),
+            "the warning names the folder: {}",
+            links.warnings[0]
+        );
+        assert!(
+            links.warnings[0].contains("cannot be resolved"),
+            "the warning says what failed: {}",
+            links.warnings[0]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_file_type_is_a_warning_naming_the_entry() {
+        let mut warnings = Vec::new();
+        let is_dir = entry_is_dir(
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied")),
+            Path::new("/home/sam/harness/key"),
+            &mut warnings,
+        );
+
+        assert!(!is_dir, "a type that cannot be read is not a folder");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("/home/sam/harness/key"));
+        assert!(warnings[0].contains("denied"));
     }
 
     #[test]
@@ -1012,7 +1217,7 @@ mod tests {
         };
         let claude_pids = BTreeMap::from([(400, SESSION.to_string())]);
 
-        let owners = running_owners(&paths, &procs, &claude_pids);
+        let owners = proc_links(&paths, &procs, &claude_pids).owners;
 
         assert_eq!(owners.get(JOB).map(String::as_str), Some(SESSION));
     }
@@ -1031,7 +1236,7 @@ mod tests {
         };
         let claude_pids = BTreeMap::from([(400, SESSION.to_string())]);
 
-        let owners = running_owners(&paths, &procs, &claude_pids);
+        let owners = proc_links(&paths, &procs, &claude_pids).owners;
 
         assert!(owners.is_empty(), "{owners:?}");
     }
@@ -1212,7 +1417,7 @@ mod tests {
         };
         let claude_pids = BTreeMap::from([(400, SESSION.to_string())]);
 
-        let owners = running_owners(&paths, &procs, &claude_pids);
+        let owners = proc_links(&paths, &procs, &claude_pids).owners;
 
         assert_eq!(owners.get(JOB).map(String::as_str), Some(SESSION));
     }

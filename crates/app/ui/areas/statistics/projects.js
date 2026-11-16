@@ -90,9 +90,9 @@ function shareText(share) {
 
 // "API values at 1 USD = 0.9048 EUR (13 Nov)." — the rate projects.rs converted
 // the page's API values with. Its currency is the rate's own, and it writes the
-// value exactly as sent (Rust rounded it to four decimals). A rate entered by
-// hand has no date. When the range's days had more than one rate, the line says
-// so and names the latest: "API values at each day's rate; latest 1 USD = …".
+// value exactly as sent (Rust rounded it to four decimals). When the range's
+// days had more than one rate, the line says so and names the latest: "API
+// values at each day's rate; latest 1 USD = …".
 function usdRateLine(rate) {
   if (
     !isObject(rate) ||

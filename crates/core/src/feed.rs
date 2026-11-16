@@ -67,12 +67,21 @@ pub struct Feed {
 /// Write `<data>/feed.json` when its numbers differ from the file's or the
 /// file is at least 10 s older than `feed.at`. Returns whether it wrote.
 ///
+/// A different `session`, `cost_usd` or `cost_problem` is a change like a
+/// different percent: the status line after a session's last answer often
+/// carries a new cost with unchanged percentages, and that cost is what the
+/// Sessions page shows.
+///
 /// The file is seatswap's own cache of the last numbers, never a source of
 /// truth: a file that does not parse is simply overwritten by this call.
 pub fn write_if_due(app: &AppPaths, feed: &Feed) -> io::Result<bool> {
     let write = match read(app) {
         Ok(Some(stored)) => {
-            let same = stored.five_hour == feed.five_hour && stored.seven_day == feed.seven_day;
+            let same = stored.five_hour == feed.five_hour
+                && stored.seven_day == feed.seven_day
+                && stored.session == feed.session
+                && stored.cost_usd == feed.cost_usd
+                && stored.cost_problem == feed.cost_problem;
             let old_enough = feed.at.signed_duration_since(stored.at)
                 >= chrono::Duration::seconds(REWRITE_AFTER_SECS);
             // A stored `at` later than this reading means the clock was set
@@ -552,6 +561,38 @@ mod tests {
             resets_at: weekday(16, 2, 0),
         });
         assert!(write_if_due(&other_app, &other).expect("different numbers"));
+    }
+
+    #[test]
+    fn a_changed_cost_is_written_even_with_the_same_percents() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let app = AppPaths::at(&tmp.path().join("data"));
+        let mut numbers = feed(
+            Some(FeedLimit {
+                percent: 48.0,
+                resets_at: weekday(16, 2, 0),
+            }),
+            None,
+        );
+        numbers.session = Some("7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34".to_string());
+        numbers.cost_usd = Some(1.25);
+        assert!(write_if_due(&app, &numbers).expect("the first write"));
+
+        // The status line after a session's last answer: same percents, a new
+        // cost, two seconds after the last write.
+        let mut costlier = numbers.clone();
+        costlier.at += chrono::Duration::seconds(2);
+        costlier.cost_usd = Some(1.47);
+        assert!(write_if_due(&app, &costlier).expect("a changed cost is written"));
+        let stored = read(&app).expect("the feed file").expect("the feed");
+        assert_eq!(stored.cost_usd, Some(1.47));
+
+        // The same feed again, still within ten seconds, is not written.
+        let mut same = costlier.clone();
+        same.at += chrono::Duration::seconds(2);
+        assert!(!write_if_due(&app, &same).expect("the same feed again"));
+        let stored = read(&app).expect("the feed file").expect("the feed");
+        assert_eq!(stored.at, costlier.at);
     }
 
     #[test]

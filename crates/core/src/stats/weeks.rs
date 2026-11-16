@@ -20,9 +20,10 @@ use crate::transcripts::Tokens;
 use super::{
     account_abbr, account_chosen, account_id, account_position, account_weeks_valued,
     blocked_by_week, blocked_spans, hours_text, keep_warnings, lost_percent, money_at, money_of,
-    money_text, next_week_start, percent_text, previous_week_start, range_of, switch_counts,
-    top_three, week_columns, week_start, window_used, working_hours, working_rhythm, AccountWeek,
-    Ctx, Query, RangeKey, StatsError, SwitchCounts,
+    money_text, next_week_start, offered_money, percent_of_offered, percent_text,
+    previous_week_start, range_of, switch_counts, top_three, week_columns, week_lost_percent,
+    week_start, window_used, working_hours, working_rhythm, AccountWeek, Ctx, Query, RangeKey,
+    StatsError, SwitchCounts,
 };
 
 /// The Weeks page: the grid of account weeks and the curves of the last 14
@@ -54,8 +55,8 @@ pub struct WeeksRow {
     pub id: String,
     pub plan: Option<String>,
     /// One cell per column; `None` when the account has no finished window of
-    /// that week. Two windows of one account in one week (its reset moved)
-    /// give the cell of the later end.
+    /// that week. Every window of the account week is kept in the cell's
+    /// `parts`, oldest first; `WeekCell::end` is the last window's end.
     pub cells: Vec<Option<WeekCell>>,
     /// The percent of the account's newest sample whose weekly window is still
     /// running; `None` without one.
@@ -75,7 +76,10 @@ pub struct WeekCell {
     /// (the rule of `stats::window_used`; `account_weeks_valued` names it once
     /// in the page's warnings).
     pub parts: Vec<f64>,
-    /// The share that expired: the window's `lost` percent.
+    /// The end of each window of `parts`, in the same order: the page opens a
+    /// window's own detail from its part.
+    pub window_ends: Vec<DateTime<Utc>>,
+    /// The share that expired: every window's `lost` percent, added.
     pub expired: f64,
     /// The money that expired; `None` without a price for the week.
     pub expired_money: Option<f64>,
@@ -97,8 +101,10 @@ pub struct Curve {
 #[serde(rename_all = "camelCase")]
 pub struct WeekSummary {
     pub week: DateTime<Utc>,
-    /// `used / paid × 100` of the priced account weeks; `None` when the week
-    /// has no priced finished window, with `money_missing` saying why.
+    /// `used / offered × 100` of the priced account weeks, the same rule as
+    /// Overview's Used share (a reset week offers each of its windows); `None`
+    /// when the week has no priced finished window, with `money_missing` saying
+    /// why.
     pub used_percent_of_paid: Option<f64>,
     /// Money used of the priced account weeks; `None` like
     /// `used_percent_of_paid`.
@@ -116,8 +122,9 @@ pub struct WeekSummary {
     /// Each account week's use in percent, per account id, every account week
     /// of the week (priced or not). The page's per-account line uses this.
     pub per_account_percent: Vec<(String, f64)>,
-    /// The expired share of the money paid in the week: `expired / paid × 100`,
-    /// `None` like `used_percent_of_paid`.
+    /// The expired share of the money the week's windows offered: `expired /
+    /// offered × 100`, the same denominator as `used_percent_of_paid` and
+    /// Overview's Expired share; `None` like `used_percent_of_paid`.
     pub expired_percent_of_paid: Option<f64>,
     /// The projects' share in % of the week's API value, the three largest
     /// then `other`; empty when `values.api` is `None`.
@@ -154,7 +161,7 @@ pub struct WindowDetail {
     pub used: f64,
     /// Money used; `None` without a price for the window.
     pub used_money: Option<f64>,
-    /// The share that expired: the window's `lost` percent.
+    /// The share that expired: this window's `lost` percent.
     pub expired: f64,
     /// Money expired; `None` without a price for the window.
     pub expired_money: Option<f64>,
@@ -339,7 +346,7 @@ fn row_for(
 
 /// One account week as the grid shows it.
 fn week_cell(week: &AccountWeek) -> Result<WeekCell, StatsError> {
-    let money = money_of(week);
+    let money = money_of(week)?;
     // The windows of the account week, oldest first. A window that ended below
     // its start adds no use (`stats::window_used`, named once in the warnings by
     // `account_weeks_valued`), exactly as `week.used` counted it.
@@ -348,11 +355,13 @@ fn week_cell(week: &AccountWeek) -> Result<WeekCell, StatsError> {
         .iter()
         .map(|window| window_used(window).unwrap_or(0.0))
         .collect();
+    let window_ends = week.windows.iter().map(|window| window.end).collect();
     Ok(WeekCell {
         end: week.window.end,
         used: week.used,
         parts,
-        expired: lost_percent(&week.window)?,
+        window_ends,
+        expired: week_lost_percent(week)?,
         expired_money: money.map(|money| money.expired),
         full: week.used >= 100.0,
         uncertain: week.window.uncertain,
@@ -449,7 +458,7 @@ pub fn week_summary<Tz: TimeZone + Copy>(
     let weeks = account_weeks_valued(ctx, &reading, q, &valuer)?;
 
     let mut used = 0.0;
-    let mut paid = 0.0;
+    let mut offered = 0.0;
     let mut expired = 0.0;
     let mut used_priced = false;
     let mut missing_reason: Option<String> = None;
@@ -459,10 +468,10 @@ pub fn week_summary<Tz: TimeZone + Copy>(
         .filter(|account_week| account_week.week == week)
     {
         percent_by_account.insert(account_week.account.clone(), account_week.used);
-        match money_of(account_week) {
+        match money_of(account_week)? {
             Some(money) => {
                 used += money.used;
-                paid += money.paid;
+                offered += offered_money(account_week, &money);
                 expired += money.expired;
                 used_priced = true;
             }
@@ -487,7 +496,7 @@ pub fn week_summary<Tz: TimeZone + Copy>(
         .iter()
         .filter(|account_week| account_week.week == previous)
     {
-        if let Some(money) = money_of(account_week) {
+        if let Some(money) = money_of(account_week)? {
             before += money.used;
             before_priced = true;
         }
@@ -529,7 +538,7 @@ pub fn week_summary<Tz: TimeZone + Copy>(
             continue;
         }
         tokens += Tokens::from(record);
-        let record_values = Values::of(std::slice::from_ref(&value), ctx.settings);
+        let record_values = Values::of(std::slice::from_ref(&value), ctx.settings, ctx.fx, ctx.now);
         match &mut values {
             Some(values) => {
                 let sum = Values::sum(&[&*values, &record_values]);
@@ -578,8 +587,10 @@ pub fn week_summary<Tz: TimeZone + Copy>(
     } else {
         None
     };
-    let used_percent_of_paid = (paid > 0.0).then_some(used / paid * 100.0);
-    let expired_percent_of_paid = (paid > 0.0).then_some(expired / paid * 100.0);
+    let used_percent_of_paid = percent_of_offered(used, offered);
+    // The same denominator as Overview's Expired share: the money the week's
+    // windows offered, one week's price for each of them.
+    let expired_percent_of_paid = percent_of_offered(expired, offered);
     let switches_total = u64::from(switches.user)
         + u64::from(switches.cli)
         + u64::from(switches.auto)
@@ -600,7 +611,7 @@ pub fn week_summary<Tz: TimeZone + Copy>(
                 percent_text(share)
             ));
         } else if let Some(currency) = ctx.settings.currency.as_deref() {
-            if let Some(money) = money_of(account_week) {
+            if let Some(money) = money_of(account_week)? {
                 conclusion.push(format!(
                     "{} of {abbr}'s week expired, {}.",
                     percent_text(share),
@@ -648,7 +659,7 @@ fn most_expired(
         .iter()
         .filter(|account_week| account_week.week == week)
     {
-        let share = lost_percent(&account_week.window)?;
+        let share = week_lost_percent(account_week)?;
         if largest.is_none_or(|(best, _)| share > best) {
             largest = Some((share, account_week));
         }
@@ -1740,6 +1751,62 @@ mod tests {
         let cell = page.rows[0].cells[0].as_ref().expect("LB's week");
         assert_eq!(cell.parts, vec![70.0, 35.0], "70 % then 45 % to 80 %");
         assert_eq!(cell.used, 105.0, "the week's total passes 100 %");
+    }
+
+    /// The summary's Expired share divides by the money the week's windows
+    /// offered, as Overview does: two ordinary windows with 20 % and 10 % lost
+    /// offer two weeks' price, so the week expired 30 / 200 = 15 %, not the last
+    /// window's 10 / 100 = 10 %.
+    #[test]
+    fn the_summary_divides_the_expired_share_by_the_offered_windows() {
+        let tiny = tiny();
+        let dir = tempdir().expect("a temp history");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let window = |end: &str, final_percent: f64, lost: f64| WindowRecord {
+            account: tiny.lb_ref(),
+            k: LimitKind::WeeklyAll,
+            m: None,
+            start: Some(utc(end) - Duration::days(7)),
+            end: utc(end),
+            final_percent,
+            lost: Some(lost),
+            last_sample: utc(end) - Duration::minutes(2),
+            plan: Some("Max".to_string()),
+            uncertain: false,
+            reset: false,
+            from: None,
+        };
+        history
+            .append_many(&[
+                window("2026-11-06T12:00:00Z", 80.0, 20.0),
+                window("2026-11-09T12:00:00Z", 90.0, 10.0),
+            ])
+            .expect("the two ordinary windows");
+        let ctx = Ctx {
+            history: &history,
+            ..tiny.ctx()
+        };
+        let summary =
+            week_summary(&ctx, &all(), utc("2026-11-02T00:00:00Z")).expect("the week's summary");
+        assert!(
+            close(
+                summary.expired_percent_of_paid.expect("a priced week"),
+                15.0
+            ),
+            "expired 30 of the 200 offered: {:?}",
+            summary.expired_percent_of_paid
+        );
+        assert!(
+            close(summary.used_percent_of_paid.expect("a priced week"), 85.0),
+            "used 170 of the 200 offered: {:?}",
+            summary.used_percent_of_paid
+        );
+        let weekly = tiny.lb().price.expect("LB's price") * 12.0 / 52.0;
+        assert!(
+            close(summary.expired.expect("a priced week"), 0.30 * weekly),
+            "expired money is both windows' lost: {:?}",
+            summary.expired
+        );
     }
 
     /// "Of about N possible" counts the typical week's working hours: the

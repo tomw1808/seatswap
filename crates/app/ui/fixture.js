@@ -197,6 +197,21 @@ function exposeFixtureHooks() {
       publishFixtureChange();
       return "off";
     },
+    // The bench's money view override: fields the real look-up thread could
+    // send but `fixtureMoneyView` would otherwise fill in from the settings or
+    // the price list. `null` puts the fixture back.
+    moneyView(patch) {
+      if (!fixture) throw new Error("fixture is not ready");
+      if (patch === null) {
+        delete fixture.moneyOverride;
+        return null;
+      }
+      if (!isObject(patch)) {
+        throw new Error(`a money view patch is needed, not ${JSON.stringify(patch)}`);
+      }
+      fixture.moneyOverride = clone(patch);
+      return clone(fixture.moneyOverride);
+    },
   };
 }
 
@@ -607,7 +622,6 @@ function makeFixture() {
       currency: "EUR",
       rate: { value: 0.9048, date: "2026-11-13" },
       lookUp: true,
-      providers: ["anthropic", "openai", "ollama-cloud"],
       modelsWithPrice: 4,
       pricesCheckedAt: isoIn(-2 * 3600000),
       lastChange: {
@@ -929,6 +943,15 @@ function fixtureIcon(abbr, color, size) {
   return pixels;
 }
 
+// The fixture's money view with the bench's last override on top, so a step can
+// show what the page does with a malformed view.
+function fixtureMoneyWithOverride(fixture) {
+  const view = fixtureMoneyView(fixture);
+  return isObject(fixture.moneyOverride)
+    ? Object.assign(view, clone(fixture.moneyOverride))
+    : view;
+}
+
 export async function fixtureInvoke(command, args) {
   if (pendingRefusal && pendingRefusal.command === command) {
     const refusal = pendingRefusal;
@@ -1247,14 +1270,14 @@ export async function fixtureInvoke(command, args) {
     }
 
     case "money_view":
-      return fixtureMoneyView(fixture);
+      return fixtureMoneyWithOverride(fixture);
 
     case "price_list":
       return clone(fixture.priceList);
 
     case "lookup_now":
       fixture.money.pricesCheckedAt = new Date().toISOString();
-      return fixtureMoneyView(fixture);
+      return fixtureMoneyWithOverride(fixture);
 
     case "skill_status":
       return clone(fixture.skill);

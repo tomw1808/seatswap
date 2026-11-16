@@ -406,17 +406,24 @@ export async function show(container, env) {
         )}${cell.full ? " | full" : ""}${
           cell.uncertain ? " | uncertain: a reading near a reset is missing" : ""
         }`;
+        const windowEnds = Array.isArray(cell.windowEnds) ? cell.windowEnds : null;
         return {
           total: cell.used,
           parts: cell.parts,
+          expired: cell.expired,
           color,
           textColor: contrastText(color),
-          hatch: true,
           text: shortPercent(cell.used),
           tip,
           full: cell.full,
           uncertain: cell.uncertain,
-          onClick: () => void selectWindow(row, cell, week),
+          onClick: () => void selectWindow(row, cell.end, week),
+          partClick:
+            windowEnds !== null &&
+            windowEnds.length === cell.parts.length &&
+            cell.parts.length > 1
+              ? (index) => void selectWindow(row, windowEnds[index], week)
+              : undefined,
         };
       });
       const nowCell =
@@ -426,7 +433,6 @@ export async function show(container, env) {
               total: row.nowPercent,
               color,
               textColor: contrastText(color),
-              hatch: true,
               current: true,
               text: shortPercent(row.nowPercent),
               tip: `${accountNameText(env.accounts, row.id)} · now ${percentText(row.nowPercent)}`,
@@ -530,12 +536,12 @@ export async function show(container, env) {
     }
   }
 
-  async function selectWindow(row, cell, week) {
+  async function selectWindow(row, end, week) {
     const token = ++state.detailToken;
     try {
       const detail = await env.call("stats_window_detail", {
         accountId: row.id,
-        end: cell.end,
+        end,
       });
       if (token !== state.detailToken) return;
       state.window = detail;

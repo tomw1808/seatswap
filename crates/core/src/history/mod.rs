@@ -827,6 +827,26 @@ pub fn same_reset(a: DateTime<Utc>, b: DateTime<Utc>) -> bool {
 /// and named once in a warning, never smoothed.
 pub const RESET_DROP_POINTS: f64 = 1.0;
 
+/// Whether a limit that fell from `previous_percent` to `current_percent` was
+/// reset early: the drop is at least [`RESET_DROP_POINTS`] and `at` is more
+/// than [`RESET_JITTER`] before `reset_at` (decision 12). A drop at or within
+/// the jitter of the reset time is the window's ordinary end, not a reset; a
+/// limit without a reset time cannot be seen as reset. This is the one rule
+/// the history recorder, the "usable again" notification and auto-burn's
+/// learned rates use.
+pub fn is_early_reset(
+    previous_percent: f64,
+    current_percent: f64,
+    reset_at: Option<DateTime<Utc>>,
+    at: DateTime<Utc>,
+) -> bool {
+    let Some(reset_at) = reset_at else {
+        return false;
+    };
+    reset_at.signed_duration_since(at) > chrono::Duration::seconds(RESET_JITTER)
+        && previous_percent - current_percent >= RESET_DROP_POINTS
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
