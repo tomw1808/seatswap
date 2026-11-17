@@ -1638,7 +1638,7 @@ function agentCells(agent, children, depth) {
       { class: "sess-name", style: { paddingLeft: `${depth * 14}px` } },
       [h("span", { class: children.length ? "sess-car" : "sess-car0" }), name]
     ),
-    h("span", {}, ""),
+    h("span", { class: "sess-model" }, agent.model ? modelName(agent.model) : "—"),
     agentStatus(agent, now),
     children.length ? agentsCell(running, done, true) : h("span", {}, ""),
     tokenNode(agent.tokens ? agent.tokens.out : 0),

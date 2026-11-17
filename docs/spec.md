@@ -1251,7 +1251,7 @@ and model, so its tokens are priced like the rest, and a closed session's hourly
 priced with it.
 
 A session opens to its agents, grouped by provider and model. One row per agent has kind, task,
-running or completed with when it finished, tokens and both values, and its own agents as "1 running ·
+the model of its last answer (`—` before its first), running or completed with when it finished, tokens and both values, and its own agents as "1 running ·
 2 done". An agent that started agents opens the same way, to any depth. A flash job is an agent with
 the tag `flash`, its workers below it. Completed agents are folded into one "38 completed" row that opens and that
 carries the subscription and API value of their tokens — one sum for the session, shown only when the

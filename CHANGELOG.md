@@ -193,6 +193,8 @@ All notable changes to this project are documented here. The format follows
 - The `tied` bubble and the count of sessions whose thinking is tied to the account leave out
   models off the Claude plan (Harness, Codex, Ollama): a switch does not touch them.
 - The large window uses half the margin around its content (12 px instead of 24 px).
+- Sessions: an agent's row shows its model, also once it is folded into "N completed"; it was
+  always empty.
 
 ### Removed
 - *Use my own rate* (`usdRate`) and the own prices in Settings. With the look-ups off, money is
