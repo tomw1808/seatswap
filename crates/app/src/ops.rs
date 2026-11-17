@@ -100,7 +100,7 @@ pub(crate) fn remove_account(
 /// written; the caller already says why.
 pub(crate) fn record_edit(
     recorder: Option<&Recorder>,
-    edited: &switcher::Edited,
+    edited: impl Into<shared::Edit>,
     at: DateTime<Utc>,
 ) -> Option<String> {
     let recorder = recorder?;

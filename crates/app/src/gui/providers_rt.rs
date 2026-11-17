@@ -17,10 +17,12 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use seatswap_core::api::{Api, Usage};
-use seatswap_core::history::{HistoryDir, Recorder, Source};
+use seatswap_core::history::{EventKind, HistoryDir, Recorder, Source};
 use seatswap_core::paths::{AppPaths, CodexPaths, PathsError};
 use seatswap_core::providers::{self, Credits, ProviderReading, CODEX_ORG, OLLAMA_ORG};
-use seatswap_core::store::{self, Settings};
+use seatswap_core::store::{self, ProviderSubscription, Settings};
+
+use seatswap_core::switcher;
 
 use crate::ops;
 
@@ -67,7 +69,7 @@ impl Provider {
 
     fn title(self) -> &'static str {
         match self {
-            Provider::Codex => "Codex",
+            Provider::Codex => "OpenAI (Codex)",
             Provider::Ollama => "Ollama",
         }
     }
@@ -243,6 +245,7 @@ fn run(
         history,
         api,
         Some(ui),
+        app.clone(),
         Box::new(CodexPaths::resolve),
         Box::new(move |_| {
             store::load_accounts(&app_for_lookup)
@@ -298,6 +301,9 @@ fn settings_of(app: &AppPaths, runtime: &mut ProvidersRuntime) -> Option<Setting
 pub(crate) struct ProvidersRuntime {
     api: Api,
     ui: Option<Sender<UiEvent>>,
+    /// The app paths; the subscription list and its prices live in
+    /// `accounts.json` there. The provider thread never needs a secret.
+    app: AppPaths,
     codex_paths: CodexPathsLookup,
     /// The way the current settings are read once a request has ended.
     settings_lookup: SettingsLookup,
@@ -321,10 +327,12 @@ pub(crate) struct ProvidersRuntime {
 }
 
 impl ProvidersRuntime {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         history: Result<HistoryDir, String>,
         api: Api,
         ui: Option<Sender<UiEvent>>,
+        app: AppPaths,
         codex_paths: CodexPathsLookup,
         settings_lookup: SettingsLookup,
         report: ReportError,
@@ -333,6 +341,7 @@ impl ProvidersRuntime {
         ProvidersRuntime {
             api,
             ui,
+            app,
             codex_paths,
             settings_lookup,
             recorder: history.map(Recorder::new),
@@ -359,7 +368,9 @@ impl ProvidersRuntime {
         views
     }
 
-    /// The start and every five minutes: every card that is switched on.
+    /// The start and every five minutes: every card that is switched on, and
+    /// every provider whose subscription has a price even while its card is off
+    /// (spec R4).
     pub(crate) fn poll_round(
         &mut self,
         settings: &Settings,
@@ -369,7 +380,7 @@ impl ProvidersRuntime {
         self.settle(settings, previous.as_ref());
         let mut due = Vec::new();
         for provider in [Provider::Codex, Provider::Ollama] {
-            if provider.is_on(settings) {
+            if provider.is_on(settings) || self.priced(provider) {
                 due.push(provider);
             }
         }
@@ -463,29 +474,115 @@ impl ProvidersRuntime {
             }
             // A save that switches this card off or moves it is a queued
             // command, so the request has ended before that save ran. Read the
-            // settings again: an answer for a card that is now off or sits
-            // elsewhere leaves no trace. A failed read is reported and drops
-            // the answer too; nothing is recorded on a guess.
-            let keep = match (self.settings_lookup)(settings) {
-                Ok(current) => {
-                    provider.is_on(&current) && !provider.setting_changed(settings, &current)
-                }
+            // settings again: an answer for a card that is now off and unpriced,
+            // or that sits elsewhere, leaves no trace. A failed read is reported
+            // and drops the answer too; nothing is recorded on a guess. A card
+            // that is off but whose subscription has a price is still recorded;
+            // it has no view (spec §7.9).
+            let current = match (self.settings_lookup)(settings) {
+                Ok(current) => current,
                 Err(text) => {
                     self.report_error(&text);
-                    false
+                    continue;
                 }
             };
+            let on = provider.is_on(&current);
+            let keep =
+                (on || self.priced(*provider)) && !provider.setting_changed(settings, &current);
             if !keep {
                 continue;
             }
             let view = match result {
                 Ok(reading) => {
                     self.record(&reading, now);
-                    success(*provider, reading, now)
+                    self.ensure_subscription(*provider, &reading, now);
+                    if on {
+                        Some(success(*provider, reading, now))
+                    } else {
+                        None
+                    }
                 }
-                Err(error) => failure(*provider, self.view(*provider), error.to_string()),
+                Err(error) => {
+                    let text = error.to_string();
+                    if on {
+                        Some(failure(*provider, self.view(*provider), text))
+                    } else {
+                        // The card is off, so there is no view to show the
+                        // error; report it the way every provider error is.
+                        self.report_error(&text);
+                        None
+                    }
+                }
             };
-            *provider.view_mut(&mut self.codex, &mut self.ollama) = Some(view);
+            *provider.view_mut(&mut self.codex, &mut self.ollama) = view;
+        }
+    }
+
+    /// The subscription of `provider`, or `None` after reporting a file that
+    /// cannot be read. A read failure is never a silent "no price".
+    fn subscription(&mut self, provider: Provider) -> Option<ProviderSubscription> {
+        match store::load_accounts(&self.app) {
+            Ok(file) => file
+                .provider_subscriptions
+                .into_iter()
+                .find(|subscription| subscription.account.org == provider.name()),
+            Err(error) => {
+                self.report_error(&error.to_string());
+                None
+            }
+        }
+    }
+
+    /// Whether this provider is polled for its price with the card off.
+    fn priced(&mut self, provider: Provider) -> bool {
+        self.subscription(provider)
+            .is_some_and(|subscription| subscription.price.is_some())
+    }
+
+    /// Make sure a successful reading's account has a subscription, and write
+    /// the events that reports: `accountAdded` when it was created, and
+    /// `planChanged` when the provider named another plan. A failure here is
+    /// reported like any provider error and never stops the poll.
+    fn ensure_subscription(
+        &mut self,
+        provider: Provider,
+        reading: &ProviderReading,
+        now: DateTime<Utc>,
+    ) {
+        match switcher::ensure_provider_subscription(
+            &self.app,
+            &reading.account,
+            reading.plan.as_deref(),
+        ) {
+            Ok(ensured) => {
+                let mut failures = Vec::new();
+                if let Ok(recorder) = &mut self.recorder {
+                    if ensured.created {
+                        if let Err(error) = recorder.event(
+                            now,
+                            EventKind::AccountAdded {
+                                account: reading.account.clone(),
+                                plan: reading.plan.clone(),
+                            },
+                        ) {
+                            failures.push(ops::history_unwritable(&error));
+                        }
+                    }
+                    if let Some(change) = &ensured.plan_change {
+                        if let Err(error) = ops::record_plan_change(recorder, change, now) {
+                            failures.push(ops::history_unwritable(&error));
+                        }
+                    }
+                }
+                for text in &failures {
+                    self.report_error(text);
+                }
+                self.print_history_warnings();
+            }
+            Err(error) => self.report_error(&format!(
+                "the {} subscription is not saved: {error}",
+                provider.title()
+            )),
         }
     }
 
@@ -617,7 +714,8 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use seatswap_core::history::{Hosts, OllamaHourRecord, Range, Sample};
+    use seatswap_core::history::{AccountRef, Hosts, OllamaHourRecord, Range, Sample};
+    use seatswap_core::store::{FileSecrets, Store};
 
     use crate::gui::ReportedErrors;
 
@@ -668,6 +766,15 @@ mod tests {
         HistoryDir::at(&dir.join("history"), "atlas")
     }
 
+    fn test_app(dir: &Path) -> AppPaths {
+        AppPaths::at(&dir.join("data"))
+    }
+
+    fn test_store(dir: &Path) -> Store {
+        let app = test_app(dir);
+        Store::new(app.clone(), Box::new(FileSecrets::new(app.secrets_dir())))
+    }
+
     fn test_runtime(dir: &Path, api: Api, codex_home: &Path) -> ProvidersRuntime {
         let codex_home = codex_home.to_path_buf();
         test_runtime_with(
@@ -692,10 +799,29 @@ mod tests {
         settings_lookup: SettingsLookup,
         report: ReportError,
     ) -> ProvidersRuntime {
+        test_runtime_with_app(
+            dir,
+            api,
+            codex_paths,
+            settings_lookup,
+            report,
+            test_app(dir),
+        )
+    }
+
+    fn test_runtime_with_app(
+        dir: &Path,
+        api: Api,
+        codex_paths: CodexPathsLookup,
+        settings_lookup: SettingsLookup,
+        report: ReportError,
+        app: AppPaths,
+    ) -> ProvidersRuntime {
         ProvidersRuntime::new(
             Ok(history(dir)),
             api,
             None,
+            app,
             codex_paths,
             settings_lookup,
             report,
@@ -868,7 +994,7 @@ mod tests {
         let paths = server.finish();
 
         assert_eq!(view.provider, "codex");
-        assert_eq!(view.title, "Codex");
+        assert_eq!(view.title, "OpenAI (Codex)");
         assert_eq!(view.plan.as_deref(), Some("Plus"));
         assert!(view.usage.is_some());
         assert_eq!(view.error, None);
@@ -1067,6 +1193,139 @@ mod tests {
             paths.len(),
             2,
             "the start and the +61 s opening asked; the +30 s one did not: {paths:?}"
+        );
+    }
+
+    /// A provider whose subscription has a price is polled with its card off:
+    /// the price turns its work into money even when the card is hidden. The
+    /// reading is recorded, the subscription kept, and no card is shown.
+    #[test]
+    fn a_provider_is_polled_while_its_price_is_set_with_the_card_off() {
+        let dir = tempdir().expect("tempdir");
+        let app = test_app(dir.path());
+        let store = test_store(dir.path());
+        let account = AccountRef {
+            acc: providers::OLLAMA_ORG.to_string(),
+            org: providers::OLLAMA_ORG.to_string(),
+        };
+        let mut file = store.load().expect("accounts.json");
+        file.ensure_provider_subscription(&account, None)
+            .expect("the Ollama subscription");
+        let subscription = file
+            .provider_subscriptions
+            .iter_mut()
+            .find(|subscription| subscription.account == account)
+            .expect("the Ollama subscription");
+        subscription.price = Some(23.0);
+        subscription.price_currency = Some("EUR".to_string());
+        store.save(&file).expect("accounts.json");
+
+        let server = Fake::start(vec![
+            (200, BALANCE.to_string()),
+            (200, USAGE_ANSWER.to_string()),
+        ]);
+        let mut runtime = test_runtime_with_app(
+            dir.path(),
+            codex_api(&server.base),
+            Box::new(|_| Ok(CodexPaths::at(Path::new("unused-codex-home")))),
+            same_settings(),
+            Box::new(|_| {}),
+            app,
+        );
+        // `ollama_on` is not used: the card stays off.
+        let settings = Settings {
+            ollama_url: server.base.clone(),
+            ..Settings::default()
+        };
+
+        let views = runtime.poll_round(&settings, utc("2026-11-14T09:00:00Z"));
+        let paths = server.finish();
+
+        assert_eq!(
+            paths,
+            vec![
+                "/api/balance".to_string(),
+                "/api/usage?range=24h".to_string()
+            ],
+            "the priced subscription was not polled with the card off"
+        );
+        assert!(
+            views.is_empty(),
+            "a card that is off showed a view: {views:?}"
+        );
+        let file = test_store(dir.path()).load().expect("accounts.json");
+        let subscription = file
+            .provider_subscription(&account)
+            .expect("the reading kept the subscription");
+        assert_eq!(subscription.price, Some(23.0));
+        assert_eq!(subscription.price_currency.as_deref(), Some("EUR"));
+        let read = history(dir.path())
+            .read::<Sample>(&Range::ALL, &Hosts::All)
+            .expect("the samples");
+        assert_eq!(read.records.len(), 1, "the reading was recorded");
+        assert_eq!(read.records[0].record.account.org, "ollama");
+    }
+
+    /// A failed poll of a priced subscription whose card is off has no card to
+    /// show the error on; it is reported like every other provider error.
+    #[test]
+    fn a_failed_poll_of_a_priced_card_that_is_off_shows_no_card() {
+        let dir = tempdir().expect("tempdir");
+        let app = test_app(dir.path());
+        let store = test_store(dir.path());
+        let account = AccountRef {
+            acc: providers::OLLAMA_ORG.to_string(),
+            org: providers::OLLAMA_ORG.to_string(),
+        };
+        let mut file = store.load().expect("accounts.json");
+        file.ensure_provider_subscription(&account, None)
+            .expect("the Ollama subscription");
+        let subscription = file
+            .provider_subscriptions
+            .iter_mut()
+            .find(|subscription| subscription.account == account)
+            .expect("the Ollama subscription");
+        subscription.price = Some(23.0);
+        subscription.price_currency = Some("EUR".to_string());
+        store.save(&file).expect("accounts.json");
+
+        let server = Fake::start(vec![(500, String::new())]);
+        let (sender, reports) = mpsc::channel();
+        let errors = ReportedErrors::new(Box::new(move |text: &str| {
+            let _ = sender.send(text.to_string());
+        }));
+        let report: ReportError = Box::new(move |text: &str| errors.report(text));
+        let mut runtime = test_runtime_with_app(
+            dir.path(),
+            codex_api(&server.base),
+            Box::new(|_| Ok(CodexPaths::at(Path::new("unused-codex-home")))),
+            same_settings(),
+            report,
+            app,
+        );
+        // The card stays off; only the price makes the provider polled.
+        let settings = Settings {
+            ollama_url: server.base.clone(),
+            ..Settings::default()
+        };
+
+        let views = runtime.poll_round(&settings, utc("2026-11-14T09:00:00Z"));
+        let _ = server.finish();
+
+        assert!(
+            views.is_empty(),
+            "a card that is off showed an error view: {views:?}"
+        );
+        let texts: Vec<String> = reports.try_iter().collect();
+        assert_eq!(
+            texts.len(),
+            1,
+            "the failure was not reported once: {texts:?}"
+        );
+        assert!(
+            texts[0].contains("server error 500"),
+            "the reported text is not the provider's: {}",
+            texts[0]
         );
     }
 
@@ -1302,6 +1561,7 @@ mod tests {
             Ok(HistoryDir::at(&root, "atlas")),
             codex_api(&server.base),
             None,
+            test_app(dir.path()),
             Box::new(move |_| Ok(CodexPaths::at(&codex_home))),
             same_settings(),
             report,
@@ -1503,6 +1763,7 @@ mod tests {
             Err("the history folder could not be opened".to_string()),
             codex_api(&server.base),
             None,
+            test_app(dir.path()),
             Box::new(move |_| Ok(CodexPaths::at(&folder))),
             same_settings(),
             report,

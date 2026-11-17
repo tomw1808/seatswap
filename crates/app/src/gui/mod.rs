@@ -260,6 +260,7 @@ pub(crate) fn run(
             panel::cancel_pending,
             panel::save_current,
             panel::edit_account,
+            panel::edit_subscription,
             panel::remove_account,
             panel::save_setting,
             panel::set_auto_burn,

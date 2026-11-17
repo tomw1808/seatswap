@@ -14,8 +14,11 @@ use chrono::{DateTime, Utc};
 use crate::history::{AccountRef, EventKind};
 use crate::live::{self, LiveError};
 use crate::locks::{self, LockError};
-use crate::paths::ClaudePaths;
-use crate::store::{self, Account, AccountsFile, LoginState, Store, StoreError};
+use crate::money::Company;
+use crate::paths::{AppPaths, ClaudePaths};
+use crate::store::{
+    self, AbbrOwner, Account, AccountsFile, LoginState, ProviderSubscription, Store, StoreError,
+};
 use crate::types::{Login, OAuthAccount};
 
 /// How long to wait for Claude Code's six lock folders (spec §6.2).
@@ -47,6 +50,10 @@ pub enum SwitchError {
     /// The login file was written but the identity was not.
     PartlyDone {
         state: String,
+    },
+    /// The provider names the plan, so the person cannot edit it here.
+    PlanFromProvider {
+        company: &'static str,
     },
 }
 
@@ -81,6 +88,10 @@ impl fmt::Display for SwitchError {
                 write!(f, "set a currency in Settings → General before a price")
             }
             SwitchError::PartlyDone { state } => write!(f, "{state}"),
+            SwitchError::PlanFromProvider { company } => write!(
+                f,
+                "{company}'s plan comes from the provider and cannot be edited here"
+            ),
         }
     }
 }
@@ -96,7 +107,8 @@ impl std::error::Error for SwitchError {
             | SwitchError::TargetHasNoLogin { .. }
             | SwitchError::CurrentNotSaved { .. }
             | SwitchError::PriceWithoutCurrency
-            | SwitchError::PartlyDone { .. } => None,
+            | SwitchError::PartlyDone { .. }
+            | SwitchError::PlanFromProvider { .. } => None,
         }
     }
 }
@@ -652,6 +664,101 @@ impl Edited {
     }
 }
 
+/// The validated shared look fields of an account or subscription edit: the
+/// label, the abbreviation (against every other abbreviation in use), the
+/// colour, and the price with the currency rule. Both edit paths call
+/// [`LookEdit::validate`]; what differs — an account's auto-burn and
+/// organization, a subscription's Ollama plan — stays in each.
+#[derive(Debug, Clone, PartialEq)]
+struct LookEdit {
+    label: Option<String>,
+    abbr: Option<String>,
+    color: Option<String>,
+    price: Option<Option<f64>>,
+    /// The currency a set price is stored in; `None` for a cleared price.
+    price_currency: Option<String>,
+}
+
+impl LookEdit {
+    fn validate(
+        file: &AccountsFile,
+        owner: AbbrOwner,
+        label: Option<&str>,
+        abbr: Option<&str>,
+        color: Option<&str>,
+        price: Option<Option<f64>>,
+    ) -> Result<LookEdit, SwitchError> {
+        let label = label.map(store::validate_label).transpose()?;
+        let abbr = match abbr {
+            Some(raw) => {
+                let taken = file.taken_abbrs(Some(owner));
+                let others: Vec<&str> = taken.iter().map(String::as_str).collect();
+                Some(store::validate_abbr(raw, &others)?)
+            }
+            None => None,
+        };
+        let color = color.map(store::validate_color).transpose()?;
+        let currency = file.settings.currency.clone();
+        let price = match price {
+            Some(value) => {
+                let value = store::validate_price(value)?;
+                if value.is_some() && currency.is_none() {
+                    return Err(SwitchError::PriceWithoutCurrency);
+                }
+                Some(value)
+            }
+            None => None,
+        };
+        let price_currency = price.flatten().map(|_| currency.clone()).unwrap_or(None);
+        Ok(LookEdit {
+            label,
+            abbr,
+            color,
+            price,
+            price_currency,
+        })
+    }
+
+    /// Write the validated fields that changed; `true` when any did.
+    fn apply(
+        &self,
+        label: &mut String,
+        abbr: &mut String,
+        color: &mut String,
+        price: &mut Option<f64>,
+        price_currency: &mut Option<String>,
+    ) -> bool {
+        let mut changed = false;
+        if let Some(value) = &self.label {
+            if label != value {
+                *label = value.clone();
+                changed = true;
+            }
+        }
+        if let Some(value) = &self.abbr {
+            if abbr != value {
+                *abbr = value.clone();
+                changed = true;
+            }
+        }
+        if let Some(value) = &self.color {
+            if color != value {
+                *color = value.clone();
+                changed = true;
+            }
+        }
+        if let Some(value) = self.price {
+            let currency = value.map(|_| self.price_currency.clone()).unwrap_or(None);
+            if *price != value || *price_currency != currency {
+                *price = value;
+                *price_currency = currency;
+                changed = true;
+            }
+        }
+        changed
+    }
+}
+
 /// Change label, abbreviation, colour, whether auto-burn may use the account,
 /// or its monthly price. Every value goes through the store's validator first,
 /// so an invalid value leaves the account list untouched.
@@ -672,66 +779,24 @@ pub fn edit_account(
         .and_then(|id| file.accounts.iter().position(|account| account.id == id))
         .ok_or_else(|| SwitchError::UnknownAccount(key.to_string()))?;
 
-    let label = label.map(store::validate_label).transpose()?;
-    let abbr = match abbr {
-        Some(raw) => {
-            let others: Vec<&str> = file
-                .accounts
-                .iter()
-                .enumerate()
-                .filter(|(other, _)| *other != index)
-                .map(|(_, account)| account.abbr.as_str())
-                .collect();
-            Some(store::validate_abbr(raw, &others)?)
-        }
-        None => None,
-    };
-    let color = color.map(store::validate_color).transpose()?;
-    let currency = file.settings.currency.clone();
-    let price = match price {
-        Some(value) => {
-            let value = store::validate_price(value)?;
-            if value.is_some() && currency.is_none() {
-                return Err(SwitchError::PriceWithoutCurrency);
-            }
-            Some(value)
-        }
-        None => None,
-    };
+    let look = LookEdit::validate(&file, AbbrOwner::Account(index), label, abbr, color, price)?;
 
     let mut changed = false;
     let before = file.accounts[index].clone();
-    let account = &mut file.accounts[index];
-    if let Some(label) = label {
-        if account.label != label {
-            account.label = label;
-            changed = true;
-        }
-    }
-    if let Some(abbr) = abbr {
-        if account.abbr != abbr {
-            account.abbr = abbr;
-            changed = true;
-        }
-    }
-    if let Some(color) = color {
-        if account.color != color {
-            account.color = color;
-            changed = true;
-        }
-    }
-    if let Some(auto_burn) = auto_burn {
-        if account.auto_burn != auto_burn {
-            account.auto_burn = auto_burn;
-            changed = true;
-        }
-    }
-    if let Some(price) = price {
-        let price_currency = price.map(|_| currency.clone()).unwrap_or(None);
-        if account.price != price || account.price_currency != price_currency {
-            account.price = price;
-            account.price_currency = price_currency;
-            changed = true;
+    {
+        let account = &mut file.accounts[index];
+        changed |= look.apply(
+            &mut account.label,
+            &mut account.abbr,
+            &mut account.color,
+            &mut account.price,
+            &mut account.price_currency,
+        );
+        if let Some(auto_burn) = auto_burn {
+            if account.auto_burn != auto_burn {
+                account.auto_burn = auto_burn;
+                changed = true;
+            }
         }
     }
     if changed {
@@ -740,6 +805,144 @@ pub fn edit_account(
     Ok(Edited {
         before,
         account: file.accounts[index].clone(),
+    })
+}
+
+/// What [`edit_subscription`] changed: the subscription before the edit, as
+/// stored afterwards, and the plan change to write as `PlanChanged`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EditedSubscription {
+    pub before: ProviderSubscription,
+    pub subscription: ProviderSubscription,
+    pub plan_change: Option<PlanChange>,
+}
+
+/// What [`ensure_provider_subscription`] did: whether it created the
+/// subscription, and the plan change a reading brought.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ensured {
+    pub created: bool,
+    pub plan_change: Option<PlanChange>,
+}
+
+/// Make sure a provider reading's account has a subscription, under the app
+/// lock; the look of a new one is the store's documented rule. The plan comes
+/// from the reading: a different one is saved and reported as a
+/// [`PlanChange`]; a reading without a plan (Ollama) leaves the typed one. It
+/// takes the app paths rather than a [`Store`] because a subscription never
+/// needs a secret.
+pub fn ensure_provider_subscription(
+    app: &AppPaths,
+    account: &AccountRef,
+    plan: Option<&str>,
+) -> Result<Ensured, SwitchError> {
+    let _app_lock = locks::acquire_app_lock(app, APP_LOCK_TIMEOUT)?;
+    let mut file = store::load_accounts(app)?;
+    let before = file.provider_subscription(account).cloned();
+    let created = file.ensure_provider_subscription(account, plan)?;
+    let after = file
+        .provider_subscription(account)
+        .cloned()
+        .ok_or_else(|| SwitchError::UnknownAccount(format!("{} ({})", account.acc, account.org)))?;
+    let plan_change = if created {
+        None
+    } else {
+        let from = before
+            .as_ref()
+            .and_then(|subscription| subscription.plan.clone());
+        (from != after.plan).then(|| PlanChange {
+            account: after.account.clone(),
+            from,
+            to: after.plan.clone(),
+        })
+    };
+    if created || plan_change.is_some() {
+        store::save_accounts(app, &file)?;
+    }
+    Ok(Ensured {
+        created,
+        plan_change,
+    })
+}
+
+/// Change a provider subscription's look, its plan (Ollama only; OpenAI's plan
+/// comes from the provider) or its monthly price. Every value goes through the
+/// store's validator first, so an invalid value leaves the file untouched. The
+/// price is stored in the settings' currency, exactly as an account's is. It
+/// takes the app paths rather than a [`Store`] because a subscription never
+/// needs a secret.
+#[allow(clippy::too_many_arguments)]
+pub fn edit_subscription(
+    app: &AppPaths,
+    account: &AccountRef,
+    label: Option<&str>,
+    abbr: Option<&str>,
+    color: Option<&str>,
+    plan: Option<Option<&str>>,
+    price: Option<Option<f64>>,
+) -> Result<EditedSubscription, SwitchError> {
+    let _app_lock = locks::acquire_app_lock(app, APP_LOCK_TIMEOUT)?;
+    let mut file = store::load_accounts(app)?;
+    let index = file
+        .provider_subscriptions
+        .iter()
+        .position(|subscription| &subscription.account == account)
+        .ok_or_else(|| SwitchError::UnknownAccount(format!("{} ({})", account.acc, account.org)))?;
+
+    let look = LookEdit::validate(
+        &file,
+        AbbrOwner::Subscription(index),
+        label,
+        abbr,
+        color,
+        price,
+    )?;
+    let plan = match plan {
+        Some(value) => {
+            if Company::of_account(&file.provider_subscriptions[index].account) != Company::Ollama {
+                return Err(SwitchError::PlanFromProvider { company: "OpenAI" });
+            }
+            Some(
+                value
+                    .map(store::validate_label)
+                    .transpose()?
+                    .filter(|name| !name.is_empty()),
+            )
+        }
+        None => None,
+    };
+
+    let mut changed = false;
+    let before = file.provider_subscriptions[index].clone();
+    {
+        let subscription = &mut file.provider_subscriptions[index];
+        changed |= look.apply(
+            &mut subscription.label,
+            &mut subscription.abbr,
+            &mut subscription.color,
+            &mut subscription.price,
+            &mut subscription.price_currency,
+        );
+        if let Some(plan) = plan {
+            if subscription.plan != plan {
+                subscription.plan = plan;
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        store::save_accounts(app, &file)?;
+    }
+    let after = file.provider_subscriptions[index].clone();
+    let plan_change = (before.plan != after.plan).then(|| PlanChange {
+        account: after.account.clone(),
+        from: before.plan.clone(),
+        to: after.plan.clone(),
+    });
+    Ok(EditedSubscription {
+        before,
+        subscription: after,
+        plan_change,
     })
 }
 
@@ -1890,6 +2093,69 @@ mod tests {
             before,
             "a refused price leaves accounts.json untouched"
         );
+    }
+
+    #[test]
+    fn edit_subscription_uses_the_shared_look_rule_and_the_settings_currency() {
+        let w = World::new();
+        w.set_currency("EUR");
+        let codex = AccountRef {
+            acc: "0f3a6c2e-7b1d-4e9a-8c5f-2d4b6a8e0c13".to_string(),
+            org: crate::providers::CODEX_ORG.to_string(),
+        };
+        let mut file = w.account_file();
+        assert!(file
+            .ensure_provider_subscription(&codex, Some("Plus"))
+            .unwrap());
+        w.store.save(&file).unwrap();
+
+        let edited = edit_subscription(
+            w.store.app_paths(),
+            &codex,
+            Some("OpenAI Team"),
+            Some("OX"),
+            Some("#111827"),
+            None,
+            Some(Some(180.0)),
+        )
+        .unwrap();
+        assert_eq!(edited.subscription.label, "OpenAI Team");
+        assert_eq!(edited.subscription.abbr, "OX");
+        assert_eq!(edited.subscription.color, "#111827");
+        assert_eq!(edited.subscription.price, Some(180.0));
+        assert_eq!(
+            edited.subscription.price_currency.as_deref(),
+            Some("EUR"),
+            "a subscription price takes the settings' currency, as an account's does"
+        );
+
+        // The one abbreviation rule: a subscription may not have three characters.
+        let refused = edit_subscription(
+            w.store.app_paths(),
+            &codex,
+            None,
+            Some("OA2"),
+            None,
+            None,
+            None,
+        );
+        assert!(matches!(
+            refused,
+            Err(SwitchError::Store(StoreError::InvalidAbbr(_)))
+        ));
+
+        let cleared = edit_subscription(
+            w.store.app_paths(),
+            &codex,
+            None,
+            None,
+            None,
+            None,
+            Some(None),
+        )
+        .unwrap();
+        assert_eq!(cleared.subscription.price, None);
+        assert_eq!(cleared.subscription.price_currency, None);
     }
 
     #[test]

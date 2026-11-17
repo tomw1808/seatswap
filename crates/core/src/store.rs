@@ -13,6 +13,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::atomic::{self, write_atomic, Access};
+use crate::history::AccountRef;
 use crate::paths::AppPaths;
 use crate::types::{Login, OAuthAccount};
 
@@ -58,7 +59,7 @@ pub enum StoreError {
     UnsupportedVersion(u32),
     #[error("invalid abbreviation {0:?}: use 1-2 letters A-Z or digits")]
     InvalidAbbr(String),
-    #[error("abbreviation {0:?} is already used by another account")]
+    #[error("abbreviation {0:?} is already used by another account or subscription")]
     DuplicateAbbr(String),
     #[error("invalid colour {0:?}: use #rrggbb")]
     InvalidColor(String),
@@ -82,6 +83,8 @@ pub enum StoreError {
     InvalidPrice(f64),
     #[error("invalid account id {0:?}: expected 32 lower-case hex characters")]
     InvalidId(String),
+    #[error("{0} is not a provider account: its org is neither codex nor ollama")]
+    NotProvider(String),
     #[error("Claude Code's account identity (oauthAccount in {path}) is missing or incomplete")]
     MissingIdentity { path: PathBuf },
 }
@@ -1305,6 +1308,34 @@ fn validate_statusline(config: &StatuslineConfig) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// A provider subscription stored beside the Claude accounts (spec R4): Codex's
+/// or Ollama's login, with the look and monthly price a Claude account has.
+/// The plan comes from the provider (Codex's `plan_type`) or, for Ollama, from
+/// the person; `price` and `price_currency` follow an account's rule.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSubscription {
+    pub account: AccountRef,
+    pub label: String,
+    pub abbr: String,
+    pub color: String,
+    #[serde(default)]
+    pub plan: Option<String>,
+    #[serde(default)]
+    pub price: Option<f64>,
+    #[serde(default)]
+    pub price_currency: Option<String>,
+}
+
+/// Which row an abbreviation check leaves out: the Claude account or the
+/// provider subscription an edit is changing, if any. [`AccountsFile::taken_abbrs`]
+/// reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbbrOwner {
+    Account(usize),
+    Subscription(usize),
+}
+
 /// `accounts.json` with its version. Only version 1 exists; a different version
 /// is [`StoreError::UnsupportedVersion`], never silently upgraded.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1313,6 +1344,11 @@ pub struct AccountsFile {
     pub version: u32,
     #[serde(default)]
     pub accounts: Vec<Account>,
+    /// The provider subscriptions, one per Codex or Ollama login (spec R4). An
+    /// older file without the key loads with an empty list, and 1.2 reads a
+    /// file that has it because it has no `deny_unknown_fields`.
+    #[serde(default)]
+    pub provider_subscriptions: Vec<ProviderSubscription>,
     #[serde(default)]
     pub settings: Settings,
     /// The secret backend chosen on first use; `None` means no choice was
@@ -1326,6 +1362,7 @@ impl Default for AccountsFile {
         AccountsFile {
             version: ACCOUNTS_VERSION,
             accounts: Vec::new(),
+            provider_subscriptions: Vec::new(),
             settings: Settings::default(),
             secrets_backend: None,
         }
@@ -1354,6 +1391,112 @@ impl AccountsFile {
                 .iter()
                 .find(|a| a.abbr.eq_ignore_ascii_case(key))
         })
+    }
+
+    /// Every abbreviation in use, upper-cased: the Claude accounts' and the
+    /// provider subscriptions', leaving out `except` (the row an edit is
+    /// changing, which may keep its own). This is the one list every
+    /// abbreviation check reads.
+    pub fn taken_abbrs(&self, except: Option<AbbrOwner>) -> Vec<String> {
+        let skip_account = match except {
+            Some(AbbrOwner::Account(index)) => Some(index),
+            _ => None,
+        };
+        let skip_subscription = match except {
+            Some(AbbrOwner::Subscription(index)) => Some(index),
+            _ => None,
+        };
+        self.accounts
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| Some(*index) != skip_account)
+            .map(|(_, account)| account.abbr.trim().to_ascii_uppercase())
+            .chain(
+                self.provider_subscriptions
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| Some(*index) != skip_subscription)
+                    .map(|(_, subscription)| subscription.abbr.trim().to_ascii_uppercase()),
+            )
+            .collect()
+    }
+
+    /// The provider subscription of `account`, or `None`.
+    pub fn provider_subscription(&self, account: &AccountRef) -> Option<&ProviderSubscription> {
+        self.provider_subscriptions
+            .iter()
+            .find(|subscription| &subscription.account == account)
+    }
+
+    /// Make sure `account` has a provider subscription, and give it `plan` when
+    /// it is new or the provider names another plan. Returns whether it was
+    /// created.
+    ///
+    /// A new subscription's look is the documented rule: OpenAI becomes
+    /// "OpenAI", `OA`, `#db2777`; Ollama becomes "Ollama", `OL`, `#ea580c`.
+    /// Its abbreviation is unique among the Claude accounts and the other
+    /// subscriptions; when `OA` or `OL` is taken, the base's first letter with
+    /// the first free digit 2-9 (`O2`, `O3`, …) is used. Every abbreviation
+    /// goes through the one [`validate_abbr`] rule. Only a Codex or Ollama
+    /// `AccountRef` makes a subscription; a Claude account's org is refused.
+    pub fn ensure_provider_subscription(
+        &mut self,
+        account: &AccountRef,
+        plan: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let plan = plan.map(str::trim).filter(|name| !name.is_empty());
+        if let Some(existing) = self
+            .provider_subscriptions
+            .iter_mut()
+            .find(|subscription| &subscription.account == account)
+        {
+            if let Some(plan) = plan {
+                if existing.plan.as_deref() != Some(plan) {
+                    existing.plan = Some(plan.to_string());
+                }
+            }
+            return Ok(false);
+        }
+        let company = crate::money::Company::of_account(account);
+        let (label, base_abbr, color) = match company {
+            crate::money::Company::OpenAI => ("OpenAI", "OA", "#db2777"),
+            crate::money::Company::Ollama => ("Ollama", "OL", "#ea580c"),
+            crate::money::Company::Anthropic => {
+                return Err(StoreError::NotProvider(account.acc.clone()))
+            }
+        };
+        let abbr = self.unique_subscription_abbr(base_abbr)?;
+        self.provider_subscriptions.push(ProviderSubscription {
+            account: account.clone(),
+            label: label.to_string(),
+            abbr,
+            color: color.to_string(),
+            plan: plan.map(str::to_string),
+            price: None,
+            price_currency: None,
+        });
+        Ok(true)
+    }
+
+    /// The first free provider abbreviation: the base, then the base's first
+    /// letter with the first free digit 2-9 appended. The rule is the
+    /// subscription look's; it is checked against every abbreviation in use,
+    /// never replaced.
+    fn unique_subscription_abbr(&self, base: &str) -> Result<String, StoreError> {
+        let taken: HashSet<String> = self.taken_abbrs(None).into_iter().collect();
+        if !taken.contains(base) {
+            return Ok(base.to_string());
+        }
+        let Some(first) = base.chars().next() else {
+            return Err(StoreError::DuplicateAbbr(base.to_string()));
+        };
+        for number in 2..=9 {
+            let candidate = format!("{first}{number}");
+            if !taken.contains(&candidate) {
+                return Ok(candidate);
+            }
+        }
+        Err(StoreError::DuplicateAbbr(base.to_string()))
     }
 }
 
@@ -1578,20 +1721,28 @@ impl Store {
     }
 
     /// Pretty JSON, mode 0600, through [`write_atomic`]; creates the data folder
-    /// (0700) when it is missing.
+    /// (0700) when it is missing. [`save_accounts`] is the one writer.
     pub fn save(&self, file: &AccountsFile) -> Result<(), StoreError> {
-        let path = self.app.accounts_file();
-        if file.version != ACCOUNTS_VERSION {
-            return Err(StoreError::UnsupportedVersion(file.version));
-        }
-        atomic::ensure_private_dir(&self.app.data_dir)
-            .map_err(|e| io_error(&self.app.data_dir, e))?;
-        let bytes = serde_json::to_vec_pretty(file).map_err(|e| StoreError::Io {
-            path: path.clone(),
-            source: io::Error::new(io::ErrorKind::InvalidData, e),
-        })?;
-        write_atomic(&path, &bytes, Access::Private).map_err(|e| io_error(&path, e))
+        save_accounts(&self.app, file)
     }
+}
+
+/// Write `accounts.json` without opening a secret store: pretty JSON, mode
+/// 0600, through [`write_atomic`]; creates the data folder (0700) when it is
+/// missing. The counterpart of [`load_accounts`] and the one writer of the
+/// file, used both by [`Store::save`] and by a caller that only keeps the
+/// account and subscription list.
+pub fn save_accounts(app: &AppPaths, file: &AccountsFile) -> Result<(), StoreError> {
+    let path = app.accounts_file();
+    if file.version != ACCOUNTS_VERSION {
+        return Err(StoreError::UnsupportedVersion(file.version));
+    }
+    atomic::ensure_private_dir(&app.data_dir).map_err(|e| io_error(&app.data_dir, e))?;
+    let bytes = serde_json::to_vec_pretty(file).map_err(|e| StoreError::Io {
+        path: path.clone(),
+        source: io::Error::new(io::ErrorKind::InvalidData, e),
+    })?;
+    write_atomic(&path, &bytes, Access::Private).map_err(|e| io_error(&path, e))
 }
 
 /// Read `accounts.json` without opening a secret store. A missing file is an
@@ -1680,7 +1831,9 @@ pub fn default_abbr(label: &str) -> Result<String, StoreError> {
 }
 
 /// Trim, upper-case, check 1-2 of A-Z 0-9, and check it is not in `others`
-/// (the abbreviations of the other accounts; compared case-insensitively).
+/// (every other abbreviation in use: the other accounts' and subscriptions';
+/// compared case-insensitively). The one abbreviation rule for accounts and
+/// provider subscriptions.
 pub fn validate_abbr(abbr: &str, others: &[&str]) -> Result<String, StoreError> {
     let normalized = abbr.trim().to_ascii_uppercase();
     let valid = (1..=2).contains(&normalized.chars().count())
@@ -1882,11 +2035,7 @@ pub fn new_account(
             validate_label(raw)?
         }
     };
-    let taken: HashSet<String> = file
-        .accounts
-        .iter()
-        .map(|a| a.abbr.trim().to_ascii_uppercase())
-        .collect();
+    let taken: HashSet<String> = file.taken_abbrs(None).into_iter().collect();
     let abbr = unique_abbr(&label, &taken)?;
     let color = pick_color(file);
     Ok(Account {
@@ -4016,5 +4165,130 @@ mod tests {
         file.secrets_backend = None;
         store.save(&file).unwrap();
         assert_eq!(store.load().unwrap().secrets_backend, None);
+    }
+
+    #[test]
+    fn a_provider_subscription_is_created_once_with_its_look() {
+        let mut file = AccountsFile::default();
+        let codex = AccountRef {
+            acc: "0f3a6c2e-7b1d-4e9a-8c5f-2d4b6a8e0c13".to_string(),
+            org: crate::providers::CODEX_ORG.to_string(),
+        };
+        assert!(file
+            .ensure_provider_subscription(&codex, Some("Plus"))
+            .unwrap());
+        let subscription = file.provider_subscription(&codex).expect("OA");
+        assert_eq!(
+            (
+                subscription.label.as_str(),
+                subscription.abbr.as_str(),
+                subscription.color.as_str(),
+                subscription.plan.as_deref(),
+            ),
+            ("OpenAI", "OA", "#db2777", Some("Plus"))
+        );
+        assert_eq!(subscription.price, None);
+        assert_eq!(subscription.price_currency, None);
+
+        let ollama = AccountRef {
+            acc: crate::providers::OLLAMA_ORG.to_string(),
+            org: crate::providers::OLLAMA_ORG.to_string(),
+        };
+        assert!(file.ensure_provider_subscription(&ollama, None).unwrap());
+        let subscription = file.provider_subscription(&ollama).expect("OL");
+        assert_eq!(
+            (
+                subscription.label.as_str(),
+                subscription.abbr.as_str(),
+                subscription.color.as_str(),
+                subscription.plan.as_deref(),
+            ),
+            ("Ollama", "OL", "#ea580c", None)
+        );
+
+        assert!(!file
+            .ensure_provider_subscription(&codex, Some("Plus"))
+            .unwrap());
+        assert_eq!(
+            file.provider_subscription(&codex)
+                .and_then(|subscription| subscription.plan.as_deref()),
+            Some("Plus"),
+            "a second call kept the plan"
+        );
+        assert!(!file.ensure_provider_subscription(&ollama, None).unwrap());
+        assert_eq!(file.provider_subscriptions.len(), 2);
+
+        let json = serde_json::to_value(&file).unwrap();
+        assert!(json.get("providerSubscriptions").is_some());
+        let older: AccountsFile =
+            serde_json::from_value(json!({"version": 1, "accounts": []})).unwrap();
+        assert!(
+            older.provider_subscriptions.is_empty(),
+            "an older file without the field loads with none"
+        );
+    }
+
+    #[test]
+    fn a_subscription_takes_the_next_free_abbreviation() {
+        let now = now();
+        let mut file = AccountsFile::default();
+        let oak = identity(ONE_ACCOUNT_UUID, ONE_ORG_UUID, "Oak", "one@example.com");
+        let mut oak = new_account(&sample_login(), &oak, None, &file, now).unwrap();
+        assert_eq!(oak.abbr, "OA");
+        oak.abbr = "OA".to_string();
+        file.accounts.push(oak);
+        let o2 = identity(TWO_ACCOUNT_UUID, TWO_ORG_UUID, "O2", "two@example.com");
+        let mut o2 = new_account(&sample_login(), &o2, None, &file, now).unwrap();
+        o2.abbr = "O2".to_string();
+        file.accounts.push(o2);
+
+        let codex = AccountRef {
+            acc: "0f3a6c2e-7b1d-4e9a-8c5f-2d4b6a8e0c13".to_string(),
+            org: crate::providers::CODEX_ORG.to_string(),
+        };
+        assert!(file
+            .ensure_provider_subscription(&codex, Some("Plus"))
+            .unwrap());
+
+        assert_eq!(
+            file.provider_subscription(&codex)
+                .expect("the OpenAI subscription")
+                .abbr,
+            "O3",
+            "the base and O2 are taken, so the first free digit is 3"
+        );
+    }
+
+    #[test]
+    fn a_new_account_does_not_take_a_subscriptions_abbreviation() {
+        let now = now();
+        let mut file = AccountsFile::default();
+        let codex = AccountRef {
+            acc: "0f3a6c2e-7b1d-4e9a-8c5f-2d4b6a8e0c13".to_string(),
+            org: crate::providers::CODEX_ORG.to_string(),
+        };
+        assert!(file
+            .ensure_provider_subscription(&codex, Some("Plus"))
+            .unwrap());
+        assert_eq!(
+            file.provider_subscription(&codex)
+                .expect("the OpenAI subscription")
+                .abbr,
+            "OA"
+        );
+
+        let oak_area = identity(
+            TWO_ACCOUNT_UUID,
+            TWO_ORG_UUID,
+            "Oak Area",
+            "two@example.com",
+        );
+        let account = new_account(&sample_login(), &oak_area, None, &file, now).unwrap();
+
+        assert_ne!(
+            account.abbr, "OA",
+            "the new Claude account took the subscription's abbreviation"
+        );
+        assert_eq!(account.abbr, "OK");
     }
 }

@@ -38,9 +38,10 @@ use seatswap_core::history::{
     SessionCounts,
 };
 use seatswap_core::locks::{self, LockError};
+use seatswap_core::money::Company;
 use seatswap_core::paths::{AppPaths, ClaudePaths};
 use seatswap_core::shared;
-use seatswap_core::store::{self, Account, AccountsFile, Settings, Store};
+use seatswap_core::store::{self, Account, AccountsFile, ProviderSubscription, Settings, Store};
 use seatswap_core::switcher::{self, LiveState, SwitchError, Synced, UnsavedPolicy};
 #[cfg(test)]
 use seatswap_core::types::Login;
@@ -105,6 +106,9 @@ pub(crate) struct Snapshot {
     /// The stored accounts behind the views: the Accounts group needs fields the
     /// card does not (`price`, `orgName`) and never a usage payload.
     pub accounts: Vec<AccountRow>,
+    /// The provider subscriptions, listed under the Claude accounts in Settings
+    /// → Accounts (spec R4).
+    pub provider_subscriptions: Vec<ProviderSubscriptionRow>,
     pub active_id: Option<String>,
     pub live: LiveView,
     pub burn: Option<super::burn_rt::BurnView>,
@@ -174,6 +178,36 @@ impl AccountRow {
     }
 }
 
+/// One provider subscription as Settings → Accounts shows it: its account
+/// reference, the company the org names, and its look, plan and price.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProviderSubscriptionRow {
+    pub account: AccountRef,
+    pub company: Company,
+    pub label: String,
+    pub abbr: String,
+    pub color: String,
+    pub plan: Option<String>,
+    pub price: Option<f64>,
+    pub price_currency: Option<String>,
+}
+
+impl ProviderSubscriptionRow {
+    fn of(subscription: &ProviderSubscription) -> ProviderSubscriptionRow {
+        ProviderSubscriptionRow {
+            account: subscription.account.clone(),
+            company: Company::of_account(&subscription.account),
+            label: subscription.label.clone(),
+            abbr: subscription.abbr.clone(),
+            color: subscription.color.clone(),
+            plan: subscription.plan.clone(),
+            price: subscription.price,
+            price_currency: subscription.price_currency.clone(),
+        }
+    }
+}
+
 /// Claude Code's running sessions as the panel shows them (spec §1.6).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -213,6 +247,7 @@ impl Snapshot {
         Snapshot {
             views: Vec::new(),
             accounts: Vec::new(),
+            provider_subscriptions: Vec::new(),
             active_id: None,
             live: LiveView::NoLogin,
             burn: None,
@@ -330,6 +365,17 @@ pub(crate) enum ActionCommand {
         color: Option<String>,
         auto_burn: Option<bool>,
         /// `None` leaves the price alone; `Some(None)` clears it.
+        price: Option<Option<f64>>,
+        reply: Sender<ActionReply>,
+    },
+    EditSubscription {
+        account: AccountRef,
+        label: Option<String>,
+        abbr: Option<String>,
+        color: Option<String>,
+        /// `None` leaves the plan alone; `Some(None)` clears it. OpenAI refuses
+        /// either because its plan comes from the provider.
+        plan: Option<Option<String>>,
         price: Option<Option<f64>>,
         reply: Sender<ActionReply>,
     },
@@ -567,12 +613,18 @@ pub(crate) struct SnapshotParts {
 pub(crate) fn build_snapshot(parts: SnapshotParts) -> Snapshot {
     let mut error = parts.engine_error;
     let mut accounts = Vec::new();
+    let mut provider_subscriptions = Vec::new();
     let (settings, live, warnings) = match parts.accounts {
         Ok(file) => {
             accounts = file
                 .accounts
                 .iter()
                 .map(|account| AccountRow::of(account, &parts.views))
+                .collect();
+            provider_subscriptions = file
+                .provider_subscriptions
+                .iter()
+                .map(ProviderSubscriptionRow::of)
                 .collect();
             let live = match parts.live {
                 Ok(state) => LiveView::from(state),
@@ -614,6 +666,7 @@ pub(crate) fn build_snapshot(parts: SnapshotParts) -> Snapshot {
     Snapshot {
         views: parts.views,
         accounts,
+        provider_subscriptions,
         active_id,
         live,
         burn: None,
@@ -1314,6 +1367,18 @@ impl ActionRuntime {
                 } => {
                     let _ = reply.send(self.edit(&key, label, abbr, color, auto_burn, price));
                 }
+                ActionCommand::EditSubscription {
+                    account,
+                    label,
+                    abbr,
+                    color,
+                    plan,
+                    price,
+                    reply,
+                } => {
+                    let _ = reply
+                        .send(self.edit_subscription(&account, label, abbr, color, plan, price));
+                }
                 ActionCommand::Remove { key, reply } => {
                     let _ = reply.send(self.remove(&key));
                 }
@@ -1595,6 +1660,45 @@ impl ActionRuntime {
             Ok(edited) => {
                 let (history, open_error) = self.history_for_action();
                 if let Some(error) = ops::record_edit(history, &edited, Utc::now()).or(open_error) {
+                    self.reported_errors.report(&error);
+                }
+                let _ = self.engine.send(EngineCommand::Publish);
+                ActionReply::Done
+            }
+            Err(error) => ActionReply::Failed(error.to_string()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn edit_subscription(
+        &mut self,
+        account: &AccountRef,
+        label: Option<String>,
+        abbr: Option<String>,
+        color: Option<String>,
+        plan: Option<Option<String>>,
+        price: Option<Option<f64>>,
+    ) -> ActionReply {
+        let result = switcher::edit_subscription(
+            &self.app,
+            account,
+            label.as_deref(),
+            abbr.as_deref(),
+            color.as_deref(),
+            plan.as_ref().map(|value| value.as_deref()),
+            price,
+        );
+        match result {
+            Ok(edited) => {
+                let now = Utc::now();
+                let (history, open_error) = self.history_for_action();
+                let mut error = ops::record_edit(history, &edited, now);
+                if let (Some(change), Some(recorder)) = (&edited.plan_change, history) {
+                    if let Err(plan_error) = ops::record_plan_change(recorder, change, now) {
+                        error.get_or_insert_with(|| ops::history_unwritable(&plan_error));
+                    }
+                }
+                if let Some(error) = error.or(open_error) {
                     self.reported_errors.report(&error);
                 }
                 let _ = self.engine.send(EngineCommand::Publish);
@@ -2302,6 +2406,7 @@ mod tests {
                 "lastPollAt",
                 "live",
                 "pending",
+                "providerSubscriptions",
                 "providers",
                 "secretsWarning",
                 "sessions",

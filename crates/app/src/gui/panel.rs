@@ -19,7 +19,8 @@ use tauri::{
 use seatswap_core::atomic::{self, Access};
 use seatswap_core::engine::PollReason;
 use seatswap_core::history::{
-    export_csv, export_json, By, Event, EventKind, HistoryDir, HostConflict, HostInfo, Hosts, Range,
+    export_csv, export_json, AccountRef, By, Event, EventKind, HistoryDir, HostConflict, HostInfo,
+    Hosts, Range,
 };
 use seatswap_core::projects::{self, ProjectEdit, Projects, ProjectsLogRecord};
 use seatswap_core::store::{self, Account, Settings};
@@ -619,6 +620,54 @@ pub(crate) async fn edit_account(
             abbr,
             color,
             auto_burn,
+            price,
+            reply,
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    match reply {
+        ActionReply::Done => Ok(()),
+        ActionReply::Failed(message) => Err(message),
+        _ => Err("the action thread gave an unexpected reply".to_string()),
+    }
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn edit_subscription(
+    state: State<'_, GuiState>,
+    account: AccountRef,
+    label: Option<String>,
+    abbr: Option<String>,
+    color: Option<String>,
+    // Absent leaves the plan alone, `null` clears it, text sets it.
+    plan: Option<serde_json::Value>,
+    // Absent leaves the price alone, `null` clears it, a number sets it.
+    price: Option<serde_json::Value>,
+) -> Result<(), String> {
+    let plan = match plan {
+        None => None,
+        Some(serde_json::Value::Null) => Some(None),
+        Some(serde_json::Value::String(text)) => Some(Some(text)),
+        Some(_) => return Err("the plan must be text or null".to_string()),
+    };
+    let price = match price {
+        None => None,
+        Some(serde_json::Value::Null) => Some(None),
+        Some(value) => match value.as_f64() {
+            Some(amount) => Some(Some(amount)),
+            None => return Err("the price must be a number above 0 per month".to_string()),
+        },
+    };
+    let action = state.action.clone();
+    let reply = tauri::async_runtime::spawn_blocking(move || {
+        request(&action, |reply| ActionCommand::EditSubscription {
+            account,
+            label,
+            abbr,
+            color,
+            plan,
             price,
             reply,
         })

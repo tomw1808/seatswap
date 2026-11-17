@@ -290,6 +290,7 @@ function makeFixture() {
   const acmeId = "5d1c2a9b-e0d3-4c11-9e21-7c8f1a2b3c4d";
   const labId = "8b4e7f20-6a1d-4d33-b8c5-2f9a0e6d7c81";
   const privateId = "c0a1b2d3-e4f5-4a6b-8c7d-9e0f1a2b3c4d";
+  const codexAccountId = "0f3a6c2e-7b1d-4e9a-8c5f-2d4b6a8e0c13";
   return {
     // The folder the app runs with (the Snapshot's field); the General group
     // shows it as the empty config-folder field's placeholder.
@@ -477,6 +478,30 @@ function makeFixture() {
         isActive: true,
       },
     ],
+    // The provider subscriptions under the Claude accounts (spec R4): OpenAI
+    // with the provider's plan and a monthly price, Ollama without either.
+    providerSubscriptions: [
+      {
+        account: { acc: codexAccountId, org: "codex" },
+        company: "openai",
+        label: "OpenAI",
+        abbr: "OA",
+        color: "#db2777",
+        plan: "Plus",
+        price: 23.0,
+        priceCurrency: "EUR",
+      },
+      {
+        account: { acc: "ollama", org: "ollama" },
+        company: "ollama",
+        label: "Ollama",
+        abbr: "OL",
+        color: "#ea580c",
+        plan: null,
+        price: null,
+        priceCurrency: null,
+      },
+    ],
     activeId: acmeId,
     live: { kind: "known", accountId: acmeId },
     burn: {
@@ -558,7 +583,7 @@ function makeFixture() {
     providerCardViews: [
       {
         provider: "codex",
-        title: "Codex",
+        title: "OpenAI (Codex)",
         plan: "Plus",
         usage: {
           limits: [
@@ -1059,8 +1084,11 @@ export async function fixtureInvoke(command, args) {
           `invalid abbreviation ${JSON.stringify(abbr)}: use 1-2 letters A-Z or digits`
         );
       }
-      if (fixture.views.some((entry) => entry.id !== view.id && entry.abbr === abbr)) {
-        throw new Error(`abbreviation ${JSON.stringify(abbr)} is already used by another account`);
+      if (
+        fixture.views.some((entry) => entry.id !== view.id && entry.abbr === abbr) ||
+        fixture.providerSubscriptions.some((entry) => entry.abbr === abbr)
+      ) {
+        throw new Error(`abbreviation ${JSON.stringify(abbr)} is already used`);
       }
       const color = (args.color === undefined || args.color === null
         ? account.color
@@ -1111,6 +1139,88 @@ export async function fixtureInvoke(command, args) {
       account.price = price;
       account.priceCurrency = priceCurrency;
       return clone(account);
+    }
+
+    case "edit_subscription": {
+      const account = isObject(args.account) ? args.account : null;
+      if (!account || typeof account.acc !== "string" || typeof account.org !== "string") {
+        throw new Error("edit_subscription needs an account {acc, org}");
+      }
+      const subscription = fixture.providerSubscriptions.find(
+        (entry) =>
+          isObject(entry.account) &&
+          entry.account.acc === account.acc &&
+          entry.account.org === account.org
+      );
+      if (!subscription) throw new Error(`unknown provider subscription ${account.org}/${account.acc}`);
+      if (args.label !== undefined && args.label !== null) {
+        const label = String(args.label).trim();
+        if (!label || label.length > 40) {
+          throw new Error(`invalid label ${JSON.stringify(label)}: use 1 to 40 characters`);
+        }
+        subscription.label = label;
+      }
+      if (args.abbr !== undefined && args.abbr !== null) {
+        const abbr = String(args.abbr).trim().toUpperCase();
+        if (!/^[A-Z0-9]{1,2}$/.test(abbr)) {
+          throw new Error(
+            `invalid abbreviation ${JSON.stringify(abbr)}: use 1-2 letters A-Z or digits`
+          );
+        }
+        const taken = [
+          ...fixture.accounts.map((entry) => entry.abbr),
+          ...fixture.providerSubscriptions
+            .filter((entry) => entry !== subscription)
+            .map((entry) => entry.abbr),
+        ];
+        if (taken.some((entry) => String(entry).toUpperCase() === abbr)) {
+          throw new Error(`abbreviation ${JSON.stringify(abbr)} is already used`);
+        }
+        subscription.abbr = abbr;
+      }
+      if (args.color !== undefined && args.color !== null) {
+        const color = String(args.color).trim().toLowerCase();
+        if (!/^#[0-9a-f]{6}$/.test(color)) {
+          throw new Error(`invalid colour ${JSON.stringify(color)}: use #rrggbb`);
+        }
+        subscription.color = color;
+      }
+      if (Object.prototype.hasOwnProperty.call(args, "plan")) {
+        if (subscription.company !== "ollama") {
+          throw new Error("OpenAI's plan comes from the provider and cannot be edited here");
+        }
+        const plan = args.plan === null ? "" : String(args.plan).trim();
+        if (!plan) {
+          subscription.plan = null;
+        } else if (plan.length > 40) {
+          throw new Error(`invalid plan ${JSON.stringify(plan)}: use 1 to 40 characters`);
+        } else {
+          subscription.plan = plan;
+        }
+      }
+      if (Object.prototype.hasOwnProperty.call(args, "price")) {
+        if (args.price === null || args.price === "") {
+          subscription.price = null;
+          subscription.priceCurrency = null;
+        } else {
+          const code =
+            typeof fixture.settings.currency === "string"
+              ? fixture.settings.currency
+              : null;
+          if (!code) {
+            throw new Error("set a currency in Settings → General before a price");
+          }
+          const amount = Number(args.price);
+          if (!Number.isFinite(amount) || amount <= 0) {
+            throw new Error(
+              `invalid price ${String(args.price)}: use a number above 0 per month`
+            );
+          }
+          subscription.price = amount;
+          subscription.priceCurrency = code;
+        }
+      }
+      return clone(subscription);
     }
 
     case "remove_account": {

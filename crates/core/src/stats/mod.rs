@@ -18,7 +18,7 @@ use crate::history::{
 };
 use crate::live_sessions::Values;
 use crate::money::{
-    window_money, Fx, Missing, MoneyError, Prices, Provider, Valued, Valuer, WindowMoney,
+    window_money, Company, Fx, Missing, MoneyError, Prices, Valued, Valuer, WindowMoney,
 };
 use crate::projects::{Projects, ProjectsLogRecord};
 use crate::store::{Account, Settings};
@@ -894,12 +894,12 @@ pub(crate) fn account_chosen<Tz: TimeZone + Copy>(
 /// Whether the query chooses a valued token record on a page of project work:
 /// a Claude record by its account ([`account_chosen`], so a Claude record
 /// without a known account is left out by a filter), while a record of
-/// another provider (Codex, Ollama) uses no Claude account and is chosen
+/// another company (OpenAI, Ollama) uses no Claude account and is chosen
 /// whatever the account chips say.
 pub(crate) fn record_chosen<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, q: &Query, value: &Valued) -> bool {
-    match value.provider {
-        Provider::Claude => account_chosen(ctx, q, value.account.as_ref()),
-        Provider::Codex | Provider::Ollama => true,
+    match value.company {
+        Company::Anthropic => account_chosen(ctx, q, value.account.as_ref()),
+        Company::OpenAI | Company::Ollama => true,
     }
 }
 

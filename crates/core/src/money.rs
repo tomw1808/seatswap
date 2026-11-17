@@ -521,76 +521,89 @@ pub fn price_key(provider: &str, model_id: &str) -> String {
     format!("{provider}/{model_id}")
 }
 
-/// Who a token record's model belongs to (spec §11.5): Claude's plan, Codex,
-/// or Ollama's cloud (DeepSeek Harness and flash workers). A Codex or Ollama
-/// record belongs to its provider and to no Claude account.
+/// The company a token record's model belongs to (spec §11.5): Anthropic's
+/// plan, OpenAI (Codex), or Ollama's cloud (DeepSeek Harness and flash
+/// workers). An OpenAI or Ollama record belongs to its company and to no
+/// Claude account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum Provider {
-    Claude,
-    Codex,
+#[serde(rename_all = "lowercase")]
+pub enum Company {
+    Anthropic,
+    OpenAI,
     Ollama,
 }
 
-impl Provider {
-    /// The provider of a model id: the one rule, which [`model_price_key`]
+impl Company {
+    /// The company of a model id: the one rule, which [`model_price_key`]
     /// and [`is_plan_model`] follow.
     ///
-    /// - An id that starts with `claude-` is Claude's.
+    /// - An id that starts with `claude-` is Anthropic's.
     /// - An Ollama cloud id, as DeepSeek Harness and flash name it, is
     ///   Ollama's: `<name>:cloud`, or `<name>:<tag>-cloud`
     ///   (`deepseek-v4.1-flash:1017-cloud`), name and tag not empty.
-    /// - Any other id is Codex's: Codex is the only other source of model ids.
-    pub fn of_model(model: &str) -> Provider {
+    /// - Any other id is OpenAI's: Codex is the only other source of model ids.
+    pub fn of_model(model: &str) -> Company {
         priced_as(model).0
     }
 
-    /// The name a page writes for the provider.
-    pub fn name(&self) -> &'static str {
-        match self {
-            Provider::Claude => "Claude",
-            Provider::Codex => "Codex",
-            Provider::Ollama => "Ollama",
+    /// The company of an account reference: the org `codex` is OpenAI's, the
+    /// org `ollama` is Ollama's, and every other org (a Claude organization id)
+    /// is Anthropic's.
+    pub fn of_account(account: &AccountRef) -> Company {
+        match account.org.as_str() {
+            crate::providers::CODEX_ORG => Company::OpenAI,
+            crate::providers::OLLAMA_ORG => Company::Ollama,
+            // A Claude organization id is a 36-character UUID.
+            _ => Company::Anthropic,
         }
     }
 
-    /// The models.dev list ([`PRICE_PROVIDERS`]) the provider's models are
-    /// priced from.
-    fn price_list(&self) -> &'static str {
+    /// The name a page writes for the company.
+    pub fn name(&self) -> &'static str {
         match self {
-            Provider::Claude => "anthropic",
-            Provider::Codex => "openai",
-            Provider::Ollama => "ollama-cloud",
+            Company::Anthropic => "Anthropic",
+            Company::OpenAI => "OpenAI",
+            Company::Ollama => "Ollama",
+        }
+    }
+
+    /// The models.dev list ([`PRICE_PROVIDERS`]) the company's models are
+    /// priced from.
+    pub fn price_list(&self) -> &'static str {
+        match self {
+            Company::Anthropic => "anthropic",
+            Company::OpenAI => "openai",
+            Company::Ollama => "ollama-cloud",
         }
     }
 }
 
-/// A model id's provider and its id in that provider's models.dev list: the
-/// decision behind [`Provider::of_model`] and [`model_price_key`]. An Ollama
+/// A model id's company and its id in that company's models.dev list: the
+/// decision behind [`Company::of_model`] and [`model_price_key`]. An Ollama
 /// cloud id loses Ollama's `-cloud` marker there: `<name>:cloud` is `<name>`,
 /// `<name>:<tag>-cloud` is `<name>:<tag>`.
-fn priced_as(model: &str) -> (Provider, &str) {
+fn priced_as(model: &str) -> (Company, &str) {
     if model.starts_with("claude-") {
-        return (Provider::Claude, model);
+        return (Company::Anthropic, model);
     }
     if let Some(name) = model.strip_suffix(":cloud") {
         if !name.is_empty() {
-            return (Provider::Ollama, name);
+            return (Company::Ollama, name);
         }
     }
     if let Some(tagged) = model.strip_suffix("-cloud") {
         if let Some((name, tag)) = tagged.rsplit_once(':') {
             if !name.is_empty() && !tag.is_empty() {
-                return (Provider::Ollama, tagged);
+                return (Company::Ollama, tagged);
             }
         }
     }
-    (Provider::Codex, model)
+    (Company::OpenAI, model)
 }
 
 /// The key a model id is priced under (spec §11.5): the one rule every price
-/// look-up of a token record goes through. The provider is
-/// [`Provider::of_model`]'s.
+/// look-up of a token record goes through. The company is
+/// [`Company::of_model`]'s.
 ///
 /// - A Claude model is `anthropic/<id>`.
 /// - An Ollama cloud model is in models.dev's `ollama-cloud` list without
@@ -600,19 +613,19 @@ fn priced_as(model: &str) -> (Provider, &str) {
 ///   `ollama-cloud/deepseek-v4.1-flash:1017`).
 /// - A Codex model is `openai/<id>`.
 ///
-/// A key without a price stays a missing price; no other provider is tried.
+/// A key without a price stays a missing price; no other company is tried.
 pub fn model_price_key(model: &str) -> String {
-    let (provider, id) = priced_as(model);
-    price_key(provider.price_list(), id)
+    let (company, id) = priced_as(model);
+    price_key(company.price_list(), id)
 }
 
 /// Whether `model` is a Claude Code model, so its tokens use the Claude plan
-/// (spec §1.4, §3.8): [`Provider::of_model`] is Claude. A DeepSeek Harness or
+/// (spec §1.4, §3.8): [`Company::of_model`] is Anthropic. A DeepSeek Harness or
 /// flash worker (`deepseek-v4.1-flash:cloud`), a Codex model (`gpt-6.1-sol`)
 /// and an Ollama model (`glm-5:cloud`) are not, so their tokens take no share
 /// of any Claude account's week.
 pub fn is_plan_model(model: &str) -> bool {
-    Provider::of_model(model) == Provider::Claude
+    Company::of_model(model) == Company::Anthropic
 }
 
 /// The value of a token or session cost: the provider's own number when it
@@ -919,8 +932,8 @@ pub struct Valued {
     /// always `None` for a record of another provider than Claude, which uses
     /// no Claude account.
     pub account: Option<AccountRef>,
-    /// The provider of the record's model ([`Provider::of_model`]).
-    pub provider: Provider,
+    /// The company of the record's model ([`Company::of_model`]).
+    pub company: Company,
     /// The currency `api` is in: the settings' currency with a rate, "USD"
     /// without one, and `None` when `api` is `None`.
     pub api_currency: Option<String>,
@@ -1340,14 +1353,14 @@ impl Valuer {
     /// provider than Claude belongs to its provider and to no Claude account,
     /// whichever account was live on its host.
     pub fn value(&self, host: &str, record: &TokenRecord) -> Valued {
-        let provider = Provider::of_model(&record.model);
-        let account = match provider {
-            Provider::Claude => self
+        let company = Company::of_model(&record.model);
+        let account = match company {
+            Company::Anthropic => self
                 .timelines
                 .get(host)
                 .and_then(|timeline| timeline.at(record.t))
                 .cloned(),
-            Provider::Codex | Provider::Ollama => None,
+            Company::OpenAI | Company::Ollama => None,
         };
         let usd = api_usd(record, &self.prices);
         let (api, api_currency, api_missing) = match usd {
@@ -1371,7 +1384,7 @@ impl Valuer {
         // uses no share of any Claude account's week either: its subscription is
         // a known 0; only its API half follows the price rule.
         let no_tokens = record.input == 0 && record.out == 0 && record.cw == 0 && record.cr == 0;
-        let (subscription, subscription_missing) = if no_tokens || provider != Provider::Claude {
+        let (subscription, subscription_missing) = if no_tokens || company != Company::Anthropic {
             (Some(0.0), None)
         } else {
             match (usd, &account) {
@@ -1392,7 +1405,7 @@ impl Valuer {
             api,
             subscription,
             account,
-            provider,
+            company,
             api_currency,
             api_missing,
             subscription_missing,
@@ -3692,28 +3705,44 @@ mod tests {
     }
 
     #[test]
-    fn each_model_has_its_provider() {
-        for (model, provider) in [
-            ("claude-opus-5-5", Provider::Claude),
-            ("claude-fable-5-2", Provider::Claude),
-            ("gpt-6.1-sol", Provider::Codex),
-            ("deepseek-v4.1-flash:cloud", Provider::Ollama),
-            ("deepseek-v4.1-flash:1017-cloud", Provider::Ollama),
-            ("glm-5:cloud", Provider::Ollama),
-            // Neither Ollama form: priced as `openai`, so Codex's.
-            ("gpt-6.1-cloud", Provider::Codex),
-            (":cloud", Provider::Codex),
+    fn company_of_model_maps_gpt_to_openai_and_cloud_tags_to_ollama() {
+        for (model, company) in [
+            ("claude-opus-5-5", Company::Anthropic),
+            ("claude-fable-5-2", Company::Anthropic),
+            ("gpt-5.5-codex", Company::OpenAI),
+            ("gpt-6.1-sol", Company::OpenAI),
+            ("deepseek-v4.1-flash:cloud", Company::Ollama),
+            ("deepseek-v4.1-flash:1017-cloud", Company::Ollama),
+            ("glm-5:cloud", Company::Ollama),
+            // Neither Ollama form: priced as `openai`, so OpenAI's.
+            ("gpt-6.1-cloud", Company::OpenAI),
+            (":cloud", Company::OpenAI),
         ] {
-            assert_eq!(Provider::of_model(model), provider, "{model}");
+            assert_eq!(Company::of_model(model), company, "{model}");
             assert_eq!(
                 is_plan_model(model),
-                provider == Provider::Claude,
+                company == Company::Anthropic,
                 "{model}: one rule"
             );
         }
-        assert_eq!(Provider::Claude.name(), "Claude");
-        assert_eq!(Provider::Codex.name(), "Codex");
-        assert_eq!(Provider::Ollama.name(), "Ollama");
+        assert_eq!(Company::Anthropic.name(), "Anthropic");
+        assert_eq!(Company::OpenAI.name(), "OpenAI");
+        assert_eq!(Company::Ollama.name(), "Ollama");
+    }
+
+    #[test]
+    fn company_of_account_follows_the_org() {
+        assert_eq!(Company::of_account(&ac()), Company::Anthropic);
+        for (org, company) in [
+            (crate::providers::CODEX_ORG, Company::OpenAI),
+            (crate::providers::OLLAMA_ORG, Company::Ollama),
+        ] {
+            let account = AccountRef {
+                acc: "0f3a6c2e-7b1d-4e9a-8c5f-2d4b6a8e0c13".to_string(),
+                org: org.to_string(),
+            };
+            assert_eq!(Company::of_account(&account), company, "{org}");
+        }
     }
 
     /// A Codex or Ollama record done while AC was live belongs to its provider
@@ -3772,7 +3801,7 @@ mod tests {
         .expect("a valuer");
 
         let value = valuer.value("atlas", &codex);
-        assert_eq!(value.provider, Provider::Codex);
+        assert_eq!(value.company, Company::OpenAI);
         assert_eq!(
             value.account, None,
             "AC was live, but Codex uses no Claude account"
@@ -3782,11 +3811,11 @@ mod tests {
         assert_eq!(value.subscription_missing, None);
 
         let value = valuer.value("atlas", &flash);
-        assert_eq!(value.provider, Provider::Ollama);
+        assert_eq!(value.company, Company::Ollama);
         assert_eq!(value.account, None);
 
         let value = valuer.value("atlas", &opus);
-        assert_eq!(value.provider, Provider::Claude);
+        assert_eq!(value.company, Company::Anthropic);
         assert_eq!(value.account, Some(ac()));
     }
 

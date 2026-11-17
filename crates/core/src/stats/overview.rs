@@ -15,7 +15,7 @@ use crate::history::{
     AccountRef, Event, EventKind, Hosted, Hosts, Range, Read, Sample, TokenRecord,
 };
 use crate::live_sessions::Values;
-use crate::money::{Provider, Valuer, WindowMoney};
+use crate::money::{Company, Valuer, WindowMoney};
 use crate::projects::ProjectId;
 
 use super::{
@@ -53,8 +53,8 @@ pub struct ThisWeek {
     /// [`Ctx::accounts`], an account no longer stored after them by id; empty
     /// until the first usage reading.
     pub accounts: Vec<ThisWeekAccount>,
-    /// One per other provider (Codex, Ollama) with token records in the
-    /// current calendar week, in [`Provider`]'s order.
+    /// One per other company (OpenAI, Ollama) with token records in the
+    /// current calendar week, in [`Company`]'s order.
     pub providers: Vec<ThisWeekProvider>,
     /// The API value of every listed account's running window and every
     /// listed provider's week together by project, in percent of their total,
@@ -62,14 +62,14 @@ pub struct ThisWeek {
     pub projects: Vec<(String, f64)>,
 }
 
-/// One other provider's work on the This-week card: its token records from
+/// One other company's work on the This-week card: its token records from
 /// Monday 00:00 of the current calendar week ([`week_start`]) to now. It has
 /// no subscription price yet, so it is valued at API prices only, and it uses
 /// no Claude account, so the account chips do not filter it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThisWeekProvider {
-    /// [`Provider::name`]: `Codex` or `Ollama`.
+    /// [`Company::name`]: `OpenAI` or `Ollama`.
     pub name: String,
     /// The records' API value, summed with [`Values::sum`]; `None` when a
     /// record's is unknown.
@@ -461,7 +461,7 @@ pub fn this_week_card<Tz: TimeZone + Copy>(
     // project, and the same over all of them together.
     let mut by_account: BTreeMap<AccountRef, (Option<Values>, BTreeMap<String, Values>)> =
         BTreeMap::new();
-    let mut by_provider: BTreeMap<Provider, (Option<Values>, BTreeMap<String, Values>)> =
+    let mut by_provider: BTreeMap<Company, (Option<Values>, BTreeMap<String, Values>)> =
         BTreeMap::new();
     let mut total: Option<Values> = None;
     let mut by_project: BTreeMap<String, Values> = BTreeMap::new();
@@ -474,8 +474,8 @@ pub fn this_week_card<Tz: TimeZone + Copy>(
             continue;
         }
         let value = valuer.value(&hosted.host, record);
-        let own = match value.provider {
-            Provider::Claude => {
+        let own = match value.company {
+            Company::Anthropic => {
                 let Some(account) = value.account.as_ref() else {
                     continue;
                 };
@@ -487,11 +487,11 @@ pub fn this_week_card<Tz: TimeZone + Copy>(
                 }
                 by_account.entry(account.clone()).or_default()
             }
-            provider => {
+            company => {
                 if record.t < calendar_week {
                     continue;
                 }
-                by_provider.entry(provider).or_default()
+                by_provider.entry(company).or_default()
             }
         };
         let name = ctx
@@ -531,11 +531,11 @@ pub fn this_week_card<Tz: TimeZone + Copy>(
     });
     let providers = by_provider
         .into_iter()
-        .filter_map(|(provider, (own_total, own_projects))| {
-            // Every provider in the map has at least one record.
+        .filter_map(|(company, (own_total, own_projects))| {
+            // Every company in the map has at least one record.
             let own_total = own_total?;
             Some(ThisWeekProvider {
-                name: provider.name().to_string(),
+                name: company.name().to_string(),
                 api: own_total.api,
                 api_currency: own_total.api_currency.clone(),
                 api_missing: own_total.api_missing.clone(),
@@ -1617,7 +1617,7 @@ mod tests {
             let card = this_week_card(&tiny.ctx(), &query).unwrap();
             assert_eq!(card.providers.len(), 1, "providers: {:?}", card.providers);
             let codex = &card.providers[0];
-            assert_eq!(codex.name, "Codex");
+            assert_eq!(codex.name, "OpenAI");
             assert!(
                 close(codex.api.expect("Codex's price"), 40.0),
                 "4 M output at 10 USD per million: {:?}",

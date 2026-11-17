@@ -169,6 +169,20 @@ function accountIdsOf(snapshot) {
     .join("\u0000");
 }
 
+// The provider subscriptions the snapshot carries (spec R4), listed under the
+// Claude accounts in the same table. A snapshot without the list is an error
+// the page shows; it is never read as an empty list.
+function providerSubscriptionsOf(snapshot) {
+  if (!Array.isArray(snapshot.providerSubscriptions)) {
+    throw new Error("the snapshot has no provider subscriptions list");
+  }
+  return snapshot.providerSubscriptions;
+}
+
+function providerSubscriptionRows() {
+  return providerSubscriptionsOf(state.snapshot || {});
+}
+
 // Open a group: replace the old content only once the views it needs are
 // stored, so the old group stays visible while it loads.
 export async function render(container, context) {
@@ -387,6 +401,25 @@ function saveAccount(account, patch, field) {
   return queuedSave(async () => {
     try {
       await state.context.invoke("edit_account", { key: account.id, ...patch });
+      fieldError(field, null);
+      return true;
+    } catch (error) {
+      fieldError(field, errorMessage(error));
+      return false;
+    }
+  });
+}
+
+// A provider subscription's field saves through `edit_subscription`. The
+// refusals are the same as an account edit's: the error stays under the row and
+// the caller puts the control back.
+function saveSubscription(subscription, patch, field) {
+  return queuedSave(async () => {
+    try {
+      await state.context.invoke("edit_subscription", {
+        account: subscription.account,
+        ...patch,
+      });
       fieldError(field, null);
       return true;
     } catch (error) {
@@ -1301,6 +1334,9 @@ function accountsCard() {
     body.appendChild(h("div", { class: "lr", text: "No accounts yet." }));
   }
   for (const row of rows) body.appendChild(accountRow(row));
+  for (const subscription of providerSubscriptionRows()) {
+    body.appendChild(subscriptionRow(subscription));
+  }
   body.appendChild(
     h("div", { class: "lr acc-add" }, [
       h("span", {
@@ -1316,7 +1352,9 @@ function accountsCard() {
       h("b", { text: "Price" }),
       " is what you pay per month, in the currency set under General. It turns percent into money, so accounts can be added up. ",
       h("b", { text: "Auto-burn may use it:" }),
-      " switch it off for an account that should be left alone.",
+      " switch it off for an account that should be left alone. ",
+      h("b", { text: "OpenAI and Ollama" }),
+      " subscriptions have no login of their own; their plan, when the provider names one, is read-only.",
     ])
   );
   return card;
@@ -1485,7 +1523,196 @@ function accountRow(row) {
   return wrap;
 }
 
-function chipEditor(row, field, changed) {
+// The company a subscription's `company` JSON names; the page never guesses
+// one it does not know.
+function companyName(company) {
+  if (company === "openai") return "OpenAI";
+  if (company === "ollama") return "Ollama";
+  if (company === "anthropic") return "Anthropic";
+  return "—";
+}
+
+function subscriptionPlan(subscription) {
+  if (typeof subscription.plan === "string" && subscription.plan !== "") {
+    return subscription.plan;
+  }
+  return "—";
+}
+
+// One provider subscription under the Claude accounts: the same table, the same
+// abbreviation/colour editor and price cell, but no auto-burn, organization or
+// login of its own. OpenAI's plan comes from the provider (read-only); Ollama's
+// is typed here.
+function subscriptionRow(subscription) {
+  const field = `subscription:${subscription.account.org}:${subscription.account.acc}`;
+  let accent = isColor(subscription.color) ? subscription.color.toLowerCase() : "#555b66";
+  let abbr = subscription.abbr || "?";
+
+  const wrap = h("div", {
+    class: "acc-wrap subscription",
+    dataset: { field },
+  });
+  const chip = h("button", {
+    type: "button",
+    class: `acc-chip${state.openEditorId === field ? " open" : ""}`,
+    title: "Change the abbreviation and the colour",
+    "aria-label": `Edit subscription ${abbr}`,
+    "aria-expanded": state.openEditorId === field ? "true" : "false",
+  });
+  chip.appendChild(h("span", { text: abbr }));
+  chip.appendChild(h("i", { "aria-hidden": "true", text: "\u270E" }));
+  const paintChip = () => {
+    chip.firstChild.textContent = abbr;
+    chip.style.background = accent;
+    chip.style.color = contrastText(accent);
+    chip.setAttribute("aria-label", `Edit subscription ${abbr}`);
+  };
+  paintChip();
+  chip.addEventListener("click", () => {
+    state.openEditorId = state.openEditorId === field ? null : field;
+    state.selectedId = null;
+    renderGroup(state.right, "accounts");
+  });
+
+  const labelInput = textInput({
+    class: "inp tall acc-label",
+    value: subscription.label || "",
+    maxlength: "40",
+    "aria-label": "Label",
+  });
+  labelInput.addEventListener("change", async () => {
+    const next = labelInput.value.trim();
+    if (next === (subscription.label || "")) {
+      labelInput.value = subscription.label || "";
+      return;
+    }
+    const ok = await saveSubscription(subscription, { label: next }, field);
+    if (ok) subscription.label = next;
+    else labelInput.value = subscription.label || "";
+  });
+
+  const code = currencyCode();
+  const currencyLabel = h("span", { class: "x11 mf" });
+  const paintPriceCurrency = () => {
+    if (subscription.price === null || subscription.price === undefined) {
+      currencyLabel.textContent = code || "currency: set it under General";
+      currencyLabel.className = code ? "x11 mf" : "x11 mf currency-hint";
+      return;
+    }
+    const own =
+      typeof subscription.priceCurrency === "string" && subscription.priceCurrency !== ""
+        ? subscription.priceCurrency
+        : null;
+    currencyLabel.textContent = own || "no currency";
+    currencyLabel.className = "x11 mf";
+    if (code && own !== code) {
+      currencyLabel.title = own
+        ? `in ${own}: enter it again for ${code}`
+        : "the price was entered before a currency was set; enter it again";
+    } else {
+      currencyLabel.title = "";
+    }
+  };
+
+  const priceInput = textInput({
+    class: "inp tall acc-price",
+    value:
+      subscription.price === null || subscription.price === undefined
+        ? ""
+        : String(subscription.price),
+    inputmode: "decimal",
+    "aria-label": "Price per month",
+  });
+  const storedPrice = () =>
+    subscription.price === null || subscription.price === undefined
+      ? ""
+      : String(subscription.price);
+  priceInput.addEventListener("change", async () => {
+    const amount = typedNumber(priceInput.value);
+    if (amount === subscription.price) {
+      priceInput.value = storedPrice();
+      return;
+    }
+    const ok = await saveSubscription(subscription, { price: amount }, field);
+    if (ok) {
+      subscription.price = amount;
+      subscription.priceCurrency = amount === null ? null : code;
+      priceInput.value = storedPrice();
+      paintPriceCurrency();
+    } else {
+      priceInput.value = storedPrice();
+    }
+  });
+  paintPriceCurrency();
+
+  let planControl;
+  if (subscription.company === "ollama") {
+    const planInput = textInput({
+      class: "inp tall acc-label",
+      value: typeof subscription.plan === "string" ? subscription.plan : "",
+      maxlength: "40",
+      "aria-label": "Plan",
+    });
+    planInput.addEventListener("change", async () => {
+      const typed = planInput.value.trim();
+      // An empty or blank field clears the plan: the command takes `null`,
+      // never an empty text.
+      const next = typed === "" ? null : typed;
+      const stored = typeof subscription.plan === "string" ? subscription.plan : null;
+      if (next === stored) {
+        planInput.value = stored || "";
+        return;
+      }
+      const ok = await saveSubscription(subscription, { plan: next }, field);
+      if (ok) subscription.plan = next;
+      else planInput.value = stored || "";
+    });
+    planControl = planInput;
+  } else {
+    planControl = h("span", {
+      class: "acc-text",
+      title: "the plan comes from the provider",
+      text: subscriptionPlan(subscription),
+    });
+  }
+
+  wrap.appendChild(
+    h("div", { class: "lr acc-grid" }, [
+      chip,
+      labelInput,
+      h("span", {
+        class: "acc-text acc-company",
+        title: companyName(subscription.company),
+        text: companyName(subscription.company),
+      }),
+      planControl,
+      h("div", { class: "price-cell" }, [priceInput, currencyLabel]),
+      h("span", { class: "acc-text", text: "—" }),
+      h("span", { class: "acc-text", text: "—" }),
+      h("span", { class: "acc-text", text: "—" }),
+    ])
+  );
+  paintRowError(wrap, field);
+
+  if (state.openEditorId === field) {
+    wrap.appendChild(
+      chipEditor(
+        subscription,
+        field,
+        (next) => {
+          if (typeof next.abbr === "string") abbr = next.abbr;
+          if (typeof next.color === "string") accent = next.color;
+          paintChip();
+        },
+        saveSubscription,
+        false
+      )
+    );
+  }
+  return wrap;
+}
+
+function chipEditor(row, field, changed, save = saveAccount, removable = true) {
   let color = isColor(row.color) ? row.color.toLowerCase() : "";
 
   const preview = iconPreview();
@@ -1500,7 +1727,7 @@ function chipEditor(row, field, changed) {
         letters.setValue(row.abbr || "");
         return;
       }
-      const ok = await saveAccount(row, { abbr }, field);
+      const ok = await save(row, { abbr }, field);
       if (ok) {
         row.abbr = abbr;
         changed({ abbr });
@@ -1519,7 +1746,7 @@ function chipEditor(row, field, changed) {
 
   async function saveColor(next) {
     if (next === row.color) return;
-    const ok = await saveAccount(row, { color: next }, field);
+    const ok = await save(row, { color: next }, field);
     if (ok) {
       row.color = next;
       swatches.select(next);
@@ -1540,6 +1767,18 @@ function chipEditor(row, field, changed) {
     onChange: saveColor,
   });
 
+  const remove = removable
+    ? h("button", {
+        type: "button",
+        class: "hbtn xs danger",
+        text: "Remove",
+        "aria-label": `Remove account ${row.abbr || "?"}`,
+        onclick: () => {
+          state.confirmRemoveId = row.id;
+          renderGroup(state.right, "accounts");
+        },
+      })
+    : null;
   const editor = h("div", { class: "acc-editor" }, [
     h("div", { class: "editor-row" }, [
       h("div", { class: "field" }, [
@@ -1555,20 +1794,9 @@ function chipEditor(row, field, changed) {
         preview.node,
       ]),
     ]),
-    h("div", { class: "editor-actions" }, [
-      h("button", {
-        type: "button",
-        class: "hbtn xs danger",
-        text: "Remove",
-        "aria-label": `Remove account ${row.abbr || "?"}`,
-        onclick: () => {
-          state.confirmRemoveId = row.id;
-          renderGroup(state.right, "accounts");
-        },
-      }),
-    ]),
+    h("div", { class: "editor-actions" }, remove ? [remove] : []),
   ]);
-  if (state.confirmRemoveId === row.id) editor.appendChild(confirmRemove(row, field));
+  if (removable && state.confirmRemoveId === row.id) editor.appendChild(confirmRemove(row, field));
   preview.draw(letters.value(), color).then((error) => {
     if (error) fieldError(field, error);
   });
@@ -2711,12 +2939,12 @@ function renderCalls(container) {
 function providersCard() {
   return panel(
     "Providers",
-    "read-only cards for Codex, Ollama's cloud plan and the API prices",
+    "read-only cards for OpenAI (Codex), Ollama's cloud plan and the API prices",
     [
-      section("Codex"),
+      section("OpenAI (Codex)"),
       setting(
-        "Show a Codex card",
-        toggle("codexCard", "Show a Codex card"),
+        "Show an OpenAI (Codex) card",
+        toggle("codexCard", "Show an OpenAI (Codex) card"),
         "read only · every 5 minutes",
         "codexCard"
       ),

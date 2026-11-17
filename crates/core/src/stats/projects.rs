@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use crate::history::{AccountRef, Hosted, Hosts, Range, TokenRecord};
 use crate::live_sessions::Values;
-use crate::money::{usd_rate, Fx, Missing, Provider, Valuer};
+use crate::money::{usd_rate, Company, Fx, Missing, Valuer};
 use crate::project::ProjectKey;
 use crate::projects::{Project, ProjectId};
 use crate::store::{Account, Settings};
@@ -56,8 +56,8 @@ pub struct Node {
     /// Each Claude account's share of this node's API value, in %, largest
     /// first; `None` is a Claude record without a known account.
     pub by_account: Vec<(Option<String>, f64)>,
-    /// Each other provider's share of this node's API value, in %, largest
-    /// first, by [`Provider::name`] (`Codex`, `Ollama`): its work uses no
+    /// Each other company's share of this node's API value, in %, largest
+    /// first, by [`Company::name`] (`OpenAI`, `Ollama`): its work uses no
     /// Claude account. With `by_account` it makes up the node's API value.
     pub by_provider: Vec<(String, f64)>,
     /// The distinct sessions of the node's records.
@@ -390,13 +390,13 @@ pub(crate) fn projects_page_in<Tz: TimeZone + Copy>(
     }
 
     let mut unknown_account_tokens = Tokens::default();
-    let mut providers: BTreeSet<Provider> = BTreeSet::new();
+    let mut providers: BTreeSet<Company> = BTreeSet::new();
     for entry in &entries {
-        match entry.value.provider {
-            Provider::Claude if entry.value.account.is_none() => {
+        match entry.value.company {
+            Company::Anthropic if entry.value.account.is_none() => {
                 unknown_account_tokens += Tokens::from(entry.record);
             }
-            Provider::Claude => {}
+            Company::Anthropic => {}
             other => {
                 providers.insert(other);
             }
@@ -426,7 +426,7 @@ pub(crate) fn projects_page_in<Tz: TimeZone + Copy>(
     if !providers.is_empty() {
         let names: Vec<String> = providers
             .iter()
-            .map(|provider| provider.name().to_string())
+            .map(|company| company.name().to_string())
             .collect();
         notes.push(format!(
             "{} work is valued at API prices only; it uses no Claude account.",
@@ -735,8 +735,8 @@ struct Sums {
     /// The Claude records' API value by account; `None` is a Claude record
     /// without a known account.
     api_by_account: BTreeMap<Option<AccountRef>, Values>,
-    /// The API value of the records of every other provider.
-    api_by_provider: BTreeMap<Provider, Values>,
+    /// The API value of the records of every other company.
+    api_by_provider: BTreeMap<Company, Values>,
     sub_by_account: BTreeMap<AccountRef, Values>,
     sessions: BTreeSet<String>,
 }
@@ -747,8 +747,8 @@ impl Sums {
         self.tokens += Tokens::from(record);
         self.sessions.insert(record.session.clone());
         add_opt_value(&mut self.values, &entry.values);
-        match entry.value.provider {
-            Provider::Claude => add_value(
+        match entry.value.company {
+            Company::Anthropic => add_value(
                 &mut self.api_by_account,
                 entry.value.account.clone(),
                 &entry.values,
@@ -1650,7 +1650,7 @@ mod tests {
             Some(150.0),
             "120 EUR of Claude, 30 of Codex"
         );
-        assert_eq!(atlas_node.by_provider, vec![("Codex".to_string(), 20.0)]);
+        assert_eq!(atlas_node.by_provider, vec![("OpenAI".to_string(), 20.0)]);
         assert_eq!(
             atlas_node.by_account.len(),
             2,
@@ -1665,11 +1665,11 @@ mod tests {
         assert_eq!(page.matrix, before.matrix, "Codex is in no matrix cell");
         assert!(
             page.notes.iter().any(|note| note
-                == "Codex work is valued at API prices only; it uses no Claude account."),
+                == "OpenAI work is valued at API prices only; it uses no Claude account."),
             "notes: {:#?}",
             page.notes
         );
-        assert!(!before.notes.iter().any(|note| note.contains("Codex")));
+        assert!(!before.notes.iter().any(|note| note.contains("OpenAI")));
 
         let only_lb = Query {
             range: crate::stats::RangeKey::All,

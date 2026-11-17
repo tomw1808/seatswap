@@ -21,8 +21,10 @@ use chrono::{DateTime, Utc};
 
 use crate::history::{AccountRef, Event, EventKind, HistoryError, Hosted, Hosts, Range, Recorder};
 use crate::locks::{self, LockError};
-use crate::store::{self, Account, Settings, Store, StoreError, SHARED_SETTINGS};
-use crate::switcher::{Edited, APP_LOCK_TIMEOUT};
+use crate::store::{
+    self, Account, ProviderSubscription, Settings, Store, StoreError, SHARED_SETTINGS,
+};
+use crate::switcher::{Edited, EditedSubscription, APP_LOCK_TIMEOUT};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SharedError {
@@ -91,6 +93,8 @@ pub struct Shared {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Applied {
     pub accounts: Vec<String>,
+    /// The abbreviations of the provider subscriptions it changed.
+    pub subscriptions: Vec<String>,
     pub settings: Vec<String>,
     pub warnings: Vec<String>,
 }
@@ -98,7 +102,7 @@ pub struct Applied {
 impl Applied {
     /// Whether `accounts.json` was written.
     pub fn changed(&self) -> bool {
-        !self.accounts.is_empty() || !self.settings.is_empty()
+        !self.accounts.is_empty() || !self.subscriptions.is_empty() || !self.settings.is_empty()
     }
 }
 
@@ -110,27 +114,100 @@ pub struct Seeded {
     pub warnings: Vec<String>,
 }
 
-/// The events an account edit writes: `accountLook` with the look fields that
-/// differ from before (none when only the price changed), then `priceChanged`
-/// when the price or its currency changed. The one source of an edit's events
-/// for the tray app and the CLI.
-pub fn edit_events(edited: &Edited) -> Vec<EventKind> {
-    let (before, after) = (&edited.before, &edited.account);
+/// The look and price of one account or provider subscription, before or
+/// after an edit. It is the one input [`edit_events`] reads, so a subscription
+/// edit writes the same events as an account edit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LookValues {
+    pub label: String,
+    pub abbr: String,
+    pub color: String,
+    /// `None` for a provider subscription, which has no auto-burn switch.
+    pub autoburn: Option<bool>,
+    pub price: Option<f64>,
+    pub price_currency: Option<String>,
+}
+
+/// One edit's before and after, named by the history's [`AccountRef`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Edit {
+    pub account: AccountRef,
+    pub before: LookValues,
+    pub after: LookValues,
+}
+
+impl From<&Edited> for Edit {
+    fn from(edited: &Edited) -> Edit {
+        Edit {
+            account: AccountRef::of(&edited.account),
+            before: LookValues {
+                label: edited.before.label.clone(),
+                abbr: edited.before.abbr.clone(),
+                color: edited.before.color.clone(),
+                autoburn: Some(edited.before.auto_burn),
+                price: edited.before.price,
+                price_currency: edited.before.price_currency.clone(),
+            },
+            after: LookValues {
+                label: edited.account.label.clone(),
+                abbr: edited.account.abbr.clone(),
+                color: edited.account.color.clone(),
+                autoburn: Some(edited.account.auto_burn),
+                price: edited.account.price,
+                price_currency: edited.account.price_currency.clone(),
+            },
+        }
+    }
+}
+
+impl From<&EditedSubscription> for Edit {
+    fn from(edited: &EditedSubscription) -> Edit {
+        Edit {
+            account: edited.subscription.account.clone(),
+            before: LookValues {
+                label: edited.before.label.clone(),
+                abbr: edited.before.abbr.clone(),
+                color: edited.before.color.clone(),
+                autoburn: None,
+                price: edited.before.price,
+                price_currency: edited.before.price_currency.clone(),
+            },
+            after: LookValues {
+                label: edited.subscription.label.clone(),
+                abbr: edited.subscription.abbr.clone(),
+                color: edited.subscription.color.clone(),
+                autoburn: None,
+                price: edited.subscription.price,
+                price_currency: edited.subscription.price_currency.clone(),
+            },
+        }
+    }
+}
+
+/// The events an account or subscription edit writes: `accountLook` with the
+/// look fields that differ from before (none when only the price changed),
+/// then `priceChanged` when the price or its currency changed. The one source
+/// of an edit's events for the tray app and the CLI.
+pub fn edit_events<E: Into<Edit>>(edited: E) -> Vec<EventKind> {
+    let edited = edited.into();
+    let (before, after) = (&edited.before, &edited.after);
     let changed = |old: &String, new: &String| (old != new).then(|| new.clone());
     let look = EventKind::AccountLook {
-        account: AccountRef::of(after),
+        account: edited.account.clone(),
         label: changed(&before.label, &after.label),
         abbr: changed(&before.abbr, &after.abbr),
         color: changed(&before.color, &after.color),
-        auto_burn: (before.auto_burn != after.auto_burn).then_some(after.auto_burn),
+        auto_burn: (before.autoburn != after.autoburn)
+            .then_some(after.autoburn)
+            .flatten(),
     };
     let mut events = Vec::new();
     if !look_is_empty(&look) {
         events.push(look);
     }
-    if edited.price_changed() {
+    if before.price != after.price || before.price_currency != after.price_currency {
         events.push(EventKind::PriceChanged {
-            account: AccountRef::of(after),
+            account: edited.account,
             amount: after.price,
             currency: after.price_currency.clone(),
         });
@@ -267,49 +344,38 @@ fn name(account: &Account) -> String {
 
 /// Write the newest shared values into `accounts.json`, under the app lock:
 /// for the accounts this host has, their label, abbreviation, colour,
-/// "Auto-burn may use it" and price; and the shared settings. Each value goes
-/// through the validator an edit uses (`validate_label`, `validate_abbr` with
-/// the other accounts' abbreviations as they will be, `validate_color`,
-/// `validate_price` and the currency rule, [`Settings::with_setting`]). A
-/// value that fails, including an abbreviation another local account holds,
-/// is not applied and is a warning naming the account or key and the host
-/// that wrote it. Applying writes no event, and the file only when a value
+/// "Auto-burn may use it" and price; for the provider subscriptions, their
+/// label, abbreviation, colour and price; and the shared settings. Each value
+/// goes through the validator an edit uses (`validate_label`, `validate_abbr`
+/// with the other abbreviations as they will be, `validate_color`,
+/// `validate_price` and the currency rule, [`Settings::with_setting`]). A value
+/// that fails, including an abbreviation another local account or subscription
+/// holds, is not applied and is a warning naming the account or key and the
+/// host that wrote it. Applying writes no event, and the file only when a value
 /// changed.
 pub fn apply(store: &Store, shared: &Shared) -> Result<Applied, SharedError> {
     let _app_lock = locks::acquire_app_lock(store.app_paths(), APP_LOCK_TIMEOUT)?;
     let mut file = store.load()?;
     let mut applied = Applied::default();
     let mut changed_accounts = vec![false; file.accounts.len()];
+    let mut changed_subscriptions = vec![false; file.provider_subscriptions.len()];
 
     for (index, account) in file.accounts.iter_mut().enumerate() {
         let Some(look) = shared.accounts.get(&AccountRef::of(account)) else {
             continue;
         };
         let who = name(account);
-        let mut refused = |field: &str, host: &str, error: &dyn std::fmt::Display| {
-            applied.warnings.push(format!(
-                "account {who}: the shared {field} from host {host} is not applied: {error}"
-            ));
-        };
-        if let Some(label) = &look.label {
-            match store::validate_label(&label.value) {
-                Ok(value) if value != account.label => {
-                    account.label = value;
-                    changed_accounts[index] = true;
-                }
-                Ok(_) => {}
-                Err(error) => refused("label", &label.host, &error),
-            }
-        }
-        if let Some(color) = &look.color {
-            match store::validate_color(&color.value) {
-                Ok(value) if value != account.color => {
-                    account.color = value;
-                    changed_accounts[index] = true;
-                }
-                Ok(_) => {}
-                Err(error) => refused("colour", &color.host, &error),
-            }
+        if apply_shared_look(
+            "account",
+            &who,
+            look,
+            &mut account.label,
+            &mut account.color,
+            &mut account.price,
+            &mut account.price_currency,
+            &mut applied.warnings,
+        ) {
+            changed_accounts[index] = true;
         }
         if let Some(auto_burn) = &look.auto_burn {
             if auto_burn.value != account.auto_burn {
@@ -317,22 +383,38 @@ pub fn apply(store: &Store, shared: &Shared) -> Result<Applied, SharedError> {
                 changed_accounts[index] = true;
             }
         }
-        if let Some(price) = &look.price {
-            match checked_price(&price.value) {
-                Ok((amount, currency)) => {
-                    if account.price != amount || account.price_currency != currency {
-                        account.price = amount;
-                        account.price_currency = currency;
-                        changed_accounts[index] = true;
-                    }
-                }
-                Err(error) => refused("price", &price.host, &error),
-            }
+    }
+
+    for (index, subscription) in file.provider_subscriptions.iter_mut().enumerate() {
+        let Some(look) = shared.accounts.get(&subscription.account) else {
+            continue;
+        };
+        let who = format!("{} ({})", subscription.abbr, subscription.label);
+        if apply_shared_look(
+            "subscription",
+            &who,
+            look,
+            &mut subscription.label,
+            &mut subscription.color,
+            &mut subscription.price,
+            &mut subscription.price_currency,
+            &mut applied.warnings,
+        ) {
+            changed_subscriptions[index] = true;
         }
     }
 
-    for index in apply_abbrs(&mut file.accounts, shared, &mut applied.warnings) {
+    let (changed_account, changed_subscription) = apply_abbrs(
+        &mut file.accounts,
+        &mut file.provider_subscriptions,
+        shared,
+        &mut applied.warnings,
+    );
+    for index in changed_account {
         changed_accounts[index] = true;
+    }
+    for index in changed_subscription {
+        changed_subscriptions[index] = true;
     }
 
     for (key, stamped) in &shared.settings {
@@ -365,10 +447,72 @@ pub fn apply(store: &Store, shared: &Shared) -> Result<Applied, SharedError> {
         .filter(|(_, changed)| **changed)
         .map(|(account, _)| account.abbr.clone())
         .collect();
+    applied.subscriptions = file
+        .provider_subscriptions
+        .iter()
+        .zip(&changed_subscriptions)
+        .filter(|(_, changed)| **changed)
+        .map(|(subscription, _)| subscription.abbr.clone())
+        .collect();
     if applied.changed() {
         store.save(&file)?;
     }
     Ok(applied)
+}
+
+/// The label, colour and price of one shared look into a stored account or
+/// subscription; `true` when a value changed. The caller applies auto-burn,
+/// which only an account has.
+#[allow(clippy::too_many_arguments)]
+fn apply_shared_look(
+    kind: &str,
+    who: &str,
+    look: &SharedLook,
+    label: &mut String,
+    color: &mut String,
+    price: &mut Option<f64>,
+    price_currency: &mut Option<String>,
+    warnings: &mut Vec<String>,
+) -> bool {
+    let mut changed = false;
+    let mut refused = |field: &str, host: &str, error: &dyn std::fmt::Display| {
+        warnings.push(format!(
+            "{kind} {who}: the shared {field} from host {host} is not applied: {error}"
+        ));
+    };
+    if let Some(stamped) = &look.label {
+        match store::validate_label(&stamped.value) {
+            Ok(value) if value != *label => {
+                *label = value;
+                changed = true;
+            }
+            Ok(_) => {}
+            Err(error) => refused("label", &stamped.host, &error),
+        }
+    }
+    if let Some(stamped) = &look.color {
+        match store::validate_color(&stamped.value) {
+            Ok(value) if value != *color => {
+                *color = value;
+                changed = true;
+            }
+            Ok(_) => {}
+            Err(error) => refused("colour", &stamped.host, &error),
+        }
+    }
+    if let Some(stamped) = &look.price {
+        match checked_price(&stamped.value) {
+            Ok((amount, currency)) => {
+                if *price != amount || *price_currency != currency {
+                    *price = amount;
+                    *price_currency = currency;
+                    changed = true;
+                }
+            }
+            Err(error) => refused("price", &stamped.host, &error),
+        }
+    }
+    changed
 }
 
 /// A shared price as the account stores it: the amount checked by
@@ -386,18 +530,32 @@ fn checked_price(price: &SharedPrice) -> Result<(Option<f64>, Option<String>), S
     Ok((amount, currency))
 }
 
-/// The shared abbreviations, decided together: each must pass
-/// `validate_abbr` against the abbreviations the other accounts will have,
-/// so two accounts that swap theirs both apply, and one that would take
-/// another's keeps its own with a warning. Returns the indexes it changed.
+/// The shared abbreviations, decided together: each must pass the one
+/// `validate_abbr` rule against the abbreviations the others will have, so
+/// two owners that swap theirs both apply, and one that would take another's
+/// keeps its own with a warning. Returns the account and subscription indexes
+/// it changed.
 fn apply_abbrs(
     accounts: &mut [Account],
+    subscriptions: &mut [ProviderSubscription],
     shared: &Shared,
     warnings: &mut Vec<String>,
-) -> Vec<usize> {
-    // The wanted abbreviation per account, already in the stored form.
-    let mut wanted: Vec<Option<(String, &str)>> = vec![None; accounts.len()];
+) -> (Vec<usize>, Vec<usize>) {
+    #[derive(Clone, Copy)]
+    enum Owner {
+        Account(usize),
+        Subscription(usize),
+    }
+
+    let mut owners = Vec::new();
+    let mut current = Vec::new();
+    let mut who = Vec::new();
+    let mut wanted: Vec<Option<(String, String)>> = Vec::new();
     for (index, account) in accounts.iter().enumerate() {
+        owners.push(Owner::Account(index));
+        current.push(account.abbr.clone());
+        who.push(format!("account {}", name(account)));
+        wanted.push(None);
         let Some(abbr) = shared
             .accounts
             .get(&AccountRef::of(account))
@@ -406,7 +564,11 @@ fn apply_abbrs(
             continue;
         };
         match store::validate_abbr(&abbr.value, &[]) {
-            Ok(value) if value != account.abbr => wanted[index] = Some((value, &abbr.host)),
+            Ok(value) if value != account.abbr => {
+                if let Some(slot) = wanted.last_mut() {
+                    *slot = Some((value, abbr.host.clone()));
+                }
+            }
             Ok(_) => {}
             Err(error) => warnings.push(format!(
                 "account {}: the shared abbreviation from host {} is not applied: {error}",
@@ -415,15 +577,44 @@ fn apply_abbrs(
             )),
         }
     }
-    // Refuse one clash at a time: a refused account keeps its abbreviation,
+    for (index, subscription) in subscriptions.iter().enumerate() {
+        owners.push(Owner::Subscription(index));
+        current.push(subscription.abbr.clone());
+        who.push(format!(
+            "subscription {} ({})",
+            subscription.abbr, subscription.label
+        ));
+        wanted.push(None);
+        let Some(abbr) = shared
+            .accounts
+            .get(&subscription.account)
+            .and_then(|look| look.abbr.as_ref())
+        else {
+            continue;
+        };
+        match store::validate_abbr(&abbr.value, &[]) {
+            Ok(value) if value != subscription.abbr => {
+                if let Some(slot) = wanted.last_mut() {
+                    *slot = Some((value, abbr.host.clone()));
+                }
+            }
+            Ok(_) => {}
+            Err(error) => warnings.push(format!(
+                "{}: the shared abbreviation from host {} is not applied: {error}",
+                who.last().map(String::as_str).unwrap_or(""),
+                abbr.host
+            )),
+        }
+    }
+    // Refuse one clash at a time: a refused owner keeps its abbreviation,
     // which can clash with another wanted one, so check again until none does.
     loop {
-        let finals: Vec<&str> = accounts
+        let finals: Vec<&str> = current
             .iter()
             .zip(&wanted)
-            .map(|(account, wanted)| match wanted {
+            .map(|(current, wanted)| match wanted {
                 Some((value, _)) => value.as_str(),
-                None => account.abbr.as_str(),
+                None => current.as_str(),
             })
             .collect();
         let clash = wanted.iter().enumerate().find_map(|(index, wanted)| {
@@ -436,25 +627,35 @@ fn apply_abbrs(
                 .collect();
             store::validate_abbr(value, &others)
                 .err()
-                .map(|error| (index, host.to_string(), error))
+                .map(|error| (index, host.clone(), error))
         });
         let Some((index, host, error)) = clash else {
             break;
         };
         warnings.push(format!(
-            "account {}: the shared abbreviation from host {host} is not applied: {error}",
-            name(&accounts[index])
+            "{}: the shared abbreviation from host {host} is not applied: {error}",
+            who[index]
         ));
         wanted[index] = None;
     }
-    let mut changed = Vec::new();
+    let mut changed_accounts = Vec::new();
+    let mut changed_subscriptions = Vec::new();
     for (index, wanted) in wanted.into_iter().enumerate() {
-        if let Some((value, _)) = wanted {
-            accounts[index].abbr = value;
-            changed.push(index);
+        let Some((value, _)) = wanted else {
+            continue;
+        };
+        match owners[index] {
+            Owner::Account(index) => {
+                accounts[index].abbr = value;
+                changed_accounts.push(index);
+            }
+            Owner::Subscription(index) => {
+                subscriptions[index].abbr = value;
+                changed_subscriptions.push(index);
+            }
         }
     }
-    changed
+    (changed_accounts, changed_subscriptions)
 }
 
 /// For each local account field and each shared setting that no host has an
@@ -462,7 +663,10 @@ fn apply_abbrs(
 /// it: one `accountLook` per account with its unshared fields, a
 /// `priceChanged` for a stored price no host shared, and a `settingSet` per
 /// unshared setting that differs from its default (a fresh host never
-/// overrides a set-up one). An event that cannot be written is a warning.
+/// overrides a set-up one). A provider subscription writes no event here: it
+/// is new in 1.3 and every edit of one writes its own events, so a default
+/// look must not win over another host's real one by a newer time. An event
+/// that cannot be written is a warning.
 pub fn seed(
     store: &Store,
     shared: &Shared,
@@ -1033,6 +1237,47 @@ mod tests {
     }
 
     #[test]
+    fn seed_writes_no_events_for_provider_subscriptions() {
+        let fixture = Fixture::new(vec![], Settings::default());
+        let codex = AccountRef {
+            acc: "0f3a6c2e-7b1d-4e9a-8c5f-2d4b6a8e0c13".to_string(),
+            org: crate::providers::CODEX_ORG.to_string(),
+        };
+        let mut file = fixture.accounts();
+        file.ensure_provider_subscription(&codex, Some("Plus"))
+            .expect("the OpenAI subscription");
+        let subscription = file
+            .provider_subscriptions
+            .iter_mut()
+            .find(|subscription| subscription.account == codex)
+            .expect("the OpenAI subscription");
+        subscription.price = Some(23.0);
+        subscription.price_currency = Some("EUR".to_string());
+        fixture.store.save(&file).expect("accounts.json");
+
+        let shared = latest(&fixture.events());
+        assert!(shared.accounts.is_empty(), "no host shared anything yet");
+
+        let seeded = seed(
+            &fixture.store,
+            &shared,
+            &fixture.atlas(),
+            utc("2026-11-16T12:00:00Z"),
+        )
+        .expect("seeded");
+
+        assert_eq!(seeded.written, 0, "{seeded:?}");
+        let written = HistoryDir::at(&fixture.root, "atlas")
+            .read::<Event>(&Range::ALL, &Hosts::One("atlas".to_string()))
+            .expect("read")
+            .records;
+        assert!(
+            written.is_empty(),
+            "a default subscription look or price was seeded: {written:?}"
+        );
+    }
+
+    #[test]
     fn a_new_account_takes_its_shared_look_and_price() {
         let fixture = Fixture::new(vec![lb()], Settings::default());
         fixture.write(
@@ -1166,6 +1411,115 @@ mod tests {
             fs::read(fixture.store.app_paths().accounts_file()).expect("the file"),
             before
         );
+    }
+
+    #[test]
+    fn a_provider_price_from_another_host_is_kept() {
+        let fixture = Fixture::new(
+            vec![lb()],
+            Settings {
+                currency: Some("EUR".to_string()),
+                ..Settings::default()
+            },
+        );
+        let codex = AccountRef {
+            acc: "0f3a6c2e-7b1d-4e9a-8c5f-2d4b6a8e0c13".to_string(),
+            org: crate::providers::CODEX_ORG.to_string(),
+        };
+        let ollama = AccountRef {
+            acc: "ollama".to_string(),
+            org: crate::providers::OLLAMA_ORG.to_string(),
+        };
+        let mut file = fixture.accounts();
+        file.ensure_provider_subscription(&codex, Some("Plus"))
+            .expect("the OpenAI subscription");
+        // This subscription already has a price; another host's look event
+        // must apply without losing it.
+        let subscription = file
+            .provider_subscriptions
+            .iter_mut()
+            .find(|subscription| subscription.account == codex)
+            .expect("the OpenAI subscription");
+        subscription.price = Some(23.0);
+        subscription.price_currency = Some("EUR".to_string());
+        fixture.store.save(&file).expect("accounts.json");
+        fixture.write(
+            "vega",
+            "2026-11-15T10:00:00Z",
+            EventKind::AccountLook {
+                account: codex.clone(),
+                label: Some("OpenAI Team".to_string()),
+                abbr: Some("OX".to_string()),
+                color: Some("#111827".to_string()),
+                auto_burn: None,
+            },
+        );
+        fixture.write(
+            "vega",
+            "2026-11-15T10:01:00Z",
+            EventKind::PriceChanged {
+                account: codex.clone(),
+                amount: Some(29.0),
+                currency: Some("EUR".to_string()),
+            },
+        );
+        // A subscription this host does not have yet: its events are skipped
+        // now and apply once the subscription is created.
+        fixture.write(
+            "vega",
+            "2026-11-15T10:02:00Z",
+            EventKind::AccountLook {
+                account: ollama.clone(),
+                label: Some("Ollama Cloud".to_string()),
+                abbr: Some("OM".to_string()),
+                color: Some("#ea580c".to_string()),
+                auto_burn: None,
+            },
+        );
+        fixture.write(
+            "vega",
+            "2026-11-15T10:03:00Z",
+            EventKind::PriceChanged {
+                account: ollama.clone(),
+                amount: Some(19.0),
+                currency: Some("EUR".to_string()),
+            },
+        );
+
+        let applied = apply(&fixture.store, &latest(&fixture.events())).expect("applied");
+
+        assert!(applied.warnings.is_empty(), "{:?}", applied.warnings);
+        let file = fixture.accounts();
+        let subscription = file
+            .provider_subscription(&codex)
+            .expect("the subscription stays");
+        assert_eq!(subscription.label, "OpenAI Team");
+        assert_eq!(subscription.abbr, "OX");
+        assert_eq!(subscription.color, "#111827");
+        assert_eq!(subscription.price, Some(29.0));
+        assert_eq!(subscription.price_currency.as_deref(), Some("EUR"));
+        assert_eq!(subscription.plan.as_deref(), Some("Plus"));
+        assert!(
+            file.provider_subscription(&ollama).is_none(),
+            "an event for a subscription this host does not have is skipped"
+        );
+
+        // Creating it here lets the same events apply to it.
+        let mut file = file;
+        file.ensure_provider_subscription(&ollama, None)
+            .expect("the Ollama subscription");
+        fixture.store.save(&file).expect("accounts.json");
+        let applied = apply(&fixture.store, &latest(&fixture.events())).expect("applied");
+        assert!(applied.warnings.is_empty(), "{:?}", applied.warnings);
+        let file = fixture.accounts();
+        let subscription = file
+            .provider_subscription(&ollama)
+            .expect("the Ollama subscription");
+        assert_eq!(subscription.label, "Ollama Cloud");
+        assert_eq!(subscription.abbr, "OM");
+        assert_eq!(subscription.color, "#ea580c");
+        assert_eq!(subscription.price, Some(19.0));
+        assert_eq!(subscription.price_currency.as_deref(), Some("EUR"));
     }
 
     #[test]
