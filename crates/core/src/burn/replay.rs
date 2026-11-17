@@ -10,27 +10,28 @@ use crate::api::LimitKind;
 use crate::history::{
     AccountRef, HistoryDir, HistoryError, Hosted, Hosts, Range, Record, Sample, TokenRecord,
 };
+use crate::money::{api_usd, is_plan_model, Prices};
 use crate::transcripts::hour_start;
 
 use super::plan::{play, AccountState, Inputs, PlanError, Policy, SessionState, Walk, Work};
 use super::rates::hour_shares;
-use super::{mean_over_hours, work_units, Rates, Rhythm};
+use super::{mean_over_hours, Rates, Rhythm};
 
 /// What one policy did with the recorded work of a range.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReplayResult {
     pub policy: Policy,
-    /// The work of the steps that had an account.
-    pub worked_wu: f64,
-    /// The work of the steps without a usable account.
-    pub blocked_wu: f64,
+    /// The API dollars of work of the steps that had an account.
+    pub worked_usd: f64,
+    /// The API dollars of work of the steps without a usable account.
+    pub blocked_usd: f64,
     pub switches: u32,
     /// The week-% unused at every weekly reset the replay passed, summed per
     /// account.
     pub expired: BTreeMap<AccountRef, f64>,
-    /// The mean work of the recorded hours that had work: the "typical working
+    /// The mean dollars of the recorded hours that had work: the "typical working
     /// hour" the play's eager rule used. 0.0 when no hour had work.
-    pub typical_wu: f64,
+    pub typical_usd: f64,
     /// The warnings of the sample and token reads, for the caller that shows
     /// them (Task 9's CLI).
     pub warnings: Vec<String>,
@@ -51,8 +52,8 @@ pub enum ReplayError {
     },
 }
 
-/// Play the recorded work of `range` (token records, each spread evenly over
-/// the four steps of its hour, all hosts together) against the accounts' limits
+/// Play the recorded work of `range` (the API dollars of the Claude token
+/// records, [`recorded_hours`], all hosts together) against the accounts' limits
 /// as they stood at `range.from`: each account starts from its first sample in
 /// the range (weekly percent and reset, session percent and its reset; a sample
 /// without a session limit is an uncapped account). Ids inside the play are
@@ -72,6 +73,7 @@ pub fn replay(
     rates: &BTreeMap<AccountRef, Rates>,
     without: &[AccountRef],
     policy: Policy,
+    prices: &Prices,
 ) -> Result<ReplayResult, ReplayError> {
     let sample_read = history.read_claude::<Sample>(range, &Hosts::All)?;
     let token_read = history.read::<TokenRecord>(range, &Hosts::All)?;
@@ -84,6 +86,7 @@ pub fn replay(
         rates,
         without,
         policy,
+        prices,
     )?;
     result.warnings = warnings;
     Ok(result)
@@ -102,6 +105,7 @@ pub fn replay_records(
     rates: &BTreeMap<AccountRef, Rates>,
     without: &[AccountRef],
     policy: Policy,
+    prices: &Prices,
 ) -> Result<ReplayResult, ReplayError> {
     let samples = inside(samples, range);
     let tokens = inside(tokens, range);
@@ -134,7 +138,7 @@ pub fn replay_records(
         refs.insert(id, account.clone());
     }
 
-    let hours = recorded_hours(tokens);
+    let hours = recorded_hours(tokens, prices);
     let walk = Walk::new(Work::Recorded(&hours), range.to);
     let inputs = Inputs {
         now: range.from,
@@ -143,15 +147,15 @@ pub fn replay_records(
         active: None,
         // The walk carries the recorded work and its typical hour; a replay
         // never reads the learned rhythm.
-        rhythm: Rhythm { wu: [0.0; 168] },
+        rhythm: Rhythm { usd: [0.0; 168] },
         // A replay plays its range from the start, as auto-burn would have
         // from no switch and no hold.
         last_switch_at: None,
         manual_hold_until: None,
     };
     inputs.check()?;
-    let typical_wu = mean_over_hours(hours.values().copied());
-    let played = play(&inputs, policy, &walk, typical_wu);
+    let typical_usd = mean_over_hours(hours.values().copied());
+    let played = play(&inputs, policy, &walk, typical_usd);
     let expired = played
         .expired
         .into_iter()
@@ -159,11 +163,11 @@ pub fn replay_records(
         .collect();
     Ok(ReplayResult {
         policy,
-        worked_wu: played.worked_wu,
-        blocked_wu: played.plan.blocked_wu,
+        worked_usd: played.worked_usd,
+        blocked_usd: played.plan.blocked_usd,
         switches: played.plan.switches,
         expired,
-        typical_wu,
+        typical_usd,
         warnings: Vec::new(),
     })
 }
@@ -202,16 +206,24 @@ fn first_samples<'a>(
     firsts.into_iter().collect()
 }
 
-/// The work recorded in each UTC hour, all hosts together. A line's work is
-/// spread over the hours its [`TokenRecord::span`] covers by [`hour_shares`], so
-/// a 5-minute line lands wholly in its hour and an hourly line counts as before.
-fn recorded_hours(tokens: &[Hosted<TokenRecord>]) -> BTreeMap<DateTime<Utc>, f64> {
+/// The API dollars of work recorded in each UTC hour, all hosts together. Only
+/// Claude work counts: a Codex or Ollama record uses no Claude account and is
+/// left out (R7 of 1.3), and so is a record whose model has no price
+/// ([`api_usd`] is `None`, documented rule). A line's work is spread over the
+/// hours its [`TokenRecord::span`] covers by [`hour_shares`], so a 5-minute
+/// line lands wholly in its hour and an hourly line counts as before.
+fn recorded_hours(tokens: &[Hosted<TokenRecord>], prices: &Prices) -> BTreeMap<DateTime<Utc>, f64> {
     let mut hours: BTreeMap<DateTime<Utc>, f64> = BTreeMap::new();
     for hosted in tokens {
         let record = &hosted.record;
-        let units = work_units(record.input, record.out, record.cw, record.cr);
+        if !is_plan_model(&record.model) {
+            continue;
+        }
+        let Some(usd) = api_usd(record, prices) else {
+            continue;
+        };
         for (hour, share) in hour_shares(record, hour_start) {
-            *hours.entry(hour).or_insert(0.0) += units * share;
+            *hours.entry(hour).or_insert(0.0) += usd * share;
         }
     }
     hours
@@ -237,6 +249,12 @@ mod tests {
     use crate::project::ProjectKey;
     use crate::stats::tests::append_codex_records;
 
+    /// The models.dev fixture's prices: `claude-opus-5-5` costs 4 USD per
+    /// million input tokens, `deepseek-v4.1-flash:cloud` has a price too.
+    fn prices() -> Prices {
+        crate::money::tests::priced_prices(now())
+    }
+
     fn account_ref(id: &str) -> AccountRef {
         AccountRef {
             acc: id.to_string(),
@@ -245,8 +263,8 @@ mod tests {
     }
 
     /// One week of token records shaped like Task 5's rhythm: every working hour
-    /// is worth the rhythm's 1.0 wu. The range is `now` to `now + 7 d - 1 h`, so
-    /// it holds the week's 92 work units before PR's Saturday reset and none of
+    /// is worth the rhythm's 1.0 USD. The range is `now` to `now + 7 d - 1 h`, so
+    /// it holds the week's 92 USD before PR's Saturday reset and none of
     /// the next Monday morning.
     fn setup() -> (
         tempfile::TempDir,
@@ -306,7 +324,8 @@ mod tests {
         (dir, history, rates, range)
     }
 
-    /// Token records of one hour each, worth that hour's rhythm work.
+    /// Token records of one hour each of `claude-opus-5-5` (4 USD per
+    /// million input tokens), worth that hour's rhythm dollars.
     fn tokens(rhythm: &Rhythm, range: &Range, offset: FixedOffset) -> Vec<TokenRecord> {
         let mut records = Vec::new();
         let mut at = range.from;
@@ -319,8 +338,8 @@ mod tests {
                     session: "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34".to_string(),
                     cwd: "/home/sam/projects/atlas".to_string(),
                     project: ProjectKey::Repo("github.com/sam/atlas".to_string()),
-                    model: "claude-fable-5-2".to_string(),
-                    input: (work * 1_000_000.0).round() as u64,
+                    model: "claude-opus-5-5".to_string(),
+                    input: (work * 250_000.0).round() as u64,
                     out: 0,
                     cw: 0,
                     cr: 0,
@@ -336,13 +355,18 @@ mod tests {
     #[test]
     fn replay_lazy_and_eager_differ_as_in_the_model() {
         let (_dir, history, rates, range) = setup();
-        let lazy = replay(&history, &range, &rates, &[], Policy::Lazy).expect("replay");
-        let eager = replay(&history, &range, &rates, &[], Policy::Eager).expect("replay");
+        let lazy = replay(&history, &range, &rates, &[], Policy::Lazy, &prices()).expect("replay");
+        let eager =
+            replay(&history, &range, &rates, &[], Policy::Eager, &prices()).expect("replay");
 
-        assert!((eager.blocked_wu - 0.0).abs() < EPS, "{}", eager.blocked_wu);
-        assert!(lazy.blocked_wu > 15.0, "{}", lazy.blocked_wu);
+        assert!(
+            (eager.blocked_usd - 0.0).abs() < EPS,
+            "{}",
+            eager.blocked_usd
+        );
+        assert!(lazy.blocked_usd > 15.0, "{}", lazy.blocked_usd);
         for result in [&lazy, &eager] {
-            let worked = result.worked_wu + result.blocked_wu;
+            let worked = result.worked_usd + result.blocked_usd;
             assert!((worked - 92.0).abs() < EPS, "{worked}");
         }
         assert_eq!(lazy.policy, Policy::Lazy);
@@ -352,15 +376,22 @@ mod tests {
     #[test]
     fn replay_without_an_account_blocks_more() {
         let (_dir, history, rates, range) = setup();
-        let with = replay(&history, &range, &rates, &[], Policy::Lazy).expect("replay");
-        let without =
-            replay(&history, &range, &rates, &[account_ref("AC")], Policy::Lazy).expect("replay");
+        let with = replay(&history, &range, &rates, &[], Policy::Lazy, &prices()).expect("replay");
+        let without = replay(
+            &history,
+            &range,
+            &rates,
+            &[account_ref("AC")],
+            Policy::Lazy,
+            &prices(),
+        )
+        .expect("replay");
 
         assert!(
-            without.blocked_wu > with.blocked_wu,
+            without.blocked_usd > with.blocked_usd,
             "{} vs {}",
-            without.blocked_wu,
-            with.blocked_wu
+            without.blocked_usd,
+            with.blocked_usd
         );
     }
 
@@ -405,15 +436,9 @@ mod tests {
             ],
         });
         let account = account_ref("AC");
-        let rates = BTreeMap::from([(
-            account,
-            Rates {
-                c: 4.0,
-                s: Some(100.0),
-            },
-        )]);
+        let rates = BTreeMap::from([(account, Rates::given(4.0, Some(100.0)))]);
 
-        let err = replay(&history, &range, &rates, &[], Policy::Lazy)
+        let err = replay(&history, &range, &rates, &[], Policy::Lazy, &prices())
             .expect_err("a window without a reset time cannot be played");
         assert!(err.to_string().contains("AC"), "{err}");
     }
@@ -436,8 +461,15 @@ mod tests {
             }],
         });
 
-        let err = replay(&history, &range, &BTreeMap::new(), &[], Policy::Lazy)
-            .expect_err("a sample without a weekly limit cannot be played");
+        let err = replay(
+            &history,
+            &range,
+            &BTreeMap::new(),
+            &[],
+            Policy::Lazy,
+            &prices(),
+        )
+        .expect_err("a sample without a weekly limit cannot be played");
         assert!(
             !matches!(err, ReplayError::History(HistoryError::Io { .. })),
             "{err}"
@@ -479,11 +511,11 @@ mod tests {
                 .expect("write the sample");
         }
         let rates = BTreeMap::from([
-            (first.clone(), Rates { c: 1.0, s: None }),
-            (second.clone(), Rates { c: 1.0, s: None }),
+            (first.clone(), Rates::given(1.0, None)),
+            (second.clone(), Rates::given(1.0, None)),
         ]);
 
-        let result = replay(&history, &range, &rates, &[], Policy::Lazy)
+        let result = replay(&history, &range, &rates, &[], Policy::Lazy, &prices())
             .expect("two accounts with one acc do not collapse");
         assert_eq!(result.expired.len(), 2);
         assert!((result.expired[&first] - 100.0).abs() < EPS);
@@ -505,7 +537,8 @@ mod tests {
             .expect("append a torn line");
         drop(file);
 
-        let result = replay(&history, &range, &rates, &[], Policy::Lazy).expect("replay");
+        let result =
+            replay(&history, &range, &rates, &[], Policy::Lazy, &prices()).expect("replay");
         assert_eq!(result.warnings.len(), 1);
         assert!(
             result.warnings[0].contains("samples-2026-11.jsonl"),
@@ -560,7 +593,8 @@ mod tests {
             .expect("the token records");
 
         for without in [vec![], vec![account_ref("AC")]] {
-            let own = replay(&history, &range, &rates, &without, Policy::Lazy).expect("replay");
+            let own = replay(&history, &range, &rates, &without, Policy::Lazy, &prices())
+                .expect("replay");
             let shared = replay_records(
                 &samples.records,
                 &records.records,
@@ -568,6 +602,7 @@ mod tests {
                 &rates,
                 &without,
                 Policy::Lazy,
+                &prices(),
             )
             .expect("replay of the shared records");
             assert_eq!(shared, own);
@@ -577,11 +612,82 @@ mod tests {
     #[test]
     fn provider_records_do_not_change_the_replay() {
         let (_dir, history, rates, range) = setup();
-        let before = replay(&history, &range, &rates, &[], Policy::Lazy).expect("the replay");
+        let before =
+            replay(&history, &range, &rates, &[], Policy::Lazy, &prices()).expect("the replay");
 
         append_codex_records(&history, range.from + Duration::hours(1));
-        let after = replay(&history, &range, &rates, &[], Policy::Lazy).expect("the replay");
+        let after =
+            replay(&history, &range, &rates, &[], Policy::Lazy, &prices()).expect("the replay");
 
         assert_eq!(after, before, "a Codex sample changed the Claude replay");
+    }
+
+    /// R7 of 1.3: Codex and Ollama work uses no Claude account, so the replay
+    /// plays only Claude work, even when the other company's model has a
+    /// price.
+    #[test]
+    fn replay_counts_only_anthropic_work() {
+        let (_dir, history, rates, range) = setup();
+        let before =
+            replay(&history, &range, &rates, &[], Policy::Lazy, &prices()).expect("the replay");
+
+        let mut others = Vec::new();
+        for (model, hour) in [("deepseek-v4.1-flash:cloud", 3), ("gpt-6.1-sol", 4)] {
+            others.push(TokenRecord {
+                t: range.from + Duration::hours(hour),
+                minutes: 60,
+                session: "5d2f8a1c-3e7b-4c9d-a0f6-8b1e4d7c2a95".to_string(),
+                cwd: "/home/sam/projects/ledger".to_string(),
+                project: ProjectKey::Repo("github.com/sam/ledger".to_string()),
+                model: model.to_string(),
+                input: 40_000_000,
+                out: 2_000_000,
+                cw: 0,
+                cr: 0,
+                answers: 12,
+                agent_answers: 0,
+            });
+        }
+        history
+            .append_many(&others)
+            .expect("write the other companies' records");
+        let after =
+            replay(&history, &range, &rates, &[], Policy::Lazy, &prices()).expect("the replay");
+
+        assert_eq!(after, before, "another company's work changed the replay");
+        assert!(
+            (after.worked_usd + after.blocked_usd - 92.0).abs() < EPS,
+            "{after:?}"
+        );
+    }
+
+    /// Work of a Claude model without a price is left out of the replay's
+    /// recorded hours: never valued as 0 in an hour, never guessed.
+    #[test]
+    fn replay_leaves_out_work_without_a_price() {
+        let (_dir, history, rates, range) = setup();
+        let before =
+            replay(&history, &range, &rates, &[], Policy::Lazy, &prices()).expect("the replay");
+
+        history
+            .append(&TokenRecord {
+                t: range.from + Duration::hours(3),
+                minutes: 60,
+                session: "5d2f8a1c-3e7b-4c9d-a0f6-8b1e4d7c2a95".to_string(),
+                cwd: "/home/sam/projects/ledger".to_string(),
+                project: ProjectKey::Repo("github.com/sam/ledger".to_string()),
+                model: "claude-new-9".to_string(),
+                input: 40_000_000,
+                out: 2_000_000,
+                cw: 0,
+                cr: 0,
+                answers: 12,
+                agent_answers: 0,
+            })
+            .expect("write the unpriced record");
+        let after =
+            replay(&history, &range, &rates, &[], Policy::Lazy, &prices()).expect("the replay");
+
+        assert_eq!(after, before);
     }
 }

@@ -1,4 +1,4 @@
-//! Auto-burn (spec §2): what a session's tokens cost in work units, the weekly
+//! Auto-burn (spec §2): the work of a session's tokens in API dollars, the weekly
 //! rhythm of work, and each account's rates. The plans, the decision, the cost
 //! of a switch and the replay join these types in the tasks after this one.
 
@@ -14,16 +14,23 @@ pub mod rates;
 pub mod replay;
 pub mod tied;
 
-/// An account's rates are known from this much work on it (spec §2.3, "while
-/// learning"). An assumed rate counts as this much work, too: it weighs as
-/// much as this many work units of the account's own measurement.
-pub const LEARN_MIN_WU: f64 = 20.0;
-/// The assumed weekly percent per work unit of a plan with capacity 1 (spec
-/// §2.3, "assumed rates"): a plan of capacity `n` (its tier ends in `_<n>x`)
-/// is assumed at this divided by `n`. Taken from a measurement on 2026-11-18:
-/// an Ultra account (`max_20x`) at 0.0618 % per work unit over 14 days of a
-/// heavy Claude Code user.
-pub const ASSUMED_WEEK_PERCENT_PER_WU: f64 = 1.235;
+use fit::Factor;
+
+/// A factor is measured from this much work of its own, in USD (spec R2 of
+/// 1.3). An assumed factor (the prior) weighs as much as this many dollars of
+/// the account's own measurement.
+pub const LEARN_MIN_USD: f64 = 100.0;
+/// The assumed weekly percent per API dollar of a plan with capacity 1 (spec
+/// R2 of 1.3, "assumed factor"): a plan of capacity `n` (its tier ends in
+/// `_<n>x`, Pro is 1) is assumed at this divided by `n`. From the fit on the
+/// owner's history of 17 Nov 2026: Max ≈ 0.15, Team Premium ≈ 0.087, Ultra ≈
+/// 0.042 % per USD.
+pub const ASSUMED_WEEK_PERCENT_PER_USD_AT_1X: f64 = 0.75;
+/// A pair of readings counts for a factor only when the account was live on
+/// some seatswap host for at least this share of the pair's time (spec R2 of
+/// 1.3, documented rule): a rise outside that time comes from use seatswap
+/// does not see.
+pub const MIN_LIVE_SHARE: f64 = 0.9;
 /// The rhythm averages this many weeks; the newer two count double.
 pub const RHYTHM_WEEKS: i64 = 4;
 /// Rates are learned from the samples of this many days.
@@ -65,12 +72,6 @@ pub const LEARN_RETRY_MIN: i64 = 5;
 /// The same switch decision is sent again after this many minutes (spec §2.5).
 pub const SWITCH_RETRY_MIN: i64 = 10;
 
-/// One output token against one input token (spec §2.3).
-const OUTPUT_WEIGHT: f64 = 5.0;
-/// One token written to the cache against one input token.
-const CACHE_WRITE_WEIGHT: f64 = 1.25;
-/// One token read from the cache against one input token.
-const CACHE_READ_WEIGHT: f64 = 0.1;
 /// The hours of the week.
 const HOURS: usize = 168;
 
@@ -84,40 +85,30 @@ fn week_weight(week: i64) -> f64 {
     }
 }
 
-/// Work in work units: a million weighted tokens (spec §2.3). The one place the
-/// four kinds of token are weighed.
-pub fn work_units(input: u64, output: u64, cache_write: u64, cache_read: u64) -> f64 {
-    (input as f64
-        + OUTPUT_WEIGHT * output as f64
-        + CACHE_WRITE_WEIGHT * cache_write as f64
-        + CACHE_READ_WEIGHT * cache_read as f64)
-        / 1_000_000.0
+/// API dollars as hours at `typical_usd` dollars per typical working hour;
+/// `None` when `typical_usd` is 0.0, because no hours can be computed then. The
+/// one dollars-to-hours conversion (spec §2.3, §2.4).
+pub fn usd_hours(usd: f64, typical_usd: f64) -> Option<f64> {
+    (typical_usd > 0.0).then(|| usd / typical_usd)
 }
 
-/// Work units as hours at `typical_wu` work units per typical working hour;
-/// `None` when `typical_wu` is 0.0, because no hours can be computed then. The
-/// one work-units-to-hours conversion (spec §2.3, §2.4).
-pub fn wu_hours(wu: f64, typical_wu: f64) -> Option<f64> {
-    (typical_wu > 0.0).then(|| wu / typical_wu)
-}
-
-/// Work units per clock hour of the week, in the local time of the offset the
-/// rhythm was learned in; index 0 is Monday 00:00.
+/// API dollars of work per clock hour of the week, in the local time of the
+/// offset the rhythm was learned in; index 0 is Monday 00:00.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Rhythm {
-    pub wu: [f64; HOURS],
+    pub usd: [f64; HOURS],
 }
 
 impl Rhythm {
-    /// The work units of the hour that holds `t`.
+    /// The dollars of the hour that holds `t`.
     pub fn at(&self, t: DateTime<Utc>, offset: FixedOffset) -> f64 {
-        self.wu[crate::stats::local_hour_of_week(t, &offset)]
+        self.usd[crate::stats::local_hour_of_week(t, &offset)]
     }
 
-    /// The mean over the hours that have work, 0.0 when there is none: the
-    /// "work of a typical working hour" of spec §2.3.
+    /// The mean dollars over the hours that have work, 0.0 when there is none:
+    /// the "work of a typical working hour" of spec §2.3.
     pub fn typical_hour(&self) -> f64 {
-        mean_over_hours(self.wu.iter().copied())
+        mean_over_hours(self.usd.iter().copied())
     }
 }
 
@@ -127,9 +118,9 @@ impl Rhythm {
 pub(crate) fn mean_over_hours(hours: impl IntoIterator<Item = f64>) -> f64 {
     let mut sum = 0.0;
     let mut count = 0usize;
-    for wu in hours {
-        if wu > 0.0 {
-            sum += wu;
+    for usd in hours {
+        if usd > 0.0 {
+            sum += usd;
             count += 1;
         }
     }
@@ -140,12 +131,33 @@ pub(crate) fn mean_over_hours(hours: impl IntoIterator<Item = f64>) -> f64 {
     }
 }
 
-/// One account's rates (spec §2.3): `c` is the percent of its week one work
-/// unit costs, `s` the percent of one 5 h window. `s` is `None` for an account
-/// without a session limit, or until enough work is known for it. Neither rate
-/// is ever 0 or below: a rate that cannot be positive is unknown, not a number.
-#[derive(Debug, Clone, Copy)]
+/// One account's rates (spec §2.3, R2 of 1.3): `c` is the factor of its week,
+/// the percent of the week one API dollar of work costs, `s` the factor of one
+/// 5 h window. `s` is `None` for an account without a session limit, or until
+/// it can be measured or assumed. The plan uses each factor's `value`; neither
+/// is ever 0 or below ([`fit::factor`] gives no such factor).
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rates {
-    pub c: f64,
-    pub s: Option<f64>,
+    pub c: Factor,
+    pub s: Option<Factor>,
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+impl Rates {
+    /// Rates given as numbers rather than learned, for tests and fixtures that
+    /// play a plan from known rates: each factor's value without a range,
+    /// measured on [`LEARN_MIN_USD`] of work.
+    pub fn given(c: f64, s: Option<f64>) -> Rates {
+        let factor = |value: f64| Factor {
+            value,
+            low: value,
+            high: value,
+            basis_usd: LEARN_MIN_USD,
+            measured: true,
+        };
+        Rates {
+            c: factor(c),
+            s: s.map(factor),
+        }
+    }
 }

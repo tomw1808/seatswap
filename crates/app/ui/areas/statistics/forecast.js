@@ -64,10 +64,10 @@ function position(value, what) {
   return `${Math.min(value, 100)}%`;
 }
 
-// Why an expected percent is missing: the account is still learning its rates,
-// or the plan has no entry for it (`forecast.rs` 74-77 and 234-242).
-function expectedReason(learning) {
-  return learning ? "its rates are not known yet" : "the plan has no entry for it";
+// Why an expected percent is missing: the account's rates are not known yet
+// (`forecast.rs`'s `unknown`), or the plan has no entry for it.
+function expectedReason(unknown) {
+  return unknown ? "its rates are not known yet" : "the plan has no entry for it";
 }
 
 export async function show(container, env) {
@@ -169,7 +169,7 @@ export async function show(container, env) {
   for (const account of data.accounts) {
     const view = accountView(env.accounts, account.id);
     const color = view && isColor(view.color) ? view.color : "var(--muted)";
-    const learning = data.learning.includes(account.id);
+    const unknown = data.unknown.includes(account.id);
     const row = h("div", { class: "stats-fc-row" });
 
     const name = h("div", { class: "stats-fc-account" }, [
@@ -206,7 +206,7 @@ export async function show(container, env) {
       `now: ${percentText(account.now)}`,
       typeof account.expected === "number"
         ? `expected at its reset: ${percentText(account.expected)}`
-        : `expected at its reset: — (${expectedReason(learning)})`,
+        : `expected at its reset: — (${expectedReason(unknown)})`,
       typeof account.low === "number"
         ? `lowest of the last 8 weeks: ${percentText(account.low)}`
         : "lowest of the last 8 weeks: — (fewer than four finished windows)",
@@ -251,7 +251,7 @@ export async function show(container, env) {
       }
     } else {
       lazy.appendChild(
-        document.createTextNode(`only when full: — (${expectedReason(learning)})`)
+        document.createTextNode(`only when full: — (${expectedReason(unknown)})`)
       );
     }
     row.appendChild(lazy);

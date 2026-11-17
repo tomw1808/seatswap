@@ -10,7 +10,7 @@ use serde::Serialize;
 use crate::burn::live;
 use crate::burn::plan::Policy;
 use crate::burn::replay::{replay_records, ReplayResult};
-use crate::burn::wu_hours;
+use crate::burn::usd_hours;
 use crate::history::{AccountRef, Event, EventKind, Hosts, Range, Sample, TokenRecord};
 use crate::live_sessions::Values;
 use crate::money::{window_money, Valuer};
@@ -378,6 +378,7 @@ pub(crate) fn what_if_in<Tz: TimeZone + Copy>(
         ctx.zone,
         ctx.accounts,
         ctx.settings.read_sessions,
+        ctx.prices,
     )?;
     let samples = keep_warnings(ctx.warnings, || {
         ctx.history.read_claude::<Sample>(range, &Hosts::All)
@@ -442,6 +443,7 @@ pub(crate) fn what_if_in<Tz: TimeZone + Copy>(
             &learned.rates,
             &[],
             Policy::Lazy,
+            ctx.prices,
         )
         .map_err(|error| StatsError::Message(error.to_string()))?;
         let without_replay = replay_records(
@@ -451,12 +453,16 @@ pub(crate) fn what_if_in<Tz: TimeZone + Copy>(
             &learned.rates,
             std::slice::from_ref(&without_ref),
             Policy::Lazy,
+            ctx.prices,
         )
         .map_err(|error| StatsError::Message(error.to_string()))?;
         // A week without recorded work has no typical hour and no blocked
         // work: it adds no hour.
-        let extra =
-            wu_hours(without_replay.blocked_wu - with.blocked_wu, with.typical_wu).unwrap_or(0.0);
+        let extra = usd_hours(
+            without_replay.blocked_usd - with.blocked_usd,
+            with.typical_usd,
+        )
+        .unwrap_or(0.0);
         // The plan's rule: dropping an account never reports fewer blocked hours
         // than were recorded.
         let without_hours = (*was + extra).max(*was);
@@ -1522,11 +1528,13 @@ mod tests {
                 sample("2026-11-09T00:00:00Z", &lb, 0.0, lb_reset),
             ])
             .expect("the samples");
+        // 3,000,000 output tokens of claude-opus-5-5 are 60 USD: each pair
+        // rests on 120 USD, enough to be measured.
         let mut records = vec![
-            record("2026-11-03T09:00:00Z", 2_000_000),
-            record("2026-11-03T10:00:00Z", 2_000_000),
-            record("2026-11-04T09:00:00Z", 2_000_000),
-            record("2026-11-04T10:00:00Z", 2_000_000),
+            record("2026-11-03T09:00:00Z", 3_000_000),
+            record("2026-11-03T10:00:00Z", 3_000_000),
+            record("2026-11-04T09:00:00Z", 3_000_000),
+            record("2026-11-04T10:00:00Z", 3_000_000),
         ];
         for day in 9..=12 {
             for hour in 9..17 {
@@ -1564,15 +1572,31 @@ mod tests {
             from: utc("2026-11-09T00:00:00Z"),
             to: utc("2026-11-16T00:00:00Z"),
         };
-        let learned =
-            live::learn(&history, week.to, tiny.offset, &tiny.accounts, true).expect("the rates");
-        let with = replay(&history, &week, &learned.rates, &[], Policy::Lazy).expect("with");
+        let learned = live::learn(
+            &history,
+            week.to,
+            tiny.offset,
+            &tiny.accounts,
+            true,
+            &tiny.prices,
+        )
+        .expect("the rates");
+        let with = replay(
+            &history,
+            &week,
+            &learned.rates,
+            &[],
+            Policy::Lazy,
+            &tiny.prices,
+        )
+        .expect("with");
         let without = replay(
             &history,
             &week,
             &learned.rates,
             &[tiny.lb_ref()],
             Policy::Lazy,
+            &tiny.prices,
         )
         .expect("without");
         assert_eq!(with.expired.get(&tiny.ac_ref()), Some(&100.0), "{with:?}");
@@ -1605,6 +1629,7 @@ mod tests {
             &learned.rates,
             &[tiny.ac_ref()],
             Policy::Lazy,
+            &tiny.prices,
         )
         .expect("without AC");
         let shift = without_ac.expired[&tiny.lb_ref()] - with.expired[&tiny.lb_ref()];

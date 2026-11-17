@@ -186,7 +186,7 @@ pub enum Fill {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Plan {
     pub segments: Vec<Segment>,
-    pub blocked_wu: f64,
+    pub blocked_usd: f64,
     pub switches: u32,
     /// Week-% unused at each account's first weekly reset inside the horizon.
     pub left_at_reset: BTreeMap<String, f64>,
@@ -242,10 +242,10 @@ pub(crate) fn week_percent_at(account: &AccountState, at: DateTime<Utc>) -> f64 
     }
 }
 
-/// The work units this account can still take before its weekly reset, minus
-/// the work units needed to empty it (spec §2.3). The walk runs in [`STEP_MIN`]
+/// The USD this account can still take before its weekly reset, minus
+/// the USD needed to empty it (spec §2.3). The walk runs in [`STEP_MIN`]
 /// steps from [`Inputs::now`]; a capped account takes at most
-/// `(100 - session-%) / s` work units per window, a window opens at the first
+/// `(100 - session-%) / s` USD per window, a window opens at the first
 /// step with work after the previous one ended and lasts 5 h. A weekly reset at
 /// or before [`Inputs::now`] means that week is over: the account is played
 /// from 0 % with its next reset, as the 5 h window already is when its reset
@@ -422,14 +422,14 @@ pub fn followed(inputs: &Inputs, regime: &Regime) -> Plan {
 /// week-% unused at every weekly reset the walk passed, per account.
 pub(super) struct Played {
     pub(super) plan: Plan,
-    pub(super) worked_wu: f64,
+    pub(super) worked_usd: f64,
     pub(super) expired: BTreeMap<String, f64>,
 }
 
 /// Play `inputs` over `walk` in [`STEP_MIN`] steps. This is the plan's one step
 /// loop: [`follow`] gives it the rhythm over [`HORIZON_H`] hours, a replay the
 /// recorded work up to the range's end and the recorded hours' typical hour.
-/// `worked_wu` is the work of the steps with an account, `plan.blocked_wu` the
+/// `worked_usd` is the work of the steps with an account, `plan.blocked_usd` the
 /// work of those without one, so they add up to the work of the walk.
 pub(super) fn play(inputs: &Inputs, policy: Policy, walk: &Walk<'_>, typical: f64) -> Played {
     let step = Duration::minutes(STEP_MIN);
@@ -452,8 +452,8 @@ pub(super) fn play(inputs: &Inputs, policy: Policy, walk: &Walk<'_>, typical: f6
         .and_then(|id| views.iter().position(|view| &view.account.id == id))
         .filter(|&index| !views[index].blocked(inputs.now));
     let mut last_switch = inputs.last_switch_at;
-    let mut worked_wu = 0.0;
-    let mut blocked_wu = 0.0;
+    let mut worked_usd = 0.0;
+    let mut blocked_usd = 0.0;
     let mut switches = 0u32;
     let mut segments: Vec<Segment> = Vec::new();
 
@@ -492,7 +492,7 @@ pub(super) fn play(inputs: &Inputs, policy: Policy, walk: &Walk<'_>, typical: f6
                 }
                 current = Some(index);
                 if work > 0.0 {
-                    worked_wu += work;
+                    worked_usd += work;
                     views[index].apply(t, work);
                     if views[index].full_at.is_none() && views[index].is_full(t) {
                         let fill = views[index].fill();
@@ -503,7 +503,7 @@ pub(super) fn play(inputs: &Inputs, policy: Policy, walk: &Walk<'_>, typical: f6
             }
             None => {
                 if work > 0.0 {
-                    blocked_wu += work;
+                    blocked_usd += work;
                 }
             }
         }
@@ -526,7 +526,7 @@ pub(super) fn play(inputs: &Inputs, policy: Policy, walk: &Walk<'_>, typical: f6
     Played {
         plan: Plan {
             segments,
-            blocked_wu,
+            blocked_usd,
             switches,
             left_at_reset: views
                 .iter()
@@ -544,7 +544,7 @@ pub(super) fn play(inputs: &Inputs, policy: Policy, walk: &Walk<'_>, typical: f6
                 .filter_map(|view| view.full_by.map(|fill| (view.account.id.clone(), fill)))
                 .collect(),
         },
-        worked_wu,
+        worked_usd,
         expired: views
             .iter()
             .filter(|view| view.resets_passed > 0)
@@ -609,7 +609,7 @@ impl<'a> View<'a> {
     /// so such an account never fills (the rule the plan states).
     fn play_rates(&self) -> (f64, f64) {
         match self.rates() {
-            Some(rates) => (rates.c, rates.s.unwrap_or(0.0)),
+            Some(rates) => (rates.c.value, rates.s.map_or(0.0, |s| s.value)),
             None => (0.0, 0.0),
         }
     }
@@ -711,22 +711,22 @@ impl<'a> View<'a> {
         let rates = self.rates()?;
         let week = self.week;
         let mut view = *self;
-        let mut usable_wu = 0.0;
+        let mut usable_usd = 0.0;
         for (cursor, work) in walk.horizon_from(at) {
             if cursor >= view.reset {
                 break;
             }
             view.clear_resets(cursor, walk.end());
             if work > 0.0 {
-                usable_wu += view.apply(cursor, work);
+                usable_usd += view.apply(cursor, work);
             }
         }
-        Some(usable_wu - (100.0 - week) / rates.c)
+        Some(usable_usd - (100.0 - week) / rates.c.value)
     }
 
     /// Apply one step's work to the account: its week grows by `c`, its open
     /// 5 h window by `s`, and a window opens when none runs. Unknown rates are
-    /// 0. Returns the work units the account can take in this step: all of it,
+    /// 0. Returns the USD the account can take in this step: all of it,
     /// or the part the open window still has room for.
     fn apply(&mut self, at: DateTime<Utc>, work: f64) -> f64 {
         let (c, s) = self.play_rates();
@@ -894,18 +894,18 @@ pub(crate) mod testkit {
         FixedOffset::east_opt(0).expect("UTC")
     }
 
-    /// The rhythm of the tests: six working days, one work unit per working
+    /// The rhythm of the tests: six working days, one USD per working
     /// hour, a free Sunday.
     ///
     /// Monday to Friday work `hours_per_weekday` hours in three 5 h blocks —
     /// 07:00–12:00, 12:00–17:00 and 18:00–23:00 for 15 — and Saturday works 18
     /// hours in four blocks, 00:00–05:00, 05:00–10:00, 10:00–15:00 and
     /// 15:00–18:00 for 15. Monday's 07:00–08:00 lies before `now`, so the work
-    /// before PR's reset on Saturday 19:00 is 14 + 4 × 15 + 18 = 92 work units.
+    /// before PR's reset on Saturday 19:00 is 14 + 4 × 15 + 18 = 92 USD.
     /// Each block opens one 5 h window; the five weekdays give three windows
-    /// each and Saturday four, so AC can use 19 work units in its windows
+    /// each and Saturday four, so AC can use 19 USD in its windows
     /// before its reset, not the 18 the plan expected: 18 windows hold at most
-    /// 18 × 5 = 90 work units of work. The tests assert those numbers.
+    /// 18 × 5 = 90 USD of work. The tests assert those numbers.
     ///
     /// `hours_per_weekday` is 0 (an empty week, the "no rhythm" case) or
     /// 10..=16: those are the values the block arithmetic below yields valid
@@ -915,9 +915,9 @@ pub(crate) mod testkit {
             hours_per_weekday == 0 || (10..=16).contains(&hours_per_weekday),
             "week: hours_per_weekday must be 0 or 10..=16, got {hours_per_weekday}"
         );
-        let mut wu = [0.0f64; 168];
+        let mut usd = [0.0f64; 168];
         if hours_per_weekday == 0 {
-            return Rhythm { wu };
+            return Rhythm { usd };
         }
         let third_end = 18 + (hours_per_weekday - 10) as u32;
         let saturday_end = 15 + (hours_per_weekday - 12) as u32;
@@ -931,11 +931,11 @@ pub(crate) mod testkit {
             };
             for &(from, to) in blocks {
                 for hour in from..to {
-                    wu[(day * 24 + hour) as usize] = 1.0;
+                    usd[(day * 24 + hour) as usize] = 1.0;
                 }
             }
         }
-        Rhythm { wu }
+        Rhythm { usd }
     }
 
     pub(crate) fn account(
@@ -956,7 +956,7 @@ pub(crate) mod testkit {
                 resets_at: None,
             }),
             model_blocked: false,
-            rates: Some(Rates { c, s }),
+            rates: Some(Rates::given(c, s)),
             thinking_held: 0,
         }
     }
@@ -1030,8 +1030,8 @@ mod tests {
 
     #[test]
     fn slack_of_a_capped_account_counts_windows() {
-        // AC needs 100 / 4 = 25 wu. Its 19 windows (three on each of the five
-        // weekdays, four on Saturday) take 1.0 wu each, so 19 - 25 = -6.0.
+        // AC needs 100 / 4 = 25 USD. Its 19 windows (three on each of the five
+        // weekdays, four on Saturday) take 1.0 USD each, so 19 - 25 = -6.0.
         let inputs = inputs();
         let slack = slack(&inputs.accounts[1], &inputs).expect("AC has c and s");
         assert!((slack - (-6.0)).abs() < EPS, "{slack}");
@@ -1191,8 +1191,12 @@ mod tests {
         let inputs = inputs();
         let lazy = follow(&inputs, Policy::Lazy);
         let eager = follow(&inputs, Policy::Eager);
-        assert!((eager.blocked_wu - 0.0).abs() < EPS, "{}", eager.blocked_wu);
-        assert!(lazy.blocked_wu > 15.0, "{}", lazy.blocked_wu);
+        assert!(
+            (eager.blocked_usd - 0.0).abs() < EPS,
+            "{}",
+            eager.blocked_usd
+        );
+        assert!(lazy.blocked_usd > 15.0, "{}", lazy.blocked_usd);
     }
 
     #[test]
@@ -1201,9 +1205,17 @@ mod tests {
         let inputs = inputs();
         let lazy = follow(&inputs, Policy::Lazy);
         let eager = follow(&inputs, Policy::Eager);
-        assert!((lazy.blocked_wu - 21.75).abs() < EPS, "{}", lazy.blocked_wu);
+        assert!(
+            (lazy.blocked_usd - 21.75).abs() < EPS,
+            "{}",
+            lazy.blocked_usd
+        );
         assert_eq!(lazy.switches, 19);
-        assert!((eager.blocked_wu - 0.0).abs() < EPS, "{}", eager.blocked_wu);
+        assert!(
+            (eager.blocked_usd - 0.0).abs() < EPS,
+            "{}",
+            eager.blocked_usd
+        );
         assert_eq!(eager.switches, 58);
     }
 
@@ -1393,7 +1405,7 @@ mod tests {
         // window in the plan, but its week fills by `c` like any other.
         let mut inputs = inputs();
         assert!(inputs.accounts[1].session.is_some(), "AC is capped");
-        inputs.accounts[1].rates = Some(Rates { c: 4.0, s: None });
+        inputs.accounts[1].rates = Some(Rates::given(4.0, None));
         assert!(slack(&inputs.accounts[1], &inputs).is_some());
 
         let mut without_window = inputs.clone();
@@ -1418,7 +1430,7 @@ mod tests {
         let eager = follow(&inputs, Policy::Eager);
         assert_eq!(eager.segments, lazy.segments);
         assert_eq!(eager.switches, 0);
-        assert!((eager.blocked_wu - 0.0).abs() < EPS);
+        assert!((eager.blocked_usd - 0.0).abs() < EPS);
     }
 
     #[test]
@@ -1426,13 +1438,10 @@ mod tests {
         let mut inputs = inputs();
         inputs.active = Some("AC".to_string());
         inputs.accounts[1].may_use = false;
-        // AC's c of 100 fills its week after 1 wu, one hour of the test rhythm.
+        // AC's c of 100 fills its week after 1 USD, one hour of the test rhythm.
         // Both policies keep it until then instead of starting on LB, and it is
         // never chosen again after it is left.
-        inputs.accounts[1].rates = Some(Rates {
-            c: 100.0,
-            s: Some(100.0),
-        });
+        inputs.accounts[1].rates = Some(Rates::given(100.0, Some(100.0)));
         for policy in [Policy::Lazy, Policy::Eager] {
             let plan = follow(&inputs, policy);
             assert_eq!(
@@ -1563,7 +1572,7 @@ mod tests {
     fn a_reset_inside_the_last_step_is_recorded() {
         let mut inputs = inputs();
         // PR stays far from full, so the reset leaves work unused.
-        inputs.accounts[0].rates = Some(Rates { c: 0.5, s: None });
+        inputs.accounts[0].rates = Some(Rates::given(0.5, None));
         inputs.accounts[0].week_resets_at =
             inputs.now + Duration::hours(167) + Duration::minutes(55);
 

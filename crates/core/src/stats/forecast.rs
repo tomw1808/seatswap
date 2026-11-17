@@ -11,7 +11,7 @@ use crate::burn::decide::Regime;
 use crate::burn::plan::{
     follow, followed, next_reset, rates_known, week_percent_at, AccountState, Inputs, Plan, Policy,
 };
-use crate::burn::{wu_hours, HORIZON_H};
+use crate::burn::{usd_hours, HORIZON_H};
 use crate::history::{same_reset, AccountRef, Hosts, Range, Sample, WindowRecord};
 use crate::money::{window_money, Valuer};
 
@@ -33,8 +33,12 @@ pub struct Forecast {
     /// Whole weeks from the first record's week start to this week's; 0 for an
     /// empty history.
     pub basis_weeks: u32,
-    /// The accounts auto-burn may use whose rates are not known yet.
-    pub learning: Vec<String>,
+    /// The accounts auto-burn may use whose week factor exists but is not
+    /// measured: it is assumed from the plan (R2 of 1.3).
+    pub assumed: Vec<String>,
+    /// The accounts auto-burn may use that have no week factor at all: their
+    /// rates are not known yet.
+    pub unknown: Vec<String>,
     pub kpis: ForecastKpis,
     /// One per [`Inputs::accounts`](crate::burn::plan::Inputs::accounts), in
     /// that order.
@@ -285,10 +289,10 @@ pub fn forecast<Tz: TimeZone + Copy>(
         expire_planned: planned_money,
         expire_only_when_full: lazy_money,
         // The plan on the page: its blocked work in the hours the rhythm makes
-        // of it, with the one work-units-to-hours function. A typical hour of
+        // of it, with the one dollars-to-hours function. A typical hour of
         // 0.0 means no hours can be computed; the regime's rule then says 0.0
         // (see `burn::decide::regime`).
-        blocked_hours: wu_hours(planned.blocked_wu, inputs.rhythm.typical_hour()).unwrap_or(0.0),
+        blocked_hours: usd_hours(planned.blocked_usd, inputs.rhythm.typical_hour()).unwrap_or(0.0),
         switches: planned.switches,
         switches_per_day: crate::burn::switches_per_day(planned.switches),
         switches_only_when_full: lazy.switches,
@@ -321,25 +325,36 @@ pub fn forecast<Tz: TimeZone + Copy>(
         .chain(std::iter::once(None))
         .collect();
 
-    let learning: Vec<String> = inputs
+    let assumed: Vec<String> = inputs
         .accounts
         .iter()
-        .filter(|state| state.may_use && !rates_known(state))
+        .filter(|state| state.may_use && state.rates.is_some_and(|rates| !rates.c.measured))
         .map(|state| state.id.clone())
         .collect();
-    let learning_abbrs: Vec<String> = inputs
+    let unknown: Vec<String> = inputs
         .accounts
         .iter()
-        .zip(&stored)
-        .filter(|(state, _)| learning.iter().any(|id| id == &state.id))
-        .map(|(_, account)| account_abbr(ctx, &AccountRef::of(account)))
+        .filter(|state| state.may_use && state.rates.is_none())
+        .map(|state| state.id.clone())
         .collect();
-    let sentence = sentence(ctx, &learning_abbrs, &planned, &accounts, to)?;
+    let abbrs = |ids: &[String]| -> Vec<String> {
+        inputs
+            .accounts
+            .iter()
+            .zip(&stored)
+            .filter(|(state, _)| ids.iter().any(|id| id == &state.id))
+            .map(|(_, account)| account_abbr(ctx, &AccountRef::of(account)))
+            .collect()
+    };
+    let unknown_abbrs = abbrs(&unknown);
+    let assumed_abbrs = abbrs(&assumed);
+    let sentence = sentence(ctx, &unknown_abbrs, &assumed_abbrs, &planned, &accounts, to)?;
     let basis_weeks = basis_weeks(ctx, inputs.now)?;
 
     Ok(Forecast {
         basis_weeks,
-        learning,
+        assumed,
+        unknown,
         kpis,
         accounts,
         lanes,
@@ -474,27 +489,35 @@ fn basis_weeks<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, now: DateTime<Utc>) -> Result
     })
 }
 
-/// The forecast's sentence (spec §3.4): the learning prefix while any account
-/// auto-burn may use has no rates, then "Enough for the week." or the first
-/// blocked stretch and what ends it: the next account's weekly reset when the
-/// stretch ends there, else that account becoming usable again.
+/// The forecast's sentence (spec §3.4): the "not known yet" prefix while an
+/// account auto-burn may use has no week factor, then the "assumed" prefix
+/// while one has a factor that is not measured, then "Enough for the week." or
+/// the first blocked stretch and what ends it: the next account's weekly reset
+/// when the stretch ends there, else that account becoming usable again.
 fn sentence<Tz: TimeZone + Copy>(
     ctx: &Ctx<Tz>,
-    learning_abbrs: &[String],
+    unknown_abbrs: &[String],
+    assumed_abbrs: &[String],
     planned: &Plan,
     accounts: &[ForecastAccount],
     to: DateTime<Utc>,
 ) -> Result<String, StatsError> {
     let mut sentence = String::new();
-    if !learning_abbrs.is_empty() {
-        let verb = if learning_abbrs.len() == 1 {
-            "is"
+    if !unknown_abbrs.is_empty() {
+        sentence.push_str(&format!(
+            "{}'s rates are not known yet. ",
+            join_names(unknown_abbrs)
+        ));
+    }
+    if !assumed_abbrs.is_empty() {
+        let whose = if assumed_abbrs.len() == 1 {
+            "its plan"
         } else {
-            "are"
+            "their plans"
         };
         sentence.push_str(&format!(
-            "Still learning how fast {} {verb} used. ",
-            join_names(learning_abbrs)
+            "{}'s rates are assumed from {whose}. ",
+            join_names(assumed_abbrs)
         ));
     }
 
@@ -560,7 +583,7 @@ mod tests {
 
     use crate::burn::decide::RegimeWhy;
     use crate::burn::plan::testkit::{inputs, week};
-    use crate::burn::{wu_hours, Rates, HORIZON_H};
+    use crate::burn::{usd_hours, Rates, HORIZON_H};
     use crate::history::{LimitSample, Source};
     use crate::store::Account;
 
@@ -702,7 +725,7 @@ mod tests {
         assert_eq!(forecast.blocked, blocked);
         assert_eq!(forecast.from, inputs.now);
         assert_eq!(forecast.to, inputs.now + Duration::hours(HORIZON_H));
-        let blocked_hours = wu_hours(planned.blocked_wu, inputs.rhythm.typical_hour())
+        let blocked_hours = usd_hours(planned.blocked_usd, inputs.rhythm.typical_hour())
             .expect("the test rhythm has working hours");
         assert_eq!(forecast.kpis.blocked_hours, blocked_hours);
         assert_eq!(forecast.kpis.switches, planned.switches);
@@ -808,7 +831,7 @@ mod tests {
             "the test needs a plan without switches"
         );
         assert_eq!(
-            planned.blocked_wu, 0.0,
+            planned.blocked_usd, 0.0,
             "the test needs a plan without blocked work"
         );
         assert!(
@@ -864,12 +887,9 @@ mod tests {
         ac.session = None;
         ac.week_percent = 20.0;
         ac.week_resets_at = utc("2026-11-23T02:00:00Z");
-        // 92 work units lie between Monday 08:00 and the reset on Monday
-        // 02:00; at 1.0 work unit per working hour this uses 60 more percent.
-        ac.rates = Some(Rates {
-            c: 60.0 / 92.0,
-            s: None,
-        });
+        // 92 USD lie between Monday 08:00 and the reset on Monday
+        // 02:00; at 1.0 USD per working hour this uses 60 more percent.
+        ac.rates = Some(Rates::given(60.0 / 92.0, None));
 
         let forecast = forecast(&ctx, &inputs, &regime(false)).expect("the forecast");
         let account = forecast
@@ -903,11 +923,43 @@ mod tests {
             .expect("LB's row");
         assert_eq!(lb.expected, None);
         assert_eq!(lb.only_when_full_expected, None);
-        assert_eq!(forecast.learning, vec!["LB".to_string()]);
+        assert_eq!(forecast.unknown, vec!["LB".to_string()]);
+        assert!(forecast.assumed.is_empty());
         assert!(
             forecast
                 .sentence
-                .starts_with("Still learning how fast LB is used. "),
+                .starts_with("LB's rates are not known yet. "),
+            "{}",
+            forecast.sentence
+        );
+    }
+
+    /// An account with a factor that is not measured is assumed from the plan,
+    /// not unknown: the two lists name different states.
+    #[test]
+    fn an_assumed_account_is_named_as_assumed() {
+        let tiny = tiny();
+        let accounts = stored_accounts(&tiny);
+        let ctx = context(&tiny, &accounts);
+        let mut inputs = inputs();
+        inputs.accounts[2].rates = Some(Rates {
+            c: crate::burn::fit::Factor {
+                value: 0.5,
+                low: 0.5,
+                high: 0.5,
+                basis_usd: 0.0,
+                measured: false,
+            },
+            s: None,
+        });
+
+        let forecast = forecast(&ctx, &inputs, &regime(false)).expect("the forecast");
+        assert_eq!(forecast.assumed, vec!["LB".to_string()]);
+        assert!(forecast.unknown.is_empty());
+        assert!(
+            forecast
+                .sentence
+                .starts_with("LB's rates are assumed from its plan. "),
             "{}",
             forecast.sentence
         );
@@ -1155,9 +1207,9 @@ mod tests {
         ac.may_use = true;
         ac.session = None;
         ac.week_resets_at = utc("2026-11-23T02:00:00Z");
-        // 89.75 work units lie between Monday 08:00 and Saturday 15:45, so at
+        // 89.75 USD lie between Monday 08:00 and Saturday 15:45, so at
         // this rate AC fills in the step that ends at Saturday 16:00.
-        ac.rates = Some(Rates { c: 1.113, s: None });
+        ac.rates = Some(Rates::given(1.113, None));
 
         let forecast = forecast(&ctx, &inputs, &regime(false)).expect("the forecast");
         assert_eq!(
@@ -1211,9 +1263,9 @@ mod tests {
         let ctx = context(&tiny, &accounts);
         let inputs = inputs();
         let planned = follow(&inputs, Policy::Lazy);
-        let expected = wu_hours(planned.blocked_wu, inputs.rhythm.typical_hour())
+        let expected = usd_hours(planned.blocked_usd, inputs.rhythm.typical_hour())
             .expect("the test rhythm has working hours");
-        assert!(planned.blocked_wu > 0.0, "the plan must have blocked work");
+        assert!(planned.blocked_usd > 0.0, "the plan must have blocked work");
 
         let page = forecast(&ctx, &inputs, &regime(false)).expect("the forecast");
         assert!(
@@ -1427,7 +1479,7 @@ mod tests {
         let page = forecast(&ctx, &inputs, &early).expect("the forecast");
         assert_eq!(page.kpis.switches, eager.switches);
         assert_eq!(page.kpis.switches_only_when_full, lazy.switches);
-        let blocked_hours = wu_hours(eager.blocked_wu, inputs.rhythm.typical_hour())
+        let blocked_hours = usd_hours(eager.blocked_usd, inputs.rhythm.typical_hour())
             .expect("the test rhythm has working hours");
         assert_eq!(page.kpis.blocked_hours, blocked_hours);
     }

@@ -1946,9 +1946,15 @@ pub fn tier_capacity(tier: &str) -> Option<f64> {
 impl Account {
     /// The capacity of the account's plan from its identity's rate-limit tier
     /// ([`OAuthAccount::rate_limit_tier`], [`tier_capacity`]): 5 for Max and
-    /// Team Premium, 20 for Ultra; `None` for a tier without a multiplier.
+    /// Team Premium, 20 for Ultra. A tier that names no multiplier is 1 when
+    /// the plan's name is exactly "Pro" (documented rule), else `None`: Team
+    /// Standard and any other plan stay unknown.
     pub fn capacity(&self) -> Option<f64> {
-        tier_capacity(self.oauth_account.rate_limit_tier()?)
+        match self.oauth_account.rate_limit_tier().and_then(tier_capacity) {
+            Some(capacity) => Some(capacity),
+            None if self.plan.as_deref() == Some("Pro") => Some(1.0),
+            None => None,
+        }
     }
 
     /// Bring the fields that come from the stored login up to date after a
@@ -3833,6 +3839,38 @@ mod tests {
         account.oauth_account = identity(&[("organizationRateLimitTier", "default_raven")]);
         assert_eq!(account.capacity(), None);
         account.oauth_account = sample_identity();
+        assert_eq!(account.capacity(), None);
+    }
+
+    /// Pro's tier names no multiplier: its plan's name makes it capacity 1. A
+    /// tier with a multiplier still wins, and another plan without one stays
+    /// unknown.
+    #[test]
+    fn capacity_of_pro_is_one_by_its_plan_name() {
+        let login = login_with(Some("pro"), Some("default_claude_ai"));
+        let mut account = new_account(
+            &login,
+            &sample_identity(),
+            None,
+            &AccountsFile::default(),
+            now(),
+        )
+        .unwrap();
+        account.plan = Some("Pro".to_string());
+        account.oauth_account = sample_identity();
+        assert_eq!(account.capacity(), Some(1.0));
+        account.oauth_account.0.insert(
+            "organizationRateLimitTier".to_string(),
+            json!("default_claude_ai"),
+        );
+        assert_eq!(account.capacity(), Some(1.0));
+        account.oauth_account.0.insert(
+            "userRateLimitTier".to_string(),
+            json!("default_claude_max_5x"),
+        );
+        assert_eq!(account.capacity(), Some(5.0), "a tier's multiplier wins");
+        account.oauth_account = sample_identity();
+        account.plan = Some("Team Standard".to_string());
         assert_eq!(account.capacity(), None);
     }
 

@@ -18,7 +18,7 @@ use seatswap_core::burn::decide::Regime;
 use seatswap_core::burn::live::{self, Readiness};
 use seatswap_core::burn::plan::{follow, slack, Inputs, Policy};
 use seatswap_core::burn::replay::replay;
-use seatswap_core::burn::wu_hours;
+use seatswap_core::burn::usd_hours;
 use seatswap_core::engine::{AccountView, Engine, PollReason, UsageCache};
 use seatswap_core::history::{
     export_csv, export_json, AccountRef, By, EventKind, HistoryDir, Imported, Range, Recorder,
@@ -1381,7 +1381,7 @@ fn prices(context: Context, refresh: bool) -> Result<(), CliError> {
         }
     }
     let stored = Prices::load(&app)
-        .map_err(|error| CliError::Message(format!("cannot read prices.json: {error}")))?;
+        .map_err(|error| CliError::Message(format!("the prices cannot be read: {error}")))?;
     let current = stored.current();
     if current.is_empty() {
         println!("no prices yet: run `seatswap prices --refresh` while online.");
@@ -1591,7 +1591,21 @@ fn burn_status(
             return status;
         }
     };
-    let learned = match live::learn(&history, now, offset, accounts, settings.read_sessions) {
+    let prices = match Prices::load(app) {
+        Ok(prices) => prices,
+        Err(error) => {
+            status.error = Some(format!("the prices cannot be read: {error}"));
+            return status;
+        }
+    };
+    let learned = match live::learn(
+        &history,
+        now,
+        offset,
+        accounts,
+        settings.read_sessions,
+        &prices,
+    ) {
         Ok(learned) => learned,
         Err(error) => {
             status.error = Some(format!("cannot read the history: {error}"));
@@ -1619,8 +1633,8 @@ fn burn_status(
 
     let typical = assessment.situation.inputs.rhythm.typical_hour();
     for account in &assessment.situation.inputs.accounts {
-        if let Some(slack_wu) = slack(account, &assessment.situation.inputs) {
-            if let Some(hours) = wu_hours(slack_wu, typical) {
+        if let Some(slack_usd) = slack(account, &assessment.situation.inputs) {
+            if let Some(hours) = usd_hours(slack_usd, typical) {
                 status.slack_hours.insert(account.id.clone(), hours);
             }
         }
@@ -1697,8 +1711,8 @@ fn burn_regime_json(inputs: &Inputs, regime: &Regime) -> BurnRegimeJson {
     BurnRegimeJson {
         early: regime.early,
         why: burn_text::why(regime.why).to_string(),
-        blocked_lazy_h: wu_hours(lazy.blocked_wu, typical),
-        blocked_eager_h: wu_hours(eager.blocked_wu, typical),
+        blocked_lazy_h: usd_hours(lazy.blocked_usd, typical),
+        blocked_eager_h: usd_hours(eager.blocked_usd, typical),
         extra_switches: regime.extra_switches,
         cost_h: regime.cost_h,
     }
@@ -1718,12 +1732,15 @@ fn burn_plan(context: Context, json: bool) -> Result<String, CliError> {
         .iter()
         .find(|view| view.is_active)
         .map(|view| view.id.as_str());
+    let prices = Prices::load(engine.store().app_paths())
+        .map_err(|error| CliError::Message(format!("the prices cannot be read: {error}")))?;
     let learned = live::learn(
         &history,
         now,
         offset,
         &accounts,
         context.settings.read_sessions,
+        &prices,
     )
     .map_err(|error| CliError::Message(format!("cannot read the history: {error}")))?;
     let readiness = live::situation(&learned, &views, &accounts, active, now, offset, 0, &[])
@@ -1813,18 +1830,21 @@ fn burn_simulate(
         excluded.push(AccountRef::of(account));
     }
     let accounts = file.accounts;
+    let prices = Prices::load(context.store.app_paths())
+        .map_err(|error| CliError::Message(format!("the prices cannot be read: {error}")))?;
     let learned = live::learn(
         &history,
         now,
         offset,
         &accounts,
         context.settings.read_sessions,
+        &prices,
     )
     .map_err(|error| CliError::Message(format!("cannot read the history: {error}")))?;
     let mut lines = Vec::new();
     let mut printed = BTreeSet::new();
     for policy in [Policy::Lazy, Policy::Eager] {
-        let result = replay(&history, &range, &learned.rates, &excluded, policy)
+        let result = replay(&history, &range, &learned.rates, &excluded, policy, &prices)
             .map_err(|error| CliError::Message(error.to_string()))?;
         // Both replays read the same files; a torn line is one warning.
         for warning in &result.warnings {
@@ -2423,8 +2443,27 @@ pub(crate) mod tests {
                 .expect("the sample is written");
         }
 
-        /// One hour of work in the history.
-        fn write_work(&self, at: DateTime<Utc>, work_wu: f64) {
+        /// One hour of work of `claude-opus-5-5` in the history, worth
+        /// `work_usd` API dollars, and `prices.json` with that model's price
+        /// (4 USD per million input tokens) so the work can be valued.
+        fn write_work(&self, at: DateTime<Utc>, work_usd: f64) {
+            let mut prices = Prices::default();
+            prices.take(
+                BTreeMap::from([(
+                    "anthropic/claude-opus-5-5".to_string(),
+                    money::ModelPrice {
+                        input: 4.0,
+                        output: 20.0,
+                        cache_write: 5.0,
+                        cache_read: 0.2,
+                        tiered: false,
+                    },
+                )]),
+                at,
+            );
+            prices
+                .save(&AppPaths::at(&self.data_dir))
+                .expect("prices.json");
             self.history()
                 .append(&TokenRecord {
                     t: at,
@@ -2432,8 +2471,8 @@ pub(crate) mod tests {
                     session: "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34".to_string(),
                     cwd: "/home/sam/projects/atlas".to_string(),
                     project: ProjectKey::Repo("github.com/sam/atlas".to_string()),
-                    model: "claude-fable-5-2".to_string(),
-                    input: (work_wu * 1_000_000.0).round() as u64,
+                    model: "claude-opus-5-5".to_string(),
+                    input: (work_usd * 250_000.0).round() as u64,
                     out: 0,
                     cw: 0,
                     cr: 0,
@@ -3846,7 +3885,7 @@ pub(crate) mod tests {
                 .with_timezone(&Utc),
             session: None,
             model_blocked: false,
-            rates: Some(Rates { c, s: None }),
+            rates: Some(Rates::given(c, None)),
             thinking_held: 0,
         };
         Inputs {
@@ -3857,7 +3896,7 @@ pub(crate) mod tests {
                 state("ac", 5.0, "2026-11-11T12:00:00Z"),
             ],
             active: Some("pr".to_string()),
-            rhythm: Rhythm { wu: [1.0; 168] },
+            rhythm: Rhythm { usd: [1.0; 168] },
             last_switch_at: None,
             manual_hold_until: None,
         }
@@ -3869,7 +3908,7 @@ pub(crate) mod tests {
         let lazy = follow(&inputs, Policy::Lazy);
         let eager = follow(&inputs, Policy::Eager);
         assert_ne!(
-            lazy.blocked_wu, eager.blocked_wu,
+            lazy.blocked_usd, eager.blocked_usd,
             "the two policies block different work"
         );
         let regime = Regime {
@@ -3884,12 +3923,12 @@ pub(crate) mod tests {
         let typical = inputs.rhythm.typical_hour();
         assert_eq!(
             json.blocked_lazy_h,
-            wu_hours(lazy.blocked_wu, typical),
+            usd_hours(lazy.blocked_usd, typical),
             "blockedLazyH is the lazy plan's hours, even while early switching is on"
         );
         assert_eq!(
             json.blocked_eager_h,
-            wu_hours(eager.blocked_wu, typical),
+            usd_hours(eager.blocked_usd, typical),
             "blockedEagerH is the eager plan's hours"
         );
         assert_ne!(json.blocked_lazy_h, json.blocked_eager_h);

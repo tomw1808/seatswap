@@ -3252,10 +3252,7 @@ mod tests {
                         resets_at: None,
                     }),
                     model_blocked: false,
-                    rates: Some(Rates {
-                        c: 4.0,
-                        s: Some(80.0),
-                    }),
+                    rates: Some(Rates::given(4.0, Some(80.0))),
                     thinking_held: 0,
                 },
                 AccountState {
@@ -3269,15 +3266,12 @@ mod tests {
                         resets_at: None,
                     }),
                     model_blocked: false,
-                    rates: Some(Rates {
-                        c: 4.0,
-                        s: Some(100.0),
-                    }),
+                    rates: Some(Rates::given(4.0, Some(100.0))),
                     thinking_held: 0,
                 },
             ],
             active: Some(tiny.accounts[0].id.clone()),
-            rhythm: Rhythm { wu: [1.0; 168] },
+            rhythm: Rhythm { usd: [1.0; 168] },
             last_switch_at: None,
             manual_hold_until: None,
         };
@@ -3460,7 +3454,7 @@ mod tests {
                 resets_at: None,
             }),
             model_blocked: false,
-            rates: Some(Rates { c: 4.0, s: Some(s) }),
+            rates: Some(Rates::given(4.0, Some(s))),
             thinking_held: 0,
         };
         let inputs = |at: DateTime<Utc>| Inputs {
@@ -3481,7 +3475,7 @@ mod tests {
                 ),
             ],
             active: Some(tiny.accounts[0].id.clone()),
-            rhythm: Rhythm { wu: [1.0; 168] },
+            rhythm: Rhythm { usd: [1.0; 168] },
             last_switch_at: None,
             manual_hold_until: None,
         };
@@ -3550,14 +3544,11 @@ mod tests {
                     resets_at: None,
                 }),
                 model_blocked: false,
-                rates: Some(Rates {
-                    c: 4.0,
-                    s: Some(80.0),
-                }),
+                rates: Some(Rates::given(4.0, Some(80.0))),
                 thinking_held: 0,
             }],
             active: Some(tiny.accounts[0].id.clone()),
-            rhythm: Rhythm { wu: [1.0; 168] },
+            rhythm: Rhythm { usd: [1.0; 168] },
             last_switch_at: None,
             manual_hold_until: None,
         };

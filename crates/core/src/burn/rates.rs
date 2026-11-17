@@ -1,7 +1,8 @@
-//! The learning side of auto-burn (spec §2.3): the weekly rhythm of work, which
-//! account was live when, and the rates an account's limits cost per work unit.
+//! The learning side of auto-burn (spec §2.3, R2 of 1.3): the weekly rhythm of
+//! work, which account was live when, and the factors an account's limits cost
+//! per API dollar of work.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 
@@ -9,33 +10,40 @@ use crate::api::LimitKind;
 use crate::history::{
     is_early_reset, same_reset, AccountRef, Event, EventKind, Hosted, Sample, TokenRecord,
 };
-use crate::money::is_plan_model;
+use crate::money::{api_usd, is_plan_model, Prices};
 use crate::store::Account;
 
 use crate::stats::{local_hour_of_week, local_hour_start};
 
+use super::fit::{self, Factor};
 use super::{
-    week_weight, work_units, Rates, Rhythm, ASSUMED_WEEK_PERCENT_PER_WU, LEARN_MIN_WU, RATES_DAYS,
+    week_weight, Rates, Rhythm, ASSUMED_WEEK_PERCENT_PER_USD_AT_1X, MIN_LIVE_SHARE, RATES_DAYS,
     RHYTHM_WEEKS,
 };
 
-/// Average work units per hour of the week from the Claude token records of
-/// all hosts in `[now - 4 weeks, now)`, in the local time of `zone`. A record
-/// of another provider (Codex, Ollama: [`crate::money::is_plan_model`] is
-/// false) uses no Claude account, so it is no work in the rates' units and is
-/// left out. A clock hour of the
-/// week is the weighted mean over the four weeks: the two newer weeks weigh 2,
-/// the two older 1. A week without a record in that hour counts as 0 for it. A
-/// record's span is spread over the local clock hours it covers, by the minutes
-/// each one holds, so an offset that is not a whole hour splits it between two
-/// and a daylight-saving change is followed.
+/// Average API dollars of work per hour of the week from the Claude token
+/// records of all hosts in `[now - 4 weeks, now)`, in the local time of
+/// `zone`. A record of another provider (Codex, Ollama:
+/// [`crate::money::is_plan_model`] is false) uses no Claude account, so it is
+/// no work here and is left out. A record whose model has no price
+/// ([`api_usd`] is `None`) is left out too: work of a model without a price is
+/// left out of auto-burn's rhythm until the price list has it (documented
+/// rule; [`unpriced_models`] names such models for [`rates`] and
+/// [`super::live::learn`]). A clock hour of the week is the weighted
+/// mean over the four weeks: the two newer weeks weigh 2, the two older 1. A
+/// week without a record in that hour counts as 0 for it. A record's span is
+/// spread over the local clock hours it covers, by the minutes each one holds,
+/// so an offset that is not a whole hour splits it between two and a
+/// daylight-saving change is followed.
 pub fn rhythm<Tz: TimeZone + Copy>(
     tokens: &[Hosted<TokenRecord>],
     now: DateTime<Utc>,
     zone: &Tz,
+    prices: &Prices,
 ) -> Rhythm {
     let mut weighted = [0.0f64; super::HOURS];
     let weight_sum: f64 = (0..RHYTHM_WEEKS).map(week_weight).sum();
+    let unpriced = unpriced_models(tokens, prices);
     for hosted in tokens {
         if hosted.record.t >= now {
             continue;
@@ -46,17 +54,19 @@ pub fn rhythm<Tz: TimeZone + Copy>(
         }
         let week = age.num_days() / 7;
         let record = &hosted.record;
-        if !is_plan_model(&record.model) {
+        if !is_plan_model(&record.model) || unpriced.contains(&record.model) {
             continue;
         }
-        let units = work_units(record.input, record.out, record.cw, record.cr);
-        spread(&mut weighted, record, zone, week_weight(week) * units);
+        let Some(usd) = api_usd(record, prices) else {
+            continue;
+        };
+        spread(&mut weighted, record, zone, week_weight(week) * usd);
     }
-    let mut wu = [0.0f64; super::HOURS];
-    for (hour, sum) in wu.iter_mut().zip(weighted) {
+    let mut usd = [0.0f64; super::HOURS];
+    for (hour, sum) in usd.iter_mut().zip(weighted) {
         *hour = sum / weight_sum;
     }
-    Rhythm { wu }
+    Rhythm { usd }
 }
 
 /// Add the work of one record's span to the clock hours it covers, by the share
@@ -66,10 +76,10 @@ fn spread<Tz: TimeZone + Copy>(
     weighted: &mut [f64; super::HOURS],
     record: &TokenRecord,
     zone: &Tz,
-    units: f64,
+    usd: f64,
 ) {
     for (hour, share) in hour_shares(record, |at| local_hour_start(at, zone)) {
-        weighted[local_hour_of_week(hour, zone)] += units * share;
+        weighted[local_hour_of_week(hour, zone)] += usd * share;
     }
 }
 
@@ -108,13 +118,16 @@ pub fn account_at(events: &[Hosted<Event>], host: &str, t: DateTime<Utc>) -> Opt
     Timeline::of(events, host).at(t).cloned()
 }
 
-/// One account the rates are learned for: how the history names it and the
-/// capacity of its plan ([`Account::capacity`]: 5 for Max, 20 for Ultra;
-/// `None` when its tier names no multiplier).
+/// One account the factors are learned for: how the history names it, the
+/// capacity of its plan ([`Account::capacity`]: 5 for Max, 20 for Ultra, 1 for
+/// Pro; `None` when its tier names no multiplier) and its plan's name
+/// ([`Account::plan`], compared exactly when one account takes another's
+/// factor).
 #[derive(Debug, Clone, PartialEq)]
 pub struct RateAccount {
     pub account: AccountRef,
     pub capacity: Option<f64>,
+    pub plan: Option<String>,
 }
 
 impl RateAccount {
@@ -122,113 +135,184 @@ impl RateAccount {
         RateAccount {
             account: AccountRef::of(account),
             capacity: account.capacity(),
+            plan: account.plan.clone(),
         }
     }
 }
 
-/// Every account's rates (spec §2.3): measured from its samples and the work
-/// done while it was live, and, for an account whose plan has a capacity,
-/// started from an assumption that the measurement takes over.
+/// What [`rates`] learned: every account's rates, and the Claude models among
+/// the token records that have no price. Their work is left out of the rates
+/// and the rhythm until the price list has them; the caller names each once.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LearnedRates {
+    pub rates: BTreeMap<AccountRef, Rates>,
+    pub unpriced: BTreeSet<String>,
+}
+
+impl LearnedRates {
+    /// One warning per Claude model without a price, not one per record: the
+    /// words [`super::live::learn`] adds to its warnings.
+    pub fn warnings(&self) -> Vec<String> {
+        self.unpriced
+            .iter()
+            .map(|model| unpriced_warning(model))
+            .collect()
+    }
+}
+
+/// The one wording of a model without a price, shared by [`LearnedRates`] and
+/// [`super::live::learn`] so the warning is said the same way with and without
+/// session reading.
+pub(super) fn unpriced_warning(model: &str) -> String {
+    format!("no price for {model}: its work is left out of auto-burn's rates and rhythm")
+}
+
+/// Every account's rates (spec §2.3, R2 of 1.3): its week factor `c` and its
+/// 5 h factor `s`, each fitted by [`fit::factor`] from the account's pairs of
+/// readings with an assumed factor as prior.
 ///
-/// The measurement: over the account's consecutive samples in the last
-/// [`RATES_DAYS`] days that lie in one weekly window, are at most 6 h apart and
-/// in which the account was live on some host for some time, the sum of the
-/// weekly percent gained and the sum of the work units done (a token record
-/// counts with the part of its hour inside the pair in which its host had the
-/// account live). The same inside one 5 h window gives the session's. A pair
-/// in which the account was live on no host is left out: a rise there comes
-/// from use seatswap does not see (claude.ai, another machine). A pair
-/// whose earlier sample is already at 100 % cannot rise and is left out too.
+/// The pairs: the account's consecutive samples in the last [`RATES_DAYS`] days
+/// that lie in one weekly window and are at most 6 h apart ([`pairs`]); a pair
+/// counts only when the account was live on some host for at least
+/// [`MIN_LIVE_SHARE`] of its time (the union over hosts, documented rule): a
+/// rise outside that time comes from use seatswap does not see (claude.ai,
+/// another machine). A pair's gain is the weekly percent gained, its dollars
+/// the work done while the account was live ([`work_in`]: a record spread
+/// evenly over its own span, counted for the part its host had the account
+/// live). A pair that holds work of a Claude model without a price is left out
+/// whole, never valued as 0. The pairs inside one 5 h window give the
+/// session's factor the same way.
 ///
-/// The assumption: the weekly percent per work unit of a plan of capacity 1 is
-/// [`ASSUMED_WEEK_PERCENT_PER_WU`], weighed as [`LEARN_MIN_WU`] work units,
-/// joined with the measurements of every account that has a capacity (gain ×
-/// capacity over work). An account of capacity `n` assumes that divided by
-/// `n`, again weighed as [`LEARN_MIN_WU`] work units next to its own
-/// measurement: `c = (gain + assumed × LEARN_MIN_WU) / (work + LEARN_MIN_WU)`.
-/// `s` is assumed the same way from the measured sessions only (there is no
-/// built-in session value), and only for an account whose latest sample has a
-/// session limit.
+/// The prior of an account and a limit (documented rule), from the factors of
+/// the **other** accounts that are measured from their own pairs alone (no
+/// circular priors):
+/// 1. pooled over those with the same plan name, `Σ gain / Σ usd`;
+/// 2. else pooled over those with a capacity, `Σ (gain × capacity) / Σ usd`,
+///    divided by this account's capacity;
+/// 3. else, for the week only, [`ASSUMED_WEEK_PERCENT_PER_USD_AT_1X`] divided
+///    by this account's capacity;
+/// 4. else no prior: the account has a factor only once it is measured.
 ///
-/// Without a capacity an account has only its measurement: `c` is `None`
-/// until its work reaches [`LEARN_MIN_WU`], and `s` likewise. A `c` at or
-/// below 0 leaves the account out; an `s` at or below 0 is `None`.
+/// `s` is learned only for an account whose latest sample has a session limit.
+/// An account without `c` has no entry.
 pub fn rates(
     accounts: &[RateAccount],
     samples: &[Hosted<Sample>],
     tokens: &[Hosted<TokenRecord>],
     events: &[Hosted<Event>],
+    prices: &Prices,
     now: DateTime<Utc>,
-) -> BTreeMap<AccountRef, Rates> {
+) -> LearnedRates {
     let timelines = timelines(events);
     let measured: Vec<(&RateAccount, Measured)> = accounts
         .iter()
         .map(|entry| {
-            let measured = measure(&entry.account, samples, tokens, &timelines, now);
+            let measured = measure(&entry.account, samples, tokens, &timelines, prices, now);
             (entry, measured)
         })
         .collect();
 
-    // Percent per work unit at capacity 1, over every account with a capacity.
-    let pooled = |gain: fn(&Measured) -> (f64, f64), start: Option<f64>| {
-        let (mut sum_gain, mut sum_work) = match start {
-            Some(assumed) => (assumed * LEARN_MIN_WU, LEARN_MIN_WU),
-            None => (0.0, 0.0),
-        };
-        for (entry, measured) in &measured {
-            if let Some(capacity) = entry.capacity {
-                let (gained, work) = gain(measured);
-                sum_gain += gained * capacity;
-                sum_work += work;
-            }
-        }
-        (sum_work >= LEARN_MIN_WU && sum_gain > 0.0).then(|| sum_gain / sum_work)
-    };
-    let week_per_wu = pooled(
-        |m| (m.week_gain, m.week_work),
-        Some(ASSUMED_WEEK_PERCENT_PER_WU),
-    );
-    let session_per_wu = pooled(|m| (m.session_gain, m.session_work), None);
-
     let mut learned = BTreeMap::new();
-    for (entry, measured) in &measured {
-        let assumed = |per_wu: Option<f64>| Some(per_wu? / entry.capacity?);
-        let Some(c) = blend(measured.week_gain, measured.week_work, assumed(week_per_wu)) else {
+    for (entry, own) in &measured {
+        let week_prior = prior(
+            entry,
+            &measured,
+            |m| &m.week,
+            Some(ASSUMED_WEEK_PERCENT_PER_USD_AT_1X),
+        );
+        let Some(c) = usable(&own.week, week_prior) else {
             continue;
         };
-        let s = if measured.has_session {
-            blend(
-                measured.session_gain,
-                measured.session_work,
-                assumed(session_per_wu),
-            )
+        let s = if own.has_session {
+            usable(&own.session, prior(entry, &measured, |m| &m.session, None))
         } else {
             None
         };
         learned.insert(entry.account.clone(), Rates { c, s });
     }
-    learned
+    LearnedRates {
+        rates: learned,
+        unpriced: unpriced_models(tokens, prices),
+    }
 }
 
-/// A rate from an account's gain and work and an assumed rate weighed as
-/// [`LEARN_MIN_WU`] work units; without an assumption, the measurement alone
-/// once its work reaches [`LEARN_MIN_WU`]. `None` when there is neither, or
-/// the rate is at or below 0.
-fn blend(gain: f64, work: f64, assumed: Option<f64>) -> Option<f64> {
-    let rate = match assumed {
-        Some(assumed) => (gain + assumed * LEARN_MIN_WU) / (work + LEARN_MIN_WU),
-        None if work >= LEARN_MIN_WU => gain / work,
-        None => return None,
-    };
-    (rate > 0.0).then_some(rate)
+/// The factor of an account's own pairs and its prior, when it may be used:
+/// with a prior always, without one only once it is measured.
+fn usable(pairs: &[fit::Pair], prior: Option<f64>) -> Option<Factor> {
+    fit::factor(pairs, prior).filter(|factor| prior.is_some() || factor.measured)
 }
 
-/// One account's measurement over its usable sample pairs (see [`rates`]).
+/// Whether pairs give a measured factor on their own, without a prior: the
+/// accounts another account's prior may come from.
+fn measured_alone(pairs: &[fit::Pair]) -> bool {
+    fit::factor(pairs, None).is_some_and(|factor| factor.measured)
+}
+
+/// The prior of `entry` for one limit (see [`rates`]): `pairs_of` picks the
+/// limit's pairs, `assumed_at_1x` is the built-in factor at capacity 1 (the
+/// week's; the 5 h limit has none).
+fn prior(
+    entry: &RateAccount,
+    all: &[(&RateAccount, Measured)],
+    pairs_of: fn(&Measured) -> &Vec<fit::Pair>,
+    assumed_at_1x: Option<f64>,
+) -> Option<f64> {
+    let others: Vec<(&RateAccount, &[fit::Pair])> = all
+        .iter()
+        .filter(|(other, _)| other.account != entry.account)
+        .map(|(other, measured)| (*other, pairs_of(measured).as_slice()))
+        .filter(|(_, pairs)| measured_alone(pairs))
+        .collect();
+
+    if let Some(plan) = &entry.plan {
+        let (mut gain, mut usd) = (0.0, 0.0);
+        for (_, pairs) in others
+            .iter()
+            .filter(|(other, _)| other.plan.as_deref() == Some(plan.as_str()))
+        {
+            for pair in *pairs {
+                gain += pair.gain;
+                usd += pair.usd;
+            }
+        }
+        if usd > 0.0 {
+            return Some(gain / usd);
+        }
+    }
+
+    let capacity = entry.capacity?;
+    let (mut gain, mut usd) = (0.0, 0.0);
+    for (other, pairs) in &others {
+        let Some(other_capacity) = other.capacity else {
+            continue;
+        };
+        for pair in *pairs {
+            gain += pair.gain * other_capacity;
+            usd += pair.usd;
+        }
+    }
+    if usd > 0.0 {
+        return Some(gain / usd / capacity);
+    }
+    assumed_at_1x.map(|assumed| assumed / capacity)
+}
+
+/// The Claude models among `tokens` that have no price: [`api_usd`] is `None`
+/// for one of their records. The one source of "a model without a price" for
+/// [`rhythm`], [`rates`] and [`super::live::learn`].
+pub(super) fn unpriced_models(tokens: &[Hosted<TokenRecord>], prices: &Prices) -> BTreeSet<String> {
+    tokens
+        .iter()
+        .map(|hosted| &hosted.record)
+        .filter(|record| is_plan_model(&record.model) && api_usd(record, prices).is_none())
+        .map(|record| record.model.clone())
+        .collect()
+}
+
+/// One account's usable pairs (see [`rates`]), as the fit takes them.
 struct Measured {
-    week_gain: f64,
-    week_work: f64,
-    session_gain: f64,
-    session_work: f64,
+    week: Vec<fit::Pair>,
+    session: Vec<fit::Pair>,
     /// The account's latest sample in the range has a session limit.
     has_session: bool,
 }
@@ -238,23 +322,36 @@ fn measure(
     samples: &[Hosted<Sample>],
     tokens: &[Hosted<TokenRecord>],
     timelines: &HashMap<String, Timeline>,
+    prices: &Prices,
     now: DateTime<Utc>,
 ) -> Measured {
-    let pairs: Vec<Pair> = pairs(account, samples, now)
+    let pairs: Vec<SamplePair> = pairs(account, samples, now)
         .into_iter()
         .filter(|pair| {
-            timelines
-                .values()
-                .any(|timeline| timeline.seconds(account, pair.from, pair.to) > 0.0)
+            live_seconds(timelines, account, pair.from, pair.to)
+                >= MIN_LIVE_SHARE * seconds_between(pair.from, pair.to)
         })
         .collect();
-    let week_spans: Vec<(DateTime<Utc>, DateTime<Utc>)> =
+    let spans: Vec<(DateTime<Utc>, DateTime<Utc>)> =
         pairs.iter().map(|pair| (pair.from, pair.to)).collect();
-    let session_pairs: Vec<&Pair> = pairs.iter().filter(|pair| pair.session.is_some()).collect();
-    let session_spans: Vec<(DateTime<Utc>, DateTime<Utc>)> = session_pairs
-        .iter()
-        .map(|pair| (pair.from, pair.to))
-        .collect();
+    let work = work_in(timelines, tokens, account, &spans, prices);
+    let mut week = Vec::new();
+    let mut session = Vec::new();
+    for (pair, work) in pairs.iter().zip(&work) {
+        if work.unpriced {
+            continue;
+        }
+        week.push(fit::Pair {
+            gain: pair.week,
+            usd: work.usd,
+        });
+        if let Some(gain) = pair.session {
+            session.push(fit::Pair {
+                gain,
+                usd: work.usd,
+            });
+        }
+    }
     let from = now - Duration::days(RATES_DAYS);
     let has_session = samples
         .iter()
@@ -263,10 +360,8 @@ fn measure(
         .max_by_key(|hosted| hosted.record.t)
         .is_some_and(|hosted| hosted.record.limit(&LimitKind::Session).is_some());
     Measured {
-        week_gain: pairs.iter().map(|pair| pair.week).sum(),
-        week_work: work_in(timelines, tokens, account, &week_spans),
-        session_gain: session_pairs.iter().filter_map(|pair| pair.session).sum(),
-        session_work: work_in(timelines, tokens, account, &session_spans),
+        week,
+        session,
         has_session,
     }
 }
@@ -284,7 +379,7 @@ pub(crate) fn timelines(events: &[Hosted<Event>]) -> HashMap<String, Timeline> {
 }
 
 /// Two consecutive samples of one account that lie in one weekly window.
-struct Pair {
+struct SamplePair {
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     /// The weekly percent gained between the two samples.
@@ -300,7 +395,7 @@ struct Pair {
 /// ([`is_early_reset`]) is a reset and is left out too, as a changed reset time
 /// already is. A pair that goes down by less stays in, so the sum of the
 /// differences is the last percent minus the first.
-fn pairs(account: &AccountRef, samples: &[Hosted<Sample>], now: DateTime<Utc>) -> Vec<Pair> {
+fn pairs(account: &AccountRef, samples: &[Hosted<Sample>], now: DateTime<Utc>) -> Vec<SamplePair> {
     let from = now - Duration::days(RATES_DAYS);
     let mut lines: Vec<&Hosted<Sample>> = samples
         .iter()
@@ -341,7 +436,7 @@ fn pairs(account: &AccountRef, samples: &[Hosted<Sample>], now: DateTime<Utc>) -
         {
             continue;
         }
-        pairs.push(Pair {
+        pairs.push(SamplePair {
             from: before.record.t,
             to: after.record.t,
             week: week_after.p - week_before.p,
@@ -413,9 +508,16 @@ impl Timeline {
             .take_while(move |at| *at < to)
     }
 
-    /// The seconds of `[from, to)` in which this timeline had `account` live.
-    fn seconds(&self, account: &AccountRef, from: DateTime<Utc>, to: DateTime<Utc>) -> f64 {
-        let mut total = 0.0;
+    /// Call `each` with every stretch of `[from, to)` in which this timeline
+    /// had `account` live, in time order. The one walk behind
+    /// [`Timeline::seconds`] and [`live_seconds`].
+    fn live_spans(
+        &self,
+        account: &AccountRef,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        mut each: impl FnMut(DateTime<Utc>, DateTime<Utc>),
+    ) {
         let mut cursor = from;
         let mut live = self.at(from) == Some(account);
         let first = self.changes.partition_point(|change| change.0 <= from);
@@ -423,17 +525,59 @@ impl Timeline {
             if *at >= to {
                 break;
             }
-            if live {
-                total += seconds_between(cursor, *at);
+            if live && cursor < *at {
+                each(cursor, *at);
             }
             cursor = *at;
             live = target.as_ref() == Some(account);
         }
-        if live {
-            total += seconds_between(cursor, to);
+        if live && cursor < to {
+            each(cursor, to);
         }
+    }
+
+    /// The seconds of `[from, to)` in which this timeline had `account` live.
+    fn seconds(&self, account: &AccountRef, from: DateTime<Utc>, to: DateTime<Utc>) -> f64 {
+        let mut total = 0.0;
+        self.live_spans(account, from, to, |start, end| {
+            total += seconds_between(start, end);
+        });
         total
     }
+}
+
+/// The seconds of `[from, to)` in which at least one host had `account` live:
+/// the union of every host's live stretches, so two hosts live at the same
+/// time count once (the [`MIN_LIVE_SHARE`] rule of [`rates`]).
+fn live_seconds(
+    timelines: &HashMap<String, Timeline>,
+    account: &AccountRef,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> f64 {
+    let mut stretches: Vec<(DateTime<Utc>, DateTime<Utc>)> = Vec::new();
+    for timeline in timelines.values() {
+        timeline.live_spans(account, from, to, |start, end| stretches.push((start, end)));
+    }
+    stretches.sort();
+    let mut total = 0.0;
+    let mut open: Option<(DateTime<Utc>, DateTime<Utc>)> = None;
+    for (start, end) in stretches {
+        open = match open {
+            Some((open_start, open_end)) if start <= open_end => {
+                Some((open_start, open_end.max(end)))
+            }
+            Some((open_start, open_end)) => {
+                total += seconds_between(open_start, open_end);
+                Some((start, end))
+            }
+            None => Some((start, end)),
+        };
+    }
+    if let Some((start, end)) = open {
+        total += seconds_between(start, end);
+    }
+    total
 }
 
 fn seconds_between(from: DateTime<Utc>, to: DateTime<Utc>) -> f64 {
@@ -441,20 +585,34 @@ fn seconds_between(from: DateTime<Utc>, to: DateTime<Utc>) -> f64 {
     span.num_seconds() as f64 + span.subsec_nanos() as f64 / 1e9
 }
 
-/// The work units of `tokens` inside the given disjoint, time-sorted spans,
-/// counting each Claude record (a Codex or Ollama record uses no Claude
-/// account and is left out) only while `account` was live on the record's host and
-/// spreading a record evenly over its own [`TokenRecord::span`]. `tokens` are
-/// sorted by time, as a history read returns them, so only the records whose
-/// longest possible span reaches into the spans are looked at.
+/// The work of one span of [`work_in`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(super) struct SpanWork {
+    /// The API dollars of the priced records.
+    pub(super) usd: f64,
+    /// A record of a Claude model without a price lay in the span while the
+    /// account was live: its work is not in `usd`.
+    pub(super) unpriced: bool,
+}
+
+/// The work of `account` in each of the given disjoint, time-sorted spans, one
+/// [`SpanWork`] per span in the same order. Each Claude record (a Codex or
+/// Ollama record uses no Claude account and is left out) counts only while
+/// `account` was live on the record's host, spread evenly over its own
+/// [`TokenRecord::span`], at its [`api_usd`]. A record without a price is not
+/// valued: it marks the spans it counts for as `unpriced`. `tokens` are sorted
+/// by time, as a history read returns them, so only the records whose longest
+/// possible span reaches into the spans are looked at.
 pub(super) fn work_in(
     timelines: &HashMap<String, Timeline>,
     tokens: &[Hosted<TokenRecord>],
     account: &AccountRef,
     spans: &[(DateTime<Utc>, DateTime<Utc>)],
-) -> f64 {
+    prices: &Prices,
+) -> Vec<SpanWork> {
+    let mut work = vec![SpanWork::default(); spans.len()];
     let (Some(first_span), Some(last_span)) = (spans.first(), spans.last()) else {
-        return 0.0;
+        return work;
     };
     debug_assert!(
         tokens.is_sorted_by_key(|hosted| hosted.record.t),
@@ -467,7 +625,6 @@ pub(super) fn work_in(
     let from =
         tokens.partition_point(|hosted| hosted.record.t + Duration::minutes(60) <= first_span.0);
     let to = tokens.partition_point(|hosted| hosted.record.t < last_span.1);
-    let mut total = 0.0;
     for hosted in &tokens[from..to.max(from)] {
         let record = &hosted.record;
         // Another provider's work uses no Claude account.
@@ -477,12 +634,12 @@ pub(super) fn work_in(
         let start = record.t;
         let end = start + record.span();
         let span_seconds = seconds_between(start, end);
-        let units = work_units(record.input, record.out, record.cw, record.cr);
+        let usd = api_usd(record, prices);
         let Some(timeline) = timelines.get(&hosted.host) else {
             continue;
         };
         let first = spans.partition_point(|span| span.1 <= start);
-        for span in &spans[first..] {
+        for (index, span) in spans.iter().enumerate().skip(first) {
             if span.0 >= end {
                 break;
             }
@@ -491,10 +648,17 @@ pub(super) fn work_in(
             if from >= to {
                 continue;
             }
-            total += units * timeline.seconds(account, from, to) / span_seconds;
+            let live = timeline.seconds(account, from, to);
+            if live <= 0.0 {
+                continue;
+            }
+            match usd {
+                Some(usd) => work[index].usd += usd * live / span_seconds,
+                None => work[index].unpriced = true,
+            }
         }
     }
-    total
+    work
 }
 
 #[cfg(test)]
@@ -502,20 +666,30 @@ mod tests {
     use super::*;
 
     use chrono::FixedOffset;
+    use serde_json::json;
 
-    use crate::history::{By, LimitSample, Source};
+    use crate::history::{By, HistoryDir, LimitSample, Source};
     use crate::project::ProjectKey;
 
     const EPS: f64 = 1e-9;
 
     const AC_SESSION: &str = "2026-11-14T19:30:00.336716Z";
     const WEEK_RESET: &str = "2026-11-16T16:00:00.336716Z";
+    /// Input tokens of `claude-opus-5-5` (4 USD per million) worth one dollar.
+    const TOKENS_PER_USD: f64 = 250_000.0;
 
     fn utc(text: &str) -> DateTime<Utc> {
         text.parse().expect("test date")
     }
 
-    /// One account's rates without a plan capacity: its measurement alone.
+    /// The models.dev fixture's prices: `claude-opus-5-5` has one,
+    /// `claude-new-9` none.
+    fn prices() -> Prices {
+        crate::money::tests::priced_prices(utc("2026-01-01T00:00:00Z"))
+    }
+
+    /// One account's rates without a plan capacity or name: its measurement
+    /// alone.
     fn rates_of(
         account: &AccountRef,
         samples: &[Hosted<Sample>],
@@ -523,11 +697,10 @@ mod tests {
         events: &[Hosted<Event>],
         now: DateTime<Utc>,
     ) -> Option<Rates> {
-        let accounts = [RateAccount {
-            account: account.clone(),
-            capacity: None,
-        }];
-        rates(&accounts, samples, tokens, events, now).remove(account)
+        let accounts = [with_capacity(account.clone(), None)];
+        rates(&accounts, samples, tokens, events, &prices(), now)
+            .rates
+            .remove(account)
     }
 
     fn east_one() -> FixedOffset {
@@ -557,6 +730,13 @@ mod tests {
         AccountRef {
             acc: "8e2c5a17-4b9d-4f30-a6e1-2d7b9c0f5a84".to_string(),
             org: "f0a3d6c9-2e8b-4c71-9b54-7a1e3d6f8c20".to_string(),
+        }
+    }
+
+    fn or() -> AccountRef {
+        AccountRef {
+            acc: "2d9f4b61-8a3c-4e7d-b5f0-9c1e6a3d8b27".to_string(),
+            org: "7b4e1c93-5f2a-4d8b-a6c0-3e9d2f7a1b54".to_string(),
         }
     }
 
@@ -592,8 +772,9 @@ mod tests {
         }
     }
 
-    /// A token line of `input` input tokens (one work unit per million).
-    fn token(host: &str, at: &str, input: u64) -> Hosted<TokenRecord> {
+    /// An hourly token line of `claude-opus-5-5` worth `usd` API dollars (its
+    /// input tokens at 4 USD per million).
+    fn token(host: &str, at: &str, usd: f64) -> Hosted<TokenRecord> {
         Hosted {
             host: host.to_string(),
             record: TokenRecord {
@@ -602,8 +783,8 @@ mod tests {
                 session: "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34".to_string(),
                 cwd: "/home/sam/projects/atlas".to_string(),
                 project: ProjectKey::Repo("github.com/sam/atlas".to_string()),
-                model: "claude-fable-5-2".to_string(),
-                input,
+                model: "claude-opus-5-5".to_string(),
+                input: (usd * TOKENS_PER_USD).round() as u64,
                 out: 0,
                 cw: 0,
                 cr: 0,
@@ -641,29 +822,69 @@ mod tests {
         }
     }
 
+    /// A stored account as `accounts.json` holds it: its plan's name and its
+    /// identity's rate-limit tier.
+    fn stored(account: &AccountRef, abbr: &str, plan: &str, tier: Option<&str>) -> Account {
+        let mut identity = json!({
+            "accountUuid": account.acc,
+            "organizationUuid": account.org,
+            "emailAddress": "sam@example.com"
+        });
+        if let Some(tier) = tier {
+            identity["organizationRateLimitTier"] = json!(tier);
+        }
+        serde_json::from_value(json!({
+            "id": format!("{}{}", &account.acc[..8], &account.org[..8]),
+            "accountUuid": account.acc,
+            "organizationUuid": account.org,
+            "label": abbr,
+            "abbr": abbr,
+            "color": "#3b82f6",
+            "email": "sam@example.com",
+            "orgName": null,
+            "plan": plan,
+            "oauthAccount": identity,
+            "addedAt": "2026-09-01T00:00:00Z",
+            "loginState": "ok",
+            "autoBurn": true
+        }))
+        .expect("a test account")
+    }
+
     #[test]
-    fn work_units_weigh_the_four_kinds() {
-        let wu = work_units(1_000_000, 1_000_000, 1_000_000, 1_000_000);
-        assert!((wu - 7.35).abs() < EPS, "{wu}");
+    fn the_rhythm_prices_each_token_kind_at_its_models_price() {
+        // One million tokens of each kind of claude-opus-5-5: 4 + 20 + 5 + 0.2
+        // USD, in the newest week, which weighs 2 of the four weeks' 6.
+        let mut line = token("atlas", "2026-11-23T08:00:00Z", 0.0);
+        line.record.input = 1_000_000;
+        line.record.out = 1_000_000;
+        line.record.cw = 1_000_000;
+        line.record.cr = 1_000_000;
+        let rhythm = rhythm(&[line], utc("2026-11-23T12:00:00Z"), &east_one(), &prices());
+        assert!(
+            (rhythm.usd[9] - 29.2 * 2.0 / 6.0).abs() < EPS,
+            "{}",
+            rhythm.usd[9]
+        );
     }
 
     #[test]
     fn rhythm_averages_per_hour_of_the_week() {
-        // The last four Mondays, 09:00 local (+01:00), 2.0 wu each; two lines
+        // The last four Mondays, 09:00 local (+01:00), 2 USD each; two lines
         // from another host count the same as this host's.
         let tokens = vec![
-            token("atlas", "2026-11-23T08:00:00Z", 2_000_000),
-            token("vega", "2026-11-16T08:00:00Z", 2_000_000),
-            token("atlas", "2026-11-09T08:00:00Z", 2_000_000),
-            token("vega", "2026-11-02T08:00:00Z", 2_000_000),
+            token("atlas", "2026-11-23T08:00:00Z", 2.0),
+            token("vega", "2026-11-16T08:00:00Z", 2.0),
+            token("atlas", "2026-11-09T08:00:00Z", 2.0),
+            token("vega", "2026-11-02T08:00:00Z", 2.0),
         ];
         let now = utc("2026-11-23T12:00:00Z");
-        let rhythm = rhythm(&tokens, now, &east_one());
+        let rhythm = rhythm(&tokens, now, &east_one(), &prices());
 
-        assert!((rhythm.wu[9] - 2.0).abs() < EPS, "{:?}", rhythm.wu[9]);
-        for (hour, wu) in rhythm.wu.iter().enumerate() {
+        assert!((rhythm.usd[9] - 2.0).abs() < EPS, "{:?}", rhythm.usd[9]);
+        for (hour, usd) in rhythm.usd.iter().enumerate() {
             if hour != 9 {
-                assert!((*wu - 0.0).abs() < EPS, "hour {hour}: {wu}");
+                assert!((*usd - 0.0).abs() < EPS, "hour {hour}: {usd}");
             }
         }
         assert!((rhythm.typical_hour() - 2.0).abs() < EPS);
@@ -675,13 +896,13 @@ mod tests {
     #[test]
     fn newer_weeks_count_double() {
         let tokens = vec![
-            token("atlas", "2026-11-23T08:00:00Z", 4_000_000),
-            token("atlas", "2026-11-16T08:00:00Z", 4_000_000),
-            token("atlas", "2026-11-09T08:00:00Z", 1_000_000),
-            token("atlas", "2026-11-02T08:00:00Z", 1_000_000),
+            token("atlas", "2026-11-23T08:00:00Z", 4.0),
+            token("atlas", "2026-11-16T08:00:00Z", 4.0),
+            token("atlas", "2026-11-09T08:00:00Z", 1.0),
+            token("atlas", "2026-11-02T08:00:00Z", 1.0),
         ];
-        let rhythm = rhythm(&tokens, utc("2026-11-23T12:00:00Z"), &east_one());
-        assert!((rhythm.wu[9] - 3.0).abs() < EPS, "{:?}", rhythm.wu[9]);
+        let rhythm = rhythm(&tokens, utc("2026-11-23T12:00:00Z"), &east_one(), &prices());
+        assert!((rhythm.usd[9] - 3.0).abs() < EPS, "{:?}", rhythm.usd[9]);
     }
 
     #[test]
@@ -708,9 +929,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rates_divide_percent_by_work() {
-        // AC live all day: weekly 40 → 48 and session 0 → 100 over 25 wu.
+    /// AC live all day: weekly 40 → 48 and session 0 → 100 over 125 USD.
+    fn ac_day() -> (Vec<Hosted<Sample>>, Vec<Hosted<TokenRecord>>) {
         let samples = vec![
             sample(
                 "atlas",
@@ -726,10 +946,16 @@ mod tests {
             ),
         ];
         let tokens = vec![
-            token("atlas", "2026-11-14T10:00:00Z", 10_000_000),
-            token("atlas", "2026-11-14T11:00:00Z", 10_000_000),
-            token("atlas", "2026-11-14T12:00:00Z", 5_000_000),
+            token("atlas", "2026-11-14T10:00:00Z", 50.0),
+            token("atlas", "2026-11-14T11:00:00Z", 50.0),
+            token("atlas", "2026-11-14T12:00:00Z", 25.0),
         ];
+        (samples, tokens)
+    }
+
+    #[test]
+    fn rates_divide_percent_by_work() {
+        let (samples, tokens) = ac_day();
         let events = vec![live("atlas", "2026-11-14T08:00:00Z", Some(ac()))];
 
         let rates = rates_of(
@@ -739,25 +965,27 @@ mod tests {
             &events,
             utc("2026-11-14T18:00:00Z"),
         )
-        .expect("25 wu is enough work");
-        assert!((rates.c - 0.32).abs() < EPS, "{}", rates.c);
+        .expect("125 USD is enough work");
+        assert!((rates.c.value - 0.064).abs() < EPS, "{:?}", rates.c);
+        assert!(rates.c.measured);
+        assert!((rates.c.basis_usd - 125.0).abs() < EPS);
         let s = rates.s.expect("a session limit");
-        assert!((s - 4.0).abs() < EPS, "{s}");
+        assert!((s.value - 0.8).abs() < EPS, "{s:?}");
     }
 
     /// The same line as [`token`], but one 5-minute bucket long.
-    fn five_minute_token(host: &str, at: &str, input: u64) -> Hosted<TokenRecord> {
-        let mut hosted = token(host, at, input);
+    fn five_minute_token(host: &str, at: &str, usd: f64) -> Hosted<TokenRecord> {
+        let mut hosted = token(host, at, usd);
         hosted.record.minutes = 5;
         hosted
     }
 
     #[test]
     fn hourly_and_five_minute_lines_of_one_hour_add_up_once() {
-        // One hourly line of 60 work units and twelve 5-minute lines of 1 each
+        // One hourly line of 300 USD and twelve 5-minute lines of 5 USD each
         // over the hour 10:00-11:00; the pair 10:00-10:30 holds half of the
-        // hourly line and six of the 5-minute ones: 30 + 6 work units. A 36 %
-        // gain over that pair is 1 % per work unit.
+        // hourly line and six of the 5-minute ones: 150 + 30 USD. A 90 % gain
+        // over that pair is 0.5 % per USD.
         let samples = vec![
             sample(
                 "atlas",
@@ -769,15 +997,15 @@ mod tests {
                 "atlas",
                 "2026-11-14T10:30:00Z",
                 ac(),
-                vec![weekly(36.0, WEEK_RESET)],
+                vec![weekly(90.0, WEEK_RESET)],
             ),
         ];
-        let mut tokens = vec![token("atlas", "2026-11-14T10:00:00Z", 60_000_000)];
+        let mut tokens = vec![token("atlas", "2026-11-14T10:00:00Z", 300.0)];
         for minute in (0..60).step_by(5) {
             tokens.push(five_minute_token(
                 "atlas",
                 &format!("2026-11-14T10:{minute:02}:00Z"),
-                1_000_000,
+                5.0,
             ));
         }
         let events = vec![live("atlas", "2026-11-14T09:00:00Z", Some(ac()))];
@@ -787,8 +1015,11 @@ mod tests {
             &tokens,
             &ac(),
             &[(utc("2026-11-14T10:00:00Z"), utc("2026-11-14T10:30:00Z"))],
+            &prices(),
         );
-        assert!((work - 36.0).abs() < EPS, "{work}");
+        assert_eq!(work.len(), 1);
+        assert!((work[0].usd - 180.0).abs() < EPS, "{:?}", work[0]);
+        assert!(!work[0].unpriced);
 
         let rates = rates_of(
             &ac(),
@@ -797,13 +1028,14 @@ mod tests {
             &events,
             utc("2026-11-14T18:00:00Z"),
         )
-        .expect("36 work units is enough work");
-        assert!((rates.c - 1.0).abs() < EPS, "{}", rates.c);
+        .expect("180 USD is enough work");
+        assert!((rates.c.value - 0.5).abs() < EPS, "{:?}", rates.c);
     }
 
-    /// The same token line on another provider's model.
-    fn token_of(model: &str, host: &str, at: &str, input: u64) -> Hosted<TokenRecord> {
-        let mut hosted = token(host, at, input);
+    /// The same token line on another model; `usd` sets its token count as
+    /// [`token`] does.
+    fn token_of(model: &str, host: &str, at: &str, usd: f64) -> Hosted<TokenRecord> {
+        let mut hosted = token(host, at, usd);
         hosted.record.model = model.to_string();
         hosted
     }
@@ -812,83 +1044,75 @@ mod tests {
     /// changes neither AC's rates, nor the switch cost's work, nor the rhythm.
     #[test]
     fn another_providers_work_leaves_the_rates_alone() {
-        let samples = vec![
-            sample(
-                "atlas",
-                "2026-11-14T09:00:00Z",
-                ac(),
-                vec![weekly(40.0, WEEK_RESET), session(0.0, AC_SESSION)],
-            ),
-            sample(
-                "atlas",
-                "2026-11-14T13:00:00Z",
-                ac(),
-                vec![weekly(48.0, WEEK_RESET), session(100.0, AC_SESSION)],
-            ),
-        ];
-        let claude = vec![
-            token("atlas", "2026-11-14T10:00:00Z", 10_000_000),
-            token("atlas", "2026-11-14T11:00:00Z", 10_000_000),
-            token("atlas", "2026-11-14T12:00:00Z", 5_000_000),
-        ];
+        let (samples, claude) = ac_day();
         let mut mixed = claude.clone();
         mixed.push(token_of(
             "gpt-6.1-sol",
             "atlas",
             "2026-11-14T10:00:00Z",
-            30_000_000,
+            150.0,
         ));
         mixed.push(token_of(
             "deepseek-v4.1-flash:cloud",
             "atlas",
             "2026-11-14T11:30:00Z",
-            40_000_000,
+            200.0,
         ));
         mixed.sort_by_key(|hosted| hosted.record.t);
         let events = vec![live("atlas", "2026-11-14T08:00:00Z", Some(ac()))];
         let now = utc("2026-11-14T18:00:00Z");
 
-        let alone = rates_of(&ac(), &samples, &claude, &events, now).expect("25 wu of Claude");
-        let with_others = rates_of(&ac(), &samples, &mixed, &events, now).expect("the same 25 wu");
-        assert_eq!((with_others.c, with_others.s), (alone.c, alone.s));
-        assert!((with_others.c - 0.32).abs() < EPS, "{}", with_others.c);
+        let alone = rates_of(&ac(), &samples, &claude, &events, now).expect("125 USD of Claude");
+        let with_others =
+            rates_of(&ac(), &samples, &mixed, &events, now).expect("the same 125 USD");
+        assert_eq!(with_others, alone);
+        assert!(
+            (with_others.c.value - 0.064).abs() < EPS,
+            "{:?}",
+            with_others.c
+        );
 
         let timelines = timelines(&events);
         let spans = [(utc("2026-11-14T09:00:00Z"), utc("2026-11-14T13:00:00Z"))];
-        assert!((work_in(&timelines, &mixed, &ac(), &spans) - 25.0).abs() < EPS);
+        let work = work_in(&timelines, &mixed, &ac(), &spans, &prices());
+        assert!((work[0].usd - 125.0).abs() < EPS, "{:?}", work[0]);
+        assert!(
+            !work[0].unpriced,
+            "a model of another company is no Claude work"
+        );
         assert_eq!(
-            rhythm(&mixed, now, &east_one()),
-            rhythm(&claude, now, &east_one()),
+            rhythm(&mixed, now, &east_one(), &prices()),
+            rhythm(&claude, now, &east_one(), &prices()),
             "the rhythm counts Claude work only"
+        );
+        let learned = rates(
+            &[with_capacity(ac(), None)],
+            &samples,
+            &mixed,
+            &events,
+            &prices(),
+            now,
+        );
+        assert!(
+            learned.unpriced.is_empty(),
+            "gpt-6.1-sol has no price but is no Claude model: {:?}",
+            learned.unpriced
         );
     }
 
     #[test]
     fn work_on_another_account_does_not_count() {
-        // The same samples and the same 25 wu for AC; 25 wu more fall into the
-        // hour in which LB was live on that host. With LB's work counted, c would
-        // be 8 / 50 = 0.16.
-        let samples = vec![
-            sample(
-                "atlas",
-                "2026-11-14T09:00:00Z",
-                ac(),
-                vec![weekly(40.0, WEEK_RESET), session(0.0, AC_SESSION)],
-            ),
-            sample(
-                "atlas",
-                "2026-11-14T13:00:00Z",
-                ac(),
-                vec![weekly(48.0, WEEK_RESET), session(100.0, AC_SESSION)],
-            ),
-        ];
+        // AC is live on atlas the whole time and does its 125 USD there; on
+        // vega LB is live and 125 USD more fall into the pair. With LB's work
+        // counted, c would be 8 / 250 = 0.032.
+        let (samples, _) = ac_day();
         let tokens = vec![
-            token("atlas", "2026-11-14T09:00:00Z", 25_000_000),
-            token("atlas", "2026-11-14T10:00:00Z", 25_000_000),
+            token("atlas", "2026-11-14T09:00:00Z", 125.0),
+            token("vega", "2026-11-14T10:00:00Z", 125.0),
         ];
         let events = vec![
             live("atlas", "2026-11-14T08:00:00Z", Some(ac())),
-            switched("atlas", "2026-11-14T10:00:00Z", lb()),
+            live("vega", "2026-11-14T08:00:00Z", Some(lb())),
         ];
 
         let rates = rates_of(
@@ -898,14 +1122,14 @@ mod tests {
             &events,
             utc("2026-11-14T18:00:00Z"),
         )
-        .expect("AC's 25 wu is enough work");
-        assert!((rates.c - 0.32).abs() < EPS, "{}", rates.c);
+        .expect("AC's 125 USD is enough work");
+        assert!((rates.c.value - 0.064).abs() < EPS, "{:?}", rates.c);
         let s = rates.s.expect("a session limit");
-        assert!((s - 4.0).abs() < EPS, "{s}");
+        assert!((s.value - 0.8).abs() < EPS, "{s:?}");
     }
 
     #[test]
-    fn less_than_twenty_work_units_is_unknown() {
+    fn less_than_100_dollars_is_unknown() {
         let samples = vec![
             sample(
                 "atlas",
@@ -920,7 +1144,7 @@ mod tests {
                 vec![weekly(48.0, WEEK_RESET)],
             ),
         ];
-        let tokens = vec![token("atlas", "2026-11-14T10:00:00Z", 19_900_000)];
+        let tokens = vec![token("atlas", "2026-11-14T10:00:00Z", 99.6)];
         let events = vec![live("atlas", "2026-11-14T08:00:00Z", Some(ac()))];
 
         assert!(rates_of(
@@ -935,9 +1159,9 @@ mod tests {
 
     #[test]
     fn a_reset_between_two_samples_is_not_a_drop() {
-        // A valid pair gains 8 % of the week over 25 wu: c = 8 / 25 = 0.32.
+        // A valid pair gains 8 % of the week over 125 USD: c = 8 / 125 = 0.064.
         // The 96 % → 3 % pair crosses the Monday reset; keeping it would add
-        // -93 % over 25 wu more, so c would be (8 - 93) / 50 = -1.7.
+        // -93 % over 125 USD more, so c would be (8 - 93) / 250 < 0.
         let samples = vec![
             sample(
                 "atlas",
@@ -965,8 +1189,8 @@ mod tests {
             ),
         ];
         let tokens = vec![
-            token("atlas", "2026-11-14T10:00:00Z", 25_000_000),
-            token("atlas", "2026-11-16T16:00:00Z", 25_000_000),
+            token("atlas", "2026-11-14T10:00:00Z", 125.0),
+            token("atlas", "2026-11-16T16:00:00Z", 125.0),
         ];
         let events = vec![live("atlas", "2026-11-14T08:00:00Z", Some(ac()))];
 
@@ -977,16 +1201,16 @@ mod tests {
             &events,
             utc("2026-11-16T18:00:00Z"),
         )
-        .expect("the valid pair carries 25 wu");
-        assert!((rates.c - 0.32).abs() < EPS, "c = {}", rates.c);
+        .expect("the valid pair carries 125 USD");
+        assert!((rates.c.value - 0.064).abs() < EPS, "c = {:?}", rates.c);
     }
 
     #[test]
     fn a_reset_that_keeps_its_reset_time_is_left_out_of_the_rates() {
         // The review's case: 40 → 48 → 0 at 09:00, 13:00 and 15:00 with the
         // same reset time. The 13:00 → 15:00 pair is an early reset, not -48
-        // points of usage; keeping it would make c (8 - 48) / 50 = -0.8 and
-        // `rates` None. The rising pair's 25 wu gives c = 8 / 25 = 0.32.
+        // points of usage; keeping it would make c (8 - 48) / 250 < 0 and
+        // `rates` None. The rising pair's 125 USD gives c = 8 / 125 = 0.064.
         let samples = vec![
             sample(
                 "atlas",
@@ -1008,8 +1232,8 @@ mod tests {
             ),
         ];
         let tokens = vec![
-            token("atlas", "2026-11-14T10:00:00Z", 25_000_000),
-            token("atlas", "2026-11-14T14:00:00Z", 25_000_000),
+            token("atlas", "2026-11-14T10:00:00Z", 125.0),
+            token("atlas", "2026-11-14T14:00:00Z", 125.0),
         ];
         let events = vec![live("atlas", "2026-11-14T08:00:00Z", Some(ac()))];
 
@@ -1020,15 +1244,15 @@ mod tests {
             &events,
             utc("2026-11-14T18:00:00Z"),
         )
-        .expect("the rising pair carries 25 wu");
-        assert!((rates.c - 0.32).abs() < EPS, "c = {}", rates.c);
+        .expect("the rising pair carries 125 USD");
+        assert!((rates.c.value - 0.064).abs() < EPS, "c = {:?}", rates.c);
     }
 
     #[test]
     fn a_model_reset_that_keeps_its_reset_time_is_left_out() {
         // A model reset takes the week from 70 % to 45 % with the reset time
-        // unchanged. The pair is a reset: with it c would be (30 - 25) / 50 =
-        // 0.1; without it the rising pair's 30 points over 25 wu give 1.2.
+        // unchanged. The pair is a reset: with it c would be (30 - 25) / 250 =
+        // 0.02; without it the rising pair's 30 points over 125 USD give 0.24.
         let samples = vec![
             sample(
                 "atlas",
@@ -1050,8 +1274,8 @@ mod tests {
             ),
         ];
         let tokens = vec![
-            token("atlas", "2026-11-14T10:00:00Z", 25_000_000),
-            token("atlas", "2026-11-14T14:00:00Z", 25_000_000),
+            token("atlas", "2026-11-14T10:00:00Z", 125.0),
+            token("atlas", "2026-11-14T14:00:00Z", 125.0),
         ];
         let events = vec![live("atlas", "2026-11-14T08:00:00Z", Some(ac()))];
 
@@ -1062,8 +1286,8 @@ mod tests {
             &events,
             utc("2026-11-14T18:00:00Z"),
         )
-        .expect("the rising pair carries 25 wu");
-        assert!((rates.c - 1.2).abs() < EPS, "c = {}", rates.c);
+        .expect("the rising pair carries 125 USD");
+        assert!((rates.c.value - 0.24).abs() < EPS, "c = {:?}", rates.c);
     }
 
     #[test]
@@ -1082,7 +1306,7 @@ mod tests {
                 vec![weekly(48.0, WEEK_RESET)],
             ),
         ];
-        let tokens = vec![token("atlas", "2026-11-14T10:00:00Z", 25_000_000)];
+        let tokens = vec![token("atlas", "2026-11-14T10:00:00Z", 125.0)];
         let events = vec![live("atlas", "2026-11-14T08:00:00Z", Some(ac()))];
 
         let rates = rates_of(
@@ -1092,15 +1316,17 @@ mod tests {
             &events,
             utc("2026-11-14T18:00:00Z"),
         )
-        .expect("25 wu is enough work");
-        assert!((rates.c - 0.32).abs() < EPS, "{}", rates.c);
+        .expect("125 USD is enough work");
+        assert!((rates.c.value - 0.064).abs() < EPS, "{:?}", rates.c);
         assert!(rates.s.is_none());
     }
 
     #[test]
     fn a_switch_inside_an_hour_splits_its_work() {
-        // A switch at 11:20 splits the 11:00 token line's hour 20/40: AC gets one
-        // third of its 10.0 wu, so 23 1/3 wu carry 8.4 % of the week.
+        // AC stays live on atlas, so the pair counts. On vega, where the work
+        // is done, a switch at 11:20 splits the 11:00 token line's hour 20/40:
+        // AC gets one third of its 50 USD, so 116 2/3 USD carry 42 % of the
+        // week.
         let samples = vec![
             sample(
                 "atlas",
@@ -1112,36 +1338,44 @@ mod tests {
                 "atlas",
                 "2026-11-14T13:00:00Z",
                 ac(),
-                vec![weekly(48.4, WEEK_RESET)],
+                vec![weekly(82.0, WEEK_RESET)],
             ),
         ];
         let tokens = vec![
-            token("atlas", "2026-11-14T09:00:00Z", 10_000_000),
-            token("atlas", "2026-11-14T10:00:00Z", 10_000_000),
-            token("atlas", "2026-11-14T11:00:00Z", 10_000_000),
+            token("vega", "2026-11-14T09:00:00Z", 50.0),
+            token("vega", "2026-11-14T10:00:00Z", 50.0),
+            token("vega", "2026-11-14T11:00:00Z", 50.0),
         ];
         let now = utc("2026-11-14T18:00:00Z");
 
         let splitting = vec![
             live("atlas", "2026-11-14T08:00:00Z", Some(ac())),
-            switched("atlas", "2026-11-14T11:20:00Z", lb()),
+            live("vega", "2026-11-14T08:00:00Z", Some(ac())),
+            switched("vega", "2026-11-14T11:20:00Z", lb()),
         ];
-        let split =
-            rates_of(&ac(), &samples, &tokens, &splitting, now).expect("23 1/3 wu is enough work");
-        assert!((split.c - 0.36).abs() < EPS, "{}", split.c);
+        let split = rates_of(&ac(), &samples, &tokens, &splitting, now)
+            .expect("116 2/3 USD is enough work");
+        assert!((split.c.value - 0.36).abs() < EPS, "{:?}", split.c);
 
-        // AC live the whole hour: the same lines are worth 30.0 wu, and the rate
-        // would be lower.
-        let whole_hour = vec![live("atlas", "2026-11-14T08:00:00Z", Some(ac()))];
+        // AC live the whole hour: the same lines are worth 150 USD, and the
+        // factor is lower.
+        let whole_hour = vec![
+            live("atlas", "2026-11-14T08:00:00Z", Some(ac())),
+            live("vega", "2026-11-14T08:00:00Z", Some(ac())),
+        ];
         let unsplit =
-            rates_of(&ac(), &samples, &tokens, &whole_hour, now).expect("30 wu is enough work");
-        assert!((unsplit.c - 8.4 / 30.0).abs() < EPS, "{}", unsplit.c);
+            rates_of(&ac(), &samples, &tokens, &whole_hour, now).expect("150 USD is enough work");
+        assert!(
+            (unsplit.c.value - 42.0 / 150.0).abs() < EPS,
+            "{:?}",
+            unsplit.c
+        );
     }
 
     #[test]
     fn two_token_lines_of_one_hour_add_up() {
         // Three lines of one session, hour and model (one per scan), and one line
-        // from another host: all four are work, 20.0 wu over the pair.
+        // from another host: all four are work, 100 USD over the pair.
         let samples = vec![
             sample(
                 "atlas",
@@ -1157,10 +1391,10 @@ mod tests {
             ),
         ];
         let tokens = vec![
-            token("atlas", "2026-11-14T10:00:00Z", 5_000_000),
-            token("atlas", "2026-11-14T10:00:00Z", 5_000_000),
-            token("atlas", "2026-11-14T10:00:00Z", 5_000_000),
-            token("vega", "2026-11-14T10:00:00Z", 5_000_000),
+            token("atlas", "2026-11-14T10:00:00Z", 25.0),
+            token("atlas", "2026-11-14T10:00:00Z", 25.0),
+            token("atlas", "2026-11-14T10:00:00Z", 25.0),
+            token("vega", "2026-11-14T10:00:00Z", 25.0),
         ];
         let events = vec![
             live("atlas", "2026-11-14T08:00:00Z", Some(ac())),
@@ -1174,8 +1408,8 @@ mod tests {
             &events,
             utc("2026-11-14T18:00:00Z"),
         )
-        .expect("20 wu is enough work");
-        assert!((rates.c - 0.4).abs() < EPS, "{}", rates.c);
+        .expect("100 USD is enough work");
+        assert!((rates.c.value - 0.08).abs() < EPS, "{:?}", rates.c);
     }
 
     // ---- proof tests of the review ----
@@ -1186,24 +1420,29 @@ mod tests {
         // 11:00Z) is 15:30 to 16:30 local: half of its work is in local hour
         // 15 and half in local hour 16.
         let tokens = vec![
-            token("atlas", "2026-11-23T10:00:00Z", 2_000_000),
-            token("atlas", "2026-11-16T10:00:00Z", 2_000_000),
-            token("atlas", "2026-11-09T10:00:00Z", 2_000_000),
-            token("atlas", "2026-11-02T10:00:00Z", 2_000_000),
+            token("atlas", "2026-11-23T10:00:00Z", 2.0),
+            token("atlas", "2026-11-16T10:00:00Z", 2.0),
+            token("atlas", "2026-11-09T10:00:00Z", 2.0),
+            token("atlas", "2026-11-02T10:00:00Z", 2.0),
         ];
-        let rhythm = rhythm(&tokens, utc("2026-11-23T12:00:00Z"), &half_hour());
+        let rhythm = rhythm(
+            &tokens,
+            utc("2026-11-23T12:00:00Z"),
+            &half_hour(),
+            &prices(),
+        );
 
         assert!(
-            (rhythm.wu[15] - 1.0).abs() < EPS,
+            (rhythm.usd[15] - 1.0).abs() < EPS,
             "hour 15: {}",
-            rhythm.wu[15]
+            rhythm.usd[15]
         );
         assert!(
-            (rhythm.wu[16] - 1.0).abs() < EPS,
+            (rhythm.usd[16] - 1.0).abs() < EPS,
             "hour 16: {}",
-            rhythm.wu[16]
+            rhythm.usd[16]
         );
-        let total: f64 = rhythm.wu.iter().sum();
+        let total: f64 = rhythm.usd.iter().sum();
         assert!((total - 2.0).abs() < EPS, "total: {total}");
     }
 
@@ -1212,7 +1451,7 @@ mod tests {
         // 08:00Z is 13:30 in +05:30, so an hourly line runs 13:30-14:30 local:
         // half of its span in each of local hours 13 and 14. A 5-minute line
         // lies wholly in one of them.
-        let hourly = token("atlas", "2026-11-23T08:00:00Z", 12_000_000);
+        let hourly = token("atlas", "2026-11-23T08:00:00Z", 12.0);
         let shares = hour_shares(&hourly.record, |at| {
             crate::stats::local_hour_start(at, &half_hour())
         });
@@ -1222,7 +1461,7 @@ mod tests {
         assert!((shares[0].1 - 0.5).abs() < EPS, "{}", shares[0].1);
         assert!((shares[1].1 - 0.5).abs() < EPS, "{}", shares[1].1);
 
-        let five = five_minute_token("atlas", "2026-11-23T08:00:00Z", 1_000_000);
+        let five = five_minute_token("atlas", "2026-11-23T08:00:00Z", 1.0);
         let shares = hour_shares(&five.record, |at| {
             crate::stats::local_hour_start(at, &half_hour())
         });
@@ -1233,23 +1472,23 @@ mod tests {
 
     #[test]
     fn rhythm_counts_five_minute_lines_like_the_hour_they_make_up() {
-        let hourly = vec![token("atlas", "2026-11-23T08:00:00Z", 12_000_000)];
+        let hourly = vec![token("atlas", "2026-11-23T08:00:00Z", 12.0)];
         let mut five = Vec::new();
         for minute in (0..60).step_by(5) {
             five.push(five_minute_token(
                 "atlas",
                 &format!("2026-11-23T08:{minute:02}:00Z"),
-                1_000_000,
+                1.0,
             ));
         }
         let now = utc("2026-11-23T12:00:00Z");
-        let a = rhythm(&hourly, now, &east_one());
-        let b = rhythm(&five, now, &east_one());
+        let a = rhythm(&hourly, now, &east_one(), &prices());
+        let b = rhythm(&five, now, &east_one(), &prices());
         assert!(
-            (b.wu[9] - a.wu[9]).abs() < EPS,
+            (b.usd[9] - a.usd[9]).abs() < EPS,
             "hourly {} vs 5-minute {}",
-            a.wu[9],
-            b.wu[9]
+            a.usd[9],
+            b.usd[9]
         );
     }
 
@@ -1257,18 +1496,22 @@ mod tests {
     fn a_record_at_now_is_outside_the_four_weeks() {
         // The window is [now - 4 weeks, now): the hour of a record that starts
         // at now lies in the future and is not work of the past four weeks.
-        let tokens = vec![token("atlas", "2026-11-23T08:00:00Z", 2_000_000)];
-        let rhythm = rhythm(&tokens, utc("2026-11-23T08:00:00Z"), &east_one());
+        let tokens = vec![token("atlas", "2026-11-23T08:00:00Z", 2.0)];
+        let rhythm = rhythm(&tokens, utc("2026-11-23T08:00:00Z"), &east_one(), &prices());
 
-        assert!((rhythm.wu[9] - 0.0).abs() < EPS, "hour 9: {}", rhythm.wu[9]);
+        assert!(
+            (rhythm.usd[9] - 0.0).abs() < EPS,
+            "hour 9: {}",
+            rhythm.usd[9]
+        );
     }
 
     #[test]
     fn a_percent_that_cannot_rise_gives_no_rate() {
         // The account is at 100 % of its week and of its window: neither
-        // percent can rise, so the pair and its 25 wu are left out. With no
-        // pair left there is not enough work and no rate at all; a rate of 0 %
-        // per work unit is not a rate: task 5 divides by it (rem / c,
+        // percent can rise, so the pair and its 125 USD are left out. With no
+        // pair left there is not enough work and no factor at all; a factor of
+        // 0 % per USD is not a factor: the plan divides by it (rem / c,
         // (100 - session%) / s and 100 * c / s).
         let full = vec![
             sample(
@@ -1284,13 +1527,13 @@ mod tests {
                 vec![weekly(100.0, WEEK_RESET), session(100.0, AC_SESSION)],
             ),
         ];
-        let tokens = vec![token("atlas", "2026-11-14T16:00:00Z", 25_000_000)];
+        let tokens = vec![token("atlas", "2026-11-14T16:00:00Z", 125.0)];
         let events = vec![live("atlas", "2026-11-14T08:00:00Z", Some(ac()))];
         assert!(rates_of(&ac(), &full, &tokens, &events, utc("2026-11-14T18:00:00Z")).is_none());
 
-        // A pair that can rise beside a 100 % one keeps its positive rate; the
-        // 100 % pair's 25 wu stay out (with them c would be 8 / 50 = 0.16 and
-        // s 50 / 50 = 1.0).
+        // A pair that can rise beside a 100 % one keeps its positive factor;
+        // the 100 % pair's 125 USD stay out (with them c would be 8 / 250 =
+        // 0.032 and s 50 / 250 = 0.2).
         let samples = vec![
             sample(
                 "atlas",
@@ -1318,8 +1561,8 @@ mod tests {
             ),
         ];
         let tokens = vec![
-            token("atlas", "2026-11-14T10:00:00Z", 25_000_000),
-            token("atlas", "2026-11-16T10:00:00Z", 25_000_000),
+            token("atlas", "2026-11-14T10:00:00Z", 125.0),
+            token("atlas", "2026-11-16T10:00:00Z", 125.0),
         ];
         let rates = rates_of(
             &ac(),
@@ -1328,57 +1571,84 @@ mod tests {
             &events,
             utc("2026-11-16T18:00:00Z"),
         )
-        .expect("the 25 wu of the pair that can rise is enough work");
-        assert!((rates.c - 0.32).abs() < EPS, "c = {}", rates.c);
+        .expect("the 125 USD of the pair that can rise is enough work");
+        assert!((rates.c.value - 0.064).abs() < EPS, "c = {:?}", rates.c);
         let s = rates.s.expect("a session limit");
-        assert!((s - 2.0).abs() < EPS, "s = {s}");
+        assert!((s.value - 0.4).abs() < EPS, "s = {s:?}");
     }
 
     /// A record at 09:00 in +02:00 stays in hour 9 of the week even when the
     /// four weeks start in +01:00: the rhythm uses the offset of each instant.
     #[test]
     fn a_summer_record_is_in_its_own_rhythm_hour() {
-        let tokens = vec![token("atlas", "2026-03-30T07:00:00Z", 2_000_000)];
+        let tokens = vec![token("atlas", "2026-03-30T07:00:00Z", 2.0)];
         let rhythm = rhythm(
             &tokens,
             utc("2026-03-30T12:00:00Z"),
             &crate::stats::tests::SummerZone,
+            &prices(),
         );
 
         assert!(
-            (rhythm.wu[9] - 2.0 / 3.0).abs() < EPS,
+            (rhythm.usd[9] - 2.0 / 3.0).abs() < EPS,
             "hour 9: {}",
-            rhythm.wu[9]
+            rhythm.usd[9]
         );
-        assert!((rhythm.wu[8] - 0.0).abs() < EPS, "hour 8: {}", rhythm.wu[8]);
+        assert!(
+            (rhythm.usd[8] - 0.0).abs() < EPS,
+            "hour 8: {}",
+            rhythm.usd[8]
+        );
     }
 
     fn with_capacity(account: AccountRef, capacity: Option<f64>) -> RateAccount {
-        RateAccount { account, capacity }
+        RateAccount {
+            account,
+            capacity,
+            plan: None,
+        }
+    }
+
+    fn on_plan(account: AccountRef, capacity: Option<f64>, plan: &str) -> RateAccount {
+        RateAccount {
+            account,
+            capacity,
+            plan: Some(plan.to_string()),
+        }
     }
 
     #[test]
     fn a_plan_without_any_measurement_starts_from_the_assumption() {
-        // No sample at all: a 5x plan assumes the built-in rate over 5, a 20x
-        // plan over 20, and a plan without a capacity has no rates.
+        // No sample at all: a 5x plan assumes the built-in factor over 5, and a
+        // plan without a capacity has no rates.
         let accounts = [with_capacity(ac(), Some(5.0)), with_capacity(lb(), None)];
-        let learned = rates(&accounts, &[], &[], &[], utc("2026-11-14T18:00:00Z"));
+        let learned = rates(
+            &accounts,
+            &[],
+            &[],
+            &[],
+            &prices(),
+            utc("2026-11-14T18:00:00Z"),
+        )
+        .rates;
         let ac_rates = learned.get(&ac()).expect("AC has a capacity");
         assert!(
-            (ac_rates.c - ASSUMED_WEEK_PERCENT_PER_WU / 5.0).abs() < EPS,
-            "{}",
+            (ac_rates.c.value - ASSUMED_WEEK_PERCENT_PER_USD_AT_1X / 5.0).abs() < EPS,
+            "{:?}",
             ac_rates.c
         );
+        assert!(!ac_rates.c.measured);
         assert!(ac_rates.s.is_none(), "no session was ever measured");
         assert!(!learned.contains_key(&lb()), "no capacity, no measurement");
     }
 
     #[test]
     fn a_measured_plan_moves_the_assumption_of_the_others() {
-        // LB (capacity 20) gained 10 % of its week over 200 wu while live.
-        // At capacity 1 that is (10 × 20 + 1.235 × 20) / (200 + 20) % per wu;
-        // AC (capacity 5, never measured) assumes a fifth of it. LB itself joins
-        // its own 200 wu with its share of the assumption, weighed as 20 wu.
+        // LB (capacity 20) gained 10 % of its week over 200 USD while live: at
+        // capacity 1 that is 10 × 20 / 200 = 1 % per USD, and AC (capacity 5,
+        // never measured) assumes a fifth of it. LB itself has no measured
+        // account beside it, so its prior is the built-in factor over 20,
+        // weighed as 100 USD next to its own 200.
         let samples = vec![
             sample(
                 "atlas",
@@ -1394,8 +1664,8 @@ mod tests {
             ),
         ];
         let tokens = vec![
-            token("atlas", "2026-11-14T09:00:00Z", 100_000_000),
-            token("atlas", "2026-11-14T10:00:00Z", 100_000_000),
+            token("atlas", "2026-11-14T09:00:00Z", 100.0),
+            token("atlas", "2026-11-14T10:00:00Z", 100.0),
         ];
         let events = vec![live("atlas", "2026-11-14T08:00:00Z", Some(lb()))];
         let accounts = [
@@ -1407,16 +1677,18 @@ mod tests {
             &samples,
             &tokens,
             &events,
+            &prices(),
             utc("2026-11-14T18:00:00Z"),
-        );
+        )
+        .rates;
 
-        let per_wu =
-            (10.0 * 20.0 + ASSUMED_WEEK_PERCENT_PER_WU * LEARN_MIN_WU) / (200.0 + LEARN_MIN_WU);
         let ac_c = learned.get(&ac()).expect("AC").c;
-        assert!((ac_c - per_wu / 5.0).abs() < EPS, "{ac_c}");
+        assert!((ac_c.value - 1.0 / 5.0).abs() < EPS, "{ac_c:?}");
+        assert!(!ac_c.measured);
         let lb_c = learned.get(&lb()).expect("LB").c;
-        let lb_expected = (10.0 + per_wu / 20.0 * LEARN_MIN_WU) / (200.0 + LEARN_MIN_WU);
-        assert!((lb_c - lb_expected).abs() < EPS, "{lb_c}");
+        let lb_expected = (10.0 + ASSUMED_WEEK_PERCENT_PER_USD_AT_1X / 20.0 * 100.0) / 300.0;
+        assert!((lb_c.value - lb_expected).abs() < EPS, "{lb_c:?}");
+        assert!(lb_c.measured);
     }
 
     #[test]
@@ -1438,7 +1710,7 @@ mod tests {
                 vec![weekly(40.0, WEEK_RESET)],
             ),
         ];
-        let tokens = vec![token("atlas", "2026-11-14T09:00:00Z", 100_000_000)];
+        let tokens = vec![token("atlas", "2026-11-14T09:00:00Z", 400.0)];
         let events = vec![live("atlas", "2026-11-14T08:00:00Z", Some(lb()))];
         let now = utc("2026-11-14T18:00:00Z");
 
@@ -1447,18 +1719,23 @@ mod tests {
             &samples,
             &tokens,
             &events,
+            &prices(),
             now,
-        );
+        )
+        .rates;
         let c = learned.get(&ac()).expect("AC has a capacity").c;
-        assert!((c - ASSUMED_WEEK_PERCENT_PER_WU / 5.0).abs() < EPS, "{c}");
+        assert!(
+            (c.value - ASSUMED_WEEK_PERCENT_PER_USD_AT_1X / 5.0).abs() < EPS,
+            "{c:?}"
+        );
         assert!(rates_of(&ac(), &samples, &tokens, &events, now).is_none());
     }
 
     #[test]
     fn a_session_rate_is_assumed_from_another_measured_session() {
-        // LB (capacity 5) filled 50 % of a 5 h window with 25 wu: 2 % per wu,
-        // 10 % at capacity 1. AC (capacity 20, capped, no work) assumes 0.5 %
-        // per wu; PR (capacity 20, no session limit) gets no s.
+        // LB (capacity 5) filled 50 % of a 5 h window with 125 USD: 0.4 % per
+        // USD, 2 % at capacity 1. AC (capacity 20, capped, no work) assumes
+        // 0.1 % per USD; PR (capacity 20, no session limit) gets no s.
         let samples = vec![
             sample(
                 "atlas",
@@ -1485,7 +1762,7 @@ mod tests {
                 vec![weekly(1.0, WEEK_RESET)],
             ),
         ];
-        let tokens = vec![token("atlas", "2026-11-14T10:00:00Z", 25_000_000)];
+        let tokens = vec![token("atlas", "2026-11-14T10:00:00Z", 125.0)];
         let events = vec![live("atlas", "2026-11-14T08:00:00Z", Some(lb()))];
         let accounts = [
             with_capacity(lb(), Some(5.0)),
@@ -1497,10 +1774,266 @@ mod tests {
             &samples,
             &tokens,
             &events,
+            &prices(),
             utc("2026-11-14T18:00:00Z"),
-        );
+        )
+        .rates;
         let s = learned.get(&ac()).expect("AC").s.expect("AC is capped");
-        assert!((s - 50.0 * 5.0 / 25.0 / 20.0).abs() < EPS, "{s}");
+        assert!((s.value - 50.0 * 5.0 / 125.0 / 20.0).abs() < EPS, "{s:?}");
         assert!(learned.get(&pr()).expect("PR").s.is_none());
+    }
+
+    // ---- 1.3: one measure of work ----
+
+    /// Review Focus 2: a stretch of work with a model that has no price. The
+    /// pair that holds it is left out of the fit; the factor comes from the
+    /// other pairs, and the model is named once, not once per record.
+    #[test]
+    fn a_pair_with_an_unpriced_model_is_left_out_not_zeroed() {
+        // Three pairs of two hours: 10 % over 100 USD, 20 % over 50 USD and
+        // two lines of `claude-new-9`, 10 % over 100 USD. Without the middle
+        // pair c = 20 / 200 = 0.1; with its unpriced lines valued as 0 it
+        // would be 40 / 250 = 0.16.
+        let samples = vec![
+            sample(
+                "atlas",
+                "2026-11-14T09:00:00Z",
+                ac(),
+                vec![weekly(10.0, WEEK_RESET)],
+            ),
+            sample(
+                "atlas",
+                "2026-11-14T11:00:00Z",
+                ac(),
+                vec![weekly(20.0, WEEK_RESET)],
+            ),
+            sample(
+                "atlas",
+                "2026-11-14T13:00:00Z",
+                ac(),
+                vec![weekly(40.0, WEEK_RESET)],
+            ),
+            sample(
+                "atlas",
+                "2026-11-14T15:00:00Z",
+                ac(),
+                vec![weekly(50.0, WEEK_RESET)],
+            ),
+        ];
+        let tokens = vec![
+            token("atlas", "2026-11-14T09:00:00Z", 50.0),
+            token("atlas", "2026-11-14T10:00:00Z", 50.0),
+            token("atlas", "2026-11-14T11:00:00Z", 50.0),
+            token_of("claude-new-9", "atlas", "2026-11-14T11:00:00Z", 30.0),
+            token_of("claude-new-9", "atlas", "2026-11-14T12:00:00Z", 30.0),
+            token("atlas", "2026-11-14T13:00:00Z", 50.0),
+            token("atlas", "2026-11-14T14:00:00Z", 50.0),
+        ];
+        let events = vec![live("atlas", "2026-11-14T08:00:00Z", Some(ac()))];
+        let now = utc("2026-11-14T18:00:00Z");
+
+        let learned = rates(
+            &[with_capacity(ac(), None)],
+            &samples,
+            &tokens,
+            &events,
+            &prices(),
+            now,
+        );
+        let c = learned.rates.get(&ac()).expect("200 USD of priced pairs").c;
+        assert!((c.value - 0.1).abs() < EPS, "{c:?}");
+        assert!((c.basis_usd - 200.0).abs() < EPS, "{c:?}");
+        assert_eq!(
+            learned.unpriced,
+            BTreeSet::from(["claude-new-9".to_string()])
+        );
+        assert_eq!(
+            learned.warnings(),
+            vec![
+                "no price for claude-new-9: its work is left out of auto-burn's rates and rhythm"
+                    .to_string()
+            ]
+        );
+
+        // The rhythm leaves the unpriced lines out as well: never as 0, never
+        // guessed.
+        let priced: Vec<Hosted<TokenRecord>> = tokens
+            .iter()
+            .filter(|hosted| hosted.record.model == "claude-opus-5-5")
+            .cloned()
+            .collect();
+        assert_eq!(
+            rhythm(&tokens, now, &east_one(), &prices()),
+            rhythm(&priced, now, &east_one(), &prices())
+        );
+    }
+
+    #[test]
+    fn a_pair_live_for_less_than_90_percent_is_left_out() {
+        // Two pairs of two hours, 100 USD each: 10 % and 30 %. AC is live on
+        // atlas until 12:45, so the second pair has AC live for 105 of its 120
+        // minutes (87.5 %): it is left out, c = 10 / 100.
+        let samples = vec![
+            sample(
+                "atlas",
+                "2026-11-14T09:00:00Z",
+                ac(),
+                vec![weekly(10.0, WEEK_RESET)],
+            ),
+            sample(
+                "atlas",
+                "2026-11-14T11:00:00Z",
+                ac(),
+                vec![weekly(20.0, WEEK_RESET)],
+            ),
+            sample(
+                "atlas",
+                "2026-11-14T13:00:00Z",
+                ac(),
+                vec![weekly(50.0, WEEK_RESET)],
+            ),
+        ];
+        let tokens = vec![
+            token("atlas", "2026-11-14T09:00:00Z", 100.0),
+            token("atlas", "2026-11-14T11:00:00Z", 100.0),
+        ];
+        let now = utc("2026-11-14T18:00:00Z");
+        let mut events = vec![
+            live("atlas", "2026-11-14T08:00:00Z", Some(ac())),
+            switched("atlas", "2026-11-14T12:45:00Z", lb()),
+        ];
+        let short = rates_of(&ac(), &samples, &tokens, &events, now).expect("the first pair");
+        assert!((short.c.value - 0.1).abs() < EPS, "{:?}", short.c);
+        assert!((short.c.basis_usd - 100.0).abs() < EPS, "{:?}", short.c);
+
+        // AC live on vega from 12:30 closes the gap: the union of both hosts
+        // covers the whole pair, which now counts: c = 40 / 200.
+        events.push(live("vega", "2026-11-14T12:30:00Z", Some(ac())));
+        let union = rates_of(&ac(), &samples, &tokens, &events, now).expect("both pairs");
+        assert!((union.c.value - 0.2).abs() < EPS, "{:?}", union.c);
+    }
+
+    /// Review Focus 4: a new install or a new account nobody has measured
+    /// starts from its plan at once; nothing waits a week.
+    #[test]
+    fn an_unmeasured_pro_account_starts_from_its_plan_name() {
+        // Pro's tier names no multiplier: its plan name makes it capacity 1.
+        // Max's tier is `_5x`.
+        let pro = stored(&pr(), "PR", "Pro", Some("default_claude_ai"));
+        let max = stored(&lb(), "LB", "Max", Some("default_claude_max_5x"));
+        let accounts = [RateAccount::of(&pro), RateAccount::of(&max)];
+        assert_eq!(accounts[0].capacity, Some(1.0));
+        let learned = rates(
+            &accounts,
+            &[],
+            &[],
+            &[],
+            &prices(),
+            utc("2026-11-14T18:00:00Z"),
+        )
+        .rates;
+        let pro_c = learned.get(&pr()).expect("Pro has a capacity").c;
+        assert!((pro_c.value - 0.75).abs() < EPS, "{pro_c:?}");
+        assert!(!pro_c.measured);
+        let max_c = learned.get(&lb()).expect("Max has a capacity").c;
+        assert!((max_c.value - 0.15).abs() < EPS, "{max_c:?}");
+        assert!(!max_c.measured);
+    }
+
+    #[test]
+    fn an_account_takes_the_factor_of_a_measured_account_on_the_same_plan() {
+        // LB (Team Premium, capacity 5) gained 10 % over 200 USD: 0.05 % per
+        // USD. AC is Team Premium too but its tier is not known: it takes LB's
+        // factor by the plan's name. PR (Ultra, capacity 20) takes the pooled
+        // factor per capacity: 10 × 5 / 200 / 20. OR (Team Standard, no
+        // capacity) has no prior and no rates.
+        let samples = vec![
+            sample(
+                "atlas",
+                "2026-11-14T09:00:00Z",
+                lb(),
+                vec![weekly(40.0, WEEK_RESET)],
+            ),
+            sample(
+                "atlas",
+                "2026-11-14T13:00:00Z",
+                lb(),
+                vec![weekly(50.0, WEEK_RESET)],
+            ),
+        ];
+        let tokens = vec![
+            token("atlas", "2026-11-14T09:00:00Z", 100.0),
+            token("atlas", "2026-11-14T10:00:00Z", 100.0),
+        ];
+        let events = vec![live("atlas", "2026-11-14T08:00:00Z", Some(lb()))];
+        let accounts = [
+            on_plan(lb(), Some(5.0), "Team Premium"),
+            on_plan(ac(), None, "Team Premium"),
+            on_plan(pr(), Some(20.0), "Ultra"),
+            on_plan(or(), None, "Team Standard"),
+        ];
+        let learned = rates(
+            &accounts,
+            &samples,
+            &tokens,
+            &events,
+            &prices(),
+            utc("2026-11-14T18:00:00Z"),
+        )
+        .rates;
+
+        let ac_c = learned.get(&ac()).expect("AC takes LB's factor").c;
+        assert!((ac_c.value - 0.05).abs() < EPS, "{ac_c:?}");
+        assert!(!ac_c.measured);
+        let pr_c = learned.get(&pr()).expect("PR takes the pooled factor").c;
+        assert!(
+            (pr_c.value - 10.0 * 5.0 / 200.0 / 20.0).abs() < EPS,
+            "{pr_c:?}"
+        );
+        assert!(!learned.contains_key(&or()), "no plan peer, no capacity");
+        // LB's own prior is the built-in factor over 5: nobody else is measured.
+        let lb_c = learned.get(&lb()).expect("LB").c;
+        let lb_expected = (10.0 + 0.75 / 5.0 * 100.0) / 300.0;
+        assert!((lb_c.value - lb_expected).abs() < EPS, "{lb_c:?}");
+    }
+
+    /// R2 of 1.3: the events of the timelines are read for all time, so an
+    /// account live for weeks without a switch still has a timeline.
+    #[test]
+    fn timelines_reach_back_past_rates_days() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let now = utc("2026-11-14T18:00:00Z");
+        let (samples, tokens) = ac_day();
+        history
+            .append(&Event {
+                t: now - Duration::days(20),
+                kind: EventKind::Live {
+                    account: Some(ac()),
+                },
+            })
+            .expect("the live event");
+        for hosted in &samples {
+            history.append(&hosted.record).expect("a sample");
+        }
+        for hosted in &tokens {
+            history.append(&hosted.record).expect("a token line");
+        }
+        // Team Standard: no capacity, so only a measurement gives rates.
+        let accounts = [stored(&ac(), "AC", "Team Standard", None)];
+
+        let learned = super::super::live::learn(
+            &history,
+            now,
+            FixedOffset::east_opt(0).expect("UTC"),
+            &accounts,
+            true,
+            &prices(),
+        )
+        .expect("the history reads");
+        let c = learned.rates.get(&ac()).expect("AC was live 20 days ago").c;
+        assert!((c.value - 0.064).abs() < EPS, "{c:?}");
+        assert!(c.measured);
+        assert!(learned.events.is_empty(), "no event of the last 14 days");
     }
 }

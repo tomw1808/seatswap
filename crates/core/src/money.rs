@@ -836,18 +836,46 @@ pub fn look_up_rate(
     }))
 }
 
-/// What one token record costs at API prices, in USD. `None` when the record's
-/// model has no price. A record whose four token counts are all 0 costs nothing,
-/// so it has the value 0 even when its model has no price (Claude Code writes
-/// such records with model `<synthetic>`). The record's model is priced under
-/// the key [`model_price_key`] gives it: a Claude model as `anthropic`, an
-/// Ollama cloud model as `ollama-cloud`, any other (Codex) as `openai`.
-pub fn api_usd(record: &TokenRecord, prices: &Prices) -> Option<f64> {
-    if record.input == 0 && record.out == 0 && record.cw == 0 && record.cr == 0 {
+/// What tokens of `model` cost at API prices at `at`, in USD: the work of
+/// auto-burn and the statistics (spec R1 of 1.3). Each of the four token kinds
+/// is priced at the model's models.dev price in effect at `at`, its base price:
+/// the long-context premium of a tiered price is left out (documented rule).
+/// The one place a token count becomes dollars.
+///
+/// `None` when the model has no price; such work is never valued as 0 or
+/// guessed. Four counts of 0 cost nothing, so they are worth 0 even when the
+/// model has no price (Claude Code writes such records with model
+/// `<synthetic>`). The model is priced under the key [`model_price_key`] gives
+/// it: a Claude model as `anthropic`, an Ollama cloud model as `ollama-cloud`,
+/// any other (Codex) as `openai`.
+pub fn work_usd(
+    model: &str,
+    input: u64,
+    output: u64,
+    cache_write: u64,
+    cache_read: u64,
+    prices: &Prices,
+    at: DateTime<Utc>,
+) -> Option<f64> {
+    if input == 0 && output == 0 && cache_write == 0 && cache_read == 0 {
         return Some(0.0);
     }
-    let price = prices.of_model(&record.model, record.t)?;
-    Some(price.usd(record.input, record.out, record.cw, record.cr))
+    let price = prices.of_model(model, at)?;
+    Some(price.usd(input, output, cache_write, cache_read))
+}
+
+/// What one token record costs at API prices, in USD: [`work_usd`] of its
+/// model, counts and time. `None` when the record's model has no price.
+pub fn api_usd(record: &TokenRecord, prices: &Prices) -> Option<f64> {
+    work_usd(
+        &record.model,
+        record.input,
+        record.out,
+        record.cw,
+        record.cr,
+        prices,
+        record.t,
+    )
 }
 
 /// The money value of one percent of one week of an account: monthly price ×
@@ -1507,7 +1535,7 @@ fn counted_price(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use serde_json::json;
@@ -1557,7 +1585,11 @@ mod tests {
             .prices
     }
 
-    fn priced_prices(at: DateTime<Utc>) -> Prices {
+    /// The models.dev fixture's prices from `at` on (`claude-opus-5-5` at
+    /// 4 / 20 / 5 / 0.2 USD per million input, output, cache-write and
+    /// cache-read tokens). `pub(crate)` so auto-burn's tests price their token
+    /// records with the same list.
+    pub(crate) fn priced_prices(at: DateTime<Utc>) -> Prices {
         let mut prices = Prices::default();
         prices.take(model_list(), at);
         prices

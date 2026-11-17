@@ -18,6 +18,7 @@ use seatswap_core::burn::{
 };
 use seatswap_core::engine::{AccountView, PollReason};
 use seatswap_core::history::{AccountRef, By, EventKind, HistoryDir};
+use seatswap_core::money::{PriceChange, Prices};
 use seatswap_core::paths::AppPaths;
 use seatswap_core::store::{Account, Settings};
 use seatswap_core::switcher::UnsavedPolicy;
@@ -86,7 +87,7 @@ pub(crate) struct Measured {
     /// week: `100 × c / s`.
     pub window_percent_of_week: BTreeMap<String, f64>,
     /// What one switch costs the active account as a percent of its 5 h
-    /// window: `cost.wu × s`.
+    /// window: `cost.usd × s`.
     pub switch_cost_percent_of_window: Option<f64>,
     /// The eager plan's switches over its horizon, per day; `None` while early
     /// switching is off.
@@ -164,6 +165,9 @@ pub(crate) struct BurnRuntime {
     /// The `burn-next.json` content this runtime wrote last, or `None` when
     /// it removed the file (or never wrote it in this run).
     next_written: Option<BurnNext>,
+    /// The stored price list's `checkedAt` and `lastChange` at the last learn;
+    /// a different list means the work is priced differently and learns again.
+    prices_learned: Option<(Option<DateTime<Utc>>, Option<PriceChange>)>,
     force_learn: bool,
     action: Sender<ActionCommand>,
     engine: Sender<EngineCommand>,
@@ -186,6 +190,7 @@ impl BurnRuntime {
             last_stale_ask: None,
             view: None,
             next_written: None,
+            prices_learned: None,
             force_learn: false,
             action,
             engine,
@@ -216,6 +221,18 @@ impl BurnRuntime {
             && self
                 .learn_attempted_at
                 .is_some_and(|at| tick.now - at >= Duration::minutes(LEARN_RETRY_MIN));
+        // The tick reads no other file, so it reads the stored price list here
+        // to notice a look-up between the hourly learns.
+        let prices = Prices::load(tick.app);
+        let prices_changed =
+            self.prices_learned
+                .as_ref()
+                .is_some_and(|(checked_at, last_change)| match &prices {
+                    Ok(prices) => {
+                        prices.checked_at != *checked_at || prices.last_change != *last_change
+                    }
+                    Err(_) => false,
+                });
         let due = self.force_learn
             || self.learn_attempted_at.is_none()
             || (self.learn_error.is_none()
@@ -224,21 +241,25 @@ impl BurnRuntime {
                     .is_some_and(|at| tick.now - at >= Duration::hours(1)))
             || failed_due
             || tick.active != self.last_active.as_deref()
+            || prices_changed
             || self.switch_relearn_due(tick);
         if due {
             self.force_learn = false;
             self.learn_attempted_at = Some(tick.now);
             self.switch_learn_at = Some(tick.now);
-            match tick.history {
-                Some(history) => match live::learn(
+            // The work is priced with the stored list read above.
+            match (tick.history, prices) {
+                (Some(history), Ok(prices)) => match live::learn(
                     history,
                     tick.now,
                     tick.offset,
                     tick.accounts,
                     tick.settings.read_sessions,
+                    &prices,
                 ) {
                     Ok(learned) => {
                         report.warnings.extend(learned.warnings.iter().cloned());
+                        self.prices_learned = Some((prices.checked_at, prices.last_change.clone()));
                         self.learned = Some(learned);
                         self.learn_error = None;
                     }
@@ -247,7 +268,11 @@ impl BurnRuntime {
                             Some(format!("auto-burn: cannot read the history: {error}"));
                     }
                 },
-                None => {
+                (Some(_), Err(error)) => {
+                    self.learn_error =
+                        Some(format!("auto-burn: the prices cannot be read: {error}"));
+                }
+                (None, _) => {
                     self.learn_error = Some("auto-burn: the history is not open".to_string());
                 }
             }
@@ -677,7 +702,7 @@ impl BurnRuntime {
 /// What auto-burn has measured: a full 5 h window as a percent of each account's
 /// week (`100 × c / s`, for every account auto-burn may use whose `s` is known),
 /// what one switch costs the active account as a percent of its window
-/// (`cost.wu × s`), and the eager plan's switches per day while early switching
+/// (`cost.usd × s`), and the eager plan's switches per day while early switching
 /// is on. Missing values stay `None`; the page says what they wait for.
 fn measured(situation: &Situation, regime: &Regime) -> Measured {
     let window_percent_of_week = situation
@@ -688,7 +713,7 @@ fn measured(situation: &Situation, regime: &Regime) -> Measured {
         .filter_map(|account| {
             let rates = account.rates?;
             let s = rates.s?;
-            Some((account.id.clone(), 100.0 * rates.c / s))
+            Some((account.id.clone(), 100.0 * rates.c.value / s.value))
         })
         .collect();
     let switch_cost_percent_of_window = situation.cost.and_then(|cost| {
@@ -698,7 +723,7 @@ fn measured(situation: &Situation, regime: &Regime) -> Measured {
             .accounts
             .iter()
             .find(|account| account.id == active)?;
-        Some(cost.wu * account.rates?.s?)
+        Some(cost.usd * account.rates?.s?.value)
     });
     let switches_per_day = regime.early.then(|| {
         seatswap_core::burn::switches_per_day(follow(&situation.inputs, Policy::Eager).switches)
@@ -817,7 +842,9 @@ mod tests {
     use seatswap_core::burn::decide::{Reason, RegimeWhy, Situation, SwitchCost};
     use seatswap_core::burn::plan::{AccountState, Inputs, Plan, Segment, SessionState};
     use seatswap_core::burn::{Rates, Rhythm};
-    use seatswap_core::history::{AccountRef, Event, EventKind, Hosted, Recorder};
+    use seatswap_core::history::{AccountRef, Event, EventKind, Hosted, Recorder, TokenRecord};
+    use seatswap_core::money::ModelPrice;
+    use seatswap_core::project::ProjectKey;
     use seatswap_core::store::LoginState;
     use seatswap_core::types::OAuthAccount;
 
@@ -928,12 +955,9 @@ mod tests {
             },
             model_blocked: false,
             rates: if session {
-                Some(Rates {
-                    c: 4.0,
-                    s: Some(100.0),
-                })
+                Some(Rates::given(4.0, Some(100.0)))
             } else {
-                Some(Rates { c: 2.0, s: None })
+                Some(Rates::given(2.0, None))
             },
             thinking_held: 0,
         }
@@ -949,12 +973,12 @@ mod tests {
                     state("ac", true, 80.0, true),
                 ],
                 active: active.map(str::to_string),
-                rhythm: Rhythm { wu: [1.0; 168] },
+                rhythm: Rhythm { usd: [1.0; 168] },
                 last_switch_at: None,
                 manual_hold_until: None,
             },
             cost: Some(SwitchCost {
-                wu: 0.05,
+                usd: 0.05,
                 samples: 3,
             }),
             tied_busy: 0,
@@ -992,7 +1016,7 @@ mod tests {
                     to: now + Duration::hours(4),
                 },
             ],
-            blocked_wu: 0.0,
+            blocked_usd: 0.0,
             switches: 1,
             left_at_reset: BTreeMap::new(),
             // The lazy plan's shape: PR fills when its segment ends.
@@ -1070,6 +1094,115 @@ mod tests {
         assert!(action_rx.try_recv().is_err(), "only one command");
     }
 
+    /// A look-up between the hourly learns must reach the rates at once: the
+    /// stored list's `checkedAt`/`lastChange` changed, so the next tick learns
+    /// again with it.
+    #[test]
+    fn a_new_price_list_learns_again() {
+        let now = utc("2026-11-10T12:00:00Z");
+        let tmp = tempfile::tempdir().expect("a temp folder");
+        let history = HistoryDir::at(tmp.path(), "atlas");
+        let app = AppPaths::at(tmp.path());
+        let recorder = Recorder::new(HistoryDir::at(history.root(), history.host()));
+        recorder
+            .tokens(&[TokenRecord {
+                t: now - Duration::minutes(30),
+                minutes: 60,
+                session: "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34".to_string(),
+                cwd: "/home/sam/projects/atlas".to_string(),
+                project: ProjectKey::Repo("github.com/sam/atlas".to_string()),
+                model: "claude-opus-5-5".to_string(),
+                input: 2_000_000,
+                out: 0,
+                cw: 0,
+                cr: 0,
+                answers: 1,
+                agent_answers: 0,
+            }])
+            .expect("the token record is written");
+
+        let (action_tx, _action_rx) = mpsc::channel();
+        let (engine_tx, _engine_rx) = mpsc::channel();
+        let mut runtime = BurnRuntime::new(action_tx, engine_tx);
+        let accounts = vec![account("pr", "PR", PR_ACC, true)];
+        let views = vec![view("pr", "PR", 10.0, false, now - Duration::minutes(1))];
+        let settings = Settings {
+            auto_burn: false,
+            ..Settings::default()
+        };
+        let tick = |at: DateTime<Utc>| BurnTick {
+            app: &app,
+            history: Some(&history),
+            views: &views,
+            accounts: &accounts,
+            settings: &settings,
+            active: Some("pr"),
+            now: at,
+            offset: offset(),
+            tied_busy: 0,
+            thinking: &[],
+        };
+
+        let first = runtime.after_snapshot(&tick(now));
+        assert!(
+            first
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("no API prices yet")),
+            "{:?}",
+            first.warnings
+        );
+        assert!(
+            runtime
+                .learned
+                .as_ref()
+                .expect("the first learn")
+                .rhythm
+                .usd
+                .iter()
+                .all(|usd| *usd == 0.0),
+            "no priced work yet"
+        );
+
+        let mut prices = Prices::default();
+        prices.take(
+            BTreeMap::from([(
+                "anthropic/claude-opus-5-5".to_string(),
+                ModelPrice {
+                    input: 4.0,
+                    output: 20.0,
+                    cache_write: 5.0,
+                    cache_read: 0.2,
+                    tiered: false,
+                },
+            )]),
+            now,
+        );
+        prices.checked_at = Some(now);
+        prices.save(&app).expect("prices.json");
+
+        let second = runtime.after_snapshot(&tick(now + Duration::minutes(1)));
+        assert!(
+            !second
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("no API prices yet")),
+            "{:?}",
+            second.warnings
+        );
+        assert!(
+            runtime
+                .learned
+                .as_ref()
+                .expect("the second learn")
+                .rhythm
+                .usd
+                .iter()
+                .any(|usd| *usd > 0.0),
+            "the new list prices the work, so the runtime learned again"
+        );
+    }
+
     #[test]
     fn measured_comes_from_the_rates_and_the_cost() {
         let now = utc("2026-11-10T12:00:00Z");
@@ -1103,7 +1236,7 @@ mod tests {
         let cost = measured
             .switch_cost_percent_of_window
             .expect("AC has an s and the situation a cost");
-        assert!((cost - 5.0).abs() < 1e-9, "cost 0.05 wu × s 100 = {cost}");
+        assert!((cost - 5.0).abs() < 1e-9, "cost 0.05 USD × s 100 = {cost}");
         let expected = follow(&situation.inputs, Policy::Eager).switches as f64 / 7.0;
         assert_eq!(measured.switches_per_day, Some(expected));
 
@@ -1639,16 +1772,10 @@ mod tests {
         let mut rates = BTreeMap::new();
         // PR fills its week fast and its 5 h windows are small; AC can work far
         // longer, so without a hold the early rule would switch to PR.
-        rates.insert(
-            AccountRef::of(&accounts[0]),
-            Rates {
-                c: 1.0,
-                s: Some(100.0),
-            },
-        );
-        rates.insert(AccountRef::of(&accounts[1]), Rates { c: 1.0, s: None });
+        rates.insert(AccountRef::of(&accounts[0]), Rates::given(1.0, Some(100.0)));
+        rates.insert(AccountRef::of(&accounts[1]), Rates::given(1.0, None));
         let learned = Learned {
-            rhythm: Rhythm { wu: [1.0; 168] },
+            rhythm: Rhythm { usd: [1.0; 168] },
             rates,
             cost: None,
             warnings: Vec::new(),
@@ -1770,7 +1897,7 @@ mod tests {
                     to: now + Duration::hours(4),
                 },
             ],
-            blocked_wu: 0.0,
+            blocked_usd: 0.0,
             switches: 2,
             left_at_reset: BTreeMap::new(),
             full_at: BTreeMap::new(),

@@ -91,9 +91,10 @@ const FORECAST_RUNS = [
   ["2026-11-19T08:00:00.000Z", "2026-11-19T10:00:00.000Z", "PR"],
 ];
 
-// `?fixture=forecast-learning`: AC's rates are not known yet, so its row has
-// no expected percent and no money. `?fixture=forecast-unread`: no plan yet,
-// AC still waits for its first reading (`window.rs`'s `no_plan_text`).
+// `?fixture=forecast-learning`: AC's rates are not known yet, and LB's are
+// assumed from its plan. AC's row has no expected percent and no money; LB's
+// expected percent is there. `?fixture=forecast-unread`: no plan yet, AC still
+// waits for its first reading (`window.rs`'s `no_plan_text`).
 function forecastVariant() {
   if (typeof location === "undefined" || typeof URLSearchParams !== "function") return null;
   return new URLSearchParams(location.search).get("fixture");
@@ -104,8 +105,10 @@ export function forecastPage() {
   if (variant === "forecast-unread") {
     throw new Error(`${FORECAST_NO_PLAN}: AC has none yet; it comes with the next usage poll`);
   }
-  const learns = (abbr) => variant === "forecast-learning" && abbr === "AC";
-  const learning = viewOrder().filter((id) => learns(accountById(id).abbr));
+  const unknownRate = (abbr) => variant === "forecast-learning" && abbr === "AC";
+  const assumedRate = (abbr) => variant === "forecast-learning" && abbr === "LB";
+  const unknown = viewOrder().filter((id) => unknownRate(accountById(id).abbr));
+  const assumed = viewOrder().filter((id) => assumedRate(accountById(id).abbr));
   const expire = (atReset) =>
     round2(
       sum(
@@ -120,12 +123,12 @@ export function forecastPage() {
     return {
       id,
       now: account.now,
-      expected: learns(abbr) ? null : FORECAST_PLANNED_AT_RESET[abbr],
+      expected: unknownRate(abbr) ? null : FORECAST_PLANNED_AT_RESET[abbr],
       low: FORECAST_LOW[abbr],
       fullAt: FORECAST_FULL[abbr] === undefined ? null : FORECAST_FULL[abbr],
       resetsAt: FORECAST_RESETS[abbr],
-      onlyWhenFullExpected: learns(abbr) ? null : FORECAST_LAZY_AT_RESET[abbr],
-      onlyWhenFullExpires: learns(abbr)
+      onlyWhenFullExpected: unknownRate(abbr) ? null : FORECAST_LAZY_AT_RESET[abbr],
+      onlyWhenFullExpires: unknownRate(abbr)
         ? null
         : round2(((100 - FORECAST_LAZY_AT_RESET[abbr]) / 100) * weeklyPrice(account)),
     };
@@ -141,9 +144,19 @@ export function forecastPage() {
       resets: [FORECAST_RESETS[abbr]],
     };
   });
+  const prefixes = [];
+  if (unknown.length > 0) {
+    const names = unknown.map((id) => accountById(id).abbr).join(" and ");
+    prefixes.push(`${names}'s rates are not known yet.`);
+  }
+  if (assumed.length > 0) {
+    const names = assumed.map((id) => accountById(id).abbr).join(" and ");
+    prefixes.push(`${names}'s rates are assumed from its plan.`);
+  }
   return {
     basisWeeks: 12,
-    learning,
+    assumed,
+    unknown,
     kpis: {
       expirePlanned: expire(FORECAST_PLANNED_AT_RESET),
       expireOnlyWhenFull: expire(FORECAST_LAZY_AT_RESET),
@@ -158,9 +171,6 @@ export function forecastPage() {
     blocked: [],
     from: FORECAST_FROM,
     to: FORECAST_TO,
-    sentence:
-      learning.length > 0
-        ? "Still learning how fast AC is used. Enough for the week."
-        : "Enough for the week.",
+    sentence: [...prefixes, "Enough for the week."].join(" "),
   };
 }

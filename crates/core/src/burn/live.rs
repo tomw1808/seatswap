@@ -3,7 +3,7 @@
 //! The CLI and the tray app both call these, so neither builds a `Situation`
 //! by hand.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Duration, FixedOffset, TimeZone, Utc};
 
@@ -13,17 +13,18 @@ use crate::history::{
     AccountRef, By, Event, EventKind, HistoryDir, HistoryError, Hosted, Hosts, Range, Sample,
     TokenRecord,
 };
+use crate::money::Prices;
 use crate::store::{Account, LoginState};
 
 use super::cost::switch_cost;
 use super::decide::{decide, regime, Decision, Regime, Situation};
 use super::plan::{blocked, followed, AccountState, Inputs, Plan, PlanError, SessionState};
-use super::rates::{rates, rhythm, RateAccount, Timeline};
+use super::rates::{rates, rhythm, unpriced_models, unpriced_warning, RateAccount, Timeline};
 use super::{Rates, Rhythm, MANUAL_HOLD_H, RATES_DAYS, RHYTHM_WEEKS};
 
 /// Everything a decision is built from, read once: the rhythm, the accounts'
-/// rates, the measured switch cost, the read warnings and the events of the last
-/// [`RATES_DAYS`] days.
+/// rates, the measured switch cost, the read warnings (and one per Claude model
+/// without a price) and the events of the last [`RATES_DAYS`] days.
 #[derive(Debug, Clone)]
 pub struct Learned {
     pub rhythm: Rhythm,
@@ -55,16 +56,27 @@ pub enum Readiness {
 }
 
 /// Read the history once: samples and tokens of [`RHYTHM_WEEKS`] weeks, events
-/// of [`RATES_DAYS`] days. The rates are computed for `accounts` only; an
-/// account with too little work has no entry. With `read_sessions` false no
-/// rates are learned: every account plays as one without rates (spec §2.3).
+/// of all time. The timelines of the rates take every event (R2 of 1.3: an
+/// account live for weeks without a switch still has a timeline); the switch
+/// cost measures the switches of the last [`RATES_DAYS`] days, and
+/// [`Learned::events`] keeps those days only. The rates are computed for
+/// `accounts` only; an account with too little work and no prior has no entry.
+/// Work is priced with `prices` ([`crate::money::api_usd`]); each Claude model
+/// without a price gets one warning, its work being left out of the rates and
+/// the rhythm, with or without session reading. When the stored list has no
+/// Anthropic model at all, one warning says that auto-burn has no API prices
+/// yet instead of one per model. With `read_sessions` false no rates are
+/// learned: every account plays as one without rates (spec §2.3).
 pub fn learn<Tz: TimeZone + Copy>(
     history: &HistoryDir,
     now: DateTime<Utc>,
     zone: Tz,
     accounts: &[Account],
     read_sessions: bool,
+    prices: &Prices,
 ) -> Result<Learned, HistoryError> {
+    /// The one sentence for a price list without an Anthropic model.
+    const NO_PRICES: &str = "auto-burn has no API prices yet: it measures work in API dollars and needs the price list (Settings → General → Look up prices)";
     let weeks = Range {
         from: now - Duration::weeks(RHYTHM_WEEKS),
         to: now,
@@ -73,47 +85,75 @@ pub fn learn<Tz: TimeZone + Copy>(
         from: now - Duration::days(RATES_DAYS),
         to: now,
     };
+    let all_time = Range {
+        from: DateTime::<Utc>::MIN_UTC,
+        to: now,
+    };
     // Auto-burn reads Claude's history only (step-d.md Task 4): a provider's
     // samples and events never make a rate, a hold or a switch cost.
     let samples = history.read_claude::<Sample>(&weeks, &Hosts::All)?;
     let tokens = history.read::<TokenRecord>(&weeks, &Hosts::All)?;
-    let events = history.read_claude::<Event>(&days, &Hosts::All)?;
+    let events = history.read_claude::<Event>(&all_time, &Hosts::All)?;
 
     let mut warnings = Vec::new();
     warnings.extend(samples.warnings);
     warnings.extend(tokens.warnings);
     warnings.extend(events.warnings);
 
-    let rhythm = rhythm(&tokens.records, now, &zone);
+    let rhythm = rhythm(&tokens.records, now, &zone, prices);
+    // The rhythm and the rates meet the same unpriced models; the union is
+    // what `learn` names once each, whether or not it read sessions.
+    let mut unpriced: BTreeSet<String> = unpriced_models(&tokens.records, prices);
     let learned_rates = if read_sessions {
         let rate_accounts: Vec<RateAccount> = accounts.iter().map(RateAccount::of).collect();
-        rates(
+        let learned = rates(
             &rate_accounts,
             &samples.records,
             &tokens.records,
             &events.records,
+            prices,
             now,
-        )
+        );
+        unpriced.extend(learned.unpriced.iter().cloned());
+        learned.rates
     } else {
         BTreeMap::new()
     };
+    if has_anthropic_prices(prices) {
+        warnings.extend(unpriced.iter().map(|model| unpriced_warning(model)));
+    } else {
+        warnings.push(NO_PRICES.to_string());
+    }
     let cost = switch_cost(
         &events.records,
         &samples.records,
         &tokens.records,
         &learned_rates,
+        prices,
         &days,
     );
+    let recent: Vec<Hosted<Event>> = events
+        .records
+        .into_iter()
+        .filter(|hosted| hosted.record.t >= days.from)
+        .collect();
 
     Ok(Learned {
         rhythm,
         rates: learned_rates,
         cost,
         warnings,
-        events: events.records,
+        events: recent,
         host: history.host().to_string(),
         sessions_off: !read_sessions,
     })
+}
+
+/// Whether the stored price list holds an Anthropic model at all: a list that
+/// was never looked up, or whose look-up is off, cannot price any Claude work.
+fn has_anthropic_prices(prices: &Prices) -> bool {
+    let prefix = format!("{}/", crate::money::Company::Anthropic.price_list());
+    prices.models.keys().any(|key| key.starts_with(&prefix))
 }
 
 /// The answers with thinking the running sessions hold, per account that
@@ -499,7 +539,7 @@ mod tests {
 
     fn learned(host: &str, events: Vec<Hosted<Event>>) -> Learned {
         Learned {
-            rhythm: Rhythm { wu: [0.0; 168] },
+            rhythm: Rhythm { usd: [0.0; 168] },
             rates: BTreeMap::new(),
             cost: None,
             warnings: Vec::new(),
@@ -865,8 +905,8 @@ mod tests {
                 session: "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d".to_string(),
                 cwd: "/home/sam/projects/seatswap".to_string(),
                 project: ProjectKey::Folder("seatswap".to_string()),
-                model: "claude-fable-5-2".to_string(),
-                input: 25_000_000,
+                model: "claude-opus-5-5".to_string(),
+                input: 30_000_000,
                 out: 0,
                 cw: 0,
                 cr: 0,
@@ -875,17 +915,141 @@ mod tests {
             }])
             .expect("the tokens");
 
-        let with_sessions = learn(&history, now, offset(), std::slice::from_ref(&ac), true)
-            .expect("the history reads");
+        // 30 million input tokens of claude-opus-5-5 are 120 USD of work.
+        let prices = crate::money::tests::priced_prices(now);
+        let with_sessions = learn(
+            &history,
+            now,
+            offset(),
+            std::slice::from_ref(&ac),
+            true,
+            &prices,
+        )
+        .expect("the history reads");
         assert!(
             with_sessions.rates.contains_key(&account_ref),
             "the readings are enough rates when sessions are read"
         );
-        let without_sessions = learn(&history, now, offset(), std::slice::from_ref(&ac), false)
-            .expect("the history reads");
+        let without_sessions = learn(
+            &history,
+            now,
+            offset(),
+            std::slice::from_ref(&ac),
+            false,
+            &prices,
+        )
+        .expect("the history reads");
         assert!(
             without_sessions.rates.is_empty(),
             "readSessions off learns no rates"
+        );
+    }
+
+    /// The rhythm leaves unpriced work out whether or not sessions are read,
+    /// so its model is named in both cases: the warning cannot depend on the
+    /// `rates` pass alone.
+    #[test]
+    fn an_unpriced_model_is_named_even_without_reading_sessions() {
+        let now = utc("2026-11-14T18:00:00Z");
+        let ac = account("ac", "AC", AC_ACC, true);
+        let tmp = tempfile::tempdir().expect("a temp folder");
+        let history = HistoryDir::at(tmp.path(), "atlas");
+        let recorder = Recorder::new(HistoryDir::at(history.root(), history.host()));
+        recorder
+            .tokens(&[TokenRecord {
+                t: utc("2026-11-14T10:00:00Z"),
+                minutes: 60,
+                session: "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d".to_string(),
+                cwd: "/home/sam/projects/seatswap".to_string(),
+                project: ProjectKey::Folder("seatswap".to_string()),
+                model: "claude-new-9".to_string(),
+                input: 30_000_000,
+                out: 0,
+                cw: 0,
+                cr: 0,
+                answers: 1,
+                agent_answers: 0,
+            }])
+            .expect("the tokens");
+        let prices = crate::money::tests::priced_prices(now);
+
+        let learned = learn(
+            &history,
+            now,
+            offset(),
+            std::slice::from_ref(&ac),
+            false,
+            &prices,
+        )
+        .expect("the history reads");
+        assert!(learned.rates.is_empty(), "no rates are learned");
+        assert_eq!(
+            learned.warnings,
+            vec![
+                "no price for claude-new-9: its work is left out of auto-burn's rates and rhythm"
+                    .to_string()
+            ]
+        );
+    }
+
+    /// A list that was never looked up has no Anthropic model at all: one
+    /// sentence says so, instead of one warning for each model met.
+    #[test]
+    fn a_learn_without_prices_says_so_once() {
+        let now = utc("2026-11-14T18:00:00Z");
+        let ac = account("ac", "AC", AC_ACC, true);
+        let tmp = tempfile::tempdir().expect("a temp folder");
+        let history = HistoryDir::at(tmp.path(), "atlas");
+        let recorder = Recorder::new(HistoryDir::at(history.root(), history.host()));
+        recorder
+            .tokens(&[TokenRecord {
+                t: utc("2026-11-14T10:00:00Z"),
+                minutes: 60,
+                session: "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d".to_string(),
+                cwd: "/home/sam/projects/seatswap".to_string(),
+                project: ProjectKey::Folder("seatswap".to_string()),
+                model: "claude-opus-5-5".to_string(),
+                input: 30_000_000,
+                out: 0,
+                cw: 0,
+                cr: 0,
+                answers: 1,
+                agent_answers: 0,
+            }])
+            .expect("the priced model's tokens");
+        recorder
+            .tokens(&[TokenRecord {
+                t: utc("2026-11-14T11:00:00Z"),
+                minutes: 60,
+                session: "b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e".to_string(),
+                cwd: "/home/sam/projects/seatswap".to_string(),
+                project: ProjectKey::Folder("seatswap".to_string()),
+                model: "claude-new-9".to_string(),
+                input: 30_000_000,
+                out: 0,
+                cw: 0,
+                cr: 0,
+                answers: 1,
+                agent_answers: 0,
+            }])
+            .expect("the unpriced model's tokens");
+
+        let learned = learn(
+            &history,
+            now,
+            offset(),
+            std::slice::from_ref(&ac),
+            true,
+            &Prices::default(),
+        )
+        .expect("the history reads");
+        assert_eq!(
+            learned.warnings,
+            vec![
+                "auto-burn has no API prices yet: it measures work in API dollars and needs the price list (Settings → General → Look up prices)"
+                    .to_string()
+            ],
+            "one sentence for the missing list, not one per model"
         );
     }
 
@@ -1146,16 +1310,10 @@ mod tests {
         let mut learned = learned("atlas", Vec::new());
         // Every hour has work, so PR at 99.5 % fills in the plan's first step
         // and the lazy plan moves to AC.
-        learned.rhythm = Rhythm { wu: [1.0; 168] };
+        learned.rhythm = Rhythm { usd: [1.0; 168] };
         learned.rates = BTreeMap::from([
-            (AccountRef::of(&pr), Rates { c: 2.0, s: None }),
-            (
-                AccountRef::of(&ac),
-                Rates {
-                    c: 4.0,
-                    s: Some(100.0),
-                },
-            ),
+            (AccountRef::of(&pr), Rates::given(2.0, None)),
+            (AccountRef::of(&ac), Rates::given(4.0, Some(100.0))),
         ]);
         let views = vec![
             view("pr", "PR", 99.5, None, now - Duration::minutes(1)),
@@ -1371,10 +1529,18 @@ mod tests {
             without.offset,
             &without.accounts,
             true,
+            &without.prices,
         )
         .expect("the history reads");
-        let after = learn(&with.history, with.now, with.offset, &with.accounts, true)
-            .expect("the history reads");
+        let after = learn(
+            &with.history,
+            with.now,
+            with.offset,
+            &with.accounts,
+            true,
+            &with.prices,
+        )
+        .expect("the history reads");
 
         assert_eq!(
             after.rhythm, before.rhythm,

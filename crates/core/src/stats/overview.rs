@@ -705,7 +705,8 @@ fn empty_week(week: DateTime<Utc>) -> OverviewWeek {
 
 /// The measured cost of one switch at the range's end (spec §2.13): the mean
 /// over the switches of the range, times `s` of the account in use at the end
-/// on this host. The rule is the Settings page's (`cost.wu × s`).
+/// on this host. The rule is the Settings page's (`cost.usd × s`, the 5 h
+/// factor's value).
 fn switch_cost_percent<Tz: TimeZone + Copy>(
     ctx: &Ctx<Tz>,
     range: &Range,
@@ -720,19 +721,22 @@ fn switch_cost_percent<Tz: TimeZone + Copy>(
         &samples.records,
         &tokens.records,
         &events.records,
+        ctx.prices,
         range.to,
-    );
+    )
+    .rates;
     let cost = switch_cost(
         &events.records,
         &samples.records,
         &tokens.records,
         &learned,
+        ctx.prices,
         range,
     )?;
     let timelines = rates::timelines(&events.records);
     let active = timelines.get(ctx.history.host())?.at(range.to)?;
-    let window = learned.get(active)?.s?;
-    Some(cost.wu * window)
+    let window = learned.get(active)?.s?.value;
+    Some(cost.usd * window)
 }
 
 /// The first finding: the account with the most expired money, if above zero;

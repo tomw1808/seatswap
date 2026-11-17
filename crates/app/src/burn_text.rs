@@ -209,13 +209,13 @@ pub fn policy_name(policy: Policy) -> &'static str {
     }
 }
 
-/// A work-unit figure as the duration it takes at `typical_wu` work units per
+/// A dollar figure as the duration it takes at `typical_usd` USD per
 /// typical working hour, in the one spelling of review item 42 (`2h 30min`). A
 /// typical hour of 0 means the hours are not known: they are said so, never
 /// divided by zero. A negative or non-finite figure is the callers' error and
 /// keeps the old one-decimal text, as before.
-fn hours(wu: f64, typical_wu: f64) -> String {
-    match seatswap_core::burn::wu_hours(wu, typical_wu) {
+fn hours(usd: f64, typical_usd: f64) -> String {
+    match seatswap_core::burn::usd_hours(usd, typical_usd) {
         Some(hours) if hours.is_finite() && hours >= 0.0 => {
             seatswap_core::duration::duration_text((hours * 3_600.0).round() as u64)
         }
@@ -231,8 +231,8 @@ pub fn replay_report(result: &ReplayResult, accounts: &[Account]) -> Result<Stri
     let mut lines = vec![format!(
         "{}: worked {}, blocked {}, {} switches",
         policy_name(result.policy),
-        hours(result.worked_wu, result.typical_wu),
-        hours(result.blocked_wu, result.typical_wu),
+        hours(result.worked_usd, result.typical_usd),
+        hours(result.blocked_usd, result.typical_usd),
         result.switches
     )];
     for (account, expired) in &result.expired {
@@ -544,7 +544,7 @@ mod tests {
                     to: now + Duration::hours(4),
                 },
             ],
-            blocked_wu: 0.0,
+            blocked_usd: 0.0,
             switches: 1,
             left_at_reset: BTreeMap::new(),
             // The lazy plan's shape: PR fills when its segment ends, so the
@@ -568,7 +568,7 @@ mod tests {
             week_resets_at: utc(reset),
             session: None,
             model_blocked: false,
-            rates: Some(Rates { c, s: None }),
+            rates: Some(Rates::given(c, None)),
             thinking_held: 0,
         }
     }
@@ -584,7 +584,7 @@ mod tests {
                 state("ac", 1.0, 10.0, "2026-11-18T12:00:00Z"),
             ],
             active: Some("pr".to_string()),
-            rhythm: Rhythm { wu: [1.0; 168] },
+            rhythm: Rhythm { usd: [1.0; 168] },
             last_switch_at: None,
             manual_hold_until: None,
         }
@@ -602,7 +602,7 @@ mod tests {
                 state("ac", 5.0, 0.0, "2026-11-11T12:00:00Z"),
             ],
             active: Some("pr".to_string()),
-            rhythm: Rhythm { wu: [1.0; 168] },
+            rhythm: Rhythm { usd: [1.0; 168] },
             last_switch_at: None,
             manual_hold_until: None,
         }

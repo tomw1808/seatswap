@@ -3490,7 +3490,7 @@ mod tests {
                 offset: chrono::FixedOffset::east_opt(0).expect("UTC"),
                 accounts: Vec::new(),
                 active: None,
-                rhythm: seatswap_core::burn::Rhythm { wu: [0.0; 168] },
+                rhythm: seatswap_core::burn::Rhythm { usd: [0.0; 168] },
                 last_switch_at: None,
                 manual_hold_until: None,
             },

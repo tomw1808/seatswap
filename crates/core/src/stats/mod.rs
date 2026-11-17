@@ -1224,7 +1224,12 @@ fn working_rhythm<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, range: &Range) -> Result<R
         ctx.history
             .read::<TokenRecord>(&Range { from, to: range.to }, &Hosts::All)
     })?;
-    Ok(rates::rhythm(&read.records, range.to, &ctx.zone))
+    Ok(rates::rhythm(
+        &read.records,
+        range.to,
+        &ctx.zone,
+        ctx.prices,
+    ))
 }
 
 /// The hours of `[from, to)` that fall in a working hour.
@@ -1238,7 +1243,7 @@ fn working_hours<Tz: TimeZone + Copy>(
     let mut cursor = from;
     while cursor < to {
         let next = (local_hour_start(cursor, zone) + Duration::hours(1)).min(to);
-        if rhythm.wu[local_hour_of_week(cursor, zone)] > 0.0 {
+        if rhythm.usd[local_hour_of_week(cursor, zone)] > 0.0 {
             hours += seconds_between(cursor, next) / 3600.0;
         }
         cursor = next;
@@ -2598,7 +2603,7 @@ pub(crate) mod tests {
             utc("2026-10-25T00:00:00Z")
         );
         let start = utc("2026-10-24T22:00:00Z");
-        let rhythm = crate::burn::Rhythm { wu: [1.0; 168] };
+        let rhythm = crate::burn::Rhythm { usd: [1.0; 168] };
         let hours = working_hours(
             start,
             next_local_day_start(start, &FallZone),

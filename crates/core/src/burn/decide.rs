@@ -9,15 +9,15 @@ use super::plan::{
     Inputs, PlanError, Policy,
 };
 use super::{
-    wu_hours, FRESH_MIN, GAIN_FACTOR, HORIZON_H, MIN_COST_SAMPLES, MIN_GAIN_H, SLACK_MARGIN_H,
+    usd_hours, FRESH_MIN, GAIN_FACTOR, HORIZON_H, MIN_COST_SAMPLES, MIN_GAIN_H, SLACK_MARGIN_H,
     STEP_MIN,
 };
 
-/// The measured cost of one switch (spec §2.13): the extra work units and the
+/// The measured cost of one switch (spec §2.13): the extra API dollars of work and the
 /// number of switches the mean came from.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SwitchCost {
-    pub wu: f64,
+    pub usd: f64,
     pub samples: u32,
 }
 
@@ -132,10 +132,10 @@ pub fn regime(situation: &Situation) -> Regime {
     let typical = inputs.rhythm.typical_hour();
     let lazy = follow(inputs, Policy::Lazy);
     let eager = follow(inputs, Policy::Eager);
-    let lazy_blocked_h = wu_hours(lazy.blocked_wu, typical).unwrap_or(0.0);
-    let eager_blocked_h = wu_hours(eager.blocked_wu, typical).unwrap_or(0.0);
+    let lazy_blocked_h = usd_hours(lazy.blocked_usd, typical).unwrap_or(0.0);
+    let eager_blocked_h = usd_hours(eager.blocked_usd, typical).unwrap_or(0.0);
     let extra_switches = eager.switches.saturating_sub(lazy.switches);
-    let cost_h = situation.cost.and_then(|cost| wu_hours(cost.wu, typical));
+    let cost_h = situation.cost.and_then(|cost| usd_hours(cost.usd, typical));
     let learning = typical == 0.0
         || inputs
             .accounts
@@ -295,14 +295,14 @@ fn next_free(inputs: &Inputs) -> Option<(String, DateTime<Utc>)> {
 }
 
 /// The end of the first [`STEP_MIN`] step at which the rhythm's work summed from
-/// [`Inputs::now`] reaches `target_wu`; the horizon's end when it never does
+/// [`Inputs::now`] reaches `target_usd`; the horizon's end when it never does
 /// (the decision is taken again at every reading).
-fn latest_reaching(inputs: &Inputs, target_wu: f64) -> DateTime<Utc> {
+fn latest_reaching(inputs: &Inputs, target_usd: f64) -> DateTime<Utc> {
     let step = Duration::minutes(STEP_MIN);
     let mut sum = 0.0;
     for (at, work) in rhythm_walk(inputs).steps_from(inputs.now) {
         sum += work;
-        if sum >= target_wu {
+        if sum >= target_usd {
             return at + step;
         }
     }
@@ -320,7 +320,7 @@ mod tests {
         Situation {
             inputs,
             cost: Some(SwitchCost {
-                wu: 0.05,
+                usd: 0.05,
                 samples: 3,
             }),
             tied_busy: 0,
@@ -486,7 +486,7 @@ mod tests {
         assert_eq!(decide(&situation, &state), Decision::Stay);
 
         situation.cost = Some(SwitchCost {
-            wu: 0.05,
+            usd: 0.05,
             samples: 2,
         });
         let state = regime(&situation);
@@ -512,17 +512,11 @@ mod tests {
     #[test]
     fn large_windows_make_it_not_worth_it() {
         let mut inputs = inputs();
-        inputs.accounts[1].rates = Some(Rates {
-            c: 4.0,
-            s: Some(25.0),
-        });
-        inputs.accounts[2].rates = Some(Rates {
-            c: 4.0,
-            s: Some(20.0),
-        });
+        inputs.accounts[1].rates = Some(Rates::given(4.0, Some(25.0)));
+        inputs.accounts[2].rates = Some(Rates::given(4.0, Some(20.0)));
         let mut situation = situation(inputs);
         situation.cost = Some(SwitchCost {
-            wu: 2.0,
+            usd: 2.0,
             samples: 3,
         });
         let state = regime(&situation);
@@ -569,16 +563,13 @@ mod tests {
     #[test]
     fn a_tied_busy_session_makes_it_wait() {
         let mut inputs = inputs();
-        // AC at 48 % still needs 52 / 4 = 13 wu. Its 19 windows before its reset
-        // take 19 wu, so its slack is 19 - 13 = 6.0 wu: six working hours at the
-        // test rhythm's 1.0 wu per working hour. LB's c of 10 lowers what its
-        // week still needs to 100 / 10 = 10 wu, so its slack is 23.75 - 10 =
-        // 13.75 wu and AC (6.0) stays the account choose() names.
+        // AC at 48 % still needs 52 / 4 = 13 USD. Its 19 windows before its reset
+        // take 19 USD, so its slack is 19 - 13 = 6.0 USD: six working hours at the
+        // test rhythm's 1.0 USD per working hour. LB's c of 10 lowers what its
+        // week still needs to 100 / 10 = 10 USD, so its slack is 23.75 - 10 =
+        // 13.75 USD and AC (6.0) stays the account choose() names.
         inputs.accounts[1].week_percent = 48.0;
-        inputs.accounts[2].rates = Some(Rates {
-            c: 10.0,
-            s: Some(80.0),
-        });
+        inputs.accounts[2].rates = Some(Rates::given(10.0, Some(80.0)));
         let ac_slack = slack(&inputs.accounts[1], &inputs).expect("AC has rates");
         assert!((ac_slack - 6.0).abs() < EPS, "{ac_slack}");
         assert_eq!(choose(&inputs, now()), Some("AC".to_string()));
@@ -600,7 +591,7 @@ mod tests {
 
     #[test]
     fn waiting_ends_when_the_target_has_no_slack_left() {
-        // The test setup's AC has slack -6.0 (19 windows take 19 wu, emptying it
+        // The test setup's AC has slack -6.0 (19 windows take 19 USD, emptying it
         // needs 25), which is all this case needs: a slack at or below 0.
         let mut situation = situation(inputs());
         situation.tied_busy = 1;
@@ -639,14 +630,11 @@ mod tests {
         let mut inputs = inputs();
         inputs.active = Some("AC".to_string());
         inputs.accounts[1].may_use = false;
-        // AC's c of 100 means its remaining 100 % needs only 1 wu; its 19 windows
-        // take 19 wu, so its slack is 18.0 wu and LB (-1.25) lies more than the
-        // 2 wu margin below it. The regime is stated directly: this case is
+        // AC's c of 100 means its remaining 100 % needs only 1 USD; its 19 windows
+        // take 19 USD, so its slack is 18.0 USD and LB (-1.25) lies more than the
+        // 2 USD margin below it. The regime is stated directly: this case is
         // about decide, not about whether the eager plan pays.
-        inputs.accounts[1].rates = Some(Rates {
-            c: 100.0,
-            s: Some(100.0),
-        });
+        inputs.accounts[1].rates = Some(Rates::given(100.0, Some(100.0)));
         let fresh = situation(inputs);
         let early = Regime {
             early: true,
@@ -695,7 +683,7 @@ mod tests {
             inputs.accounts[2].session.is_some(),
             "the account is capped"
         );
-        inputs.accounts[2].rates = Some(Rates { c: 4.0, s: None });
+        inputs.accounts[2].rates = Some(Rates::given(4.0, None));
         assert_ne!(regime(&situation(inputs)).why, RegimeWhy::Learning);
         // Without any `c` it is still learning.
         let mut inputs = super::super::plan::testkit::inputs();
@@ -745,14 +733,14 @@ mod tests {
     #[test]
     fn a_target_whose_slack_is_within_the_margin_is_not_switched_to() {
         let mut inputs = inputs();
-        // LB is full. PR's slack is 43 wu (92 work units before its reset minus
+        // LB is full. PR's slack is 43 USD (92 USD before its reset minus
         // 49 needed); AC is played uncapped with c = 2 and the next Monday's
-        // reset, so its slack is 92 - 50 = 42 wu. That is one work unit below
+        // reset, so its slack is 92 - 50 = 42 USD. That is one USD below
         // PR and inside the 2-hour margin, so there is no early switch.
         inputs.accounts[2].week_percent = 100.0;
         inputs.accounts[0].week_percent = 2.0;
         inputs.accounts[1].session = None;
-        inputs.accounts[1].rates = Some(Rates { c: 2.0, s: None });
+        inputs.accounts[1].rates = Some(Rates::given(2.0, None));
         let pr_slack = slack(&inputs.accounts[0], &inputs).expect("PR has rates");
         let ac_slack = slack(&inputs.accounts[1], &inputs).expect("AC has rates");
         assert!((pr_slack - 43.0).abs() < EPS, "{pr_slack}");
@@ -767,12 +755,12 @@ mod tests {
     fn an_uncapped_target_switches_for_its_reset_near() {
         let mut inputs = inputs();
         inputs.active = Some("AC".to_string());
-        // LB is full. AC's slack is 19 - (100 - 84) / 4 = 15 wu; PR's is
-        // 92 - (100 - 13) / 1 = 5 wu, so choose() names the uncapped PR.
+        // LB is full. AC's slack is 19 - (100 - 84) / 4 = 15 USD; PR's is
+        // 92 - (100 - 13) / 1 = 5 USD, so choose() names the uncapped PR.
         inputs.accounts[2].week_percent = 100.0;
         inputs.accounts[1].week_percent = 84.0;
         inputs.accounts[0].week_percent = 13.0;
-        inputs.accounts[0].rates = Some(Rates { c: 1.0, s: None });
+        inputs.accounts[0].rates = Some(Rates::given(1.0, None));
         assert_eq!(choose(&inputs, now()), Some("PR".to_string()));
         let situation = situation(inputs);
         assert_eq!(
