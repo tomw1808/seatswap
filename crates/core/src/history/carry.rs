@@ -588,9 +588,12 @@ mod tests {
             .collect();
         assert_eq!(folder_files(&f.new.join("atlas")), copied);
         assert_eq!(remembered(&f.app), Some(f.new.clone()));
+        // Parsed, so a Windows path's escaped backslashes compare as the path.
+        let file: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(f.app.history_root_file()).unwrap()).unwrap();
         assert_eq!(
-            fs::read_to_string(f.app.history_root_file()).unwrap(),
-            format!("{{\"historyRoot\":\"{}\"}}", f.new.display())
+            file,
+            serde_json::json!({ "historyRoot": f.new.to_str().unwrap() })
         );
         assert!(!bring_along_due(&f.app, &f.settings).unwrap());
         // The folder opens, and the window reads the old records there.
