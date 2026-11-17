@@ -144,3 +144,65 @@ Write `<Dropbox>\seatswap-handover\windows-report-1.2.md` (create the folder; ne
 
 No code changes and no git commits on Windows. A bug found here goes into the report; it is fixed
 on Linux.
+
+---
+
+# Round 2 (2026-11-17, after the first report)
+
+The first report (`<Dropbox>\seatswap-handover\windows-report-1.2.md`) found three faults. They are
+fixed in release 1.2.0 (tag `v1.2.0`), but the window and the menu could not be checked on Linux:
+
+- **B1, white large window:** the window is now built on a thread of its own, not inside the tray
+  menu's handler or a synchronous command (`gui/window.rs` `show`).
+- **B2, right-click menu closing after about 1 s:** the menu is replaced only when its items change;
+  a changed text is set on the open menu's item (`gui/tray.rs` `apply_menu`).
+- **B3, flaky test:** an accepted test connection blocks again (`gui/lookup_rt.rs` `read_request`).
+- **Q1, worker copies:** `copy_source` now knows every flash-agents layout (`<key>\<pid>\<instance>\slots\slot-<n>`
+  included) and both cases of the drive letter.
+- **History:** changing the history folder now brings this host's history along at the next start
+  (spec §5 "A new history folder"); no manual copy is needed. Without `history-root.json` the previous
+  folder is `%APPDATA%\seatswap\history`.
+
+Section 1's allowances P1–P7 still apply, plus: **P8** read `%APPDATA%\seatswap\history-root.json`;
+list file names and sizes below `<Dropbox>\seatswap\andreas-pl` and `%APPDATA%\seatswap\history\andreas-pl`.
+P6 (copying history by hand) is no longer needed and no longer allowed.
+
+### R1 (S): code and checks
+`git pull` on `main`; `git log -1` shows `v1.2.0` (`git describe --tags`) or later. Run the six commands
+of `docs/windows.md` section 9, the test command with `--no-fail-fast`. Report pass/fail and the counts.
+
+### R2 (S, then A): install
+1. S: `cargo build --offline --release -p seatswap`; `--version` prints `seatswap 1.2.0`.
+2. A: quit the tray app from its menu. S checks that no `seatswap` / `seatswap-tray` process runs.
+3. S: in `%USERPROFILE%\.local\bin` rename the current `seatswap.exe` / `seatswap-tray.exe` to
+   `seatswap-1.2.0-rc.exe` / `seatswap-tray-1.2.0-rc.exe`, then copy the two new programs there.
+4. A: start `seatswap-tray.exe` from the Start menu.
+
+### R3 (A): the window and the menu
+1. Tray menu → *Sessions…*: the large window opens with content, not white. Then *Statistics…* and
+   *Settings…* while it is open: it switches area. Close it and open it again.
+2. The pop-up's *Statistics ↗* link opens it too.
+3. With a Claude Code session working, open the right-click menu and leave it open for 20 s: it stays
+   open, and a percentage in it may change while it is open.
+
+### R4 (A, then S): history into Dropbox
+1. A: Settings → History and hosts → *Use* on the suggested `C:\Users\…\Dropbox\seatswap`; quit the
+   tray app; start it again.
+2. S (P8): `history-root.json` names the Dropbox folder; `<Dropbox>\seatswap\andreas-pl` exists and holds
+   at least the files of `%APPDATA%\seatswap\history\andreas-pl` (names, and sizes at least as large).
+   Report both listings. A notification about the history (a warning or an error) goes into the report
+   word for word.
+
+### R5 (A): checks by eye
+Items 1–10 of step 6 of the first round, now that the window works. For item 9 (sharing) the Linux
+machine runs 1.2.0 with its history in the same Dropbox folder.
+
+### R6 (S): flash worker copies
+Only if flash-agents runs here: start one small flash task from a Claude Code session in
+`c:\projects\seatswap`. While it runs, and after it finished, the Sessions area shows it under the
+project **seatswap**, not under a temp folder. Report the folder name it created below
+`%TEMP%\flash-mcp` (the 12-hex key) and which spelling of the project path it matches.
+
+### R7 (S): the report
+Write `<Dropbox>\seatswap-handover\windows-report-1.2-round2.md` with R1–R6, in the shape of the first
+report. No code changes and no git commits on Windows.
