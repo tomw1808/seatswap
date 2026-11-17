@@ -13,6 +13,7 @@ use crate::history::{
 use crate::transcripts::hour_start;
 
 use super::plan::{play, AccountState, Inputs, PlanError, Policy, SessionState, Walk, Work};
+use super::rates::hour_shares;
 use super::{mean_over_hours, work_units, Rates, Rhythm};
 
 /// What one policy did with the recorded work of a range.
@@ -201,13 +202,17 @@ fn first_samples<'a>(
     firsts.into_iter().collect()
 }
 
-/// The work recorded in each UTC hour, all hosts together.
+/// The work recorded in each UTC hour, all hosts together. A line's work is
+/// spread over the hours its [`TokenRecord::span`] covers by [`hour_shares`], so
+/// a 5-minute line lands wholly in its hour and an hourly line counts as before.
 fn recorded_hours(tokens: &[Hosted<TokenRecord>]) -> BTreeMap<DateTime<Utc>, f64> {
     let mut hours: BTreeMap<DateTime<Utc>, f64> = BTreeMap::new();
     for hosted in tokens {
         let record = &hosted.record;
         let units = work_units(record.input, record.out, record.cw, record.cr);
-        *hours.entry(hour_start(record.t)).or_insert(0.0) += units;
+        for (hour, share) in hour_shares(record, hour_start) {
+            *hours.entry(hour).or_insert(0.0) += units * share;
+        }
     }
     hours
 }
@@ -310,6 +315,7 @@ mod tests {
             if work > 0.0 {
                 records.push(TokenRecord {
                     t: at,
+                    minutes: 60,
                     session: "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34".to_string(),
                     cwd: "/home/sam/projects/atlas".to_string(),
                     project: ProjectKey::Repo("github.com/sam/atlas".to_string()),

@@ -459,6 +459,15 @@ impl Record for Event {
 #[serde(rename_all = "camelCase")]
 pub struct TokenRecord {
     pub t: DateTime<Utc>,
+    /// How long the line lasts, in minutes: 5 for a line written since 1.3, 60
+    /// for the hour every older version wrote. A line without `min` is an hour.
+    #[serde(
+        rename = "min",
+        default = "sixty",
+        deserialize_with = "deserialize_minutes",
+        skip_serializing_if = "is_sixty"
+    )]
+    pub minutes: u32,
     pub session: String,
     pub cwd: String,
     pub project: ProjectKey,
@@ -470,6 +479,14 @@ pub struct TokenRecord {
     pub cr: u64,
     pub answers: u32,
     pub agent_answers: u32,
+}
+
+impl TokenRecord {
+    /// How long this line lasts: its `min` minutes. The one place a token line's
+    /// length is read.
+    pub fn span(&self) -> chrono::Duration {
+        chrono::Duration::minutes(i64::from(self.minutes))
+    }
 }
 
 impl Record for TokenRecord {
@@ -878,6 +895,31 @@ pub fn is_early_reset(
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+/// The length of a line written before 1.3: one hour.
+fn sixty() -> u32 {
+    60
+}
+
+fn is_sixty(minutes: &u32) -> bool {
+    *minutes == sixty()
+}
+
+/// Read a line's `min`: a positive number of minutes that divides one hour. A
+/// value that cannot be a length is an error with the value in its text, never
+/// a silent clamp.
+fn deserialize_minutes<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let minutes = u32::deserialize(deserializer)?;
+    if minutes == 0 || 60 % minutes != 0 {
+        return Err(serde::de::Error::custom(format!(
+            "a token line's min must be a positive number of minutes that divides 60, not {minutes}"
+        )));
+    }
+    Ok(minutes)
 }
 
 /// One record as its JSON line, with the checks every history write makes.
@@ -1834,6 +1876,7 @@ mod tests {
     ) -> TokenRecord {
         TokenRecord {
             t,
+            minutes: 60,
             session: "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34".to_string(),
             cwd: "/home/sam/projects/atlas".to_string(),
             project,
@@ -1845,6 +1888,44 @@ mod tests {
             answers: 1,
             agent_answers: 0,
         }
+    }
+
+    #[test]
+    fn a_line_without_min_is_an_hour() {
+        let line = serde_json::to_value(a_token(
+            utc("2026-11-11T11:00:00Z"),
+            atlas_project(),
+            "claude-opus-5-5",
+            1_204,
+            3_877,
+        ))
+        .unwrap();
+        assert!(line.get("min").is_none(), "{line}");
+        let hourly: TokenRecord = serde_json::from_value(line.clone()).unwrap();
+        assert_eq!(hourly.span(), chrono::Duration::minutes(60));
+
+        let mut five_minutes = line;
+        five_minutes["min"] = Value::from(5);
+        let five: TokenRecord = serde_json::from_value(five_minutes).unwrap();
+        assert_eq!(five.span(), chrono::Duration::minutes(5));
+    }
+
+    #[test]
+    fn a_line_with_min_0_is_an_error() {
+        let mut line = serde_json::to_value(a_token(
+            utc("2026-11-11T11:00:00Z"),
+            atlas_project(),
+            "claude-opus-5-5",
+            1_204,
+            3_877,
+        ))
+        .unwrap();
+        line["min"] = Value::from(0);
+        let error = serde_json::from_value::<TokenRecord>(line)
+            .expect_err("a line of no minutes cannot last")
+            .to_string();
+        assert!(error.contains("min"), "{error}");
+        assert!(error.contains('0'), "{error}");
     }
 
     /// A host folder a reader recognizes: a `host.json` marker and no records.

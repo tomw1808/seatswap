@@ -1116,6 +1116,7 @@ mod tests {
     fn record(at: &str, out: u64) -> TokenRecord {
         TokenRecord {
             t: utc(at),
+            minutes: 60,
             session: "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34".to_string(),
             cwd: "/home/sam/projects/atlas/engine".to_string(),
             project: crate::project::ProjectKey::Repo("github.com/sam/atlas".to_string()),

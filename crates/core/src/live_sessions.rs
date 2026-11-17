@@ -625,8 +625,16 @@ pub fn running(
             let values = match pricing {
                 Pricing::Known { valuer, .. } => match (model.as_deref(), last) {
                     (Some(model), Some(last)) => {
-                        let record =
-                            token_record(&file.session_id, &file.cwd, &key, model, last, tokens);
+                        // A row value, never written: the span keeps today's 60 minutes.
+                        let record = token_record(
+                            &file.session_id,
+                            &file.cwd,
+                            &key,
+                            model,
+                            last,
+                            60,
+                            tokens,
+                        );
                         pricing.of(&[valuer.value(host, &record)])
                     }
                     _ => pricing.missing(NO_AGENT_MODEL),
@@ -698,8 +706,16 @@ pub fn running(
                 let valued: Vec<Valued> = last_hour_by_model
                     .iter()
                     .map(|(model, (at, tokens))| {
-                        let record =
-                            token_record(&file.session_id, &file.cwd, &key, model, *at, *tokens);
+                        // The last 60 minutes, never written: a 60-minute span.
+                        let record = token_record(
+                            &file.session_id,
+                            &file.cwd,
+                            &key,
+                            model,
+                            *at,
+                            60,
+                            *tokens,
+                        );
                         valuer.value(host, &record)
                     })
                     .collect();
@@ -1237,7 +1253,8 @@ fn harness_values_at(
     let Some(model) = session.model.as_deref() else {
         return pricing.missing(NO_AGENT_MODEL);
     };
-    let record = token_record(&session.id, cwd, project, model, at, tokens);
+    // A Harness row value, never written: the span keeps today's 60 minutes.
+    let record = token_record(&session.id, cwd, project, model, at, 60, tokens);
     match pricing {
         Pricing::Known { valuer, .. } => pricing.of(&[valuer.value(host, &record)]),
         Pricing::Unknown { .. } => pricing.of(&[]),
@@ -1271,8 +1288,8 @@ fn harness_last_hour(
 
 /// One token line for what a Harness session gained since `recorded`, or a
 /// warning when its totals went down or its model or folder is not known. The
-/// growth is split by the hour and model of each new assistant message, exactly
-/// as S-1's `token_records` groups its answers.
+/// growth is split by the 5-minute bucket and model of each new assistant
+/// message, exactly as S-1's `token_records` groups its answers.
 #[allow(clippy::too_many_arguments)]
 fn harness_token_line(
     session: &HarnessSession,
@@ -1328,7 +1345,7 @@ fn harness_token_line(
             return;
         };
         let group = groups
-            .entry((transcripts::hour_start(message.at), model))
+            .entry((transcripts::bucket_start(message.at), model))
             .or_default();
         if let Some(usage) = message.usage {
             group.0 += usage;
@@ -1342,8 +1359,16 @@ fn harness_token_line(
         ));
         return;
     }
-    for ((hour, model), (tokens, answers)) in groups {
-        let mut record = token_record(history_session, cwd, project, &model, hour, tokens);
+    for ((bucket, model), (tokens, answers)) in groups {
+        let mut record = token_record(
+            history_session,
+            cwd,
+            project,
+            &model,
+            bucket,
+            transcripts::TOKEN_BUCKET_MINUTES as u32,
+            tokens,
+        );
         record.agent_answers = answers;
         lines.push(record);
     }
@@ -1509,7 +1534,8 @@ fn codex_tokens_values(
     let Some(model) = session.model.as_deref() else {
         return pricing.missing(NO_AGENT_MODEL);
     };
-    let record = token_record(&session.id, cwd, project, model, session.last, tokens);
+    // A Codex row value, never written: the span keeps today's 60 minutes.
+    let record = token_record(&session.id, cwd, project, model, session.last, 60, tokens);
     match pricing {
         Pricing::Known { valuer, .. } => pricing.of(&[valuer.value(host, &record)]),
         Pricing::Unknown { .. } => pricing.of(&[]),
@@ -1519,13 +1545,13 @@ fn codex_tokens_values(
 /// The sessions of every host that closed in `[since, now)` (spec §3.8). A row
 /// is a session whose last `SessionRecord` has `closed: true` and whose `last`
 /// is in the range; its tokens are the sum of every `TokenRecord` of the
-/// session from the hour start of the earliest `first` of the rows (a record's
-/// `t` is the start of its hour), because one hour and model can have several
-/// lines; they are valued through [`of_records`], the running row's way. Its
-/// last hour sums the records whose hour `[t, t + 1 h)` overlaps
-/// `[now - 60 min, now)`: the history's records are hourly, so a record from
-/// the hour before the window still counts; those overlapping records are also
-/// its `last_hour_values`, each valued like `values`. Its agents list is empty,
+/// session from the hour start of the earliest `first` of the rows, because one
+/// bucket and model can have several lines; they are valued through
+/// [`of_records`], the running row's way. Its last hour sums the records whose
+/// span `[t, t + span)` overlaps `[now - 60 min, now)`: a 5-minute line lands
+/// wholly in its bucket, and an hourly record from the hour before the window
+/// still counts; those overlapping records are also its `last_hour_values`,
+/// each valued like `values`. Its agents list is empty,
 /// so its `agents_done_values` is the sum of an empty list; the counts come from
 /// the record. `label` is `<project>-<first 2 characters of
 /// the session id>`.
@@ -1578,13 +1604,14 @@ pub fn closed(
             .map(Vec::as_slice)
             .unwrap_or(&[]);
         let (tokens, values) = of_records(of_session.iter().copied(), &hosted.host, pricing);
-        // The history is hourly: a record whose hour overlaps the window
-        // counts, even when its start is before the window.
+        // A line whose span overlaps the window counts, even when its start is
+        // before the window.
         let hour_ago = now - Duration::minutes(60);
         let (last_hour, last_hour_values) = of_records(
-            of_session.iter().copied().filter(|token| {
-                token.t < now && transcripts::hour_start(token.t) + Duration::hours(1) > hour_ago
-            }),
+            of_session
+                .iter()
+                .copied()
+                .filter(|token| token.t < now && token.t + token.span() > hour_ago),
             &hosted.host,
             pricing,
         );
@@ -1805,17 +1832,21 @@ pub(crate) fn most_output<K: Ord + Clone>(by: &BTreeMap<K, u64>) -> Option<K> {
 }
 
 /// One token record for the live view: a model's or an agent's sum dated at its
-/// last answer. Only the fields the valuer reads are filled.
+/// last answer. Only the fields the valuer reads are filled. `minutes` is how
+/// long the line lasts; only a written line's span is read, so a record built
+/// only to value a row keeps today's 60 minutes.
 fn token_record(
     session: &str,
     cwd: &str,
     project: &ProjectKey,
     model: &str,
     at: DateTime<Utc>,
+    minutes: u32,
     tokens: Tokens,
 ) -> TokenRecord {
     TokenRecord {
         t: at,
+        minutes,
         session: session.to_string(),
         cwd: cwd.to_string(),
         project: project.clone(),
@@ -1954,6 +1985,7 @@ mod tests {
     fn token(session: &str, at: DateTime<Utc>, model: &str, input: u64, out: u64) -> TokenRecord {
         TokenRecord {
             t: at,
+            minutes: 60,
             session: session.to_string(),
             cwd: ATLAS_CWD.to_string(),
             project: project_key(),
@@ -1964,6 +1996,20 @@ mod tests {
             cr: 0,
             answers: 1,
             agent_answers: 0,
+        }
+    }
+
+    /// A token line of one 5-minute bucket.
+    fn five_minute_token(
+        session: &str,
+        at: DateTime<Utc>,
+        model: &str,
+        input: u64,
+        out: u64,
+    ) -> TokenRecord {
+        TokenRecord {
+            minutes: transcripts::TOKEN_BUCKET_MINUTES as u32,
+            ..token(session, at, model, input, out)
         }
     }
 
@@ -3041,6 +3087,57 @@ mod tests {
     }
 
     #[test]
+    fn closed_rows_last_hour_counts_five_minute_lines_inside_the_hour() {
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        history
+            .append(&session_record(
+                SESSION_11,
+                utc("2026-11-14T10:16:00Z"),
+                utc("2026-11-14T09:40:00Z"),
+                utc("2026-11-14T10:15:00Z"),
+                true,
+                0,
+            ))
+            .expect("a session record");
+        // One line before the window, whose 5 minutes end at 09:15, and two
+        // inside it.
+        for (at, out) in [
+            ("2026-11-14T09:10:00Z", 4_000_000),
+            ("2026-11-14T09:55:00Z", 1_000_000),
+            ("2026-11-14T10:05:00Z", 2_000_000),
+        ] {
+            history
+                .append(&five_minute_token(
+                    SESSION_11,
+                    utc(at),
+                    "claude-opus-5-5",
+                    0,
+                    out,
+                ))
+                .expect("a token record");
+        }
+        let settings = settings_eur();
+        let valuer = valuer(&history, &settings, &[]);
+        let rows = closed(
+            &history,
+            utc("2026-11-14T09:00:00Z"),
+            utc("2026-11-14T10:20:00Z"),
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
+        )
+        .expect("rows");
+
+        assert_eq!(rows.sessions.len(), 1);
+        assert_eq!(
+            rows.sessions[0].last_hour.expect("a known hour").out,
+            3_000_000,
+            "the lines of 09:55 and 10:05 overlap [09:20, 10:20), not the one at 09:10"
+        );
+        assert_eq!(rows.sessions[0].tokens.out, 7_000_000);
+    }
+
+    #[test]
     fn a_session_closed_before_since_is_left_out() {
         let dir = tempdir().expect("tempdir");
         let history = HistoryDir::at(dir.path(), "atlas");
@@ -3329,6 +3426,7 @@ mod tests {
         history.append(&window).expect("a finished window");
         let claude = TokenRecord {
             t: utc("2026-11-14T18:00:00Z"),
+            minutes: 60,
             session: SESSION.to_string(),
             cwd: ATLAS_CWD.to_string(),
             project: project_key(),
@@ -5773,13 +5871,13 @@ mod tests {
             &|_| project_key(),
         );
 
-        let hour_of = |ms: i64| {
-            transcripts::hour_start(Utc.timestamp_millis_opt(ms).single().expect("a time"))
+        let bucket_of = |ms: i64| {
+            transcripts::bucket_start(Utc.timestamp_millis_opt(ms).single().expect("a time"))
         };
         assert_eq!(
             out.tokens.len(),
             2,
-            "one line per hour of the new answers: {:?}",
+            "one line per bucket of the new answers: {:?}",
             out.tokens
         );
         let mut lines: Vec<(DateTime<Utc>, u64, u64, u32)> = out
@@ -5790,7 +5888,17 @@ mod tests {
         lines.sort();
         assert_eq!(
             lines,
-            vec![(hour_of(first), 100, 50, 1), (hour_of(second), 200, 70, 1),]
+            vec![
+                (bucket_of(first), 100, 50, 1),
+                (bucket_of(second), 200, 70, 1),
+            ]
+        );
+        assert!(
+            out.tokens
+                .iter()
+                .all(|record| record.minutes == transcripts::TOKEN_BUCKET_MINUTES as u32),
+            "{:?}",
+            out.tokens
         );
         assert_eq!(
             out.tokens.iter().map(|record| record.input).sum::<u64>(),
@@ -5800,6 +5908,61 @@ mod tests {
         assert_eq!(
             out.tokens.iter().map(|record| record.out).sum::<u64>(),
             session.tokens.out
+        );
+    }
+
+    #[test]
+    fn harness_lines_use_five_minute_buckets() {
+        let (_dir, paths) = harness_store();
+        let first = 1_794_696_000_000_i64;
+        write_harness_answers(
+            &paths,
+            JOB_A,
+            &[
+                (first, Some((100, 50))),
+                (first + 60_000, Some((200, 70))),
+                (first + 360_000, Some((300, 90))),
+            ],
+        );
+        let harness = crate::harness::sessions(&paths, utc("2026-11-01T00:00:00Z"));
+
+        let out = harness_rows(
+            &harness.sessions,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &crate::harness::JobReports::default(),
+            None,
+            &unknown_pricing(),
+            "atlas",
+            utc("2026-11-14T19:00:00Z"),
+            &|_| project_key(),
+        );
+
+        let bucket_of = |ms: i64| {
+            transcripts::bucket_start(Utc.timestamp_millis_opt(ms).single().expect("a time"))
+        };
+        let mut lines: Vec<(DateTime<Utc>, u64, u64, u32)> = out
+            .tokens
+            .iter()
+            .map(|record| (record.t, record.input, record.out, record.agent_answers))
+            .collect();
+        lines.sort();
+        assert_eq!(
+            lines,
+            vec![
+                (bucket_of(first), 300, 120, 2),
+                (bucket_of(first + 360_000), 300, 90, 1),
+            ],
+            "the two answers of the first bucket share one line"
+        );
+        assert!(
+            out.tokens
+                .iter()
+                .all(|record| record.minutes == transcripts::TOKEN_BUCKET_MINUTES as u32),
+            "{:?}",
+            out.tokens
         );
     }
 
@@ -5864,13 +6027,13 @@ mod tests {
         assert_eq!(first.tokens[0].input, 200);
         assert_eq!(
             first.tokens[0].t,
-            transcripts::hour_start(session.last_message),
-            "the line is dated at the hour of the last answer S-1 uses"
+            transcripts::bucket_start(session.last_message),
+            "the line is dated at the bucket of the last answer S-1 uses"
         );
         assert_ne!(
             first.tokens[0].t,
-            transcripts::hour_start(session.last),
-            "the last event (turn/end) is not the answer's hour"
+            transcripts::bucket_start(session.last),
+            "the last event (turn/end) is not the answer's bucket"
         );
 
         write_harness_messages(&paths, JOB_A, None, 0, 3, true, 1_794_696_005_000);

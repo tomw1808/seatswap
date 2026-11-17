@@ -1059,6 +1059,7 @@ mod tests {
         history
             .append(&TokenRecord {
                 t: utc("2026-11-03T10:00:00Z"),
+                minutes: 60,
                 session: "s0".to_string(),
                 cwd: "/home/sam/projects/atlas/engine".to_string(),
                 project: crate::project::ProjectKey::Repo("github.com/sam/atlas".to_string()),
@@ -1441,6 +1442,7 @@ mod tests {
         let token =
             |t: &str, project: &crate::project::ProjectKey, model: &str, out: u64| TokenRecord {
                 t: utc(t),
+                minutes: 60,
                 session: "4a1f9c2e-6b3d-4e8a-9f7c-1d2e3b4a5c6d".to_string(),
                 cwd: "/home/sam/projects/atlas/engine".to_string(),
                 project: project.clone(),
@@ -1572,6 +1574,7 @@ mod tests {
     ) -> TokenRecord {
         TokenRecord {
             t: utc(t),
+            minutes: 60,
             session: "019a7c3e-4b2a-7d3f-9e6a-b8c52f0a1d7e".to_string(),
             cwd: "/home/sam/projects/atlas".to_string(),
             project: project.clone(),

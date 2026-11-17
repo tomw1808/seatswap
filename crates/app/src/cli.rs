@@ -2428,6 +2428,7 @@ pub(crate) mod tests {
             self.history()
                 .append(&TokenRecord {
                     t: at,
+                    minutes: 60,
                     session: "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34".to_string(),
                     cwd: "/home/sam/projects/atlas".to_string(),
                     project: ProjectKey::Repo("github.com/sam/atlas".to_string()),
@@ -3122,6 +3123,7 @@ pub(crate) mod tests {
     fn a_token(t: DateTime<Utc>, input: u64) -> TokenRecord {
         TokenRecord {
             t,
+            minutes: 60,
             session: "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34".to_string(),
             cwd: "/home/sam/projects/atlas".to_string(),
             project: ProjectKey::Repo("github.com/sam/atlas".to_string()),

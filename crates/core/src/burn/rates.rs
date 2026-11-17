@@ -26,7 +26,7 @@ use super::{
 /// left out. A clock hour of the
 /// week is the weighted mean over the four weeks: the two newer weeks weigh 2,
 /// the two older 1. A week without a record in that hour counts as 0 for it. A
-/// record's hour is spread over the local clock hours it covers, by the minutes
+/// record's span is spread over the local clock hours it covers, by the minutes
 /// each one holds, so an offset that is not a whole hour splits it between two
 /// and a daylight-saving change is followed.
 pub fn rhythm<Tz: TimeZone + Copy>(
@@ -50,7 +50,7 @@ pub fn rhythm<Tz: TimeZone + Copy>(
             continue;
         }
         let units = work_units(record.input, record.out, record.cw, record.cr);
-        spread(&mut weighted, record.t, zone, week_weight(week) * units);
+        spread(&mut weighted, record, zone, week_weight(week) * units);
     }
     let mut wu = [0.0f64; super::HOURS];
     for (hour, sum) in wu.iter_mut().zip(weighted) {
@@ -59,22 +59,46 @@ pub fn rhythm<Tz: TimeZone + Copy>(
     Rhythm { wu }
 }
 
-/// Add the work of one record's hour to the clock hours it covers, by the share
-/// of the hour each one holds. A whole-hour offset leaves it in one hour. The
+/// Add the work of one record's span to the clock hours it covers, by the share
+/// of the span each one holds. A whole-hour offset leaves it in one hour. The
 /// hour boundaries and the hour-of-week index are the statistics' one rule.
 fn spread<Tz: TimeZone + Copy>(
     weighted: &mut [f64; super::HOURS],
-    t: DateTime<Utc>,
+    record: &TokenRecord,
     zone: &Tz,
     units: f64,
 ) {
-    let end = t + Duration::hours(1);
-    let mut cursor = t;
+    for (hour, share) in hour_shares(record, |at| local_hour_start(at, zone)) {
+        weighted[local_hour_of_week(hour, zone)] += units * share;
+    }
+}
+
+/// How a record's [`TokenRecord::span`] is shared between the clock hours it
+/// covers: each hour's start (as `hour_of` returns it) and the share of the
+/// span that lies in it, in order, the shares summing to 1. `hour_of` gives the
+/// start of the hour an instant lies in, so the caller chooses local or UTC
+/// hours. The one place a token line is spread over hours; `work_in` uses its
+/// timeline overlap instead because a line can be split by an account switch.
+pub(crate) fn hour_shares(
+    record: &TokenRecord,
+    hour_of: impl Fn(DateTime<Utc>) -> DateTime<Utc>,
+) -> Vec<(DateTime<Utc>, f64)> {
+    let start = record.t;
+    let end = start + record.span();
+    let span = seconds_between(start, end);
+    let mut shares: Vec<(DateTime<Utc>, f64)> = Vec::new();
+    let mut cursor = start;
     while cursor < end {
-        let to = (local_hour_start(cursor, zone) + Duration::hours(1)).min(end);
-        weighted[local_hour_of_week(cursor, zone)] += units * seconds_between(cursor, to) / 3600.0;
+        let hour = hour_of(cursor);
+        let to = (hour + Duration::hours(1)).min(end);
+        let share = seconds_between(cursor, to) / span;
+        match shares.last_mut() {
+            Some((last, sum)) if *last == hour => *sum += share,
+            _ => shares.push((hour, share)),
+        }
         cursor = to;
     }
+    shares
 }
 
 /// Which account was live on `host` at `t`: the last `live` or `switch` event of
@@ -420,10 +444,9 @@ fn seconds_between(from: DateTime<Utc>, to: DateTime<Utc>) -> f64 {
 /// The work units of `tokens` inside the given disjoint, time-sorted spans,
 /// counting each Claude record (a Codex or Ollama record uses no Claude
 /// account and is left out) only while `account` was live on the record's host and
-/// spreading a record evenly over its hour: the hour starts at the record's time,
-/// as `transcripts::token_records` groups the answers of one hour. `tokens`
-/// are sorted by time, as a history read returns them, so only the records
-/// whose hour reaches into the spans are looked at.
+/// spreading a record evenly over its own [`TokenRecord::span`]. `tokens` are
+/// sorted by time, as a history read returns them, so only the records whose
+/// longest possible span reaches into the spans are looked at.
 pub(super) fn work_in(
     timelines: &HashMap<String, Timeline>,
     tokens: &[Hosted<TokenRecord>],
@@ -437,10 +460,12 @@ pub(super) fn work_in(
         tokens.is_sorted_by_key(|hosted| hosted.record.t),
         "work_in needs the token records sorted by time"
     );
-    // A record whose hour ends at or before the first span, or that starts at
-    // or after the last span's end, has no part inside a span.
+    // A record whose longest span ends at or before the first span, or that
+    // starts at or after the last span's end, has no part inside a span. The
+    // bound uses the longest span (an hour) so a 5-minute line next to an
+    // hourly one is never skipped; the overlap below uses the line's own span.
     let from =
-        tokens.partition_point(|hosted| hosted.record.t + Duration::hours(1) <= first_span.0);
+        tokens.partition_point(|hosted| hosted.record.t + Duration::minutes(60) <= first_span.0);
     let to = tokens.partition_point(|hosted| hosted.record.t < last_span.1);
     let mut total = 0.0;
     for hosted in &tokens[from..to.max(from)] {
@@ -450,7 +475,8 @@ pub(super) fn work_in(
             continue;
         }
         let start = record.t;
-        let end = start + Duration::hours(1);
+        let end = start + record.span();
+        let span_seconds = seconds_between(start, end);
         let units = work_units(record.input, record.out, record.cw, record.cr);
         let Some(timeline) = timelines.get(&hosted.host) else {
             continue;
@@ -465,7 +491,7 @@ pub(super) fn work_in(
             if from >= to {
                 continue;
             }
-            total += units * timeline.seconds(account, from, to) / 3600.0;
+            total += units * timeline.seconds(account, from, to) / span_seconds;
         }
     }
     total
@@ -572,6 +598,7 @@ mod tests {
             host: host.to_string(),
             record: TokenRecord {
                 t: utc(at),
+                minutes: 60,
                 session: "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34".to_string(),
                 cwd: "/home/sam/projects/atlas".to_string(),
                 project: ProjectKey::Repo("github.com/sam/atlas".to_string()),
@@ -716,6 +743,62 @@ mod tests {
         assert!((rates.c - 0.32).abs() < EPS, "{}", rates.c);
         let s = rates.s.expect("a session limit");
         assert!((s - 4.0).abs() < EPS, "{s}");
+    }
+
+    /// The same line as [`token`], but one 5-minute bucket long.
+    fn five_minute_token(host: &str, at: &str, input: u64) -> Hosted<TokenRecord> {
+        let mut hosted = token(host, at, input);
+        hosted.record.minutes = 5;
+        hosted
+    }
+
+    #[test]
+    fn hourly_and_five_minute_lines_of_one_hour_add_up_once() {
+        // One hourly line of 60 work units and twelve 5-minute lines of 1 each
+        // over the hour 10:00-11:00; the pair 10:00-10:30 holds half of the
+        // hourly line and six of the 5-minute ones: 30 + 6 work units. A 36 %
+        // gain over that pair is 1 % per work unit.
+        let samples = vec![
+            sample(
+                "atlas",
+                "2026-11-14T10:00:00Z",
+                ac(),
+                vec![weekly(0.0, WEEK_RESET)],
+            ),
+            sample(
+                "atlas",
+                "2026-11-14T10:30:00Z",
+                ac(),
+                vec![weekly(36.0, WEEK_RESET)],
+            ),
+        ];
+        let mut tokens = vec![token("atlas", "2026-11-14T10:00:00Z", 60_000_000)];
+        for minute in (0..60).step_by(5) {
+            tokens.push(five_minute_token(
+                "atlas",
+                &format!("2026-11-14T10:{minute:02}:00Z"),
+                1_000_000,
+            ));
+        }
+        let events = vec![live("atlas", "2026-11-14T09:00:00Z", Some(ac()))];
+        let timelines = timelines(&events);
+        let work = work_in(
+            &timelines,
+            &tokens,
+            &ac(),
+            &[(utc("2026-11-14T10:00:00Z"), utc("2026-11-14T10:30:00Z"))],
+        );
+        assert!((work - 36.0).abs() < EPS, "{work}");
+
+        let rates = rates_of(
+            &ac(),
+            &samples,
+            &tokens,
+            &events,
+            utc("2026-11-14T18:00:00Z"),
+        )
+        .expect("36 work units is enough work");
+        assert!((rates.c - 1.0).abs() < EPS, "{}", rates.c);
     }
 
     /// The same token line on another provider's model.
@@ -1122,6 +1205,52 @@ mod tests {
         );
         let total: f64 = rhythm.wu.iter().sum();
         assert!((total - 2.0).abs() < EPS, "total: {total}");
+    }
+
+    #[test]
+    fn hour_shares_split_a_line_over_the_local_hours_it_covers() {
+        // 08:00Z is 13:30 in +05:30, so an hourly line runs 13:30-14:30 local:
+        // half of its span in each of local hours 13 and 14. A 5-minute line
+        // lies wholly in one of them.
+        let hourly = token("atlas", "2026-11-23T08:00:00Z", 12_000_000);
+        let shares = hour_shares(&hourly.record, |at| {
+            crate::stats::local_hour_start(at, &half_hour())
+        });
+        assert_eq!(shares.len(), 2, "{shares:?}");
+        assert_eq!(shares[0].0, utc("2026-11-23T07:30:00Z"));
+        assert_eq!(shares[1].0, utc("2026-11-23T08:30:00Z"));
+        assert!((shares[0].1 - 0.5).abs() < EPS, "{}", shares[0].1);
+        assert!((shares[1].1 - 0.5).abs() < EPS, "{}", shares[1].1);
+
+        let five = five_minute_token("atlas", "2026-11-23T08:00:00Z", 1_000_000);
+        let shares = hour_shares(&five.record, |at| {
+            crate::stats::local_hour_start(at, &half_hour())
+        });
+        assert_eq!(shares.len(), 1, "{shares:?}");
+        assert_eq!(shares[0].0, utc("2026-11-23T07:30:00Z"));
+        assert!((shares[0].1 - 1.0).abs() < EPS, "{}", shares[0].1);
+    }
+
+    #[test]
+    fn rhythm_counts_five_minute_lines_like_the_hour_they_make_up() {
+        let hourly = vec![token("atlas", "2026-11-23T08:00:00Z", 12_000_000)];
+        let mut five = Vec::new();
+        for minute in (0..60).step_by(5) {
+            five.push(five_minute_token(
+                "atlas",
+                &format!("2026-11-23T08:{minute:02}:00Z"),
+                1_000_000,
+            ));
+        }
+        let now = utc("2026-11-23T12:00:00Z");
+        let a = rhythm(&hourly, now, &east_one());
+        let b = rhythm(&five, now, &east_one());
+        assert!(
+            (b.wu[9] - a.wu[9]).abs() < EPS,
+            "hourly {} vs 5-minute {}",
+            a.wu[9],
+            b.wu[9]
+        );
     }
 
     #[test]

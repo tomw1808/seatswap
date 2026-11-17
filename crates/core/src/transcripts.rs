@@ -1294,7 +1294,7 @@ struct EndMessage {
     stop_reason: Option<String>,
 }
 
-/// One [`TokenRecord`] per (session, hour, model).
+/// One [`TokenRecord`] per (session, 5-minute bucket, model).
 pub fn token_records(answers: &[Answer], state: &ScanState, home: &Path) -> Vec<TokenRecord> {
     // The earliest answer of a group names its folder, so the answers are taken
     // in time order.
@@ -1306,7 +1306,7 @@ pub fn token_records(answers: &[Answer], state: &ScanState, home: &Path) -> Vec<
     for answer in ordered {
         let cwd = answer_cwd(answer, state);
         let key = (
-            hour_start(answer.at),
+            bucket_start(answer.at),
             answer.session.clone(),
             answer.model.clone(),
         );
@@ -1339,6 +1339,7 @@ pub fn token_records(answers: &[Answer], state: &ScanState, home: &Path) -> Vec<
         .into_iter()
         .map(|((t, session, model), group)| TokenRecord {
             t,
+            minutes: TOKEN_BUCKET_MINUTES as u32,
             session,
             cwd: group.cwd,
             project: group.project,
@@ -2363,6 +2364,16 @@ fn read_at(
     Ok(buffer)
 }
 
+/// The length of a token line's bucket, in minutes (spec R3).
+pub const TOKEN_BUCKET_MINUTES: i64 = 5;
+
+/// The start of the 5-minute bucket `at` falls in, in UTC.
+pub fn bucket_start(at: DateTime<Utc>) -> DateTime<Utc> {
+    at - Duration::minutes(i64::from(at.minute()) % TOKEN_BUCKET_MINUTES)
+        - Duration::seconds(i64::from(at.second()))
+        - Duration::nanoseconds(i64::from(at.nanosecond()))
+}
+
 /// The start of the hour `at` falls in, in UTC.
 pub(crate) fn hour_start(at: DateTime<Utc>) -> DateTime<Utc> {
     at - Duration::minutes(i64::from(at.minute()))
@@ -2376,7 +2387,7 @@ fn minute_start(at: DateTime<Utc>) -> DateTime<Utc> {
         - Duration::nanoseconds(i64::from(at.nanosecond()))
 }
 
-/// A group of [`TokenRecord`], keyed by session, hour and model.
+/// A group of [`TokenRecord`], keyed by session, 5-minute bucket and model.
 type GroupKey = (DateTime<Utc>, String, String);
 
 struct TokenGroup {
@@ -4146,34 +4157,94 @@ mod tests {
         let (state, scan) = scan_run(&claude);
         let records = token_records(&scan.answers, &state, home);
 
-        assert_eq!(records.len(), 3, "{records:?}");
-        let nine = at("2026-11-12T09:00:00Z");
-        let ten = at("2026-11-12T10:00:00Z");
+        assert_eq!(records.len(), 4, "{records:?}");
+        let nine_forty = at("2026-11-12T09:40:00Z");
+        let nine_fifty = at("2026-11-12T09:50:00Z");
+        let nine_fifty_five = at("2026-11-12T09:55:00Z");
+        let ten_five = at("2026-11-12T10:05:00Z");
         let opus = records
             .iter()
-            .find(|record| record.t == nine && record.model == OPUS)
+            .find(|record| record.t == nine_forty && record.model == OPUS)
             .unwrap();
         assert_eq!(opus.session, SESSION);
         assert_eq!(opus.cwd, engine);
-        assert_eq!(opus.out, 166);
-        assert_eq!(opus.answers, 2);
+        assert_eq!(opus.out, 100);
+        assert_eq!(opus.answers, 1);
         assert_eq!(opus.agent_answers, 0);
+        assert_eq!(opus.minutes, TOKEN_BUCKET_MINUTES as u32);
         assert_eq!(
             opus.project,
             ProjectKey::Repo("github.com/sam/atlas".to_string())
         );
         let sonnet = records
             .iter()
-            .find(|record| record.t == nine && record.model == SONNET)
+            .find(|record| record.t == nine_fifty && record.model == SONNET)
             .unwrap();
         assert_eq!(sonnet.answers, 1);
         assert_eq!(sonnet.agent_answers, 1);
         assert_eq!(sonnet.out, 20);
         assert_eq!(sonnet.cwd, engine, "an agent uses its session's folder");
-        let later = records.iter().find(|record| record.t == ten).unwrap();
+        let later = records.iter().find(|record| record.t == ten_five).unwrap();
         assert_eq!(later.answers, 1);
-        assert_eq!(records[0].t, nine);
-        assert_eq!(records[2].t, ten);
+        assert_eq!(later.out, 50);
+        let nine_fifty_five = records
+            .iter()
+            .find(|record| record.t == nine_fifty_five)
+            .unwrap();
+        assert_eq!(nine_fifty_five.answers, 1);
+        assert_eq!(nine_fifty_five.out, 66);
+        assert_eq!(records[0].t, nine_forty);
+        assert_eq!(records[3].t, ten_five);
+    }
+
+    #[test]
+    fn five_minute_buckets_group_answers_by_session_model_and_bucket() {
+        let (tmp, claude, _app) = fixture();
+        let home = tmp.path();
+        write_lines(
+            &folder(&claude, FOLDER),
+            &format!("{SESSION}.jsonl"),
+            &[
+                assistant_line(
+                    "msg_1",
+                    "2026-11-12T10:01:00.000Z",
+                    ENGINE,
+                    OPUS,
+                    &["text"],
+                    USAGE,
+                ),
+                assistant_line(
+                    "msg_2",
+                    "2026-11-12T10:04:00.000Z",
+                    ENGINE,
+                    OPUS,
+                    &["text"],
+                    USAGE,
+                ),
+                assistant_line(
+                    "msg_3",
+                    "2026-11-12T10:06:00.000Z",
+                    ENGINE,
+                    OPUS,
+                    &["text"],
+                    USAGE,
+                ),
+            ],
+        );
+
+        let (state, scan) = scan_run(&claude);
+        let records = token_records(&scan.answers, &state, home);
+
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert_eq!(records[0].t, at("2026-11-12T10:00:00Z"));
+        assert_eq!(records[0].minutes, TOKEN_BUCKET_MINUTES as u32);
+        assert_eq!(records[0].answers, 2);
+        assert_eq!(records[1].t, at("2026-11-12T10:05:00Z"));
+        assert_eq!(records[1].minutes, TOKEN_BUCKET_MINUTES as u32);
+        assert_eq!(records[1].answers, 1);
+
+        let line = serde_json::to_value(&records[0]).unwrap();
+        assert_eq!(line["min"], serde_json::json!(TOKEN_BUCKET_MINUTES));
     }
 
     #[test]

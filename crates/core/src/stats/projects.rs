@@ -1175,6 +1175,7 @@ mod tests {
     ) -> TokenRecord {
         TokenRecord {
             t: utc(t),
+            minutes: 60,
             session: session.to_string(),
             cwd: cwd.to_string(),
             project,

@@ -1923,6 +1923,7 @@ mod tests {
             history
                 .append(&crate::history::TokenRecord {
                     t: utc("2026-11-09T00:00:00Z") + Duration::hours(hour),
+                    minutes: 60,
                     session: "session-1".to_string(),
                     cwd: "/home/sam/atlas".to_string(),
                     project: crate::project::ProjectKey::Folder("/home/sam/atlas".to_string()),
@@ -2014,6 +2015,7 @@ mod tests {
             history
                 .append(&crate::history::TokenRecord {
                     t: utc("2026-11-09T00:00:00Z") + Duration::hours(hour),
+                    minutes: 60,
                     session: "session-1".to_string(),
                     cwd: "/home/sam/atlas".to_string(),
                     project: crate::project::ProjectKey::Folder("/home/sam/atlas".to_string()),

@@ -3359,7 +3359,6 @@ mod tests {
     /// forty answers, two models, several answers in one hour.
     #[test]
     fn a_backfill_writes_each_hour_once() {
-        use chrono::Timelike;
         use std::collections::BTreeMap;
 
         const LEDGER: &str = "2b7d9c1e-5a4f-4c3b-9e8d-7f6a5b4c3d2e";
@@ -3386,10 +3385,8 @@ mod tests {
             }
         }
 
-        fn start_of_hour(at: DateTime<Utc>) -> DateTime<Utc> {
-            at - chrono::Duration::minutes(i64::from(at.minute()))
-                - chrono::Duration::seconds(i64::from(at.second()))
-                - chrono::Duration::nanoseconds(i64::from(at.nanosecond()))
+        fn start_of_bucket(at: DateTime<Utc>) -> DateTime<Utc> {
+            seatswap_core::transcripts::bucket_start(at)
         }
 
         fn project_folder(cwd: &Path) -> String {
@@ -3442,7 +3439,7 @@ mod tests {
             cwds.insert(name, repo(tmp.path(), name));
         }
 
-        // (project, session, first answer, model, answers in that hour)
+        // (project, session, first answer, model, answers from that time)
         let groups: [(&str, &str, &str, &str, u32); 15] = [
             ("atlas", SESSION, "2026-11-12T09:10:00Z", OPUS, 3),
             ("atlas", SESSION, "2026-11-12T09:30:00Z", SONNET, 2),
@@ -3478,7 +3475,7 @@ mod tests {
                     31_000 + u64::from(sequence) * 257,
                 );
                 expected
-                    .entry((session.to_string(), start_of_hour(at), model.to_string()))
+                    .entry((session.to_string(), start_of_bucket(at), model.to_string()))
                     .or_default()
                     .add(usage);
                 per_session
@@ -3537,7 +3534,7 @@ mod tests {
         assert_eq!(
             token_lines(&history_root),
             expected.len(),
-            "one token line per session, hour and model"
+            "one token line per session, 5-minute bucket and model"
         );
 
         let read = history_dir
@@ -3868,6 +3865,7 @@ mod tests {
         let project = ProjectKey::Folder("atlas".to_string());
         let token = TokenRecord {
             t: time("2026-11-16T09:00:00Z"),
+            minutes: 60,
             session: SESSION.to_string(),
             cwd: "/home/sam/projects/atlas".to_string(),
             project: project.clone(),
@@ -5563,6 +5561,7 @@ mod tests {
         history
             .append(&seatswap_core::history::TokenRecord {
                 t: closed_at - chrono::Duration::minutes(10),
+                minutes: 60,
                 session: "11a2b3c4-d5e6-4f70-8a9b-0c1d2e3f4a5b".to_string(),
                 cwd: "/home/sam/projects/acme-kb".to_string(),
                 project: ProjectKey::Repo("github.com/sam/acme-kb".to_string()),

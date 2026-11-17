@@ -1033,6 +1033,7 @@ mod tests {
     fn record(t: &str, session: &str, cwd: &str, project: ProjectKey, out: u64) -> TokenRecord {
         TokenRecord {
             t: utc(t),
+            minutes: 60,
             session: session.to_string(),
             cwd: cwd.to_string(),
             project,
@@ -1062,6 +1063,7 @@ mod tests {
     fn ollama_record(t: &str, session: &str, input: u64, out: u64) -> TokenRecord {
         TokenRecord {
             t: utc(t),
+            minutes: 60,
             session: session.to_string(),
             cwd: "/home/sam/projects/atlas/engine".to_string(),
             project: atlas(),

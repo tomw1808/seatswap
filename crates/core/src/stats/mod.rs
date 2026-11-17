@@ -2081,6 +2081,7 @@ pub(crate) mod tests {
         assert_eq!(weeks[0].used, 92.0);
         let record = TokenRecord {
             t: utc("2026-11-03T10:00:00Z"),
+            minutes: 60,
             session: "s0".to_string(),
             cwd: "/home/sam/ledger".to_string(),
             project: ProjectKey::Folder("/home/sam/ledger".to_string()),
@@ -2154,6 +2155,7 @@ pub(crate) mod tests {
         tiny.history
             .append(&TokenRecord {
                 t: utc("2026-10-01T09:00:00Z"),
+                minutes: 60,
                 session: "s0".to_string(),
                 cwd: "/home/sam/ledger".to_string(),
                 project: ProjectKey::Folder("/home/sam/ledger".to_string()),
@@ -2477,6 +2479,7 @@ pub(crate) mod tests {
         tiny.history
             .append(&TokenRecord {
                 t: utc("2026-03-30T07:00:00Z"),
+                minutes: 60,
                 session: "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34".to_string(),
                 cwd: "/home/sam/projects/atlas/engine".to_string(),
                 project: crate::project::ProjectKey::Repo("github.com/sam/atlas".to_string()),
