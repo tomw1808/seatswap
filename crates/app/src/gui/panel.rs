@@ -687,6 +687,52 @@ pub(crate) async fn edit_subscription(
     }
 }
 
+/// Switch Codex's live login to a saved one (R8). The answer is the note the
+/// pop-up shows under the card: it names the sessions still on the old login.
+#[tauri::command]
+pub(crate) async fn switch_codex(
+    state: State<'_, GuiState>,
+    account: AccountRef,
+) -> Result<String, String> {
+    let action = state.action.clone();
+    let reply = tauri::async_runtime::spawn_blocking(move || {
+        request(&action, |reply| ActionCommand::SwitchCodex {
+            account,
+            reply,
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    match reply {
+        ActionReply::Switched(note) => Ok(note),
+        ActionReply::Failed(message) => Err(message),
+        _ => Err("the action thread gave an unexpected reply".to_string()),
+    }
+}
+
+/// Delete seatswap's saved copy of a Codex login (R8). The subscription and
+/// Codex's own login file stay.
+#[tauri::command]
+pub(crate) async fn remove_codex_login(
+    state: State<'_, GuiState>,
+    account: AccountRef,
+) -> Result<(), String> {
+    let action = state.action.clone();
+    let reply = tauri::async_runtime::spawn_blocking(move || {
+        request(&action, |reply| ActionCommand::RemoveCodexLogin {
+            account,
+            reply,
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    match reply {
+        ActionReply::Done => Ok(()),
+        ActionReply::Failed(message) => Err(message),
+        _ => Err("the action thread gave an unexpected reply".to_string()),
+    }
+}
+
 #[tauri::command]
 pub(crate) async fn remove_account(state: State<'_, GuiState>, key: String) -> Result<(), String> {
     let action = state.action.clone();

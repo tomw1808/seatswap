@@ -72,6 +72,9 @@ const state = {
   openEditorId: null,
   selectedId: null,
   confirmRemoveId: null,
+  // The Codex login whose "Remove saved login" waits for a second click (R8):
+  // `saved:<org>:<acc>`, or null.
+  confirmSavedLoginId: null,
   confirmRemoveOrgId: null,
   right: null,
   errors: Object.create(null),
@@ -324,6 +327,7 @@ function selectGroup(id, right) {
   state.selectedId = null;
   state.confirmRemoveId = null;
   state.confirmRemoveOrgId = null;
+  state.confirmSavedLoginId = null;
   const target = `settings/${id}`;
   if (location.hash.slice(1) === target) {
     state.group = id;
@@ -1390,8 +1394,10 @@ function accountsCard() {
       " is what you pay per month, in the currency set under General. It turns percent into money, so accounts can be added up. ",
       h("b", { text: "Auto-burn may use it:" }),
       " switch it off for an account that should be left alone. ",
-      h("b", { text: "OpenAI and Ollama" }),
-      " subscriptions have no login of their own; their plan, when the provider names one, is read-only.",
+      h("b", { text: "OpenAI" }),
+      " subscriptions are the Codex logins seatswap has seen; ",
+      h("b", { text: "Ollama" }),
+      " has one. Their plan, when the provider names one, is read-only.",
     ])
   );
   return card;
@@ -1608,6 +1614,7 @@ function subscriptionRow(subscription) {
   chip.addEventListener("click", () => {
     state.openEditorId = state.openEditorId === field ? null : field;
     state.selectedId = null;
+    state.confirmSavedLoginId = null;
     renderGroup(state.right, "accounts");
   });
 
@@ -1732,21 +1739,116 @@ function subscriptionRow(subscription) {
   paintRowError(wrap, field);
 
   if (state.openEditorId === field) {
-    wrap.appendChild(
-      chipEditor(
-        subscription,
-        field,
-        (next) => {
-          if (typeof next.abbr === "string") abbr = next.abbr;
-          if (typeof next.color === "string") accent = next.color;
-          paintChip();
-        },
-        saveSubscription,
-        false
-      )
+    const editor = chipEditor(
+      subscription,
+      field,
+      (next) => {
+        if (typeof next.abbr === "string") abbr = next.abbr;
+        if (typeof next.color === "string") accent = next.color;
+        paintChip();
+      },
+      saveSubscription,
+      false
     );
+    // R8: an OpenAI subscription whose login seatswap has a saved copy of gets
+    // the one action that deletes that copy; the row, its plan, price and
+    // history stay, and Codex's own login file is never touched. The live login
+    // is not offered: the next poll would save its copy again.
+    const loginState = codexLoginState(subscription.account);
+    if (loginState === "saved") {
+      editor.appendChild(removeSavedLogin(subscription, field));
+    } else if (loginState === "live") {
+      editor.appendChild(liveLoginNote());
+    }
+    wrap.appendChild(editor);
   }
   return wrap;
+}
+
+// What Settings knows about a Codex login from the snapshot: the live one, a
+// saved one, or nothing (the OpenAI card is off, or its copy is gone). Only a
+// saved, non-live login may be removed.
+function codexLoginState(account) {
+  if (!isObject(account) || account.org !== "codex") return "unknown";
+  const snapshot = state.snapshot || {};
+  const logins = Array.isArray(snapshot.codexLogins) ? snapshot.codexLogins : [];
+  const login = logins.find(
+    (entry) => isObject(entry.account) && sameRef(entry.account, account)
+  );
+  if (!login) return "unknown";
+  return login.live === true ? "live" : "saved";
+}
+
+// The sentence that takes the place of Remove on the live login, muted: the
+// worker refuses the same remove with the same words.
+const LIVE_LOGIN_REMOVE =
+  "the live login: switch Codex to another login first to remove it";
+
+function liveLoginNote() {
+  return h("div", { class: "editor-actions" }, [
+    h("span", { class: "mf x11", text: LIVE_LOGIN_REMOVE }),
+  ]);
+}
+
+function removeSavedLogin(subscription, field) {
+  const account = { acc: subscription.account.acc, org: subscription.account.org };
+  const id = `saved:${account.org}:${account.acc}`;
+  const abbr = subscription.abbr || "?";
+  if (state.confirmSavedLoginId === id) {
+    return h("div", { class: "confirm" }, [
+      h("div", {
+        class: "confirm-text",
+        text: `Delete seatswap's copy of ${abbr}? Codex's own login file is not touched.`,
+      }),
+      h("div", { class: "confirm-actions" }, [
+        h("button", {
+          type: "button",
+          class: "hbtn xs danger",
+          text: "Remove saved login",
+          onclick: () => forgetCodexLogin(account, field),
+        }),
+        h("button", {
+          type: "button",
+          class: "hbtn xs ghost",
+          text: "Keep it",
+          onclick: () => {
+            state.confirmSavedLoginId = null;
+            renderGroup(state.right, "accounts");
+          },
+        }),
+      ]),
+    ]);
+  }
+  return h("div", { class: "editor-actions" }, [
+    h("button", {
+      type: "button",
+      class: "hbtn xs danger",
+      text: "Remove saved login",
+      title:
+        "Deletes seatswap's copy of this Codex login. Codex's own login file is not touched.",
+      onclick: () => {
+        state.confirmSavedLoginId = id;
+        renderGroup(state.right, "accounts");
+      },
+    }),
+  ]);
+}
+
+async function forgetCodexLogin(account, field) {
+  try {
+    await state.context.invoke("remove_codex_login", { account });
+    state.confirmSavedLoginId = null;
+    delete state.errors[field];
+    const snapshot = state.snapshot;
+    if (snapshot && Array.isArray(snapshot.codexLogins)) {
+      snapshot.codexLogins = snapshot.codexLogins.filter(
+        (login) => !(isObject(login.account) && sameRef(login.account, account))
+      );
+    }
+    renderGroup(state.right, "accounts");
+  } catch (error) {
+    fieldError(field, errorMessage(error));
+  }
 }
 
 function chipEditor(row, field, changed, save = saveAccount, removable = true) {

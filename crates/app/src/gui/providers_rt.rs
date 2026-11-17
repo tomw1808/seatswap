@@ -1,10 +1,18 @@
-//! The provider thread (step-d.md Task 4): Codex's and Ollama's read-only cards,
-//! polled every five minutes while their switch is on.
+//! The provider thread (step-d.md Task 4): Codex's and Ollama's cards, polled
+//! every five minutes while their switch is on, and Codex's saved logins (R8).
+//!
+//! The thread opens the store once at spawn ([`store::open_store`]) and keeps
+//! it. A Codex round saves the live login, asks every other saved login with its
+//! own token, and keeps the logins that expired on a failed renewal out of the
+//! requests until their stored copy changes. Only Codex's stored copies and its
+//! live `auth.json` are touched; no Claude login is read or written.
 //!
 //! The thread reads `accounts.json` at every round, so a switch, a Codex folder
 //! or an Ollama URL counts without a restart. A card that is off is never read
-//! and never asked. Every change of the list is one [`UiEvent::Providers`] for
-//! the main thread, Codex first; the list holds only the cards that are on.
+//! and never asked, unless its subscription has a price. Every change of the
+//! lists is one [`UiEvent::Providers`] for the main thread, Codex first; the
+//! card list holds only the cards that are on, and the Codex login list is empty
+//! while the Codex card is off.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,12 +25,11 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use seatswap_core::api::{Api, Usage};
-use seatswap_core::history::{EventKind, HistoryDir, Recorder, Source};
+use seatswap_core::history::{AccountRef, HistoryDir, Recorder, Source};
 use seatswap_core::paths::{AppPaths, CodexPaths, PathsError};
 use seatswap_core::providers::{self, Credits, ProviderReading, CODEX_ORG, OLLAMA_ORG};
-use seatswap_core::store::{self, ProviderSubscription, Settings};
-
-use seatswap_core::switcher;
+use seatswap_core::store::{self, ProviderSubscription, Settings, Store};
+use seatswap_core::types::CodexLogin;
 
 use crate::ops;
 
@@ -35,6 +42,15 @@ pub(crate) const PROVIDER_POLL_SECS: u64 = 300;
 /// An open pop-up polls a provider only when its last attempt is older than
 /// this.
 const PROVIDER_OPEN_SECS: i64 = 60;
+
+/// An expired answer always carries its message and the copy it failed from
+/// (the only constructor is [`CodexAnswer::failed`]); an answer without them is
+/// a stated error, never a default. Such a login is asked again next round
+/// rather than remembered wrongly as expired.
+const EXPIRED_WITHOUT_MESSAGE: &str =
+    "a saved Codex login was marked expired without a message; it is asked again at the next round";
+const EXPIRED_WITHOUT_COPY: &str =
+    "a saved Codex login was marked expired without the copy it failed from; it is asked again at the next round";
 
 /// One provider card as the panel shows it. Only a card that is switched on is
 /// in the snapshot; a missing value stays `None`.
@@ -50,6 +66,40 @@ pub(crate) struct ProviderView {
     pub spend_24h_error: Option<String>,
     pub fetched_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
+}
+
+/// One saved Codex login as the pop-up lists it (R8): the subscription's look
+/// and plan, the last reading's usage, and whether the login is the live one.
+/// `state` is `"ok"`, `"expired"` after a failed renewal, or `"error"` for any
+/// other failed reading; `message` says why and is `None` when ok.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CodexLoginView {
+    pub account: AccountRef,
+    pub abbr: String,
+    pub label: String,
+    pub color: String,
+    pub plan: Option<String>,
+    pub live: bool,
+    pub usage: Option<Usage>,
+    pub state: CodexLoginState,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum CodexLoginState {
+    Ok,
+    Expired,
+    Error,
+}
+
+/// The two lists the provider thread hands to the UI in one event: the cards
+/// that are on, and the saved Codex logins (R8).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ProviderLists {
+    pub cards: Vec<ProviderView>,
+    pub codex_logins: Vec<CodexLoginView>,
 }
 
 /// The provider one card reads, in the list's order.
@@ -89,17 +139,6 @@ impl Provider {
         }
     }
 
-    fn view<'a>(
-        self,
-        codex: &'a Option<ProviderView>,
-        ollama: &'a Option<ProviderView>,
-    ) -> Option<&'a ProviderView> {
-        match self {
-            Provider::Codex => codex.as_ref(),
-            Provider::Ollama => ollama.as_ref(),
-        }
-    }
-
     fn view_mut<'a>(
         self,
         codex: &'a mut Option<ProviderView>,
@@ -123,12 +162,15 @@ impl Provider {
     }
 }
 
-/// The commands the window and the settings save send to the provider thread.
+/// The commands the window, the settings save and a Codex action send to the
+/// provider thread.
 enum ProvidersCommand {
     /// The pop-up opened.
     Opened,
     /// A settings save wrote `accounts.json`.
     SettingsSaved,
+    /// A Codex login was switched or forgotten: poll Codex now.
+    CodexChanged,
     Stop,
 }
 
@@ -149,6 +191,12 @@ impl ProvidersClient {
     /// or URL changed, and drop the view of one that was switched off.
     pub(crate) fn settings_saved(&self) -> Result<(), String> {
         super::send_to_worker(self.commands.send(ProvidersCommand::SettingsSaved))
+    }
+
+    /// A Codex login was switched or forgotten: ask the thread to poll Codex at
+    /// once, as a settings save pokes it.
+    pub(crate) fn codex_changed(&self) -> Result<(), String> {
+        super::send_to_worker(self.commands.send(ProvidersCommand::CodexChanged))
     }
 }
 
@@ -183,6 +231,10 @@ impl Drop for ProvidersHandle {
 /// [`CodexPaths::resolve`]; a test passes a folder in its tempdir.
 pub(crate) type CodexPathsLookup =
     Box<dyn Fn(Option<&Path>) -> Result<CodexPaths, PathsError> + Send>;
+
+/// The way the thread opens the store (R8): [`store::open_store`] in the app;
+/// a test answers with its own `Store` and can fail an open to show the retry.
+pub(crate) type StoreOpener = Box<dyn Fn() -> Result<Store, String> + Send>;
 
 /// The way to read the settings now. The app loads `accounts.json`; a test
 /// answers with its own. The settings the request used are passed in, so the
@@ -241,11 +293,26 @@ fn run(
     printed_warnings: Arc<Mutex<PrintedWarnings>>,
 ) {
     let app_for_lookup = app.clone();
+    // The one store this thread keeps (R8). It opens on the first Codex round;
+    // an open that failed is tried again at every round, and its error is the
+    // OpenAI card's error until an open succeeds, never a silent "no logins".
+    let store_app = app.clone();
+    let store_reporter = Arc::clone(&reported_errors);
+    let store_opener: StoreOpener = Box::new(move || match store::open_store(store_app.clone()) {
+        Ok((store, warning)) => {
+            if let Some(warning) = warning {
+                store_reporter.report(&warning);
+            }
+            Ok(store)
+        }
+        Err(error) => Err(error.to_string()),
+    });
     let mut runtime = ProvidersRuntime::new(
         history,
         api,
         Some(ui),
         app.clone(),
+        store_opener,
         Box::new(CodexPaths::resolve),
         Box::new(move |_| {
             store::load_accounts(&app_for_lookup)
@@ -271,6 +338,11 @@ fn run(
             Ok(ProvidersCommand::SettingsSaved) => {
                 if let Some(settings) = settings_of(&app, &mut runtime) {
                     runtime.settings_saved(&settings, Utc::now());
+                }
+            }
+            Ok(ProvidersCommand::CodexChanged) => {
+                if let Some(settings) = settings_of(&app, &mut runtime) {
+                    runtime.codex_changed(&settings, Utc::now());
                 }
             }
             Ok(ProvidersCommand::Stop) | Err(RecvTimeoutError::Disconnected) => return,
@@ -302,8 +374,14 @@ pub(crate) struct ProvidersRuntime {
     api: Api,
     ui: Option<Sender<UiEvent>>,
     /// The app paths; the subscription list and its prices live in
-    /// `accounts.json` there. The provider thread never needs a secret.
+    /// `accounts.json` there.
     app: AppPaths,
+    /// The store the Codex round reads and saves in; none until an open
+    /// succeeds. An open that failed is tried again at every round, and its
+    /// error is the OpenAI card's error until then.
+    store: Option<Store>,
+    /// The one way the thread opens its store.
+    store_opener: StoreOpener,
     codex_paths: CodexPathsLookup,
     /// The way the current settings are read once a request has ended.
     settings_lookup: SettingsLookup,
@@ -320,10 +398,90 @@ pub(crate) struct ProvidersRuntime {
     settings: Option<Settings>,
     codex: Option<ProviderView>,
     ollama: Option<ProviderView>,
+    /// The saved Codex logins the pop-up lists; empty while the card is off.
+    codex_logins: Vec<CodexLoginView>,
+    /// A saved login whose renewal failed, with the stored copy it failed from:
+    /// that copy is not asked again until it changes ([`CodexLogin::same_tokens`]).
+    codex_failed: Vec<FailedCodex>,
     codex_tried: Option<DateTime<Utc>>,
     ollama_tried: Option<DateTime<Utc>>,
-    /// The list the UI received last; a send happens only when it changes.
-    published: Vec<ProviderView>,
+    /// The lists the UI received last; a send happens only when they change.
+    published: (Vec<ProviderView>, Vec<CodexLoginView>),
+}
+
+/// One saved login whose renewal failed: the account, the stored copy that
+/// failed, and the error's text. A new stored copy is asked again.
+#[derive(Debug, Clone, PartialEq)]
+struct FailedCodex {
+    account: AccountRef,
+    copy: CodexLogin,
+    message: String,
+}
+
+/// One Codex round's work before the settings are read again: the live login's
+/// answer for the card, every other saved login's answer, and whether the list
+/// of saved logins could be read at all.
+struct CodexRound {
+    card: CodexCard,
+    /// The account `sync_live` saw in `auth.json`, when it saved one.
+    live: Option<AccountRef>,
+    answers: Vec<CodexAnswer>,
+    /// The saved logins could not be read: the pop-up keeps the ones it had.
+    keep_logins: bool,
+}
+
+impl CodexRound {
+    /// A round that read nothing: `text` is the card's error and the pop-up
+    /// keeps the list it had, never a silent "no logins".
+    fn unreadable(text: String) -> CodexRound {
+        CodexRound {
+            card: CodexCard::Failed(text),
+            live: None,
+            answers: Vec::new(),
+            keep_logins: true,
+        }
+    }
+}
+
+/// The live Codex login's answer, as the card shows it.
+enum CodexCard {
+    Reading(Box<ProviderReading>),
+    Failed(String),
+}
+
+/// One saved Codex login's answer in a round, before it is recorded or shown.
+struct CodexAnswer {
+    account: AccountRef,
+    state: CodexLoginState,
+    message: Option<String>,
+    /// The reading's usage; a failed answer keeps its last one from the rows.
+    usage: Option<Usage>,
+    /// The reading to record and to make a subscription for, when the answer
+    /// is a successful one.
+    reading: Option<ProviderReading>,
+    /// The stored copy a failed renewal is remembered from.
+    copy: Option<CodexLogin>,
+    /// Whether this is the login `sync_live` saw in `auth.json`.
+    live: bool,
+}
+
+impl CodexAnswer {
+    fn failed(
+        account: AccountRef,
+        state: CodexLoginState,
+        message: String,
+        copy: Option<CodexLogin>,
+    ) -> CodexAnswer {
+        CodexAnswer {
+            account,
+            state,
+            message: Some(message),
+            usage: None,
+            reading: None,
+            copy,
+            live: false,
+        }
+    }
 }
 
 impl ProvidersRuntime {
@@ -333,6 +491,7 @@ impl ProvidersRuntime {
         api: Api,
         ui: Option<Sender<UiEvent>>,
         app: AppPaths,
+        store_opener: StoreOpener,
         codex_paths: CodexPathsLookup,
         settings_lookup: SettingsLookup,
         report: ReportError,
@@ -342,6 +501,8 @@ impl ProvidersRuntime {
             api,
             ui,
             app,
+            store: None,
+            store_opener,
             codex_paths,
             settings_lookup,
             recorder: history.map(Recorder::new),
@@ -350,9 +511,11 @@ impl ProvidersRuntime {
             settings: None,
             codex: None,
             ollama: None,
+            codex_logins: Vec::new(),
+            codex_failed: Vec::new(),
             codex_tried: None,
             ollama_tried: None,
-            published: Vec::new(),
+            published: (Vec::new(), Vec::new()),
         }
     }
 
@@ -366,6 +529,12 @@ impl ProvidersRuntime {
             views.push(view.clone());
         }
         views
+    }
+
+    /// The saved Codex logins the snapshot carries; empty while the card is off.
+    #[cfg(test)]
+    pub(crate) fn codex_logins(&self) -> Vec<CodexLoginView> {
+        self.codex_logins.clone()
     }
 
     /// The start and every five minutes: every card that is switched on, and
@@ -444,6 +613,25 @@ impl ProvidersRuntime {
         self.views()
     }
 
+    /// A Codex login was switched or forgotten: poll Codex at once, the way a
+    /// settings save pokes the thread, so the live mark and the rows follow the
+    /// switch before the next five-minute round.
+    pub(crate) fn codex_changed(
+        &mut self,
+        settings: &Settings,
+        now: DateTime<Utc>,
+    ) -> Vec<ProviderView> {
+        let previous = self.settings.replace(settings.clone());
+        self.settle(settings, previous.as_ref());
+        let mut due = Vec::new();
+        if Provider::Codex.is_on(settings) || self.priced(Provider::Codex) {
+            due.push(Provider::Codex);
+        }
+        self.poll(&due, settings, now);
+        self.publish();
+        self.views()
+    }
+
     /// Drop the view of a card that is now off, and of one whose folder or URL
     /// changed since `previous`: the old numbers belong to another account or
     /// server. Returns the cards whose folder or URL changed.
@@ -453,9 +641,15 @@ impl ProvidersRuntime {
             if !provider.is_on(settings) {
                 *provider.view_mut(&mut self.codex, &mut self.ollama) = None;
                 *provider.tried_mut(&mut self.codex_tried, &mut self.ollama_tried) = None;
+                if provider == Provider::Codex {
+                    self.codex_logins.clear();
+                }
             } else if previous.is_some_and(|previous| provider.setting_changed(previous, settings))
             {
                 *provider.view_mut(&mut self.codex, &mut self.ollama) = None;
+                if provider == Provider::Codex {
+                    self.codex_logins.clear();
+                }
                 changed.push(provider);
             }
         }
@@ -464,136 +658,390 @@ impl ProvidersRuntime {
 
     fn poll(&mut self, due: &[Provider], settings: &Settings, now: DateTime<Utc>) {
         for provider in due {
-            let result = match provider {
-                Provider::Codex => self.read_codex(settings),
-                Provider::Ollama => providers::ollama::read(&settings.ollama_url, &self.api),
-            };
             match provider {
-                Provider::Codex => self.codex_tried = Some(now),
-                Provider::Ollama => self.ollama_tried = Some(now),
+                Provider::Codex => self.poll_codex(settings, now),
+                Provider::Ollama => self.poll_ollama(settings, now),
             }
-            // A save that switches this card off or moves it is a queued
-            // command, so the request has ended before that save ran. Read the
-            // settings again: an answer for a card that is now off and unpriced,
-            // or that sits elsewhere, leaves no trace. A failed read is reported
-            // and drops the answer too; nothing is recorded on a guess. A card
-            // that is off but whose subscription has a price is still recorded;
-            // it has no view (spec §7.9).
-            let current = match (self.settings_lookup)(settings) {
-                Ok(current) => current,
-                Err(text) => {
-                    self.report_error(&text);
-                    continue;
-                }
-            };
-            let on = provider.is_on(&current);
-            let keep =
-                (on || self.priced(*provider)) && !provider.setting_changed(settings, &current);
-            if !keep {
-                continue;
-            }
-            let view = match result {
-                Ok(reading) => {
-                    self.record(&reading, now);
-                    self.ensure_subscription(*provider, &reading, now);
-                    if on {
-                        Some(success(*provider, reading, now))
-                    } else {
-                        None
-                    }
-                }
-                Err(error) => {
-                    let text = error.to_string();
-                    if on {
-                        Some(failure(*provider, self.view(*provider), text))
-                    } else {
-                        // The card is off, so there is no view to show the
-                        // error; report it the way every provider error is.
-                        self.report_error(&text);
-                        None
-                    }
-                }
-            };
-            *provider.view_mut(&mut self.codex, &mut self.ollama) = view;
         }
     }
 
-    /// The subscription of `provider`, or `None` after reporting a file that
-    /// cannot be read. A read failure is never a silent "no price".
-    fn subscription(&mut self, provider: Provider) -> Option<ProviderSubscription> {
-        match store::load_accounts(&self.app) {
-            Ok(file) => file
-                .provider_subscriptions
-                .into_iter()
-                .find(|subscription| subscription.account.org == provider.name()),
-            Err(error) => {
-                self.report_error(&error.to_string());
+    /// The settings as they are after a request ended, or `None` after
+    /// reporting a setting read that failed: a save that switches a card off or
+    /// moves it is a queued command, so the request has ended before that save
+    /// ran.
+    fn settings_after_request(&mut self, used: &Settings) -> Option<Settings> {
+        match (self.settings_lookup)(used) {
+            Ok(current) => Some(current),
+            Err(text) => {
+                self.report_error(&text);
                 None
             }
         }
     }
 
-    /// Whether this provider is polled for its price with the card off.
-    fn priced(&mut self, provider: Provider) -> bool {
-        self.subscription(provider)
-            .is_some_and(|subscription| subscription.price.is_some())
+    /// Whether a card is still read after the request: it is on, or its
+    /// subscription has a price, and it has not moved. A card that is on and
+    /// unpriced is still shown. A card that is off but whose subscription has a
+    /// price is still recorded; it has no view (spec §7.9).
+    fn keeps(&mut self, provider: Provider, used: &Settings, current: &Settings) -> bool {
+        if provider.setting_changed(used, current) {
+            return false;
+        }
+        provider.is_on(current) || self.priced(provider)
     }
 
-    /// Make sure a successful reading's account has a subscription, and write
-    /// the events that reports: `accountAdded` when it was created, and
-    /// `planChanged` when the provider named another plan. A failure here is
-    /// reported like any provider error and never stops the poll.
-    fn ensure_subscription(
-        &mut self,
-        provider: Provider,
-        reading: &ProviderReading,
-        now: DateTime<Utc>,
-    ) {
-        match switcher::ensure_provider_subscription(
-            &self.app,
-            &reading.account,
-            reading.plan.as_deref(),
-        ) {
-            Ok(ensured) => {
-                let mut failures = Vec::new();
-                if let Ok(recorder) = &mut self.recorder {
-                    if ensured.created {
-                        if let Err(error) = recorder.event(
-                            now,
-                            EventKind::AccountAdded {
-                                account: reading.account.clone(),
-                                plan: reading.plan.clone(),
-                            },
-                        ) {
-                            failures.push(ops::history_unwritable(&error));
-                        }
-                    }
-                    if let Some(change) = &ensured.plan_change {
-                        if let Err(error) = ops::record_plan_change(recorder, change, now) {
-                            failures.push(ops::history_unwritable(&error));
-                        }
-                    }
-                }
-                for text in &failures {
-                    self.report_error(text);
-                }
-                self.print_history_warnings();
+    /// One Ollama round: the balance and the 24 h usage, then the same checks
+    /// every provider answer gets before it is recorded or shown.
+    fn poll_ollama(&mut self, settings: &Settings, now: DateTime<Utc>) {
+        let result = providers::ollama::read(&settings.ollama_url, &self.api);
+        self.ollama_tried = Some(now);
+        let Some(current) = self.settings_after_request(settings) else {
+            return;
+        };
+        let on = current.ollama_card;
+        let keep = self.keeps(Provider::Ollama, settings, &current);
+        if !keep {
+            return;
+        }
+        let view = match result {
+            Ok(reading) => {
+                self.record(&reading, now);
+                self.ensure_subscription(&reading, now);
+                on.then(|| success(Provider::Ollama, reading, now))
             }
-            Err(error) => self.report_error(&format!(
-                "the {} subscription is not saved: {error}",
-                provider.title()
-            )),
+            Err(error) => {
+                let text = error.to_string();
+                if on {
+                    Some(failure(Provider::Ollama, self.ollama.as_ref(), text))
+                } else {
+                    // The card is off, so there is no view to show the error;
+                    // report it the way every provider error is.
+                    self.report_error(&text);
+                    None
+                }
+            }
+        };
+        self.ollama = view;
+    }
+
+    /// One Codex round (R8): save the live login, read it, then read every other
+    /// saved login with its own stored token, all before the settings are read
+    /// again. A login whose renewal failed is not asked again until its stored
+    /// copy changes.
+    fn poll_codex(&mut self, settings: &Settings, now: DateTime<Utc>) {
+        let round = self.read_codex_round(settings);
+        self.codex_tried = Some(now);
+        let Some(current) = self.settings_after_request(settings) else {
+            return;
+        };
+        let on = current.codex_card;
+        let keep = self.keeps(Provider::Codex, settings, &current);
+        if !keep {
+            return;
+        }
+
+        let mut live_answer = None;
+        let card = match round.card {
+            CodexCard::Reading(reading) => {
+                let reading = *reading;
+                live_answer = Some(CodexAnswer {
+                    account: round
+                        .live
+                        .clone()
+                        .unwrap_or_else(|| reading.account.clone()),
+                    state: CodexLoginState::Ok,
+                    message: None,
+                    usage: reading.usage.clone(),
+                    // The reading is recorded here; the saved logins' below.
+                    reading: None,
+                    copy: None,
+                    live: true,
+                });
+                self.record(&reading, now);
+                self.ensure_subscription(&reading, now);
+                on.then(|| success(Provider::Codex, reading, now))
+            }
+            CodexCard::Failed(text) => {
+                if let Some(live) = &round.live {
+                    live_answer = Some(CodexAnswer {
+                        account: live.clone(),
+                        state: CodexLoginState::Error,
+                        message: Some(text.clone()),
+                        usage: None,
+                        reading: None,
+                        copy: None,
+                        live: true,
+                    });
+                }
+                if on {
+                    Some(failure(Provider::Codex, self.codex.as_ref(), text))
+                } else {
+                    // The card is off, so there is no view to show the error.
+                    self.report_error(&text);
+                    None
+                }
+            }
+        };
+        self.codex = card;
+
+        let mut answers = round.answers;
+        if let Some(answer) = live_answer {
+            answers.push(answer);
+        }
+        for answer in &answers {
+            if let Some(reading) = &answer.reading {
+                self.record(reading, now);
+                self.ensure_subscription(reading, now);
+            }
+        }
+        if !round.keep_logins {
+            // A login whose renewal failed is kept out of the requests until
+            // its stored copy changes (R8): a new copy means the user signed
+            // in again. An expired answer without its message or copy cannot
+            // come from `CodexAnswer::failed`; it is reported, not defaulted.
+            let mut failed = Vec::new();
+            for answer in &answers {
+                if answer.state != CodexLoginState::Expired {
+                    continue;
+                }
+                match (answer.copy.clone(), answer.message.clone()) {
+                    (Some(copy), Some(message)) => failed.push(FailedCodex {
+                        account: answer.account.clone(),
+                        copy,
+                        message,
+                    }),
+                    (Some(_), None) => self.report_error(EXPIRED_WITHOUT_MESSAGE),
+                    (None, _) => self.report_error(EXPIRED_WITHOUT_COPY),
+                }
+            }
+            self.codex_failed = failed;
+            if on {
+                self.publish_codex_logins(&answers);
+            } else {
+                // The card is off: the pop-up has nowhere to show the rows.
+                self.codex_logins.clear();
+            }
         }
     }
 
-    fn read_codex(&self, settings: &Settings) -> Result<ProviderReading, providers::ProviderError> {
-        let paths = (self.codex_paths)(settings.codex_home.as_deref())
-            .map_err(|error| providers::ProviderError::Setting(error.to_string()))?;
-        providers::codex::read(&paths, &self.api)
+    /// The Codex round's network and store work, before the settings are read
+    /// again: nothing in here is recorded or shown.
+    fn read_codex_round(&mut self, settings: &Settings) -> CodexRound {
+        let paths = match (self.codex_paths)(settings.codex_home.as_deref()) {
+            Ok(paths) => paths,
+            Err(error) => {
+                return CodexRound::unreadable(
+                    providers::ProviderError::Setting(error.to_string()).to_string(),
+                )
+            }
+        };
+        // The store opens on the first Codex round; an earlier failed open is
+        // tried again here, and its error is the card's until an open succeeds.
+        if self.store.is_none() {
+            match (self.store_opener)() {
+                Ok(store) => self.store = Some(store),
+                Err(text) => return CodexRound::unreadable(text),
+            }
+        }
+        let store = match self.store.as_ref() {
+            Some(store) => store,
+            None => return CodexRound::unreadable("the store is not open".to_string()),
+        };
+        let secrets = store.secrets();
+        let (live, card) = match providers::codex::sync_live(&self.app, &paths, secrets) {
+            Ok(live) => {
+                let reading = providers::codex::read(&paths, &self.api);
+                (Some(live.account.clone()), reading)
+            }
+            // Without the live login the round cannot tell which saved login is
+            // live, so it asks none of them (B2): the rows keep their last
+            // values and state until the live login can be read again.
+            Err(error) => {
+                return CodexRound {
+                    card: CodexCard::Failed(error.to_string()),
+                    live: None,
+                    answers: Vec::new(),
+                    keep_logins: true,
+                }
+            }
+        };
+        let card = match card {
+            Ok(reading) => CodexCard::Reading(Box::new(reading)),
+            Err(error) => CodexCard::Failed(error.to_string()),
+        };
+        let subscriptions = match store::load_accounts(&self.app) {
+            Ok(file) => file.provider_subscriptions,
+            Err(error) => {
+                // The list of saved logins cannot be known; the pop-up keeps
+                // the one it had.
+                self.report_error(&error.to_string());
+                return CodexRound {
+                    card,
+                    live,
+                    answers: Vec::new(),
+                    keep_logins: true,
+                };
+            }
+        };
+
+        let mut answers = Vec::new();
+        for subscription in subscriptions
+            .iter()
+            .filter(|subscription| subscription.account.org == CODEX_ORG)
+        {
+            if live.as_ref() == Some(&subscription.account) {
+                continue;
+            }
+            let account = subscription.account.clone();
+            let copy = match secrets.get_codex(&providers::codex::secret_id(&account)) {
+                Ok(Some(copy)) => copy,
+                // No stored copy: this subscription's login is not saved.
+                Ok(None) => continue,
+                Err(error) => {
+                    answers.push(CodexAnswer::failed(
+                        account,
+                        CodexLoginState::Error,
+                        error.to_string(),
+                        None,
+                    ));
+                    continue;
+                }
+            };
+            if let Some(failed) = self
+                .codex_failed
+                .iter()
+                .find(|failed| failed.account == account && failed.copy.same_tokens(&copy))
+            {
+                answers.push(CodexAnswer::failed(
+                    account,
+                    CodexLoginState::Expired,
+                    failed.message.clone(),
+                    Some(copy),
+                ));
+                continue;
+            }
+            match providers::codex::read_saved(&self.app, secrets, &account, &self.api) {
+                Ok(reading) => answers.push(CodexAnswer {
+                    account,
+                    state: CodexLoginState::Ok,
+                    message: None,
+                    usage: reading.usage.clone(),
+                    reading: Some(reading),
+                    copy: Some(copy),
+                    live: false,
+                }),
+                Err(providers::ProviderError::RenewFailed(message)) => answers.push(
+                    CodexAnswer::failed(account, CodexLoginState::Expired, message, Some(copy)),
+                ),
+                Err(error) => answers.push(CodexAnswer::failed(
+                    account,
+                    CodexLoginState::Error,
+                    error.to_string(),
+                    Some(copy),
+                )),
+            }
+        }
+        CodexRound {
+            card,
+            live,
+            answers,
+            keep_logins: false,
+        }
     }
 
-    fn view(&self, provider: Provider) -> Option<&ProviderView> {
-        provider.view(&self.codex, &self.ollama)
+    /// The pop-up's Codex rows (R8): the live login first, then the rest by
+    /// abbreviation, from the round's answers and the subscriptions in
+    /// `accounts.json`. A failed reading keeps the usage of its last one, like
+    /// the card. A list that cannot be built keeps the rows it had.
+    fn publish_codex_logins(&mut self, answers: &[CodexAnswer]) {
+        let subscriptions = match store::load_accounts(&self.app) {
+            Ok(file) => file.provider_subscriptions,
+            Err(error) => {
+                self.report_error(&error.to_string());
+                return;
+            }
+        };
+        let previous = std::mem::take(&mut self.codex_logins);
+        let mut views = Vec::new();
+        for answer in answers {
+            let Some(subscription) = subscriptions
+                .iter()
+                .find(|subscription| subscription.account == answer.account)
+            else {
+                self.report_error(&format!(
+                    "the saved Codex login {} has no subscription in accounts.json",
+                    answer.account.acc
+                ));
+                continue;
+            };
+            let usage = answer.usage.clone().or_else(|| {
+                previous
+                    .iter()
+                    .find(|view| view.account == answer.account)
+                    .and_then(|view| view.usage.clone())
+            });
+            views.push(CodexLoginView {
+                account: answer.account.clone(),
+                abbr: subscription.abbr.clone(),
+                label: subscription.label.clone(),
+                color: subscription.color.clone(),
+                plan: subscription.plan.clone(),
+                live: answer.live,
+                usage,
+                state: answer.state,
+                message: answer.message.clone(),
+            });
+        }
+        views
+            .sort_by(|first, second| (!first.live, &first.abbr).cmp(&(!second.live, &second.abbr)));
+        self.codex_logins = views;
+    }
+
+    /// The subscriptions of `provider`'s org, or none after reporting a file
+    /// that cannot be read. A read failure is never a silent "no price".
+    /// One org can have several (one per Codex login, R8), so nothing here may
+    /// assume a single subscription.
+    fn subscriptions(&mut self, provider: Provider) -> Vec<ProviderSubscription> {
+        match store::load_accounts(&self.app) {
+            Ok(file) => file
+                .provider_subscriptions
+                .into_iter()
+                .filter(|subscription| subscription.account.org == provider.name())
+                .collect(),
+            Err(error) => {
+                self.report_error(&error.to_string());
+                Vec::new()
+            }
+        }
+    }
+
+    /// Whether any subscription of this provider has a price, so the provider is
+    /// polled even with its card off (spec R4).
+    fn priced(&mut self, provider: Provider) -> bool {
+        self.subscriptions(provider)
+            .iter()
+            .any(|subscription| subscription.price.is_some())
+    }
+
+    /// Make sure a successful reading's account has a subscription through the
+    /// one [`ops::ensure_provider_subscription`], which writes `accountAdded`
+    /// and `planChanged`. Its warnings are reported here like any provider
+    /// error and never stop the poll.
+    fn ensure_subscription(&mut self, reading: &ProviderReading, now: DateTime<Utc>) {
+        let warnings = {
+            let recorder = self.recorder.as_ref().ok();
+            ops::ensure_provider_subscription(
+                &self.app,
+                recorder,
+                &reading.account,
+                reading.plan.as_deref(),
+                now,
+            )
+        };
+        for text in &warnings {
+            self.report_error(text);
+        }
+        self.print_history_warnings();
     }
 
     /// Record a reading that carries a usage and Ollama's hourly buckets; one
@@ -656,13 +1104,16 @@ impl ProvidersRuntime {
     }
 
     fn publish(&mut self) {
-        let list = self.views();
+        let list = (self.views(), self.codex_logins.clone());
         if list == self.published {
             return;
         }
         self.published = list.clone();
         if let Some(ui) = &self.ui {
-            let _ = ui.send(UiEvent::Providers(list));
+            let _ = ui.send(UiEvent::Providers(ProviderLists {
+                cards: list.0,
+                codex_logins: list.1,
+            }));
         }
     }
 }
@@ -719,7 +1170,28 @@ mod tests {
 
     use crate::gui::ReportedErrors;
 
-    const AUTH: &str = r#"{"OPENAI_API_KEY":null,"auth_mode":"chatgpt","last_refresh":"2026-11-14T16:53:03.750022420Z","tokens":{"id_token":"eyJhbGciOi.id.sig","access_token":"eyJhbGciOi.access.sig","refresh_token":"rt_9f2c","account_id":"0f3a6c2e-7b1d-4e9a-8c5f-2d4b6a8e0c13","login_owner_id":"user-sam","oauth_provenance":"cli"}}"#;
+    const AUTH: &str = r#"{"OPENAI_API_KEY":null,"auth_mode":"chatgpt","last_refresh":"2026-11-14T16:53:03.750022420Z","tokens":{"id_token":"eyJhbGciOi.id.sig","access_token":"eyJhbGciOi.access.sig","refresh_token":"rt_9f2c","account_id":"0f3a6c2e-7b1d-4e9a-8c5f-2d4b6a8e0c13","login_owner_id":"user-sam","oauth_provenance":{"issuer":"https://auth.openai.com","client_id":"app_4c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f"}}}"#;
+
+    /// The fixture's live Codex account id.
+    const LIVE_ACCOUNT_ID: &str = "0f3a6c2e-7b1d-4e9a-8c5f-2d4b6a8e0c13";
+    /// A second Codex login's account id and its own access token (R8: every
+    /// saved login is asked with its own, never with the live one's).
+    const SAVED_ACCOUNT_ID: &str = "7d2b9e4c-1a3f-4c5e-8b6d-9f0a1c2e3d4b";
+    const SAVED_AUTH: &str = r#"{"OPENAI_API_KEY":null,"auth_mode":"chatgpt","last_refresh":"2026-11-15T09:10:00.000000000Z","tokens":{"id_token":"eyJhbGciOi.saved.id","access_token":"eyJhbGciOi.saved.sig","refresh_token":"rt_51ab","account_id":"7d2b9e4c-1a3f-4c5e-8b6d-9f0a1c2e3d4b","login_owner_id":"user-sam","oauth_provenance":{"issuer":"https://auth.openai.com","client_id":"app_4c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f"}}}"#;
+
+    /// The second login's usage answer: the `pro` plan of its own account.
+    const PRO_ANSWER: &str = r#"{"user_id":"user-sam","account_id":"7d2b9e4c-1a3f-4c5e-8b6d-9f0a1c2e3d4b","email":"sam@mail.example","plan_type":"pro",
+  "rate_limit":{"allowed":true,"limit_reached":false,
+   "primary_window":{"used_percent":3,"limit_window_seconds":18000,"reset_after_seconds":17100,"reset_at":1794693195},
+   "secondary_window":{"used_percent":20,"limit_window_seconds":604800,"reset_after_seconds":316800,"reset_at":1795279995}},
+  "code_review_rate_limit":null,"additional_rate_limits":null,
+  "credits":{"has_credits":false,"unlimited":false,"overage_limit_reached":false,"balance":"0"},
+  "spend_control":{"reached":false,"individual_limit":null},"rate_limit_reached_type":null}"#;
+
+    /// The fixture's live login with another access token, as Codex renews it in
+    /// place, and a second `auth.json` for another account (a new account id).
+    const AUTH_RENEWED: &str = r#"{"OPENAI_API_KEY":null,"auth_mode":"chatgpt","last_refresh":"2026-11-15T09:10:00.000000000Z","tokens":{"id_token":"eyJhbGciOi.id.sig","access_token":"eyJhbGciOi.renewed.sig","refresh_token":"rt_9f2c","account_id":"0f3a6c2e-7b1d-4e9a-8c5f-2d4b6a8e0c13","login_owner_id":"user-sam","oauth_provenance":{"issuer":"https://auth.openai.com","client_id":"app_4c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f"}}}"#;
+    const AUTH_OTHER_ACCOUNT: &str = r#"{"OPENAI_API_KEY":null,"auth_mode":"chatgpt","last_refresh":"2026-11-15T10:00:00.000000000Z","tokens":{"id_token":"eyJhbGciOi.other.id","access_token":"eyJhbGciOi.other.sig","refresh_token":"rt_77cd","account_id":"7d2b9e4c-1a3f-4c5e-8b6d-9f0a1c2e3d4b","login_owner_id":"user-sam","oauth_provenance":{"issuer":"https://auth.openai.com","client_id":"app_4c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f"}}}"#;
 
     const PLUS_ANSWER: &str = r#"{"user_id":"user-sam","account_id":"0f3a6c2e-7b1d-4e9a-8c5f-2d4b6a8e0c13","email":"sam@mail.example","plan_type":"plus",
   "rate_limit":{"allowed":true,"limit_reached":false,
@@ -775,6 +1247,17 @@ mod tests {
         Store::new(app.clone(), Box::new(FileSecrets::new(app.secrets_dir())))
     }
 
+    /// The opener a runtime gets in a test: a store with `FileSecrets` in the
+    /// tempdir's secrets folder.
+    fn test_store_opener(app: AppPaths) -> StoreOpener {
+        Box::new(move || {
+            Ok(Store::new(
+                app.clone(),
+                Box::new(FileSecrets::new(app.secrets_dir())),
+            ))
+        })
+    }
+
     fn test_runtime(dir: &Path, api: Api, codex_home: &Path) -> ProvidersRuntime {
         let codex_home = codex_home.to_path_buf();
         test_runtime_with(
@@ -817,11 +1300,13 @@ mod tests {
         report: ReportError,
         app: AppPaths,
     ) -> ProvidersRuntime {
+        let store_opener = test_store_opener(app.clone());
         ProvidersRuntime::new(
             Ok(history(dir)),
             api,
             None,
             app,
+            store_opener,
             codex_paths,
             settings_lookup,
             report,
@@ -857,6 +1342,8 @@ mod tests {
     struct Fake {
         base: String,
         paths: Receiver<String>,
+        /// Each request's `Authorization` header, in the same order as `paths`.
+        authorizations: Receiver<Option<String>>,
         stop: Arc<AtomicBool>,
         thread: Option<thread::JoinHandle<()>>,
     }
@@ -871,6 +1358,7 @@ mod tests {
             let stop = Arc::new(AtomicBool::new(false));
             let thread_stop = Arc::clone(&stop);
             let (sender, receiver) = mpsc::channel();
+            let (auth_sender, auth_receiver) = mpsc::channel();
             let thread = thread::spawn(move || {
                 let mut served = 0usize;
                 let mut deadline = Instant::now() + Duration::from_secs(10);
@@ -881,8 +1369,9 @@ mod tests {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
                             stream.set_nonblocking(false).expect("a blocking stream");
-                            let path = read_request(&stream);
+                            let (path, authorization) = read_request(&stream);
                             let _ = sender.send(path);
+                            let _ = auth_sender.send(authorization);
                             let (status, body) = replies
                                 .get(served)
                                 .cloned()
@@ -905,22 +1394,37 @@ mod tests {
             Fake {
                 base,
                 paths: receiver,
+                authorizations: auth_receiver,
                 stop,
                 thread: Some(thread),
             }
         }
 
         fn finish(mut self) -> Vec<String> {
+            self.stop_and_join();
+            self.paths.try_iter().collect()
+        }
+
+        /// Every request's path and `Authorization` header, in order.
+        fn finish_requests(mut self) -> (Vec<String>, Vec<Option<String>>) {
+            self.stop_and_join();
+            (
+                self.paths.try_iter().collect(),
+                self.authorizations.try_iter().collect(),
+            )
+        }
+
+        fn stop_and_join(&mut self) {
             thread::sleep(Duration::from_millis(50));
             self.stop.store(true, Ordering::SeqCst);
             if let Some(thread) = self.thread.take() {
                 thread.join().expect("the server thread");
             }
-            self.paths.try_iter().collect()
         }
     }
 
-    fn read_request(stream: &std::net::TcpStream) -> String {
+    /// One request's path and its `Authorization` header, when it has one.
+    fn read_request(stream: &std::net::TcpStream) -> (String, Option<String>) {
         let mut reader = BufReader::new(stream.try_clone().expect("a stream clone"));
         let mut line = String::new();
         reader.read_line(&mut line).expect("the request line");
@@ -929,6 +1433,7 @@ mod tests {
             .nth(1)
             .unwrap_or_default()
             .to_string();
+        let mut authorization = None;
         loop {
             let mut header = String::new();
             if reader.read_line(&mut header).expect("a header") == 0 {
@@ -937,8 +1442,13 @@ mod tests {
             if header == "\r\n" || header == "\n" {
                 break;
             }
+            if let Some((name, value)) = header.split_once(':') {
+                if name.eq_ignore_ascii_case("authorization") {
+                    authorization = Some(value.trim().to_string());
+                }
+            }
         }
-        path
+        (path, authorization)
     }
 
     fn write_reply(stream: &mut std::net::TcpStream, status: u16, body: &str) {
@@ -949,9 +1459,418 @@ mod tests {
         stream.write_all(text.as_bytes()).expect("a reply");
     }
 
+    fn codex_login(text: &str) -> CodexLogin {
+        serde_json::from_str(text).expect("a Codex login")
+    }
+
+    fn account(acc: &str) -> AccountRef {
+        AccountRef {
+            acc: acc.to_string(),
+            org: CODEX_ORG.to_string(),
+        }
+    }
+
     fn only_view(views: Vec<ProviderView>) -> ProviderView {
         assert_eq!(views.len(), 1, "one switched-on card is one view");
         views.into_iter().next().expect("one view")
+    }
+
+    /// R8: every poll saves the live Codex login, so a login Codex renewed — or
+    /// the user just signed in with — is the one seatswap stores, and a new
+    /// account id gets its subscription.
+    #[test]
+    fn the_live_codex_login_is_saved_at_each_poll() {
+        let dir = tempdir().expect("tempdir");
+        let codex_home = dir.path().join("codex");
+        write_auth(&codex_home);
+        let server = Fake::start(vec![
+            (200, PLUS_ANSWER.to_string()),
+            (200, PLUS_ANSWER.to_string()),
+            (200, PRO_ANSWER.to_string()),
+            (200, PLUS_ANSWER.to_string()),
+        ]);
+        let api = codex_api(&server.base);
+        let mut runtime = test_runtime(dir.path(), api, &codex_home);
+        let store = test_store(dir.path());
+        let live = account(LIVE_ACCOUNT_ID);
+
+        only_view(runtime.poll_round(&codex_on(), utc("2026-11-14T09:00:00Z")));
+        let saved = store
+            .secrets()
+            .get_codex(&providers::codex::secret_id(&live))
+            .expect("the stored copy")
+            .expect("the live login is saved");
+        assert_eq!(saved, codex_login(AUTH));
+        let file = store.load().expect("accounts.json");
+        let subscription = file
+            .provider_subscription(&live)
+            .expect("the live login's subscription");
+        assert_eq!(subscription.abbr, "OA");
+        assert_eq!(subscription.plan.as_deref(), Some("Plus"));
+
+        // Codex renewed the login in place: the next poll saves the new copy.
+        std::fs::write(codex_home.join("auth.json"), AUTH_RENEWED).expect("the renewed auth.json");
+        only_view(runtime.poll_round(&codex_on(), utc("2026-11-14T09:05:00Z")));
+        let saved = store
+            .secrets()
+            .get_codex(&providers::codex::secret_id(&live))
+            .expect("the stored copy")
+            .expect("the renewed login is saved");
+        assert_eq!(saved, codex_login(AUTH_RENEWED));
+
+        // The user signed in with another account: it is saved and gets its own
+        // subscription, beside the one the first login has.
+        std::fs::write(codex_home.join("auth.json"), AUTH_OTHER_ACCOUNT)
+            .expect("the other account's auth.json");
+        only_view(runtime.poll_round(&codex_on(), utc("2026-11-14T09:10:00Z")));
+        let other = account(SAVED_ACCOUNT_ID);
+        let saved = store
+            .secrets()
+            .get_codex(&providers::codex::secret_id(&other))
+            .expect("the stored copy")
+            .expect("the other login is saved");
+        assert_eq!(saved, codex_login(AUTH_OTHER_ACCOUNT));
+        let file = store.load().expect("accounts.json");
+        let subscription = file
+            .provider_subscription(&other)
+            .expect("the new account id's subscription");
+        assert_eq!(subscription.abbr, "O2", "OA is taken by the first login");
+        assert_eq!(subscription.plan.as_deref(), Some("Pro"));
+
+        let logins = runtime.codex_logins();
+        assert_eq!(logins.len(), 2, "one row per saved login");
+        assert_eq!(logins[0].account, other);
+        assert!(logins[0].live, "the live login comes first");
+        assert_eq!(logins[0].abbr, "O2");
+        assert_eq!(logins[0].plan.as_deref(), Some("Pro"));
+        assert_eq!(logins[1].account, live);
+        assert!(!logins[1].live);
+        assert_eq!(logins[1].abbr, "OA");
+        assert_eq!(logins[1].state, CodexLoginState::Ok);
+        let _ = server.finish();
+    }
+
+    /// R8: every saved Codex login is asked with its own stored token, never
+    /// with the live one's, and the pop-up lists each with its own plan.
+    #[test]
+    fn every_saved_codex_login_is_polled_with_its_own_token() {
+        let dir = tempdir().expect("tempdir");
+        let codex_home = dir.path().join("codex");
+        write_auth(&codex_home);
+        let store = test_store(dir.path());
+        let live = account(LIVE_ACCOUNT_ID);
+        let other = account(SAVED_ACCOUNT_ID);
+        store
+            .secrets()
+            .set_codex(
+                &providers::codex::secret_id(&other),
+                &codex_login(SAVED_AUTH),
+            )
+            .expect("the saved copy");
+        let mut file = store.load().expect("accounts.json");
+        file.provider_subscriptions.push(ProviderSubscription {
+            account: other.clone(),
+            label: "OpenAI".to_string(),
+            abbr: "OA2".to_string(),
+            color: "#db2777".to_string(),
+            plan: Some("Pro".to_string()),
+            price: None,
+            price_currency: None,
+        });
+        store.save(&file).expect("accounts.json");
+
+        let server = Fake::start(vec![
+            (200, PLUS_ANSWER.to_string()),
+            (200, PRO_ANSWER.to_string()),
+        ]);
+        let mut runtime = test_runtime(dir.path(), codex_api(&server.base), &codex_home);
+        let view = only_view(runtime.poll_round(&codex_on(), utc("2026-11-14T09:00:00Z")));
+        let (paths, authorizations) = server.finish_requests();
+
+        assert_eq!(view.error, None);
+        assert_eq!(
+            view.plan.as_deref(),
+            Some("Plus"),
+            "the card is the live login"
+        );
+        assert_eq!(
+            paths,
+            vec![
+                "/backend-api/wham/usage".to_string(),
+                "/backend-api/wham/usage".to_string()
+            ],
+            "the live login and the saved one are each asked once"
+        );
+        assert_eq!(
+            authorizations,
+            vec![
+                Some("Bearer eyJhbGciOi.access.sig".to_string()),
+                Some("Bearer eyJhbGciOi.saved.sig".to_string())
+            ],
+            "the saved login is asked with its own token"
+        );
+
+        let logins = runtime.codex_logins();
+        assert_eq!(logins.len(), 2, "one row per saved login");
+        assert_eq!(logins[0].account, live);
+        assert!(logins[0].live);
+        assert_eq!(logins[0].abbr, "OA");
+        assert_eq!(logins[0].plan.as_deref(), Some("Plus"));
+        assert_eq!(logins[0].state, CodexLoginState::Ok);
+        assert!(logins[0].usage.is_some());
+        assert_eq!(logins[1].account, other);
+        assert!(!logins[1].live);
+        assert_eq!(logins[1].abbr, "OA2");
+        assert_eq!(logins[1].plan.as_deref(), Some("Pro"));
+        assert_eq!(logins[1].state, CodexLoginState::Ok);
+        assert!(logins[1].usage.is_some());
+        assert_eq!(logins[1].message, None);
+
+        // A card switched off keeps no rows, and a round after the switch makes
+        // no request while no price keeps the provider polled.
+        let mut off = codex_on();
+        off.codex_card = false;
+        let server = Fake::start(vec![]);
+        runtime.api = codex_api(&server.base);
+        assert!(runtime
+            .poll_round(&off, utc("2026-11-14T09:05:00Z"))
+            .is_empty());
+        let paths = server.finish();
+        assert!(
+            paths.is_empty(),
+            "a switched-off card made a request: {paths:?}"
+        );
+        assert!(
+            runtime.codex_logins().is_empty(),
+            "the rows are gone while the card is off"
+        );
+    }
+
+    /// R8: a login whose renewal failed is `expired` with the error's text and
+    /// is not asked again at every poll; a new stored copy — the user signed in
+    /// again — is asked at the next round.
+    #[test]
+    fn a_login_whose_renewal_failed_is_not_asked_again_until_its_copy_changes() {
+        let dir = tempdir().expect("tempdir");
+        let codex_home = dir.path().join("codex");
+        write_auth(&codex_home);
+        let store = test_store(dir.path());
+        let other = account(SAVED_ACCOUNT_ID);
+        store
+            .secrets()
+            .set_codex(
+                &providers::codex::secret_id(&other),
+                &codex_login(SAVED_AUTH),
+            )
+            .expect("the saved copy");
+        let mut file = store.load().expect("accounts.json");
+        file.provider_subscriptions.push(ProviderSubscription {
+            account: other.clone(),
+            label: "OpenAI".to_string(),
+            abbr: "OA2".to_string(),
+            color: "#db2777".to_string(),
+            plan: Some("Pro".to_string()),
+            price: None,
+            price_currency: None,
+        });
+        store.save(&file).expect("accounts.json");
+
+        // Round one: the live login; then the saved one, whose access token is
+        // dead (401) and whose refresh token is dead too (400). Round two: the
+        // live login only.
+        let server = Fake::start(vec![
+            (200, PLUS_ANSWER.to_string()),
+            (401, String::new()),
+            (400, String::new()),
+            (200, PLUS_ANSWER.to_string()),
+        ]);
+        let api =
+            codex_api(&server.base).with_codex_token_url(&format!("{}/oauth/token", server.base));
+        let mut runtime = test_runtime(dir.path(), api, &codex_home);
+        only_view(runtime.poll_round(&codex_on(), utc("2026-11-14T09:00:00Z")));
+        let expired_row = |runtime: &ProvidersRuntime| {
+            runtime
+                .codex_logins()
+                .into_iter()
+                .find(|login| login.account == other)
+                .expect("the saved login's row")
+        };
+        let expired = expired_row(&runtime);
+        assert_eq!(expired.state, CodexLoginState::Expired);
+        assert_eq!(
+            expired.message.as_deref(),
+            Some("Sign in again with codex login.")
+        );
+        assert!(expired.usage.is_none());
+
+        runtime.poll_round(&codex_on(), utc("2026-11-14T09:05:00Z"));
+        let (paths, _) = server.finish_requests();
+        assert_eq!(
+            paths.len(),
+            4,
+            "the dead login was asked once, not at the second poll: {paths:?}"
+        );
+        assert_eq!(expired_row(&runtime).state, CodexLoginState::Expired);
+
+        // The user signed in again and the new copy is saved: the next round
+        // asks it again and it is OK.
+        let signed_in_again = SAVED_AUTH.replace("eyJhbGciOi.saved.sig", "eyJhbGciOi.signedin.sig");
+        store
+            .secrets()
+            .set_codex(
+                &providers::codex::secret_id(&other),
+                &codex_login(&signed_in_again),
+            )
+            .expect("the new copy");
+        let server = Fake::start(vec![
+            (200, PLUS_ANSWER.to_string()),
+            (200, PRO_ANSWER.to_string()),
+        ]);
+        runtime.api = codex_api(&server.base);
+        runtime.poll_round(&codex_on(), utc("2026-11-14T09:10:00Z"));
+        let (paths, authorizations) = server.finish_requests();
+        assert_eq!(paths.len(), 2, "the new copy is asked again: {paths:?}");
+        assert_eq!(
+            authorizations[1],
+            Some("Bearer eyJhbGciOi.signedin.sig".to_string()),
+            "the new copy's own token"
+        );
+        let row = expired_row(&runtime);
+        assert_eq!(row.state, CodexLoginState::Ok);
+        assert_eq!(row.message, None);
+        assert!(row.usage.is_some());
+    }
+
+    /// B1: a store that could not be opened is not written off for the whole
+    /// run. The first round shows its error; the next round opens it again and
+    /// reads Codex.
+    #[test]
+    fn a_store_that_failed_to_open_is_opened_again_at_the_next_round() {
+        let dir = tempdir().expect("tempdir");
+        let codex_home = dir.path().join("codex");
+        write_auth(&codex_home);
+        let server = Fake::start(vec![(200, PLUS_ANSWER.to_string())]);
+        let api = codex_api(&server.base);
+        let app = test_app(dir.path());
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let opener_app = app.clone();
+        let opener_attempts = Arc::clone(&attempts);
+        let opener: StoreOpener = Box::new(move || {
+            let attempt = opener_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt == 0 {
+                Err("the store could not be opened: accounts.json is corrupt".to_string())
+            } else {
+                Ok(Store::new(
+                    opener_app.clone(),
+                    Box::new(FileSecrets::new(opener_app.secrets_dir())),
+                ))
+            }
+        });
+        let folder = codex_home.clone();
+        let mut runtime = ProvidersRuntime::new(
+            Ok(history(dir.path())),
+            api,
+            None,
+            app,
+            opener,
+            Box::new(move |_| Ok(CodexPaths::at(&folder))),
+            same_settings(),
+            Box::new(|_| {}),
+            Arc::new(Mutex::new(PrintedWarnings::new())),
+        );
+
+        let first = only_view(runtime.poll_round(&codex_on(), utc("2026-11-14T09:00:00Z")));
+        assert_eq!(
+            first.error.as_deref(),
+            Some("the store could not be opened: accounts.json is corrupt")
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the first round tried the open once"
+        );
+
+        let second = only_view(runtime.poll_round(&codex_on(), utc("2026-11-14T09:05:00Z")));
+        let paths = server.finish();
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the next round opened the store again"
+        );
+        assert_eq!(second.error, None, "the card reads Codex after the open");
+        assert!(second.usage.is_some());
+        assert_eq!(
+            paths,
+            vec!["/backend-api/wham/usage".to_string()],
+            "only the round after the open asked Codex"
+        );
+    }
+
+    /// B2: while the live login cannot be read, the round does not know which
+    /// saved login is live, so it asks none of them; their rows keep the last
+    /// values and state.
+    #[test]
+    fn no_saved_login_is_asked_while_the_live_login_is_unknown() {
+        let dir = tempdir().expect("tempdir");
+        let codex_home = dir.path().join("codex");
+        write_auth(&codex_home);
+        let store = test_store(dir.path());
+        let other = account(SAVED_ACCOUNT_ID);
+        store
+            .secrets()
+            .set_codex(
+                &providers::codex::secret_id(&other),
+                &codex_login(SAVED_AUTH),
+            )
+            .expect("the saved copy");
+        let mut file = store.load().expect("accounts.json");
+        file.provider_subscriptions.push(ProviderSubscription {
+            account: other.clone(),
+            label: "OpenAI".to_string(),
+            abbr: "OA2".to_string(),
+            color: "#db2777".to_string(),
+            plan: Some("Pro".to_string()),
+            price: None,
+            price_currency: None,
+        });
+        store.save(&file).expect("accounts.json");
+
+        let server = Fake::start(vec![
+            (200, PLUS_ANSWER.to_string()),
+            (200, PRO_ANSWER.to_string()),
+        ]);
+        let mut runtime = test_runtime(dir.path(), codex_api(&server.base), &codex_home);
+        only_view(runtime.poll_round(&codex_on(), utc("2026-11-14T09:00:00Z")));
+        let (paths, _) = server.finish_requests();
+        assert_eq!(paths.len(), 2, "the live and the saved login were asked");
+        let before = runtime.codex_logins();
+        assert_eq!(before.len(), 2, "both rows were read");
+
+        // Codex's login is now kept in the keyring: sync_live cannot tell which
+        // account is live, so no saved login is asked and none is renewed.
+        std::fs::write(
+            codex_home.join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":null}"#,
+        )
+        .expect("the keyring-shaped auth.json");
+        let server = Fake::start(vec![]);
+        runtime.api = codex_api(&server.base);
+        let view = only_view(runtime.poll_round(&codex_on(), utc("2026-11-14T09:05:00Z")));
+        let paths = server.finish();
+
+        assert!(paths.is_empty(), "a saved login was asked: {paths:?}");
+        assert!(
+            view.error
+                .as_deref()
+                .is_some_and(|text| text.contains("system keyring")),
+            "the card does not say why the live login is unknown: {:?}",
+            view.error
+        );
+        assert_eq!(
+            runtime.codex_logins(),
+            before,
+            "the rows keep their last values and state"
+        );
     }
 
     #[test]
@@ -1558,11 +2477,13 @@ mod tests {
             let _ = sender.send(text.to_string());
         }));
         let report: ReportError = Box::new(move |text: &str| errors.report(text));
+        let app = test_app(dir.path());
         let mut runtime = ProvidersRuntime::new(
             Ok(HistoryDir::at(&root, "atlas")),
             codex_api(&server.base),
             None,
-            test_app(dir.path()),
+            app.clone(),
+            test_store_opener(app),
             Box::new(move |_| Ok(CodexPaths::at(&codex_home))),
             same_settings(),
             report,
@@ -1760,11 +2681,13 @@ mod tests {
             let _ = sender.send(text.to_string());
         });
         let folder = codex_home.clone();
+        let app = test_app(dir.path());
         let mut runtime = ProvidersRuntime::new(
             Err("the history folder could not be opened".to_string()),
             codex_api(&server.base),
             None,
-            test_app(dir.path()),
+            app.clone(),
+            test_store_opener(app),
             Box::new(move |_| Ok(CodexPaths::at(&folder))),
             same_settings(),
             report,

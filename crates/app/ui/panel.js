@@ -45,6 +45,15 @@ const state = {
   unknownKey: null,
   unknownLabel: "",
   refreshing: false,
+  // The note a Codex switch left ("Codex now uses O2..."), shown under the
+  // OpenAI card for ten seconds (R8); the timer clears it.
+  codexNote: null,
+  codexNoteTimer: null,
+  // The `org:acc` of the login whose switch is running: every row waits, and
+  // that row says "switching…" until the worker answers.
+  codexPending: null,
+  // The worker's error answer, shown in the OpenAI card until the next click.
+  codexSwitchError: null,
   lastPercents: new Map(),
   lastCardOrder: [],
   errors: {
@@ -177,6 +186,20 @@ function styleChip(node, abbr, color) {
   node.style.background = accent;
   node.style.color = contrastText(accent);
   return node;
+}
+
+// The one header of an account card and a saved Codex login row (review rule
+// 4): the chip in its colour, the label, any buttons between, and the status
+// on the right. `status` holds the status nodes; an empty list draws none.
+function renderCardTop({ chip, label, extra = [], status = [] }) {
+  const text = label || "?";
+  const parts = [
+    chip,
+    h("span", { class: "card-label", text, title: text }),
+    ...extra,
+  ];
+  if (status.length > 0) parts.push(h("div", { class: "card-status" }, status));
+  return h("div", { class: "card-top" }, parts);
 }
 
 function loginWarningText(warning) {
@@ -833,26 +856,22 @@ function renderCard(view, index) {
   );
   pencil.addEventListener("click", edit);
 
-  const status = h("div", { class: "card-status" });
+  const status = [];
   if (view.loginState === "loggedOut") {
-    status.appendChild(h("span", { class: "card-note", text: "Logged out" }));
+    status.push(h("span", { class: "card-note", text: "Logged out" }));
   } else if (viewIsActive(view)) {
-    status.appendChild(h("span", { class: "pill", text: "Active" }));
+    status.push(h("span", { class: "pill", text: "Active" }));
   } else {
-    status.appendChild(button("Switch", "small", switchHere));
+    status.push(button("Switch", "small", switchHere));
   }
 
   main.appendChild(
-    h("div", { class: "card-top" }, [
-      badge,
-      h("span", {
-        class: "card-label",
-        text: view.label || "Unnamed account",
-        title: view.label || "",
-      }),
-      pencil,
+    renderCardTop({
+      chip: badge,
+      label: view.label || "Unnamed account",
+      extra: [pencil],
       status,
-    ])
+    })
   );
 
   const metaParts = [];
@@ -1089,6 +1108,22 @@ function providerViews() {
   return state.snapshot.providers.filter(isObject);
 }
 
+// The saved Codex logins (R8), one entry per login as the provider thread sends
+// them, the live one first. Empty while the OpenAI card is off.
+function codexLogins() {
+  if (!state.snapshot || !Array.isArray(state.snapshot.codexLogins)) return [];
+  return state.snapshot.codexLogins.filter(isObject);
+}
+
+// The key a saved Codex login is known by while its switch runs, or null when
+// the snapshot's account is not a full `{acc, org}`.
+function codexAccountKey(account) {
+  if (!isObject(account)) return null;
+  if (typeof account.acc !== "string" || account.acc === "") return null;
+  if (typeof account.org !== "string" || account.org === "") return null;
+  return `${account.org}:${account.acc}`;
+}
+
 // The list after the account cards: empty, it leaves neither heading nor
 // section. The keyboard cursor and the card order animation stay on accounts.
 function renderProviders() {
@@ -1100,17 +1135,27 @@ function renderProviders() {
   section.hidden = views.length === 0;
   for (const view of views) {
     list.appendChild(renderProviderCard(view));
+    if (view.provider === "codex" && state.codexNote) {
+      list.appendChild(h("div", { class: "codex-note", text: state.codexNote }));
+    }
   }
 }
 
 function renderProviderCard(view) {
   const credits = isObject(view.credits) ? view.credits : null;
-  const numbers = Boolean(credits || view.usage);
-  const stale = Boolean(view.error) && numbers;
+  // One saved Codex login (or none) is today's card; two or more are the rows a
+  // person switches between (R8).
+  const logins = view.provider === "codex" ? codexLogins() : [];
+  const rows = logins.length >= 2;
+  const live = rows ? logins.find((login) => login.live === true) : null;
+  const numbers = rows ? Boolean(live) : Boolean(credits || view.usage);
+  const stale = Boolean(view.error) && numbers && !rows;
   const ringKey = `provider:${view.provider}`;
 
   let gauge = null;
-  if (credits) {
+  if (rows) {
+    // The rows carry each login's own bars; the card keeps no gauge of its own.
+  } else if (credits) {
     const monthly = findLimit(view, "monthly_credits");
     if (monthly) gauge = renderGauge(monthly, null, ringKey);
   } else if (view.usage) {
@@ -1140,33 +1185,42 @@ function renderProviderCard(view) {
   // The plan sits where an account's plan does; a failed first poll with no
   // numbers leaves the title and the error text alone. The age appears only
   // once the reading is old or a poll has failed.
-  const meta = [];
-  if (numbers && typeof view.plan === "string" && view.plan !== "") meta.push(view.plan);
-  const age = numbers ? usageAge(view) : null;
-  if (age) {
-    if (meta.length > 0) meta.push(" · ");
-    meta.push(age);
-  }
-  if (meta.length > 0) {
-    main.appendChild(
-      h("div", { class: "card-meta-row" }, [
-        h("div", { class: "card-meta" }, meta),
-      ])
-    );
-  }
+  if (rows) {
+    main.appendChild(renderCodexLogins(logins));
+  } else {
+    const meta = [];
+    if (numbers && typeof view.plan === "string" && view.plan !== "") meta.push(view.plan);
+    const age = numbers ? usageAge(view) : null;
+    if (age) {
+      if (meta.length > 0) meta.push(" · ");
+      meta.push(age);
+    }
+    if (meta.length > 0) {
+      main.appendChild(
+        h("div", { class: "card-meta-row" }, [
+          h("div", { class: "card-meta" }, meta),
+        ])
+      );
+    }
 
-  if (credits) {
-    main.appendChild(renderCreditRows(view, credits));
-  } else if (view.usage) {
-    const rows = renderLimitRows(view);
-    if (rows.length > 0) {
-      main.appendChild(h("div", { class: "usage-rows" }, rows));
-    } else {
-      main.appendChild(h("div", { class: "card-note", text: NO_LIMITS_TEXT }));
+    if (credits) {
+      main.appendChild(renderCreditRows(view, credits));
+    } else if (view.usage) {
+      const limits = renderLimitRows(view);
+      if (limits.length > 0) {
+        main.appendChild(h("div", { class: "usage-rows" }, limits));
+      } else {
+        main.appendChild(h("div", { class: "card-note", text: NO_LIMITS_TEXT }));
+      }
     }
   }
 
-  if (view.error) {
+  // A failed round with no live login has no row to carry its text, so the card
+  // says it itself, as it always did; a live row that already shows the same
+  // text is not repeated.
+  const liveMessage =
+    live && typeof live.message === "string" && live.message !== "" ? live.message : null;
+  if (view.error && view.error !== liveMessage) {
     main.appendChild(
       h("div", {
         class: "card-note error",
@@ -1176,8 +1230,159 @@ function renderProviderCard(view) {
     );
   }
 
+  // A switch the worker refused says so in the card, where the person clicked.
+  if (view.provider === "codex" && state.codexSwitchError) {
+    main.appendChild(
+      h("div", {
+        class: "card-note error",
+        text: state.codexSwitchError,
+        title: state.codexSwitchError,
+      })
+    );
+  }
+
   card.appendChild(main);
   return card;
+}
+
+// The saved Codex logins, one row each (R8): the abbreviation chip in the
+// subscription's colour, the label, the plan, the 5 h and week bars, and a
+// "Live" mark on the login Codex is using now. A row that is not live and not
+// expired is a switch, even when its last poll failed (a switch needs no
+// network). While one switch runs every row waits; the clicked one says
+// "switching…".
+function renderCodexLogins(logins) {
+  const list = h("div", { class: "codex-logins", role: "list" });
+  for (const login of logins) list.appendChild(renderCodexLoginRow(login));
+  return list;
+}
+
+function renderCodexLoginRow(login) {
+  const abbr =
+    typeof login.abbr === "string" && login.abbr !== "" ? login.abbr : "?";
+  const live = login.live === true;
+  const expired = login.state === "expired";
+  const failed = expired || login.state === "error";
+  const message =
+    typeof login.message === "string" && login.message !== "" ? login.message : null;
+  const key = codexAccountKey(login.account);
+  const account = isObject(login.account) ? login.account : {};
+  const pending = key !== null && state.codexPending === key;
+  const waiting = Boolean(state.codexPending);
+  const clickable = !live && !expired && !waiting && key !== null;
+  let title = `${abbr} is the login Codex uses now`;
+  if (pending) title = `Switching Codex to ${abbr}…`;
+  else if (clickable) title = `Switch Codex to ${abbr}`;
+  else if (expired) title = message || `${abbr} has expired; sign in again with codex login`;
+  else if (waiting) title = "A Codex switch is still running";
+  else if (failed) title = message || `${abbr} cannot be switched to`;
+
+  const row = h("div", {
+    class:
+      "codex-login" +
+      (live ? " live" : "") +
+      (failed ? " failed" : "") +
+      (pending ? " pending" : "") +
+      (clickable ? " switchable" : ""),
+    role: clickable ? "button" : "listitem",
+    tabindex: clickable ? "0" : null,
+    "aria-busy": pending ? "true" : null,
+    title,
+    dataset: {
+      acc: typeof account.acc === "string" ? account.acc : null,
+      org: typeof account.org === "string" ? account.org : null,
+    },
+  });
+  const chip = styleChip(h("span", { class: "badge codex-login-badge" }), abbr, login.color);
+  const status = [];
+  if (pending) status.push(h("span", { class: "pill", text: "switching…" }));
+  else if (live) status.push(h("span", { class: "pill", text: "Live" }));
+  row.appendChild(
+    renderCardTop({
+      chip,
+      label: typeof login.label === "string" && login.label !== "" ? login.label : "Unnamed login",
+      status,
+    })
+  );
+
+  const body = h("div", { class: "codex-login-body" });
+  const plan = typeof login.plan === "string" && login.plan !== "" ? login.plan : "—";
+  body.appendChild(
+    h("div", { class: "card-meta-row" }, [
+      h("div", { class: "card-meta codex-login-plan", text: plan }),
+    ])
+  );
+
+  if (isObject(login.usage)) {
+    const limits = renderLimitRows({ usage: login.usage });
+    if (limits.length > 0) {
+      body.appendChild(h("div", { class: "usage-rows" }, limits));
+    } else {
+      body.appendChild(h("div", { class: "card-note", text: NO_LIMITS_TEXT }));
+    }
+  } else if (!failed) {
+    body.appendChild(
+      h("div", { class: "card-note", text: "No usage read for this login yet." })
+    );
+  }
+  if (message) {
+    body.appendChild(
+      h("div", { class: "card-note error", text: message, title: message })
+    );
+  }
+  row.appendChild(body);
+
+  if (clickable) {
+    row.addEventListener("click", () => switchCodexLogin(login));
+    row.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        switchCodexLogin(login);
+      }
+    });
+  }
+  return row;
+}
+
+// Switching to a login Codex already uses changes nothing and says nothing; the
+// worker's reply is then empty. The note stays under the card for ten seconds.
+// The clicked row says "switching…" and no row accepts a click until the answer;
+// a failed answer shows in the card.
+async function switchCodexLogin(login) {
+  if (state.codexPending) return;
+  const account = isObject(login.account) ? login.account : null;
+  const key = codexAccountKey(account);
+  if (!key) {
+    state.errors.banner = "This Codex login has no account in the snapshot.";
+    renderMain();
+    return;
+  }
+  state.codexPending = key;
+  state.codexSwitchError = null;
+  renderMain();
+  try {
+    const note = await invoke("switch_codex", {
+      account: { acc: account.acc, org: account.org },
+    });
+    state.codexPending = null;
+    if (typeof note === "string" && note !== "") showCodexNote(note);
+    afterCommand();
+  } catch (error) {
+    state.codexPending = null;
+    state.codexSwitchError = errorMessage(error);
+    renderMain();
+  }
+}
+
+function showCodexNote(text) {
+  state.codexNote = text;
+  if (state.codexNoteTimer) clearTimeout(state.codexNoteTimer);
+  state.codexNoteTimer = setTimeout(() => {
+    state.codexNote = null;
+    state.codexNoteTimer = null;
+    renderMain();
+  }, 10000);
+  renderMain();
 }
 
 // The rows of an Ollama card on a new plan: the included credits with the

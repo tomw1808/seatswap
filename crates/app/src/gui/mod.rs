@@ -70,7 +70,7 @@ use burn_rt::KeptForecast;
 #[cfg(feature = "gui")]
 use lookup_rt::{LookupClient, LookupHandle};
 #[cfg(feature = "gui")]
-use providers_rt::{ProviderView, ProvidersClient, ProvidersHandle};
+use providers_rt::{CodexLoginView, ProviderView, ProvidersClient, ProvidersHandle};
 #[cfg(feature = "gui")]
 use sessions_rt::{SessionsClient, SessionsHandle};
 #[cfg(feature = "gui")]
@@ -143,6 +143,8 @@ pub(crate) struct GuiState {
     _lookup: Mutex<Option<LookupHandle>>,
     /// The latest provider cards; every snapshot is emitted with them.
     providers: Mutex<Vec<ProviderView>>,
+    /// The latest saved Codex logins (R8); every snapshot is emitted with them.
+    codex_logins: Mutex<Vec<CodexLoginView>>,
     /// The provider thread's commands; the pop-up and the settings save use them.
     pub(crate) providers_client: ProvidersClient,
     _providers: Mutex<Option<ProvidersHandle>>,
@@ -263,6 +265,8 @@ pub(crate) fn run(
             panel::edit_account,
             panel::edit_subscription,
             panel::remove_account,
+            panel::switch_codex,
+            panel::remove_codex_login,
             panel::save_setting,
             panel::set_auto_burn,
             panel::pause_burn,
@@ -505,6 +509,7 @@ fn setup(
         lookup,
         _lookup: Mutex::new(Some(lookup_handle)),
         providers: Mutex::new(Vec::new()),
+        codex_logins: Mutex::new(Vec::new()),
         providers_client,
         _providers: Mutex::new(Some(providers_handle)),
         deduper: Mutex::new(notify::Deduper::new()),
@@ -602,9 +607,10 @@ fn handle_ui_event(app: &AppHandle, event: UiEvent) {
             *lock(&state.sessions) = Some(summary);
             apply_snapshot(app, Shown::Again);
         }
-        UiEvent::Providers(list) => {
+        UiEvent::Providers(lists) => {
             let state = app.state::<GuiState>();
-            *lock(&state.providers) = list;
+            *lock(&state.providers) = lists.cards;
+            *lock(&state.codex_logins) = lists.codex_logins;
             apply_snapshot(app, Shown::Again);
         }
         UiEvent::Money(view) => {
@@ -674,6 +680,7 @@ fn apply_snapshot(app: &AppHandle, shown: Shown) {
     );
     snapshot.sessions = lock(&state.sessions).clone();
     snapshot.providers = lock(&state.providers).clone();
+    snapshot.codex_logins = lock(&state.codex_logins).clone();
     let now = Utc::now();
     let (due, recheck) = {
         let mut current = lock(&state.snapshot);

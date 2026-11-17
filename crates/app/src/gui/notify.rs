@@ -840,6 +840,7 @@ mod tests {
             views: Vec::new(),
             accounts: Vec::new(),
             provider_subscriptions: Vec::new(),
+            codex_logins: Vec::new(),
             active_id: None,
             live,
             burn: suggestion.map(|suggestion| BurnView {
@@ -952,6 +953,7 @@ mod tests {
         Snapshot {
             accounts: Vec::new(),
             provider_subscriptions: Vec::new(),
+            codex_logins: Vec::new(),
             active_id: views
                 .iter()
                 .find(|view| view.is_active)

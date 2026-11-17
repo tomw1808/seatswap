@@ -39,7 +39,8 @@ use seatswap_core::history::{
 };
 use seatswap_core::locks::{self, LockError};
 use seatswap_core::money::Company;
-use seatswap_core::paths::{AppPaths, ClaudePaths};
+use seatswap_core::paths::{AppPaths, ClaudePaths, CodexPaths};
+use seatswap_core::providers;
 use seatswap_core::shared;
 use seatswap_core::store::{self, Account, AccountsFile, ProviderSubscription, Settings, Store};
 use seatswap_core::switcher::{self, LiveState, SwitchError, Synced, UnsavedPolicy};
@@ -50,7 +51,9 @@ use super::autostart;
 use super::burn_rt::{BurnRuntime, BurnTick, KeptForecast};
 use super::lookup_rt::{self, LookupClient, LookupHandle, MoneyView};
 use super::notify;
-use super::providers_rt::{self, ProviderView, ProvidersClient, ProvidersHandle};
+use super::providers_rt::{
+    self, CodexLoginView, ProviderLists, ProviderView, ProvidersClient, ProvidersHandle,
+};
 use super::sessions_rt::{self, SessionsHandle};
 use super::ReportedErrors;
 use crate::format::{expand_tilde, with_tilde};
@@ -58,6 +61,10 @@ use crate::ops;
 
 /// How often the engine thread polls even without a command.
 const TICK: Duration = Duration::from_secs(30);
+
+/// The refusal a Remove of the live Codex login gets (R8), in the worker and in
+/// Settings alike: the UI is not the only guard.
+const LIVE_LOGIN_REMOVE: &str = "the live login: switch Codex to another login first to remove it";
 
 /// How often the engine thread asks the action thread to exchange the shared
 /// looks and settings with the other hosts (spec §5): on its poll tick, at most
@@ -123,6 +130,9 @@ pub(crate) struct Snapshot {
     /// The switched-on provider cards; the provider thread fills them in on the
     /// main thread.
     pub providers: Vec<ProviderView>,
+    /// The saved Codex logins (R8), live first; the provider thread fills them
+    /// in on the main thread and it is empty while the OpenAI card is off.
+    pub codex_logins: Vec<CodexLoginView>,
     /// `None` when accounts.json cannot be read: the panel shows the error and
     /// disables Save instead of offering defaults that would overwrite it.
     pub settings: Option<Settings>,
@@ -258,6 +268,7 @@ impl Snapshot {
             error,
             sessions: None,
             providers: Vec::new(),
+            codex_logins: Vec::new(),
             settings,
             claude_config_dir: String::new(),
             claude_not_set_up: false,
@@ -383,6 +394,17 @@ pub(crate) enum ActionCommand {
         key: String,
         reply: Sender<ActionReply>,
     },
+    /// Switch Codex's live login to a saved one (R8).
+    SwitchCodex {
+        account: AccountRef,
+        reply: Sender<ActionReply>,
+    },
+    /// Delete seatswap's copy of a saved Codex login (R8); Codex's own
+    /// `auth.json` is not touched.
+    RemoveCodexLogin {
+        account: AccountRef,
+        reply: Sender<ActionReply>,
+    },
     SaveSetting {
         field: String,
         value: serde_json::Value,
@@ -429,7 +451,7 @@ pub(crate) enum ActionReply {
 pub(crate) enum UiEvent {
     Snapshot(Snapshot),
     Sessions(SessionsSummary),
-    Providers(Vec<ProviderView>),
+    Providers(ProviderLists),
     Money(MoneyView),
     /// A pushed Sessions area view; the main thread sends it to the large
     /// window only.
@@ -677,6 +699,7 @@ pub(crate) fn build_snapshot(parts: SnapshotParts) -> Snapshot {
         error,
         sessions: None,
         providers: Vec::new(),
+        codex_logins: Vec::new(),
         settings,
         claude_config_dir: parts.claude_config_dir,
         claude_not_set_up: false,
@@ -1382,6 +1405,12 @@ impl ActionRuntime {
                 ActionCommand::Remove { key, reply } => {
                     let _ = reply.send(self.remove(&key));
                 }
+                ActionCommand::SwitchCodex { account, reply } => {
+                    let _ = reply.send(self.switch_codex(&account));
+                }
+                ActionCommand::RemoveCodexLogin { account, reply } => {
+                    let _ = reply.send(self.remove_codex_login(&account));
+                }
                 ActionCommand::SaveSetting {
                     field,
                     value,
@@ -1725,6 +1754,91 @@ impl ActionRuntime {
                 ActionReply::Done
             }
             Err(error) => ActionReply::Failed(error),
+        }
+    }
+
+    /// Codex's folder for an action: the `codexHome` setting, then the
+    /// environment, resolved the one way the provider thread resolves it.
+    fn codex_paths(&mut self) -> Result<CodexPaths, String> {
+        let settings = self
+            .store()?
+            .load()
+            .map_err(|error| error.to_string())?
+            .settings;
+        CodexPaths::resolve(settings.codex_home.as_deref()).map_err(|error| error.to_string())
+    }
+
+    /// Tell the provider thread that a Codex login changed, so it polls Codex at
+    /// once. A thread that cannot be reached is reported, never dropped.
+    fn codex_changed(&self) {
+        if let Some(providers) = &self.providers {
+            if let Err(text) = providers.codex_changed() {
+                self.reported_errors.report(&text);
+            }
+        }
+    }
+
+    /// Switch Codex's live login to a saved one (R8). The one decision is
+    /// [`ops::switch_codex`], shared with the CLI: the switch, the
+    /// `providerSwitch` event and the note about running sessions. A history
+    /// that cannot be written is reported and never fails the switch.
+    fn switch_codex(&mut self, account: &AccountRef) -> ActionReply {
+        if let Err(error) = self.ensure_store() {
+            return ActionReply::Failed(error);
+        }
+        let paths = match self.codex_paths() {
+            Ok(paths) => paths,
+            Err(error) => return ActionReply::Failed(error),
+        };
+        let Some(store) = self.store.as_ref() else {
+            return ActionReply::Failed("the store is not open".to_string());
+        };
+        let (history, open_error) = self.history_for_action();
+        let result = ops::switch_codex(&self.app, &paths, store, history, account, Utc::now());
+        match result {
+            Ok(switched) => {
+                let mut warnings = switched.warnings;
+                if let Some(error) = open_error {
+                    warnings.push(error);
+                }
+                for text in &warnings {
+                    self.reported_errors.report(text);
+                }
+                self.codex_changed();
+                ActionReply::Switched(switched.note)
+            }
+            Err(error) => ActionReply::Failed(error),
+        }
+    }
+
+    /// Delete seatswap's copy of a saved Codex login (R8); the subscription, its
+    /// history and its price stay, and Codex's own login file is not touched.
+    /// The live login's copy cannot be removed: the next poll would save it
+    /// again, so the worker refuses with the sentence Settings shows.
+    fn remove_codex_login(&mut self, account: &AccountRef) -> ActionReply {
+        if let Err(error) = self.ensure_store() {
+            return ActionReply::Failed(error);
+        }
+        let paths = match self.codex_paths() {
+            Ok(paths) => paths,
+            Err(error) => return ActionReply::Failed(error),
+        };
+        match providers::codex::live_account(&paths) {
+            Ok(Some(live)) if &live == account => {
+                return ActionReply::Failed(LIVE_LOGIN_REMOVE.to_string())
+            }
+            Ok(_) => {}
+            Err(error) => return ActionReply::Failed(error.to_string()),
+        }
+        let Some(store) = self.store.as_ref() else {
+            return ActionReply::Failed("the store is not open".to_string());
+        };
+        match providers::codex::forget(&self.app, store.secrets(), account) {
+            Ok(()) => {
+                self.codex_changed();
+                ActionReply::Done
+            }
+            Err(error) => ActionReply::Failed(error.to_string()),
         }
     }
 
@@ -2115,6 +2229,7 @@ mod tests {
 
     use seatswap_core::api::{Limit, LimitKind, Severity, Usage};
     use seatswap_core::live;
+    use seatswap_core::providers::CODEX_ORG;
     use seatswap_core::store::FileSecrets;
     use seatswap_core::store::{self, Account, AccountsFile, SecretsBackend};
     use serde_json::json;
@@ -2122,6 +2237,13 @@ mod tests {
     const ACCOUNT_UUID: &str = "4b7e2f91-3c5a-4d8e-9f1b-6a2c8e4d7b30";
     const ORG_UUID: &str = "e2a6c9d1-7f4b-4a3e-8c5d-1b9f0a7e3c62";
     const EMAIL: &str = "someone@example.com";
+
+    /// Two made-up Codex logins for the Codex switch (R8): the one Codex has
+    /// open and the saved one the switch goes to.
+    const CODEX_LIVE_ID: &str = "0f3a6c2e-7b1d-4e9a-8c5f-2d4b6a8e0c13";
+    const CODEX_OTHER_ID: &str = "7d2b9e4c-1a3f-4c5e-8b6d-9f0a1c2e3d4b";
+    const CODEX_LIVE_AUTH: &str = r#"{"OPENAI_API_KEY":null,"auth_mode":"chatgpt","last_refresh":"2026-11-14T16:53:03.750022420Z","tokens":{"id_token":"eyJhbGciOi.id.sig","access_token":"eyJhbGciOi.access.sig","refresh_token":"rt_9f2c","account_id":"0f3a6c2e-7b1d-4e9a-8c5f-2d4b6a8e0c13","login_owner_id":"user-sam","oauth_provenance":{"issuer":"https://auth.openai.com","client_id":"app_4c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f"}}}"#;
+    const CODEX_OTHER_AUTH: &str = r#"{"OPENAI_API_KEY":null,"auth_mode":"chatgpt","last_refresh":"2026-11-15T09:10:00.000000000Z","tokens":{"id_token":"eyJhbGciOi.other.id","access_token":"eyJhbGciOi.other.sig","refresh_token":"rt_51ab","account_id":"7d2b9e4c-1a3f-4c5e-8b6d-9f0a1c2e3d4b","login_owner_id":"user-sam","oauth_provenance":{"issuer":"https://auth.openai.com","client_id":"app_4c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f"}}}"#;
 
     /// The app's one error reporter with a sink a test ignores.
     fn test_errors() -> Arc<ReportedErrors> {
@@ -2402,6 +2524,7 @@ mod tests {
                 "burn",
                 "claudeConfigDir",
                 "claudeNotSetUp",
+                "codexLogins",
                 "error",
                 "lastPollAt",
                 "live",
@@ -2516,6 +2639,242 @@ mod tests {
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    /// R8: a Codex switch goes through `ops::switch_codex`, writes one
+    /// `providerSwitch` event with `by: user`, and the reply says that the
+    /// sessions already running keep their login.
+    #[test]
+    fn a_codex_switch_records_a_provider_switch_and_says_running_sessions_keep_theirs() {
+        let fixture = Fixture::new();
+        let codex_home = fixture._tmp.path().join("codex");
+        fs::create_dir_all(&codex_home).expect("the Codex folder");
+        fs::write(codex_home.join("auth.json"), CODEX_LIVE_AUTH).expect("auth.json");
+        let live = AccountRef {
+            acc: CODEX_LIVE_ID.to_string(),
+            org: CODEX_ORG.to_string(),
+        };
+        let other = AccountRef {
+            acc: CODEX_OTHER_ID.to_string(),
+            org: CODEX_ORG.to_string(),
+        };
+        let store = Store::new(
+            fixture.app.clone(),
+            Box::new(FileSecrets::new(fixture.app.secrets_dir())),
+        );
+        let mut file = store.load().expect("accounts.json");
+        file.settings.codex_home = Some(codex_home.clone());
+        for (account, abbr, plan) in [
+            (live.clone(), "OA", Some("Plus")),
+            (other.clone(), "OA2", Some("Pro")),
+        ] {
+            file.provider_subscriptions.push(ProviderSubscription {
+                account,
+                label: "OpenAI".to_string(),
+                abbr: abbr.to_string(),
+                color: "#db2777".to_string(),
+                plan: plan.map(str::to_string),
+                price: None,
+                price_currency: None,
+            });
+        }
+        store.save(&file).expect("accounts.json");
+        let stored: seatswap_core::types::CodexLogin =
+            serde_json::from_str(CODEX_OTHER_AUTH).expect("a Codex login");
+        store
+            .secrets()
+            .set_codex(&providers::codex::secret_id(&other), &stored)
+            .expect("the saved copy");
+
+        let (engine, _engine_rx) = mpsc::channel();
+        let history = fixture.history().expect("the history folder");
+        let mut action = ActionRuntime::new(
+            fixture.app.clone(),
+            fixture.claude.clone(),
+            Vec::new(),
+            engine,
+            Ok(history.clone()),
+            test_errors(),
+            test_printed_warnings(),
+        );
+        let note = match action.switch_codex(&other) {
+            ActionReply::Switched(note) => note,
+            other => panic!("expected Switched, got {other:?}"),
+        };
+        assert_eq!(
+            note,
+            "Codex now uses OA2. Codex sessions already running keep OA until they restart."
+        );
+
+        // Codex's own file now holds the saved login, byte for byte.
+        assert_eq!(
+            fs::read(codex_home.join("auth.json")).expect("auth.json"),
+            CODEX_OTHER_AUTH.as_bytes(),
+            "auth.json does not hold the saved login byte for byte"
+        );
+
+        let now = Utc::now();
+        let read = history
+            .read::<Event>(
+                &Range {
+                    from: now - chrono::Duration::hours(1),
+                    to: now + chrono::Duration::hours(1),
+                },
+                &Hosts::One(history.host().to_string()),
+            )
+            .expect("the events are read");
+        let switches: Vec<&EventKind> = read
+            .records
+            .iter()
+            .map(|record| &record.record.kind)
+            .filter(|kind| matches!(kind, EventKind::ProviderSwitch { .. }))
+            .collect();
+        assert_eq!(switches.len(), 1, "one providerSwitch event");
+        assert_eq!(
+            switches[0],
+            &EventKind::ProviderSwitch {
+                from: Some(live),
+                to: other,
+                by: By::User,
+            }
+        );
+    }
+
+    /// R8: Remove deletes seatswap's copy only. The subscription, its plan and
+    /// Codex's own login file stay.
+    #[test]
+    fn remove_codex_login_deletes_the_copy_and_keeps_the_subscription() {
+        let fixture = Fixture::new();
+        let codex_home = fixture._tmp.path().join("codex");
+        fs::create_dir_all(&codex_home).expect("the Codex folder");
+        fs::write(codex_home.join("auth.json"), CODEX_LIVE_AUTH).expect("auth.json");
+        let live = AccountRef {
+            acc: CODEX_LIVE_ID.to_string(),
+            org: CODEX_ORG.to_string(),
+        };
+        let other = AccountRef {
+            acc: CODEX_OTHER_ID.to_string(),
+            org: CODEX_ORG.to_string(),
+        };
+        let store = Store::new(
+            fixture.app.clone(),
+            Box::new(FileSecrets::new(fixture.app.secrets_dir())),
+        );
+        let mut file = store.load().expect("accounts.json");
+        file.settings.codex_home = Some(codex_home.clone());
+        for (account, abbr) in [(live.clone(), "OA"), (other.clone(), "OA2")] {
+            file.provider_subscriptions.push(ProviderSubscription {
+                account,
+                label: "OpenAI".to_string(),
+                abbr: abbr.to_string(),
+                color: "#db2777".to_string(),
+                plan: Some("Pro".to_string()),
+                price: None,
+                price_currency: None,
+            });
+        }
+        store.save(&file).expect("accounts.json");
+        for (account, auth) in [(&live, CODEX_LIVE_AUTH), (&other, CODEX_OTHER_AUTH)] {
+            let login = serde_json::from_str(auth).expect("a Codex login");
+            store
+                .secrets()
+                .set_codex(&providers::codex::secret_id(account), &login)
+                .expect("a saved copy");
+        }
+        let auth_before = fs::read(codex_home.join("auth.json")).expect("auth.json");
+
+        let (engine, _engine_rx) = mpsc::channel();
+        let mut action = ActionRuntime::new(
+            fixture.app.clone(),
+            fixture.claude.clone(),
+            Vec::new(),
+            engine,
+            fixture.history(),
+            test_errors(),
+            test_printed_warnings(),
+        );
+        match action.remove_codex_login(&other) {
+            ActionReply::Done => {}
+            other => panic!("expected Done, got {other:?}"),
+        }
+
+        assert!(
+            store
+                .secrets()
+                .get_codex(&providers::codex::secret_id(&other))
+                .expect("the secret store")
+                .is_none(),
+            "the copy is gone"
+        );
+        let file = store.load().expect("accounts.json");
+        assert!(
+            file.provider_subscription(&other).is_some(),
+            "the subscription stays"
+        );
+        assert_eq!(
+            fs::read(codex_home.join("auth.json")).expect("auth.json"),
+            auth_before,
+            "Codex's own login file is not touched"
+        );
+    }
+
+    /// R8: the live login's copy cannot be removed, because the next poll would
+    /// save it again. The worker is a guard of its own, not only the UI.
+    #[test]
+    fn the_live_codex_login_cannot_be_removed() {
+        let fixture = Fixture::new();
+        let codex_home = fixture._tmp.path().join("codex");
+        fs::create_dir_all(&codex_home).expect("the Codex folder");
+        fs::write(codex_home.join("auth.json"), CODEX_LIVE_AUTH).expect("auth.json");
+        let live = AccountRef {
+            acc: CODEX_LIVE_ID.to_string(),
+            org: CODEX_ORG.to_string(),
+        };
+        let store = Store::new(
+            fixture.app.clone(),
+            Box::new(FileSecrets::new(fixture.app.secrets_dir())),
+        );
+        let mut file = store.load().expect("accounts.json");
+        file.settings.codex_home = Some(codex_home.clone());
+        file.provider_subscriptions.push(ProviderSubscription {
+            account: live.clone(),
+            label: "OpenAI".to_string(),
+            abbr: "OA".to_string(),
+            color: "#db2777".to_string(),
+            plan: Some("Plus".to_string()),
+            price: None,
+            price_currency: None,
+        });
+        store.save(&file).expect("accounts.json");
+        let login = serde_json::from_str(CODEX_LIVE_AUTH).expect("a Codex login");
+        store
+            .secrets()
+            .set_codex(&providers::codex::secret_id(&live), &login)
+            .expect("the live copy");
+
+        let (engine, _engine_rx) = mpsc::channel();
+        let mut action = ActionRuntime::new(
+            fixture.app.clone(),
+            fixture.claude.clone(),
+            Vec::new(),
+            engine,
+            fixture.history(),
+            test_errors(),
+            test_printed_warnings(),
+        );
+
+        match action.remove_codex_login(&live) {
+            ActionReply::Failed(text) => assert_eq!(text, LIVE_LOGIN_REMOVE),
+            other => panic!("expected the live-login refusal, got {other:?}"),
+        }
+        assert!(
+            store
+                .secrets()
+                .get_codex(&providers::codex::secret_id(&live))
+                .expect("the secret store")
+                .is_some(),
+            "the live login's copy stays"
+        );
     }
 
     /// Turning auto-burn on or off writes `AutoBurnSet`, not the pause/resume

@@ -291,6 +291,7 @@ function makeFixture() {
   const labId = "8b4e7f20-6a1d-4d33-b8c5-2f9a0e6d7c81";
   const privateId = "c0a1b2d3-e4f5-4a6b-8c7d-9e0f1a2b3c4d";
   const codexAccountId = "0f3a6c2e-7b1d-4e9a-8c5f-2d4b6a8e0c13";
+  const codexSavedId = "7d2b9e4c-1a3f-4c5e-8b6d-9f0a1c2e3d4b";
   return {
     // The folder the app runs with (the Snapshot's field); the General group
     // shows it as the empty config-folder field's placeholder.
@@ -492,6 +493,16 @@ function makeFixture() {
         priceCurrency: "EUR",
       },
       {
+        account: { acc: codexSavedId, org: "codex" },
+        company: "openai",
+        label: "OpenAI",
+        abbr: "O2",
+        color: "#db2777",
+        plan: "Pro",
+        price: null,
+        priceCurrency: null,
+      },
+      {
         account: { acc: "ollama", org: "ollama" },
         company: "ollama",
         label: "Ollama",
@@ -576,6 +587,68 @@ function makeFixture() {
       ],
       unavailable: null,
       warning: null,
+    },
+    // The saved Codex logins (R8): one entry per login, live first, each with
+    // its own usage. `codexLogins` is what the snapshot carries while the OpenAI
+    // card is on; the live row takes its numbers from that card, since one
+    // login's poll fills both.
+    codexLoginRows: [
+      {
+        account: { acc: codexAccountId, org: "codex" },
+        abbr: "OA",
+        label: "OpenAI",
+        color: "#db2777",
+        plan: "Plus",
+        live: true,
+        usage: null,
+        state: "ok",
+        message: null,
+      },
+      {
+        account: { acc: codexSavedId, org: "codex" },
+        abbr: "O2",
+        label: "OpenAI",
+        color: "#db2777",
+        plan: "Pro",
+        live: false,
+        usage: {
+          limits: [
+            {
+              kind: "session",
+              percent: 3,
+              severity: "normal",
+              resetsAt: isoIn(4 * hour + 45 * 60000),
+              model: null,
+              isActive: false,
+            },
+            {
+              kind: "weekly_all",
+              percent: 20,
+              severity: "normal",
+              resetsAt: isoIn(3 * day + 16 * hour),
+              model: null,
+              isActive: true,
+            },
+          ],
+          extraUsageEnabled: false,
+        },
+        state: "ok",
+        message: null,
+      },
+    ],
+    get codexLogins() {
+      const settings = this.settings || {};
+      if (!settings.codexCard) return [];
+      const card = this.providerCardViews.find((view) => view.provider === "codex");
+      if (!card) throw new Error("the fixture has no Codex card view");
+      return this.codexLoginRows.map((row) => {
+        const login = clone(row);
+        if (login.live) {
+          login.plan = card.plan;
+          login.usage = card.usage ? clone(card.usage) : null;
+        }
+        return login;
+      });
     },
     // Every provider view the fixture keeps (spec §7): a Codex Plus login and
     // an Ollama cloud plan, as gui/providers_rt.rs can send them. `providers`
@@ -1143,6 +1216,63 @@ export async function fixtureInvoke(command, args) {
       account.price = price;
       account.priceCurrency = priceCurrency;
       return clone(account);
+    }
+
+    // The saved Codex logins (R8): a switch moves the live mark and answers with
+    // the worker's note; the saved login's own numbers become the card's. The
+    // old login keeps its usage until the app's next poll, as it does in Rust.
+    case "switch_codex": {
+      const account = isObject(args.account) ? args.account : null;
+      if (!account || typeof account.acc !== "string" || typeof account.org !== "string") {
+        throw new Error("switch_codex needs an account {acc, org}");
+      }
+      const target = fixture.codexLoginRows.find(
+        (row) => row.account.acc === account.acc && row.account.org === account.org
+      );
+      if (!target || account.org !== "codex") {
+        throw new Error(`${account.acc} is not a saved Codex login`);
+      }
+      if (target.live) return "";
+      // A switch takes a moment in the app too; the delay lets the pending state
+      // be seen in a page shot.
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      const previous = fixture.codexLoginRows.find((row) => row.live) || null;
+      const card = fixture.providerCardViews.find((view) => view.provider === "codex");
+      if (previous && card) {
+        previous.plan = card.plan;
+        previous.usage = card.usage ? clone(card.usage) : null;
+      }
+      for (const row of fixture.codexLoginRows) row.live = row === target;
+      if (card) {
+        card.plan = target.plan;
+        card.usage = target.usage ? clone(target.usage) : null;
+        card.fetchedAt = isoIn(0);
+        card.error = null;
+      }
+      return previous
+        ? `Codex now uses ${target.abbr}. Codex sessions already running keep ${previous.abbr} until they restart.`
+        : `Codex now uses ${target.abbr}.`;
+    }
+
+    // Settings → Accounts: deletes seatswap's copy only; the subscription row,
+    // its plan, price and history stay, and Codex's own file is not touched.
+    // The live login is refused with the worker's words.
+    case "remove_codex_login": {
+      const account = isObject(args.account) ? args.account : null;
+      if (!account || typeof account.acc !== "string" || typeof account.org !== "string") {
+        throw new Error("remove_codex_login needs an account {acc, org}");
+      }
+      const target = fixture.codexLoginRows.find(
+        (row) => row.account.acc === account.acc && row.account.org === account.org
+      );
+      if (!target) {
+        throw new Error(`${account.acc} is not a saved Codex login`);
+      }
+      if (target.live) {
+        throw new Error("the live login: switch Codex to another login first to remove it");
+      }
+      fixture.codexLoginRows = fixture.codexLoginRows.filter((row) => row !== target);
+      return null;
     }
 
     case "edit_subscription": {

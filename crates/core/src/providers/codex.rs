@@ -100,6 +100,28 @@ pub fn read(paths: &CodexPaths, api: &Api) -> Result<ProviderReading, ProviderEr
     reading_from(&answer, account_id)
 }
 
+/// The account Codex's live `auth.json` belongs to, read by the one
+/// [`chatgpt_tokens`] rule and without saving anything or taking a lock (R8).
+/// `None` when there is no login file. A login kept in the keyring, an API-key
+/// login, a file that does not read and a file without an `account_id` are
+/// their own errors, exactly as [`sync_live`] and [`read`] report them.
+///
+/// The one read-only way to know which saved login is live, for `codex list`
+/// and for the worker's guard against removing the live login's copy. A poll
+/// uses [`sync_live`], which also stores what it sees.
+pub fn live_account(paths: &CodexPaths) -> Result<Option<AccountRef>, ProviderError> {
+    let login = match live_login(paths)? {
+        Some(login) => login,
+        None => return Ok(None),
+    };
+    let tokens = chatgpt_tokens(&login, &paths.auth_file)?;
+    let account_id = string_field(tokens, "account_id")?;
+    Ok(Some(AccountRef {
+        acc: account_id.to_string(),
+        org: CODEX_ORG.to_string(),
+    }))
+}
+
 /// A saved Codex login that is not live: its usage, asked with the stored access
 /// token (R8). The first usage ask and the renewal call are network calls and
 /// run without a lock. A 401 renews the login once at Codex's own issuer and
@@ -148,6 +170,20 @@ pub fn read_saved(
         }
         Err(other) => Err(ProviderError::Api(other)),
     }
+}
+
+/// Forget seatswap's saved copy of a Codex login (R8). Codex's own `auth.json`
+/// is not touched, so a login that is live keeps working; a copy that is not
+/// there is not an error. The delete runs under seatswap's app lock, as every
+/// other write of a stored copy does.
+pub fn forget(
+    app: &AppPaths,
+    secrets: &dyn SecretStore,
+    account: &AccountRef,
+) -> Result<(), ProviderError> {
+    let _app_lock = acquire_app_lock(app, APP_LOCK_TIMEOUT)?;
+    secrets.delete(&secret_id(account))?;
+    Ok(())
 }
 
 /// A finished switch: which login was live before (none when `auth.json` was
@@ -1673,6 +1709,39 @@ mod tests {
         );
         #[cfg(unix)]
         assert_eq!(mode(&fake.paths().auth_file), 0o600);
+    }
+
+    /// R8: forgetting deletes seatswap's stored copy only; Codex's own
+    /// `auth.json` stays byte for byte, another login's copy stays, and a copy
+    /// that is already gone is not an error.
+    #[test]
+    fn forget_deletes_only_the_saved_copy() {
+        let fake = Fake::new();
+        let oa = account(OA);
+        let oa2 = account(OA2);
+        fake.write_live(&login_value(OA));
+        fake.store(&oa, &login_value(OA));
+        fake.store(&oa2, &login_value(OA2));
+        let auth_before = std::fs::read(&fake.paths().auth_file).unwrap();
+
+        forget(&fake.app(), &fake.secrets, &oa2).unwrap();
+
+        assert!(
+            fake.secrets.get_codex(&secret_id(&oa2)).unwrap().is_none(),
+            "the forgotten copy is gone"
+        );
+        assert!(
+            fake.secrets.get_codex(&secret_id(&oa)).unwrap().is_some(),
+            "the other login's copy stays"
+        );
+        assert_eq!(
+            std::fs::read(&fake.paths().auth_file).unwrap(),
+            auth_before,
+            "Codex's own auth.json is not touched"
+        );
+
+        // A copy that is not there is not an error.
+        forget(&fake.app(), &fake.secrets, &oa2).unwrap();
     }
 
     #[test]

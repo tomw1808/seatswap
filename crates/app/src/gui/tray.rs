@@ -810,6 +810,7 @@ mod tests {
         Snapshot {
             accounts: Vec::new(),
             provider_subscriptions: Vec::new(),
+            codex_logins: Vec::new(),
             active_id: views
                 .iter()
                 .find(|view| view.is_active)

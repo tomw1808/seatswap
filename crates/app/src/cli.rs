@@ -24,9 +24,12 @@ use seatswap_core::history::{
     export_csv, export_json, AccountRef, By, EventKind, HistoryDir, Imported, Range, Recorder,
 };
 use seatswap_core::money::{self, Prices};
-use seatswap_core::paths::{self, AppPaths, ClaudePaths, PathsError};
+use seatswap_core::paths::{self, AppPaths, ClaudePaths, CodexPaths, PathsError};
+use seatswap_core::providers::{self, CODEX_ORG};
 use seatswap_core::shared;
-use seatswap_core::store::{self, Account, AccountsFile, LoginState, Settings, Store, StoreError};
+use seatswap_core::store::{
+    self, Account, AccountsFile, LoginState, ProviderSubscription, Settings, Store, StoreError,
+};
 use seatswap_core::switcher::{self, LiveState, SwitchError, UnsavedPolicy};
 
 use crate::agent_skill::{self, SkillError};
@@ -250,8 +253,31 @@ pub(crate) enum Command {
         action: HistoryAction,
     },
 
+    /// List the saved Codex logins or switch Codex to one of them (R8).
+    Codex {
+        #[command(subcommand)]
+        action: CodexAction,
+    },
+
     /// Print Claude Code's status line; reads its JSON from standard input.
     Statusline,
+}
+
+/// What `seatswap codex` does (R8).
+#[derive(Debug, Subcommand)]
+pub(crate) enum CodexAction {
+    /// Print one line per saved Codex login.
+    List {
+        /// Print JSON: one entry per saved login, without its usage.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Switch Codex's live login to a saved one (by abbreviation).
+    Switch {
+        /// Abbreviation of a saved Codex login.
+        abbr: String,
+    },
 }
 
 /// What `seatswap history` does (spec §1.5, §3.7).
@@ -609,6 +635,7 @@ fn run_command(
         },
         Command::AgentSkill { action } => agent_skill(&context, action),
         Command::Prices { refresh } => prices(context, refresh),
+        Command::Codex { action } => codex(context, action),
         // Handled before the store was opened; kept for exhaustiveness.
         Command::Panel { .. } | Command::Window { .. } | Command::Statusline => Ok(()),
         Command::Status {
@@ -752,6 +779,24 @@ pub(crate) fn gate(command: &Command, caller: Caller, settings: &Settings) -> Ga
                 Gate::Refused(AGENTS_MAY_NOT_SWITCH)
             }
         }
+        // `codex list` reads like `status`; `codex switch` is a switch between
+        // logins the person saved, like `use`.
+        Command::Codex { action } => match action {
+            CodexAction::List { .. } => {
+                if settings.agents_read {
+                    Gate::Allowed
+                } else {
+                    Gate::Refused(AGENTS_MAY_NOT_READ)
+                }
+            }
+            CodexAction::Switch { .. } => {
+                if settings.agents_switch {
+                    Gate::Allowed
+                } else {
+                    Gate::Refused(AGENTS_MAY_NOT_SWITCH)
+                }
+            }
+        },
         Command::Add { .. }
         | Command::Rm { .. }
         | Command::Edit { .. }
@@ -825,6 +870,11 @@ fn command_text(command: &Command) -> String {
             ),
             // The folder is free text; a path stays out of the recorded line.
             HistoryAction::Import { .. } => "history import".to_string(),
+        },
+        Command::Codex { action } => match action {
+            CodexAction::List { json } => flags("codex list", &[("--json", *json)]),
+            // The abbreviation is free text and stays out of the recorded line.
+            CodexAction::Switch { .. } => "codex switch".to_string(),
         },
         Command::Statusline => "statusline".to_string(),
         Command::Prices { refresh } => flags("prices", &[("--refresh", *refresh)]),
@@ -1262,6 +1312,171 @@ fn edit(
         warn(&error);
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Codex logins (R8)
+
+/// One saved Codex login as `seatswap codex list --json` prints it: the
+/// snapshot's entry without `usage` (the CLI asks no usage and does not poll),
+/// and without `state`/`message`, which only a provider poll can know.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexLoginRow {
+    account: AccountRef,
+    abbr: String,
+    label: String,
+    color: String,
+    plan: Option<String>,
+    live: bool,
+}
+
+/// `seatswap codex`: Codex's folder is the `codexHome` setting, then
+/// `$CODEX_HOME`, then `~/.codex`, as the app resolves it.
+fn codex(context: Context, action: CodexAction) -> Result<(), CliError> {
+    let paths = CodexPaths::resolve(context.settings.codex_home.as_deref())
+        .map_err(|error| CliError::Message(error.to_string()))?;
+    codex_at(context, &paths, action)
+}
+
+/// [`codex`] with Codex's folder given, so a test passes a fake folder
+/// (`CodexPaths::at`) and never resolves the real one.
+fn codex_at(context: Context, paths: &CodexPaths, action: CodexAction) -> Result<(), CliError> {
+    match action {
+        CodexAction::List { json } => {
+            if json {
+                println!("{}", serde_json::to_string(&codex_rows(&context, paths)?)?);
+            } else {
+                for line in codex_lines(&context, paths)? {
+                    println!("{line}");
+                }
+            }
+            Ok(())
+        }
+        CodexAction::Switch { abbr } => {
+            let subscriptions = codex_subscriptions(&context)?;
+            let target = match subscriptions
+                .iter()
+                .find(|subscription| subscription.abbr.eq_ignore_ascii_case(&abbr))
+            {
+                Some(target) => target,
+                None => {
+                    let file = context
+                        .store
+                        .load()
+                        .map_err(|error| CliError::Message(error.to_string()))?;
+                    if file
+                        .accounts
+                        .iter()
+                        .any(|account| account.abbr.eq_ignore_ascii_case(&abbr))
+                    {
+                        return Err(CliError::Usage(format!(
+                            "codex switch {abbr:?}: {abbr} is a Claude account, not a Codex login"
+                        )));
+                    }
+                    return Err(CliError::Usage(format!(
+                        "codex switch {abbr:?}: no saved Codex login has that abbreviation"
+                    )));
+                }
+            };
+            let recorder = cli_history(&context);
+            let switched = ops::switch_codex(
+                context.store.app_paths(),
+                paths,
+                &context.store,
+                recorder.as_ref(),
+                &target.account,
+                Utc::now(),
+            )
+            .map_err(CliError::Message)?;
+            for warning in &switched.warnings {
+                warn(warning);
+            }
+            if !switched.note.is_empty() {
+                println!("{}", switched.note);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The saved logins `seatswap codex list` prints, live first and then by
+/// abbreviation. Reading only: no login is saved and no subscription is made.
+fn codex_rows(context: &Context, paths: &CodexPaths) -> Result<Vec<CodexLoginRow>, CliError> {
+    let subscriptions = codex_subscriptions(context)?;
+    let live = codex_live(paths);
+    let mut rows: Vec<CodexLoginRow> = subscriptions
+        .into_iter()
+        .map(|subscription| CodexLoginRow {
+            live: live.as_ref() == Some(&subscription.account),
+            account: subscription.account,
+            abbr: subscription.abbr,
+            label: subscription.label,
+            color: subscription.color,
+            plan: subscription.plan,
+        })
+        .collect();
+    rows.sort_by(|first, second| (!first.live, &first.abbr).cmp(&(!second.live, &second.abbr)));
+    Ok(rows)
+}
+
+/// The lines `seatswap codex list` prints, one per saved login.
+fn codex_lines(context: &Context, paths: &CodexPaths) -> Result<Vec<String>, CliError> {
+    Ok(codex_rows(context, paths)?.iter().map(codex_line).collect())
+}
+
+/// The subscriptions whose Codex login seatswap has a saved copy of, in
+/// `accounts.json` order. A subscription whose copy was forgotten is not a saved
+/// login and is left out.
+fn codex_subscriptions(context: &Context) -> Result<Vec<ProviderSubscription>, CliError> {
+    let file = context
+        .store
+        .load()
+        .map_err(|error| CliError::Message(error.to_string()))?;
+    let mut saved = Vec::new();
+    for subscription in file
+        .provider_subscriptions
+        .into_iter()
+        .filter(|subscription| subscription.account.org == CODEX_ORG)
+    {
+        let copy = context
+            .store
+            .secrets()
+            .get_codex(&providers::codex::secret_id(&subscription.account))
+            .map_err(|error| CliError::Message(error.to_string()))?;
+        if copy.is_some() {
+            saved.push(subscription);
+        }
+    }
+    Ok(saved)
+}
+
+/// The account Codex's login file holds now, read without saving anything
+/// ([`providers::codex::live_account`]); `None` when there is no login. Any
+/// other failure is said out loud — the list cannot know which login is live
+/// then.
+fn codex_live(paths: &CodexPaths) -> Option<AccountRef> {
+    match providers::codex::live_account(paths) {
+        Ok(live) => live,
+        Err(providers::ProviderError::NoLogin { .. }) => None,
+        Err(error) => {
+            warn(&format!("the live Codex login was not read: {error}"));
+            None
+        }
+    }
+}
+
+/// One line of `seatswap codex list`: `* OA  Plus  live`.
+fn codex_line(row: &CodexLoginRow) -> String {
+    format!(
+        "{} {:<3} {:<5} {}",
+        if row.live { "*" } else { " " },
+        row.abbr,
+        row.plan.as_deref().unwrap_or("\u{2014}"),
+        if row.live { "live" } else { "" }
+    )
+    .trim_end()
+    .to_string()
 }
 
 /// `agent-skill install` / `uninstall`: the file below
@@ -2176,6 +2391,13 @@ pub(crate) mod tests {
     const THIRD_ACCOUNT_UUID: &str = "2b7e9c4d-1a3f-4c5e-8b6d-7f0a1c2e3d4b";
     const THIRD_ORG_UUID: &str = "9a1c3e5f-7b9d-4f2a-8c6e-0d1b3a5c7e9f";
 
+    /// Two made-up Codex logins for `seatswap codex` (R8): the one in Codex's
+    /// fake `auth.json` and the saved one the command switches to.
+    const CODEX_LIVE_ID: &str = "0f3a6c2e-7b1d-4e9a-8c5f-2d4b6a8e0c13";
+    const CODEX_OTHER_ID: &str = "7d2b9e4c-1a3f-4c5e-8b6d-9f0a1c2e3d4b";
+    const CODEX_LIVE_AUTH: &str = r#"{"OPENAI_API_KEY":null,"auth_mode":"chatgpt","last_refresh":"2026-11-14T16:53:03.750022420Z","tokens":{"id_token":"eyJhbGciOi.id.sig","access_token":"eyJhbGciOi.access.sig","refresh_token":"rt_9f2c","account_id":"0f3a6c2e-7b1d-4e9a-8c5f-2d4b6a8e0c13","login_owner_id":"user-sam","oauth_provenance":{"issuer":"https://auth.openai.com","client_id":"app_4c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f"}}}"#;
+    const CODEX_OTHER_AUTH: &str = r#"{"OPENAI_API_KEY":null,"auth_mode":"chatgpt","last_refresh":"2026-11-15T09:10:00.000000000Z","tokens":{"id_token":"eyJhbGciOi.other.id","access_token":"eyJhbGciOi.other.sig","refresh_token":"rt_51ab","account_id":"7d2b9e4c-1a3f-4c5e-8b6d-9f0a1c2e3d4b","login_owner_id":"user-sam","oauth_provenance":{"issuer":"https://auth.openai.com","client_id":"app_4c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f"}}}"#;
+
     struct Fixture {
         _tmp: tempfile::TempDir,
         home: PathBuf,
@@ -2300,6 +2522,45 @@ pub(crate) mod tests {
                 Utc::now(),
             )
             .expect("the live login is saved");
+        }
+
+        /// A fake Codex folder with `CODEX_LIVE_AUTH` in `auth.json` and both
+        /// logins as OpenAI subscriptions, the second one saved.
+        fn codex_logins(&self) -> PathBuf {
+            let home = self.home.join("codex");
+            fs::create_dir_all(&home).expect("the Codex folder");
+            fs::write(home.join("auth.json"), CODEX_LIVE_AUTH).expect("auth.json");
+            let store = self.store();
+            let mut file = store.load().expect("accounts");
+            file.settings.codex_home = Some(home.clone());
+            for (id, abbr, plan) in [
+                (CODEX_LIVE_ID, "OA", Some("Plus")),
+                (CODEX_OTHER_ID, "OA2", Some("Pro")),
+            ] {
+                file.provider_subscriptions.push(ProviderSubscription {
+                    account: AccountRef {
+                        acc: id.to_string(),
+                        org: CODEX_ORG.to_string(),
+                    },
+                    label: "OpenAI".to_string(),
+                    abbr: abbr.to_string(),
+                    color: "#db2777".to_string(),
+                    plan: plan.map(str::to_string),
+                    price: None,
+                    price_currency: None,
+                });
+            }
+            store.save(&file).expect("accounts saved");
+            let other = AccountRef {
+                acc: CODEX_OTHER_ID.to_string(),
+                org: CODEX_ORG.to_string(),
+            };
+            let login = serde_json::from_str(CODEX_OTHER_AUTH).expect("a Codex login");
+            store
+                .secrets()
+                .set_codex(&providers::codex::secret_id(&other), &login)
+                .expect("the saved copy");
+            home
         }
 
         fn set_agents(&self, read: bool, switch: bool) {
@@ -2583,6 +2844,203 @@ pub(crate) mod tests {
                 .find(|(key, _)| *key == name)
                 .map(|(_, value)| value.to_string())
         })
+    }
+
+    /// R8 from the command line: `seatswap codex switch <abbr>` finds the login
+    /// by its abbreviation, switches Codex's fake `auth.json` to it and writes
+    /// the `providerSwitch` event; an unknown abbreviation, or a Claude
+    /// account's, is an error naming it and changes nothing. `codex list`
+    /// prints one line per saved login.
+    #[test]
+    fn codex_switch_by_abbreviation() {
+        let fixture = Fixture::new();
+        fixture.add_account(0);
+        {
+            // A Claude account's abbreviation is known, but it is no Codex login.
+            let store = fixture.store();
+            let mut file = store.load().expect("accounts");
+            file.accounts[0].abbr = "LB".to_string();
+            store.save(&file).expect("accounts saved");
+        }
+        let codex_home = fixture.codex_logins();
+
+        fixture
+            .run(
+                Command::Codex {
+                    action: CodexAction::Switch {
+                        abbr: "oa2".to_string(),
+                    },
+                },
+                Caller::Person,
+            )
+            .expect("the switch runs");
+
+        assert_eq!(
+            fs::read(codex_home.join("auth.json")).expect("auth.json"),
+            CODEX_OTHER_AUTH.as_bytes(),
+            "the switch writes the saved login byte for byte"
+        );
+
+        let app = AppPaths::at(&fixture.data_dir);
+        let host = "atlas".to_string();
+        let history = HistoryDir::at(&app.history_dir(), &host);
+        let now = Utc::now();
+        let read = history
+            .read::<seatswap_core::history::Event>(
+                &Range {
+                    from: now - Duration::hours(1),
+                    to: now + Duration::hours(1),
+                },
+                &seatswap_core::history::Hosts::One(host),
+            )
+            .expect("the events are read");
+        let switches: Vec<&EventKind> = read
+            .records
+            .iter()
+            .map(|record| &record.record.kind)
+            .filter(|kind| matches!(kind, EventKind::ProviderSwitch { .. }))
+            .collect();
+        assert_eq!(switches.len(), 1, "one providerSwitch event");
+        assert_eq!(
+            switches[0],
+            &EventKind::ProviderSwitch {
+                from: Some(AccountRef {
+                    acc: CODEX_LIVE_ID.to_string(),
+                    org: CODEX_ORG.to_string(),
+                }),
+                to: AccountRef {
+                    acc: CODEX_OTHER_ID.to_string(),
+                    org: CODEX_ORG.to_string(),
+                },
+                by: By::User,
+            }
+        );
+
+        let before = fs::read(codex_home.join("auth.json")).expect("auth.json");
+        // An unknown abbreviation is an error naming it.
+        let error = fixture
+            .run(
+                Command::Codex {
+                    action: CodexAction::Switch {
+                        abbr: "ZZ".to_string(),
+                    },
+                },
+                Caller::Person,
+            )
+            .expect_err("an unknown abbreviation is refused");
+        assert!(error.to_string().contains("ZZ"), "{error}");
+        // A known abbreviation that is not a Codex login is refused too, and
+        // changes nothing.
+        let error = fixture
+            .run(
+                Command::Codex {
+                    action: CodexAction::Switch {
+                        abbr: "LB".to_string(),
+                    },
+                },
+                Caller::Person,
+            )
+            .expect_err("a Claude account is not a Codex login");
+        assert!(
+            error.to_string().contains("LB") && error.to_string().contains("Claude account"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(codex_home.join("auth.json")).expect("auth.json"),
+            before,
+            "a refused switch writes nothing"
+        );
+
+        // `codex list` runs on the same fake folders (no usage is asked) and
+        // prints the live login first, then the other by abbreviation.
+        let store = fixture.store();
+        let settings = store.load().expect("accounts").settings;
+        let context = Context {
+            store,
+            claude: fixture.claude(),
+            settings,
+        };
+        let lines = codex_lines(&context, &CodexPaths::at(&codex_home)).expect("the list lines");
+        assert_eq!(
+            lines,
+            vec!["* OA2 Pro   live".to_string(), "  OA  Plus".to_string()],
+            "{lines:?}"
+        );
+        fixture
+            .run(
+                Command::Codex {
+                    action: CodexAction::List { json: false },
+                },
+                Caller::Person,
+            )
+            .expect("the list runs");
+    }
+
+    /// B8: `codex list` only reads. A live login Codex has open is not saved by
+    /// listing it, and neither its missing subscription nor any other record is
+    /// written.
+    #[test]
+    fn codex_list_writes_nothing() {
+        let fixture = Fixture::new();
+        let codex_home = fixture.codex_logins();
+        // The live login has no subscription and no stored copy: a poll would
+        // create both, a list must not.
+        let store = fixture.store();
+        let mut file = store.load().expect("accounts.json");
+        file.provider_subscriptions
+            .retain(|subscription| subscription.account.acc != CODEX_LIVE_ID);
+        store.save(&file).expect("accounts.json");
+        let accounts_before =
+            fs::read(fixture.data_dir.join("accounts.json")).expect("accounts.json");
+        let secrets_before = read_folder(&fixture.data_dir.join("secrets"));
+        let settings = store.load().expect("accounts").settings;
+        let context = Context {
+            store,
+            claude: fixture.claude(),
+            settings,
+        };
+        let rows = codex_rows(&context, &CodexPaths::at(&codex_home)).expect("the rows");
+
+        assert_eq!(rows.len(), 1, "only the saved login is listed: {rows:?}");
+        assert_eq!(rows[0].abbr, "OA2");
+        assert_eq!(
+            fs::read(fixture.data_dir.join("accounts.json")).expect("accounts.json"),
+            accounts_before,
+            "codex list changed accounts.json"
+        );
+        assert_eq!(
+            read_folder(&fixture.data_dir.join("secrets")),
+            secrets_before,
+            "codex list saved or changed a login"
+        );
+        assert!(
+            !fixture
+                .store()
+                .secrets()
+                .get_codex(&providers::codex::secret_id(&AccountRef {
+                    acc: CODEX_LIVE_ID.to_string(),
+                    org: CODEX_ORG.to_string(),
+                }))
+                .expect("the secret store")
+                .is_some(),
+            "codex list saved the live login"
+        );
+    }
+
+    /// Every file name and its bytes under one folder, for "nothing changed".
+    fn read_folder(folder: &std::path::Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
+        let mut files: Vec<(std::ffi::OsString, Vec<u8>)> = fs::read_dir(folder)
+            .expect("the folder")
+            .map(|entry| {
+                let entry = entry.expect("a folder entry");
+                (
+                    entry.file_name(),
+                    fs::read(entry.path()).expect("a file in the folder"),
+                )
+            })
+            .collect();
+        files.sort_by(|first, second| first.0.cmp(&second.0));
+        files
     }
 
     #[test]

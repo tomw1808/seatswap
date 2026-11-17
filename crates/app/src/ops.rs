@@ -7,7 +7,8 @@ use chrono::{DateTime, Utc};
 use seatswap_core::history::{
     self, AccountRef, By, EventKind, HistoryDir, HistoryError, Recorder, SessionCounts,
 };
-use seatswap_core::paths::{AppPaths, ClaudePaths};
+use seatswap_core::paths::{AppPaths, ClaudePaths, CodexPaths};
+use seatswap_core::providers::{self, CODEX_ORG};
 use seatswap_core::shared;
 #[cfg(feature = "gui")]
 use seatswap_core::store::AccountsFile;
@@ -89,6 +90,134 @@ pub(crate) fn remove_account(
             .map(|error| history_unwritable(&error))
     });
     Ok((removed, history_error))
+}
+
+/// The one place a provider reading's account gets its subscription, for the
+/// provider thread and for a Codex switch (R8): `switcher` creates it (and
+/// keeps its plan current under the app lock), then the history gets
+/// `accountAdded` when it was created and `planChanged` when the provider named
+/// another plan. Every history failure is one sentence in the returned
+/// warnings; the caller reports them the one way it reports provider errors.
+pub(crate) fn ensure_provider_subscription(
+    app: &AppPaths,
+    recorder: Option<&Recorder>,
+    account: &AccountRef,
+    plan: Option<&str>,
+    now: DateTime<Utc>,
+) -> Vec<String> {
+    let ensured = match switcher::ensure_provider_subscription(app, account, plan) {
+        Ok(ensured) => ensured,
+        Err(error) => {
+            let label = match account.org.as_str() {
+                CODEX_ORG => "OpenAI (Codex)",
+                seatswap_core::providers::OLLAMA_ORG => "Ollama",
+                _ => account.org.as_str(),
+            };
+            return vec![format!("the {label} subscription is not saved: {error}")];
+        }
+    };
+    let mut warnings = Vec::new();
+    if let Some(recorder) = recorder {
+        if ensured.created {
+            if let Err(error) = recorder.event(
+                now,
+                EventKind::AccountAdded {
+                    account: account.clone(),
+                    plan: plan.map(str::to_string),
+                },
+            ) {
+                warnings.push(history_unwritable(&error));
+            }
+        }
+        if let Some(change) = &ensured.plan_change {
+            if let Err(error) = record_plan_change(recorder, change, now) {
+                warnings.push(history_unwritable(&error));
+            }
+        }
+    }
+    warnings
+}
+
+/// The one place a Codex login switch is decided, for the CLI and the GUI
+/// (R8): the switch itself through `codex::switch_to`, then one
+/// [`EventKind::ProviderSwitch`] when the live login changed. A history write
+/// or a subscription write that fails is one sentence in `warnings`, reported
+/// beside the note and never failing the switch. An account that is not an
+/// OpenAI subscription is an error naming it.
+///
+/// The note is the sentence the person reads, and it is empty when the target
+/// already is the live login: the switch then does nothing and says nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexSwitch {
+    pub note: String,
+    pub warnings: Vec<String>,
+}
+
+pub(crate) fn switch_codex(
+    app: &AppPaths,
+    codex_paths: &CodexPaths,
+    store: &Store,
+    recorder: Option<&Recorder>,
+    to: &AccountRef,
+    now: DateTime<Utc>,
+) -> Result<CodexSwitch, String> {
+    let file = store.load().map_err(|error| error.to_string())?;
+    let to_subscription = file
+        .provider_subscription(to)
+        .filter(|subscription| subscription.account.org == CODEX_ORG)
+        .ok_or_else(|| format!("{} is not a saved Codex login", to.acc))?;
+    let to_abbr = to_subscription.abbr.clone();
+
+    let switched = providers::codex::switch_to(app, codex_paths, store.secrets(), to)
+        .map_err(|error| error.to_string())?;
+
+    // The switch stored the live login; make sure its subscription is there
+    // too (R8: a new account id gets one), so the note can name it. The one
+    // function writes its `accountAdded`, beside the switch event.
+    let mut warnings = match &switched.from {
+        Some(from) => ensure_provider_subscription(app, recorder, from, None, now),
+        None => Vec::new(),
+    };
+    let file = store.load().map_err(|error| error.to_string())?;
+
+    let changed = switched.from.as_ref() != Some(to);
+    if changed {
+        if let Some(recorder) = recorder {
+            if let Err(error) = recorder.event(
+                now,
+                EventKind::ProviderSwitch {
+                    from: switched.from.clone(),
+                    to: switched.to.clone(),
+                    by: By::User,
+                },
+            ) {
+                warnings.push(history_unwritable(&error));
+            }
+        }
+    }
+
+    let note = if !changed {
+        String::new()
+    } else {
+        let mut note = format!("Codex now uses {to_abbr}.");
+        match switched
+            .from
+            .as_ref()
+            .and_then(|from| file.provider_subscription(from))
+        {
+            Some(from) => note.push_str(&format!(
+                " Codex sessions already running keep {} until they restart.",
+                from.abbr
+            )),
+            None if switched.from.is_some() => note.push_str(
+                " Codex sessions already running keep their previous login until they restart.",
+            ),
+            None => {}
+        }
+        note
+    };
+
+    Ok(CodexSwitch { note, warnings })
 }
 
 /// The one place an account edit is written to the history, for the CLI and
@@ -303,11 +432,16 @@ mod tests {
 
     use chrono::Utc;
     use seatswap_core::paths::{AppPaths, ClaudePaths};
-    use seatswap_core::store::{FileSecrets, Store};
+    use seatswap_core::store::{FileSecrets, ProviderSubscription, Store};
 
     const ACCOUNT_UUID: &str = "4b7e2f91-3c5a-4d8e-9f1b-6a2c8e4d7b30";
     const ORG_UUID: &str = "e2a6c9d1-7f4b-4a3e-8c5d-1b9f0a7e3c62";
     const EMAIL: &str = "someone@example.com";
+    /// Two made-up Codex logins (R8), both real-shaped.
+    const CODEX_LIVE_ID: &str = "0f3a6c2e-7b1d-4e9a-8c5f-2d4b6a8e0c13";
+    const CODEX_OTHER_ID: &str = "7d2b9e4c-1a3f-4c5e-8b6d-9f0a1c2e3d4b";
+    const CODEX_LIVE_AUTH: &str = r#"{"OPENAI_API_KEY":null,"auth_mode":"chatgpt","last_refresh":"2026-11-14T16:53:03.750022420Z","tokens":{"id_token":"eyJhbGciOi.id.sig","access_token":"eyJhbGciOi.access.sig","refresh_token":"rt_9f2c","account_id":"0f3a6c2e-7b1d-4e9a-8c5f-2d4b6a8e0c13","login_owner_id":"user-sam","oauth_provenance":{"issuer":"https://auth.openai.com","client_id":"app_4c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f"}}}"#;
+    const CODEX_OTHER_AUTH: &str = r#"{"OPENAI_API_KEY":null,"auth_mode":"chatgpt","last_refresh":"2026-11-15T09:10:00.000000000Z","tokens":{"id_token":"eyJhbGciOi.other.id","access_token":"eyJhbGciOi.other.sig","refresh_token":"rt_51ab","account_id":"7d2b9e4c-1a3f-4c5e-8b6d-9f0a1c2e3d4b","login_owner_id":"user-sam","oauth_provenance":{"issuer":"https://auth.openai.com","client_id":"app_4c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f"}}}"#;
 
     struct Fixture {
         _tmp: tempfile::TempDir,
@@ -574,6 +708,75 @@ mod tests {
         assert_eq!(changed[0]["account"]["org"], ORG_UUID);
         assert_eq!(changed[0]["from"], "Team");
         assert_eq!(changed[0]["to"], "Team Premium");
+    }
+
+    /// R8: a switch whose live login had no subscription creates it through
+    /// the one `ensure_provider_subscription`, and the history records it as
+    /// `accountAdded` beside the switch.
+    #[test]
+    fn a_subscription_made_by_a_switch_is_recorded_as_added() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let codex_home = fixture._tmp.path().join("codex");
+        fs::create_dir_all(&codex_home).expect("the Codex folder");
+        fs::write(codex_home.join("auth.json"), CODEX_LIVE_AUTH).expect("auth.json");
+        let paths = CodexPaths::at(&codex_home);
+        let live = AccountRef {
+            acc: CODEX_LIVE_ID.to_string(),
+            org: CODEX_ORG.to_string(),
+        };
+        let other = AccountRef {
+            acc: CODEX_OTHER_ID.to_string(),
+            org: CODEX_ORG.to_string(),
+        };
+        let mut file = store.load().expect("accounts.json");
+        file.provider_subscriptions.push(ProviderSubscription {
+            account: other.clone(),
+            label: "OpenAI".to_string(),
+            abbr: "OA2".to_string(),
+            color: "#db2777".to_string(),
+            plan: Some("Pro".to_string()),
+            price: None,
+            price_currency: None,
+        });
+        store.save(&file).expect("accounts.json");
+        let login = serde_json::from_str(CODEX_OTHER_AUTH).expect("a Codex login");
+        store
+            .secrets()
+            .set_codex(&providers::codex::secret_id(&other), &login)
+            .expect("the saved copy");
+
+        let history = tempfile::tempdir().expect("history folder");
+        let recorder = Recorder::new(HistoryDir::at(history.path(), "atlas"));
+        let switched = switch_codex(
+            &fixture.app,
+            &paths,
+            &store,
+            Some(&recorder),
+            &other,
+            Utc::now(),
+        )
+        .expect("the switch runs");
+        assert!(switched.warnings.is_empty(), "{:?}", switched.warnings);
+        assert_eq!(
+            switched.note,
+            "Codex now uses OA2. Codex sessions already running keep OA until they restart."
+        );
+
+        let file = store.load().expect("accounts.json");
+        let made = file
+            .provider_subscription(&live)
+            .expect("the live login's subscription was created");
+        assert_eq!(made.abbr, "OA");
+        assert_eq!(made.plan, None, "a switch knows no plan for the old login");
+
+        let events = event_values(history.path());
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0]["type"], "accountAdded");
+        assert_eq!(events[0]["account"]["acc"], CODEX_LIVE_ID);
+        assert_eq!(events[0]["account"]["org"], CODEX_ORG);
+        assert_eq!(events[1]["type"], "providerSwitch");
+        assert_eq!(events[1]["to"]["acc"], CODEX_OTHER_ID);
     }
 
     #[test]
