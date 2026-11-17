@@ -91,7 +91,7 @@ there, and seatswap does not read or write that yet.
   CSV or JSON, and another history folder's files imported by hand.
 - **Usage at a glance.** The icon ring shows the active account's binding limit, coloured green,
   amber or red. The pop-up shows every account's session (5 h) and weekly limits, with the time
-  until each one resets — and its plan, such as "Team 5x".
+  until each one resets — and its plan, such as "Team Premium".
 - **Two read-only provider cards.** With a switch in *Settings → Providers*, the pop-up shows a
   Codex card (its 5 h and weekly limits, or whatever window lengths Codex sends) and an Ollama card
   (credits left, reset date, spend in the last 24 h, or session and weekly limits on an old plan).

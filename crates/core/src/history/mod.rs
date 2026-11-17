@@ -129,7 +129,7 @@ impl Kind {
 }
 
 /// One line of one history file.
-pub trait Record: Serialize + DeserializeOwned {
+pub trait Record: Serialize + DeserializeOwned + Send {
     const KIND: Kind;
     fn at(&self) -> DateTime<Utc>;
 

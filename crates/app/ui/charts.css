@@ -59,22 +59,75 @@
   bottom: 0;
 }
 
+/* A label anchored at a point (charts.js `anchoredLabel`): a column's middle,
+   a time on a track, a mark. Centred on its anchor; at the chart's edges it
+   starts or ends there (the fit sets `data-align`). */
+.chart-axis-label {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  white-space: nowrap;
+  transform: translateX(-50%);
+}
+
+.chart-axis-label[data-align="start"] {
+  transform: none;
+}
+
+.chart-axis-label[data-align="end"] {
+  transform: translateX(-100%);
+}
+
+/* A label or number the fit left out for lack of room: it keeps its line, so
+   every column keeps its height. */
+.chart-label-off,
+.chart-label-covered,
+.chart-number-off {
+  visibility: hidden;
+}
+
+/* A mark: its label on line 0 or 1 (charts.js `layoutMarks`), its dashed
+   line from under the label down. Line 1 lies above line 0 over columns
+   (step -13px) and below it over a plot (step 13px). */
 .chart-mark {
   position: absolute;
   top: 0;
   bottom: 0;
+  width: 0;
+  --chart-mark-row: 0;
+}
+
+.chart-mark::before {
+  content: "";
+  position: absolute;
+  top: calc(13px + var(--chart-mark-row) * var(--chart-mark-step, 13px));
+  bottom: 0;
+  left: 0;
   border-left: 1px dashed var(--border-strong);
 }
 
 .chart-mark-label {
-  position: absolute;
-  top: 0;
-  padding-left: 4px;
+  left: 0;
+  top: calc(var(--chart-mark-row) * var(--chart-mark-step, 13px));
+  padding: 0 3px;
   color: var(--muted);
   font-size: 9px;
   line-height: 13px;
-  white-space: nowrap;
-  transform: translateX(-50%);
+  pointer-events: auto;
+  /* Above every mark's line, so a line never runs through a label. */
+  z-index: 1;
+  background: var(--card);
+}
+
+/* A mark whose label has no room on either line: a dot on its line; its
+   tooltip names it. */
+.chart-mark-label.chart-mark-tick {
+  top: calc(var(--chart-mark-row) * var(--chart-mark-step, 13px) + 3px);
+  width: 8px;
+  height: 8px;
+  padding: 0;
+  border-radius: 50%;
+  background: var(--border-strong);
 }
 
 .chart-cols-body {
@@ -84,8 +137,8 @@
   gap: 8px;
   min-height: 0;
   /* the band above the tallest column: its mark labels sit at 15px and end at
-     28px, so no label touches a column (the labels of "PR added" and
-     "auto-burn on" in the All range). */
+     28px (a second line at 2px when two would touch), so no label touches a
+     column (the labels of "PR added" and "auto-burn on" in the All range). */
   padding: 34px 4px 0;
 }
 
@@ -129,14 +182,44 @@
   border-top: 1px solid var(--card);
 }
 
+/* The label line under a column: its label is anchored at the column's
+   middle and may be wider than the column; the fit shows it only where it
+   touches no other label. */
 .chart-col-label {
-  max-width: 100%;
+  position: relative;
+  flex: 0 0 13px;
+  width: 100%;
   font-size: 10px;
   line-height: 13px;
   color: var(--muted);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+}
+
+/* Columns narrower than 28px (charts.js `NARROW_COLUMN`): small gaps and
+   corners, so the bars keep their width. */
+.chart-narrow .chart-cols-body,
+.chart-narrow .chart-bars-body {
+  gap: 2px;
+}
+
+.chart-narrow .chart-pair,
+.chart-narrow .chart-bar-group {
+  gap: 1px;
+}
+
+.chart-narrow .chart-stack {
+  border-radius: 2px;
+}
+
+.chart-narrow .chart-bar {
+  border-radius: 2px 2px 0 0;
+}
+
+.chart-grid.chart-narrow {
+  --chart-grid-gap: 2px;
+}
+
+.chart-narrow .chart-cell {
+  border-radius: 3px;
 }
 
 .chart-col-sub {
@@ -211,6 +294,17 @@
   background: var(--chart-point-color, var(--focus));
   transform: translate(-50%, 50%);
   z-index: 1;
+}
+
+/* Points closer than 14px (charts.js `lines`): shown on hover and focus only;
+   the line shows the course. */
+.chart-lines-dense .chart-point {
+  opacity: 0;
+}
+
+.chart-lines-dense .chart-point:hover,
+.chart-lines-dense .chart-point:focus-visible {
+  opacity: 1;
 }
 
 .chart-xaxis {
@@ -301,14 +395,39 @@
   gap: calc(3px + var(--chart-grid-over, 0) * 0.42px);
   padding-top: calc(var(--chart-grid-over, 0) * 0.42px);
   font-size: 11px;
+  /* Many weeks: the columns shrink to `--chart-grid-cell-min`, then the grid
+     scrolls sideways inside the chart, never the page. */
+  overflow-x: auto;
+  overflow-y: hidden;
+  --chart-grid-label-min: 96px;
+  --chart-grid-cell-min: 12px;
+  --chart-grid-gap: 3px;
 }
 
+/* Every row has the same columns (`--chart-grid-cols` is set by charts.js),
+   and is at least as wide as they need, so the rows stay aligned when the
+   grid scrolls. */
 .chart-grid-row {
   display: grid;
-  grid-template-columns: var(--chart-grid-columns);
-  gap: 3px;
+  grid-template-columns:
+    minmax(var(--chart-grid-label-min), 1.3fr)
+    repeat(var(--chart-grid-cols), minmax(var(--chart-grid-cell-min), 1fr));
+  gap: var(--chart-grid-gap);
   align-items: center;
-  min-width: 0;
+  min-width: calc(
+    var(--chart-grid-label-min) + var(--chart-grid-cols) *
+      (var(--chart-grid-cell-min) + var(--chart-grid-gap))
+  );
+}
+
+/* The row labels stay in view while the grid scrolls. */
+.chart-grid-corner,
+.chart-grid-label {
+  position: sticky;
+  left: 0;
+  z-index: 3;
+  align-self: stretch;
+  background: var(--card);
 }
 
 .chart-grid-corner {
@@ -319,8 +438,13 @@
   min-height: 16px;
 }
 
+/* A week's header: the whole column is its click target; its label is
+   anchored at the column's middle and shown where it fits. */
 .chart-grid-head {
+  position: relative;
+  align-self: stretch;
   min-width: 0;
+  min-height: 12px;
   padding: 0;
   border: 0;
   background: none;
@@ -328,15 +452,24 @@
   font: inherit;
   font-size: 9px;
   line-height: 12px;
-  text-align: center;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 .chart-grid-head-selected {
   color: var(--focus);
   font-weight: 600;
+}
+
+/* The chosen week whose label has no room (beside "now"): a bar in its
+   colour still marks the column. */
+.chart-grid-head-selected:has(> .chart-label-off)::after {
+  content: "";
+  position: absolute;
+  left: 15%;
+  right: 15%;
+  bottom: 1px;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--focus);
 }
 
 .chart-grid-head-current {
@@ -437,7 +570,10 @@
 .chart-cell-text {
   position: relative;
   z-index: 1;
+  max-width: 100%;
+  overflow: hidden;
   padding-bottom: 4px;
+  white-space: nowrap;
   font-variant-numeric: tabular-nums;
 }
 
@@ -470,10 +606,12 @@
   box-shadow: inset 0 0 0 1px var(--focus);
 }
 
-/* The columns chart's mark labels sit above the columns, never behind them. */
+/* The columns chart's mark labels sit above the columns, never behind them:
+   line 0 at 15px, line 1 above it, both in the band the columns leave free. */
 .chart-marks-cols {
   top: 0;
   z-index: 2;
+  --chart-mark-step: -13px;
 }
 
 .chart-marks-cols .chart-mark {
@@ -586,16 +724,6 @@
   font-size: 9px;
   line-height: 14px;
   white-space: nowrap;
-}
-
-.chart-mark[data-align="start"] .chart-mark-label {
-  transform: none;
-}
-
-.chart-mark[data-align="end"] .chart-mark-label {
-  padding-left: 0;
-  padding-right: 4px;
-  transform: translateX(-100%);
 }
 
 /* A horizontal reference line of a lines chart (the window's 100 % line). */

@@ -521,45 +521,98 @@ pub fn price_key(provider: &str, model_id: &str) -> String {
     format!("{provider}/{model_id}")
 }
 
-/// The key a model id is priced under (spec §11.5): the one rule every price
-/// look-up of a token record goes through.
-///
-/// - A Claude plan model ([`is_plan_model`]) is `anthropic/<id>`.
-/// - An Ollama cloud model, as DeepSeek Harness and flash name it, is in
-///   models.dev's `ollama-cloud` list without Ollama's `-cloud` marker:
-///   `<name>:cloud` is `ollama-cloud/<name>`, and `<name>:<tag>-cloud` is
-///   `ollama-cloud/<name>:<tag>` (`deepseek-v4.1-flash:1017-cloud` is
-///   `ollama-cloud/deepseek-v4.1-flash:1017`).
-/// - Any other id is `openai/<id>`: Codex is the only other source of model
-///   ids.
-///
-/// A key without a price stays a missing price; no other provider is tried.
-pub fn model_price_key(model: &str) -> String {
-    if is_plan_model(model) {
-        return price_key("anthropic", model);
+/// Who a token record's model belongs to (spec §11.5): Claude's plan, Codex,
+/// or Ollama's cloud (DeepSeek Harness and flash workers). A Codex or Ollama
+/// record belongs to its provider and to no Claude account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Provider {
+    Claude,
+    Codex,
+    Ollama,
+}
+
+impl Provider {
+    /// The provider of a model id: the one rule, which [`model_price_key`]
+    /// and [`is_plan_model`] follow.
+    ///
+    /// - An id that starts with `claude-` is Claude's.
+    /// - An Ollama cloud id, as DeepSeek Harness and flash name it, is
+    ///   Ollama's: `<name>:cloud`, or `<name>:<tag>-cloud`
+    ///   (`deepseek-v4.1-flash:1017-cloud`), name and tag not empty.
+    /// - Any other id is Codex's: Codex is the only other source of model ids.
+    pub fn of_model(model: &str) -> Provider {
+        priced_as(model).0
+    }
+
+    /// The name a page writes for the provider.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Provider::Claude => "Claude",
+            Provider::Codex => "Codex",
+            Provider::Ollama => "Ollama",
+        }
+    }
+
+    /// The models.dev list ([`PRICE_PROVIDERS`]) the provider's models are
+    /// priced from.
+    fn price_list(&self) -> &'static str {
+        match self {
+            Provider::Claude => "anthropic",
+            Provider::Codex => "openai",
+            Provider::Ollama => "ollama-cloud",
+        }
+    }
+}
+
+/// A model id's provider and its id in that provider's models.dev list: the
+/// decision behind [`Provider::of_model`] and [`model_price_key`]. An Ollama
+/// cloud id loses Ollama's `-cloud` marker there: `<name>:cloud` is `<name>`,
+/// `<name>:<tag>-cloud` is `<name>:<tag>`.
+fn priced_as(model: &str) -> (Provider, &str) {
+    if model.starts_with("claude-") {
+        return (Provider::Claude, model);
     }
     if let Some(name) = model.strip_suffix(":cloud") {
         if !name.is_empty() {
-            return price_key("ollama-cloud", name);
+            return (Provider::Ollama, name);
         }
     }
     if let Some(tagged) = model.strip_suffix("-cloud") {
         if let Some((name, tag)) = tagged.rsplit_once(':') {
             if !name.is_empty() && !tag.is_empty() {
-                return price_key("ollama-cloud", tagged);
+                return (Provider::Ollama, tagged);
             }
         }
     }
-    price_key("openai", model)
+    (Provider::Codex, model)
+}
+
+/// The key a model id is priced under (spec §11.5): the one rule every price
+/// look-up of a token record goes through. The provider is
+/// [`Provider::of_model`]'s.
+///
+/// - A Claude model is `anthropic/<id>`.
+/// - An Ollama cloud model is in models.dev's `ollama-cloud` list without
+///   Ollama's `-cloud` marker: `<name>:cloud` is `ollama-cloud/<name>`, and
+///   `<name>:<tag>-cloud` is `ollama-cloud/<name>:<tag>`
+///   (`deepseek-v4.1-flash:1017-cloud` is
+///   `ollama-cloud/deepseek-v4.1-flash:1017`).
+/// - A Codex model is `openai/<id>`.
+///
+/// A key without a price stays a missing price; no other provider is tried.
+pub fn model_price_key(model: &str) -> String {
+    let (provider, id) = priced_as(model);
+    price_key(provider.price_list(), id)
 }
 
 /// Whether `model` is a Claude Code model, so its tokens use the Claude plan
-/// (spec §1.4, §3.8): the one rule. Claude Code's own model ids start with
-/// `claude-`; a DeepSeek Harness or flash worker (`deepseek-v4.1-flash:cloud`),
-/// a Codex model (`gpt-6.1-sol`) and an Ollama model (`glm-5:cloud`) do not, so
-/// their tokens take no share of any Claude account's week.
+/// (spec §1.4, §3.8): [`Provider::of_model`] is Claude. A DeepSeek Harness or
+/// flash worker (`deepseek-v4.1-flash:cloud`), a Codex model (`gpt-6.1-sol`)
+/// and an Ollama model (`glm-5:cloud`) are not, so their tokens take no share
+/// of any Claude account's week.
 pub fn is_plan_model(model: &str) -> bool {
-    model.starts_with("claude-")
+    Provider::of_model(model) == Provider::Claude
 }
 
 /// The value of a token or session cost: the provider's own number when it
@@ -859,10 +912,15 @@ pub struct Valued {
     /// The tokens at API prices, times the rate of the record's day. Without a
     /// rate of the settings' currency this is the USD value (spec §1.4).
     pub api: Option<f64>,
-    /// The share of the account's subscription that the record's week used.
+    /// The share of the account's subscription that the record's week used;
+    /// a known 0 for a record of another provider than Claude.
     pub subscription: Option<f64>,
-    /// The account that was live on the record's host at its time.
+    /// The Claude account that was live on the record's host at its time;
+    /// always `None` for a record of another provider than Claude, which uses
+    /// no Claude account.
     pub account: Option<AccountRef>,
+    /// The provider of the record's model ([`Provider::of_model`]).
+    pub provider: Provider,
     /// The currency `api` is in: the settings' currency with a rate, "USD"
     /// without one, and `None` when `api` is `None`.
     pub api_currency: Option<String>,
@@ -882,6 +940,9 @@ struct WeekWindow {
     /// A running window's first percent when a reset began it: its use is
     /// `used − from`, the rule of `stats::window_used`. Absent means 0.
     from: Option<f64>,
+    /// A running window's newest weekly reading, in percent: the `final` its
+    /// [`Valuer::running_windows`] record carries. `None` for a finished window.
+    percent: Option<f64>,
     /// Whether `used` came from a finished [`WindowRecord`].
     finished: bool,
     last_sample: Option<DateTime<Utc>>,
@@ -901,9 +962,12 @@ type PriceChanges = BTreeMap<AccountRef, Vec<(DateTime<Utc>, Option<f64>, Option
 pub struct Valuer {
     timelines: HashMap<String, Timeline>,
     windows: Vec<WeekWindow>,
-    /// For each reset window, the reading it began at, keyed by the account and
-    /// that reading's time: the `from` of the running window it opened.
-    window_starts: BTreeMap<(AccountRef, DateTime<Utc>), f64>,
+    /// Each account's windows, by their place in `windows`, in the order they
+    /// were added: a lookup reads only the account's own windows.
+    account_windows: HashMap<AccountRef, Vec<usize>>,
+    /// For each reset window, the reading it began at, by the account and that
+    /// reading's time: the `from` of the running window it opened.
+    window_starts: HashMap<AccountRef, BTreeMap<DateTime<Utc>, f64>>,
     price_changes: PriceChanges,
     /// The price as `accounts.json` has it now and the currency it was entered
     /// in, for an account without changes.
@@ -983,7 +1047,7 @@ impl Valuer {
         // (`final − from`) instead of counting the tokens from before the reset.
         // The reading's own reset time names the new window, so a reset that
         // also moved the reset time is found too.
-        let mut window_starts = BTreeMap::new();
+        let mut window_starts: HashMap<AccountRef, BTreeMap<DateTime<Utc>, f64>> = HashMap::new();
         for hosted in &windows.records {
             let record = &hosted.record;
             if record.k != crate::api::LimitKind::WeeklyAll || !record.reset {
@@ -997,21 +1061,27 @@ impl Valuer {
                     .find(|limit| limit.k == crate::api::LimitKind::WeeklyAll && limit.r.is_some())
                     .map(|limit| (sample.record.t, limit.p))
             };
-            let first = samples
+            // The samples are sorted by time: the first one at or after the
+            // reset is the earliest.
+            let after = samples
                 .records
+                .partition_point(|sample| sample.record.t < record.end);
+            let first = samples.records[after..]
                 .iter()
                 .filter(|sample| sample.record.account == record.account)
-                .filter(|sample| sample.record.t >= record.end)
-                .filter_map(weekly)
-                .min_by_key(|(t, _)| *t);
+                .find_map(weekly);
             if let Some((t, percent)) = first {
-                window_starts.insert((record.account.clone(), t), percent);
+                window_starts
+                    .entry(record.account.clone())
+                    .or_default()
+                    .insert(t, percent);
             }
         }
 
         let mut valuer = Valuer {
             timelines: timelines(&events.records),
             windows: Vec::new(),
+            account_windows: HashMap::new(),
             window_starts,
             price_changes: BTreeMap::new(),
             stored_prices: accounts
@@ -1047,6 +1117,7 @@ impl Valuer {
         for hosted in &samples.records {
             valuer.sample_window(&hosted.record);
         }
+        valuer.sample_windows_used();
         for hosted in &events.records {
             if let EventKind::PriceChanged {
                 account,
@@ -1075,25 +1146,44 @@ impl Valuer {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> usize {
-        if let Some(index) = self
-            .windows
-            .iter()
-            .position(|window| &window.account == account && same_reset(window.end, end))
-        {
+        let same = self.account_windows.get(account).and_then(|own| {
+            own.iter()
+                .copied()
+                .find(|index| same_reset(self.windows[*index].end, end))
+        });
+        if let Some(index) = same {
             return index;
         }
+        self.account_windows
+            .entry(account.clone())
+            .or_default()
+            .push(self.windows.len());
         self.windows.push(WeekWindow {
             account: account.clone(),
             start,
             end,
             used: None,
             from: None,
+            percent: None,
             finished: false,
             last_sample: None,
             api_sum: 0.0,
             unpriced: None,
         });
         self.windows.len() - 1
+    }
+
+    /// The account's first window, in the order they were added, that holds
+    /// `at` (`start <= at < end`).
+    fn window_holding(&self, account: &AccountRef, at: DateTime<Utc>) -> Option<usize> {
+        self.account_windows
+            .get(account)?
+            .iter()
+            .copied()
+            .find(|index| {
+                let window = &self.windows[*index];
+                window.start <= at && at < window.end
+            })
     }
 
     fn finished_window(&mut self, record: &WindowRecord) {
@@ -1130,15 +1220,29 @@ impl Valuer {
             if newer {
                 if let Some(from) = self
                     .window_starts
-                    .get(&(sample.account.clone(), sample.t))
+                    .get(&sample.account)
+                    .and_then(|starts| starts.get(&sample.t))
                     .copied()
                 {
                     window.from = Some(from);
                 }
                 window.last_sample = Some(sample.t);
-                window.used =
-                    open_window_used(&sample.account, end, sample.t, limit.p, window.from);
+                window.percent = Some(limit.p);
             }
+        }
+    }
+
+    /// The use of every window the readings opened and no finished record
+    /// closed, from its newest reading: set once after all readings are in.
+    fn sample_windows_used(&mut self) {
+        for window in &mut self.windows {
+            if window.finished {
+                continue;
+            }
+            let (Some(at), Some(percent)) = (window.last_sample, window.percent) else {
+                continue;
+            };
+            window.used = open_window_used(&window.account, window.end, at, percent, window.from);
         }
     }
 
@@ -1158,9 +1262,7 @@ impl Valuer {
         else {
             return;
         };
-        let Some(index) = self.windows.iter().position(|window| {
-            window.account == account && window.start <= record.t && record.t < window.end
-        }) else {
+        let Some(index) = self.window_holding(&account, record.t) else {
             return;
         };
         // A record without tokens adds nothing anywhere and is never "unpriced".
@@ -1178,19 +1280,75 @@ impl Valuer {
         }
     }
 
+    /// The weekly windows still running at `now`, one per account at most, as
+    /// the records a finished window would have: of every window the readings
+    /// opened and no finished record closed, the account's one with the newest
+    /// reading, when its reset (`end`) lies after `now`. A reading of another
+    /// host whose clock runs a little ahead still counts. A window the
+    /// readings opened before an early reset that moved the reset time has an
+    /// older newest reading than the window after the reset, so it is never
+    /// taken for the running one. The record's `start` is seven days
+    /// before `end`, `final` the newest reading's percent, `from` the reading a
+    /// reset began it at (the `from` its use is counted with), `lastSample` that
+    /// reading's time; it has no `lost` (nothing expired yet) and is no reset.
+    /// Sorted by end, then account.
+    pub(crate) fn running_windows(&self, now: DateTime<Utc>) -> Vec<WindowRecord> {
+        let mut newest: BTreeMap<&AccountRef, (&WeekWindow, DateTime<Utc>, f64)> = BTreeMap::new();
+        for window in &self.windows {
+            if window.finished {
+                continue;
+            }
+            let (Some(last_sample), Some(percent)) = (window.last_sample, window.percent) else {
+                continue;
+            };
+            let newer = newest
+                .get(&window.account)
+                .is_none_or(|(_, kept, _)| last_sample > *kept);
+            if newer {
+                newest.insert(&window.account, (window, last_sample, percent));
+            }
+        }
+        let mut running: Vec<WindowRecord> = newest
+            .into_values()
+            .filter(|(window, _, _)| window.end > now)
+            .map(|(window, last_sample, percent)| WindowRecord {
+                account: window.account.clone(),
+                k: crate::api::LimitKind::WeeklyAll,
+                m: None,
+                start: Some(window.start),
+                end: window.end,
+                final_percent: percent,
+                lost: None,
+                last_sample,
+                plan: None,
+                uncertain: false,
+                reset: false,
+                from: window.from,
+            })
+            .collect();
+        running.sort_by(|a, b| a.end.cmp(&b.end).then_with(|| a.account.cmp(&b.account)));
+        running
+    }
+
     /// The dollar rate this valuer was built with: the API column's rate at a
     /// record's day, and at the view's day for a list without records.
     pub fn fx(&self) -> &Fx {
         &self.fx
     }
 
-    /// The money value of one token record of `host`.
+    /// The money value of one token record of `host`. A record of another
+    /// provider than Claude belongs to its provider and to no Claude account,
+    /// whichever account was live on its host.
     pub fn value(&self, host: &str, record: &TokenRecord) -> Valued {
-        let account = self
-            .timelines
-            .get(host)
-            .and_then(|timeline| timeline.at(record.t))
-            .cloned();
+        let provider = Provider::of_model(&record.model);
+        let account = match provider {
+            Provider::Claude => self
+                .timelines
+                .get(host)
+                .and_then(|timeline| timeline.at(record.t))
+                .cloned(),
+            Provider::Codex | Provider::Ollama => None,
+        };
         let usd = api_usd(record, &self.prices);
         let (api, api_currency, api_missing) = match usd {
             None => (
@@ -1213,7 +1371,7 @@ impl Valuer {
         // uses no share of any Claude account's week either: its subscription is
         // a known 0; only its API half follows the price rule.
         let no_tokens = record.input == 0 && record.out == 0 && record.cw == 0 && record.cr == 0;
-        let (subscription, subscription_missing) = if no_tokens || !is_plan_model(&record.model) {
+        let (subscription, subscription_missing) = if no_tokens || provider != Provider::Claude {
             (Some(0.0), None)
         } else {
             match (usd, &account) {
@@ -1234,6 +1392,7 @@ impl Valuer {
             api,
             subscription,
             account,
+            provider,
             api_currency,
             api_missing,
             subscription_missing,
@@ -1247,9 +1406,8 @@ impl Valuer {
         usd: f64,
     ) -> Result<f64, Missing> {
         let window = self
-            .windows
-            .iter()
-            .find(|window| &window.account == account && window.start <= at && at < window.end)
+            .window_holding(account, at)
+            .map(|index| &self.windows[index])
             .ok_or(Missing::NoReading)?;
         let used = window.used.ok_or(Missing::NoReading)?;
         let price = self.window_price(&window.account, window.start, window.end)?;
@@ -1424,7 +1582,7 @@ mod tests {
             "color": "#3b82f6",
             "email": "sam@example.com",
             "orgName": "Acme",
-            "plan": "Team 5x",
+            "plan": "Team Premium",
             "price": price,
             "oauthAccount": {
                 "accountUuid": AC_ACC,
@@ -3532,6 +3690,105 @@ mod tests {
         assert!(!is_plan_model("glm-5:cloud"));
     }
 
+    #[test]
+    fn each_model_has_its_provider() {
+        for (model, provider) in [
+            ("claude-opus-5-5", Provider::Claude),
+            ("claude-fable-5-2", Provider::Claude),
+            ("gpt-6.1-sol", Provider::Codex),
+            ("deepseek-v4.1-flash:cloud", Provider::Ollama),
+            ("deepseek-v4.1-flash:1017-cloud", Provider::Ollama),
+            ("glm-5:cloud", Provider::Ollama),
+            // Neither Ollama form: priced as `openai`, so Codex's.
+            ("gpt-6.1-cloud", Provider::Codex),
+            (":cloud", Provider::Codex),
+        ] {
+            assert_eq!(Provider::of_model(model), provider, "{model}");
+            assert_eq!(
+                is_plan_model(model),
+                provider == Provider::Claude,
+                "{model}: one rule"
+            );
+        }
+        assert_eq!(Provider::Claude.name(), "Claude");
+        assert_eq!(Provider::Codex.name(), "Codex");
+        assert_eq!(Provider::Ollama.name(), "Ollama");
+    }
+
+    /// A Codex or Ollama record done while AC was live belongs to its provider
+    /// and to no Claude account: its subscription value is a known 0, its API
+    /// value its own. A Claude record of the same hour stays AC's.
+    #[test]
+    fn a_codex_record_belongs_to_no_claude_account() {
+        let (history, _dir, opus, _haiku, mut prices) = two_records();
+        prices.take(
+            BTreeMap::from([(
+                "openai/gpt-6.1-sol".to_string(),
+                ModelPrice {
+                    input: 1.25,
+                    output: 10.0,
+                    cache_write: 0.0,
+                    cache_read: 0.125,
+                    tiered: false,
+                },
+            )]),
+            utc("2026-11-01T00:00:00Z"),
+        );
+        let codex = token(
+            utc("2026-11-10T10:30:00Z"),
+            "gpt-6.1-sol",
+            0,
+            2_000_000,
+            0,
+            0,
+        );
+        let flash = token(
+            utc("2026-11-10T10:40:00Z"),
+            "deepseek-v4.1-flash:cloud",
+            0,
+            1_000_000,
+            0,
+            0,
+        );
+        history.append(&codex).expect("a Codex record");
+        history.append(&flash).expect("a flash record");
+        history
+            .append(&weekly_window(
+                utc("2026-11-07T00:00:00Z"),
+                utc("2026-11-14T00:00:00Z"),
+                80.0,
+            ))
+            .expect("a finished window");
+        let valuer = Valuer::build(
+            &history,
+            &range("2026-11-10T00:00:00Z", "2026-11-11T00:00:00Z"),
+            &prices,
+            &empty_fx(),
+            &settings_eur(),
+            &[account_with_price(Some(140.0))],
+            &RefCell::new(Vec::new()),
+        )
+        .expect("a valuer");
+
+        let value = valuer.value("atlas", &codex);
+        assert_eq!(value.provider, Provider::Codex);
+        assert_eq!(
+            value.account, None,
+            "AC was live, but Codex uses no Claude account"
+        );
+        assert_eq!(value.api, Some(20.0));
+        assert_eq!(value.subscription, Some(0.0));
+        assert_eq!(value.subscription_missing, None);
+
+        let value = valuer.value("atlas", &flash);
+        assert_eq!(value.provider, Provider::Ollama);
+        assert_eq!(value.account, None);
+
+        let value = valuer.value("atlas", &opus);
+        assert_eq!(value.provider, Provider::Claude);
+        assert_eq!(value.account, Some(ac()));
+    }
+
     /// A flash worker's records never touch the Claude account's week: they add
     /// no API money and never make the week's subscription value unknown.
     #[test]
@@ -3659,6 +3916,68 @@ mod tests {
             Some(15.0),
             "the running window's use is 60 − 45, not 60"
         );
+    }
+
+    /// The running window is the one of the account's newest reading: after a
+    /// reset that moved the reset time, the window the older readings named
+    /// (reset 20 Nov, still in the future) is not running; the new one is,
+    /// with its newest percent and the `from` the reset began it at. Once its
+    /// reset has passed, nothing runs.
+    #[test]
+    fn the_running_window_is_the_one_of_the_newest_reading() {
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let old_reset = utc("2026-11-20T10:00:00Z");
+        let new_reset = utc("2026-11-27T10:00:00Z");
+        let before = utc("2026-11-16T09:00:00Z");
+        let reset_reading = utc("2026-11-18T08:30:00Z");
+        let later = utc("2026-11-19T12:00:00Z");
+        history
+            .append(&weekly_sample(before, old_reset, 70.0))
+            .expect("a weekly sample");
+        history
+            .append(&weekly_sample(reset_reading, new_reset, 45.0))
+            .expect("a weekly sample");
+        history
+            .append(&weekly_sample(later, new_reset, 60.0))
+            .expect("a weekly sample");
+        let mut reset = weekly_window(old_reset - Duration::days(7), reset_reading, 70.0);
+        reset.reset = true;
+        reset.last_sample = before;
+        history.append(&reset).expect("the reset window");
+
+        let valuer = Valuer::build(
+            &history,
+            &range("2026-11-16T00:00:00Z", "2026-11-19T13:00:00Z"),
+            &priced_prices(utc("2026-11-01T00:00:00Z")),
+            &empty_fx(),
+            &settings_eur(),
+            &[account_with_price(Some(140.0))],
+            &RefCell::new(Vec::new()),
+        )
+        .expect("a valuer");
+
+        let now = utc("2026-11-19T13:00:00Z");
+        assert_eq!(
+            valuer.running_windows(now),
+            vec![WindowRecord {
+                account: ac(),
+                k: crate::api::LimitKind::WeeklyAll,
+                m: None,
+                start: Some(new_reset - Duration::days(7)),
+                end: new_reset,
+                final_percent: 60.0,
+                lost: None,
+                last_sample: later,
+                plan: None,
+                uncertain: false,
+                reset: false,
+                from: Some(45.0),
+            }]
+        );
+        assert!(valuer
+            .running_windows(new_reset + Duration::minutes(1))
+            .is_empty());
     }
 
     /// After a model reset that keeps the reset time, the running window holds

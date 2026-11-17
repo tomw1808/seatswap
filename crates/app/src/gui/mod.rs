@@ -161,8 +161,13 @@ pub(crate) struct GuiState {
     /// hid it (`panel::PanelState`).
     panel: Mutex<panel::PanelState>,
     tray: Mutex<Option<tauri::tray::TrayIcon>>,
-    _watcher: Mutex<Option<seatswap_core::watcher::Watcher>>,
+    /// The login watch; `None` when it could not start (that error is then
+    /// one of the start-up errors). Its state says whether Claude Code's
+    /// folder exists yet.
+    watcher: Mutex<Option<seatswap_core::watcher::Watcher>>,
     _sessions: Mutex<Option<SessionsHandle>>,
+    /// The start-up errors joined once; [`with_gui_facts`] adds them to every
+    /// new snapshot.
     startup_error: Option<String>,
     /// A normal quit sets this before the engine thread stops, so the UI
     /// disconnect is not mistaken for a crash.
@@ -280,6 +285,7 @@ pub(crate) fn run(
             window::sessions_subscribe,
             window::sessions_unsubscribe,
             window::stats_overview,
+            window::stats_this_week,
             window::stats_weeks,
             window::stats_week_summary,
             window::stats_window_detail,
@@ -462,7 +468,14 @@ fn setup(
     } else {
         Some(startup_errors.join("; "))
     };
-    let initial = Snapshot::empty(startup_error.clone(), None, settings);
+    let initial = with_gui_facts(
+        Snapshot::empty(None, None, settings),
+        startup_error.as_deref(),
+        watcher
+            .as_ref()
+            .map(seatswap_core::watcher::Watcher::state)
+            .as_ref(),
+    );
     let sessions = worker.sessions.take();
     let lookup_handle = worker
         .lookup
@@ -499,7 +512,7 @@ fn setup(
         printed_warnings,
         panel: Mutex::new(panel::PanelState::new()),
         tray: Mutex::new(None),
-        _watcher: Mutex::new(watcher),
+        watcher: Mutex::new(watcher),
         _sessions: Mutex::new(sessions),
         startup_error,
         exiting: AtomicBool::new(false),
@@ -540,7 +553,7 @@ fn setup(
                         return;
                     }
                     let snapshot = stopped_snapshot(lock(&state.snapshot).clone());
-                    apply_snapshot(&handle, snapshot);
+                    apply_snapshot(&handle, Shown::New(Box::new(snapshot)));
                 }
             });
         })?;
@@ -581,18 +594,16 @@ struct ListenerHolder {
 #[cfg(feature = "gui")]
 fn handle_ui_event(app: &AppHandle, event: UiEvent) {
     match event {
-        UiEvent::Snapshot(snapshot) => apply_snapshot(app, snapshot),
+        UiEvent::Snapshot(snapshot) => apply_snapshot(app, Shown::New(Box::new(snapshot))),
         UiEvent::Sessions(summary) => {
             let state = app.state::<GuiState>();
             *lock(&state.sessions) = Some(summary);
-            let snapshot = lock(&state.snapshot).clone();
-            apply_snapshot(app, snapshot);
+            apply_snapshot(app, Shown::Again);
         }
         UiEvent::Providers(list) => {
             let state = app.state::<GuiState>();
             *lock(&state.providers) = list;
-            let snapshot = lock(&state.snapshot).clone();
-            apply_snapshot(app, snapshot);
+            apply_snapshot(app, Shown::Again);
         }
         UiEvent::Money(view) => {
             let _ = app.emit("money", &view);
@@ -603,17 +614,64 @@ fn handle_ui_event(app: &AppHandle, event: UiEvent) {
     }
 }
 
+/// What [`apply_snapshot`] shows: a snapshot that comes from the engine (or
+/// replaces the engine's, as the stopped one does), or the stored one again
+/// because the sessions, the providers or a re-check changed.
 #[cfg(feature = "gui")]
-fn apply_snapshot(app: &AppHandle, mut snapshot: Snapshot) {
+enum Shown {
+    New(Box<Snapshot>),
+    Again,
+}
+
+/// The snapshot to show. Only a new one gets the GUI's own facts: the stored
+/// one already carries them, and adding them again joined every start-up error
+/// to itself ("X; X") on the first sessions or providers update.
+#[cfg(feature = "gui")]
+fn to_show(
+    shown: Shown,
+    stored: &Mutex<Snapshot>,
+    startup: Option<&str>,
+    watch: Option<&seatswap_core::watcher::WatchState>,
+) -> Snapshot {
+    match shown {
+        Shown::New(snapshot) => with_gui_facts(*snapshot, startup, watch),
+        Shown::Again => lock(stored).clone(),
+    }
+}
+
+/// Add what the GUI knows and the engine does not: the start-up errors, the
+/// login watch's failure, and whether Claude Code's folder exists yet.
+#[cfg(feature = "gui")]
+fn with_gui_facts(
+    mut snapshot: Snapshot,
+    startup: Option<&str>,
+    watch: Option<&seatswap_core::watcher::WatchState>,
+) -> Snapshot {
+    use seatswap_core::watcher::WatchState;
+    if let Some(startup) = startup {
+        snapshot.error = worker::combine(snapshot.error.take(), startup.to_string());
+    }
+    if let Some(WatchState::Failed(text)) = watch {
+        snapshot.error = worker::combine(snapshot.error.take(), format!("file watcher: {text}"));
+    }
+    snapshot.claude_not_set_up = matches!(watch, Some(WatchState::NotSetUp));
+    snapshot
+}
+
+#[cfg(feature = "gui")]
+fn apply_snapshot(app: &AppHandle, shown: Shown) {
     let state = app.state::<GuiState>();
+    let watch = lock(&state.watcher)
+        .as_ref()
+        .map(seatswap_core::watcher::Watcher::state);
+    let mut snapshot = to_show(
+        shown,
+        &state.snapshot,
+        state.startup_error.as_deref(),
+        watch.as_ref(),
+    );
     snapshot.sessions = lock(&state.sessions).clone();
     snapshot.providers = lock(&state.providers).clone();
-    if let Some(startup) = &state.startup_error {
-        snapshot.error = Some(match snapshot.error.take() {
-            Some(engine) => format!("{engine}; {startup}"),
-            None => startup.clone(),
-        });
-    }
     let now = Utc::now();
     let (due, recheck) = {
         let mut current = lock(&state.snapshot);
@@ -784,9 +842,8 @@ fn apply_recheck_now(handle: &AppHandle) {
         recheck.at = None;
         recheck.running = false;
     }
-    let snapshot = lock(&state.snapshot).clone();
     let wake = handle.clone();
-    let _ = handle.run_on_main_thread(move || apply_snapshot(&wake, snapshot));
+    let _ = handle.run_on_main_thread(move || apply_snapshot(&wake, Shown::Again));
 }
 
 #[cfg(feature = "gui")]
@@ -1222,6 +1279,64 @@ mod tests {
                 "auto-burn: cannot read the history".to_string(),
             ],
             "each error text is notified once, and a new text is notified"
+        );
+    }
+
+    /// The start-up error is added to each new snapshot once. Showing the
+    /// stored snapshot again (a sessions or providers update, a re-check) must
+    /// not add it a second time: that printed "X; X" at every start.
+    #[test]
+    fn a_startup_error_is_shown_once_however_often_the_snapshot_is_shown() {
+        let startup = "notification name: the registry refused the write";
+        let stored = Mutex::new(to_show(
+            Shown::New(Box::new(Snapshot::empty(None, None, None))),
+            &Mutex::new(Snapshot::empty(None, None, None)),
+            Some(startup),
+            None,
+        ));
+        assert_eq!(lock(&stored).error.as_deref(), Some(startup));
+
+        for _ in 0..3 {
+            let again = to_show(Shown::Again, &stored, Some(startup), None);
+            assert_eq!(again.error.as_deref(), Some(startup));
+            *lock(&stored) = again;
+        }
+
+        // A new engine snapshot with its own error: both, each once.
+        let engine = Snapshot::empty(Some("usage: rate limited".to_string()), None, None);
+        let shown = to_show(Shown::New(Box::new(engine)), &stored, Some(startup), None);
+        assert_eq!(
+            shown.error.as_deref(),
+            Some(format!("usage: rate limited; {startup}").as_str())
+        );
+    }
+
+    /// A machine without Claude Code's folder is a calm state, not an error;
+    /// a watch that cannot follow the folders is an error.
+    #[test]
+    fn the_watch_state_reaches_the_snapshot() {
+        use seatswap_core::watcher::WatchState;
+        let empty = || Snapshot::empty(None, None, None);
+
+        let not_set_up = with_gui_facts(empty(), None, Some(&WatchState::NotSetUp));
+        assert!(not_set_up.claude_not_set_up);
+        assert_eq!(not_set_up.error, None);
+
+        let watching = with_gui_facts(empty(), None, Some(&WatchState::Watching));
+        assert!(!watching.claude_not_set_up);
+        assert_eq!(watching.error, None);
+
+        let failed = with_gui_facts(
+            empty(),
+            None,
+            Some(&WatchState::Failed(
+                "/home/sam/.claude: not a folder".to_string(),
+            )),
+        );
+        assert!(!failed.claude_not_set_up);
+        assert_eq!(
+            failed.error.as_deref(),
+            Some("file watcher: /home/sam/.claude: not a folder")
         );
     }
 }

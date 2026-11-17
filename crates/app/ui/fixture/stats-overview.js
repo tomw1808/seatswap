@@ -1,8 +1,15 @@
-// The statistics Overview page's fixture: `stats_overview`.
+// The statistics Overview page's fixture: `stats_overview` and its This-week
+// card, `stats_this_week`.
+//
+// Two variants by the page address: `?fixture=stats-no-running` has no usage
+// reading yet, so the This-week card is empty; `?fixture=stats-day1` has the
+// running windows but no finished one, so the history below is empty. With
+// `?fixture=stats-empty` every range holds nothing, and the card still answers.
 
 import {
   BLOCKED,
   DAY,
+  NOW_MS,
   byAbbr,
   chosenAccounts,
   expiredByAccount,
@@ -11,6 +18,7 @@ import {
   findingExpired,
   findingFull,
   marksOf,
+  resetEnd,
   sum,
   switchesOf,
   topProjects,
@@ -21,24 +29,132 @@ import {
   windowsOfWeek,
 } from "./stats-frame.js";
 
+function variant() {
+  if (typeof location === "undefined") return null;
+  return new URLSearchParams(location.search).get("fixture");
+}
+
+// Each account's running window by project, in % of its API value: the
+// mock-up's four projects, PR's smallest one beyond the three named.
+const RUNNING_PROJECTS = {
+  LB: [
+    ["atlas", 58],
+    ["ledger", 27],
+    ["notes", 15],
+  ],
+  AC: [
+    ["acme-kb", 81],
+    ["atlas", 19],
+  ],
+  PR: [
+    ["atlas", 44],
+    ["ledger", 30],
+    ["notes", 16],
+    ["acme-kb", 10],
+  ],
+};
+
+// The three largest, then `other`, as Rust's `top_three` writes them.
+function topThree(items) {
+  const sorted = [...items].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  if (sorted.length <= 3) return sorted;
+  return [...sorted.slice(0, 3), ["other", sum(sorted.slice(3).map(([, value]) => value))]];
+}
+
+// The weekly window of `account` that runs at the fixture's now: the first one
+// whose reset lies after it.
+function runningWindow(account) {
+  for (let index = 0; ; index += 1) {
+    const end = Date.parse(resetEnd(account, index));
+    if (end > NOW_MS) return { start: end - 7 * DAY, end };
+  }
+}
+
+// The other providers' work since Monday, at API prices in EUR: a Codex
+// session on atlas and ledger, flash workers on ledger and notes. The account
+// chips do not filter them.
+const PROVIDERS = [
+  {
+    name: "Codex",
+    api: 34.1,
+    apiCurrency: "EUR",
+    apiMissing: null,
+    projects: [
+      ["atlas", 72],
+      ["ledger", 28],
+    ],
+  },
+  {
+    name: "Ollama",
+    api: 6.85,
+    apiCurrency: "EUR",
+    apiMissing: null,
+    projects: [
+      ["ledger", 64],
+      ["notes", 36],
+    ],
+  },
+];
+
+// The card ignores the range, so it never answers "empty".
+export function thisWeek(query) {
+  const { chosen } = chosenAccounts(query);
+  if (variant() === "stats-no-running") return { accounts: [], providers: [], projects: [] };
+  const accounts = chosen.map((account) => {
+    const window = runningWindow(account);
+    const projects = RUNNING_PROJECTS[account.abbr];
+    if (!projects) throw new Error(`no running projects for ${account.abbr}`);
+    return {
+      id: account.id,
+      used: account.now,
+      now: account.now,
+      money: (account.now / 100) * weeklyPrice(account),
+      moneyMissing: null,
+      startedAt: new Date(window.start).toISOString(),
+      resetsAt: new Date(window.end).toISOString(),
+      projects: topThree(projects),
+    };
+  });
+  // All listed accounts and providers together, each weighted by its value
+  // this week (an account's money stands in for its API value here).
+  const total =
+    sum(accounts.map((account) => account.money)) + sum(PROVIDERS.map((provider) => provider.api));
+  const byProject = new Map();
+  const add = (weight, projects) => {
+    for (const [name, share] of projects) {
+      byProject.set(name, (byProject.get(name) || 0) + (weight * share) / total);
+    }
+  };
+  for (const account of chosen) {
+    add((account.now / 100) * weeklyPrice(account), RUNNING_PROJECTS[account.abbr]);
+  }
+  for (const provider of PROVIDERS) add(provider.api, provider.projects);
+  return { accounts, providers: PROVIDERS, projects: topThree([...byProject.entries()]) };
+}
+
 export function overview(query) {
   const { indexes, chosen } = chosenAccounts(query);
   const currency = "EUR";
+  // The weeks whose windows finished: none on day 1.
+  const finished = variant() === "stats-day1" ? [] : indexes;
   const weeks = indexes.map((index) => {
-    const accounts = weekAccounts(index, chosen);
+    const done = finished.includes(index);
+    const accounts = done ? weekAccounts(index, chosen) : [];
     const used = sum(accounts.map((account) => account.used ?? 0));
     const expired = sum(accounts.map((account) => account.expired ?? 0));
     // Every window of a priced account week offers one week's price, as Rust
     // counts the offered weeks (a reset week offers each of its windows).
-    const offered = sum(
-      chosen
-        .filter((account) => account.used[index] !== null)
-        .map((account) => weeklyPrice(account) * windowsOfWeek(account, index).length)
-    );
+    const offered = done
+      ? sum(
+          chosen
+            .filter((account) => account.used[index] !== null)
+            .map((account) => weeklyPrice(account) * windowsOfWeek(account, index).length)
+        )
+      : 0;
     return {
       week: weekIso(index),
       accounts,
-      projects: topProjects(index, used, false),
+      projects: done ? topProjects(index, used, false) : [],
       blockedHours: BLOCKED[index],
       expiredShare: offered > 0 ? (expired / offered) * 100 : null,
     };
@@ -46,7 +162,7 @@ export function overview(query) {
   const used = sum(weeks.flatMap((week) => week.accounts.map((account) => account.used ?? 0)));
   const expired = sum(weeks.flatMap((week) => week.accounts.map((account) => account.expired ?? 0)));
   const paid = sum(
-    indexes.flatMap((index) =>
+    finished.flatMap((index) =>
       chosen
         .filter((account) => account.used[index] !== null)
         .map((account) => weeklyPrice(account))
@@ -55,7 +171,7 @@ export function overview(query) {
   // The percentages divide by the windows the weeks offered, not by `paid`: a
   // reset week offers each of its windows.
   const offered = sum(
-    indexes.flatMap((index) =>
+    finished.flatMap((index) =>
       chosen
         .filter((account) => account.used[index] !== null)
         .map((account) => weeklyPrice(account) * windowsOfWeek(account, index).length)
@@ -87,13 +203,12 @@ export function overview(query) {
     blockedBeforeAdded = { name, hours };
   }
   const findings = [
-    findingExpired(indexes, chosen, currency),
+    finished.length > 0 ? findingExpired(finished, chosen, currency) : null,
     findingBlocked(indexes, blockedHours, avoidableHours),
-    findingAutoBurn(indexes, chosen),
-    findingFull(indexes, chosen),
+    finished.length > 0 ? findingAutoBurn(finished, chosen) : null,
+    findingFull(finished, chosen),
   ].filter((text) => text !== null);
   return {
-    currency,
     withoutPrice: [],
     kpis: {
       used,
@@ -101,7 +216,7 @@ export function overview(query) {
       expired,
       usedPercent,
       expiredPercent,
-      expiredByAccount: expiredByAccount(indexes, chosen),
+      expiredByAccount: expiredByAccount(finished, chosen),
       blockedHours,
       blockedBeforeAdded,
       avoidableHours,

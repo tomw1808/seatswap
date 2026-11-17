@@ -687,15 +687,20 @@ mod tests {
     }
 
     #[test]
-    fn a_capped_account_without_a_session_rate_is_learning() {
-        // The plan treats a capped account without `s` as one without known
-        // rates; the regime must use the same rule, not only `rates.is_none()`.
+    fn a_capped_account_without_a_session_rate_is_not_learning() {
+        // A capped account with a known `c` and no `s` yet is planned without
+        // its 5 h limit; the regime uses the same rule as the plan.
         let mut inputs = inputs();
+        assert!(
+            inputs.accounts[2].session.is_some(),
+            "the account is capped"
+        );
         inputs.accounts[2].rates = Some(Rates { c: 4.0, s: None });
-        let situation = situation(inputs);
-        let state = regime(&situation);
-        assert_eq!(state.why, RegimeWhy::Learning);
-        assert!(!state.early);
+        assert_ne!(regime(&situation(inputs)).why, RegimeWhy::Learning);
+        // Without any `c` it is still learning.
+        let mut inputs = super::super::plan::testkit::inputs();
+        inputs.accounts[2].rates = None;
+        assert_eq!(regime(&situation(inputs)).why, RegimeWhy::Learning);
     }
 
     #[test]

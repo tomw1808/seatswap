@@ -39,7 +39,7 @@ pub struct AccountState {
     pub week_resets_at: DateTime<Utc>,
     /// `None`: the account has no 5 h limit at all. It is the only sign of a
     /// capped account: `rates.s` is `None` also while that rate is not learned
-    /// yet, and such an account is played like one without rates.
+    /// yet, and such an account is played without its 5 h limit.
     pub session: Option<SessionState>,
     pub model_blocked: bool,
     pub rates: Option<Rates>,
@@ -222,14 +222,12 @@ pub fn usable_again(account: &AccountState, at: DateTime<Utc>) -> Option<DateTim
     View::of(account, at).usable_again(at)
 }
 
-/// Whether the account's rates are known (spec §2.3): its `c` and, for an
-/// account with a 5 h limit, its `s`. This is the one rule [`View::rates`] and
-/// the decision's regime use.
+/// Whether the account's rates are known (spec §2.3): its `c`, measured or
+/// assumed. A capped account whose `s` is not known yet is planned without its
+/// 5 h limit (`s` plays as 0); at 100 % it is still left. This is the one rule
+/// [`View::rates`] and the decision's regime use.
 pub fn rates_known(account: &AccountState) -> bool {
-    match account.rates {
-        None => false,
-        Some(rates) => account.session.is_none() || rates.s.is_some(),
-    }
+    account.rates.is_some()
 }
 
 /// The weekly percent the plan plays an account from at `at`: 0 when the
@@ -597,8 +595,8 @@ impl<'a> View<'a> {
         self.account.session.is_some()
     }
 
-    /// The rates the account can be planned with. `None` while they are
-    /// unknown, including a capped account whose `s` is not learned yet.
+    /// The rates the account can be planned with. `None` while `c` is
+    /// unknown.
     fn rates(&self) -> Option<Rates> {
         if rates_known(self.account) {
             self.account.rates
@@ -1390,13 +1388,21 @@ mod tests {
     }
 
     #[test]
-    fn a_capped_account_without_a_session_rate_never_fills_its_window() {
+    fn a_capped_account_without_a_session_rate_is_planned_by_its_week() {
+        // Without `s` the 5 h limit plays as 0: the account never fills its
+        // window in the plan, but its week fills by `c` like any other.
         let mut inputs = inputs();
+        assert!(inputs.accounts[1].session.is_some(), "AC is capped");
         inputs.accounts[1].rates = Some(Rates { c: 4.0, s: None });
-        assert!(slack(&inputs.accounts[1], &inputs).is_none());
+        assert!(slack(&inputs.accounts[1], &inputs).is_some());
 
-        let plan = follow(&inputs, Policy::Lazy);
-        assert!(!plan.full_at.contains_key("AC"), "{:?}", plan.full_at);
+        let mut without_window = inputs.clone();
+        without_window.accounts[1].session = None;
+        assert_eq!(
+            follow(&inputs, Policy::Lazy).full_at,
+            follow(&without_window, Policy::Lazy).full_at,
+            "an unknown s plans the account as one without a 5 h limit"
+        );
     }
 
     #[test]

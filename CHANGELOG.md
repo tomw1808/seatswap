@@ -6,6 +6,74 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-11-17
+
+### Changed
+
+- Codex and Ollama work no longer counts under a Claude account. Statistics → Projects shows it
+  under its provider (valued at API prices), Overview's "This week" card has a row per provider, and
+  the account chips no longer hide it. Auto-burn's rates no longer count it as work on the account
+  that happened to be in use.
+- Plans carry Claude's current names: "Max" and "Ultra" instead of "Max 5x" and "Max 20x", "Team
+  Premium" instead of "Team 5x". The new name replaces the old one at the next login refresh and is
+  not recorded as a plan change.
+- Auto-burn no longer waits to measure an account: an account on Max, Team Premium or Ultra starts
+  from an assumed rate for its plan (scaled from the accounts already measured), and its own
+  measurements take over as they come in. The pop-up no longer shows "Measuring how much work fits
+  in …".
+- A rise of an account's usage while it was in use on no seatswap machine (claude.ai, the phone,
+  another computer) no longer counts as work done here, so such use no longer makes the account look
+  smaller than it is.
+- An account whose 5 h rate is not measured yet is planned by its week alone; it no longer holds
+  back early switching.
+- Statistics → Subscriptions: an account whose price was typed in a few minutes after it was added,
+  or after its plan changed, no longer shows a second, minutes-long period. A row without a finished
+  week says so in plain words instead of empty bars and `—`.
+- On a machine where Claude Code was never run, the pop-up no longer shows a red "file watcher: … No
+  such file or directory" error. It says that Claude Code is not set up yet, and the first `/login` is
+  noticed without restarting seatswap. A start-up error is no longer shown joined to itself ("X; X").
+- A new install no longer shows empty statistics cards: Statistics shows one "No statistics yet" note
+  until the first reading (the history of removed accounts stays on show); the pop-up asks to save an account and hides "see the plan"
+  while there is no plan; the Forecast names the accounts still waiting for their first reading; its
+  "only when full" column wraps instead of being cut; Activity says when no work was recorded and
+  shows no row of zeros.
+- Statistics → Overview opens with a "This week · so far" card: each account's current weekly window,
+  its use so far and what it went to by project, from the first usage reading on, whatever range is
+  picked, also one with no history yet. The weekly history below counts finished windows. The Weeks page shows the running week as
+  "so far". Overview's marks of one week form one label ("AC, PR added") instead of printing on top
+  of each other.
+- The dollar rate is asked at every start, and at once when the currency changes, also when the
+  currency arrives from another machine. A new install on a second machine no longer shows no rate
+  for up to half an hour.
+- Statistics → Activity: the hour chart shows only machines. The "Ollama · other" row and the "Other
+  Ollama use" box are gone; a note under the chart says how many tokens Ollama counted beyond the
+  sessions seatswap saw.
+
+### Fixed
+
+- Statistics → Subscriptions, "What if without it": the expired money could be negative and the
+  card then showed only an error. It is now counted per window with the window rule (a window at or
+  above 100 % expires nothing), and the dropped account's own expired money no longer counts.
+- Statistics is faster with a long history: on a year of history every page and range answers in
+  about 0.25 s or less in the core (Overview over 12 months: 0.57 s → 0.17 s). History files are
+  read in parallel, and switch costs and window look-ups no longer scan the whole history.
+- Statistics: charts stay readable at any number of weeks. Week labels show only where they fit and
+  switch to month names ("Oct", "Nov", "2026") for long ranges; numbers under narrow columns shorten
+  ("11h blocked" → "11h") or hide and stay in the tooltips; mark labels move to a second line or
+  become a dot whose tooltip names them. On Weeks a year of weeks fits a wide window; in a narrow one
+  only the grid scrolls, with the account names kept in view. Overview's "Share that expired" keeps a
+  readable height under the This-week card, and the Subscriptions time axis stays on Mondays across a
+  clock change.
+- Status line: a first run without a Claude login shows an information line instead of an error.
+- The large window opens at once. On Linux it shares the pop-up's web process instead of starting a
+  new one, which on a laptop with a sleeping NVIDIA card waited about 2 s for the card to wake; the
+  page now starts loading within 0.1 s instead of 0.7–2.9 s. The window appears once its page has
+  loaded.
+- Statistics no longer hangs on a range that holds the night the clocks go back (e.g. 25 Oct in
+  Central Europe) with a block or work in the repeated hour. The local hour of the second 02:00–03:00
+  was taken for the first one, so the hour loops never ended. Every local time that exists twice is
+  now ordered by itself, whatever order the time-zone library gives.
+
 ## [1.2.0] - 2026-11-17
 
 ### Added
@@ -398,7 +466,8 @@ All notable changes to this project are documented here. The format follows
   starts later): it says so and shows the icon as soon as a tray appears; `seatswap panel` opens
   the pop-up meanwhile.
 
-[Unreleased]: https://github.com/ymihere/seatswap/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/ymihere/seatswap/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/ymihere/seatswap/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/ymihere/seatswap/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/ymihere/seatswap/releases/tag/v1.1.0
 [1.0.6]: https://github.com/ymihere/seatswap/releases/tag/v1.0.6

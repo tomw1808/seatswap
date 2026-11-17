@@ -6,7 +6,7 @@
 import { answer, resolveIds, statsEmpty, statsFrame } from "./fixture/stats-frame.js";
 import { activity } from "./fixture/stats-activity.js";
 import { FORECAST_NO_PLAN, forecastPage } from "./fixture/stats-forecast.js";
-import { overview } from "./fixture/stats-overview.js";
+import { overview, thisWeek } from "./fixture/stats-overview.js";
 import { projectDetail, projects } from "./fixture/stats-projects.js";
 import { rhythm } from "./fixture/stats-rhythm.js";
 import { subscriptions, whatIf } from "./fixture/stats-subscriptions.js";
@@ -21,6 +21,8 @@ export function fixtureStats(command, args) {
       return statsFrame();
     case "stats_overview":
       return answer(query, overview);
+    case "stats_this_week":
+      return thisWeek(query);
     case "stats_weeks":
       return answer(query, weeks);
     case "stats_week_summary":

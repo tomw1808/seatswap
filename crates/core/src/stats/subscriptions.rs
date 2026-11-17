@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use crate::burn::live;
 use crate::burn::plan::Policy;
-use crate::burn::replay::{replay, ReplayResult};
+use crate::burn::replay::{replay_records, ReplayResult};
 use crate::burn::wu_hours;
 use crate::history::{AccountRef, Event, EventKind, Hosts, Range, Sample, TokenRecord};
 use crate::live_sessions::Values;
@@ -17,21 +17,23 @@ use crate::money::{window_money, Valuer};
 
 use super::{
     account_abbr, account_chosen, account_id, account_weeks_valued, accounts_without_price,
-    add_value, blocked_by_week, blocked_spans, hours_text, keep_warnings, money_of,
-    next_week_start, output_by_account_week, range_of, stored_account, week_columns,
-    week_lost_percent, week_of_record, windows_span, working_rhythm, AccountWeek, Ctx, Query,
-    StatsError,
+    add_value, blocked_by_week, blocked_spans, finished_windows, hours_text, keep_warnings,
+    lost_percent, money_of, next_week_start, output_by_account_week, range_of, stored_account,
+    week_columns, week_lost_percent, week_of_record, windows_span, working_rhythm, AccountWeek,
+    Ctx, Query, StatsError,
 };
 
 /// One period of one account's subscription: from its `AccountAdded` (or its
-/// first record) to its `AccountRemoved`, split at every plan and price change.
+/// first record) to its `AccountRemoved`, split at every plan change and at
+/// every price change that changes the price (see [`split_at_changes`]).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Period {
     pub id: String,
     pub plan: Option<String>,
-    /// The monthly price at [`Period::from`], in the display currency; `None`
-    /// when the account has no price there.
+    /// The monthly price of the period, in the display currency: the price at
+    /// [`Period::from`], or the first price set in it when the period starts
+    /// with a price not known yet; `None` when the account has no price there.
     pub price: Option<f64>,
     pub from: DateTime<Utc>,
     /// `None` while the subscription runs.
@@ -419,9 +421,13 @@ pub(crate) fn what_if_in<Tz: TimeZone + Copy>(
     // Every calendar week of the range, cut to the range: the replay with every
     // account and the replay without the one. The extra hours of a week are the
     // replay's blocked work difference in hours of the typical working hour.
+    // The range's samples and token records are read once for all its weeks.
+    let tokens = keep_warnings(ctx.warnings, || {
+        ctx.history.read::<TokenRecord>(range, &Hosts::All)
+    })?;
     let mut weekly = Vec::new();
-    let mut expired_with = 0.0;
-    let mut expired_without = 0.0;
+    let mut cuts = Vec::new();
+    let mut shifts = BTreeMap::new();
     for (week, was) in &was_by_week {
         let from = (*week).max(range.from);
         let to = next_week_start(*week, &ctx.zone).min(range.to);
@@ -429,10 +435,18 @@ pub(crate) fn what_if_in<Tz: TimeZone + Copy>(
             continue;
         }
         let week_range = Range { from, to };
-        let with = replay(ctx.history, &week_range, &learned.rates, &[], Policy::Lazy)
-            .map_err(|error| StatsError::Message(error.to_string()))?;
-        let without_replay = replay(
-            ctx.history,
+        let with = replay_records(
+            &samples.records,
+            &tokens.records,
+            &week_range,
+            &learned.rates,
+            &[],
+            Policy::Lazy,
+        )
+        .map_err(|error| StatsError::Message(error.to_string()))?;
+        let without_replay = replay_records(
+            &samples.records,
+            &tokens.records,
             &week_range,
             &learned.rates,
             std::slice::from_ref(&without_ref),
@@ -447,12 +461,17 @@ pub(crate) fn what_if_in<Tz: TimeZone + Copy>(
         // than were recorded.
         let without_hours = (*was + extra).max(*was);
         weekly.push((*week, *was, without_hours));
-        expired_with += replay_expired_money(&valuer, &with, range.to);
-        expired_without += replay_expired_money(&valuer, &without_replay, range.to);
+        for (account, shift) in expired_shifts(&with, &without_replay, &without_ref)? {
+            shifts.insert((account, cuts.len()), shift);
+        }
+        cuts.push(week_range);
     }
 
     let blocked_hours = weekly.iter().fold(0.0, |sum, (_, _, hours)| sum + hours);
-    let expired = expired_was.map(|was| was + expired_without - expired_with);
+    let expired = match expired_was {
+        Some(_) => Some(expired_without(&weeks, &without_ref, &cuts, &shifts)?),
+        None => None,
+    };
     let abbr = account_abbr(ctx, &without_ref);
     let more = hours_text(blocked_hours - blocked_hours_was);
     let sentence = if more == "0s" {
@@ -689,20 +708,98 @@ fn saved_price(weeks: &[AccountWeek], reference: &AccountRef) -> Result<Option<f
     Ok(paid)
 }
 
-/// The expired money of one replay at the range's end: each account's expired
-/// week-percent as the expired part of a window at its price there; an account
-/// without a price is left out.
-fn replay_expired_money(valuer: &Valuer, result: &ReplayResult, at: DateTime<Utc>) -> f64 {
-    result
+/// What dropping `without` changes in the expired week-percent of every other
+/// account, in one replayed calendar week: the replay without it minus the
+/// replay with every account. A replay names an account here only when it
+/// passed one of its weekly resets; both replays pass the same resets, so an
+/// account named by one and not the other is an error.
+fn expired_shifts(
+    with: &ReplayResult,
+    without_replay: &ReplayResult,
+    without: &AccountRef,
+) -> Result<Vec<(AccountRef, f64)>, StatsError> {
+    let accounts: BTreeSet<&AccountRef> = with
         .expired
-        .iter()
-        .filter_map(|(account, expired)| {
-            valuer
-                .price_at(account, at)
-                .ok()
-                .map(|price| window_money(price, 100.0 - *expired).expired)
+        .keys()
+        .chain(without_replay.expired.keys())
+        .filter(|account| *account != without)
+        .collect();
+    accounts
+        .into_iter()
+        .map(|account| {
+            match (
+                with.expired.get(account),
+                without_replay.expired.get(account),
+            ) {
+                (Some(with), Some(without)) => Ok((account.clone(), without - with)),
+                _ => Err(StatsError::Message(format!(
+                    "the replays with and without an account passed different weekly resets of {}",
+                    account.acc
+                ))),
+            }
         })
-        .sum()
+        .collect()
+}
+
+/// The expired money of the range without `without` (spec "Used, paid and
+/// expired money", "What if without it"): every finished window the recorded
+/// expired money counts, of every account but `without` (whose windows do not
+/// exist without it), at its recorded `lost` plus the replays' shift of its
+/// account in the calendar week its end lies in, priced like the recorded
+/// money. The shift is a change of the window's final percent, so the window
+/// rule holds for the estimate too: a window that ends above 100 % expires
+/// nothing. A replayed week passes one reset per account, so its shift goes to
+/// the account's last window ending in that week; a week a reset split keeps
+/// its earlier window as recorded. A window ending outside the replayed weeks
+/// keeps its recorded `lost`; a week without a price is left out.
+fn expired_without(
+    weeks: &[AccountWeek],
+    without: &AccountRef,
+    cuts: &[Range],
+    shifts: &BTreeMap<(AccountRef, usize), f64>,
+) -> Result<f64, StatsError> {
+    let cut_of = |end: DateTime<Utc>| {
+        let index = cuts.partition_point(|cut| cut.to <= end);
+        cuts.get(index).filter(|cut| cut.from <= end).map(|_| index)
+    };
+    let kept = || {
+        weeks
+            .iter()
+            .filter(|week| &week.account != without)
+            .flat_map(|week| {
+                week.windows[..finished_windows(week)]
+                    .iter()
+                    .map(move |window| (week, window))
+            })
+    };
+    let mut last_ends: BTreeMap<(&AccountRef, usize), DateTime<Utc>> = BTreeMap::new();
+    for (week, window) in kept() {
+        if let Some(cut) = cut_of(window.end) {
+            let end = last_ends.entry((&week.account, cut)).or_insert(window.end);
+            *end = (*end).max(window.end);
+        }
+    }
+    let mut expired = 0.0;
+    for (week, window) in kept() {
+        let Some(price) = week.price else {
+            continue;
+        };
+        let shift = match cut_of(window.end) {
+            Some(cut) if last_ends.get(&(&week.account, cut)) == Some(&window.end) => {
+                match shifts.get(&(week.account.clone(), cut)) {
+                    Some(shift) => *shift,
+                    // The replays passed no reset of the account in that week
+                    // (its first reading there named a later one): they say
+                    // nothing about this window.
+                    None => 0.0,
+                }
+            }
+            _ => 0.0,
+        };
+        let lost = lost_percent(window)? + shift;
+        expired += window_money(price, 100.0 - lost).expired;
+    }
+    Ok(expired)
 }
 
 /// Everything the history says about one account's existence and changes.
@@ -712,8 +809,8 @@ struct AccountHistory {
     first_record: Option<DateTime<Utc>>,
     added: Vec<DateTime<Utc>>,
     removed: Vec<DateTime<Utc>>,
-    /// Every `PlanChanged` and `PriceChanged` time.
-    changes: Vec<DateTime<Utc>>,
+    /// Every `PriceChanged` time, oldest first.
+    price_changes: Vec<DateTime<Utc>>,
     plan_changes: Vec<(DateTime<Utc>, Option<String>, Option<String>)>,
     /// The plan of the account's latest window record, by end.
     latest_window: Option<(DateTime<Utc>, Option<String>)>,
@@ -775,10 +872,9 @@ fn account_histories<Tz: TimeZone + Copy>(
                 EventKind::AccountAdded { .. } => entry.added.push(at),
                 EventKind::AccountRemoved { .. } => entry.removed.push(at),
                 EventKind::PlanChanged { from, to, .. } => {
-                    entry.changes.push(at);
                     entry.plan_changes.push((at, from.clone(), to.clone()));
                 }
-                EventKind::PriceChanged { .. } => entry.changes.push(at),
+                EventKind::PriceChanged { .. } => entry.price_changes.push(at),
                 _ => {}
             }
         }
@@ -788,8 +884,8 @@ fn account_histories<Tz: TimeZone + Copy>(
         history.added.dedup();
         history.removed.sort_unstable();
         history.removed.dedup();
-        history.changes.sort_unstable();
-        history.changes.dedup();
+        history.price_changes.sort_unstable();
+        history.price_changes.dedup();
         history.plan_changes.sort_by_key(|(at, _, _)| *at);
     }
     Ok(histories)
@@ -809,18 +905,29 @@ fn periods_of<Tz: TimeZone + Copy>(
         if start >= end.unwrap_or(DateTime::<Utc>::MAX_UTC) {
             continue;
         }
-        for (from, to) in split_at_changes(history, start, end) {
-            if from >= to.unwrap_or(DateTime::<Utc>::MAX_UTC) {
-                continue;
-            }
-            periods.push(Period {
+        let mut stretch: Vec<Period> = Vec::new();
+        for part in split_at_changes(history, start, end) {
+            let period = Period {
                 id: id.clone(),
-                plan: plan_at(ctx, reference, from, history),
-                price: valuer.price_at(reference, from).ok(),
-                from,
-                to,
-            });
+                plan: plan_at(ctx, reference, part.from, history),
+                price: valuer.price_at(reference, part.price_at).ok(),
+                from: part.from,
+                to: part.to,
+            };
+            // Two adjacent periods with the same plan and price are one
+            // period: a price entered again unchanged starts nothing new.
+            match stretch.last_mut() {
+                Some(last)
+                    if last.to == Some(period.from)
+                        && last.plan == period.plan
+                        && last.price == period.price =>
+                {
+                    last.to = period.to;
+                }
+                _ => stretch.push(period),
+            }
         }
+        periods.extend(stretch);
     }
     periods.sort_by_key(|period| period.from);
     Ok(periods)
@@ -866,27 +973,69 @@ fn segments(history: &AccountHistory) -> Vec<(DateTime<Utc>, Option<DateTime<Utc
     segments
 }
 
-/// A stretch split at every plan and price change inside it.
+/// One part of a stretch: its span and the time its price is read at.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Part {
+    from: DateTime<Utc>,
+    to: Option<DateTime<Utc>>,
+    price_at: DateTime<Utc>,
+}
+
+/// A stretch split at its plan changes and price changes. The stretch's start
+/// (an `AccountAdded`, or the first record) and each plan change start a plan
+/// whose price is not known yet, unless a price was set at that very moment:
+/// the first price set later during that plan is its price from its start —
+/// the price was unknown, not different. So a price typed in a few minutes
+/// after an account was added or its plan changed makes no period of a few
+/// minutes. Every later price change during the same plan starts a new part.
 fn split_at_changes(
     history: &AccountHistory,
     start: DateTime<Utc>,
     end: Option<DateTime<Utc>>,
-) -> Vec<(DateTime<Utc>, Option<DateTime<Utc>>)> {
-    let mut cuts: Vec<DateTime<Utc>> = history
-        .changes
-        .iter()
-        .copied()
-        .filter(|at| *at > start && end.is_none_or(|end| *at < end))
-        .collect();
-    cuts.sort_unstable();
-    cuts.dedup();
+) -> Vec<Part> {
+    let inside = |at: DateTime<Utc>, from: DateTime<Utc>, to: Option<DateTime<Utc>>| {
+        at > from && to.is_none_or(|to| at < to)
+    };
+    let mut plan_starts = vec![start];
+    plan_starts.extend(
+        history
+            .plan_changes
+            .iter()
+            .map(|(at, _, _)| *at)
+            .filter(|at| inside(*at, start, end)),
+    );
+    plan_starts.dedup();
+
     let mut parts = Vec::new();
-    let mut from = start;
-    for cut in cuts {
-        parts.push((from, Some(cut)));
-        from = cut;
+    for (index, plan_from) in plan_starts.iter().copied().enumerate() {
+        let plan_to = plan_starts.get(index + 1).copied().or(end);
+        let mut prices = history
+            .price_changes
+            .iter()
+            .copied()
+            .filter(|at| inside(*at, plan_from, plan_to));
+        let mut from = plan_from;
+        let mut price_at = plan_from;
+        if !history.price_changes.contains(&plan_from) {
+            if let Some(first) = prices.next() {
+                price_at = first;
+            }
+        }
+        for cut in prices {
+            parts.push(Part {
+                from,
+                to: Some(cut),
+                price_at,
+            });
+            from = cut;
+            price_at = cut;
+        }
+        parts.push(Part {
+            from,
+            to: plan_to,
+            price_at,
+        });
     }
-    parts.push((from, end));
     parts
 }
 
@@ -923,6 +1072,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::api::LimitKind;
+    use crate::burn::replay::replay;
     use crate::history::{Event, EventKind, HistoryDir, LimitSample, Source, WindowRecord};
     use crate::stats::tests::{all, append_codex_records, tiny, utc, Tiny};
     use crate::stats::{Ctx, Range};
@@ -1140,31 +1290,160 @@ mod tests {
         }
     }
 
+    /// A `PriceChanged` event as the settings write it.
+    fn price(at: &str, account: &AccountRef, amount: f64) -> Event {
+        Event {
+            t: utc(at),
+            kind: EventKind::PriceChanged {
+                account: account.clone(),
+                amount: Some(amount),
+                currency: Some("EUR".to_string()),
+            },
+        }
+    }
+
+    fn added(at: &str, account: &AccountRef, plan: &str) -> Event {
+        Event {
+            t: utc(at),
+            kind: EventKind::AccountAdded {
+                account: account.clone(),
+                plan: Some(plan.to_string()),
+            },
+        }
+    }
+
+    fn periods_of_account<'a>(page: &'a SubscriptionsPage, id: &str) -> Vec<&'a Period> {
+        page.periods
+            .iter()
+            .filter(|period| period.id == id)
+            .collect()
+    }
+
+    /// A real price change weeks after the price was first typed in still
+    /// splits the period: the account was added on 12 Oct, its price typed in
+    /// three minutes later, and raised on 10 Nov.
     #[test]
     fn a_price_change_splits_the_period() {
         let tiny = tiny();
+        let lb = tiny.lb_ref();
         tiny.history
-            .append(&Event {
-                t: utc("2026-11-10T00:00:00Z"),
-                kind: EventKind::PriceChanged {
-                    account: tiny.lb_ref(),
-                    amount: Some(200.0),
-                    currency: Some("EUR".to_string()),
-                },
-            })
-            .expect("LB's price change");
+            .append_many(&[
+                added("2026-10-12T07:20:11Z", &lb, "Max"),
+                price("2026-10-12T07:23:11Z", &lb, 180.0),
+                price("2026-11-10T00:00:00Z", &lb, 200.0),
+            ])
+            .expect("LB's events");
 
         let page = subscriptions_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
-        let lb: Vec<&Period> = page
-            .periods
-            .iter()
-            .filter(|period| period.id == tiny.lb().id)
-            .collect();
+        let lb = periods_of_account(&page, &tiny.lb().id);
         assert_eq!(lb.len(), 2, "LB's periods: {lb:#?}");
+        assert_eq!(lb[0].from, utc("2026-10-12T07:20:11Z"));
+        assert_eq!(lb[0].price, Some(180.0));
         assert_eq!(lb[0].to, Some(utc("2026-11-10T00:00:00Z")));
         assert_eq!(lb[1].from, utc("2026-11-10T00:00:00Z"));
         assert_eq!(lb[1].price, Some(200.0));
         assert_eq!(lb[1].to, None);
+    }
+
+    /// An account added and its price typed in three minutes later is one
+    /// period from the moment it was added, at that price (the bench's day 1).
+    #[test]
+    fn a_price_typed_in_after_adding_makes_one_period() {
+        let tiny = tiny();
+        let ac = tiny.ac_ref();
+        tiny.history
+            .append_many(&[
+                added("2026-11-09T05:25:54Z", &ac, "Max"),
+                price("2026-11-09T05:28:54Z", &ac, 100.0),
+            ])
+            .expect("AC's events");
+
+        let page = subscriptions_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        let ac_periods = periods_of_account(&page, &tiny.ac().id);
+        assert_eq!(ac_periods.len(), 1, "AC's periods: {ac_periods:#?}");
+        assert_eq!(ac_periods[0].from, utc("2026-11-09T05:25:54Z"));
+        assert_eq!(ac_periods[0].price, Some(100.0));
+        assert_eq!(ac_periods[0].to, None);
+        assert_eq!(row(&page, &tiny.ac().id).price, Some(100.0));
+    }
+
+    /// A plan change and the new price typed in four minutes later make one
+    /// period per plan, the new plan at its new price from the change on (the
+    /// bench's AC: Pro at 20 EUR, then Max at 100 EUR). Before the change the
+    /// old plan keeps its old price.
+    #[test]
+    fn a_plan_change_and_its_price_make_one_period_per_plan() {
+        let tiny = tiny();
+        let ac = tiny.ac_ref();
+        tiny.history
+            .append_many(&[
+                added("2026-11-02T06:33:02Z", &ac, "Pro"),
+                price("2026-11-02T06:36:02Z", &ac, 20.0),
+                Event {
+                    t: utc("2026-11-09T05:39:02Z"),
+                    kind: EventKind::PlanChanged {
+                        account: ac.clone(),
+                        from: Some("Pro".to_string()),
+                        to: Some("Max".to_string()),
+                    },
+                },
+                price("2026-11-09T05:43:02Z", &ac, 100.0),
+            ])
+            .expect("AC's events");
+
+        let page = subscriptions_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        let ac_periods = periods_of_account(&page, &tiny.ac().id);
+        assert_eq!(ac_periods.len(), 2, "AC's periods: {ac_periods:#?}");
+        assert_eq!(ac_periods[0].plan.as_deref(), Some("Pro"));
+        assert_eq!(ac_periods[0].price, Some(20.0));
+        assert_eq!(ac_periods[0].from, utc("2026-11-02T06:33:02Z"));
+        assert_eq!(ac_periods[0].to, Some(utc("2026-11-09T05:39:02Z")));
+        assert_eq!(ac_periods[1].plan.as_deref(), Some("Max"));
+        assert_eq!(ac_periods[1].price, Some(100.0));
+        assert_eq!(ac_periods[1].from, utc("2026-11-09T05:39:02Z"));
+        assert_eq!(ac_periods[1].to, None);
+    }
+
+    /// The same price typed in again changes nothing, so it starts no period.
+    #[test]
+    fn the_same_price_again_is_no_new_period() {
+        let tiny = tiny();
+        let lb = tiny.lb_ref();
+        tiny.history
+            .append_many(&[
+                added("2026-10-12T07:20:11Z", &lb, "Max"),
+                price("2026-10-12T07:20:11Z", &lb, 180.0),
+                price("2026-11-04T12:00:00Z", &lb, 180.0),
+            ])
+            .expect("LB's events");
+
+        let page = subscriptions_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        let lb = periods_of_account(&page, &tiny.lb().id);
+        assert_eq!(lb.len(), 1, "LB's periods: {lb:#?}");
+        assert_eq!(lb[0].from, utc("2026-10-12T07:20:11Z"));
+        assert_eq!(lb[0].to, None);
+    }
+
+    /// A price set at the very moment of the add is known from the start: a
+    /// different price set later is a real change and splits.
+    #[test]
+    fn a_price_set_with_the_add_is_known_from_the_start() {
+        let tiny = tiny();
+        let lb = tiny.lb_ref();
+        tiny.history
+            .append_many(&[
+                added("2026-11-03T09:00:00Z", &lb, "Max"),
+                price("2026-11-03T09:00:00Z", &lb, 180.0),
+                price("2026-11-03T09:05:00Z", &lb, 200.0),
+            ])
+            .expect("LB's events");
+
+        let page = subscriptions_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        let lb = periods_of_account(&page, &tiny.lb().id);
+        assert_eq!(lb.len(), 2, "LB's periods: {lb:#?}");
+        assert_eq!(lb[0].price, Some(180.0));
+        assert_eq!(lb[1].price, Some(200.0));
+        assert_eq!(lb[1].from, utc("2026-11-03T09:05:00Z"));
     }
 
     #[test]
@@ -1184,6 +1463,155 @@ mod tests {
             ),
             "saved price {:?}",
             what.saved_price
+        );
+    }
+
+    /// A weekly window of `account` from `start` to `end` ending at `final_percent`.
+    fn window(account: &AccountRef, start: &str, end: &str, final_percent: f64) -> WindowRecord {
+        WindowRecord {
+            account: account.clone(),
+            k: LimitKind::WeeklyAll,
+            m: None,
+            start: Some(utc(start)),
+            end: utc(end),
+            final_percent,
+            lost: Some(100.0 - final_percent),
+            last_sample: utc(end) - Duration::minutes(2),
+            plan: None,
+            uncertain: false,
+            reset: false,
+            from: None,
+        }
+    }
+
+    /// The week 9 Nov .. 16 Nov of a history of its own, with the fixture's
+    /// accounts and prices (AC 140, LB 180). Recorded: AC's window ending
+    /// 14 Nov 12:00 at 26 % (74 % expired), LB's ending 13 Nov 00:00 at 70 %
+    /// (30 % expired). Learned on 3 and 4 Nov: AC fills eight times faster than
+    /// LB. The work of 9 .. 12 Nov is far more than AC's whole week and less than
+    /// LB's: the lazy replay with every account stays on LB, so AC expires
+    /// 100 % at its reset; without LB, AC fills and expires nothing.
+    fn ac_fills_without_lb(tiny: &Tiny) -> (tempfile::TempDir, HistoryDir) {
+        let dir = tempdir().expect("a temp history");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let (ac, lb) = (tiny.ac_ref(), tiny.lb_ref());
+        let live = |at: &str, account: &AccountRef| Event {
+            t: utc(at),
+            kind: EventKind::Live {
+                account: Some(account.clone()),
+            },
+        };
+        history
+            .append_many(&[
+                live("2026-11-03T08:00:00Z", &ac),
+                live("2026-11-04T08:00:00Z", &lb),
+            ])
+            .expect("the events");
+        let ac_old_reset = utc("2026-11-07T12:00:00Z");
+        let lb_old_reset = utc("2026-11-06T00:00:00Z");
+        let ac_reset = utc("2026-11-14T12:00:00Z");
+        let lb_reset = utc("2026-11-13T00:00:00Z");
+        history
+            .append_many(&[
+                sample("2026-11-03T09:00:00Z", &ac, 10.0, ac_old_reset),
+                sample("2026-11-03T11:00:00Z", &ac, 50.0, ac_old_reset),
+                sample("2026-11-04T09:00:00Z", &lb, 10.0, lb_old_reset),
+                sample("2026-11-04T11:00:00Z", &lb, 15.0, lb_old_reset),
+                sample("2026-11-09T00:00:00Z", &ac, 0.0, ac_reset),
+                sample("2026-11-09T00:00:00Z", &lb, 0.0, lb_reset),
+            ])
+            .expect("the samples");
+        let mut records = vec![
+            record("2026-11-03T09:00:00Z", 2_000_000),
+            record("2026-11-03T10:00:00Z", 2_000_000),
+            record("2026-11-04T09:00:00Z", 2_000_000),
+            record("2026-11-04T10:00:00Z", 2_000_000),
+        ];
+        for day in 9..=12 {
+            for hour in 9..17 {
+                records.push(record(
+                    &format!("2026-11-{day:02}T{hour:02}:00:00Z"),
+                    1_000_000,
+                ));
+            }
+        }
+        history.append_many(&records).expect("the token records");
+        history
+            .append_many(&[
+                window(&ac, "2026-11-07T12:00:00Z", "2026-11-14T12:00:00Z", 26.0),
+                window(&lb, "2026-11-06T00:00:00Z", "2026-11-13T00:00:00Z", 70.0),
+            ])
+            .expect("the windows");
+        (dir, history)
+    }
+
+    #[test]
+    fn what_if_never_expires_less_than_nothing() {
+        // The bench's "last week without OR" answered -3.19 EUR: the replay
+        // with every account let AC expire 100 % where it recorded 74 %, and
+        // `recorded + (without − with)` took the difference off the money sum,
+        // so AC's window counted as if it had expired -26 %. Applied to the
+        // window, the same estimate is a window at 126 %, and a window above
+        // 100 % expires nothing.
+        let tiny = tiny();
+        let (_dir, history) = ac_fills_without_lb(&tiny);
+        let ctx = Ctx {
+            history: &history,
+            ..tiny.ctx()
+        };
+        let week = Range {
+            from: utc("2026-11-09T00:00:00Z"),
+            to: utc("2026-11-16T00:00:00Z"),
+        };
+        let learned =
+            live::learn(&history, week.to, tiny.offset, &tiny.accounts, true).expect("the rates");
+        let with = replay(&history, &week, &learned.rates, &[], Policy::Lazy).expect("with");
+        let without = replay(
+            &history,
+            &week,
+            &learned.rates,
+            &[tiny.lb_ref()],
+            Policy::Lazy,
+        )
+        .expect("without");
+        assert_eq!(with.expired.get(&tiny.ac_ref()), Some(&100.0), "{with:?}");
+        assert_eq!(
+            without.expired.get(&tiny.ac_ref()),
+            Some(&0.0),
+            "{without:?}"
+        );
+
+        let what = what_if_in(&ctx, &week, &all(), &tiny.lb().id).unwrap();
+
+        let pv = |price: f64| price * 12.0 / 52.0 / 100.0;
+        assert!(
+            close(
+                what.expired_was.expect("both weeks have a price"),
+                74.0 * pv(140.0) + 30.0 * pv(180.0)
+            ),
+            "expired was {:?}",
+            what.expired_was
+        );
+        // AC: 74 % recorded + (0 % − 100 %) is a window at 126 %: nothing
+        // expired. LB is dropped: none of its windows exist without it.
+        assert_eq!(what.expired, Some(0.0));
+
+        // Without AC, LB's window keeps its recorded 30 % plus what the
+        // replays shift for it, and AC's 74 % are gone with AC.
+        let without_ac = replay(
+            &history,
+            &week,
+            &learned.rates,
+            &[tiny.ac_ref()],
+            Policy::Lazy,
+        )
+        .expect("without AC");
+        let shift = without_ac.expired[&tiny.lb_ref()] - with.expired[&tiny.lb_ref()];
+        let what = what_if_in(&ctx, &week, &all(), &tiny.ac().id).unwrap();
+        let expired = what.expired.expect("LB's week has a price");
+        assert!(
+            close(expired, (30.0 + shift).max(0.0) * pv(180.0)),
+            "expired {expired}, shift {shift}"
         );
     }
 
@@ -1403,7 +1831,7 @@ mod tests {
                 t: utc("2026-11-09T00:00:00Z"),
                 kind: EventKind::AccountAdded {
                     account: tiny.ac_ref(),
-                    plan: Some("Team 5x".to_string()),
+                    plan: Some("Team Premium".to_string()),
                 },
             })
             .expect("AC's later addition");
@@ -1490,7 +1918,7 @@ mod tests {
                 final_percent: 100.0,
                 lost: Some(0.0),
                 last_sample: utc("2026-11-17T23:58:00Z"),
-                plan: Some("Team 5x".to_string()),
+                plan: Some("Team Premium".to_string()),
                 uncertain: false,
                 reset: false,
                 from: None,

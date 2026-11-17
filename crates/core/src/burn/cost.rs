@@ -29,7 +29,9 @@ const WINDOW_MIN: i64 = 10;
 /// record spread evenly over its hour), between the two samples. Switches
 /// without two such samples, or whose target has no entry in `rates`, are left
 /// out; a negative result counts as 0. The result is the mean over the
-/// switches that remain, `None` when none remains.
+/// switches that remain, `None` when none remains. `samples` and `tokens` are
+/// sorted by time, as a history read returns them: each switch looks only at
+/// its own ten minutes.
 pub fn switch_cost(
     events: &[Hosted<Event>],
     samples: &[Hosted<Sample>],
@@ -37,6 +39,10 @@ pub fn switch_cost(
     rates: &BTreeMap<AccountRef, Rates>,
     range: &Range,
 ) -> Option<SwitchCost> {
+    debug_assert!(
+        samples.is_sorted_by_key(|hosted| hosted.record.t),
+        "switch_cost needs the samples sorted by time"
+    );
     let mut sum = 0.0;
     let mut count = 0u32;
     let timelines = timelines(events);
@@ -81,17 +87,19 @@ pub fn switch_cost(
 
 /// The target's first and last sample in the ten minutes after `at`, both
 /// carrying a weekly limit of the first one's window. `None` unless they are two
-/// different samples.
+/// different samples. `samples` are sorted by time, as a history read returns
+/// them, so only the ten minutes are looked at.
 fn target_pair<'a>(
     samples: &'a [Hosted<Sample>],
     account: &AccountRef,
     at: DateTime<Utc>,
 ) -> Option<(&'a Hosted<Sample>, &'a Hosted<Sample>)> {
     let end = at + Duration::minutes(WINDOW_MIN);
-    let mut found: Vec<&Hosted<Sample>> = samples
+    let from = samples.partition_point(|hosted| hosted.record.t < at);
+    let to = samples.partition_point(|hosted| hosted.record.t <= end);
+    let mut found: Vec<&Hosted<Sample>> = samples[from..to.max(from)]
         .iter()
         .filter(|hosted| &hosted.record.account == account)
-        .filter(|hosted| hosted.record.t >= at && hosted.record.t <= end)
         .filter(|hosted| hosted.record.limit(&LimitKind::WeeklyAll).is_some())
         .collect();
     found.sort_by(|a, b| {

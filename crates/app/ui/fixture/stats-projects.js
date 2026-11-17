@@ -38,14 +38,34 @@ function sameKey(first, second) {
   );
 }
 
+// The work of other providers than Claude, in % of a row's API value, by the
+// row's level and name: a Codex session in atlas/engine and flash workers in
+// ledger. projects.rs sends them as `byProvider`, beside the accounts' split.
+const PROVIDERS = {
+  "0:sam": [
+    ["Codex", 6.8],
+    ["Ollama", 2.6],
+  ],
+  "1:atlas": [["Codex", 11.7]],
+  "2:engine": [["Codex", 19]],
+  "1:ledger": [["Ollama", 9]],
+};
+
+function providersOf(entry) {
+  return PROVIDERS[`${entry.level}:${entry.name}`] || [];
+}
+
+// The chosen accounts' split of the part of the row's API value that is
+// Claude's: the account chips do not choose another provider's work.
 function chosenSplit(entry, chosen) {
+  const claude = 100 - sum(providersOf(entry).map(([, percent]) => percent));
   const weights = chosen.map((account) => {
     const index = ACCOUNTS.indexOf(account);
     return { account, weight: entry.split[index] };
   });
   const total = sum(weights.map((row) => row.weight));
   return weights
-    .map((row) => [row.account.id, total > 0 ? (row.weight / total) * 100 : 0])
+    .map((row) => [row.account.id, total > 0 ? (row.weight / total) * claude : 0])
     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
 }
 
@@ -191,6 +211,7 @@ export function projects(query) {
         ? unpricedValues(subscription)
         : fixtureValues((entry.share / 100) * apiTotal, subscription),
       byAccount: chosenSplit(entry, chosen),
+      byProvider: providersOf(entry),
       sessions: Math.round(entry.sessions * keptFraction),
     };
   });
@@ -222,6 +243,7 @@ export function projects(query) {
     usdRate: USD_RATE,
     notes: [
       "Not in any project: use of these accounts without a session file on a host with seatswap (claude.ai in the browser, the phone).",
+      "Codex and Ollama work is valued at API prices only; it uses no Claude account.",
     ],
   };
 }

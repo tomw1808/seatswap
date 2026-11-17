@@ -48,12 +48,6 @@ const HOST_TOKENS = [
   "var(--muted)",
 ];
 
-// "Other Ollama use" has its own colour token in activity.css, with one
-// meaning in both themes: the rest of Ollama's hour after the known sessions.
-const OLLAMA_COLOR = "var(--stats-act-ollama)";
-const OLLAMA_LABEL = "Ollama";
-const OLLAMA_LANE_LABEL = "Ollama · other";
-
 const STATE_TEXT = {
   work: "worked",
   idle: "on, but idle",
@@ -191,40 +185,12 @@ export async function show(container, env) {
     throw new Error("the activity view has no What it shows sentence");
   }
 
-  // Ollama's use is a list the page only draws: every count is computed in
+  // What Ollama counted beyond the known sessions: one number computed in
   // Rust. A missing or malformed field is an error, not a zero.
   const ollama = data.ollama;
   if (!isObject(ollama)) throw new Error("the activity view has no Ollama use");
-  if (!Array.isArray(ollama.hours)) {
-    throw new Error("the Ollama use has no hours");
-  }
-  for (const hour of ollama.hours) {
-    if (!isObject(hour) || typeof hour.t !== "string") {
-      throw new Error(`an Ollama hour has no time: ${JSON.stringify(hour)}`);
-    }
-    if (
-      hour.total !== null &&
-      (!Number.isInteger(hour.total) || hour.total < 0)
-    ) {
-      throw new Error(`the Ollama hour ${hour.t} has no valid total: ${JSON.stringify(hour.total)}`);
-    }
-    if (!Number.isInteger(hour.tracked) || hour.tracked < 0) {
-      throw new Error(`the Ollama hour ${hour.t} has no valid tracked count: ${JSON.stringify(hour.tracked)}`);
-    }
-    if (hour.other !== null && (!Number.isInteger(hour.other) || hour.other < 0)) {
-      throw new Error(`the Ollama hour ${hour.t} has no valid other value: ${JSON.stringify(hour.other)}`);
-    }
-    if (hour.note !== null && (typeof hour.note !== "string" || hour.note === "")) {
-      throw new Error(`the Ollama hour ${hour.t} has an empty note`);
-    }
-  }
   if (!Number.isInteger(ollama.otherTokens) || ollama.otherTokens < 0) {
     throw new Error(`the Ollama use has no valid total: ${JSON.stringify(ollama.otherTokens)}`);
-  }
-  for (const field of ["hoursWithoutFigure", "moreTrackedHours", "reportedHours"]) {
-    if (!Number.isInteger(ollama[field]) || ollama[field] < 0) {
-      throw new Error(`the Ollama use has no valid ${field}: ${JSON.stringify(ollama[field])}`);
-    }
   }
 
   const perHostTokens = lanes.map((lane) => `${lane.host} ${tokenText(lane.tokens)}`);
@@ -282,45 +248,6 @@ export async function show(container, env) {
     )
   );
 
-  // The KPI exists only when Ollama reported a line in the range: a user
-  // without an Ollama account sees nothing new. Its sub-line names only the
-  // counts above 0, so an hour without a figure never reads "0 hours".
-  if (ollama.reportedHours > 0) {
-    const ollamaNotes = [];
-    if (ollama.hoursWithoutFigure > 0) {
-      ollamaNotes.push(
-        `${ollama.hoursWithoutFigure} hour${
-          ollama.hoursWithoutFigure === 1 ? "" : "s"
-        } had no Ollama figure`
-      );
-    }
-    if (ollama.moreTrackedHours > 0) {
-      ollamaNotes.push(
-        `${ollama.moreTrackedHours} hour${ollama.moreTrackedHours === 1 ? "" : "s"} ${
-          ollama.moreTrackedHours === 1 ? "shows" : "show"
-        } more tracked than reported`
-      );
-    }
-    const ollamaTipParts = [
-      "Other Ollama use in the range",
-      "Ollama's input + output for an hour minus the tokens of known sessions on Ollama models",
-    ];
-    if (ollama.hoursWithoutFigure > 0) {
-      ollamaTipParts.push(`${ollama.hoursWithoutFigure} hours with no Ollama figure`);
-    }
-    if (ollama.moreTrackedHours > 0) {
-      ollamaTipParts.push(`${ollama.moreTrackedHours} hours show more tracked than reported`);
-    }
-    kpis.appendChild(
-      kpi(
-        "Other Ollama use",
-        [showTokens(h("span"), ollama.otherTokens), " tokens"],
-        ollamaNotes.join(" · ") || null,
-        ollamaTipParts.join(" | ")
-      )
-    );
-  }
-
   const whatItShows = kpi(
     "What it shows",
     data.whatItShows,
@@ -359,24 +286,22 @@ export async function show(container, env) {
   const hoursBody = h("div", { class: "stats-act-hours-body" });
   hoursCard.appendChild(hoursBody);
 
-  const firstLane = lanes.find((lane) => lane.hours.length > 0);
-  const hourCells = firstLane ? firstLane.hours : ollama.hours;
-  const hourTimes = hourCells.map((cell) => new Date(cell.t));
-  if (
-    firstLane &&
-    ollama.hours.length > 0 &&
-    ollama.hours.length !== hourTimes.length
-  ) {
-    throw new Error(
-      `the Ollama hours (${ollama.hours.length}) do not align with the lane's ${hourTimes.length} hours`
+  // The chart draws the hosts only. What Ollama counted beyond the sessions
+  // seatswap saw is one muted line under the lanes, and only when there is
+  // any: Ollama's account total is never a lane of its own.
+  if (ollama.otherTokens > 0) {
+    hoursCard.appendChild(
+      h("p", {
+        class: "stats-note",
+        text: `Ollama counted ${tokens(
+          ollama.otherTokens
+        )} more tokens in this range than the sessions seatswap saw (other machines, apps or Ollama's website).`,
+      })
     );
   }
 
-  // Ollama has something to draw only when Rust reported a line in the range;
-  // with none the page shows no Ollama lane and no legend entry.
-  function ollamaHasData() {
-    return ollama.reportedHours > 0;
-  }
+  const firstLane = lanes.find((lane) => lane.hours.length > 0);
+  const hourTimes = firstLane ? firstLane.hours.map((cell) => new Date(cell.t)) : [];
 
   // The history's start marks the first hour a subscription value can exist:
   // a record's account is the last live or switch event at or before it, and
@@ -431,9 +356,6 @@ export async function show(container, env) {
         )
       );
     }
-    if (state.unit === "tokens" && ollamaHasData()) {
-      legend.appendChild(legendItem(OLLAMA_COLOR, "other Ollama use", false));
-    }
     legend.appendChild(legendItem("var(--track)", "on, but idle", false));
     legend.appendChild(legendItem("var(--text)", "off", true));
   }
@@ -458,46 +380,6 @@ export async function show(container, env) {
     return lines.join(" | ");
   }
 
-  // The Ollama hour's tooltip: Ollama's own figure, the known sessions' tokens
-  // and the rest. A more-tracked hour has no rest and carries its note.
-  function ollamaTip(hour) {
-    const parts = [];
-    if (hour.total === null) {
-      parts.push("no Ollama figure");
-    } else {
-      parts.push(`Ollama reported ${tokens(hour.total)} tokens`);
-    }
-    parts.push(`known sessions on Ollama models ${tokens(hour.tracked)} tokens`);
-    if (hour.other !== null) {
-      parts.push(`other Ollama use ${tokens(hour.other)} tokens`);
-    }
-    const lines = [`${OLLAMA_LABEL} · ${hourText(hour.t)}`, parts.join(" · ")];
-    if (hour.note !== null) lines.push(hour.note);
-    return lines.join(" | ");
-  }
-
-  // The Ollama series as one more lane of the hour chart. Its bars are the
-  // other use only; the known sessions are the host lanes' bars.
-  function ollamaLane() {
-    return {
-      label: h("span", { text: OLLAMA_LANE_LABEL }),
-      cells: ollama.hours.map((hour) => {
-        const cellState = hour.total !== null || hour.tracked > 0 ? "work" : "unknown";
-        const stack = [];
-        if (hour.other !== null && hour.other > 0) {
-          stack.push({ value: hour.other, color: OLLAMA_COLOR });
-        }
-        return {
-          t: hour.t,
-          state: cellState,
-          stack,
-          strip: 0,
-          tip: ollamaTip(hour),
-        };
-      }),
-    };
-  }
-
   function paintHours() {
     for (const button of unitSwitch.childNodes) {
       const on = button.dataset && button.dataset.unit === state.unit;
@@ -516,9 +398,6 @@ export async function show(container, env) {
         tip: hourTip(lane, cell),
       })),
     }));
-    if (state.unit === "tokens" && ollamaHasData()) {
-      hourLanes.push(ollamaLane());
-    }
     if (hourLanes.every((lane) => lane.cells.length === 0)) {
       hoursBody.appendChild(emptyLine("no hour recorded on this host"));
     } else {
@@ -613,7 +492,6 @@ export async function show(container, env) {
     waitedBody.appendChild(
       bars({
         categories: data.waited.map(([date]) => dayLabel(date)),
-        labelEvery: Math.max(1, Math.ceil(data.waited.length / 14)),
         series: [
           {
             name: "waited",
@@ -677,8 +555,10 @@ export async function show(container, env) {
     }
     view.appendChild(head);
     const weeks = [...data.weeks].reverse();
+    // No row at all means the range holds no tokens (`activity.rs`): one line
+    // instead of a week of zeros.
     if (weeks.length === 0) {
-      view.appendChild(emptyLine("no week in the range"));
+      view.appendChild(emptyLine("no work recorded in the range"));
       return view;
     }
     for (const week of weeks) {

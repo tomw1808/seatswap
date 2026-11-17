@@ -150,6 +150,12 @@
   height: 100%;
 }
 
+/* Another provider's part (Codex, Ollama): neutral and faded, no account's. */
+.stats-split i.stats-split-provider {
+  background: var(--muted);
+  opacity: 0.45;
+}
+
 .stats-tree-none {
   margin-left: 5px;
   color: var(--muted);

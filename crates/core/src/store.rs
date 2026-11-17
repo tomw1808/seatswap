@@ -102,7 +102,7 @@ pub struct Account {
     pub color: String,
     pub email: Option<String>,
     pub org_name: Option<String>,
-    /// [`plan_label`], e.g. `"Ultra"` or `"Team 5x"`.
+    /// [`plan_label`], e.g. `"Ultra"` or `"Team Premium"`.
     pub plan: Option<String>,
     /// What the subscription costs per month, in the display currency; `None`
     /// when it has not been entered. An older file without the key loads with
@@ -1711,10 +1711,30 @@ pub fn validate_color(color: &str) -> Result<String, StoreError> {
     }
 }
 
+/// Claude's current plan names for a subscription type and the multiplier of
+/// its `rateLimitTier` (spec §3.7.1), with the label seatswap up to 1.2.0 gave
+/// the same plan. Claude renamed its plans: what the tier still calls `max_5x`
+/// is "Max", `max_20x` is "Ultra", and a Team seat with the 5x tier is "Team
+/// Premium".
+const PLAN_NAMES: [(&str, &str, &str, &str); 3] = [
+    ("max", "5x", "Max", "Max 5x"),
+    ("max", "20x", "Ultra", "Max 20x"),
+    ("team", "5x", "Team Premium", "Team 5x"),
+];
+
+/// Whether `from` → `to` is only seatswap's old label of a plan giving way to
+/// Claude's current name ([`PLAN_NAMES`]): the plan itself did not change.
+fn renamed_only(from: Option<&str>, to: Option<&str>) -> bool {
+    PLAN_NAMES
+        .iter()
+        .any(|(_, _, name, old)| from == Some(*old) && to == Some(*name))
+}
+
 /// The plan as Claude names it: the identity's `planDisplayName` ("Pro",
-/// "Max", "Ultra"), else the login's `subscriptionType` with a capital first
-/// letter plus its level from `rateLimitTier` (spec §3.7.1). A tier ending in
-/// `_<n>x` adds `" <n>x"` ("Team 5x"); any other tier adds
+/// "Max", "Ultra"), else the name [`PLAN_NAMES`] gives the login's
+/// `subscriptionType` and tier, else the `subscriptionType` with a capital
+/// first letter plus its level from `rateLimitTier`. A tier ending in `_<n>x`
+/// adds `" <n>x"` ("Enterprise 20x"); any other tier adds
 /// `" (<tier without the prefix default_claude_>)"`; no tier adds nothing.
 pub fn plan_label(login: &Login, identity: &OAuthAccount) -> Option<String> {
     let named = identity
@@ -1731,7 +1751,13 @@ pub fn plan_label(login: &Login, identity: &OAuthAccount) -> Option<String> {
             if tier.is_empty() {
                 return Some(label);
             }
-            if let Some(level) = tier_multiplier(tier) {
+            let level = tier_multiplier(tier);
+            if let Some((_, _, name, _)) = PLAN_NAMES.iter().find(|(kind, multiplier, _, _)| {
+                kind.eq_ignore_ascii_case(subscription) && level == Some(*multiplier)
+            }) {
+                return Some(name.to_string());
+            }
+            if let Some(level) = level {
                 label.push(' ');
                 label.push_str(level);
             } else {
@@ -1756,16 +1782,33 @@ fn tier_multiplier(tier: &str) -> Option<&str> {
     Some(&tier[start..])
 }
 
+/// The capacity a tier names: `n` for a tier ending in `_<n>x` with `n` above
+/// 0, else `None` (nothing is guessed for a tier without a multiplier).
+pub fn tier_capacity(tier: &str) -> Option<f64> {
+    let digits = tier_multiplier(tier)?.strip_suffix('x')?;
+    let capacity: u32 = digits.parse().ok()?;
+    (capacity > 0).then_some(f64::from(capacity))
+}
+
 impl Account {
+    /// The capacity of the account's plan from its identity's rate-limit tier
+    /// ([`OAuthAccount::rate_limit_tier`], [`tier_capacity`]): 5 for Max and
+    /// Team Premium, 20 for Ultra; `None` for a tier without a multiplier.
+    pub fn capacity(&self) -> Option<f64> {
+        tier_capacity(self.oauth_account.rate_limit_tier()?)
+    }
+
     /// Bring the fields that come from the stored login up to date after a
     /// login was stored for this account (switch, live sync, refresh): the plan
     /// ([`plan_label`] with the account's identity), the login's end date and
-    /// the login state.
+    /// the login state. An old label replaced by Claude's current name
+    /// ([`renamed_only`]) is saved but is no plan change.
     pub fn note_stored_login(&mut self, login: &Login) -> LoginNote {
         let plan = plan_label(login, &self.oauth_account);
         let ends_at_ms = login.refresh_token_expires_at_ms();
-        let plan_changed = self.plan != plan;
-        let changed = plan_changed
+        let plan_changed =
+            self.plan != plan && !renamed_only(self.plan.as_deref(), plan.as_deref());
+        let changed = self.plan != plan
             || self.login_ends_at_ms != ends_at_ms
             || self.login_state != LoginState::Ok;
         let previous_plan = self.plan.clone();
@@ -2117,7 +2160,7 @@ mod tests {
         let loaded = store.load().unwrap();
         assert_eq!(loaded, file);
         assert_eq!(loaded.accounts[0].oauth_account, sample_identity());
-        assert_eq!(loaded.accounts[0].plan.as_deref(), Some("Team 5x"));
+        assert_eq!(loaded.accounts[0].plan.as_deref(), Some("Team Premium"));
         assert_eq!(loaded.accounts[0].abbr, "AC");
         assert_eq!(loaded.accounts[1].abbr, "PR");
     }
@@ -3441,15 +3484,24 @@ mod tests {
             .as_deref(),
             Some("Pro")
         );
-        // Team seats have no display name: the subscription type, capitalised,
-        // with the tier's multiplier.
+        // Without a display name, Claude's current names for the old tiers:
+        // a Team seat on the 5x tier is "Team Premium", a personal max_5x is
+        // "Max" and max_20x is "Ultra".
         assert_eq!(
             plan_label(
                 &login_with(Some("team"), Some("default_claude_max_5x")),
                 &sample_identity()
             )
             .as_deref(),
-            Some("Team 5x")
+            Some("Team Premium")
+        );
+        assert_eq!(
+            plan_label(
+                &login_with(Some("max"), Some("default_claude_max_5x")),
+                &sample_identity()
+            )
+            .as_deref(),
+            Some("Max")
         );
         assert_eq!(
             plan_label(
@@ -3469,7 +3521,16 @@ mod tests {
                 &sample_identity()
             )
             .as_deref(),
-            Some("Max 20x")
+            Some("Ultra")
+        );
+        // A tier the table does not name keeps its multiplier.
+        assert_eq!(
+            plan_label(
+                &login_with(Some("team"), Some("default_claude_max_20x")),
+                &sample_identity()
+            )
+            .as_deref(),
+            Some("Team 20x")
         );
         assert_eq!(
             plan_label(
@@ -3507,10 +3568,10 @@ mod tests {
         );
         assert_eq!(
             label(Some("default_claude_max_5x")),
-            Some("Team 5x".to_string())
+            Some("Team Premium".to_string())
         );
         // A tier without the prefix: the multiplier is still the end of it.
-        assert_eq!(label(Some("max_5x")), Some("Team 5x".to_string()));
+        assert_eq!(label(Some("max_5x")), Some("Team Premium".to_string()));
         // A tier that is not a multiplier is shown as it is, without the prefix.
         assert_eq!(
             label(Some("default_claude_team_premium")),
@@ -3568,7 +3629,7 @@ mod tests {
         assert!(note.changed);
         assert!(note.plan_changed);
         assert_eq!(note.previous_plan.as_deref(), Some("team · max 5x"));
-        assert_eq!(account.plan.as_deref(), Some("Team 5x"));
+        assert_eq!(account.plan.as_deref(), Some("Team Premium"));
         assert_eq!(account.login_state, LoginState::Ok);
         assert_eq!(
             account.login_ends_at_ms,
@@ -3577,6 +3638,85 @@ mod tests {
         let again = account.note_stored_login(&login);
         assert!(!again.changed, "nothing changes the second time");
         assert!(!again.plan_changed);
+    }
+
+    /// The capacity comes from the identity's tiers: the seat's first, then
+    /// the organization's; a tier without a multiplier gives none.
+    #[test]
+    fn capacity_reads_the_seat_tier_then_the_organization_tier() {
+        assert_eq!(tier_capacity("default_claude_max_20x"), Some(20.0));
+        assert_eq!(tier_capacity("default_claude_max_5x"), Some(5.0));
+        assert_eq!(tier_capacity("default_raven"), None);
+        assert_eq!(tier_capacity("default_claude_max_0x"), None);
+        let identity = |pairs: &[(&str, &str)]| {
+            let mut identity = sample_identity();
+            for (key, value) in pairs {
+                identity.0.insert(key.to_string(), json!(value));
+            }
+            identity
+        };
+        let login = login_with(Some("team"), Some("default_claude_max_5x"));
+        let mut account = new_account(
+            &login,
+            &sample_identity(),
+            None,
+            &AccountsFile::default(),
+            now(),
+        )
+        .unwrap();
+        // A Team Premium seat: the seat's tier wins over the organization's.
+        account.oauth_account = identity(&[
+            ("userRateLimitTier", "default_claude_max_5x"),
+            ("organizationRateLimitTier", "default_raven"),
+        ]);
+        assert_eq!(account.capacity(), Some(5.0));
+        // Ultra: only the organization's tier.
+        account.oauth_account =
+            identity(&[("organizationRateLimitTier", "default_claude_max_20x")]);
+        assert_eq!(account.capacity(), Some(20.0));
+        // A blank seat tier counts as absent.
+        account.oauth_account = identity(&[
+            ("userRateLimitTier", " "),
+            ("organizationRateLimitTier", "default_claude_max_5x"),
+        ]);
+        assert_eq!(account.capacity(), Some(5.0));
+        // No tier, or one without a multiplier: no capacity.
+        account.oauth_account = identity(&[("organizationRateLimitTier", "default_raven")]);
+        assert_eq!(account.capacity(), None);
+        account.oauth_account = sample_identity();
+        assert_eq!(account.capacity(), None);
+    }
+
+    /// An old label giving way to Claude's current name is saved, but it is no
+    /// plan change: the history gets no `PlanChanged` for a rename.
+    #[test]
+    fn a_renamed_plan_is_saved_but_is_no_plan_change() {
+        let identity = identity(
+            ONE_ACCOUNT_UUID,
+            ONE_ORG_UUID,
+            "Acme",
+            "someone@example.com",
+        );
+        for (subscription, tier, old, new) in [
+            ("team", "default_claude_max_5x", "Team 5x", "Team Premium"),
+            ("max", "default_claude_max_5x", "Max 5x", "Max"),
+            ("max", "default_claude_max_20x", "Max 20x", "Ultra"),
+        ] {
+            let login = login_with(Some(subscription), Some(tier));
+            let mut account =
+                new_account(&login, &identity, None, &AccountsFile::default(), now()).unwrap();
+            account.plan = Some(old.to_string());
+            let note = account.note_stored_login(&login);
+            assert!(note.changed, "{old}: the new name is saved");
+            assert!(!note.plan_changed, "{old}: a rename is no plan change");
+            assert_eq!(account.plan.as_deref(), Some(new));
+        }
+        // An old label of another plan is still a change.
+        let login = login_with(Some("max"), Some("default_claude_max_20x"));
+        let mut account =
+            new_account(&login, &identity, None, &AccountsFile::default(), now()).unwrap();
+        account.plan = Some("Max 5x".to_string());
+        assert!(account.note_stored_login(&login).plan_changed);
     }
 
     #[test]
@@ -3595,7 +3735,7 @@ mod tests {
         assert_eq!(account.color, "#3b82f6");
         assert_eq!(account.email.as_deref(), Some("someone@example.com"));
         assert_eq!(account.org_name.as_deref(), Some("Acme"));
-        assert_eq!(account.plan.as_deref(), Some("Team 5x"));
+        assert_eq!(account.plan.as_deref(), Some("Team Premium"));
         assert_eq!(account.price, None);
         assert_eq!(account.account_uuid, ONE_ACCOUNT_UUID);
         assert_eq!(account.organization_uuid, ONE_ORG_UUID);

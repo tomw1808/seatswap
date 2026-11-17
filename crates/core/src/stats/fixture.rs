@@ -123,7 +123,15 @@ pub fn write(root: &Path) -> Result<Tiny, String> {
 
     let accounts = vec![
         account(LB_ID, LB_ACC, LB_ORG, "LB", "Max", 180.0, "#3b82f6")?,
-        account(AC_ID, AC_ACC, AC_ORG, "AC", "Team 5x", 140.0, "#f59e0b")?,
+        account(
+            AC_ID,
+            AC_ACC,
+            AC_ORG,
+            "AC",
+            "Team Premium",
+            140.0,
+            "#f59e0b",
+        )?,
     ];
     let lb = crate::history::AccountRef::of(&accounts[0]);
     let ac = crate::history::AccountRef::of(&accounts[1]);
@@ -140,7 +148,7 @@ pub fn write(root: &Path) -> Result<Tiny, String> {
             utc("2026-11-02T02:00:00Z")?,
             utc("2026-11-09T02:00:00Z")?,
             50.0,
-            "Team 5x",
+            "Team Premium",
         ),
         weekly_window(
             &lb,
@@ -154,7 +162,7 @@ pub fn write(root: &Path) -> Result<Tiny, String> {
             utc("2026-11-09T02:00:00Z")?,
             utc("2026-11-16T02:00:00Z")?,
             90.0,
-            "Team 5x",
+            "Team Premium",
         ),
         weekly_window(
             &lb,

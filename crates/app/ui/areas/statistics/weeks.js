@@ -112,6 +112,9 @@ export async function show(container, env) {
     }
     const reason = summary.moneyMissing;
     const missingTitle = typeof reason === "string" ? reason : undefined;
+    // A week whose window still runs shows its use so far; what it leaves
+    // unused is only known at its reset.
+    const running = summary.running === true;
     const usedPercent = h("span", {
       class: "stats-kpi-value",
       text:
@@ -130,7 +133,7 @@ export async function show(container, env) {
     const kpis = h("div", { class: "stats-mini-kpis" });
     kpis.appendChild(
       h("div", { class: "stats-mini-kpi" }, [
-        h("span", { class: "stats-kpi-label", text: "Used" }),
+        h("span", { class: "stats-kpi-label", text: running ? "Used so far" : "Used" }),
         usedPercent,
         h("span", { class: "stats-kpi-sub" }, [usedMoney]),
       ])
@@ -144,8 +147,10 @@ export async function show(container, env) {
           text:
             typeof summary.expiredPercentOfPaid === "number"
               ? `${percentText(summary.expiredPercentOfPaid)} of value`
-              : "—",
-          title: missingTitle,
+              : running
+                ? "the week still runs"
+                : "—",
+          title: running ? "what the running week leaves unused is known at its reset" : missingTitle,
         }),
       ])
     );
@@ -163,6 +168,9 @@ export async function show(container, env) {
       ])
     );
     card.appendChild(kpis);
+    if (summary.perAccountPercent.length === 0 && missingTitle) {
+      card.appendChild(h("p", { class: "stats-note", text: missingTitle }));
+    }
 
     const apiValue = amountNode(summary.values.api, summary.values.apiCurrency);
     apiValue.title = valueTip(summary.values, "api", "in this week");
@@ -180,11 +188,13 @@ export async function show(container, env) {
         "Week before",
         h("span", {
           text:
-            typeof summary.usedChangePercent !== "number"
-              ? "—"
-              : `${summary.usedChangePercent >= 0 ? "+" : ""}${percentText(
+            typeof summary.usedChangePercent === "number"
+              ? `${summary.usedChangePercent >= 0 ? "+" : ""}${percentText(
                   summary.usedChangePercent
-                )} used`,
+                )} used`
+              : running
+                ? "— · the week still runs"
+                : "—",
           title: beforeTitle,
         }),
       ],
@@ -350,6 +360,9 @@ export async function show(container, env) {
           text: `Summary · week from ${dateText(state.summary.week)}`,
         })
       );
+      if (state.summary.running === true) {
+        head.appendChild(h("span", { class: "stats-tag stats-tag-running", text: "so far" }));
+      }
       const names = h("span", { class: "s" });
       for (const [index, view] of env.accounts.entries()) {
         if (index > 0) names.appendChild(document.createTextNode(" · "));
@@ -381,10 +394,13 @@ export async function show(container, env) {
       const current = lastIsCurrent && index === data.weekStarts.length - 1;
       return {
         label: current ? "now" : shortDate(week),
-        tip: current ? "the running week" : `Summary of the week from ${dateText(week)}`,
-        selected: !current && state.summaryWeek === week,
+        at: week,
+        tip: current
+          ? `Summary of the running week from ${dateText(week)}, so far`
+          : `Summary of the week from ${dateText(week)}`,
+        selected: state.summaryWeek === week,
         current,
-        onClick: current ? undefined : () => void selectSummary(week),
+        onClick: () => void selectSummary(week),
       };
     });
     if (!lastIsCurrent) {
@@ -428,6 +444,9 @@ export async function show(container, env) {
               : undefined,
         };
       });
+      if (typeof row.nowPercent === "number" && typeof row.nowWeek !== "string") {
+        throw new Error(`the running window of ${row.id} names no week it counts in`);
+      }
       const nowCell =
         typeof row.nowPercent !== "number"
           ? null
@@ -437,7 +456,10 @@ export async function show(container, env) {
               textColor: contrastText(color),
               current: true,
               text: shortPercent(row.nowPercent),
-              tip: `${accountNameText(env.accounts, row.id)} · now ${percentText(row.nowPercent)}`,
+              tip: `${accountNameText(env.accounts, row.id)} · now ${percentText(
+                row.nowPercent
+              )} | counts in the week from ${dateText(row.nowWeek)} · a click shows that week so far`,
+              onClick: () => void selectSummary(row.nowWeek),
             };
       if (lastIsCurrent) {
         const index = cells.length - 1;
@@ -449,9 +471,12 @@ export async function show(container, env) {
     });
     const blocked = {
       label: h("span", { class: "stats-row-label", text: "Blocked" }),
-      cells: data.blocked.map((value) => ({
+      // A narrow column hides the number; its tooltip always has it.
+      cells: data.blocked.map((value, index) => ({
         text: durationText(Math.round(value * 3600)),
-        tip: "working hours blocked in this week",
+        tip: `Blocked · week from ${dateText(data.weekStarts[index])} | ${durationText(
+          Math.round(value * 3600)
+        )}: working hours in which the active account was full`,
       })),
     };
     if (!lastIsCurrent) {
@@ -563,6 +588,13 @@ export async function show(container, env) {
   paint();
   const finished =
     runningIndex === -1 ? data.weekStarts : data.weekStarts.slice(0, runningIndex);
-  const week = finished.length > 0 ? finished[finished.length - 1] : null;
+  // The newest finished week; without one the running week, so far: no page
+  // waits a week before it shows something.
+  const week =
+    finished.length > 0
+      ? finished[finished.length - 1]
+      : runningIndex !== -1
+        ? data.weekStarts[runningIndex]
+        : null;
   if (week !== null) await selectSummary(week);
 }

@@ -4,12 +4,121 @@
 .stats-overview {
   flex: 1;
   grid-template-columns: minmax(0, 13fr) minmax(0, 7fr);
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
   gap: 12px;
 }
 
 .stats-kpi-card {
   grid-column: 1 / -1;
+}
+
+/* The This-week card: one row per running weekly window. */
+.stats-tw-card {
+  grid-column: 1 / -1;
+}
+
+/* A range that holds no record: the area's empty line under the card. */
+.stats-overview-empty {
+  grid-column: 1 / -1;
+}
+
+.stats-tw-rows {
+  display: flex;
+  flex-direction: column;
+  padding: 0 12px 2px;
+}
+
+.stats-tw-row {
+  display: grid;
+  grid-template-columns: 150px minmax(120px, 1fr) 132px 104px;
+  column-gap: 12px;
+  align-items: center;
+  min-height: 28px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+}
+
+.stats-tw-row:first-child {
+  border-top: 0;
+}
+
+.stats-tw-account {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.stats-tw-bar {
+  height: 10px;
+  border-radius: 5px;
+  background: var(--track);
+  overflow: hidden;
+}
+
+.stats-tw-fill {
+  display: flex;
+  height: 100%;
+}
+
+/* Another provider's row (Codex, Ollama): no limit to fill, so its project
+   pieces span a thinner, faded bar and never read as a share of a limit. */
+.stats-tw-bar-api {
+  height: 6px;
+  border-radius: 3px;
+}
+
+.stats-tw-bar-api .stats-tw-fill {
+  opacity: 0.5;
+}
+
+/* One project's piece; a thin gap in the card's colour parts two pieces. */
+.stats-tw-seg {
+  flex: 1 1 0;
+  min-width: 0;
+  height: 100%;
+}
+
+.stats-tw-seg + .stats-tw-seg {
+  box-shadow: inset 1px 0 0 var(--card);
+}
+
+.stats-tw-figure {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.stats-tw-reset {
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.stats-tw-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 14px;
+  padding: 3px 12px 9px;
+}
+
+.stats-tw-legend .stats-legend-name {
+  max-width: 140px;
+}
+
+.stats-tw-share {
+  font-variant-numeric: tabular-nums;
+}
+
+.stats-tw-empty {
+  margin: 0;
+  padding: 2px 12px 10px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 17px;
 }
 
 .stats-kpis {
@@ -148,8 +257,10 @@
   min-height: 0;
 }
 
+/* The share chart keeps a readable height; the findings above it scroll when
+   the This-week card leaves the row little room. */
 .stats-side > .hcard.stats-share-card {
-  flex: 1;
+  flex: 1 0 150px;
 }
 
 .stats-body {

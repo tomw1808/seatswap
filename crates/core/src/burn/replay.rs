@@ -8,7 +8,7 @@ use chrono::{DateTime, Offset, Utc};
 
 use crate::api::LimitKind;
 use crate::history::{
-    AccountRef, HistoryDir, HistoryError, Hosted, Hosts, Range, Sample, TokenRecord,
+    AccountRef, HistoryDir, HistoryError, Hosted, Hosts, Range, Record, Sample, TokenRecord,
 };
 use crate::transcripts::hour_start;
 
@@ -74,14 +74,40 @@ pub fn replay(
 ) -> Result<ReplayResult, ReplayError> {
     let sample_read = history.read_claude::<Sample>(range, &Hosts::All)?;
     let token_read = history.read::<TokenRecord>(range, &Hosts::All)?;
-    let samples = sample_read.records;
-    let tokens = token_read.records;
     let mut warnings = sample_read.warnings;
     warnings.extend(token_read.warnings);
+    let mut result = replay_records(
+        &sample_read.records,
+        &token_read.records,
+        range,
+        rates,
+        without,
+        policy,
+    )?;
+    result.warnings = warnings;
+    Ok(result)
+}
+
+/// [`replay`] over records the caller has read already, so a caller that
+/// replays many ranges of one longer range reads the history once: the Claude
+/// samples ([`HistoryDir::read_claude`]) and the token records
+/// ([`HistoryDir::read`]) of a range that holds `range`, sorted by time as a
+/// read returns them. Only the records inside `range` are played. The result
+/// has no warnings: the caller's read has them.
+pub fn replay_records(
+    samples: &[Hosted<Sample>],
+    tokens: &[Hosted<TokenRecord>],
+    range: &Range,
+    rates: &BTreeMap<AccountRef, Rates>,
+    without: &[AccountRef],
+    policy: Policy,
+) -> Result<ReplayResult, ReplayError> {
+    let samples = inside(samples, range);
+    let tokens = inside(tokens, range);
 
     let mut accounts = Vec::new();
     let mut refs: BTreeMap<String, AccountRef> = BTreeMap::new();
-    for (account, sample) in first_samples(&samples, without) {
+    for (account, sample) in first_samples(samples, without) {
         let week = sample
             .limit(&LimitKind::WeeklyAll)
             .ok_or_else(|| unplayable(account, sample.t, "weekly limit"))?;
@@ -107,7 +133,7 @@ pub fn replay(
         refs.insert(id, account.clone());
     }
 
-    let hours = recorded_hours(&tokens);
+    let hours = recorded_hours(tokens);
     let walk = Walk::new(Work::Recorded(&hours), range.to);
     let inputs = Inputs {
         now: range.from,
@@ -137,8 +163,20 @@ pub fn replay(
         switches: played.plan.switches,
         expired,
         typical_wu,
-        warnings,
+        warnings: Vec::new(),
     })
+}
+
+/// The records of `records` (sorted by time, as a history read returns them)
+/// whose time lies in `range`: what a read of `range` itself returns.
+fn inside<'a, R: Record>(records: &'a [Hosted<R>], range: &Range) -> &'a [Hosted<R>] {
+    debug_assert!(
+        records.is_sorted_by_key(|hosted| hosted.record.at()),
+        "a replay needs its records sorted by time"
+    );
+    let from = records.partition_point(|hosted| hosted.record.at() < range.from);
+    let to = records.partition_point(|hosted| hosted.record.at() < range.to);
+    &records[from..to.max(from)]
 }
 
 /// The id a play uses for `account`: unique per [`AccountRef`], unlike the
@@ -468,6 +506,66 @@ mod tests {
             "{:?}",
             result.warnings
         );
+    }
+
+    /// A replay over records read once for a longer range plays exactly what a
+    /// replay that reads its own range plays: the records before and after the
+    /// range are left out.
+    #[test]
+    fn a_replay_of_records_read_for_a_longer_range_is_the_same() {
+        let (_dir, history, rates, range) = setup();
+        let before = range.from - Duration::days(3);
+        let after = range.to + Duration::days(2);
+        for (at, percent) in [(before, 70.0), (after, 90.0)] {
+            history
+                .append(&Sample {
+                    t: at,
+                    account: account_ref("AC"),
+                    src: Source::Poll,
+                    l: vec![LimitSample {
+                        k: LimitKind::WeeklyAll,
+                        m: None,
+                        p: percent,
+                        r: Some(at + Duration::days(1)),
+                        b: false,
+                    }],
+                })
+                .expect("a sample outside the range");
+        }
+        history
+            .append_many(&tokens(
+                &inputs().rhythm,
+                &Range {
+                    from: before,
+                    to: range.from,
+                },
+                offset(),
+            ))
+            .expect("token records before the range");
+        let longer = Range {
+            from: before,
+            to: after + Duration::hours(1),
+        };
+        let samples = history
+            .read_claude::<Sample>(&longer, &Hosts::All)
+            .expect("the samples");
+        let records = history
+            .read::<TokenRecord>(&longer, &Hosts::All)
+            .expect("the token records");
+
+        for without in [vec![], vec![account_ref("AC")]] {
+            let own = replay(&history, &range, &rates, &without, Policy::Lazy).expect("replay");
+            let shared = replay_records(
+                &samples.records,
+                &records.records,
+                &range,
+                &rates,
+                &without,
+                Policy::Lazy,
+            )
+            .expect("replay of the shared records");
+            assert_eq!(shared, own);
+        }
     }
 
     #[test]

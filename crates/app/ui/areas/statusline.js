@@ -61,6 +61,11 @@ const SCENARIOS = [
 
 const PREVIEW_DELAY_MS = 150;
 
+// The preview's line when Claude Code has no login yet (the snapshot's live
+// login is `noLogin`): a first run's normal state, shown as information.
+const NO_LOGIN_NOTICE =
+  "No Claude login yet. Log in to Claude Code once and save the account in the pop-up; the preview then shows its numbers.";
+
 // The six separator characters of store.rs's `SeparatorChar`, in its order:
 // the stored id, the glyph it prints and the name the page shows. `blank` is
 // one space. The fixture's preview reads this table too, so the glyphs are
@@ -127,6 +132,8 @@ const state = {
   widths: ["120", "100", "80"],
   previews: null,
   previewErrors: [],
+  // An info line in place of the preview (no Claude login yet), or null.
+  previewNotice: null,
   previewRows: [],
   previewErrorHost: null,
   previewTimer: null,
@@ -1872,6 +1879,7 @@ function schedulePreview() {
 
 async function requestPreview() {
   if (!state.active || !state.config) return;
+  state.previewNotice = null;
   const parsed = previewWidths();
   if (parsed.error) {
     state.previews = null;
@@ -1894,6 +1902,17 @@ async function requestPreview() {
   }
   state.previewKey = key;
   const token = ++state.previewToken;
+  // A first run without a Claude login is a normal state, not an error: the
+  // preview has no account to show until one is saved.
+  const live = isObject(state.snapshot) ? state.snapshot.live : null;
+  if (isObject(live) && live.kind === "noLogin") {
+    state.previews = null;
+    state.previewKey = null;
+    state.previewErrors = [];
+    state.previewNotice = NO_LOGIN_NOTICE;
+    renderPreview();
+    return;
+  }
   try {
     const reply = await state.context.invoke("statusline_preview", {
       config: clone(state.config),
@@ -2003,6 +2022,9 @@ function renderPreview() {
   clear(state.previewErrorHost);
   for (const text of state.previewErrors) {
     state.previewErrorHost.appendChild(banner("error", "⚠", text));
+  }
+  if (state.previewNotice !== null) {
+    state.previewErrorHost.appendChild(banner("info", "ℹ", state.previewNotice));
   }
   for (let index = 0; index < state.previewRows.length; index += 1) {
     const row = state.previewRows[index];

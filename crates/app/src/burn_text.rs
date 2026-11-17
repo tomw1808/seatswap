@@ -139,13 +139,17 @@ pub fn unread_line(views: &[AccountView], accounts: &[String]) -> Result<Vec<Bur
 }
 
 /// The line when no account auto-burn may use (nor the active one) has a
-/// working login and a reading: every such login ended, or auto-burn may use
-/// no account.
+/// working login and a reading. With no stored account at all it asks for the
+/// first one; otherwise every such login ended, or auto-burn may use no
+/// account.
 #[cfg(feature = "gui")]
-pub fn no_accounts_line() -> Vec<BurnPart> {
-    vec![BurnPart::Text(
-        "No account auto-burn may use has a working login.".to_string(),
-    )]
+pub fn no_accounts_line(accounts: &[Account]) -> Vec<BurnPart> {
+    let text = if accounts.is_empty() {
+        "Save an account to start."
+    } else {
+        "No account auto-burn may use has a working login."
+    };
+    vec![BurnPart::Text(text.to_string())]
 }
 
 /// The target's weekly reset, in the words a reason needs.
@@ -283,30 +287,15 @@ pub fn reason(
 #[cfg(feature = "gui")]
 /// The line under the auto-burn switch: the account in use, when it fills and
 /// which account follows. A plan that leaves the account before it fills (an
-/// eager plan can) says `Then AC, before PR is full.` instead. While learning,
-/// the accounts whose rates are missing.
+/// eager plan can) says `Then AC, before PR is full.` instead. The line never
+/// mentions learning: an account whose rates are not known yet is simply not
+/// planned to fill (spec §2.3).
 pub fn line(
     plan: &Plan,
     active: Option<&str>,
     views: &[AccountView],
-    learning: &[String],
     now: DateTime<Utc>,
 ) -> Result<Option<Vec<BurnPart>>, TextError> {
-    if !learning.is_empty() {
-        let mut parts = vec![BurnPart::Text(
-            "Measuring how much work fits in ".to_string(),
-        )];
-        for (index, id) in learning.iter().enumerate() {
-            if index > 0 {
-                parts.push(BurnPart::Text(", ".to_string()));
-            }
-            parts.push(account_part(views, id)?);
-        }
-        parts.push(BurnPart::Text(
-            ". Until then: switch only when full.".to_string(),
-        ));
-        return Ok(Some(parts));
-    }
     let current = active
         .filter(|id| {
             plan.segments
@@ -644,15 +633,9 @@ mod tests {
     #[test]
     fn the_line_names_the_account_in_use_and_the_next() {
         let views = vec![view("pr", "PR", 20.0, false), view("ac", "AC", 10.0, true)];
-        let line = line(
-            &plan(),
-            Some("pr"),
-            &views,
-            &[],
-            utc("2026-11-10T12:00:00Z"),
-        )
-        .expect("a line")
-        .expect("the plan has a next account");
+        let line = line(&plan(), Some("pr"), &views, utc("2026-11-10T12:00:00Z"))
+            .expect("a line")
+            .expect("the plan has a next account");
         assert_eq!(
             plain(&line),
             "On PR until its week is full, about 2h. Then AC."
@@ -663,15 +646,9 @@ mod tests {
     #[test]
     fn the_line_says_week_when_the_week_fills_first() {
         let views = vec![view("pr", "PR", 20.0, true), view("ac", "AC", 10.0, true)];
-        let line = line(
-            &plan(),
-            Some("pr"),
-            &views,
-            &[],
-            utc("2026-11-10T12:00:00Z"),
-        )
-        .expect("a line")
-        .expect("the plan has a next account");
+        let line = line(&plan(), Some("pr"), &views, utc("2026-11-10T12:00:00Z"))
+            .expect("a line")
+            .expect("the plan has a next account");
         assert_eq!(
             plain(&line),
             "On PR until its week is full, about 2h. Then AC.",
@@ -687,7 +664,7 @@ mod tests {
         let mut plan = plan();
         plan.full_at
             .insert("pr".to_string(), now + Duration::hours(3));
-        let line = line(&plan, Some("pr"), &views, &[], now)
+        let line = line(&plan, Some("pr"), &views, now)
             .expect("a line")
             .expect("the plan has a next account");
         assert_eq!(
@@ -784,7 +761,7 @@ mod tests {
         ];
         let now = utc("2026-11-10T12:00:00Z");
 
-        let plan_line = line(&plan(), Some("pr"), &views, &[], now)
+        let plan_line = line(&plan(), Some("pr"), &views, now)
             .expect("a line")
             .expect("a next account");
         assert_eq!(
@@ -795,21 +772,6 @@ mod tests {
         assert_eq!(
             plain(&plan_line),
             "On PR until its week is full, about 2h. Then AC."
-        );
-
-        let learning = line(
-            &plan(),
-            Some("pr"),
-            &views,
-            &["lb".to_string(), "ac".to_string()],
-            now,
-        )
-        .expect("a line")
-        .expect("a learning line");
-        assert_eq!(accounts(&learning), vec![("lb", "LB"), ("ac", "AC")]);
-        assert_eq!(
-            plain(&learning),
-            "Measuring how much work fits in LB, AC. Until then: switch only when full."
         );
 
         let unread = unread_line(&views, &["ac".to_string(), "lb".to_string()])

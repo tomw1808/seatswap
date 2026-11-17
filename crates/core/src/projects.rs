@@ -1165,7 +1165,7 @@ mod tests {
             "color": "#3b82f6",
             "email": email,
             "orgName": org_name,
-            "plan": "Team 5x",
+            "plan": "Team Premium",
             "oauthAccount": {
                 "accountUuid": account_uuid,
                 "organizationUuid": organization_uuid,

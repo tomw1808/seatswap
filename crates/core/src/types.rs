@@ -119,6 +119,17 @@ impl OAuthAccount {
     pub fn organization_name(&self) -> Option<&str> {
         self.s("organizationName")
     }
+    /// The seat's rate-limit tier (`userRateLimitTier`, e.g.
+    /// `default_claude_max_5x` on a Team Premium seat), else the
+    /// organization's (`organizationRateLimitTier`, e.g.
+    /// `default_claude_max_20x` on Ultra). Blank values count as absent.
+    pub fn rate_limit_tier(&self) -> Option<&str> {
+        ["userRateLimitTier", "organizationRateLimitTier"]
+            .into_iter()
+            .filter_map(|key| self.s(key))
+            .map(str::trim)
+            .find(|tier| !tier.is_empty())
+    }
     /// Claude's own name for a personal plan: "Free", "Pro", "Max", "Ultra".
     /// Absent for Team and Enterprise seats.
     pub fn plan_display_name(&self) -> Option<&str> {

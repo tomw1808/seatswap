@@ -211,20 +211,7 @@ fn show_or_create(app: &AppHandle, target: &str) -> Result<(), String> {
 /// Build the large window on its first opening, with the target in its address.
 #[cfg(feature = "gui")]
 fn create(app: &AppHandle, target: &str) -> Result<(), String> {
-    let initial = target.to_string();
-    let window =
-        WebviewWindowBuilder::new(app, WINDOW_LABEL, WebviewUrl::App("window.html".into()))
-            .title("seatswap")
-            .inner_size(WINDOW_WIDTH, WINDOW_HEIGHT)
-            .resizable(true)
-            .decorations(true)
-            .always_on_top(false)
-            .skip_taskbar(false)
-            // Before the page's scripts run, so the window opens on its target
-            // instead of drawing Sessions first and jumping.
-            .initialization_script(format!("window.location.hash = {initial:?};"))
-            .build()
-            .map_err(|error| format!("cannot open the window: {error}"))?;
+    let window = build(app, target)?;
     let handle = app.clone();
     window.on_window_event(move |event| {
         if matches!(event, tauri::WindowEvent::Destroyed) {
@@ -240,12 +227,101 @@ fn create(app: &AppHandle, target: &str) -> Result<(), String> {
             });
         }
     });
-    window
-        .show()
-        .map_err(|error| format!("cannot show the window: {error}"))?;
-    window
-        .set_focus()
-        .map_err(|error| format!("cannot focus the window: {error}"))
+    Ok(())
+}
+
+/// The large window's builder, opening on `target`. The window is built hidden
+/// and shown and focused once its page has loaded: a web view drawn before its
+/// page is in waits up to 0.5 s for a first frame (WebKit on Linux, measured in
+/// the bench 2026-11-17), and that page cannot get its files meanwhile, because
+/// the app's own protocol answers on the main thread that is waiting.
+#[cfg(feature = "gui")]
+fn builder<'a>(
+    app: &'a AppHandle,
+    target: &str,
+) -> WebviewWindowBuilder<'a, tauri::Wry, AppHandle> {
+    let shown = std::sync::atomic::AtomicBool::new(false);
+    WebviewWindowBuilder::new(app, WINDOW_LABEL, WebviewUrl::App("window.html".into()))
+        .title("seatswap")
+        .inner_size(WINDOW_WIDTH, WINDOW_HEIGHT)
+        .resizable(true)
+        .decorations(true)
+        .always_on_top(false)
+        .skip_taskbar(false)
+        .visible(false)
+        // Before the page's scripts run, so the window opens on its target
+        // instead of drawing Sessions first and jumping.
+        .initialization_script(format!("window.location.hash = {target:?};"))
+        // A failed load ends with `Finished` too, so the window always comes up;
+        // a later reload does not take the focus again.
+        .on_page_load(move |window, payload| {
+            if payload.event() != tauri::webview::PageLoadEvent::Finished
+                || shown.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return;
+            }
+            let revealed = window
+                .show()
+                .map_err(|error| format!("cannot show the window: {error}"))
+                .and_then(|()| {
+                    window
+                        .set_focus()
+                        .map_err(|error| format!("cannot focus the window: {error}"))
+                });
+            if let Err(error) = revealed {
+                super::report_error(window.app_handle(), &format!("window: {error}"));
+            }
+        })
+}
+
+/// Build the window. On Linux its web view shares the pop-up's web process
+/// (WebKit's "related view"), so no new WebKit process starts: a new one first
+/// sets up the graphics driver, and on a laptop whose NVIDIA card sleeps when
+/// idle that waits about 2 s for the card to wake (`/dev/nvidiactl`, measured
+/// in the bench 2026-11-17), and about 0.5 s more even when it is awake. The
+/// pop-up is created at start (`panel::preload`), and again here if it was
+/// closed since. A GTK web view is used only on the main thread, so the build
+/// runs there and this thread waits for it.
+#[cfg(all(feature = "gui", target_os = "linux"))]
+fn build(app: &AppHandle, target: &str) -> Result<tauri::WebviewWindow, String> {
+    let (built, result) = std::sync::mpsc::channel();
+    let handle = app.clone();
+    let target = target.to_string();
+    app.run_on_main_thread(move || {
+        let sender = built.clone();
+        let asked = super::panel::preload(&handle)
+            .and_then(|()| {
+                handle
+                    .get_webview_window(super::panel::PANEL_LABEL)
+                    .ok_or_else(|| "the pop-up is missing".to_string())
+            })
+            .and_then(|panel| {
+                panel
+                    .with_webview(move |related| {
+                        let window = builder(&handle, &target)
+                            .with_related_view(related.inner())
+                            .build()
+                            .map_err(|error| format!("cannot open the window: {error}"));
+                        let _ = sender.send(window);
+                    })
+                    .map_err(|error| error.to_string())
+            });
+        if let Err(error) = asked {
+            let _ = built.send(Err(format!("cannot open the window: {error}")));
+        }
+    })
+    .map_err(|error| format!("cannot open the window: {error}"))?;
+    result
+        .recv()
+        .map_err(|_| "cannot open the window: the build did not finish".to_string())?
+}
+
+/// Build the window.
+#[cfg(all(feature = "gui", not(target_os = "linux")))]
+fn build(app: &AppHandle, target: &str) -> Result<tauri::WebviewWindow, String> {
+    builder(app, target)
+        .build()
+        .map_err(|error| format!("cannot open the window: {error}"))
 }
 
 /// `open_window("settings")` from a page: the same as `show`.
@@ -746,6 +822,21 @@ pub(crate) fn stats_overview_at<Tz: TimeZone + Copy>(
     })
 }
 
+/// The Overview's This-week card. It ignores the query's range, so it never
+/// says "nothing recorded" and does not go through [`stats_page`]: without a
+/// running window its lists are empty and the page says so itself.
+#[cfg(feature = "gui")]
+pub(crate) fn stats_this_week_at<Tz: TimeZone + Copy>(
+    parts: &StatsParts,
+    history: &HistoryDir,
+    now: DateTime<Utc>,
+    zone: Tz,
+    query: &Query,
+) -> Result<overview::ThisWeek, String> {
+    overview::this_week_card(&parts.ctx(history, now, zone), query)
+        .map_err(|error| error.to_string())
+}
+
 #[cfg(feature = "gui")]
 pub(crate) fn stats_weeks_at<Tz: TimeZone + Copy>(
     parts: &StatsParts,
@@ -842,8 +933,41 @@ pub(crate) fn stats_what_if_at<Tz: TimeZone + Copy>(
     })
 }
 
-/// The forecast has no empty marker: it either has a plan or the error that no
-/// reading of every account exists yet. A reading older than the burn runtime's
+/// The Forecast page's error while there is no plan. The page shows it, and
+/// every error that starts with it and a colon, as a plain line.
+#[cfg(feature = "gui")]
+pub(crate) const NO_PLAN: &str = "the forecast needs a reading of every account first";
+
+/// Why the Forecast page has no plan: [`NO_PLAN`], and while auto-burn waits for
+/// a first reading of some accounts, which ones and when it comes. The accounts
+/// are the auto-burn view's `unread`, named by their abbreviations.
+#[cfg(feature = "gui")]
+pub(crate) fn no_plan_text(
+    burn: Option<&super::burn_rt::BurnView>,
+    views: &[seatswap_core::engine::AccountView],
+) -> Result<String, String> {
+    let unread = burn.map(|view| view.unread.as_slice()).unwrap_or(&[]);
+    if unread.is_empty() {
+        return Ok(NO_PLAN.to_string());
+    }
+    let abbrs = unread
+        .iter()
+        .map(|id| crate::burn_text::abbr(views, id))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let (has, comes) = if abbrs.len() == 1 {
+        ("has", "it comes")
+    } else {
+        ("have", "they come")
+    };
+    Ok(format!(
+        "{NO_PLAN}: {} {has} none yet; {comes} with the next usage poll",
+        abbrs.join(", ")
+    ))
+}
+
+/// The forecast has no empty marker: it either has a plan or the error
+/// `no_plan` ([`no_plan_text`]). A reading older than the burn runtime's
 /// freshness is the same as no reading; the age is the oldest reading the
 /// situation kept, not the tick time its plan was built for.
 #[cfg(feature = "gui")]
@@ -853,13 +977,14 @@ pub(crate) fn stats_forecast_at<Tz: TimeZone + Copy>(
     now: DateTime<Utc>,
     zone: Tz,
     kept: Option<KeptForecast>,
+    no_plan: String,
 ) -> Result<Page<forecast::Forecast>, String> {
     let Some((inputs, regime, oldest_reading)) = kept else {
-        return Err("the forecast needs a reading of every account first".to_string());
+        return Err(no_plan);
     };
     if now.signed_duration_since(oldest_reading) > Duration::minutes(seatswap_core::burn::FRESH_MIN)
     {
-        return Err("the forecast needs a reading of every account first".to_string());
+        return Err(no_plan);
     }
     let ctx = parts.ctx(history, now, zone);
     forecast::forecast(&ctx, &inputs, &regime)
@@ -933,6 +1058,18 @@ pub(crate) async fn stats_overview(
 ) -> Result<Page<overview::Overview>, String> {
     stats_command(state, move |parts, history, now, offset| {
         stats_overview_at(parts, history, now, offset, &query)
+    })
+    .await
+}
+
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub(crate) async fn stats_this_week(
+    state: State<'_, super::GuiState>,
+    query: Query,
+) -> Result<overview::ThisWeek, String> {
+    stats_command(state, move |parts, history, now, offset| {
+        stats_this_week_at(parts, history, now, offset, &query)
     })
     .await
 }
@@ -1032,8 +1169,10 @@ pub(crate) async fn stats_forecast(
     state: State<'_, super::GuiState>,
 ) -> Result<Page<forecast::Forecast>, String> {
     let inputs = super::lock(&state.forecast).clone();
+    let snapshot = state.snapshot()?;
+    let no_plan = no_plan_text(snapshot.burn.as_ref(), &snapshot.views)?;
     stats_command(state, move |parts, history, now, offset| {
-        stats_forecast_at(parts, history, now, offset, inputs)
+        stats_forecast_at(parts, history, now, offset, inputs, no_plan)
     })
     .await
 }
@@ -3040,6 +3179,8 @@ mod tests {
             stats_overview_at(&parts, &tiny.history, now, offset, &query).expect("the overview");
         match overview {
             Page::Data(overview) => {
+                // The history counts the two finished weeks' 120 EUR; the
+                // running windows (LB 30 %, AC 40 %) are on the This-week card.
                 assert!(
                     (overview.kpis.used - 120.0).abs() < 0.001,
                     "used {}",
@@ -3048,6 +3189,10 @@ mod tests {
             }
             Page::Empty(empty) => panic!("the tiny history is not empty: {empty:?}"),
         }
+        let card =
+            stats_this_week_at(&parts, &tiny.history, now, offset, &query).expect("the card");
+        let running: Vec<f64> = card.accounts.iter().map(|account| account.used).collect();
+        assert_eq!(running, vec![30.0, 40.0]);
 
         assert!(stats_weeks_at(&parts, &tiny.history, now, offset, &query).is_ok());
         assert!(stats_week_summary_at(
@@ -3150,13 +3295,90 @@ mod tests {
             now,
             offset,
             Some((inputs, regime, now)),
+            NO_PLAN.to_string(),
         )
         .expect("the forecast");
         assert!(matches!(forecast, Page::Data(_)), "{forecast:?}");
 
-        let error = stats_forecast_at(&parts, &tiny.history, now, offset, None)
-            .expect_err("no reading, no forecast");
+        let error = stats_forecast_at(
+            &parts,
+            &tiny.history,
+            now,
+            offset,
+            None,
+            NO_PLAN.to_string(),
+        )
+        .expect_err("no reading, no forecast");
         assert_eq!(error, "the forecast needs a reading of every account first");
+    }
+
+    /// Without a plan the Forecast page names the accounts auto-burn waits a
+    /// first reading of, by their abbreviations, and says when it comes.
+    /// Without such an account it keeps the one plain sentence.
+    #[cfg(feature = "gui")]
+    #[test]
+    fn no_plan_names_the_accounts_without_a_reading() {
+        use super::super::burn_rt::BurnView;
+        use seatswap_core::engine::AccountView;
+        use seatswap_core::store::LoginState;
+
+        let view = |id: &str, abbr: &str| AccountView {
+            id: id.to_string(),
+            label: abbr.to_string(),
+            abbr: abbr.to_string(),
+            color: "#3b82f6".to_string(),
+            email: None,
+            plan: None,
+            auto_burn: true,
+            is_active: false,
+            login_state: LoginState::Ok,
+            login_ends_at_ms: None,
+            login_days_left: None,
+            usage: None,
+            usable: true,
+            blocked_until: None,
+            blocker: None,
+            fetched_at: None,
+            last_error: None,
+        };
+        let ac = "3f2b8c1e9d4a4e7b8c6d5e4f3a2b1c0d";
+        let pr = "9e8d7c6b5a4f4e3d2c1b0a9f8e7d6c5b";
+        let views = vec![view(ac, "AC"), view(pr, "PR")];
+
+        assert_eq!(no_plan_text(None, &views).expect("a text"), NO_PLAN);
+        assert_eq!(
+            no_plan_text(Some(&BurnView::default()), &views).expect("a text"),
+            NO_PLAN
+        );
+
+        let one = BurnView {
+            unread: vec![pr.to_string()],
+            ..BurnView::default()
+        };
+        assert_eq!(
+            no_plan_text(Some(&one), &views).expect("a text"),
+            "the forecast needs a reading of every account first: PR has none yet; \
+             it comes with the next usage poll"
+        );
+
+        let two = BurnView {
+            unread: vec![ac.to_string(), pr.to_string()],
+            ..BurnView::default()
+        };
+        assert_eq!(
+            no_plan_text(Some(&two), &views).expect("a text"),
+            "the forecast needs a reading of every account first: AC, PR have none yet; \
+             they come with the next usage poll"
+        );
+
+        let gone = BurnView {
+            unread: vec!["0a1b2c3d4e5f4a6b8c7d9e0f1a2b3c4d".to_string()],
+            ..BurnView::default()
+        };
+        assert!(
+            no_plan_text(Some(&gone), &views).is_err(),
+            "an account without a view is an error, never a guessed name"
+        );
     }
 
     #[cfg(feature = "gui")]
@@ -3271,6 +3493,7 @@ mod tests {
             now,
             offset,
             Some((inputs(now), regime.clone(), now)),
+            NO_PLAN.to_string(),
         )
         .expect("the forecast of a fresh reading");
         assert!(matches!(fresh, Page::Data(_)), "{fresh:?}");
@@ -3284,6 +3507,7 @@ mod tests {
             now,
             offset,
             Some((inputs(old), regime.clone(), old)),
+            NO_PLAN.to_string(),
         )
         .expect_err("a reading that is too old is no plan");
         assert_eq!(
@@ -3345,11 +3569,68 @@ mod tests {
             now,
             offset,
             Some((inputs, regime, oldest)),
+            NO_PLAN.to_string(),
         )
         .expect_err("readings two hours old are no plan");
         assert_eq!(
             error, "the forecast needs a reading of every account first",
             "{error}"
+        );
+    }
+
+    /// The This-week card ignores the range: on the accounts' first day, last
+    /// week holds no record and the Overview says "nothing recorded yet", but
+    /// the card still lists the two weekly windows running now.
+    #[cfg(feature = "gui")]
+    #[test]
+    fn an_empty_range_still_has_the_this_week_card() {
+        let dir = tempfile::tempdir().expect("a temp folder");
+        let tiny = fixture::write(dir.path()).expect("the tiny fixture");
+        // A history of today's usage readings only: the fixture's two.
+        let readings = tiny
+            .history
+            .read_claude::<seatswap_core::history::Sample>(
+                &seatswap_core::history::Range::ALL,
+                &seatswap_core::history::Hosts::All,
+            )
+            .expect("the fixture's readings");
+        let today: Vec<_> = readings
+            .records
+            .into_iter()
+            .map(|hosted| hosted.record)
+            .filter(|sample| sample.t > tiny.now - Duration::days(1))
+            .collect();
+        assert_eq!(today.len(), 2, "LB's and AC's reading of today");
+        let first_day = tempfile::tempdir().expect("a second temp folder");
+        let history = HistoryDir::at(first_day.path(), "atlas");
+        history.append_many(&today).expect("today's readings");
+
+        let app = AppPaths::at(dir.path());
+        let parts = stats_ctx_parts(&app, &history).expect("the statistics parts");
+        let query = Query {
+            range: RangeKey::LastWeek,
+            accounts: Vec::new(),
+            host: None,
+        };
+        let overview = stats_overview_at(&parts, &history, tiny.now, tiny.offset, &query)
+            .expect("the overview command");
+        assert!(
+            matches!(overview, Page::Empty(_)),
+            "last week holds no record: {overview:?}"
+        );
+        let card = stats_this_week_at(&parts, &history, tiny.now, tiny.offset, &query)
+            .expect("the card command");
+        let running: Vec<(&str, f64)> = card
+            .accounts
+            .iter()
+            .map(|account| (account.id.as_str(), account.used))
+            .collect();
+        assert_eq!(
+            running,
+            vec![
+                (tiny.accounts[0].id.as_str(), 30.0),
+                (tiny.accounts[1].id.as_str(), 40.0)
+            ]
         );
     }
 

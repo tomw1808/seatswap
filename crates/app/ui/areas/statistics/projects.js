@@ -20,6 +20,7 @@ import {
   modelColor,
   modelName,
   percentText,
+  providerName,
   shortDate,
   showTokens,
   tokens,
@@ -59,9 +60,23 @@ function visibleRows(nodes, mode, collapsed) {
   return rows;
 }
 
-// The tree's by-account bar. Every part is in its account's own colour from the
-// snapshot, through the helper the other statistics pages use (`accountView`
-// and `isColor`); an account the snapshot does not know is the muted colour.
+// What a row stands for, in a provider tag's tooltip.
+const NODE_NOUN = { org: "organization", project: "project", folder: "folder" };
+
+// What a provider's part of a row says: its share of the row's API value, and
+// that it has no subscription price (projects.rs values it at API prices and
+// in no Claude account).
+function providerTip(node, name, percent) {
+  const noun = NODE_NOUN[node.kind];
+  if (!noun) throw new Error(`unknown row kind ${JSON.stringify(node.kind)}`);
+  return `${name} · ${percentText(percent)} of this ${noun}'s API value · no subscription price yet`;
+}
+
+// The tree's by-account bar. Every account's part is in its account's own
+// colour from the snapshot, through the helper the other statistics pages use
+// (`accountView` and `isColor`); an account the snapshot does not know is the
+// muted colour. Another provider's part (Codex, Ollama) follows, neutral and
+// faded: it is no account's.
 function splitBar(node, env) {
   const bar = h("span", { class: "stats-split" });
   for (const [id, percent] of node.byAccount) {
@@ -74,6 +89,15 @@ function splitBar(node, env) {
       title: `${name}: ${percentText(percent)}`,
     });
     bar.appendChild(part);
+  }
+  for (const [name, percent] of node.byProvider) {
+    bar.appendChild(
+      h("i", {
+        class: "stats-split-provider",
+        style: { width: `${Math.min(100, Math.max(0, percent))}%` },
+        title: providerTip(node, name, percent),
+      })
+    );
   }
   return bar;
 }
@@ -217,6 +241,9 @@ export async function show(container, env) {
         if (node.orgAccounts.length === 0) {
           nameCell.appendChild(h("span", { class: "stats-tree-none", text: "· no organization" }));
         }
+      }
+      for (const [name, percent] of node.byProvider) {
+        nameCell.appendChild(providerName(name, providerTip(node, name, percent)));
       }
       row.appendChild(nameCell);
 

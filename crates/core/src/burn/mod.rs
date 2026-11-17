@@ -14,8 +14,15 @@ pub mod replay;
 pub mod tied;
 
 /// An account's rates are known from this much work on it (spec §2.3, "while
-/// learning").
+/// learning"). An assumed rate counts as this much work, too: it weighs as
+/// much as this many work units of the account's own measurement.
 pub const LEARN_MIN_WU: f64 = 20.0;
+/// The assumed weekly percent per work unit of a plan with capacity 1 (spec
+/// §2.3, "assumed rates"): a plan of capacity `n` (its tier ends in `_<n>x`)
+/// is assumed at this divided by `n`. Taken from a measurement on 2026-11-18:
+/// an Ultra account (`max_20x`) at 0.0618 % per work unit over 14 days of a
+/// heavy Claude Code user.
+pub const ASSUMED_WEEK_PERCENT_PER_WU: f64 = 1.235;
 /// The rhythm averages this many weeks; the newer two count double.
 pub const RHYTHM_WEEKS: i64 = 4;
 /// Rates are learned from the samples of this many days.

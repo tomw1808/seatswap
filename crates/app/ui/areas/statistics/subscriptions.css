@@ -80,13 +80,8 @@
   border-radius: 4px;
 }
 
-.stats-gantt-tick {
-  position: absolute;
-  top: 0;
-  transform: translateX(-50%);
-  font-size: 9px;
+.stats-gantt-axis .chart-axis-label {
   line-height: 14px;
-  white-space: nowrap;
 }
 
 .stats-sub-rows-body {

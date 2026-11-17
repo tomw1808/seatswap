@@ -60,6 +60,8 @@ const state = {
   historyBytes: null,
   hostError: null,
   choiceError: null,
+  // A frame question of `refreshNewInstall` is under way.
+  frameAsked: false,
   range: "thisWeek",
   excluded: new Set(),
   host: "*",
@@ -75,6 +77,31 @@ function emptyRangeText(recordingSince) {
   if (typeof recordingSince !== "string" || recordingSince === "") return "Nothing recorded yet.";
   if (Number.isNaN(Date.parse(recordingSince))) return "Nothing recorded yet.";
   return `Nothing recorded yet. seatswap has been recording since ${dateText(recordingSince)}.`;
+}
+
+// A new install: a history with no reading and no switch yet (the frame's
+// `historyStart` is null). Every page would be cards of dashes, so the area
+// shows this one note in place of the page instead. A history of accounts that
+// were all removed since stays on show. A frame that could not be read is not a
+// new install: its banner stands.
+function newInstall() {
+  if (state.hostError !== null || state.historyBytes === null) return false;
+  return state.historyStart === null;
+}
+
+function newInstallNote() {
+  const first =
+    state.accounts.length === 0
+      ? "Save your first account in the pop-up. Statistics start with its first usage reading."
+      : "Statistics start with the first usage reading, which comes with the next usage poll.";
+  return h("div", { class: "stats-fresh" }, [
+    h("p", { class: "stats-fresh-title", text: "No statistics yet" }),
+    h("p", { class: "stats-fresh-text", text: first }),
+    h("p", {
+      class: "stats-fresh-text",
+      text: "Then Activity and Rhythm fill in as you work, the weekly numbers once a first weekly window has ended.",
+    }),
+  ]);
 }
 
 class EmptyRange extends Error {
@@ -372,11 +399,19 @@ function open(tab) {
 // the commands
 // ---------------------------------------------------------------------------
 
-async function call(command, extra) {
+// A command's reply as it comes, asked with the page's query: for a command
+// that never says "nothing recorded" (the Overview's This-week card).
+async function ask(command, extra) {
   const args = { query: state.query };
   if (isObject(extra)) Object.assign(args, extra);
   const reply = await state.context.invoke(command, args);
   if (!isObject(reply)) throw new Error(`${command} returned an unexpected reply`);
+  return reply;
+}
+
+// A page command's data; a range with no record is the error EmptyRange.
+async function call(command, extra) {
+  const reply = await ask(command, extra);
   if (Object.prototype.hasOwnProperty.call(reply, "empty")) {
     const empty = isObject(reply.empty) ? reply.empty : {};
     throw new EmptyRange(empty.recordingSince === undefined ? null : empty.recordingSince);
@@ -442,6 +477,12 @@ async function loadPage() {
   showHostError();
   showChoiceError();
 
+  if (newInstall()) {
+    clear(state.pageHost);
+    state.pageHost.appendChild(newInstallNote());
+    return;
+  }
+
   let module;
   try {
     module = await import(`./statistics/${state.page}.js`);
@@ -458,6 +499,7 @@ async function loadPage() {
   const env = {
     query: state.query,
     call,
+    ask,
     accounts: chosenAccounts(),
     open,
     currency: pageCurrency(),
@@ -564,6 +606,23 @@ export async function render(container, context) {
   await loadPage();
 }
 
+// While the area shows the new-install note, every snapshot asks the frame
+// again: the first reading or the first saved account ends the note without
+// leaving the area. One question at a time.
+async function refreshNewInstall() {
+  if (state.frameAsked || !newInstall()) return;
+  state.frameAsked = true;
+  const token = state.loadToken;
+  try {
+    await loadFrame();
+  } finally {
+    state.frameAsked = false;
+  }
+  if (!state.active || token !== state.loadToken) return;
+  renderFrame();
+  if (!newInstall()) await loadPage();
+}
+
 export function update(snapshot) {
   if (!state.active || !isObject(snapshot)) return;
   state.snapshot = snapshot;
@@ -577,10 +636,11 @@ export function update(snapshot) {
     state.query = buildQuery();
     renderFrame();
     void loadPage();
-    return;
+  } else {
+    state.accounts = nextAccounts;
+    renderFrame();
   }
-  state.accounts = nextAccounts;
-  renderFrame();
+  void refreshNewInstall();
 }
 
 export function unmount() {

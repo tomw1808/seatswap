@@ -43,12 +43,14 @@ pub(crate) struct BurnView {
     pub paused_until: Option<DateTime<Utc>>,
     pub early: bool,
     pub why: String,
-    pub learning: Vec<String>,
     pub line: Option<Vec<BurnPart>>,
     /// The first future use of each account auto-burn may switch to.
     pub planned: BTreeMap<String, DateTime<Utc>>,
     pub waiting: Option<WaitingSwitch>,
     pub suggestion: Option<SwitchSuggestion>,
+    /// The accounts auto-burn waits a first reading of, in account order; empty
+    /// otherwise. The Forecast page names them while it has no plan.
+    pub unread: Vec<String>,
     /// What auto-burn has measured so far (spec §2.13); `None` while there is
     /// no situation to measure.
     pub measured: Option<Measured>,
@@ -64,11 +66,11 @@ impl Default for BurnView {
             paused_until: None,
             early: false,
             why: String::new(),
-            learning: Vec::new(),
             line: None,
             planned: BTreeMap::new(),
             waiting: None,
             suggestion: None,
+            unread: Vec::new(),
             measured: None,
             manual_hold_h: MANUAL_HOLD_H,
         }
@@ -276,11 +278,12 @@ impl BurnRuntime {
         let situation = match readiness {
             Readiness::Ready(situation) => situation,
             Readiness::Unread { accounts } => {
-                let mut view = waiting_view(tick.settings, accounts.clone());
+                let mut view = waiting_view(tick.settings);
                 match burn_text::unread_line(tick.views, &accounts) {
                     Ok(line) => view.line = Some(line),
                     Err(error) => append_error(&mut report, text_error(error)),
                 }
+                view.unread = accounts;
                 self.view = Some(view.clone());
                 report.view = Some(view);
                 // The same behaviour as `Decision::Stale`: poll, never switch.
@@ -291,8 +294,8 @@ impl BurnRuntime {
                 return report;
             }
             Readiness::NoAccounts => {
-                let mut view = waiting_view(tick.settings, Vec::new());
-                view.line = Some(burn_text::no_accounts_line());
+                let mut view = waiting_view(tick.settings);
+                view.line = Some(burn_text::no_accounts_line(tick.accounts));
                 self.view = Some(view.clone());
                 report.view = Some(view);
                 if let Some(error) = self.clear_next(tick.app) {
@@ -543,15 +546,8 @@ impl BurnRuntime {
         offset: FixedOffset,
     ) -> BurnReport {
         let active = situation.inputs.active.as_deref();
-        let learning: Vec<String> = situation
-            .inputs
-            .accounts
-            .iter()
-            .filter(|account| account.may_use && !rates_known(account))
-            .map(|account| account.id.clone())
-            .collect();
         let mut report = BurnReport::default();
-        let line = match burn_text::line(plan, active, views, &learning, now) {
+        let line = match burn_text::line(plan, active, views, now) {
             Ok(line) => line,
             Err(error) => {
                 report.error = Some(text_error(error));
@@ -566,11 +562,11 @@ impl BurnRuntime {
                 .filter(|until| *until > now),
             early: regime.early,
             why: burn_text::why(regime.why).to_string(),
-            learning: learning.clone(),
             line,
             planned: burn_text::planned(plan, active),
             waiting: None,
             suggestion: None,
+            unread: Vec::new(),
             measured: Some(measured(situation, regime)),
             manual_hold_h: MANUAL_HOLD_H,
         };
@@ -742,17 +738,17 @@ fn newest_switch_target(learned: &Learned, now: DateTime<Utc>) -> Option<&Accoun
 
 /// A view with no decision behind it: the strip keeps its switch and Pause and
 /// shows `line` (spec §7.4.6's unread and no-account cases).
-fn waiting_view(settings: &Settings, learning: Vec<String>) -> BurnView {
+fn waiting_view(settings: &Settings) -> BurnView {
     BurnView {
         on: settings.auto_burn,
         paused_until: None,
         early: false,
         why: burn_text::why(RegimeWhy::Learning).to_string(),
-        learning,
         line: None,
         planned: BTreeMap::new(),
         waiting: None,
         suggestion: None,
+        unread: Vec::new(),
         measured: None,
         manual_hold_h: MANUAL_HOLD_H,
     }
@@ -1739,7 +1735,7 @@ mod tests {
             view("pr", "PR", 20.0, false, now - Duration::minutes(1)),
             view("ac", "AC", 80.0, true, now - Duration::minutes(1)),
         ];
-        let line = burn_text::line(&plan(now), Some("pr"), &views, &[], now)
+        let line = burn_text::line(&plan(now), Some("pr"), &views, now)
             .expect("a line")
             .expect("a next account");
         assert_eq!(
@@ -2093,6 +2089,57 @@ mod tests {
             burn_text::plain(view.line.as_deref().expect("a line")),
             "Waiting for a first reading of LB, AC.",
             "the strip names the unread accounts in account order"
+        );
+        assert_eq!(
+            view.unread,
+            vec!["lb".to_string(), "ac".to_string()],
+            "the Forecast page names the same accounts"
+        );
+        assert!(report.forecast.is_none(), "no plan without every reading");
+    }
+
+    /// A new install has no stored account: the strip asks for the first one
+    /// instead of saying that no login works. Stored accounts whose logins all
+    /// ended keep the old line.
+    #[test]
+    fn no_stored_account_asks_for_one() {
+        let now = utc("2026-11-10T12:00:00Z");
+        let tmp = tempfile::tempdir().expect("a temp folder");
+        let history = HistoryDir::at(tmp.path(), "atlas");
+        let app = AppPaths::at(tmp.path());
+        let settings = Settings::default();
+        let line_for = |accounts: &[Account], views: &[AccountView]| {
+            let (mut runtime, _action, _engine) = runtime();
+            let tick = BurnTick {
+                app: &app,
+                history: Some(&history),
+                views,
+                accounts,
+                settings: &settings,
+                active: None,
+                now,
+                offset: offset(),
+                tied_busy: 0,
+                thinking: &[],
+            };
+            let report = runtime.after_snapshot(&tick);
+            assert!(report.forecast.is_none(), "no account, no plan");
+            let view = report.view.expect("the strip stays");
+            assert!(view.unread.is_empty(), "no account waits for a reading");
+            burn_text::plain(view.line.as_deref().expect("a line"))
+        };
+
+        assert_eq!(line_for(&[], &[]), "Save an account to start.");
+
+        let mut lb = account("lb", "LB", PR_ACC, true);
+        lb.login_state = LoginState::LoggedOut;
+        let mut lb_view = view("lb", "LB", 20.0, false, now);
+        lb_view.login_state = LoginState::LoggedOut;
+        lb_view.usage = None;
+        lb_view.fetched_at = None;
+        assert_eq!(
+            line_for(&[lb], &[lb_view]),
+            "No account auto-burn may use has a working login."
         );
     }
 

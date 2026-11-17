@@ -10,7 +10,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -44,30 +44,67 @@ pub enum WatchError {
     },
 }
 
+/// Whether the login watch sees Claude Code's folders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchState {
+    /// Every folder that holds a login file exists and is watched.
+    Watching,
+    /// A folder that holds a login file does not exist yet: Claude Code has not
+    /// been set up on this machine. The nearest existing parent is watched for
+    /// it, so the folder and a later login are noticed without a restart.
+    NotSetUp,
+    /// The folders changed in a way the watch cannot follow (a path that is not
+    /// a folder, one that cannot be read, a watch the system refused). The text
+    /// says which path and why; a later change that fixes it ends this state.
+    Failed(String),
+}
+
 /// Notices changes to the live login. Dropping it stops the watcher thread and
 /// joins it, so no callback runs after `drop` returned.
 pub struct Watcher {
-    backend: Option<RecommendedWatcher>,
+    /// Shared with the thread, which moves the watches when a folder appears
+    /// or goes away; `None` once dropped.
+    backend: Arc<Mutex<Option<RecommendedWatcher>>>,
+    state: Arc<Mutex<WatchState>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+}
+
+impl Watcher {
+    /// Whether the login folders exist and are watched (see [`WatchState`]).
+    pub fn state(&self) -> WatchState {
+        lock(&self.state).clone()
+    }
 }
 
 impl Drop for Watcher {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         // Dropping the backend closes the channel, so an idle thread wakes at once.
-        drop(self.backend.take());
+        let backend = lock(&self.backend).take();
+        drop(backend);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
     }
 }
 
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Watch the folders that hold the credentials file and the identity file.
 /// Both are watched non-recursively (the files are replaced by rename); a folder
 /// that is the same for both files is watched once. Events for other file names,
-/// and pure read-access events, are ignored. A missing folder is an error; no
-/// folder is created.
+/// and pure read-access events, are ignored.
+///
+/// A missing folder is not an error: Claude Code has not been set up yet
+/// ([`WatchState::NotSetUp`]). Its nearest existing parent is watched instead,
+/// and when the folder appears the watch moves to it and `on_change` is called
+/// (files written before the new watch took hold are then read by the
+/// callback). A folder that goes away moves the watch back up the same way.
+/// No folder is created. A path that exists but is not a folder, or that
+/// cannot be read, is an error.
 pub fn watch(
     claude: &ClaudePaths,
     on_change: impl Fn() + Send + 'static,
@@ -83,22 +120,39 @@ pub fn watch(
             folders.push(folder.to_path_buf());
         }
     }
-    for folder in &folders {
-        ensure_folder(folder)?;
-    }
 
     let (events, received) = mpsc::channel();
     let mut backend = RecommendedWatcher::new(events, notify::Config::default())?;
-    for folder in &folders {
-        backend.watch(folder, RecursiveMode::NonRecursive)?;
-    }
+    let mut watched = Vec::new();
+    let set_up = follow_folders(&mut backend, &mut watched, &folders)?;
+    let state = Arc::new(Mutex::new(if set_up {
+        WatchState::Watching
+    } else {
+        WatchState::NotSetUp
+    }));
+    let backend = Arc::new(Mutex::new(Some(backend)));
 
     let stop = Arc::new(AtomicBool::new(false));
+    let layout = Layout {
+        folders,
+        watched,
+        backend: Arc::clone(&backend),
+        state: Arc::clone(&state),
+    };
     let thread_stop = Arc::clone(&stop);
     let thread_paths = claude.clone();
     let spawned = thread::Builder::new()
         .name("seatswap-watcher".to_string())
-        .spawn(move || run(received, thread_stop, thread_paths, names, on_change));
+        .spawn(move || {
+            run(
+                received,
+                thread_stop,
+                thread_paths,
+                names,
+                layout,
+                on_change,
+            )
+        });
     let thread = match spawned {
         Ok(thread) => thread,
         Err(source) => {
@@ -110,10 +164,153 @@ pub fn watch(
     };
 
     Ok(Watcher {
-        backend: Some(backend),
+        backend,
+        state,
         stop,
         thread: Some(thread),
     })
+}
+
+/// Where the login watch looks: the folders that hold the login files, the
+/// paths watched for them now (each folder, or its nearest existing parent while
+/// it is missing), and the state the GUI reads.
+struct Layout {
+    folders: Vec<PathBuf>,
+    watched: Vec<PathBuf>,
+    backend: Arc<Mutex<Option<RecommendedWatcher>>>,
+    state: Arc<Mutex<WatchState>>,
+}
+
+impl Layout {
+    /// An event about one of the login folders or a parent of one may have
+    /// created, removed or renamed it.
+    fn touches(&self, event: &Event) -> bool {
+        event
+            .paths
+            .iter()
+            .any(|path| self.folders.iter().any(|folder| folder.starts_with(path)))
+    }
+
+    /// Plan the watches again after such an event. Returns true when the
+    /// watched paths or the state changed: the login may have changed with them.
+    fn follow(&mut self) -> bool {
+        let before = self.watched.clone();
+        let state = {
+            let mut backend = lock(&self.backend);
+            let Some(backend) = backend.as_mut() else {
+                return false;
+            };
+            match follow_folders(backend, &mut self.watched, &self.folders) {
+                Ok(true) => WatchState::Watching,
+                Ok(false) => WatchState::NotSetUp,
+                Err(error) => WatchState::Failed(error.to_string()),
+            }
+        };
+        let mut current = lock(&self.state);
+        let changed = *current != state || !same_paths(&before, &self.watched);
+        *current = state;
+        changed
+    }
+}
+
+/// The path to watch for `folder`: the folder itself when it exists, else its
+/// nearest existing parent. The flag says whether the folder itself exists. A
+/// path on the way that exists but is not a folder, or cannot be read, is an
+/// error.
+fn watch_point(folder: &Path) -> Result<(PathBuf, bool), WatchError> {
+    let mut candidate = folder;
+    loop {
+        match fs::metadata(candidate) {
+            Ok(metadata) if metadata.is_dir() => {
+                return Ok((candidate.to_path_buf(), candidate == folder));
+            }
+            Ok(_) => {
+                return Err(WatchError::Io {
+                    path: candidate.to_path_buf(),
+                    source: io::Error::other("not a folder"),
+                });
+            }
+            // "Not a directory" means a parent is a file: walking up finds it
+            // and names it.
+            Err(source)
+                if matches!(
+                    source.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                candidate = match candidate.parent() {
+                    Some(parent) if !parent.as_os_str().is_empty() => parent,
+                    _ => {
+                        return Err(WatchError::Io {
+                            path: folder.to_path_buf(),
+                            source,
+                        })
+                    }
+                };
+            }
+            Err(source) => {
+                return Err(WatchError::Io {
+                    path: candidate.to_path_buf(),
+                    source,
+                });
+            }
+        }
+    }
+}
+
+/// The same paths, in any order (neither list holds a path twice).
+fn same_paths(a: &[PathBuf], b: &[PathBuf]) -> bool {
+    a.len() == b.len() && a.iter().all(|path| b.contains(path))
+}
+
+/// Bring the backend's watches in line with the folders as they are now, and
+/// say whether every folder exists. New watches are added before old ones are
+/// removed, and the plan is checked again afterwards, so a folder that appears
+/// in between is still followed.
+fn follow_folders(
+    backend: &mut RecommendedWatcher,
+    watched: &mut Vec<PathBuf>,
+    folders: &[PathBuf],
+) -> Result<bool, WatchError> {
+    loop {
+        let mut wanted: Vec<PathBuf> = Vec::new();
+        let mut set_up = true;
+        for folder in folders {
+            let (point, present) = watch_point(folder)?;
+            set_up &= present;
+            if !wanted.contains(&point) {
+                wanted.push(point);
+            }
+        }
+        if same_paths(&wanted, watched) {
+            return Ok(set_up);
+        }
+        for path in &wanted {
+            if watched.contains(path) {
+                continue;
+            }
+            if let Err(error) = backend.watch(path, RecursiveMode::NonRecursive) {
+                // The folder went away between the check and the watch: plan
+                // again. Any other refusal is the error.
+                if path.is_dir() {
+                    return Err(error.into());
+                }
+                continue;
+            }
+            watched.push(path.clone());
+        }
+        let gone: Vec<PathBuf> = watched
+            .iter()
+            .filter(|path| !wanted.contains(path))
+            .cloned()
+            .collect();
+        for path in gone {
+            // A folder that was removed has lost its watch already, so the
+            // system's answer here says nothing new.
+            let _ = backend.unwatch(&path);
+            watched.retain(|kept| *kept != path);
+        }
+    }
 }
 
 fn ensure_folder(path: &Path) -> Result<(), WatchError> {
@@ -215,12 +412,19 @@ fn run(
     stop: Arc<AtomicBool>,
     claude: ClaudePaths,
     names: WatchedNames,
+    mut layout: Layout,
     on_change: impl Fn() + Send + 'static,
 ) {
     run_debounced(
         events,
         stop,
-        |event| names.is_change(event),
+        |event| {
+            // A login folder that appeared or went away counts as a change:
+            // login files written before the new watch took hold are read by
+            // the callback.
+            let moved = !is_read_access(&event.kind) && layout.touches(event) && layout.follow();
+            moved || names.is_change(event)
+        },
         || !locks::claude_locks_busy(&claude),
         None,
         on_change,
@@ -294,7 +498,7 @@ pub fn watch_folder(
 fn run_debounced(
     events: Receiver<notify::Result<Event>>,
     stop: Arc<AtomicBool>,
-    is_change: impl Fn(&Event) -> bool,
+    mut is_change: impl FnMut(&Event) -> bool,
     ready: impl Fn() -> bool,
     max_wait: Option<Duration>,
     on_change: impl Fn(),
@@ -530,12 +734,131 @@ mod tests {
         drop(watcher);
     }
 
+    /// Wait for at least one call, then for the burst to end.
+    fn expect_some(received: &Receiver<()>, what: &str) {
+        received
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap_or_else(|_| panic!("on_change was not called after {what}"));
+        while received.recv_timeout(Duration::from_millis(1200)).is_ok() {}
+    }
+
     #[test]
-    fn missing_config_folder_is_an_error() {
+    fn a_missing_config_folder_is_not_set_up_and_noticed_when_it_appears() {
         let tmp = TempDir::new().unwrap();
-        let missing = tmp.path().join("missing");
-        let paths = ClaudePaths::for_config_dir(&missing, tmp.path());
-        assert!(watch(&paths, || {}).is_err());
+        let config = tmp.path().join("cfg");
+        let paths = ClaudePaths::for_config_dir(&config, tmp.path());
+        let (watcher, _count, received) = watched(&paths);
+        assert_eq!(watcher.state(), WatchState::NotSetUp);
+
+        fs::create_dir(&config).unwrap();
+        expect_some(&received, "the folder appeared");
+        assert_eq!(watcher.state(), WatchState::Watching);
+
+        atomic::write_atomic(&paths.credentials_file, b"{}", atomic::Access::Private).unwrap();
+        expect_some(&received, "the first login was written");
+        drop(watcher);
+    }
+
+    #[test]
+    fn claude_codes_first_start_in_the_home_layout_is_noticed() {
+        let tmp = TempDir::new().unwrap();
+        let paths = ClaudePaths::for_config_dir(&tmp.path().join(".claude"), tmp.path());
+        let (watcher, _count, received) = watched(&paths);
+        assert_eq!(watcher.state(), WatchState::NotSetUp);
+
+        // Claude Code creates the folder and writes the login right after:
+        // the file may land before the new watch holds, and is still noticed.
+        fs::create_dir(&paths.config_dir).unwrap();
+        atomic::write_atomic(&paths.credentials_file, b"{}", atomic::Access::Private).unwrap();
+        atomic::write_atomic(&paths.identity_file, b"{}", atomic::Access::Private).unwrap();
+        expect_some(&received, "the folder and the login appeared");
+        assert_eq!(watcher.state(), WatchState::Watching);
+        drop(watcher);
+    }
+
+    #[test]
+    fn a_folder_several_levels_down_is_followed() {
+        let tmp = TempDir::new().unwrap();
+        let config = tmp.path().join("work").join("claude").join("cfg");
+        let paths = ClaudePaths::for_config_dir(&config, tmp.path());
+        let (watcher, _count, received) = watched(&paths);
+        assert_eq!(watcher.state(), WatchState::NotSetUp);
+
+        fs::create_dir_all(&config).unwrap();
+        expect_some(&received, "the folders appeared");
+        assert_eq!(watcher.state(), WatchState::Watching);
+
+        atomic::write_atomic(&paths.credentials_file, b"{}", atomic::Access::Private).unwrap();
+        expect_some(&received, "the login was written");
+        drop(watcher);
+    }
+
+    #[test]
+    fn a_removed_folder_is_followed_back_up_and_down() {
+        let tmp = TempDir::new().unwrap();
+        let paths = config_paths(&tmp);
+        let (watcher, _count, received) = watched(&paths);
+        assert_eq!(watcher.state(), WatchState::Watching);
+
+        fs::remove_dir(&paths.config_dir).unwrap();
+        expect_some(&received, "the folder was removed");
+        assert_eq!(watcher.state(), WatchState::NotSetUp);
+
+        fs::create_dir(&paths.config_dir).unwrap();
+        expect_some(&received, "the folder came back");
+        assert_eq!(watcher.state(), WatchState::Watching);
+        atomic::write_atomic(&paths.credentials_file, b"{}", atomic::Access::Private).unwrap();
+        expect_some(&received, "the login was written again");
+        drop(watcher);
+    }
+
+    #[test]
+    fn a_config_path_that_is_a_file_is_an_error() {
+        let tmp = TempDir::new().unwrap();
+        let config = tmp.path().join("cfg");
+        fs::write(&config, b"").unwrap();
+        let paths = ClaudePaths::for_config_dir(&config, tmp.path());
+        let error = watch(&paths, || {})
+            .err()
+            .expect("a file is not a config folder");
+        assert_eq!(
+            error.to_string(),
+            format!("{}: not a folder", config.display())
+        );
+
+        // A file on the way to the folder can never become it either.
+        let below = ClaudePaths::for_config_dir(&config.join("inner"), tmp.path());
+        let error = watch(&below, || {})
+            .err()
+            .expect("a file is not a parent folder");
+        assert_eq!(
+            error.to_string(),
+            format!("{}: not a folder", config.display())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_config_folder_that_cannot_be_read_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let closed = tmp.path().join("closed");
+        fs::create_dir(&closed).unwrap();
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o000)).unwrap();
+        let config = closed.join("cfg");
+        let paths = ClaudePaths::for_config_dir(&config, tmp.path());
+        let result = watch(&paths, || {});
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o700)).unwrap();
+        let error = result
+            .err()
+            .expect("a folder behind a closed one cannot be checked");
+        assert!(
+            error
+                .to_string()
+                .starts_with(&format!("{}: ", config.display())),
+            "the error names the path: {error}"
+        );
+        assert!(error.to_string().contains("ermission denied"), "{error}");
     }
 
     #[test]

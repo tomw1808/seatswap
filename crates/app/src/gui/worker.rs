@@ -47,7 +47,7 @@ use seatswap_core::types::Login;
 
 use super::autostart;
 use super::burn_rt::{BurnRuntime, BurnTick, KeptForecast};
-use super::lookup_rt::{self, LookupHandle, MoneyView};
+use super::lookup_rt::{self, LookupClient, LookupHandle, MoneyView};
 use super::notify;
 use super::providers_rt::{self, ProviderView, ProvidersClient, ProvidersHandle};
 use super::sessions_rt::{self, SessionsHandle};
@@ -125,6 +125,10 @@ pub(crate) struct Snapshot {
     /// Claude Code's config folder as the app runs with it, with `~` for the
     /// home folder. The General group shows it as the empty field's placeholder.
     pub claude_config_dir: String,
+    /// Claude Code's folder does not exist yet (it was never run on this
+    /// machine). The pop-up says so calmly instead of an error; the GUI sets it
+    /// from the login watch (`watcher::WatchState::NotSetUp`).
+    pub claude_not_set_up: bool,
 }
 
 /// One stored account as the Accounts group shows it. `loginDaysLeft` comes
@@ -221,6 +225,7 @@ impl Snapshot {
             providers: Vec::new(),
             settings,
             claude_config_dir: String::new(),
+            claude_not_set_up: false,
         }
     }
 
@@ -491,6 +496,7 @@ pub(crate) fn spawn(
         )?),
         None => None,
     };
+    let lookup_client = lookup.as_ref().map(LookupHandle::client);
     let latest = sessions
         .as_ref()
         .map(SessionsHandle::latest)
@@ -512,6 +518,7 @@ pub(crate) fn spawn(
             )
             .with_sessions(latest)
             .with_providers(providers_client)
+            .with_lookup(lookup_client)
             .run(action_rx)
         })
         .map_err(|error| format!("cannot start the action thread: {error}"))?;
@@ -531,7 +538,7 @@ pub(crate) fn spawn(
 // Engine thread
 
 /// Join two error texts without losing either.
-fn combine(first: Option<String>, second: String) -> Option<String> {
+pub(crate) fn combine(first: Option<String>, second: String) -> Option<String> {
     Some(match first {
         Some(first) => format!("{first}; {second}"),
         None => second,
@@ -619,6 +626,7 @@ pub(crate) fn build_snapshot(parts: SnapshotParts) -> Snapshot {
         providers: Vec::new(),
         settings,
         claude_config_dir: parts.claude_config_dir,
+        claude_not_set_up: false,
     }
 }
 
@@ -861,10 +869,7 @@ impl EngineRuntime {
                     .secrets_warning
                     .or_else(|| self.secrets_warning.clone());
                 if let Some(notice) = opened.notice {
-                    self.notice = Some(match self.notice.take() {
-                        Some(previous) => format!("{previous}; {notice}"),
-                        None => notice,
-                    });
+                    self.notice = combine(self.notice.take(), notice);
                 }
                 self.open_error = None;
                 self.write_live_once();
@@ -1192,8 +1197,11 @@ struct ActionRuntime {
     /// The recorder, or the sentence that says why there is none.
     history: Result<Recorder, String>,
     latest_sessions: Arc<Mutex<Option<SessionsSummary>>>,
-    /// The provider thread's commands; every settings save tells it.
+    /// The provider thread's commands; every settings change tells it.
     providers: Option<ProvidersClient>,
+    /// The look-up thread's commands; every settings change tells it, so a
+    /// new currency gets its rate at once.
+    lookup: Option<LookupClient>,
     /// The last account seen live, so an external switch has a `from`.
     live: Option<AccountRef>,
     /// The one set of history read warnings this run has printed, so a torn
@@ -1229,6 +1237,7 @@ impl ActionRuntime {
             history,
             latest_sessions: Arc::new(Mutex::new(None)),
             providers: None,
+            lookup: None,
             live,
             printed_warnings,
             reported_errors,
@@ -1243,6 +1252,22 @@ impl ActionRuntime {
     fn with_providers(mut self, providers: Option<ProvidersClient>) -> ActionRuntime {
         self.providers = providers;
         self
+    }
+
+    fn with_lookup(mut self, lookup: Option<LookupClient>) -> ActionRuntime {
+        self.lookup = lookup;
+        self
+    }
+
+    /// The settings changed, by a save here or by a shared setting from
+    /// another host: the threads that read them act at once.
+    fn settings_changed(&self) {
+        if let Some(providers) = &self.providers {
+            let _ = providers.settings_saved();
+        }
+        if let Some(lookup) = &self.lookup {
+            let _ = lookup.settings_saved();
+        }
     }
 
     fn recorder(&self) -> Result<&Recorder, String> {
@@ -1511,6 +1536,9 @@ impl ActionRuntime {
         match shared::sync(store, recorder, Utc::now()) {
             Ok(applied) => {
                 super::lock(&self.printed_warnings).print(&applied.warnings);
+                if !applied.settings.is_empty() {
+                    self.settings_changed();
+                }
                 if applied.changed() {
                     let _ = self.engine.send(EngineCommand::Publish);
                 }
@@ -1634,9 +1662,7 @@ impl ActionRuntime {
         let warning = autostart::apply_autostart(settings.start_at_login, &self.autostart_args)
             .err()
             .map(|error| autostart_failure_message(&error));
-        if let Some(providers) = &self.providers {
-            let _ = providers.settings_saved();
-        }
+        self.settings_changed();
         let _ = self.engine.send(EngineCommand::Publish);
         ActionReply::Saved(SavedSetting { settings, warning })
     }
@@ -2271,6 +2297,7 @@ mod tests {
                 "activeId",
                 "burn",
                 "claudeConfigDir",
+                "claudeNotSetUp",
                 "error",
                 "lastPollAt",
                 "live",
@@ -2750,7 +2777,7 @@ mod tests {
             fixture.app.clone(),
             Box::new(FileSecrets::new(fixture.app.secrets_dir())),
         );
-        // The stored plan is stale; the live login's tier says "Team 5x".
+        // The stored plan is stale; the live login's tier says "Team Premium".
         let mut file = store.load().expect("accounts");
         file.accounts[0].plan = Some("Team".to_string());
         store.save(&file).expect("the stale plan is stored");
@@ -2770,7 +2797,7 @@ mod tests {
 
         assert_eq!(
             store.load().expect("accounts").accounts[0].plan.as_deref(),
-            Some("Team 5x"),
+            Some("Team Premium"),
             "the plan of the account is the login's"
         );
 

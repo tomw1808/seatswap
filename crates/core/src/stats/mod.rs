@@ -17,7 +17,9 @@ use crate::history::{
     Sample, SessionRecord, TokenRecord, UpRecord, WindowRecord,
 };
 use crate::live_sessions::Values;
-use crate::money::{window_money, Fx, Missing, MoneyError, Prices, Valuer, WindowMoney};
+use crate::money::{
+    window_money, Fx, Missing, MoneyError, Prices, Provider, Valued, Valuer, WindowMoney,
+};
 use crate::projects::{Projects, ProjectsLogRecord};
 use crate::store::{Account, Settings};
 
@@ -169,7 +171,7 @@ pub fn range_of<Tz: TimeZone + Copy>(key: RangeKey, ctx: &Ctx<Tz>) -> Result<Ran
 fn local_start<Tz: TimeZone>(zone: &Tz, local: NaiveDateTime) -> DateTime<Utc> {
     match zone.from_local_datetime(&local) {
         MappedLocalTime::Single(at) => at.with_timezone(&Utc),
-        MappedLocalTime::Ambiguous(earlier, _) => earlier.with_timezone(&Utc),
+        MappedLocalTime::Ambiguous(a, b) => fold(a, b).0,
         MappedLocalTime::None => {
             // The gap holds no instant. The first local clock second that
             // exists again is the gap's end, which is the first instant after
@@ -179,13 +181,24 @@ fn local_start<Tz: TimeZone>(zone: &Tz, local: NaiveDateTime) -> DateTime<Utc> {
                 after += Duration::seconds(1);
                 match zone.from_local_datetime(&after) {
                     MappedLocalTime::Single(at) => return at.with_timezone(&Utc),
-                    MappedLocalTime::Ambiguous(earlier, _) => {
-                        return earlier.with_timezone(&Utc);
-                    }
+                    MappedLocalTime::Ambiguous(a, b) => return fold(a, b).0,
                     MappedLocalTime::None => {}
                 }
             }
         }
+    }
+}
+
+/// The two instants of a local time that exists twice, earlier first. chrono
+/// does not keep one order: its `Local` on Linux names the later instant first
+/// (seen with chrono 0.4.45 in Europe/Vienna on 25 Oct 2026), so every caller
+/// orders them here instead of trusting the order of `Ambiguous`.
+fn fold<Tz: TimeZone>(a: DateTime<Tz>, b: DateTime<Tz>) -> (DateTime<Utc>, DateTime<Utc>) {
+    let (a, b) = (a.with_timezone(&Utc), b.with_timezone(&Utc));
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
     }
 }
 
@@ -200,12 +213,12 @@ pub(crate) fn local_hour_start<Tz: TimeZone + Copy>(t: DateTime<Utc>, zone: &Tz)
     let wall = local.naive_local() - into_hour;
     match zone.from_local_datetime(&wall) {
         MappedLocalTime::Single(start) => start.with_timezone(&Utc),
-        MappedLocalTime::Ambiguous(earlier, later) => {
-            let later = later.with_timezone(&Utc);
+        MappedLocalTime::Ambiguous(a, b) => {
+            let (earlier, later) = fold(a, b);
             if t >= later {
                 later
             } else {
-                earlier.with_timezone(&Utc)
+                earlier
             }
         }
         MappedLocalTime::None => local_start(zone, wall),
@@ -306,15 +319,19 @@ pub fn frame(history: &HistoryDir) -> Result<StatsFrame, StatsError> {
     })
 }
 
-/// One finished weekly window, put into the calendar week its midpoint falls in.
+/// The weekly windows of one account whose midpoints fall in one calendar week.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountWeek {
     pub week: DateTime<Utc>,
     pub account: AccountRef,
-    /// Every finished weekly window of the account whose midpoint falls in
-    /// this calendar week, oldest end first.
+    /// Every weekly window of the account whose midpoint falls in this
+    /// calendar week, oldest end first: the finished ones, and with
+    /// [`account_weeks_so_far`] the running one last.
     pub windows: Vec<WindowRecord>,
+    /// The last of `windows` is still running ([`Valuer::running_windows`]):
+    /// its use is the use so far and it has expired nothing yet.
+    pub running: bool,
     /// The last of `windows`: the window whose end, lost percent and plan the
     /// week shows.
     pub window: WindowRecord,
@@ -398,26 +415,160 @@ pub(crate) fn account_weeks_valued<Tz: TimeZone + Copy>(
     q: &Query,
     valuer: &Valuer,
 ) -> Result<Vec<AccountWeek>, StatsError> {
-    let mut weeks: Vec<AccountWeek> = Vec::new();
     let windows = keep_warnings(ctx.warnings, || {
         ctx.history
             .finished_claude_windows(&Range::ALL, &Hosts::All)
     })?;
-    for hosted in windows.records {
-        let window = hosted.record;
+    let finished = windows
+        .records
+        .into_iter()
+        .map(|hosted| (hosted.record, false));
+    Ok(weeks_of_windows(ctx, range, q, valuer, finished))
+}
+
+/// [`account_weeks_valued`] with the weekly windows still running at
+/// `ctx.now` ([`Valuer::running_windows`]): each is placed by its midpoint like
+/// a finished window (its end is the known reset, its start seven days
+/// before), so it never moves to another week when it finishes. Its use is
+/// the use so far (`final − from`), it offers one week's price like any window
+/// and it expires nothing ([`week_lost_percent`]); its week is `running`.
+pub(crate) fn account_weeks_so_far<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
+    range: &Range,
+    q: &Query,
+    valuer: &Valuer,
+) -> Result<Vec<AccountWeek>, StatsError> {
+    let windows = keep_warnings(ctx.warnings, || {
+        ctx.history
+            .finished_claude_windows(&Range::ALL, &Hosts::All)
+    })?;
+    let finished = windows
+        .records
+        .into_iter()
+        .map(|hosted| (hosted.record, false));
+    let running = valuer
+        .running_windows(ctx.now)
+        .into_iter()
+        .map(|window| (window, true));
+    Ok(weeks_of_windows(
+        ctx,
+        range,
+        q,
+        valuer,
+        finished.chain(running),
+    ))
+}
+
+/// The chosen accounts' weekly windows still running at `ctx.now`
+/// ([`Valuer::running_windows`]), one account week each, wherever their
+/// midpoint lies: the windows Overview's This-week card shows, whatever range
+/// the page has. Each is priced at its own midpoint like any account week; its
+/// use is the use so far (`final − from`) and it has expired nothing yet.
+pub(crate) fn running_account_weeks<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
+    q: &Query,
+    valuer: &Valuer,
+) -> Vec<AccountWeek> {
+    let running = valuer
+        .running_windows(ctx.now)
+        .into_iter()
+        .map(|window| (window, true));
+    weeks_of_windows(ctx, &Range::ALL, q, valuer, running)
+}
+
+/// What a range that holds now says about the chosen accounts' running weekly
+/// windows that count in a week it does not show: a window counts in the week
+/// of its midpoint, and a running window's midpoint lies within three and a
+/// half days of now, so it can count in last week or in next week. One
+/// sentence per such week, last week first, e.g. `AC's running weekly window
+/// counts in last week, the week that holds its middle.`; empty when the range
+/// does not hold now or every running window counts in one of its weeks.
+pub(crate) fn running_elsewhere<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
+    range: &Range,
+    q: &Query,
+    valuer: &Valuer,
+) -> Vec<String> {
+    if ctx.now < range.from || ctx.now > range.to {
+        return Vec::new();
+    }
+    let this_week = week_start(ctx.now, &ctx.zone);
+    // Last week's and next week's running windows, by account name.
+    let mut before: Vec<String> = Vec::new();
+    let mut after: Vec<String> = Vec::new();
+    for window in valuer.running_windows(ctx.now) {
+        if !account_chosen(ctx, q, Some(&window.account)) {
+            continue;
+        }
+        let Some(midpoint) = window_midpoint(&window) else {
+            continue;
+        };
+        let week = week_start(midpoint, &ctx.zone);
+        let name = account_abbr(ctx, &window.account);
+        if midpoint < range.from && week < this_week {
+            before.push(name);
+        } else if week >= range.to && week > this_week {
+            after.push(name);
+        }
+    }
+    let sentence = |names: &[String], when: &str| match names {
+        [one] => format!(
+            "{one}'s running weekly window counts in {when}, the week that holds its middle."
+        ),
+        _ => format!(
+            "The running weekly windows of {} count in {when}, the week that holds their middle.",
+            join_names(names)
+        ),
+    };
+    let mut sentences = Vec::new();
+    if !before.is_empty() {
+        sentences.push(sentence(&before, "last week"));
+    }
+    if !after.is_empty() {
+        sentences.push(sentence(&after, "next week"));
+    }
+    sentences
+}
+
+/// The account weeks of `windows` (each with whether it still runs): the
+/// weekly_all windows of the chosen accounts whose midpoint lies in the range,
+/// grouped by account and calendar week, oldest end first, each week priced at
+/// its last window.
+fn weeks_of_windows<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
+    range: &Range,
+    q: &Query,
+    valuer: &Valuer,
+    windows: impl IntoIterator<Item = (WindowRecord, bool)>,
+) -> Vec<AccountWeek> {
+    let mut windows: Vec<(WindowRecord, bool)> = windows.into_iter().collect();
+    // A running window ends after every finished one of its account; the
+    // stable sort keeps the finished list's own order (by end, then account).
+    windows.sort_by(|a, b| {
+        a.0.end
+            .cmp(&b.0.end)
+            .then_with(|| a.0.account.cmp(&b.0.account))
+    });
+    let mut weeks: Vec<AccountWeek> = Vec::new();
+    for (window, running) in windows {
         if window.k != LimitKind::WeeklyAll {
             continue;
         }
         let Some(midpoint) = window_midpoint(&window) else {
             continue;
         };
-        if midpoint < range.from || midpoint >= range.to {
+        // The range chooses a window whose midpoint's calendar week is one of
+        // its weeks. A finished window's midpoint lies before now, so for a
+        // range that ends now or on a Monday this is "its midpoint lies in the
+        // range"; a running window's midpoint may still lie ahead in the week
+        // that holds now.
+        let week = week_start(midpoint, &ctx.zone);
+        if midpoint < range.from || week >= range.to {
             continue;
         }
         if !account_chosen(ctx, q, Some(&window.account)) {
             continue;
         }
-        let week = week_start(midpoint, &ctx.zone);
         let used = match window_used(&window) {
             Some(used) => used,
             None => {
@@ -434,6 +585,7 @@ pub(crate) fn account_weeks_valued<Tz: TimeZone + Copy>(
         {
             Some(kept) => {
                 kept.used += used;
+                kept.running = running;
                 kept.window = window.clone();
                 kept.windows.push(window);
             }
@@ -445,6 +597,7 @@ pub(crate) fn account_weeks_valued<Tz: TimeZone + Copy>(
                     account,
                     windows: vec![window],
                     window: last,
+                    running,
                     used,
                     price: None,
                     price_missing: None,
@@ -461,7 +614,7 @@ pub(crate) fn account_weeks_valued<Tz: TimeZone + Copy>(
         week.price = price;
         week.price_missing = price_missing;
     }
-    Ok(weeks)
+    weeks
 }
 
 /// The ids of the accounts with at least one account week without a price:
@@ -638,13 +791,24 @@ pub(crate) fn lost_percent(window: &WindowRecord) -> Result<f64, StatsError> {
 
 /// The share of one account week that expired: every window's `lost` added, so
 /// a week with two ordinary windows counts both. A reset window counts nothing
-/// ([`lost_percent`]).
+/// ([`lost_percent`]), and neither does a running window (the last one of a
+/// `running` week): it has expired nothing yet.
 pub(crate) fn week_lost_percent(week: &AccountWeek) -> Result<f64, StatsError> {
     let mut expired = 0.0;
-    for window in &week.windows {
+    for window in &week.windows[..finished_windows(week)] {
         expired += lost_percent(window)?;
     }
     Ok(expired)
+}
+
+/// How many of an account week's windows have finished: all of them, or all
+/// but the last of a `running` week.
+pub(crate) fn finished_windows(week: &AccountWeek) -> usize {
+    if week.running {
+        week.windows.len().saturating_sub(1)
+    } else {
+        week.windows.len()
+    }
 }
 
 /// The money an account week's windows offered: one week's price for each
@@ -652,6 +816,14 @@ pub(crate) fn week_lost_percent(week: &AccountWeek) -> Result<f64, StatsError> {
 /// divides by this; a week's `paid` itself stays one week's price.
 pub(crate) fn offered_money(week: &AccountWeek, money: &WindowMoney) -> f64 {
     money.paid * week.windows.len() as f64
+}
+
+/// The money an account week's finished windows offered: [`offered_money`]
+/// without a running window. The Expired share divides by this: a running
+/// window has expired nothing yet, and counting its offer would make the share
+/// shrink while it runs.
+pub(crate) fn offered_finished_money(week: &AccountWeek, money: &WindowMoney) -> f64 {
+    money.paid * finished_windows(week) as f64
 }
 
 /// `part` as a percent of `offered`: the one rule of the Used and Expired
@@ -718,6 +890,18 @@ pub(crate) fn account_chosen<Tz: TimeZone + Copy>(
     q.accounts.iter().any(|chosen| chosen == &id)
 }
 
+/// Whether the query chooses a valued token record on a page of project work:
+/// a Claude record by its account ([`account_chosen`], so a Claude record
+/// without a known account is left out by a filter), while a record of
+/// another provider (Codex, Ollama) uses no Claude account and is chosen
+/// whatever the account chips say.
+pub(crate) fn record_chosen<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, q: &Query, value: &Valued) -> bool {
+    match value.provider {
+        Provider::Claude => account_chosen(ctx, q, value.account.as_ref()),
+        Provider::Codex | Provider::Ollama => true,
+    }
+}
+
 /// The abbreviation a page writes for `reference`: the stored account's, or the
 /// first 8 characters of the id `account_id` gives it when it is no longer
 /// stored (the rule `crates/app/ui/common.js` uses for an unknown account).
@@ -748,6 +932,25 @@ pub(crate) fn top_three(mut items: Vec<(String, f64)>) -> Vec<(String, f64)> {
     let other = rest.into_iter().fold(0.0, |sum, (_, value)| sum + value);
     items.push(("other".to_string(), other));
     items
+}
+
+/// Each project's share of the API value of `total`, in percent, the three
+/// largest then `other` ([`top_three`]); a project whose API value is unknown
+/// is left out. Empty when the total's API value is unknown or 0: a share of
+/// nothing is no share. `by_project` and `total` are sums of [`Values::of`].
+pub(crate) fn api_shares(
+    by_project: BTreeMap<String, Values>,
+    total: &Values,
+) -> Vec<(String, f64)> {
+    match total.api {
+        Some(total) if total > 0.0 => top_three(
+            by_project
+                .into_iter()
+                .filter_map(|(name, values)| values.api.map(|value| (name, value / total * 100.0)))
+                .collect(),
+        ),
+        _ => Vec::new(),
+    }
 }
 
 /// Money as the page writes it (`crates/app/ui/common.js`'s `money`): two
@@ -969,14 +1172,18 @@ fn any_record<R: Record>(
     )
 }
 
+/// The kinds with the fewest lines are asked first: a range with records
+/// mostly has a window or an event, and then the many samples are not read.
 fn has_record<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, range: &Range) -> Result<bool, StatsError> {
-    Ok(any_record::<Sample>(ctx.warnings, ctx.history, range)?
-        || any_record::<WindowRecord>(ctx.warnings, ctx.history, range)?
-        || any_record::<Event>(ctx.warnings, ctx.history, range)?
-        || any_record::<TokenRecord>(ctx.warnings, ctx.history, range)?
-        || any_record::<SessionRecord>(ctx.warnings, ctx.history, range)?
-        || any_record::<UpRecord>(ctx.warnings, ctx.history, range)?
-        || any_record::<ProjectsLogRecord>(ctx.warnings, ctx.history, range)?)
+    Ok(
+        any_record::<WindowRecord>(ctx.warnings, ctx.history, range)?
+            || any_record::<Event>(ctx.warnings, ctx.history, range)?
+            || any_record::<ProjectsLogRecord>(ctx.warnings, ctx.history, range)?
+            || any_record::<TokenRecord>(ctx.warnings, ctx.history, range)?
+            || any_record::<SessionRecord>(ctx.warnings, ctx.history, range)?
+            || any_record::<UpRecord>(ctx.warnings, ctx.history, range)?
+            || any_record::<Sample>(ctx.warnings, ctx.history, range)?,
+    )
 }
 
 pub(crate) fn stored_account<'a, Tz: TimeZone + Copy>(
@@ -1286,7 +1493,9 @@ pub(crate) mod tests {
         match found.as_slice() {
             [] => MappedLocalTime::None,
             [(_, offset)] => MappedLocalTime::Single(*offset),
-            [(_, earlier), (_, later)] => MappedLocalTime::Ambiguous(*earlier, *later),
+            // The later instant first, as chrono's `Local` answers on Linux
+            // (see `fold`): the order the code must not depend on.
+            [(_, earlier), (_, later)] => MappedLocalTime::Ambiguous(*later, *earlier),
             _ => MappedLocalTime::None,
         }
     }
@@ -1662,6 +1871,93 @@ pub(crate) mod tests {
             })
             .expect("LB's window ending 9 Nov");
         assert_eq!(first.week, utc("2026-11-02T00:00:00Z"));
+    }
+
+    /// The running windows join the finished ones only through
+    /// `account_weeks_so_far`: placed by their midpoint (LB's, Fri 20 Nov 05:00,
+    /// still ahead of now, counts in the week that holds now), `running`, with
+    /// their newest percent as the use so far and nothing expired.
+    #[test]
+    fn running_windows_are_weeks_so_far() {
+        let tiny = tiny();
+        let ctx = tiny.ctx();
+        let range = Range {
+            from: utc("2026-11-02T00:00:00Z"),
+            to: tiny.now,
+        };
+        let valuer = Valuer::build(
+            ctx.history,
+            &range,
+            ctx.prices,
+            ctx.fx,
+            ctx.settings,
+            ctx.accounts,
+            ctx.warnings,
+        )
+        .expect("the valuer");
+
+        let finished = account_weeks_valued(&ctx, &range, &all(), &valuer).unwrap();
+        assert!(finished.iter().all(|week| !week.running));
+        let so_far = account_weeks_so_far(&ctx, &range, &all(), &valuer).unwrap();
+        assert_eq!(so_far.len(), finished.len() + 2);
+        for (reference, percent) in [(tiny.lb_ref(), 30.0), (tiny.ac_ref(), 40.0)] {
+            let week = so_far
+                .iter()
+                .find(|week| week.account == reference && week.running)
+                .expect("the running week");
+            assert_eq!(week.week, utc("2026-11-16T00:00:00Z"));
+            assert_eq!(week.used, percent);
+            assert_eq!(week_lost_percent(week).unwrap(), 0.0);
+            assert!(week.price.is_some(), "a running week is priced");
+        }
+    }
+
+    /// A week a reset split, whose second window still runs: the finished
+    /// window's `lost` is the week's expired share, over the one week's price
+    /// the finished window offered; the running window offers its week to the
+    /// Used share only.
+    #[test]
+    fn a_running_window_offers_to_the_used_share_only() {
+        let tiny = tiny();
+        let finished = WindowRecord {
+            account: tiny.lb_ref(),
+            k: LimitKind::WeeklyAll,
+            m: None,
+            start: Some(utc("2026-11-09T17:00:00Z")),
+            end: utc("2026-11-17T09:00:00Z"),
+            final_percent: 80.0,
+            lost: Some(20.0),
+            last_sample: utc("2026-11-17T08:58:00Z"),
+            plan: Some("Max".to_string()),
+            uncertain: false,
+            reset: false,
+            from: None,
+        };
+        let running = WindowRecord {
+            start: Some(utc("2026-11-16T17:00:00Z")),
+            end: utc("2026-11-23T17:00:00Z"),
+            final_percent: 30.0,
+            lost: None,
+            last_sample: utc("2026-11-19T09:59:00Z"),
+            from: None,
+            ..finished.clone()
+        };
+        let week = AccountWeek {
+            week: utc("2026-11-16T00:00:00Z"),
+            account: tiny.lb_ref(),
+            windows: vec![finished, running.clone()],
+            window: running,
+            running: true,
+            used: 110.0,
+            price: Some(180.0),
+            price_missing: None,
+        };
+
+        let money = money_of(&week).unwrap().expect("a priced week");
+        assert_eq!(week_lost_percent(&week).unwrap(), 20.0);
+        assert!(close(offered_money(&week, &money), 2.0 * money.paid));
+        assert!(close(offered_finished_money(&week, &money), money.paid));
+        assert!(close(money.expired, 0.20 * money.paid));
     }
 
     #[test]
@@ -2272,6 +2568,32 @@ pub(crate) mod tests {
         let end = next_local_day_start(start, &FallZone);
         assert_eq!(end, utc("2026-10-25T23:00:00Z")); // Monday 00:00 +01:00
         assert_eq!(end - start, Duration::hours(25));
+    }
+
+    /// The repeated hour of the fall-back night: an instant in the second
+    /// 02:00-03:00 starts its own hour (01:00Z), never the first one (00:00Z),
+    /// whatever order the zone names the two instants in. With the first one,
+    /// the hour loops of the working hours and the rates never got past
+    /// 01:00Z and Statistics hung (bench world `year`, 2026-11-17).
+    #[test]
+    fn the_repeated_hour_of_a_fall_back_night_moves_on() {
+        assert_eq!(
+            local_hour_start(utc("2026-10-25T01:30:00Z"), &FallZone),
+            utc("2026-10-25T01:00:00Z")
+        );
+        assert_eq!(
+            local_hour_start(utc("2026-10-25T00:30:00Z"), &FallZone),
+            utc("2026-10-25T00:00:00Z")
+        );
+        let start = utc("2026-10-24T22:00:00Z");
+        let rhythm = crate::burn::Rhythm { wu: [1.0; 168] };
+        let hours = working_hours(
+            start,
+            next_local_day_start(start, &FallZone),
+            &rhythm,
+            &FallZone,
+        );
+        assert!((hours - 25.0).abs() < 1e-9, "{hours}");
     }
 
     #[test]

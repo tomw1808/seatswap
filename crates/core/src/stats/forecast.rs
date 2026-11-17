@@ -487,8 +487,13 @@ fn sentence<Tz: TimeZone + Copy>(
 ) -> Result<String, StatsError> {
     let mut sentence = String::new();
     if !learning_abbrs.is_empty() {
+        let verb = if learning_abbrs.len() == 1 {
+            "is"
+        } else {
+            "are"
+        };
         sentence.push_str(&format!(
-            "Still learning how fast {} is used. ",
+            "Still learning how fast {} {verb} used. ",
             join_names(learning_abbrs)
         ));
     }

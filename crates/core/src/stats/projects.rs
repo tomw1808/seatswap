@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use crate::history::{AccountRef, Hosted, Hosts, Range, TokenRecord};
 use crate::live_sessions::Values;
-use crate::money::{usd_rate, Fx, Missing, Valuer};
+use crate::money::{usd_rate, Fx, Missing, Provider, Valuer};
 use crate::project::ProjectKey;
 use crate::projects::{Project, ProjectId};
 use crate::store::{Account, Settings};
@@ -20,7 +20,8 @@ use crate::transcripts::Tokens;
 use super::{
     account_abbr, account_chosen, account_id, account_position, account_weeks_valued,
     add_opt_value, add_value, join_names, keep_warnings, money_text, output_by_account_week,
-    percent_text, range_of, thousands, week_start, windows_span, Ctx, Query, StatsError,
+    percent_text, range_of, record_chosen, thousands, week_start, windows_span, Ctx, Query,
+    StatsError,
 };
 
 /// The level of a row of the tree.
@@ -52,9 +53,13 @@ pub struct Node {
     /// The two values of the node's records, built with [`Values::of`]: a
     /// missing half names its reason, and the API half names its currency.
     pub values: Values,
-    /// Each account's share of this node's API value, in %, largest first;
-    /// `None` is a record without a known account.
+    /// Each Claude account's share of this node's API value, in %, largest
+    /// first; `None` is a Claude record without a known account.
     pub by_account: Vec<(Option<String>, f64)>,
+    /// Each other provider's share of this node's API value, in %, largest
+    /// first, by [`Provider::name`] (`Codex`, `Ollama`): its work uses no
+    /// Claude account. With `by_account` it makes up the node's API value.
+    pub by_provider: Vec<(String, f64)>,
     /// The distinct sessions of the node's records.
     pub sessions: u32,
 }
@@ -70,7 +75,8 @@ pub struct ProjectsPage {
     /// The output tokens per percent of a finished account week, per chosen
     /// account; an account without a finished week of the range is left out.
     pub tokens_per_percent: Vec<(String, f64)>,
-    /// The tokens of the records whose account is unknown.
+    /// The tokens of the Claude records whose account is unknown; a record of
+    /// another provider uses no Claude account and is not counted here.
     pub unknown_account_tokens: Tokens,
     /// The distinct models whose API value is missing because they have no
     /// price, sorted.
@@ -191,7 +197,7 @@ pub(crate) fn projects_page_in<Tz: TimeZone + Copy>(
             }
         }
         let value = valuer.value(&hosted.host, &hosted.record);
-        if !account_chosen(ctx, q, value.account.as_ref()) {
+        if !record_chosen(ctx, q, &value) {
             continue;
         }
         let values = Values::of(std::slice::from_ref(&value), ctx.settings, ctx.fx, ctx.now);
@@ -384,9 +390,16 @@ pub(crate) fn projects_page_in<Tz: TimeZone + Copy>(
     }
 
     let mut unknown_account_tokens = Tokens::default();
+    let mut providers: BTreeSet<Provider> = BTreeSet::new();
     for entry in &entries {
-        if entry.value.account.is_none() {
-            unknown_account_tokens += Tokens::from(entry.record);
+        match entry.value.provider {
+            Provider::Claude if entry.value.account.is_none() => {
+                unknown_account_tokens += Tokens::from(entry.record);
+            }
+            Provider::Claude => {}
+            other => {
+                providers.insert(other);
+            }
         }
     }
 
@@ -408,8 +421,21 @@ pub(crate) fn projects_page_in<Tz: TimeZone + Copy>(
             thousands(unknown_total as i64)
         ));
     }
-    // A record with a known account can still have no subscription value; the
-    // page says how many tokens that leaves out and why.
+    // The work of another provider is in the tree's API value and in no
+    // subscription value or matrix cell: the page says why.
+    if !providers.is_empty() {
+        let names: Vec<String> = providers
+            .iter()
+            .map(|provider| provider.name().to_string())
+            .collect();
+        notes.push(format!(
+            "{} work is valued at API prices only; it uses no Claude account.",
+            join_names(&names)
+        ));
+    }
+    // A Claude record with a known account can still have no subscription
+    // value; the page says how many tokens that leaves out and why. A record
+    // of another provider has no account and a known 0.
     let mut without_subscription = Tokens::default();
     let mut reasons = BTreeSet::new();
     let mut has_unvalued = false;
@@ -623,7 +649,7 @@ pub(crate) fn project_detail_in<Tz: TimeZone + Copy>(
     let mut weekly: BTreeMap<DateTime<Utc>, BTreeMap<String, u64>> = BTreeMap::new();
     for hosted in read.records.iter().filter(in_host) {
         let value = valuer.value(&hosted.host, &hosted.record);
-        if !account_chosen(ctx, q, value.account.as_ref()) {
+        if !record_chosen(ctx, q, &value) {
             continue;
         }
         let values = Values::of(std::slice::from_ref(&value), ctx.settings, ctx.fx, ctx.now);
@@ -706,7 +732,11 @@ struct Entry<'a> {
 struct Sums {
     tokens: Tokens,
     values: Option<Values>,
+    /// The Claude records' API value by account; `None` is a Claude record
+    /// without a known account.
     api_by_account: BTreeMap<Option<AccountRef>, Values>,
+    /// The API value of the records of every other provider.
+    api_by_provider: BTreeMap<Provider, Values>,
     sub_by_account: BTreeMap<AccountRef, Values>,
     sessions: BTreeSet<String>,
 }
@@ -717,11 +747,14 @@ impl Sums {
         self.tokens += Tokens::from(record);
         self.sessions.insert(record.session.clone());
         add_opt_value(&mut self.values, &entry.values);
-        add_value(
-            &mut self.api_by_account,
-            entry.value.account.clone(),
-            &entry.values,
-        );
+        match entry.value.provider {
+            Provider::Claude => add_value(
+                &mut self.api_by_account,
+                entry.value.account.clone(),
+                &entry.values,
+            ),
+            other => add_value(&mut self.api_by_provider, other, &entry.values),
+        }
         if let Some(account) = &entry.value.account {
             add_value(&mut self.sub_by_account, account.clone(), &entry.values);
         }
@@ -734,6 +767,9 @@ impl Sums {
         }
         for (account, values) in &other.api_by_account {
             add_value(&mut self.api_by_account, account.clone(), values);
+        }
+        for (provider, values) in &other.api_by_provider {
+            add_value(&mut self.api_by_provider, *provider, values);
         }
         for (account, values) in &other.sub_by_account {
             add_value(&mut self.sub_by_account, account.clone(), values);
@@ -791,6 +827,7 @@ fn node_from<Tz: TimeZone + Copy>(
         share: share_of(values.api, page_api),
         values,
         by_account: by_account(ctx, sums),
+        by_provider: by_provider(sums),
         sessions: sums.sessions.len() as u32,
     }
 }
@@ -823,6 +860,25 @@ fn by_account<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, sums: &Sums) -> Vec<(Option<St
             (None, None) => Ordering::Equal,
         })
     });
+    shares
+}
+
+/// Each other provider's share of the node's API value, largest first, then
+/// by name.
+fn by_provider(sums: &Sums) -> Vec<(String, f64)> {
+    let Some(api) = sums.api().filter(|api| *api > 0.0) else {
+        return Vec::new();
+    };
+    let mut shares: Vec<(String, f64)> = sums
+        .api_by_provider
+        .iter()
+        .filter_map(|(provider, values)| {
+            values
+                .api
+                .map(|value| (provider.name().to_string(), value / api * 100.0))
+        })
+        .collect();
+    shares.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     shares
 }
 
@@ -1548,6 +1604,89 @@ mod tests {
         assert_eq!(atlas.values.api, Some(60.0));
     }
 
+    /// Codex's price: 10 USD per million output tokens, at the fixture's
+    /// rate of 1.
+    fn price_codex(tiny: &mut crate::stats::tests::Tiny) {
+        tiny.prices.models.insert(
+            crate::money::price_key("openai", "gpt-6.1-sol"),
+            vec![crate::money::PricePoint {
+                from: utc("2026-01-01T00:00:00Z"),
+                price: crate::money::ModelPrice {
+                    input: 1.25,
+                    output: 10.0,
+                    cache_write: 0.0,
+                    cache_read: 0.125,
+                    tiered: false,
+                },
+            }],
+        );
+    }
+
+    /// A Codex record on atlas belongs to Codex, not to the account that was
+    /// live: it is in `by_provider`, not in `by_account`, not in the unknown
+    /// account's tokens and in no matrix cell; the page says why. The account
+    /// chips do not drop it.
+    #[test]
+    fn codex_work_is_its_providers() {
+        let mut tiny = tiny();
+        price_codex(&mut tiny);
+        let before = projects_page_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        tiny.history
+            .append(&record(
+                "2026-11-10T10:00:00Z",
+                "019a7c3e-4b2a-7d3f-9e6a-b8c52f0a1d7e",
+                "/home/sam/projects/atlas/engine",
+                atlas(),
+                "gpt-6.1-sol",
+                3_000_000,
+            ))
+            .expect("a Codex record");
+
+        let page = projects_page_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        let atlas_node = node(&page, "atlas");
+        assert_eq!(
+            atlas_node.values.api,
+            Some(150.0),
+            "120 EUR of Claude, 30 of Codex"
+        );
+        assert_eq!(atlas_node.by_provider, vec![("Codex".to_string(), 20.0)]);
+        assert_eq!(
+            atlas_node.by_account.len(),
+            2,
+            "{:?}",
+            atlas_node.by_account
+        );
+        assert!(atlas_node
+            .by_account
+            .iter()
+            .all(|(account, share)| account.is_some() && close(*share, 40.0)));
+        assert_eq!(page.unknown_account_tokens, before.unknown_account_tokens);
+        assert_eq!(page.matrix, before.matrix, "Codex is in no matrix cell");
+        assert!(
+            page.notes.iter().any(|note| note
+                == "Codex work is valued at API prices only; it uses no Claude account."),
+            "notes: {:#?}",
+            page.notes
+        );
+        assert!(!before.notes.iter().any(|note| note.contains("Codex")));
+
+        let only_lb = Query {
+            range: crate::stats::RangeKey::All,
+            accounts: vec![tiny.lb().id.clone()],
+            host: None,
+        };
+        let page = projects_page_in(&tiny.ctx(), &two_weeks(), &only_lb).unwrap();
+        let atlas_node = node(&page, "atlas");
+        assert_eq!(
+            atlas_node.values.api,
+            Some(90.0),
+            "LB's 60 EUR and Codex's 30: the chips do not drop Codex"
+        );
+        assert_eq!(atlas_node.by_account.len(), 1);
+        let detail = project_detail_in(&tiny.ctx(), &two_weeks(), &only_lb, &atlas()).unwrap();
+        assert_eq!(detail.values.api, Some(90.0));
+    }
+
     // ---- proof tests of the review ----
 
     /// The project log joins a second project into atlas: from then on the two
@@ -1622,7 +1761,7 @@ mod tests {
                 final_percent: 100.0,
                 lost: Some(0.0),
                 last_sample: utc("2026-11-17T23:58:00Z"),
-                plan: Some("Team 5x".to_string()),
+                plan: Some("Team Premium".to_string()),
                 uncertain: false,
                 reset: false,
                 from: None,

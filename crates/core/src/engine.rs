@@ -1887,7 +1887,10 @@ mod tests {
         let views = engine.poll(PollReason::Timer, t0()).unwrap();
 
         let file = engine.store().load().unwrap();
-        assert_eq!(file.find(B_ID).unwrap().plan.as_deref(), Some("Team 5x"));
+        assert_eq!(
+            file.find(B_ID).unwrap().plan.as_deref(),
+            Some("Team Premium")
+        );
         assert_eq!(
             views
                 .iter()
@@ -1895,7 +1898,7 @@ mod tests {
                 .unwrap()
                 .plan
                 .as_deref(),
-            Some("Team 5x")
+            Some("Team Premium")
         );
     }
 
@@ -1935,7 +1938,7 @@ mod tests {
                     org: B_ORG.to_string(),
                 },
                 from: Some("Team".to_string()),
-                to: Some("Team 5x".to_string()),
+                to: Some("Team Premium".to_string()),
             }
         );
     }

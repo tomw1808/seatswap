@@ -3,7 +3,7 @@
 // in (an account's colour is its view's colour). The one tooltip of every chart
 // lives here: a mark with a `tip` shows it on hover and on keyboard focus.
 
-import { WEEKDAYS, appendChildren, clear, dateText, h } from "./common.js";
+import { WEEKDAYS, appendChildren, clear, dateText, h, monthText } from "./common.js";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 
@@ -146,6 +146,271 @@ function timeBounds(series) {
   return { min, max };
 }
 
+// ---------------------------------------------------------------------------
+// fitting labels, numbers and marks to the space the chart has
+// ---------------------------------------------------------------------------
+
+// How much text a chart can show depends on the width it gets, and that is
+// known only once it is in the page. `fitOnResize` runs a chart's fit when its
+// width is first known and again whenever the width changes. A fit only shows,
+// hides or rewords text and moves labels; it never changes the chart's own
+// size, so it cannot start a resize loop.
+const fits = new WeakMap();
+const fittedWidths = new WeakMap();
+let fitObserver = null;
+
+function fitOnResize(root, fit) {
+  fits.set(root, fit);
+  if (fitObserver === null) {
+    fitObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        // A chart not shown (a hidden tab, taken out of the page) has no width
+        // to fit to; it is fitted when it is shown again.
+        const width = Math.round(entry.contentRect.width);
+        if (width === 0 || fittedWidths.get(entry.target) === width) continue;
+        fittedWidths.set(entry.target, width);
+        fits.get(entry.target)();
+      }
+    });
+  }
+  fitObserver.observe(root);
+}
+
+// The space between two labels on one line, in px.
+const LABEL_GAP = 6;
+
+// A label anchored at a point: a column's middle, a time on a track, a mark.
+// It is centred on its anchor, or starts or ends there at the chart's edges
+// (`data-align`, set by the fit).
+function anchoredLabel(className, text) {
+  const node = h("span", { class: `chart-axis-label${className ? ` ${className}` : ""}`, text });
+  node.dataset.align = "middle";
+  return node;
+}
+
+// Where a label lies with its text centred on its anchor, or turned inwards
+// when centred it would cross the edge of `box`. The label's alignment is
+// "middle" when this is called.
+function labelExtent(node, box) {
+  const rect = node.getBoundingClientRect();
+  const width = rect.width;
+  const anchor = rect.left + width / 2;
+  if (rect.left < box.left) return { left: anchor, right: anchor + width, align: "start" };
+  if (rect.right > box.right) return { left: anchor - width, right: anchor, align: "end" };
+  return { left: rect.left, right: rect.right, align: "middle" };
+}
+
+function apart(a, b) {
+  return a.right + LABEL_GAP <= b.left || b.right + LABEL_GAP <= a.left;
+}
+
+// Axis labels: `labels` is one { node, text, at, keep } per anchor, left to
+// right; `at` is the anchor's time (or null), `keep` the rank of a label that
+// shows before all others (2 the running week, 1 the chosen week, 0 none).
+// The fit shows as many labels as fit without touching each other or leaving
+// `bounds`: every one, else every second; then on a time axis the month
+// starts ("Oct", a year at January), else every n-th. The labels shown in
+// steps are counted from the newest one, so it always shows. A hidden label
+// keeps its line, so every column keeps its height.
+function layoutAxis(labels, bounds) {
+  if (labels.length === 0) return;
+  const box = bounds.getBoundingClientRect();
+  const place = (texts) => {
+    for (const [index, label] of labels.entries()) {
+      label.node.textContent = texts[index];
+      label.node.dataset.align = "middle";
+    }
+    return labels.map((label) => labelExtent(label.node, box));
+  };
+  const show = (extents, picked) => {
+    const shown = new Set(picked);
+    for (const [index, label] of labels.entries()) {
+      label.node.dataset.align = extents[index].align;
+      label.node.classList.toggle("chart-label-off", !shown.has(index));
+    }
+  };
+  const together = (extents, picked) =>
+    picked.every((index, at) => at === 0 || apart(extents[picked[at - 1]], extents[index]));
+
+  const count = labels.length;
+  const full = place(labels.map((label) => label.text));
+  // The kept labels by their rank, highest first; one that would touch a
+  // higher one is left out (the chosen week beside the running one).
+  const kept = [];
+  for (const index of [...labels.keys()]
+    .filter((candidate) => labels[candidate].keep)
+    .sort((a, b) => labels[b].keep - labels[a].keep)) {
+    if (kept.every((other) => apart(full[other], full[index]))) kept.push(index);
+  }
+  kept.sort((a, b) => a - b);
+  const everyNth = (step) =>
+    [...labels.keys()].filter(
+      (index) => kept.includes(index) || (!labels[index].keep && (count - 1 - index) % step === 0)
+    );
+  const timed = labels.every((label) => label.keep || label.at !== null);
+  const steps = timed ? [1, 2] : [...labels.keys()].map((index) => index + 1);
+  for (const step of steps) {
+    const picked = everyNth(step);
+    if (together(full, picked)) {
+      show(full, picked);
+      return;
+    }
+  }
+  if (!timed) {
+    show(full, kept);
+    return;
+  }
+  // Month starts: the first column of each month, named by its month. The
+  // newest first; a month label that would touch one already placed is left
+  // out.
+  let previous = null;
+  const starts = [];
+  const texts = labels.map((label, index) => {
+    if (label.keep || label.at === null) return label.text;
+    const date = new Date(label.at);
+    const month = date.getFullYear() * 12 + date.getMonth();
+    const start = previous === null || month !== previous;
+    previous = month;
+    if (!start) return label.text;
+    starts.push(index);
+    return monthText(date);
+  });
+  const extents = place(texts);
+  const picked = [...kept];
+  for (const index of starts.reverse()) {
+    if (picked.every((other) => apart(extents[other], extents[index]))) picked.push(index);
+  }
+  show(extents, picked);
+}
+
+// Numbers inside or under columns (a cell's percent, a week's blocked hours),
+// each in one or more forms, longest first ("11h blocked", "11h"). A group
+// shows all its numbers in the longest form in which each fits its own
+// column, else none, so a blank never stands beside a number and reads as
+// "nothing". The tooltip of the column or cell always carries the number.
+const numberForms = new WeakMap();
+
+function numberNode(className, forms) {
+  const list = (Array.isArray(forms) ? forms : [forms]).map(String);
+  if (list.length === 0) throw new Error("a number needs at least one form");
+  const node = h("span", { class: className, text: list[0] });
+  numberForms.set(node, list);
+  return node;
+}
+
+function fitNumbers(nodes) {
+  const count = Math.max(0, ...nodes.map((node) => numberForms.get(node).length));
+  for (let form = 0; form < count; form += 1) {
+    for (const node of nodes) {
+      const forms = numberForms.get(node);
+      node.textContent = forms[Math.min(form, forms.length - 1)];
+      node.classList.remove("chart-number-off");
+    }
+    // 1px free on each side, so a number never touches its column's edge.
+    if (nodes.every((node) => node.scrollWidth + 2 <= node.parentElement.clientWidth)) return;
+  }
+  for (const node of nodes) node.classList.add("chart-number-off");
+}
+
+// Mark labels ("PR added", "auto-burn on"): each on the first line where it
+// touches no other label; when neither of the two lines has room, a tick on
+// its line whose tooltip names it. Labels at the chart's edges turn inwards.
+function layoutMarks(layer) {
+  const marks = [...layer.querySelectorAll(".chart-mark")];
+  const labels = marks.map((mark) => mark.querySelector(".chart-mark-label"));
+  for (const [index, label] of labels.entries()) {
+    label.textContent = label.dataset.text;
+    label.dataset.align = "middle";
+    label.classList.remove("chart-mark-tick");
+    marks[index].style.setProperty("--chart-mark-row", "0");
+  }
+  const box = layer.getBoundingClientRect();
+  const anchors = marks.map((mark) => mark.getBoundingClientRect().left);
+  const full = labels.map((label) => labelExtent(label, box));
+  // A tick is 8px wide (charts.css `.chart-mark-tick`) and needs 1px beside it.
+  const ticks = anchors.map((anchor) =>
+    anchor - 5 < box.left
+      ? { left: anchor, right: anchor + 9, align: "start" }
+      : anchor + 5 > box.right
+        ? { left: anchor - 9, right: anchor, align: "end" }
+        : { left: anchor - 5, right: anchor + 5, align: "middle" }
+  );
+  const order = [...marks.keys()].sort((a, b) => anchors[a] - anchors[b]);
+  const tick = new Set();
+  // Place left to right; a label with no room on either line becomes a tick.
+  // A tick with no room either turns the label it touches into a tick too,
+  // and the placing starts again: labels only ever become ticks, so it ends.
+  let placed = null;
+  while (placed === null) {
+    placed = new Map();
+    const rows = [[], []];
+    const overlaps = (extent, other, gap) =>
+      !(other.right + gap <= extent.left || extent.right + gap <= other.left);
+    const gapOf = (a, b) => (tick.has(a) || tick.has(b) ? 0 : LABEL_GAP);
+    const freeRow = (index, extent) =>
+      rows.findIndex((row) =>
+        row.every((other) => !overlaps(extent, placed.get(other).extent, gapOf(index, other)))
+      );
+    for (const index of order) {
+      let extent = tick.has(index) ? ticks[index] : full[index];
+      let row = freeRow(index, extent);
+      if (row === -1 && !tick.has(index)) {
+        tick.add(index);
+        extent = ticks[index];
+        row = freeRow(index, extent);
+      }
+      if (row === -1) {
+        const touched = [...placed.keys()].find(
+          (other) => !tick.has(other) && overlaps(extent, placed.get(other).extent, 0)
+        );
+        if (touched !== undefined) {
+          tick.add(touched);
+          placed = null;
+          break;
+        }
+        // Ticks of neighbouring weeks only: they share line 0.
+        row = 0;
+      }
+      placed.set(index, { extent, row });
+      rows[row].push(index);
+    }
+  }
+  for (const [index, { extent, row }] of placed) {
+    const label = labels[index];
+    if (tick.has(index)) {
+      label.textContent = "";
+      label.classList.add("chart-mark-tick");
+    }
+    label.dataset.align = extent.align;
+    marks[index].style.setProperty("--chart-mark-row", String(row));
+  }
+}
+
+// The time axis of a track a page draws itself (the Subscriptions page's
+// periods): one label per tick `{ at, text, left }` (`left` a CSS length on
+// the track), fitted like every chart's axis.
+export function timeAxis(track, ticks) {
+  const labels = ticks.map((tick) => {
+    const node = anchoredLabel("", String(tick.text));
+    node.style.left = tick.left;
+    track.appendChild(node);
+    return { node, text: String(tick.text), at: timeOf(tick.at), keep: 0 };
+  });
+  fitOnResize(track, () => layoutAxis(labels, track));
+}
+
+// A column narrower than this (px, gap included) is drawn narrow: smaller gaps
+// and corners (charts.css `.chart-narrow`).
+const NARROW_COLUMN = 28;
+
+// The axis label under each column of a chart of columns; the label row keeps
+// its height when the fit hides the label.
+function columnLabel(text, at) {
+  const node = anchoredLabel("", text);
+  node.title = text;
+  return { slot: h("span", { class: "chart-col-label" }, [node]), label: { node, text, at, keep: 0 } };
+}
+
 // Marks are placed at the left edge of the column whose week they fall in, as
 // the mock-up does. Without column times a mark cannot be placed and is left
 // out rather than guessed.
@@ -169,17 +434,11 @@ function markLayer(marks, leftOf, className) {
       throw new Error(`cannot place the mark ${JSON.stringify(mark.label)}: the chart has no time axis`);
     }
     const line = h("div", { class: "chart-mark", style: { left } });
-    // A label at the chart's edge is aligned inwards so it stays inside its box.
-    const percent = Number.parseFloat(left);
-    line.dataset.align =
-      Number.isFinite(percent) && percent < 10
-        ? "start"
-        : Number.isFinite(percent) && percent > 90
-          ? "end"
-          : "middle";
-    line.appendChild(
-      h("span", { class: "chart-mark-label", text: String(mark.label), title: String(mark.label) })
-    );
+    const text = String(mark.label);
+    const label = anchoredLabel("chart-mark-label", text);
+    label.dataset.text = text;
+    attachTip(label, text);
+    line.appendChild(label);
     layer.appendChild(line);
   }
   return layer.childNodes.length > 0 ? layer : null;
@@ -207,9 +466,19 @@ export function stackedColumns({ columns, marks } = {}) {
   }
   const scale = maxTotal > 0 ? maxTotal : 1;
 
-  for (const column of columns) {
+  const columnTimes = columns.map((column) => timeOf(column.at));
+  const labels = [];
+  const subs = [];
+  for (const [index, column] of columns.entries()) {
     const col = h("div", { class: "chart-col" });
     const pair = h("div", { class: "chart-pair" });
+    // The line under the column: one text or its forms, longest first.
+    const subForms =
+      column.sub === undefined || column.sub === null || column.sub === ""
+        ? null
+        : Array.isArray(column.sub)
+          ? column.sub
+          : [column.sub];
     const stacks = Array.isArray(column.stacks) ? column.stacks : [];
     for (const stack of stacks) {
       const stackNode = h("div", { class: "chart-stack" });
@@ -222,27 +491,40 @@ export function stackedColumns({ columns, marks } = {}) {
           style.boxShadow = `inset 0 0 0 1px ${segment.color}`;
         }
         const piece = h("div", { class: "chart-stack-seg", style });
-        attachTip(piece, segment.tip);
+        // The line under the column is hidden when the column is narrow; its
+        // tooltips always carry it.
+        const tip =
+          subForms !== null && segment.tip !== undefined && segment.tip !== null && segment.tip !== ""
+            ? `${segment.tip} | ${subForms[0]}`
+            : segment.tip;
+        attachTip(piece, tip);
         stackNode.appendChild(piece);
       }
       pair.appendChild(stackNode);
     }
     col.appendChild(pair);
-    col.appendChild(
-      h("span", { class: "chart-col-label", text: String(column.label ?? ""), title: String(column.label ?? "") })
-    );
-    if (column.sub !== undefined && column.sub !== null && column.sub !== "") {
-      col.appendChild(h("span", { class: "chart-col-sub", text: String(column.sub) }));
+    const { slot, label } = columnLabel(String(column.label ?? ""), columnTimes[index]);
+    labels.push(label);
+    col.appendChild(slot);
+    if (subForms !== null) {
+      const sub = numberNode("chart-col-sub", subForms);
+      subs.push(sub);
+      col.appendChild(sub);
     }
     body.appendChild(col);
   }
 
-  const columnTimes = columns.map((column) => timeOf(column.at));
   const layer = markLayer(marks, (at) => markPosition(at, columnTimes), "chart-marks chart-marks-cols");
   // The marks come after the columns so their labels lie above them, as in the
   // mock-up (Task 8, part 3, item 7).
   root.appendChild(body);
   if (layer) root.appendChild(layer);
+  fitOnResize(root, () => {
+    root.classList.toggle("chart-narrow", body.clientWidth / Math.max(1, columns.length) < NARROW_COLUMN);
+    layoutAxis(labels, body);
+    fitNumbers(subs);
+    if (layer) layoutMarks(layer);
+  });
   return root;
 }
 
@@ -404,6 +686,20 @@ export function lines({ series, yMax, marks, hlines, ySuffix, yDecimals, yFormat
   if (layer) plot.appendChild(layer);
   plot.appendChild(svg);
   root.appendChild(plot);
+  // Points closer than this (px) are drawn only on hover and focus: the line
+  // shows the course, and each point still answers with its tooltip.
+  const densePoints = 14;
+  const mostPoints = Math.max(
+    0,
+    ...series.map((entry) => (Array.isArray(entry.points) ? entry.points.length : 0))
+  );
+  fitOnResize(root, () => {
+    root.classList.toggle(
+      "chart-lines-dense",
+      mostPoints > 1 && plot.clientWidth / (mostPoints - 1) < densePoints
+    );
+    if (layer) layoutMarks(layer);
+  });
 
   const axis = h("div", { class: "chart-xaxis" });
   if (bounds.min !== null && bounds.max !== null) {
@@ -423,7 +719,7 @@ export function lines({ series, yMax, marks, hlines, ySuffix, yDecimals, yFormat
 // bars — one bar per category and series
 // ---------------------------------------------------------------------------
 
-export function bars({ categories, series, labelEvery } = {}) {
+export function bars({ categories, series } = {}) {
   if (!Array.isArray(categories)) throw new Error("bars needs a list of categories");
   if (!Array.isArray(series)) throw new Error("bars needs a list of series");
   const root = h("div", { class: "chart chart-bars" });
@@ -448,7 +744,7 @@ export function bars({ categories, series, labelEvery } = {}) {
     }
   }
   const scale = max > 0 ? max : 1;
-  const labelStep = Number.isInteger(labelEvery) && labelEvery > 0 ? labelEvery : 1;
+  const labels = [];
   for (const [index, category] of categories.entries()) {
     const group = h("div", { class: "chart-bar-group" });
     for (const entry of series) {
@@ -467,17 +763,19 @@ export function bars({ categories, series, labelEvery } = {}) {
       attachTip(bar, tip);
       group.appendChild(bar);
     }
-    const col = h("div", { class: "chart-bar-col" }, [
-      group,
-      h("span", {
-        class: "chart-col-label",
-        text: index % labelStep === 0 ? String(category) : "",
-        title: String(category),
-      }),
-    ]);
-    body.appendChild(col);
+    // A category is a name, not a time: its labels are thinned in steps.
+    const { slot, label } = columnLabel(String(category), null);
+    labels.push(label);
+    body.appendChild(h("div", { class: "chart-bar-col" }, [group, slot]));
   }
   root.appendChild(body);
+  fitOnResize(root, () => {
+    root.classList.toggle(
+      "chart-narrow",
+      body.clientWidth / Math.max(1, categories.length) < NARROW_COLUMN
+    );
+    layoutAxis(labels, body);
+  });
   return root;
 }
 
@@ -485,12 +783,29 @@ export function bars({ categories, series, labelEvery } = {}) {
 // grid — the Weeks page's account × week grid
 // ---------------------------------------------------------------------------
 
+// A grid cell's filled height in percent: its `total`, else its `fill`, else
+// the sum of its `parts`; `null` for a plain cell.
+function cellTotal(cell) {
+  if (finite(cell.total)) return cell.total;
+  if (finite(cell.fill)) return cell.fill;
+  if (Array.isArray(cell.parts)) {
+    return cell.parts.reduce((sum, part) => sum + (finite(part) ? part : 0), 0);
+  }
+  return null;
+}
+
+// The fill percent from which a grid cell's number stands on the fill, not on
+// the track: the number's foot padding and line take the lowest 40 % of the
+// cell (`.chart-cell-text` in charts.css, 4 px + 13 px of 42 px).
+const TEXT_ON_FILL = 40;
+
 export function grid({ rows, headers } = {}) {
   if (!Array.isArray(rows)) throw new Error("grid needs a list of rows");
   if (!Array.isArray(headers)) throw new Error("grid needs a list of headers");
   const root = h("div", { class: "chart chart-grid" });
-  const template = `minmax(96px, 1.3fr) repeat(${headers.length}, minmax(0, 1fr))`;
-  root.style.setProperty("--chart-grid-columns", template);
+  // The column sizes live in charts.css; a grid wider than its card scrolls
+  // sideways inside the chart, with the row labels kept in view.
+  root.style.setProperty("--chart-grid-cols", String(headers.length));
   // A cell's track is its height for 100 %. A week with a reset sums its
   // windows and may pass 100: the bar then grows into the headroom above the
   // cell, while the 100 % line stays at the cell's top. The gap between rows
@@ -501,14 +816,7 @@ export function grid({ rows, headers } = {}) {
     const cells = row && Array.isArray(row.cells) ? row.cells : [];
     for (const cell of cells) {
       if (!cell) continue;
-      const parts = Array.isArray(cell.parts) ? cell.parts : null;
-      const total = finite(cell.total)
-        ? cell.total
-        : finite(cell.fill)
-          ? cell.fill
-          : parts !== null
-            ? parts.reduce((sum, part) => sum + (finite(part) ? part : 0), 0)
-            : null;
+      const total = cellTotal(cell);
       if (total !== null && total > highest) highest = total;
     }
   }
@@ -516,18 +824,37 @@ export function grid({ rows, headers } = {}) {
 
   const head = h("div", { class: "chart-grid-row chart-grid-headrow" });
   head.appendChild(h("span", { class: "chart-grid-corner" }));
+  // A header may carry its week's time (`at`): a long run of weeks is then
+  // labelled by its month starts. The running and the chosen week keep their
+  // label.
+  const labels = [];
+  let selectedHead = null;
   for (const header of headers) {
     const spec = header !== null && typeof header === "object" ? header : { label: header };
-    const node = h("div", {
-      class: `chart-grid-head${spec.selected ? " chart-grid-head-selected" : ""}${spec.current ? " chart-grid-head-current" : ""}`,
-      text: String(spec.label ?? ""),
-      title: String(spec.label ?? ""),
+    const text = String(spec.label ?? "");
+    const label = anchoredLabel("", text);
+    const node = h(
+      "div",
+      {
+        class: `chart-grid-head${spec.selected ? " chart-grid-head-selected" : ""}${spec.current ? " chart-grid-head-current" : ""}`,
+        title: spec.tip ? undefined : text,
+      },
+      [label]
+    );
+    labels.push({
+      node: label,
+      text,
+      at: spec.at === undefined || spec.at === null ? null : timeOf(spec.at),
+      keep: spec.current ? 2 : spec.selected ? 1 : 0,
     });
+    if (spec.selected) selectedHead = node;
     attachTip(node, spec.tip);
     clickable(node, spec.onClick);
     head.appendChild(node);
   }
   root.appendChild(head);
+  const barTexts = [];
+  const plainTexts = [];
 
   for (const row of rows) {
     const rowNode = h("div", { class: "chart-grid-row" });
@@ -554,7 +881,14 @@ export function grid({ rows, headers } = {}) {
       if (cell.current) classes.push("chart-cell-current");
       const style = {};
       if (cell.color) style["--chart-cell-color"] = cell.color;
-      if (cell.textColor) style["--chart-cell-text"] = cell.textColor;
+      // The number sits at the cell's foot (about its lowest 40 %): it takes
+      // the fill's contrast colour only when the fill reaches over it, else it
+      // stands on the empty track and keeps the page's text colour (a dark
+      // number on the dark theme's track was unreadable).
+      const total = cellTotal(cell);
+      if (cell.textColor && total !== null && total >= TEXT_ON_FILL) {
+        style["--chart-cell-text"] = cell.textColor;
+      }
       const node = h("div", { class: classes.join(" "), style });
       const parts = Array.isArray(cell.parts) ? cell.parts : null;
       if (parts) {
@@ -567,7 +901,6 @@ export function grid({ rows, headers } = {}) {
           }
         }
       }
-      const total = finite(cell.total) ? cell.total : finite(cell.fill) ? cell.fill : null;
       const over = total !== null && total > 100;
       const splitBar = parts !== null && (parts.length > 1 || over);
       if (splitBar && total !== null) {
@@ -627,7 +960,11 @@ export function grid({ rows, headers } = {}) {
         }
       }
       if (cell.text !== undefined && cell.text !== null && cell.text !== "") {
-        node.appendChild(h("span", { class: "chart-cell-text", text: String(cell.text) }));
+        const text = numberNode("chart-cell-text", cell.text);
+        // The numbers on bars and those in plain cells (blocked hours) are
+        // shown or hidden as two groups.
+        (total !== null ? barTexts : plainTexts).push(text);
+        node.appendChild(text);
       }
       attachTip(node, cell.tip);
       clickable(node, cell.onClick);
@@ -635,6 +972,48 @@ export function grid({ rows, headers } = {}) {
     }
     root.appendChild(rowNode);
   }
+  let scrolled = false;
+  fitOnResize(root, () => {
+    // Narrow week columns get the small gap (charts.css), so 53 weeks fit a
+    // wide window without scrolling.
+    root.classList.remove("chart-narrow");
+    const weeks = head.lastChild.getBoundingClientRect().right - head.firstChild.getBoundingClientRect().right;
+    root.classList.toggle("chart-narrow", weeks / Math.max(1, headers.length) < NARROW_COLUMN);
+    layoutAxis(labels, head);
+    fitNumbers(barTexts);
+    fitNumbers(plainTexts);
+    // A grid wider than its card opens at its newest weeks, and keeps the
+    // chosen week in view.
+    if (!scrolled) {
+      scrolled = true;
+      root.scrollLeft = root.scrollWidth;
+    }
+    if (selectedHead !== null) {
+      // The column and its label, which may be wider than the column.
+      const corner = head.firstChild.getBoundingClientRect();
+      const view = root.getBoundingClientRect();
+      const column = selectedHead.getBoundingClientRect();
+      const label = selectedHead.firstChild.getBoundingClientRect();
+      const left = Math.min(column.left, label.left);
+      const right = Math.max(column.right, label.right);
+      // Whole pixels: the scroll offset is rounded, a part of a pixel would
+      // leave the label just under the row labels.
+      if (left < corner.right) root.scrollLeft -= Math.ceil(corner.right - left);
+      else if (right > view.right) root.scrollLeft += Math.ceil(right - view.right);
+    }
+    hideCovered();
+  });
+  // A week label scrolled partly under the row labels is hidden, never cut.
+  function hideCovered() {
+    const edge = head.firstChild.getBoundingClientRect().right;
+    for (const label of labels) {
+      label.node.classList.toggle(
+        "chart-label-covered",
+        label.node.getBoundingClientRect().left < edge - 1
+      );
+    }
+  }
+  root.addEventListener("scroll", hideCovered, { passive: true });
   return root;
 }
 
@@ -875,7 +1254,10 @@ export function hours({ lanes, days, marks } = {}) {
     (at) => markPosition(at, columnTimes),
     "chart-marks chart-marks-hours"
   );
-  if (layer) root.appendChild(layer);
+  if (layer) {
+    root.appendChild(layer);
+    fitOnResize(root, () => layoutMarks(layer));
+  }
   return root;
 }
 

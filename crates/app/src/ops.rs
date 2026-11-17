@@ -516,7 +516,7 @@ mod tests {
         assert_eq!(events[0]["type"], "accountAdded");
         assert_eq!(events[0]["account"]["acc"], ACCOUNT_UUID);
         assert_eq!(events[0]["account"]["org"], ORG_UUID);
-        assert_eq!(events[0]["plan"], "Team 5x");
+        assert_eq!(events[0]["plan"], "Team Premium");
 
         // Saving the same login again updates the stored copy, not a new account.
         save_live_login(&fixture.claude, &store, Some(&recorder), None, Utc::now())
@@ -526,7 +526,7 @@ mod tests {
     }
 
     /// The live login is stored again and the plan of the account changed
-    /// (the login says "Team 5x", the stored plan says "Team"): the change
+    /// (the login says "Team Premium", the stored plan says "Team"): the change
     /// belongs in the history, written by the code that records the events of
     /// this path.
     #[test]
@@ -541,7 +541,7 @@ mod tests {
             Utc::now(),
         )
         .expect("the live login is saved");
-        // The stored plan is stale; the live login's tier says "Team 5x".
+        // The stored plan is stale; the live login's tier says "Team Premium".
         let mut file = store.load().expect("accounts");
         file.accounts[0].plan = Some("Team".to_string());
         store.save(&file).expect("the stale plan is stored");
@@ -552,7 +552,7 @@ mod tests {
             .expect("the stored copy is updated");
         assert_eq!(
             store.load().expect("accounts").accounts[0].plan.as_deref(),
-            Some("Team 5x"),
+            Some("Team Premium"),
             "the plan of the account is the login's"
         );
 
@@ -573,7 +573,7 @@ mod tests {
         assert_eq!(changed[0]["account"]["acc"], ACCOUNT_UUID);
         assert_eq!(changed[0]["account"]["org"], ORG_UUID);
         assert_eq!(changed[0]["from"], "Team");
-        assert_eq!(changed[0]["to"], "Team 5x");
+        assert_eq!(changed[0]["to"], "Team Premium");
     }
 
     #[test]
@@ -637,7 +637,7 @@ mod tests {
         assert_eq!(events.len(), 2, "{events:?}");
         assert_eq!(events[0]["type"], "accountAdded");
         assert_eq!(events[0]["account"]["acc"], ACCOUNT_UUID);
-        assert_eq!(events[0]["plan"], "Team 5x");
+        assert_eq!(events[0]["plan"], "Team Premium");
         assert_eq!(events[1]["type"], "switch");
     }
 

@@ -8,6 +8,7 @@ import {
   WEEKDAYS,
   accountName,
   accountNameText,
+  accountPlan,
   accountView,
   amountNode,
   clear,
@@ -25,8 +26,14 @@ import {
 import { lanes } from "../../charts.js";
 
 // The one error the page shows as a plain line: the plan does not exist before
-// every account has a reading. Every other failure stays the area's banner.
+// every account has a reading (`window.rs`'s `NO_PLAN`). It may go on after a
+// colon with the accounts that have none yet. Every other failure stays the
+// area's banner.
 const NO_PLAN = "the forecast needs a reading of every account first";
+
+function isNoPlan(text) {
+  return text === NO_PLAN || text.startsWith(`${NO_PLAN}: `);
+}
 
 function dayTicks(from, to) {
   const ticks = [];
@@ -63,15 +70,6 @@ function expectedReason(learning) {
   return learning ? "its rates are not known yet" : "the plan has no entry for it";
 }
 
-function learningLine(env, ids) {
-  const line = h("span", {}, ["still learning the rates of "]);
-  for (const [index, id] of ids.entries()) {
-    if (index > 0) line.appendChild(document.createTextNode(", "));
-    line.appendChild(accountName(env.accounts, id));
-  }
-  return line;
-}
-
 export async function show(container, env) {
   let data;
   try {
@@ -79,7 +77,7 @@ export async function show(container, env) {
   } catch (error) {
     const text = errorMessage(error);
     if (error && error.name === "EmptyRange") throw error;
-    if (text !== NO_PLAN) throw error;
+    if (!isNoPlan(text)) throw error;
     clear(container);
     container.appendChild(h("p", { class: "stats-empty stats-forecast-noplan", text }));
     return;
@@ -140,7 +138,7 @@ export async function show(container, env) {
   const sentence = kpi(
     "All accounts together",
     data.sentence,
-    data.learning.length > 0 ? learningLine(env, data.learning) : null,
+    null,
     data.sentence
   );
   sentence.classList.add("stats-kpi-sentence");
@@ -176,17 +174,8 @@ export async function show(container, env) {
 
     const name = h("div", { class: "stats-fc-account" }, [
       accountName(env.accounts, account.id),
+      accountPlan(env.accounts, account.id),
     ]);
-    name.appendChild(
-      h("span", {
-        class: "stats-plan",
-        text: view && typeof view.plan === "string" && view.plan !== "" ? view.plan : "—",
-        title:
-          view && typeof view.plan === "string" && view.plan !== ""
-            ? undefined
-            : "no plan stored for this account",
-      })
-    );
     row.appendChild(name);
 
     const bar = h("div", { class: "stats-fc-bar" });
@@ -244,20 +233,26 @@ export async function show(container, env) {
     times.push(`resets ${weekdayTimeText(account.resetsAt)}`);
     row.appendChild(h("span", { class: "stats-fc-times", text: times.join(" · ") }));
 
+    // Without an expected percent there is no money either (`forecast.rs`):
+    // the reason is said once. With a percent, a missing amount means the
+    // account's price could not be valued (`forecast.rs`'s `price_at`).
     const lazy = h("span", { class: "stats-fc-lazy" });
-    lazy.appendChild(
-      document.createTextNode(
-        typeof account.onlyWhenFullExpected === "number"
-          ? `only when full: ${percentText(account.onlyWhenFullExpected)} at the reset`
-          : `only when full: — (${expectedReason(learning)}) at the reset`
-      )
-    );
-    lazy.appendChild(document.createTextNode(" · "));
-    if (typeof account.onlyWhenFullExpires === "number") {
-      lazy.appendChild(amountNode(account.onlyWhenFullExpires, currency));
-      lazy.appendChild(document.createTextNode(" expires"));
+    if (typeof account.onlyWhenFullExpected === "number") {
+      lazy.appendChild(
+        document.createTextNode(
+          `only when full: ${percentText(account.onlyWhenFullExpected)} at the reset · `
+        )
+      );
+      if (typeof account.onlyWhenFullExpires === "number") {
+        lazy.appendChild(amountNode(account.onlyWhenFullExpires, currency));
+        lazy.appendChild(document.createTextNode(" expires"));
+      } else {
+        lazy.appendChild(document.createTextNode("— expires (its price is not known)"));
+      }
     } else {
-      lazy.appendChild(document.createTextNode(`— expires (${expectedReason(learning)})`));
+      lazy.appendChild(
+        document.createTextNode(`only when full: — (${expectedReason(learning)})`)
+      );
     }
     row.appendChild(lazy);
 
@@ -346,7 +341,7 @@ export async function show(container, env) {
   lanesCard.appendChild(
     h("p", {
       class: "stats-note",
-      text: "The plan uses your usual working hours and each account's measured rates; it is recomputed at every reading.",
+      text: "The plan uses your usual working hours and each account's rates, measured or assumed from its plan; it is recomputed at every reading.",
     })
   );
 }

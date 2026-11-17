@@ -18,7 +18,7 @@ use crate::store::{Account, LoginState};
 use super::cost::switch_cost;
 use super::decide::{decide, regime, Decision, Regime, Situation};
 use super::plan::{blocked, followed, AccountState, Inputs, Plan, PlanError, SessionState};
-use super::rates::{rates, rhythm, Timeline};
+use super::rates::{rates, rhythm, RateAccount, Timeline};
 use super::{Rates, Rhythm, MANUAL_HOLD_H, RATES_DAYS, RHYTHM_WEEKS};
 
 /// Everything a decision is built from, read once: the rhythm, the accounts'
@@ -85,21 +85,18 @@ pub fn learn<Tz: TimeZone + Copy>(
     warnings.extend(events.warnings);
 
     let rhythm = rhythm(&tokens.records, now, &zone);
-    let mut learned_rates = BTreeMap::new();
-    if read_sessions {
-        for account in accounts {
-            let account_ref = AccountRef::of(account);
-            if let Some(account_rates) = rates(
-                &account_ref,
-                &samples.records,
-                &tokens.records,
-                &events.records,
-                now,
-            ) {
-                learned_rates.insert(account_ref, account_rates);
-            }
-        }
-    }
+    let learned_rates = if read_sessions {
+        let rate_accounts: Vec<RateAccount> = accounts.iter().map(RateAccount::of).collect();
+        rates(
+            &rate_accounts,
+            &samples.records,
+            &tokens.records,
+            &events.records,
+            now,
+        )
+    } else {
+        BTreeMap::new()
+    };
     let cost = switch_cost(
         &events.records,
         &samples.records,

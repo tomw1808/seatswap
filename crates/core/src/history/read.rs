@@ -8,7 +8,7 @@
 //! writes the export ([`export_csv`], [`export_json`]). The export is raw data:
 //! accounts by the server's ids, projects by the key as stored.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
@@ -18,9 +18,10 @@ use serde::Serialize;
 
 use super::carry::merge_folder;
 use super::{
-    read_marker, same_reset, Event, HistoryDir, HistoryError, Kind, Record, Sample, SessionRecord,
-    TokenRecord, UpRecord, WindowRecord, SESSIONS_NOW_FILE,
+    read_marker, same_reset, AccountRef, Event, HistoryDir, HistoryError, Kind, Record, Sample,
+    SessionRecord, TokenRecord, UpRecord, WindowRecord, SESSIONS_NOW_FILE,
 };
+use crate::api::LimitKind;
 use crate::paths;
 use crate::project::ProjectKey;
 use crate::projects::ProjectsLogRecord;
@@ -99,14 +100,25 @@ pub struct Read<R> {
 
 impl HistoryDir {
     pub fn read<R: Record>(&self, range: &Range, hosts: &Hosts) -> Result<Read<R>, HistoryError> {
-        let mut records = Vec::new();
-        let mut warnings = Vec::new();
+        let mut files = Vec::new();
         for host in self.hosts_to_read(hosts)? {
             let dir = self.root().join(&host);
             for file in month_files(&dir, R::KIND.stem(), range)? {
-                let path = dir.join(&file);
-                read_file::<R>(&path, &host, &file, range, &mut records, &mut warnings)?;
+                files.push(MonthFile {
+                    path: dir.join(&file),
+                    host: host.clone(),
+                    file,
+                });
             }
+        }
+        let mut records = Vec::new();
+        let mut warnings = Vec::new();
+        // In file order, so the records and warnings come out as one file
+        // after the other, and the first broken file is the error.
+        for part in read_files::<R>(&files, range) {
+            let part = part?;
+            records.extend(part.records);
+            warnings.extend(part.warnings);
         }
         records.sort_by(|a, b| {
             a.record
@@ -189,9 +201,21 @@ impl HistoryDir {
 /// saw the window longest also saw where it began.
 fn finished_of(mut records: Vec<Hosted<WindowRecord>>) -> Vec<Hosted<WindowRecord>> {
     let mut windows: Vec<Hosted<WindowRecord>> = Vec::new();
+    // The kept windows of each account, kind and model, by their place in
+    // `windows`: only those can be the same window ([`same_window`]), so a
+    // record is compared with them alone, in the order they were kept.
+    let mut by_limit: HashMap<(AccountRef, LimitKind, Option<String>), Vec<usize>> = HashMap::new();
     for hosted in records.drain(..) {
-        let same = windows.iter().position(|kept| same_window(kept, &hosted));
+        let record = &hosted.record;
+        let kept = by_limit
+            .entry((record.account.clone(), record.k.clone(), record.m.clone()))
+            .or_default();
+        let same = kept
+            .iter()
+            .copied()
+            .find(|index| same_window(&windows[*index], &hosted));
         let Some(index) = same else {
+            kept.push(windows.len());
             windows.push(hosted);
             continue;
         };
@@ -405,6 +429,57 @@ pub(super) fn file_lines(bytes: &[u8]) -> Vec<&[u8]> {
         lines.pop();
     }
     lines
+}
+
+/// One month file a read takes in: its path, its host and its name.
+struct MonthFile {
+    path: std::path::PathBuf,
+    host: String,
+    file: String,
+}
+
+/// Read every file of `files` ([`read_file`]), one result per file in the
+/// order of `files`. The files are parsed side by side on up to as many
+/// threads as the machine runs at once: a year of history is dozens of month
+/// files, and parsing them is most of a statistics page's time. A machine
+/// that cannot say how many threads it runs reads them on this thread.
+fn read_files<R: Record>(files: &[MonthFile], range: &Range) -> Vec<Result<Read<R>, HistoryError>> {
+    let read_one = |month: &MonthFile| {
+        let mut part = Read {
+            records: Vec::new(),
+            warnings: Vec::new(),
+        };
+        read_file::<R>(
+            &month.path,
+            &month.host,
+            &month.file,
+            range,
+            &mut part.records,
+            &mut part.warnings,
+        )
+        .map(|()| part)
+    };
+    let threads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(files.len());
+    if threads <= 1 {
+        return files.iter().map(read_one).collect();
+    }
+    let per_thread = files.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = files
+            .chunks(per_thread)
+            .map(|chunk| scope.spawn(move || chunk.iter().map(read_one).collect::<Vec<_>>()))
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| match worker.join() {
+                Ok(parts) => parts,
+                // A worker only parses; a panic there is a bug, and it stays one.
+                Err(panic) => std::panic::resume_unwind(panic),
+            })
+            .collect()
+    })
 }
 
 fn read_file<R: Record>(
@@ -1194,6 +1269,133 @@ mod tests {
         let folder = root.join(host);
         fs::create_dir_all(&folder).expect("the host folder");
         fs::write(folder.join("host.json"), "{\"machineId\":\"test\"}").expect("the host marker");
+    }
+
+    /// A torn line at the end of a month file of `host`.
+    fn tear(root: &Path, host: &str, file: &str) {
+        use std::io::Write as _;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(root.join(host).join(file))
+            .expect("open the month file");
+        file.write_all(b"{\"t\":\"2026-1").expect("a torn line");
+    }
+
+    /// The files of a read are parsed side by side, yet the read answers as if
+    /// it went through them one after the other: the records sorted by time and
+    /// host, every file's warnings in the order of the hosts and their months,
+    /// and of two broken files the first one is the error.
+    #[test]
+    fn a_read_of_many_files_answers_in_file_order() {
+        let dir = tempdir().expect("a temp history");
+        let root = dir.path();
+        let hosts = ["atlas", "orion", "vega"];
+        let months = ["2026-08", "2026-09", "2026-10", "2026-11"];
+        for host in hosts {
+            host_folder(root, host);
+            let history = HistoryDir::at(root, host);
+            for month in months {
+                // The same instants on every host, so the hosts decide the order.
+                let samples: Vec<Sample> = (1..=3)
+                    .map(|day| Sample {
+                        t: utc(&format!("{month}-0{day}T09:00:00Z")),
+                        account: account(),
+                        src: super::super::Source::Poll,
+                        l: Vec::new(),
+                    })
+                    .collect();
+                history.append_many(&samples).expect("the samples");
+                tear(root, host, &format!("samples-{month}.jsonl"));
+            }
+        }
+
+        let read = HistoryDir::at(root, "atlas")
+            .read::<Sample>(&Range::ALL, &Hosts::All)
+            .expect("the read");
+
+        let order: Vec<(DateTime<Utc>, String)> = read
+            .records
+            .iter()
+            .map(|hosted| (hosted.record.t, hosted.host.clone()))
+            .collect();
+        let mut sorted = order.clone();
+        sorted.sort();
+        assert_eq!(order, sorted);
+        assert_eq!(order.len(), hosts.len() * months.len() * 3);
+        let named: Vec<String> = read
+            .warnings
+            .iter()
+            .map(|warning| warning.split(" line ").next().unwrap_or("").to_string())
+            .collect();
+        let expected: Vec<String> = hosts
+            .iter()
+            .flat_map(|host| {
+                months
+                    .iter()
+                    .map(move |month| format!("{host}/samples-{month}.jsonl"))
+            })
+            .collect();
+        assert_eq!(named, expected);
+
+        // Two files that are more than 1 % broken: the first one in file order
+        // is the error, whichever thread parsed it.
+        for (host, month) in [("orion", "2026-09"), ("vega", "2026-08")] {
+            fs::write(
+                root.join(host).join(format!("samples-{month}.jsonl")),
+                "not json\n",
+            )
+            .expect("a broken file");
+        }
+        let error = HistoryDir::at(root, "atlas")
+            .read::<Sample>(&Range::ALL, &Hosts::All)
+            .expect_err("a broken file is an error");
+        assert!(
+            error.to_string().contains("orion") && error.to_string().contains("2026-09"),
+            "{error}"
+        );
+    }
+
+    /// Two windows of one account that end at the same moment, one per kind:
+    /// the finished windows keep the order they were read in.
+    #[test]
+    fn windows_that_end_together_keep_their_read_order() {
+        let end = utc("2026-11-07T19:00:00Z");
+        let window = |k: LimitKind, m: Option<&str>, host: &str| Hosted {
+            host: host.to_string(),
+            record: WindowRecord {
+                account: account(),
+                k,
+                m: m.map(str::to_string),
+                start: Some(end - Duration::days(7)),
+                end,
+                final_percent: 40.0,
+                lost: Some(60.0),
+                last_sample: end - Duration::minutes(2),
+                plan: Some("Max".to_string()),
+                uncertain: false,
+                reset: false,
+                from: None,
+            },
+        };
+        let records = vec![
+            window(LimitKind::WeeklyScoped, Some("Fable"), "atlas"),
+            window(LimitKind::WeeklyAll, None, "atlas"),
+            window(LimitKind::WeeklyScoped, Some("Fable"), "vega"),
+            window(LimitKind::WeeklyAll, None, "vega"),
+        ];
+
+        let kinds: Vec<(LimitKind, String)> = finished_of(records)
+            .into_iter()
+            .map(|hosted| (hosted.record.k, hosted.host))
+            .collect();
+
+        assert_eq!(
+            kinds,
+            vec![
+                (LimitKind::WeeklyScoped, "atlas".to_string()),
+                (LimitKind::WeeklyAll, "atlas".to_string()),
+            ]
+        );
     }
 
     /// Host atlas saw the drop before the reset time and wrote a reset window

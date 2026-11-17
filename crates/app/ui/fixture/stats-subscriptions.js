@@ -10,6 +10,7 @@ import {
   chosenAccounts,
   expiredMoney,
   fixtureValues,
+  mockWeek,
   round1,
   round2,
   sum,
@@ -122,7 +123,11 @@ export function whatIf(query, without) {
   const mock = WHAT_IF[account.abbr];
   const windows = indexes.filter((index) => account.used[index] !== null);
   const allWindows = account.used.filter((value) => value !== null).length;
-  const blockedHours = round1(sum(indexes.map((index) => mock.weekly[index])));
+  // The mock-up's twelve weeks; a made-up earlier week of the year variant
+  // (`?fixture=stats-year`) doubles its blocked hours without the account.
+  const weeklyOf = (index) =>
+    index < mockWeek(0) ? round1(BLOCKED[index] * 2) : mock.weekly[index - mockWeek(0)];
+  const blockedHours = round1(sum(indexes.map(weeklyOf)));
   const blockedHoursWas = round1(sum(indexes.map((index) => BLOCKED[index])));
   const expiredWas = round2(
     sum(
@@ -133,14 +138,19 @@ export function whatIf(query, without) {
       )
     )
   );
+  // An account without a finished week in the range stands for a range too
+  // young to replay: like the Rust page, no replayed number and no weeks.
+  const replayed = windows.length > 0;
   return {
     without: account.id,
-    blockedHours: windows.length > 0 ? blockedHours : null,
+    blockedHours: replayed ? blockedHours : null,
     blockedHoursWas,
-    expired: windows.length > 0 ? round2(mock.expired * (windows.length / allWindows)) : null,
+    expired: replayed ? round2(mock.expired * (windows.length / allWindows)) : null,
     expiredWas,
-    savedPrice: windows.length > 0 ? round2(weeklyPrice(account) * windows.length) : null,
-    sentence: mock.sentence,
-    weekly: indexes.map((index) => [weekIso(index), BLOCKED[index], mock.weekly[index]]),
+    savedPrice: replayed ? round2(weeklyPrice(account) * windows.length) : null,
+    sentence: replayed ? mock.sentence : "Not enough history yet to replay this.",
+    weekly: replayed
+      ? indexes.map((index) => [weekIso(index), BLOCKED[index], weeklyOf(index)])
+      : [],
   };
 }

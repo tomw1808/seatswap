@@ -16,15 +16,47 @@ const VIEW_ABBRS = ["PR", "LB", "AC"];
 export const HISTORY_START = "2026-08-17T08:14:00Z";
 export const HISTORY_BYTES = 4_812_288;
 
+// `?fixture=stats-fresh`: a new install's frame, a history with no reading and
+// no switch yet. The Statistics area shows its one "No statistics yet" note.
+function statsFresh() {
+  return (
+    typeof location !== "undefined" &&
+    new URLSearchParams(location.search).get("fixture") === "stats-fresh"
+  );
+}
+
+// `?fixture=stats-year`: a year of history. 41 made-up weeks come before the
+// mock-up's twelve, so the ranges "12 mo" and "All" show 52 and 53 weeks (the
+// charts' check at many columns). The mock-up's weeks keep their numbers:
+// `mockWeek(n)` is the index of its week n (0 = 17 Aug, 11 = 2 Nov).
+function statsYear() {
+  return (
+    typeof location !== "undefined" &&
+    new URLSearchParams(location.search).get("fixture") === "stats-year"
+  );
+}
+
+const YEAR_WEEKS = statsYear() ? 41 : 0;
+
+export function mockWeek(n) {
+  return YEAR_WEEKS + n;
+}
+
+// The made-up weeks' values, oldest first: `valueOf(k)` for k = 0..40.
+function yearValues(valueOf) {
+  return Array.from({ length: YEAR_WEEKS }, (_, k) => valueOf(k));
+}
+
 export function statsFrame() {
+  if (statsFresh()) return { hosts: ["atlas"], historyStart: null, historyBytes: 0 };
   return {
     hosts: ["atlas", "vega"],
-    historyStart: HISTORY_START,
+    historyStart: YEAR_WEEKS > 0 ? `${WEEKS[0]}T08:14:00Z` : HISTORY_START,
     historyBytes: HISTORY_BYTES,
   };
 }
 
-export const WEEKS = [
+const MOCK_WEEKS = [
   "2026-08-17",
   "2026-08-24",
   "2026-08-31",
@@ -39,6 +71,15 @@ export const WEEKS = [
   "2026-11-02",
 ];
 
+export const WEEKS = [
+  ...yearValues((k) =>
+    new Date(Date.parse(`${MOCK_WEEKS[0]}T00:00:00.000Z`) - (YEAR_WEEKS - k) * 7 * DAY)
+      .toISOString()
+      .slice(0, 10)
+  ),
+  ...MOCK_WEEKS,
+];
+
 // data.py's ACC, in the mock-up's ORDER (LB, AC, PR). The id is the built-in
 // snapshot's view id for the abbreviation, filled in before an answer is built.
 export const ACCOUNTS = [
@@ -48,7 +89,10 @@ export const ACCOUNTS = [
     label: "Lab",
     plan: "Max",
     price: 180,
-    used: [100, 100, 96, 100, 100, 88, 74, 81, 69, 92, 94, 97],
+    used: [
+      ...yearValues((k) => Math.min(100, 64 + ((k * 37) % 43))),
+      100, 100, 96, 100, 100, 88, 74, 81, 69, 92, 94, 97,
+    ],
     now: 40,
     resetDay: 7,
     resetHour: 17,
@@ -57,9 +101,12 @@ export const ACCOUNTS = [
     id: null,
     abbr: "AC",
     label: "Acme",
-    plan: "Team 5x",
+    plan: "Team Premium",
     price: 140,
-    used: [91, 100, 100, 97, 100, 72, 58, 64, 49, 71, 91, 93],
+    used: [
+      ...yearValues((k) => Math.min(100, 52 + ((k * 23) % 53))),
+      91, 100, 100, 97, 100, 72, 58, 64, 49, 71, 91, 93,
+    ],
     now: 48,
     resetDay: 7,
     resetHour: 2,
@@ -70,7 +117,10 @@ export const ACCOUNTS = [
     label: "Private",
     plan: "Ultra",
     price: 360,
-    used: [null, null, null, null, null, 61, 83, 77, 90, 68, 88, 90],
+    used: [
+      ...yearValues(() => null),
+      null, null, null, null, null, 61, 83, 77, 90, 68, 88, 90,
+    ],
     now: 70,
     resetDay: 5,
     resetHour: 19,
@@ -103,14 +153,20 @@ export function viewOrder() {
   });
 }
 
-export const BLOCKED = [11, 14, 8, 12, 9, 1, 0, 0.5, 0, 1, 0.5, 0];
-const SW_YOU = [9, 11, 8, 10, 9, 6, 5, 6, 4, 6, 2, 1];
-export const SW_AUTO = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 19, 22];
-const SW_AGENT = [0, 0, 0, 0, 0, 0, 1, 0, 2, 0, 0, 0];
+export const BLOCKED = [
+  ...yearValues((k) => [0, 3, 0, 9, 14, 1, 0, 27, 6, 0, 0.5][k % 11]),
+  11, 14, 8, 12, 9, 1, 0, 0.5, 0, 1, 0.5, 0,
+];
+const SW_YOU = [...yearValues((k) => 5 + (k % 6)), 9, 11, 8, 10, 9, 6, 5, 6, 4, 6, 2, 1];
+export const SW_AUTO = [...yearValues(() => 0), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 19, 22];
+const SW_AGENT = [...yearValues(() => 0), 0, 0, 0, 0, 0, 0, 1, 0, 2, 0, 0, 0];
 
 // Output tokens (millions) of all accounts together, data.py's 68.9 in week 11
 // and 44.8 in week 8.
-export const OUT_M = [58.0, 61.5, 55.2, 66.4, 64.1, 70.8, 72.6, 79.4, 44.8, 88.0, 110.3, 68.9];
+export const OUT_M = [
+  ...yearValues((k) => 40 + ((k * 13) % 29)),
+  58.0, 61.5, 55.2, 66.4, 64.1, 70.8, 72.6, 79.4, 44.8, 88.0, 110.3, 68.9,
+];
 export const TOK_TOTAL = 840.0;
 export const API_TOTAL = 17100;
 export const API_PER_M = API_TOTAL / TOK_TOTAL;
@@ -211,7 +267,7 @@ export function usedMoney(account, index) {
 // window that used nothing, so the pages must not draw a 1 px part for it while
 // its total and tooltip still count it.
 const WEEK_WINDOWS = {
-  "LB:11": [
+  [`LB:${mockWeek(11)}`]: [
     {
       used: 62,
       start: "2026-11-02T17:00:00.000Z",
@@ -227,7 +283,7 @@ const WEEK_WINDOWS = {
       reset: false,
     },
   ],
-  "LB:10": [
+  [`LB:${mockWeek(10)}`]: [
     {
       used: 94,
       start: "2026-10-26T17:00:00.000Z",
@@ -283,17 +339,20 @@ export function resetEnd(account, index) {
 }
 
 function rangeIndexes(range) {
+  const all = WEEKS.map((_, index) => index);
   switch (range) {
     case "thisWeek":
-      return [11];
+      return [mockWeek(11)];
     case "lastWeek":
-      return [10];
+      return [mockWeek(10)];
     case "days30":
-      return [7, 8, 9, 10, 11];
+      return [7, 8, 9, 10, 11].map(mockWeek);
     case "days90":
+      return all.slice(-13);
     case "months12":
+      return all.slice(-52);
     case "all":
-      return WEEKS.map((_, index) => index);
+      return all;
     default:
       throw new Error(`unknown range ${JSON.stringify(range)}`);
   }
@@ -400,7 +459,19 @@ export function expiredByAccount(indexes, chosen) {
 export function marksOf(indexes) {
   const first = weekTime(indexes[0]);
   const end = weekTime(indexes[indexes.length - 1]) + 7 * DAY;
+  // The year adds marks in neighbouring weeks, whose labels would touch.
+  const year =
+    YEAR_WEEKS > 0
+      ? [
+          { at: `${WEEKS[0]}T00:00:00.000Z`, label: "LB, AC added" },
+          { at: "2026-03-02T00:00:00.000Z", label: "auto-burn on" },
+          { at: "2026-03-09T00:00:00.000Z", label: "auto-burn off" },
+          { at: "2026-03-16T00:00:00.000Z", label: "auto-burn on" },
+          { at: "2026-09-14T00:00:00.000Z", label: "auto-burn off" },
+        ]
+      : [];
   return [
+    ...year,
     { at: "2026-09-21T00:00:00.000Z", label: "PR added" },
     { at: "2026-10-26T00:00:00.000Z", label: "auto-burn on" },
   ].filter((mark) => {

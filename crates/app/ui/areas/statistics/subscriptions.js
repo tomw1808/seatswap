@@ -23,7 +23,7 @@ import {
   valueTip,
   weekdayIndex,
 } from "../../common.js";
-import { bars, lines } from "../../charts.js";
+import { bars, lines, timeAxis } from "../../charts.js";
 
 const VERDICT_LABELS = {
   mostlyUnused: "Mostly unused",
@@ -32,7 +32,8 @@ const VERDICT_LABELS = {
   tooEarly: "Too early",
 };
 
-const DAY = 86400000;
+// What a row without a finished weekly window in the range is missing.
+const NO_WEEK_YET = "no finished week yet in this range";
 
 function verdictTag(verdict) {
   const label = VERDICT_LABELS[verdict];
@@ -96,20 +97,13 @@ export async function show(container, env) {
     firstTick.setHours(0, 0, 0, 0);
     while (firstTick.getTime() < start) firstTick.setDate(firstTick.getDate() + 1);
     while (weekdayIndex(firstTick) !== 0) firstTick.setDate(firstTick.getDate() + 1);
-    for (let time = firstTick.getTime(); time <= end; time += 7 * DAY) {
-      ticks.push(time);
+    // Every Monday is a tick; the chart's axis fit shows those that fit. A
+    // week is counted in calendar days, so a clock change keeps the Monday.
+    for (const tick = new Date(firstTick); tick.getTime() <= end; tick.setDate(tick.getDate() + 7)) {
+      const time = tick.getTime();
+      ticks.push({ at: time, text: shortDate(new Date(time)), left: `${xOf(time)}%` });
     }
-    const stride = Math.max(1, Math.ceil(ticks.length / 13));
-    for (const [index, time] of ticks.entries()) {
-      if (index % stride !== 0) continue;
-      axisTrack.appendChild(
-        h("span", {
-          class: "stats-gantt-tick",
-          style: { left: `${xOf(time)}%` },
-          text: shortDate(new Date(time)),
-        })
-      );
-    }
+    timeAxis(axisTrack, ticks);
     axis.appendChild(axisTrack);
     periodsBody.appendChild(axis);
 
@@ -215,18 +209,23 @@ export async function show(container, env) {
     node.appendChild(h("span", { class: "mf", text: shortDate(row.since) }));
     node.appendChild(h("span", { class: "n", text: String(row.weeks) }));
     const average = h("span", { class: "stats-sub-cell-wide" });
-    const bar = h("span", { class: "stats-ubar" });
-    if (typeof row.avgUsed === "number") {
-      if (!Number.isFinite(row.avgUsed) || row.avgUsed < 0) {
-        throw new Error(`the average used ${String(row.avgUsed)} is not a percent`);
+    if (row.weeks === 0) {
+      // No finished week: the bar's place says so instead of an empty bar.
+      average.appendChild(h("span", { class: "mf", text: NO_WEEK_YET }));
+    } else {
+      const bar = h("span", { class: "stats-ubar" });
+      if (typeof row.avgUsed === "number") {
+        if (!Number.isFinite(row.avgUsed) || row.avgUsed < 0) {
+          throw new Error(`the average used ${String(row.avgUsed)} is not a percent`);
+        }
+        // A window above 100 % exists (C3-2): the bar is full, the number beside
+        // it is written as it is.
+        bar.appendChild(
+          h("i", { style: { width: `${Math.min(100, row.avgUsed)}%`, background: color } })
+        );
       }
-      // A window above 100 % exists (C3-2): the bar is full, the number beside
-      // it is written as it is.
-      bar.appendChild(
-        h("i", { style: { width: `${Math.min(100, row.avgUsed)}%`, background: color } })
-      );
+      average.appendChild(bar);
     }
-    average.appendChild(bar);
     node.appendChild(average);
     node.appendChild(
       h("span", {
@@ -249,7 +248,9 @@ export async function show(container, env) {
     } else {
       node.appendChild(h("span", { class: "n" }, [amountNode(row.expired, currency)]));
     }
-    node.appendChild(h("span", { class: "n", text: `${row.fullWeeks} of ${row.weeks}` }));
+    node.appendChild(
+      h("span", { class: "n", text: row.weeks === 0 ? "—" : `${row.fullWeeks} of ${row.weeks}` })
+    );
     node.appendChild(
       h("span", {
         class: "n",
@@ -268,7 +269,11 @@ export async function show(container, env) {
     api.appendChild(apiValue);
     api.appendChild(document.createTextNode(` · × ${times}`));
     node.appendChild(api);
-    node.appendChild(h("span", {}, [verdictTag(row.verdict)]));
+    const verdict = verdictTag(row.verdict);
+    if (row.verdict === "tooEarly") {
+      verdict.title = `a verdict needs 4 finished weeks; this account has ${row.weeks} in the range`;
+    }
+    node.appendChild(h("span", {}, [verdict]));
     node.addEventListener("click", () => void selectRow(row));
     node.addEventListener("keydown", (event) => {
       if (event.key !== "Enter" && event.key !== " ") return;
@@ -338,7 +343,7 @@ export async function show(container, env) {
       kpi(
         "Saved on the price",
         amountNode(what.savedPrice, currency),
-        "in this range",
+        row.weeks === 0 ? NO_WEEK_YET : "in this range",
         "Saved on the price | the paid money of this account's weeks of the range"
       )
     );
@@ -349,11 +354,11 @@ export async function show(container, env) {
 
     const charts = h("div", { class: "stats-whatif-charts" });
 
+    const blockedBlock = h("div", { class: "stats-whatif-chart" });
+    blockedBlock.appendChild(
+      h("p", { class: "stats-detail-label", text: "Blocked hours per week" })
+    );
     if (what.weekly.length > 0) {
-      const blockedBlock = h("div", { class: "stats-whatif-chart" });
-      blockedBlock.appendChild(
-        h("p", { class: "stats-detail-label", text: "Blocked hours per week" })
-      );
       const name = accountNameText(env.accounts, row.id);
       blockedBlock.appendChild(
         bars({
@@ -378,17 +383,26 @@ export async function show(container, env) {
           ],
         })
       );
-      charts.appendChild(blockedBlock);
     } else {
-      charts.appendChild(emptyLine("no week in the range"));
+      // A refused replay has no weeks; the sentence beside the numbers says why.
+      blockedBlock.appendChild(
+        emptyLine(
+          what.blockedHours === null
+            ? "not replayed yet, so nothing to compare"
+            : "no week in the range"
+        )
+      );
     }
+    charts.appendChild(blockedBlock);
 
     const tokensBlock = h("div", { class: "stats-whatif-chart stats-whatif-tokens" });
     tokensBlock.appendChild(
       h("p", { class: "stats-detail-label", text: "Output tokens per percent of the week" })
     );
     if (row.tokensPerPercent.length === 0) {
-      tokensBlock.appendChild(emptyLine("no account week in this range"));
+      tokensBlock.appendChild(
+        emptyLine(row.weeks === 0 ? NO_WEEK_YET : "no week with use in this range")
+      );
     } else {
       const view = accountView(env.accounts, row.id);
       tokensBlock.appendChild(

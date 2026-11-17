@@ -588,7 +588,7 @@ mod tests {
             color: color.to_string(),
             email: Some(format!("{}@example.com", abbr.to_ascii_lowercase())),
             org_name: Some("Lumen Bay".to_string()),
-            plan: Some("Team 5x".to_string()),
+            plan: Some("Team Premium".to_string()),
             price: None,
             price_currency: None,
             oauth_account: OAuthAccount(serde_json::Map::new()),
@@ -1152,7 +1152,7 @@ mod tests {
             EventKind::PlanChanged {
                 account: reference(LB_UUID),
                 from: Some("Team".to_string()),
-                to: Some("Team 5x".to_string()),
+                to: Some("Team Premium".to_string()),
             },
         );
         let before = fs::read(fixture.store.app_paths().accounts_file()).expect("the file");

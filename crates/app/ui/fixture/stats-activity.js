@@ -19,7 +19,9 @@ import { ACT_PATTERN } from "./stats-rhythm.js";
 // Activity (spec §3.9; mock_activity.py)
 // ---------------------------------------------------------------------------
 
-const ACT_START = Date.parse("2026-08-17T00:00:00.000Z");
+// The first week of the fixture's history (17 Aug; earlier with
+// `?fixture=stats-year`). A shift by whole weeks keeps every hour's data.
+const ACT_START = Date.parse(`${WEEKS[0]}T00:00:00.000Z`);
 const ACT_NOW = Date.parse("2026-11-12T10:00:00.000Z");
 const ACT_NOW_HOUR = (ACT_NOW - ACT_START) / HOUR;
 const ACT_FIRST = ACT_NOW_HOUR - 168;
@@ -268,11 +270,6 @@ function activityWaited(indexes) {
 const ACT_WHAT_IT_SHOWS =
   "Two nights with work on atlas. vega is used on three evenings and at the weekend.";
 
-// The note an hour carries when the known sessions show more Ollama tokens
-// than Ollama reported (Review Focus 5): the same words as `activity.rs`.
-const ACT_OLLAMA_NOTE =
-  "sessions show more Ollama tokens than Ollama reported for this hour";
-
 // The known sessions on Ollama models in a UTC hour: the `:cloud` part of
 // every host's lane, summed over every host (the Ollama line is the whole
 // account's, so the page's host filter does not narrow it).
@@ -282,68 +279,42 @@ function actOllamaTracked(hour) {
   return tracked;
 }
 
-// Ollama's own use: a deterministic line per working hour. The known sessions
-// are the `:cloud` tokens the lanes carry, so the tooltip names sessions the
-// page shows; the total is therefore always at least the tracked figure,
-// except at 10:00 UTC where it is smaller on purpose (the note, no rest). At
-// 15:00 UTC the hour has known sessions but no Ollama figure. `withLine` is
-// false for `?fixture=noollama`: no Ollama line at all.
-function actOllamaHour(hour, withLine) {
+// What Ollama counted in an hour beyond the known sessions, as `activity.rs`
+// sums it: a deterministic line per working hour, always at least the tracked
+// figure, except at 10:00 UTC where it is smaller on purpose (the hour adds
+// nothing, never a negative). At 15:00 UTC the hour has known sessions but no
+// Ollama line, so it adds nothing either. `withLine` is false for
+// `?fixture=noollama`: no Ollama line at all.
+function actOllamaOther(hour, withLine) {
   const tracked = actOllamaTracked(hour);
-  if (!withLine || tracked <= 0) {
-    return { total: null, tracked, other: null, note: null };
-  }
+  if (!withLine || tracked <= 0) return 0;
   const clock = new Date(ACT_START + hour * HOUR).getUTCHours();
-  // An hour with known sessions but no Ollama line (seatswap was off, or no
-  // Ollama account was configured): no other value and no note.
-  if (clock === 15) {
-    return { total: null, tracked, other: null, note: null };
-  }
-  // An hour in which the known sessions used more than Ollama reported: no
-  // other value, never a negative, and the note.
+  if (clock === 15) return 0;
   if (clock === 10) {
     if (tracked <= 1200) {
       throw new Error(`the fixture's 10:00 hour has only ${tracked} tracked tokens`);
     }
-    return { total: tracked - 1200, tracked, other: null, note: ACT_OLLAMA_NOTE };
+    return 0;
   }
   const reported = tracked + Math.round(tracked * 0.9) + 900;
-  return { total: reported, tracked, other: reported - tracked, note: null };
+  return reported - tracked;
 }
 
+// The page's Ollama note: the sum over the UTC hours of the page's range.
 function activityOllama(indexes) {
   const withLine = !noOllamaWanted();
-  const hours = [];
-  for (let step = 0; step < 168; step += 1) {
-    const hour = ACT_FIRST + step;
-    const entry = actOllamaHour(hour, withLine);
-    hours.push({
-      t: new Date(ACT_START + hour * HOUR).toISOString(),
-      total: entry.total,
-      tracked: entry.tracked,
-      other: entry.other,
-      note: entry.note,
-    });
-  }
   const start = weekTime(indexes[0]);
   const end = Math.min(ACT_NOW, weekTime(indexes[indexes.length - 1]) + 7 * DAY);
   let otherTokens = 0;
-  let hoursWithoutFigure = 0;
-  let moreTrackedHours = 0;
-  let reportedHours = 0;
   for (
     let hour = Math.ceil((start - ACT_START) / HOUR);
     hour < ACT_NOW_HOUR;
     hour += 1
   ) {
     if (ACT_START + hour * HOUR >= end) break;
-    const entry = actOllamaHour(hour, withLine);
-    if (entry.total !== null) reportedHours += 1;
-    if (entry.total === null && entry.tracked > 0) hoursWithoutFigure += 1;
-    if (entry.total !== null && entry.tracked > entry.total) moreTrackedHours += 1;
-    if (entry.other !== null) otherTokens += entry.other;
+    otherTokens += actOllamaOther(hour, withLine);
   }
-  return { hours, otherTokens, hoursWithoutFigure, moreTrackedHours, reportedHours };
+  return { otherTokens };
 }
 
 // A 30-character host name for the wrapping check (`?fixture=longhost`).
@@ -362,7 +333,7 @@ function longHostsWanted() {
 }
 
 // `?fixture=noollama`: the page of a user without an Ollama line, so the
-// Ollama KPI, lane and legend entry must not appear.
+// Ollama note under the hour chart must not appear.
 function noOllamaWanted() {
   if (typeof location === "undefined" || typeof URLSearchParams !== "function") return false;
   try {

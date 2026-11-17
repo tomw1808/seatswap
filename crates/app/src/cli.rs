@@ -3505,7 +3505,7 @@ pub(crate) mod tests {
         assert_eq!(added.len(), 1, "{events:?}");
         assert_eq!(added[0]["account"]["acc"], json!(FIRST_ACCOUNT_UUID));
         assert_eq!(added[0]["account"]["org"], json!(FIRST_ORG_UUID));
-        assert_eq!(added[0]["plan"], json!("Team 5x"));
+        assert_eq!(added[0]["plan"], json!("Team Premium"));
 
         // Saving the same login again is an update, not a second account.
         fixture
@@ -3638,7 +3638,7 @@ pub(crate) mod tests {
     }
 
     /// The account that is switched away from had a stale plan and the live
-    /// login says "Team 5x": the change belongs in the history, written by the
+    /// login says "Team Premium": the change belongs in the history, written by the
     /// code that records the events of this path.
     #[test]
     fn a_changed_plan_is_written_to_the_history_when_the_account_is_switched_away() {
@@ -3646,7 +3646,7 @@ pub(crate) mod tests {
         fixture.add_account(0);
         fixture.write_live(1);
         fixture.add_account(1);
-        // The live account's stored plan is stale; its login says "Team 5x".
+        // The live account's stored plan is stale; its login says "Team Premium".
         let store = fixture.store();
         let mut file = store.load().expect("accounts");
         let live = file
@@ -3676,7 +3676,7 @@ pub(crate) mod tests {
                 .expect("the live account")
                 .plan
                 .as_deref(),
-            Some("Team 5x"),
+            Some("Team Premium"),
             "the plan of the account is the login's"
         );
 
@@ -3693,7 +3693,7 @@ pub(crate) mod tests {
         assert_eq!(changed[0]["account"]["acc"], json!(SECOND_ACCOUNT_UUID));
         assert_eq!(changed[0]["account"]["org"], json!(SECOND_ORG_UUID));
         assert_eq!(changed[0]["from"], json!("Team"));
-        assert_eq!(changed[0]["to"], json!("Team 5x"));
+        assert_eq!(changed[0]["to"], json!("Team Premium"));
     }
 
     #[test]
@@ -3741,7 +3741,7 @@ pub(crate) mod tests {
             .expect("the switch line");
         assert!(added < switched, "{events:?}");
         assert_eq!(events[added]["account"]["acc"], json!(THIRD_ACCOUNT_UUID));
-        assert_eq!(events[added]["plan"], json!("Team 5x"));
+        assert_eq!(events[added]["plan"], json!("Team Premium"));
         assert_eq!(events[switched]["to"]["acc"], json!(FIRST_ACCOUNT_UUID));
     }
 

@@ -18,12 +18,13 @@ use crate::projects::ProjectId;
 use crate::transcripts::Tokens;
 
 use super::{
-    account_abbr, account_chosen, account_id, account_position, account_weeks_valued,
-    blocked_by_week, blocked_spans, hours_text, keep_warnings, lost_percent, money_at, money_of,
-    money_text, next_week_start, offered_money, percent_of_offered, percent_text,
-    previous_week_start, range_of, switch_counts, top_three, week_columns, week_lost_percent,
-    week_start, window_used, working_hours, working_rhythm, AccountWeek, Ctx, Query, RangeKey,
-    StatsError, SwitchCounts,
+    account_abbr, account_chosen, account_id, account_position, account_weeks_so_far,
+    account_weeks_valued, api_shares, blocked_by_week, blocked_spans, hours_text, keep_warnings,
+    lost_percent, money_at, money_of, money_text, next_week_start, offered_finished_money,
+    offered_money, percent_of_offered, percent_text, previous_week_start, range_of, record_chosen,
+    running_elsewhere, switch_counts, week_columns, week_lost_percent, week_start, window_midpoint,
+    window_used, working_hours, working_rhythm, AccountWeek, Ctx, Query, RangeKey, StatsError,
+    SwitchCounts,
 };
 
 /// The Weeks page: the grid of account weeks and the curves of the last 14
@@ -58,9 +59,13 @@ pub struct WeeksRow {
     /// that week. Every window of the account week is kept in the cell's
     /// `parts`, oldest first; `WeekCell::end` is the last window's end.
     pub cells: Vec<Option<WeekCell>>,
-    /// The percent of the account's newest sample whose weekly window is still
-    /// running; `None` without one.
+    /// The newest reading of the account's weekly window that is still
+    /// running ([`Valuer::running_windows`]), in percent; `None` without one.
     pub now_percent: Option<f64>,
+    /// The calendar week that running window counts in: the week of its
+    /// midpoint, which may be last week or next week. The page opens that
+    /// week's summary from the row's "now" cell. `None` without one.
+    pub now_week: Option<DateTime<Utc>>,
 }
 
 /// One finished account week as a grid cell.
@@ -112,8 +117,13 @@ pub struct WeekSummary {
     /// Money expired of the priced account weeks; `None` like
     /// `used_percent_of_paid`.
     pub expired: Option<f64>,
-    /// Why `used_percent_of_paid`, `used` and `expired` are `None`.
+    /// Why `used_percent_of_paid`, `used` and `expired` are `None`. For the
+    /// week that holds now without a window, the sentences of
+    /// [`running_elsewhere`] say in which week the running windows count.
     pub money_missing: Option<String>,
+    /// A window of the week still runs: its use is the use so far, and the
+    /// week has no change against the week before yet.
+    pub running: bool,
     /// The working hours blocked in the week.
     pub blocked_hours: f64,
     pub switches: SwitchCounts,
@@ -124,7 +134,9 @@ pub struct WeekSummary {
     pub per_account_percent: Vec<(String, f64)>,
     /// The expired share of the money the week's windows offered: `expired /
     /// offered × 100`, the same denominator as `used_percent_of_paid` and
-    /// Overview's Expired share; `None` like `used_percent_of_paid`.
+    /// Overview's Expired share, over the finished windows' offer only (a
+    /// running window has expired nothing yet); `None` when the week has no
+    /// finished, priced window.
     pub expired_percent_of_paid: Option<f64>,
     /// The projects' share in % of the week's API value, the three largest
     /// then `other`; empty when `values.api` is `None`.
@@ -136,8 +148,8 @@ pub struct WeekSummary {
     /// half names its currency.
     pub values: Values,
     /// The change of `used` against the week before, in percent; `None` when
-    /// the week itself has no priced account week (a running week has no
-    /// finished window) or the week before has none.
+    /// the week itself has no priced account week, is `running` (its use is
+    /// not complete), or the week before has none.
     pub used_change_percent: Option<f64>,
     /// At most three sentences, in the order the plan gives them.
     pub conclusion: Vec<String>,
@@ -231,6 +243,8 @@ pub(crate) fn weeks_in<Tz: TimeZone + Copy>(
         ctx.history.read_claude::<Sample>(&Range::ALL, &Hosts::All)
     })?;
     let recent_from = ctx.now - Duration::days(14);
+    // The running windows give each row its "now" cell and the week it opens.
+    let running_windows = valuer.running_windows(ctx.now);
 
     let mut rows = Vec::new();
     let mut recent = Vec::new();
@@ -245,8 +259,8 @@ pub(crate) fn weeks_in<Tz: TimeZone + Copy>(
             &reference,
             &week_starts,
             &finished,
-            &samples.records,
-            ctx.now,
+            &running_windows,
+            &ctx.zone,
         )?);
         recent.push(curve(
             account.id.clone(),
@@ -286,8 +300,8 @@ pub(crate) fn weeks_in<Tz: TimeZone + Copy>(
             &reference,
             &week_starts,
             &finished,
-            &samples.records,
-            ctx.now,
+            &running_windows,
+            &ctx.zone,
         )?);
         recent.push(curve(
             id,
@@ -316,15 +330,16 @@ pub(crate) fn weeks_in<Tz: TimeZone + Copy>(
 }
 
 /// One row of the grid: the account's cell of every column, the cell of the
-/// account week that `finished` holds for that week, and its running percent.
-fn row_for(
+/// account week that `finished` holds for that week, and its running window's
+/// newest percent and the week it counts in.
+fn row_for<Tz: TimeZone + Copy>(
     id: String,
     plan: Option<String>,
     reference: &AccountRef,
     week_starts: &[DateTime<Utc>],
     finished: &[AccountWeek],
-    samples: &[Hosted<Sample>],
-    now: DateTime<Utc>,
+    running_windows: &[WindowRecord],
+    zone: &Tz,
 ) -> Result<WeeksRow, StatsError> {
     let mut cells = Vec::with_capacity(week_starts.len());
     for start in week_starts {
@@ -336,11 +351,17 @@ fn row_for(
             None => None,
         });
     }
+    let running = running_windows
+        .iter()
+        .find(|window| &window.account == reference);
     Ok(WeeksRow {
         id,
         plan,
         cells,
-        now_percent: running_percent(samples, reference, now),
+        now_percent: running.map(|window| window.final_percent),
+        now_week: running
+            .and_then(window_midpoint)
+            .map(|midpoint| week_start(midpoint, zone)),
     })
 }
 
@@ -366,25 +387,6 @@ fn week_cell(week: &AccountWeek) -> Result<WeekCell, StatsError> {
         full: week.used >= 100.0,
         uncertain: week.window.uncertain,
     })
-}
-
-/// The percent of the account's newest sample at or before `now` whose
-/// `weekly_all` limit resets after `now`.
-fn running_percent(
-    samples: &[Hosted<Sample>],
-    reference: &AccountRef,
-    now: DateTime<Utc>,
-) -> Option<f64> {
-    samples
-        .iter()
-        .filter(|hosted| &hosted.record.account == reference && hosted.record.t <= now)
-        .filter_map(|hosted| {
-            let limit = hosted.record.limit(&LimitKind::WeeklyAll)?;
-            let reset = limit.r?;
-            (reset > now).then_some((hosted.record.t, limit.p))
-        })
-        .max_by_key(|(at, _)| *at)
-        .map(|(_, percent)| percent)
 }
 
 /// The account's weekly percent from `from` to `now`, a reset as a drop to 0.
@@ -455,23 +457,29 @@ pub fn week_summary<Tz: TimeZone + Copy>(
         ctx.accounts,
         ctx.warnings,
     )?;
-    let weeks = account_weeks_valued(ctx, &reading, q, &valuer)?;
+    // Every window, the running ones with their use so far: the week that
+    // holds a running window shows what it used up to now.
+    let weeks = account_weeks_so_far(ctx, &reading, q, &valuer)?;
 
     let mut used = 0.0;
     let mut offered = 0.0;
+    let mut offered_finished = 0.0;
     let mut expired = 0.0;
     let mut used_priced = false;
     let mut missing_reason: Option<String> = None;
+    let mut running = false;
     let mut percent_by_account: BTreeMap<AccountRef, f64> = BTreeMap::new();
     for account_week in weeks
         .iter()
         .filter(|account_week| account_week.week == week)
     {
+        running |= account_week.running;
         percent_by_account.insert(account_week.account.clone(), account_week.used);
         match money_of(account_week)? {
             Some(money) => {
                 used += money.used;
                 offered += offered_money(account_week, &money);
+                offered_finished += offered_finished_money(account_week, &money);
                 expired += money.expired;
                 used_priced = true;
             }
@@ -484,10 +492,16 @@ pub fn week_summary<Tz: TimeZone + Copy>(
     let money_missing = if used_priced {
         None
     } else {
-        Some(
-            missing_reason
-                .unwrap_or_else(|| "no finished, priced weekly window in this week".to_string()),
-        )
+        // A week without any window says why: for the week that holds now, in
+        // which week the running windows count.
+        Some(missing_reason.unwrap_or_else(|| {
+            let elsewhere = running_elsewhere(ctx, &week_range, q, &valuer);
+            if elsewhere.is_empty() {
+                "no priced weekly window in this week".to_string()
+            } else {
+                elsewhere.join(" ")
+            }
+        }))
     };
 
     let mut before = 0.0;
@@ -534,7 +548,7 @@ pub fn week_summary<Tz: TimeZone + Copy>(
         }
         let record = &hosted.record;
         let value = valuer.value(&hosted.host, record);
-        if !account_chosen(ctx, q, value.account.as_ref()) {
+        if !record_chosen(ctx, q, &value) {
             continue;
         }
         tokens += Tokens::from(record);
@@ -562,15 +576,7 @@ pub fn week_summary<Tz: TimeZone + Copy>(
     }
     let values = values.unwrap_or_else(|| Values::sum(&[]));
     // A share of nothing is no share: a week without API value lists none.
-    let top_projects = match values.api {
-        Some(total) if total > 0.0 => top_three(
-            by_project
-                .into_iter()
-                .filter_map(|(name, values)| values.api.map(|value| (name, value / total * 100.0)))
-                .collect(),
-        ),
-        _ => Vec::new(),
-    };
+    let top_projects = api_shares(by_project, &values);
 
     let mut per_account_percent: Vec<(String, f64)> = percent_by_account
         .iter()
@@ -582,15 +588,15 @@ pub fn week_summary<Tz: TimeZone + Copy>(
             .then_with(|| a.0.cmp(&b.0))
     });
 
-    let used_change_percent = if used_priced && before_priced && before != 0.0 {
+    let used_change_percent = if used_priced && !running && before_priced && before != 0.0 {
         Some((used - before) / before * 100.0)
     } else {
         None
     };
     let used_percent_of_paid = percent_of_offered(used, offered);
     // The same denominator as Overview's Expired share: the money the week's
-    // windows offered, one week's price for each of them.
-    let expired_percent_of_paid = percent_of_offered(expired, offered);
+    // finished windows offered, one week's price for each of them.
+    let expired_percent_of_paid = percent_of_offered(expired, offered_finished);
     let switches_total = u64::from(switches.user)
         + u64::from(switches.cli)
         + u64::from(switches.auto)
@@ -636,6 +642,7 @@ pub fn week_summary<Tz: TimeZone + Copy>(
         used: used_priced.then_some(used),
         expired: used_priced.then_some(expired),
         money_missing,
+        running,
         blocked_hours,
         switches,
         switches_total,
@@ -649,7 +656,8 @@ pub fn week_summary<Tz: TimeZone + Copy>(
     })
 }
 
-/// The account week of `week` with the largest expired share.
+/// The finished account week of `week` with the largest expired share; a
+/// running week has expired nothing yet and is not compared.
 fn most_expired(
     weeks: &[AccountWeek],
     week: DateTime<Utc>,
@@ -657,7 +665,7 @@ fn most_expired(
     let mut largest: Option<(f64, &AccountWeek)> = None;
     for account_week in weeks
         .iter()
-        .filter(|account_week| account_week.week == week)
+        .filter(|account_week| account_week.week == week && !account_week.running)
     {
         let share = week_lost_percent(account_week)?;
         if largest.is_none_or(|(best, _)| share > best) {
@@ -1085,12 +1093,15 @@ mod tests {
 
         let ac = &page.rows[1];
         assert_eq!(ac.id, tiny.ac().id);
-        assert_eq!(ac.plan.as_deref(), Some("Team 5x"));
+        assert_eq!(ac.plan.as_deref(), Some("Team Premium"));
         assert_eq!(ac.cells[0].as_ref().expect("AC's W1").used, 50.0);
         assert_eq!(ac.cells[1].as_ref().expect("AC's W2").used, 90.0);
 
         assert_eq!(lb.now_percent, Some(30.0));
         assert_eq!(ac.now_percent, Some(40.0));
+        // Both running windows have their middle in the week of 16 Nov.
+        assert_eq!(lb.now_week, Some(utc("2026-11-16T00:00:00Z")));
+        assert_eq!(ac.now_week, Some(utc("2026-11-16T00:00:00Z")));
         assert_eq!(page.blocked, vec![2.0, 0.0]);
     }
 
@@ -1130,7 +1141,7 @@ mod tests {
                 t: utc("2026-11-09T00:00:00Z"),
                 kind: EventKind::AccountAdded {
                     account: tiny.ac_ref(),
-                    plan: Some("Team 5x".to_string()),
+                    plan: Some("Team Premium".to_string()),
                 },
             })
             .expect("AC added");
@@ -1324,7 +1335,7 @@ mod tests {
         assert_eq!(summary.used_percent_of_paid, None);
         assert_eq!(
             summary.money_missing.as_deref(),
-            Some("no finished, priced weekly window in this week")
+            Some("no priced weekly window in this week")
         );
         assert_eq!(summary.blocked_hours, 0.0);
         assert_eq!(summary.switches, SwitchCounts::default());
@@ -1396,22 +1407,76 @@ mod tests {
         );
     }
 
-    /// A running week has no finished window, so it has no priced account week:
-    /// its money is missing with the reason, not a made-up zero, and it has no
-    /// change against the week before.
+    /// The running week counts its windows' use so far: LB at 30 % of 180 EUR
+    /// and AC at 40 % of 140 EUR a month, each offering one week's price. It
+    /// has expired nothing yet, so it has no expired share, no "came closest
+    /// to expiring" sentence and no change against the week before.
     #[test]
-    fn a_running_week_has_no_change() {
+    fn a_running_week_counts_its_use_so_far() {
         let tiny = tiny();
         let summary = week_summary(&tiny.ctx(), &all(), utc("2026-11-16T00:00:00Z")).unwrap();
 
-        assert_eq!(summary.used, None);
-        assert_eq!(summary.expired, None);
-        assert_eq!(summary.used_percent_of_paid, None);
+        let lb_week = 180.0 * 12.0 / 52.0;
+        let ac_week = 140.0 * 12.0 / 52.0;
+        let used = 0.30 * lb_week + 0.40 * ac_week;
+        assert!(summary.running);
+        assert!(close(summary.used.expect("the used money"), used));
+        assert_eq!(summary.expired, Some(0.0));
+        assert!(close(
+            summary.used_percent_of_paid.expect("the used share"),
+            used / (lb_week + ac_week) * 100.0
+        ));
+        assert_eq!(summary.expired_percent_of_paid, None);
+        assert_eq!(summary.money_missing, None);
         assert_eq!(
-            summary.money_missing.as_deref(),
-            Some("no finished, priced weekly window in this week")
+            summary.per_account_percent,
+            vec![(tiny.lb().id.clone(), 30.0), (tiny.ac().id.clone(), 40.0)]
         );
         assert_eq!(summary.used_change_percent, None);
+        assert!(
+            summary
+                .conclusion
+                .iter()
+                .all(|sentence| !sentence.contains("expir")),
+            "a running week has expired nothing: {:#?}",
+            summary.conclusion
+        );
+    }
+
+    /// On Monday 23 Nov 01:00 both running windows (resets 23 Nov 02:00 and
+    /// 17:00) have their middle in last week: the summary of this week says so
+    /// instead of showing an empty week.
+    #[test]
+    fn this_week_without_a_window_says_where_the_running_ones_count() {
+        let tiny = tiny();
+        let ctx = Ctx {
+            now: utc("2026-11-23T01:00:00Z"),
+            ..tiny.ctx()
+        };
+        let this_week = Query {
+            range: RangeKey::ThisWeek,
+            accounts: Vec::new(),
+            host: None,
+        };
+        let summary = week_summary(&ctx, &this_week, utc("2026-11-23T00:00:00Z")).unwrap();
+
+        assert!(!summary.running);
+        assert_eq!(summary.used, None);
+        assert!(summary.per_account_percent.is_empty());
+        assert_eq!(
+            summary.money_missing.as_deref(),
+            Some(
+                "The running weekly windows of AC and LB count in last week, \
+                 the week that holds their middle."
+            )
+        );
+        // Last week's summary holds them, with their use so far.
+        let last = week_summary(&ctx, &this_week, utc("2026-11-16T00:00:00Z")).unwrap();
+        assert!(last.running);
+        assert_eq!(
+            last.per_account_percent,
+            vec![(tiny.lb().id.clone(), 30.0), (tiny.ac().id.clone(), 40.0)]
+        );
     }
 
     /// An account no longer in the store keeps its row when it has a window in
@@ -1449,7 +1514,7 @@ mod tests {
         assert_eq!(page.rows[0].id, tiny.lb().id);
         let ac = &page.rows[1];
         assert_eq!(ac.id, ac_acc, "the id `account_id` gives a removed account");
-        assert_eq!(ac.plan.as_deref(), Some("Team 5x"));
+        assert_eq!(ac.plan.as_deref(), Some("Team Premium"));
         assert_eq!(shape(ac), expected, "AC's cells are as they were");
         assert_eq!(page.recent.len(), page.rows.len(), "curves stay with rows");
     }

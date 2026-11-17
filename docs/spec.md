@@ -223,7 +223,7 @@ Config folder (Rust `dirs` crate):
   "accounts": [
     { "id": "6f1c…", "accountUuid": "…", "organizationUuid": "…",
       "label": "Acme", "abbr": "AC", "color": "#3b82f6",
-      "email": "…", "orgName": "…", "plan": "Team 5x", "price": 180.0,
+      "email": "…", "orgName": "…", "plan": "Team Premium", "price": 180.0,
       "priceCurrency": "EUR",
       "oauthAccount": { "...": "copy of ~/.claude.json oauthAccount" },
       "addedAt": "2026-11-10T12:00:00Z", "lastUsedAt": "…" },
@@ -535,11 +535,29 @@ before the hold ends, exactly when S2 may switch. So the pop-up, `burn-next.json
 line never name a switch for "now" that auto-burn will not make yet. Early switching (S2) is on
 only when all of these hold:
 
-- every account auto-burn may use has learned rates, and the rhythm has a typical working hour;
+- every account auto-burn may use has rates (measured or assumed, below), and the rhythm has a
+  typical working hour;
 - the measured cost of a switch has at least 3 samples;
 - the eager plan blocks at least 0.5 typical working hours less than the lazy plan;
 - those saved hours are at least twice the extra switches' cost (extra switches × the measured
   cost of one switch, in working hours).
+
+**Rates, measured and assumed.** An account's rates say how many percent of its week (`c`) and of
+its 5 h window (`s`) one work unit costs. They are measured over the last 14 days from pairs of
+readings of one weekly window at most 6 h apart: the percent gained over the work done while the
+account was live. Work is the token records of Claude models only; a Codex or Ollama record uses
+no Claude account and counts neither here nor in the rhythm. A pair in which the account was live on no host is left out: a rise there comes
+from use seatswap does not see (claude.ai, the phone, a machine without seatswap). An account whose
+plan has a capacity (its rate-limit tier ends in `_<n>x`: Max and Team Premium 5, Ultra 20) does not
+wait for measurements: it starts from an assumed rate. At capacity 1 a week costs 1.235 % per work
+unit (measured on an Ultra account in November 2026), joined with the measurements of every account
+that has a capacity; an account of capacity `n` assumes that divided by `n`. The assumption weighs
+as much as 20 work units of the account's own measurement, so the measurement takes over as it
+grows. `s` is assumed the same way, but only from measured windows (there is no built-in value).
+An account without a capacity (Pro, Team Standard, any tier without a multiplier) has rates only
+once 20 work units of its own were measured. An account whose `s` is not known yet is planned
+without its 5 h limit; at 100 % it is still left. Nothing of this is shown in the pop-up: learning
+is never a message there. Statistics → Forecast names an account without any rates.
 
 While any of these is missing, auto-burn switches only when the active account is full. With
 `readSessions` off there are no work units: no rates are learned, the regime says `reading
@@ -585,8 +603,8 @@ minutes are not shown (`3d 4h`); `about 2h` keeps its word.
 
 - **The line under the switch:** `On PR until its week is full, about 2h. Then AC.`, `On AC until
   its 5h window is full, about 1h 30min. Then LB.`, `On PR for about 2h. Then AC, before PR is full.`
-  (the plan leaves PR before it fills), `On PR. No switch planned this week.` While rates are
-  missing: `Measuring how much work fits in AC, LB. Until then: switch only when full.`
+  (the plan leaves PR before it fills), `On PR. No switch planned this week.` The line never
+  speaks of learning: an account without rates is simply not planned to fill (§7.4.1).
 - **An automatic switch** (when `notifyOnSwitch` is on): `Auto-burn: now on PR. AC is full until
   14:40.` or `Auto-burn: now on PR: its week resets on Mon 02:00.`
 - **A suggestion** (auto-burn off): `Switch to AC now: its 5h window is open and its week resets
@@ -816,7 +834,7 @@ is asked there.
   `remaining_percent` and `resets_at`. They become a session and a week limit with
   `percent = 100 − remaining_percent`, like a Claude account; the card has no credits.
 - The account is named `ollama` under the organization `ollama`; the plan is empty.
-- Every successful `/api/usage?range=24h` answer's `buckets` also become the history's Ollama hours (§5); the Activity page draws them (§11.4).
+- Every successful `/api/usage?range=24h` answer's `buckets` also become the history's Ollama hours (§5); the Activity page names in one note how much they counted beyond the known sessions (§11.4).
 
 **What the card shows.** One card per switched-on provider, Codex first. A Codex card has the
 account card's rings and bars, the plan and a row per limit with its reset and its own name; a
@@ -1022,7 +1040,7 @@ They give real click handling and exact placement on those desktops. They're not
 | `lookUpPrices` | on | `bool`; whether seatswap may ask models.dev for API prices and Frankfurter for the dollar rate (§11.5). Off, neither host is contacted and `prices --refresh` refuses; stored values stay and API values are shown in USD. Settings → General, Money, "Look up prices and the dollar rate" |
 | `price` per account | none | **shared** (as `priceCurrency` with it). `null` or a number above 0: what the subscription costs per month, in `priceCurrency`; `Option<f64>`. Without one the account is left out of every sum in money and the page says so (§11.5). Settings → Accounts, column "Price / month" |
 | `priceCurrency` per account | none | `null` or three capital letters: the `currency` in effect when `price` was entered. A price counts only in that currency; a price entered before a currency was set has `null` and does not count (§11.5). Settings → Accounts, the price cell |
-| `plan` per account | from the login | read-only `Option<String>`: the identity's `planDisplayName`, else the capitalised `subscriptionType` with its level from `rateLimitTier` ("Team 5x"; a tier seatswap cannot read as a multiplier in parentheses, "Team (team_premium)"). Shown in the pop-up, Settings → Accounts and `seatswap list` |
+| `plan` per account | from the login | read-only `Option<String>`: the identity's `planDisplayName`, else Claude's current name for the login's `subscriptionType` and `rateLimitTier` (Claude renamed its plans: `max` with `_5x` is "Max", `max` with `_20x` is "Ultra", `team` with `_5x` is "Team Premium"), else the capitalised `subscriptionType` with its level from `rateLimitTier` ("Enterprise 20x"; a tier seatswap cannot read as a multiplier in parentheses, "Team (team_premium)"). Team Standard seats are not named yet: their tier value has not been seen. A stored label of seatswap 1.2.0 ("Team 5x", "Max 5x", "Max 20x") that gives way to the current name is saved, but it is no plan change: the history gets no `planChanged`. Shown in the pop-up, Settings → Accounts and `seatswap list` |
 | `agentsRead` | on | agents may run `list`, `status`, `burn plan`, `burn simulate`, `prices` and `history export` (§6.6, §7.7) |
 | `agentsSwitch` | off | agents may run `use` and `next` (§6.6); an agent's `next` does nothing while auto-burn is on (§7.8) |
 | `codexCard` | off | `bool`; show a read-only Codex card in the pop-up. While off, the card reads nothing and sends no usage request (§7.9). The Sessions area still reads Codex's rollout files while *Read sessions* is on. Settings → Providers, "Show a Codex card" |
@@ -1071,7 +1089,7 @@ The target is somewhere between the macOS Control Centre and Raycast: one floati
 - **Motion:** after a switch, the cards trade places with a 250 ms spring animation. The ticking reset countdowns ("1h 12min") update every minute without flicker. All animation is off when the system asks for reduced motion.
 - **Keyboard:** ↑/↓ moves between accounts, Enter switches, 1–9 switch directly, `,` opens the settings in the large window, Esc closes. The cursor (a blue ring) appears only with the first ↑/↓, starting from the account in use, and is gone again each time the pop-up opens; until then Enter does nothing. Clicking a card does not move it.
 
-**Sessions line.** In the footer next to "+ Add account" the pop-up reads `9 sessions · 2 busy · see the plan` (the mock-up shows it shorter: `3 sessions · 1 busy`), and while someone waits ` · 1 waiting for you` in the warning colour before the plan link. With `readSessions` off there is no line. When the session files cannot be read, their reason stands there muted instead; a newer Claude Code adds a small ⚠ whose tooltip is the warning text. The numbers do not depend on the pop-up being open. `9 sessions` opens the Sessions area; `1 waiting for you` opens Sessions at that session (`sessions?<id>`), and a waiting id the window cannot parse is refused with an error; `see the plan` opens Statistics at Forecast.
+**Sessions line.** In the footer next to "+ Add account" the pop-up reads `9 sessions · 2 busy · see the plan` (the mock-up shows it shorter: `3 sessions · 1 busy`), and while someone waits ` · 1 waiting for you` in the warning colour before the plan link. With `readSessions` off there is no line. When the session files cannot be read, their reason stands there muted instead; a newer Claude Code adds a small ⚠ whose tooltip is the warning text. The numbers do not depend on the pop-up being open. `9 sessions` opens the Sessions area; `1 waiting for you` opens Sessions at that session (`sessions?<id>`), and a waiting id the window cannot parse is refused with an error; `see the plan` opens Statistics at Forecast; it shows only while auto-burn has a plan. With no stored account the auto-burn line is `Save an account to start.`
 
 **The auto-burn line.** The line under the cards names every account it mentions as a chip in the account's colour, so a sentence like `On AC until its 5h window is full, about 1h 30min. Then LB.` shows `AC` and `LB` as chips. Where plain text is needed — the tray menu, a notification, the CLI — the same line is printed with each account's abbreviation and no chips.
 
@@ -1420,7 +1438,9 @@ Subscriptions · Forecast · Rhythm · Activity. Under them:
 - **The accounts**, as chips in their colours. A click takes an account out of every page; at least
   one stays chosen. While no chip is taken out the query names no account, which means every
   account the history knows, including one no longer stored. As soon as a chip is taken out the
-  query names the remaining stored accounts, so accounts no longer stored fall out too.
+  query names the remaining stored accounts, so accounts no longer stored fall out too. Work of
+  another provider (Codex, Ollama models) uses no Claude account, so the chips never take it out:
+  a page that shows project work always counts it (§11.5).
 - **The host**, when the history holds more than one: All hosts, or one. Every page except Forecast
   follows it. A missing host list is a banner, and the pages still show every host.
 
@@ -1432,7 +1452,15 @@ The range, the excluded chips, the host and the tab are remembered. The address 
 been recording since {date}.` with the date as `Mon 9 Nov`. This is one marker from `stats::empty`,
 the same on every page except Forecast. The Forecast is a plan for every account and host, not a
 range; without a reading of every account it says `the forecast needs a reading of every account
-first` instead.
+first` instead, and while auto-burn waits for the first reading of some accounts it goes on `: AC has
+none yet; it comes with the next usage poll` (`AC, PR have none yet; they come …`).
+
+**A new install.** While the history holds no reading and no switch yet, the area shows one note
+instead of any page: `No statistics yet`, then `Save your first account in
+the pop-up. Statistics start with its first usage reading.` (with accounts: `Statistics start with
+the first usage reading, which comes with the next usage poll.`) and `Then Activity and Rhythm fill
+in as you work, the weekly numbers once a first weekly window has ended.` It ends by itself with the
+first reading. A history whose accounts were all removed since stays on show.
 
 **Definitions every page uses.**
 
@@ -1453,6 +1481,13 @@ first` instead.
   the latest last reading is kept. One window seen by two hosts is counted once. A week can hold more than one window — an
   early reset splits one, and two ordinary windows can share a week — and each is placed by its own
   midpoint. Every statistics page reads this one shared list.
+- **A running window.** Each account's weekly window that runs now is the one of its newest weekly
+  reading whose reset still lies ahead. It starts seven days before that reset; its use so far is
+  the newest reading minus `from`, the reading a reset began it at. It is placed by its midpoint
+  like a finished window, so it never moves to another week when it ends; that midpoint can lie in
+  last week or next week. Where a page counts it (the Weeks page), it offers one week's price like
+  any window, it has expired nothing yet, and its week is marked "so far". Overview's history counts
+  finished windows only; its This-week card shows the running ones.
 - **The price of a window** is the account's monthly price at the window's midpoint: the last
   `PriceChanged` at or before it, or the first change when the midpoint lies before all of them, or
   the stored price when there is no change. It counts only in the currency it was entered in, as in
@@ -1465,7 +1500,9 @@ first` instead.
   is `final − from` (`from` absent = 0), and a week's used money is the sum of its windows' use at
   one week's price. A window above 100 % therefore expired nothing; in a week with a reset, used and
   expired money together can be more than one week's price, because the reset gave a fresh window.
-  The Used and Expired shares divide by the offered money, never by the one-week paid money. A week
+  The Used and Expired shares divide by the offered money, never by the one-week paid money: the
+  Used share by the offered money of every window counted (on Weeks a running one too), the Expired
+  share by the finished windows' offered money only, so it does not shrink while a window runs. A week
   without a price is left out of every money sum — the account's other, priced weeks still count —
   and the Overview and Subscriptions pages name that account under "No price for …".
 - **Blocked hours.** A block is counted only while its account was the account in use on that host,
@@ -1481,7 +1518,28 @@ first` instead.
   the pop-up), *cli* (`seatswap use`), *auto* (auto-burn), *agent* (a call by an agent), and
   *external* (a change seatswap noticed but did not make).
 
-**Overview.** Five numbers for the range:
+**Overview.** On top stands the card **This week · so far** ("each account's current weekly window,
+by project"). It ignores the range: it always shows the weekly windows running now, so a new install
+sees its use from the first reading on. It shows also when the range holds nothing: then
+"Nothing recorded yet." stands below it instead of the rest of the page. One row per chosen account with a running window, in the
+stored accounts' order: the account and its plan, a bar from 0 to 100 % whose filled part is the use
+so far split into the projects' pieces, then `27 % · 14.20 EUR` (the use so far and its money at the
+window's price; `—` with the reason without a price) and `resets Thu 10:00`. When a reset began the
+window, its tooltip says the newest reading and the reading it began at. A project's piece is its
+share of the account's API value in the window, from the window's start to now: the three largest,
+then *other*. Only token records of Claude models count in an account's row, and the host filter
+applies to them. After the account rows comes one row per other provider (Codex, Ollama) with token
+records in the current calendar week: a neutral tag with the provider's name, a thinner, faded bar
+whose project pieces span its whole width (there is no limit to fill, so it never reads as a share
+of a limit used), then `34.10 EUR at API prices` (`—` with the reason when a model has no price)
+and `since Mon`. Its records are those from Monday 00:00 local time to now; the host filter applies,
+the account chips do not. Its tooltip says `Codex this week: no subscription price yet, valued at
+API prices`. A line below names the projects with their share of the API value over all listed
+accounts and providers together. Before the first usage reading the card says `No usage reading
+yet: this card fills in with the next usage poll.`, followed by the provider rows when there are
+any.
+
+Everything below counts **finished weekly windows only**: five numbers for the range,
 
 - **Used**: the money used of the priced account weeks, with the money paid for them below it; its
   percent is the used money over the money the windows offered, one week's price per window, so a
@@ -1503,7 +1561,9 @@ subscription value among the projects (the three largest, the rest as *other*). 
 stand under each week, and the marks say when an account was added and when auto-burn was switched
 on or off. Beside them, "Share that expired, per week" is one line: the expired money over the money
 the week's windows offered, by the same rule as the Expired share; a week without a priced week has
-no point. "What the numbers say"
+no point. When no weekly window of the range has finished yet, the chart card says `No weekly window
+has finished in this range yet. The card above shows the running ones.` instead of a chart; the
+numbers stay. A project's colour is the same on the card and in the chart. "What the numbers say"
 holds at most four sentences, in this order, each only when it has data:
 
 1. `{abbr} is where most money expired: {amount} in {n} weeks.` — the account with the largest
@@ -1525,7 +1585,15 @@ with another part. One curve per stored account shows its weekly percent over th
 reset is a drop to 0 at the earlier window's reset when that lies between two readings, else at the
 later reading, and the curve carries a `now` mark and, when the history starts after its first point,
 `history from 16 Nov · no subscription value before`. The page opens on the summary of the newest
-finished week of the range when it has one.
+finished week of the range, or the running week's when no week has finished.
+
+The running week: the grid's `now` column holds each account's newest percent; a click on it opens
+the summary of the week its running window counts in (the week of its midpoint, which may be last
+week or next week). That summary counts the running window's use so far, is tagged `so far` and
+names its first number `Used so far`; its change against the week before is `—` while the window
+runs. The summary of the week that holds now, when no window counts in it, says in which week the
+running windows count: `The running weekly windows of AC and LB count in last week, the week that
+holds their middle.` (`AC's running weekly window counts in …` for one).
 
 - **The summary of a week** (a click on a week's date): used as a percent of the money the week
   offered (one week's price per window) and in money (a reset week's use can push the percent past
@@ -1555,7 +1623,12 @@ under it when it has more than one. A folder is the first path part below the pr
 that host (the common parent of the project's folders), or the top folder. The second view is the
 plain folder tree without organization rows; either view opens and closes its rows. Every row shows
 its tokens, its share of the page's API value, its subscription value and API value, a bar split by
-account in the accounts' colours, and its distinct sessions. The matrix's `Used` footer repeats the
+account in the accounts' colours, and its distinct sessions. Work of another provider (Codex,
+Ollama) belongs to no account: it is a faded neutral part at the end of the bar, and the row's name
+carries a neutral tag with the provider's name, whose tooltip reads `Codex · 12 % of this project's
+API value · no subscription price yet`. It counts in the row's API value and share, never in a
+subscription value or a matrix cell, and the page notes `Codex and Ollama work is valued at API
+prices only; it uses no Claude account.` (naming the providers present). The matrix's `Used` footer repeats the
 column totals, each the sum of the cells above it; a share whose API value or whose page total is
 unknown is `—` with the reason, never `0 %`. A project's detail gives its share of all use
 (`21.9 % of all use · 18 sessions`) and the line `API values at 1 USD = 0.9048 EUR (13 Nov)`, or
@@ -1575,14 +1648,18 @@ unknown is `—` with the reason, never `0 %`. A project's detail gives its shar
 - **Tokens per percent** of each account is its output tokens of its finished weeks over the sum of
   those weeks' use (each week's windows summed). A fall means use that left no transcript, such as
   claude.ai, the phone, Claude Desktop or a host without the shared history. The page says that such
-  use is in the percent but in no project, and how many tokens have no known account at all.
+  use is in the percent but in no project, and how many tokens of Claude models have no known
+  account at all (another provider's tokens are not among them: they use no account).
 - The page also names the models whose API value is missing because they have no price, and the
   tokens that have no subscription value with the reasons. It does not merge two projects with the
   same name: their keys differ.
 
 **Subscriptions.** One bar per subscription period that overlaps the range: from the account's
-`AccountAdded` (or its first record) to its `AccountRemoved`, split at every plan and price change.
-A period that still runs has no end; its price is the price at the period's start. The rows follow,
+`AccountAdded` (or its first record) to its `AccountRemoved`, split at every plan change and every
+price change. An account's start and each plan change begin with a price not known yet, unless one is
+set at that moment: the first price set later during that plan is its price from its start, so a
+price typed in minutes after adding an account or changing its plan makes no separate period. Two
+adjacent periods with the same plan and price are one. A period that still runs has no end. The rows follow,
 one per account, stored accounts first and accounts no longer stored after them:
 
 | Column | What it is |
@@ -1605,8 +1682,11 @@ one per account, stored accounts first and accounts no longer stored after them:
   reports fewer hours than were recorded. It shows the hours blocked instead of the recorded number,
   the money expired instead of the recorded expired money, the money paid for that account's weeks
   of the range ("saved on the price"), one sentence, and the blocked hours per week as it was and
-  without the account. Expired money is `recorded + (replay without − replay with)`; a week with no
-  price is left out. Without enough history — no learned rate for an account with a reading in the
+  without the account. Expired money is counted per finished window of every other account: its
+  recorded expired percent plus the week's shift for that account (replay without − replay with,
+  added to its last window ending in that week), priced with the window rule, so a window at or
+  above 100 % expires nothing and no window expires less than nothing. The dropped account's own
+  windows do not exist without it and count 0. A week with no price is left out. Without enough history — no learned rate for an account with a reading in the
   range — it says `Not enough history yet to replay this.`, gives no replayed number, and keeps the
   recorded numbers beside the sentence. A reading from an account the store no longer holds refuses
   the replay too: `{abbr} is no longer stored, so this range cannot be replayed.`
@@ -1635,7 +1715,7 @@ weeks of history that plan reads. Below it:
   so is a negative gain (a drop after a model reset is not use); with fewer than four gains there is
   no low.
 - **The sentence**: while an account auto-burn may use has no rates it starts
-  `Still learning how fast {abbrs} is used. ` Then either `Enough for the week.`, or
+  `Still learning how fast {abbrs} is used. ` (`are` for more than one) Then either `Enough for the week.`, or
   `All accounts full from {weekday HH:MM} to the end of the forecast.`, or
   `All accounts full from {weekday HH:MM} until {abbr} resets {weekday HH:MM}.` when the gap ends at
   that account's reset, else `All accounts full from {weekday HH:MM} until {abbr} is usable again
@@ -1665,20 +1745,23 @@ An hour's tooltip holds its output tokens per model, its sessions and the projec
 the strip below each lane shows how many sessions worked in that hour. On top stand the boxes:
 **Tokens**, the range's output tokens summed over the hosts with each host's below it; **Their
 value**, the subscription value and the API value summed over the hosts; **Per working hour**, with
-the highest hour; and, only when Ollama reported an hour in the range, **Other Ollama use** —
-Ollama's input + output of an hour minus the tokens of the known sessions on Ollama models
-(`…:cloud`) in that same UTC hour, counted over every host whatever the host filter, with a note for
-hours without an Ollama figure and for hours where the sessions used more than Ollama reported (such
-an hour has no rest). Then **What it shows**: a sentence about the last 7 days — `2 nights with
+the highest hour. Then **What it shows**: a sentence about the last 7 days — `2 nights with
 work on atlas.` for the first host with work before 05:00, and each other host's evenings and
 weekend use; with none of those, `No night work, evening or weekend use stands out in the last 7
-days.` The lanes carry no agent data, so it never claims an agent ran. Per host the page also counts
+days.`; with no hour of work at all, `No work recorded in the last 7 days.` The Per week table lists
+no row when the range holds no token record; it says `no work recorded in the range`. The lanes carry no agent data, so it never claims an agent ran. Per host the page also counts
 hours working, on but idle, off and not known, and its tokens and two values. A switch picks what
 the hour bars measure: tokens (per model) · subscription value · API value (the two values exist per
 hour only); in the subscription view the chart marks `history from 16 Nov · no subscription value
 before`. The chart is as tall as the mock-up's, its host names wrap instead of being cut, and it has
-no row labels. Ollama's hours are UTC hours, each placed in the local hour cell where its UTC hour
-starts; the Ollama line has its own colour and a legend entry `other Ollama use`. Below the lanes:
+no row labels. The chart tracks what seatswap sees: one lane per host, and Ollama's account total
+is never a lane of its own. When Ollama counted more than the known sessions, one muted line under the
+lanes, inside the chart's card, says so: `Ollama counted {tokens} more tokens in this range than the
+sessions seatswap saw (other machines, apps or Ollama's website).` The number sums, over the UTC hours
+whose start is inside the range, Ollama's input + output of the hour (its largest line across hosts,
+never a sum) minus the input + output of the known sessions on Ollama models (`…:cloud`) in that same
+UTC hour, counted over every host whatever the host filter; an hour where the sessions used more than
+Ollama reported adds nothing, never a negative. With 0, or no Ollama line, there is no note. Below the lanes:
 output tokens per day for the last 14 days, one bar per host. The card below has two tabs, *Per week*
 and *Largest sessions*, and its switch sits inside the card's frame, which lines up with the card
 above. *Per week*: one row per calendar week with its working hours per host, tokens and their two
@@ -1751,7 +1834,10 @@ model and effort the payload names; the account's abbreviation, colour, plan and
 live account's. The text and the colours come from
 `statusline_preview`, the command's own renderer (§7.6): the preview and the real line are one
 implementation. The preview is requested again with every new reading, and 150 ms after the last
-change. Without a live login the preview shows the command's error instead of a line.
+change. Without any login yet (a first run) the page asks for no preview and shows an information
+line: `No Claude login yet. Log in to Claude Code once and save the account in the pop-up; the preview
+then shows its numbers.` Any other failure, such as an ended login, shows the command's error instead
+of a line.
 
 **The presets.** *My current line* (what the script of §5.1 printed; the stored default), *Limits
 only* and *Everything*. A layout that equals none of them shows *Custom layout*. Choosing a preset
@@ -1902,7 +1988,7 @@ or this machine:
 | What | Request | When |
 |---|---|---|
 | API prices | `GET https://models.dev/api.json`, with `If-None-Match: <etag>` when a list is stored | at the tray app's start, then every hour while `lookUpPrices` is on; on a Money setting's save; and with `seatswap prices --refresh` |
-| The dollar rate | `GET https://api.frankfurter.dev/v1/latest?base=USD&symbols=<currency>` | at the tray app's start and then in the hourly round, once per Frankfurt day; on working days from 16:00 to 18:00 Frankfurt time while the stored rate is older than today, every 30 minutes until the answer carries today's date or it is 18:00, then not again that day. Only when `lookUpPrices` is on and the currency is set and not `USD` |
+| The dollar rate | `GET https://api.frankfurter.dev/v1/latest?base=USD&symbols=<currency>` | at every start of the tray app (even when today's rate is stored), at once when the settings change (a save here, or a currency shared from another host), and then in the hourly round, once per Frankfurt day; on working days from 16:00 to 18:00 Frankfurt time while the stored rate is older than today, every 30 minutes until the answer carries today's date or it is 18:00, then not again that day. Only when `lookUpPrices` is on and the currency is set and not `USD` |
 
 "Not modified" only moves `checkedAt`; the stored prices stay. The 16:00–18:00 asks are Frankfurt
 time, computed from UTC with the EU summer-time rule (the last Sunday of March and of October at
@@ -1928,8 +2014,14 @@ the account has no price, or when the week's used part or its API value is unkno
   `<name>:<tag>-cloud` → `ollama-cloud/<name>:<tag>`, any other id (Codex's) → `openai/<id>`. A model
   with no price stays unpriced, with the model named.
   The value in the currency is that USD amount times the rate of the record's day.
-- A token record belongs to the account that the history's live and switch events say was in use on
-  its host at its time.
+- A token record belongs to its model's provider: `claude-*` is Claude's, an Ollama cloud id
+  (`<name>:cloud`, `<name>:<tag>-cloud`) Ollama's, any other id Codex's — the same rule as the
+  price key. A Claude record belongs to the account that the history's live and switch events say
+  was in use on its host at its time. A Codex or Ollama record belongs to its provider and to no
+  Claude account, whichever account was live: it is valued at API prices, its subscription value is
+  a known 0 until 1.3 brings provider prices, it never counts as a record without a known account,
+  and the account chips never filter it out. Auto-burn's work units (the rhythm, the rates and the
+  cost of a switch, §2.3) count Claude records only.
 - The value of a subscription for a week: the week's used money, split among the account's token
   records of that week in proportion to their API value. A record's subscription value is `its API
   USD / the week's API USD × used money`. A record whose model is not on the Claude plan (its id does

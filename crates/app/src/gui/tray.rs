@@ -825,6 +825,7 @@ mod tests {
             providers: Vec::new(),
             settings: Some(Settings::default()),
             claude_config_dir: String::new(),
+            claude_not_set_up: false,
         }
     }
 }

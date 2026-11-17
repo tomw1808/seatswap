@@ -94,6 +94,12 @@
   overflow-wrap: anywhere;
 }
 
+/* Why a week has no money (e.g. where its running windows count), under the
+   numbers and in line with them. */
+.stats-detail-body > .stats-note {
+  padding: 6px 0 2px;
+}
+
 .stats-detail-label {
   margin: 7px 0 2px;
   color: var(--muted);
@@ -194,6 +200,12 @@
   border-radius: 5px;
   font-size: 10px;
   white-space: nowrap;
+}
+
+/* The summary of a week whose window still runs: its numbers are so far. */
+.stats-tag-running {
+  color: var(--muted);
+  border: 1px dashed var(--border-strong);
 }
 
 .stats-tag-warn {

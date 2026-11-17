@@ -184,6 +184,18 @@ function shortDate(value) {
   return dateText(value).replace(/^\S+\s+/, "");
 }
 
+// "Oct": a month on a chart's time axis, in this computer's local time; a
+// January is named by its year ("2026"), so a year of weeks says where it
+// turns. A bad time is an error, never a made-up month.
+function monthText(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    throw new Error(`invalid time ${JSON.stringify(value)}`);
+  }
+  if (date.getMonth() === 0) return String(date.getFullYear());
+  return date.toLocaleDateString("en-GB", { month: "short" });
+}
+
 // A date as a Monday-first weekday index: 0 = Monday, 6 = Sunday. This is the
 // one place the statistics pages apply the week's Monday-first rule; they name
 // the day with `WEEKDAYS[index]`.
@@ -875,6 +887,28 @@ function accountName(views, id, className) {
   });
 }
 
+// The one provider tag of the window: a provider other than Claude (Codex,
+// Ollama) by its name, in the account tag's shape but neutral, since its work
+// uses no Claude account. `title` says what the tag stands for where it is.
+function providerName(name, title) {
+  if (typeof name !== "string" || name === "") {
+    throw new Error(`a provider tag needs the provider's name, not ${JSON.stringify(name)}`);
+  }
+  return h("span", { class: "stats-acc stats-provider", text: name, title });
+}
+
+// The account's stored plan beside its name, as the statistics rows write it;
+// "—" titled with why when the account has none.
+function accountPlan(views, id) {
+  const view = accountView(views, id);
+  const plan = view && typeof view.plan === "string" && view.plan !== "" ? view.plan : null;
+  return h("span", {
+    class: "stats-plan",
+    text: plan || "—",
+    title: plan ? undefined : "no plan stored for this account",
+  });
+}
+
 function bytesOf(value) {
   if (Array.isArray(value)) return value;
   if (value instanceof Uint8Array || value instanceof Uint8ClampedArray) return value;
@@ -1151,6 +1185,7 @@ export {
   shortPercent,
   clear,
   shortDate,
+  monthText,
   weekdayIndex,
   pad,
   kpi,
@@ -1190,6 +1225,8 @@ export {
   accountLabel,
   accountNameText,
   accountName,
+  accountPlan,
+  providerName,
   textInput,
   selectInput,
   switchControl,

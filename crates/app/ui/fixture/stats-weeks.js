@@ -9,12 +9,14 @@ import {
   DAY,
   HOUR,
   NOW_MS,
+  WEEKS,
   SW_AUTO,
   accountOut,
   chosenAccounts,
   fixtureMoney,
   fixtureValues,
   fixtureWholePercent,
+  mockWeek,
   resetEnd,
   round1,
   sum,
@@ -34,7 +36,7 @@ import {
 function recentCurve(account) {
   const start = NOW_MS - 14 * DAY;
   const points = new Map();
-  for (let index = 0; index <= 12; index += 1) {
+  for (let index = 0; index <= WEEKS.length; index += 1) {
     if (account.used[index] === undefined && index < ACCOUNTS[0].used.length) continue;
     if (account.used[index] === null) {
       // A week before the account existed: no window, so no point.
@@ -65,14 +67,32 @@ function recentCurve(account) {
     .map(([time, value]) => [new Date(time).toISOString(), value]);
 }
 
+// The calendar week that holds `time`, as an index of the fixture's weeks.
+function weekIndexOf(time) {
+  let index = 0;
+  while (weekTime(index + 1) <= time) index += 1;
+  return index;
+}
+
+// The week the running window counts in: the week of its middle, half a week
+// before its reset.
+function nowWeek(account) {
+  const running = weekIndexOf(NOW_MS);
+  const end = Date.parse(resetEnd(account, running));
+  return new Date(weekTime(weekIndexOf(end - 3.5 * DAY))).toISOString();
+}
+
+// Whether the fixture's week `index` holds its now: the running week.
+export function holdsNow(index) {
+  return weekTime(index) <= NOW_MS && NOW_MS < weekTime(index + 1);
+}
+
 export function weeks(query) {
   const { indexes, chosen } = chosenAccounts(query);
   return {
     weekStarts: indexes.map(weekIso),
     // The column that holds the fixture's now; its week has no finished window.
-    running: indexes.map(
-      (index) => weekTime(index) <= NOW_MS && NOW_MS < weekTime(index + 1)
-    ),
+    running: indexes.map(holdsNow),
     rows: chosen.map((account) => ({
       id: account.id,
       plan: account.plan,
@@ -92,6 +112,7 @@ export function weeks(query) {
         };
       }),
       nowPercent: account.now,
+      nowWeek: nowWeek(account),
     })),
     blocked: indexes.map((index) => BLOCKED[index]),
     recent: chosen.map((account) => ({ id: account.id, points: recentCurve(account) })),
@@ -103,9 +124,37 @@ export function usedPercentTotal(account, indexes) {
   return sum(indexes.map((index) => account.used[index] ?? 0));
 }
 
+// The summary of the week that holds the fixture's now, after its last
+// finished week: the running windows' use so far, nothing expired yet.
+function runningSummary(chosen, week) {
+  const used = sum(chosen.map((account) => (account.now / 100) * weeklyPrice(account)));
+  const offered = sum(chosen.map((account) => weeklyPrice(account)));
+  return {
+    week,
+    usedPercentOfPaid: offered > 0 ? (used / offered) * 100 : null,
+    used: offered > 0 ? used : null,
+    expired: offered > 0 ? 0 : null,
+    moneyMissing: offered > 0 ? null : "no priced weekly window in this week",
+    running: true,
+    blockedHours: 0,
+    switches: { user: 0, cli: 0, auto: 0, agent: 0, external: 0 },
+    switchesTotal: 0,
+    perAccountPercent: chosen.map((account) => [account.id, account.now]),
+    expiredPercentOfPaid: null,
+    topProjects: [],
+    tokens: tokenCounts(0),
+    values: fixtureValues(0, null),
+    usedChangePercent: null,
+    conclusion: ["No hour blocked."],
+  };
+}
+
 export function weekSummary(query, week) {
   const { indexes, chosen } = chosenAccounts(query);
   const index = indexes.find((candidate) => weekIso(candidate) === week);
+  if (index === undefined && holdsNow(weekIndexOf(Date.parse(week)))) {
+    return runningSummary(chosen, week);
+  }
   if (index === undefined) throw new Error(`week ${JSON.stringify(week)} is not in the chosen range`);
   const accounts = weekAccounts(index, chosen);
   const priced = chosen.filter((account) => account.used[index] !== null);
@@ -118,9 +167,10 @@ export function weekSummary(query, week) {
   const switches = switchesOf([index]);
   const out = sum(chosen.map((account) => accountOut(account, index)));
   const tokens = tokenCounts(out);
+  const running = holdsNow(index);
   const previous = index - 1;
   let usedChangePercent = null;
-  if (previous >= 0 && chosen.length > 0) {
+  if (!running && previous >= 0 && chosen.length > 0) {
     const before = sum(
       chosen
         .filter((account) => account.used[previous] !== null)
@@ -159,7 +209,7 @@ export function weekSummary(query, week) {
     }
   }
   if (SW_AUTO[index] > 0) {
-    const minutes = index === 11 ? 38 : index === 10 ? 19 : SW_AUTO[index];
+    const minutes = index === mockWeek(11) ? 38 : index === mockWeek(10) ? 19 : SW_AUTO[index];
     const count = SW_AUTO[index];
     conclusion.push(
       `Auto-burn held back ${count} planned ${count === 1 ? "switch" : "switches"}, ${minutes} ${
@@ -172,13 +222,14 @@ export function weekSummary(query, week) {
     usedPercentOfPaid: offered > 0 ? (used / offered) * 100 : null,
     used: offered > 0 ? used : null,
     expired: offered > 0 ? expired : null,
-    moneyMissing: offered > 0 ? null : "no finished, priced weekly window in this week",
+    moneyMissing: offered > 0 ? null : "no priced weekly window in this week",
+    running,
     blockedHours: BLOCKED[index],
     switches,
     switchesTotal:
       switches.user + switches.cli + switches.auto + switches.agent + switches.external,
     perAccountPercent: accounts.map((account) => [account.id, account.usedPercent]),
-    expiredPercentOfPaid: offered > 0 ? (expired / offered) * 100 : null,
+    expiredPercentOfPaid: !running && offered > 0 ? (expired / offered) * 100 : null,
     topProjects: topProjects(index, used, true),
     tokens,
     values: fixtureValues(out > 0 ? (out / 1000000) * API_PER_M : null, null),
@@ -205,10 +256,11 @@ function windowCurve(window, reachedAt) {
 // The mock-up's notes for the weeks its detail card shows; every other week
 // gets the note its numbers state.
 const NOTES = {
-  "LB:11": "Second week with auto-burn. 65 % expired at the reset on Monday 17:00.",
-  "AC:8": "51 % expired. All work that week went to PR and LB; AC was opened on two days only.",
-  "PR:5": "First week of this subscription.",
-  "LB:1": "AC was full that week too: 14h with no usable account.",
+  [`LB:${mockWeek(11)}`]: "Second week with auto-burn. 65 % expired at the reset on Monday 17:00.",
+  [`AC:${mockWeek(8)}`]:
+    "51 % expired. All work that week went to PR and LB; AC was opened on two days only.",
+  [`PR:${mockWeek(5)}`]: "First week of this subscription.",
+  [`LB:${mockWeek(1)}`]: "AC was full that week too: 14h with no usable account.",
 };
 
 function noteFor(account, index, window) {
@@ -248,11 +300,11 @@ export function windowDetail(query, accountId, end) {
   // A typical week holds 24 windows; LB's 26 Oct week is the demo of a week
   // that used more windows (12) than its usual working hours hold (8).
   const possibleSessionWindows =
-    account.abbr === "PR" ? null : account.abbr === "LB" && index === 10 ? 8 : 24;
+    account.abbr === "PR" ? null : account.abbr === "LB" && index === mockWeek(10) ? 8 : 24;
   const sessionWindowsUsed =
     possibleSessionWindows === null
       ? null
-      : account.abbr === "LB" && index === 10
+      : account.abbr === "LB" && index === mockWeek(10)
         ? 12
         : used > 0
           ? Math.round(used / (account.abbr === "AC" ? 8 : 10))

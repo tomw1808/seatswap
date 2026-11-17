@@ -95,7 +95,7 @@ function fixtureSampleValue(kind, segment, scenario) {
     case "account":
       return "AC";
     case "plan":
-      return "Team 5x";
+      return "Team Premium";
     case "fiveHourPercent":
       return scenario === "noSessionLimit" ? null : "12";
     case "fiveHourReset":

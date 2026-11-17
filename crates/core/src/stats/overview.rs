@@ -14,23 +14,23 @@ use crate::burn::{Rates, RATES_DAYS};
 use crate::history::{
     AccountRef, Event, EventKind, Hosted, Hosts, Range, Read, Sample, TokenRecord,
 };
-use crate::money::{Valuer, WindowMoney};
+use crate::live_sessions::Values;
+use crate::money::{Provider, Valuer, WindowMoney};
 use crate::projects::ProjectId;
 
 use super::{
     account_abbr, account_id, account_position, account_weeks_valued, accounts_without_price,
-    blocked_by_week, blocked_spans, date_text, hours_text, keep_warnings, money_of, money_text,
-    offered_money, percent_of_offered, percent_text, range_of, switch_counts, top_three,
-    week_columns, week_lost_percent, week_of_record, week_span, week_start, working_rhythm,
-    AccountWeek, Ctx, Query, StatsError, SwitchCounts,
+    add_opt_value, add_value, api_shares, blocked_by_week, blocked_spans, date_text, hours_text,
+    keep_warnings, money_of, money_text, offered_money, percent_of_offered, percent_text, range_of,
+    running_account_weeks, switch_counts, top_three, week_columns, week_lost_percent,
+    week_of_record, week_span, week_start, working_rhythm, AccountWeek, Ctx, Query, StatsError,
+    SwitchCounts,
 };
 
 /// The Overview page's numbers for one range (spec §3.1).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Overview {
-    /// The settings' currency; `None` until one is set.
-    pub currency: Option<String>,
     /// The accounts with at least one week left out of the money sums, in the
     /// order of [`Ctx::accounts`]: a week without a price is left out, while
     /// the account's priced weeks still count. An account no longer stored is
@@ -40,6 +40,75 @@ pub struct Overview {
     pub weeks: Vec<OverviewWeek>,
     pub marks: Vec<Mark>,
     pub findings: Vec<String>,
+}
+
+/// The This-week card on top of the Overview page ([`this_week_card`]): each
+/// chosen account's weekly window that runs now ([`running_account_weeks`]),
+/// the work of every other provider in the current calendar week, and what it
+/// all went to. The Overview's history below counts finished windows only.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThisWeek {
+    /// One per chosen account with a running weekly window, in the order of
+    /// [`Ctx::accounts`], an account no longer stored after them by id; empty
+    /// until the first usage reading.
+    pub accounts: Vec<ThisWeekAccount>,
+    /// One per other provider (Codex, Ollama) with token records in the
+    /// current calendar week, in [`Provider`]'s order.
+    pub providers: Vec<ThisWeekProvider>,
+    /// The API value of every listed account's running window and every
+    /// listed provider's week together by project, in percent of their total,
+    /// the three largest then `other` ([`api_shares`]).
+    pub projects: Vec<(String, f64)>,
+}
+
+/// One other provider's work on the This-week card: its token records from
+/// Monday 00:00 of the current calendar week ([`week_start`]) to now. It has
+/// no subscription price yet, so it is valued at API prices only, and it uses
+/// no Claude account, so the account chips do not filter it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThisWeekProvider {
+    /// [`Provider::name`]: `Codex` or `Ollama`.
+    pub name: String,
+    /// The records' API value, summed with [`Values::sum`]; `None` when a
+    /// record's is unknown.
+    pub api: Option<f64>,
+    /// The currency `api` is in: the settings' currency with a stored rate,
+    /// "USD" without one; `None` when `api` is.
+    pub api_currency: Option<String>,
+    /// Why `api` is `None`; `None` when it has a value.
+    pub api_missing: Option<String>,
+    /// The API value by project, in percent of `api`, the three largest then
+    /// `other` ([`api_shares`]); empty while the value is unknown or 0.
+    pub projects: Vec<(String, f64)>,
+}
+
+/// One account's running weekly window on the This-week card.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThisWeekAccount {
+    /// The account's id ([`account_id`]).
+    pub id: String,
+    /// The use so far in percent: the newest reading minus the reading a
+    /// reset began the window at (`stats::window_used`).
+    pub used: f64,
+    /// The newest reading's percent; above `used` when a reset began the
+    /// window.
+    pub now: f64,
+    /// The money of `used` at the window's price; `None` without a price.
+    pub money: Option<f64>,
+    /// Why `money` is `None`, in the words the week money uses; `None` when
+    /// it has a value.
+    pub money_missing: Option<String>,
+    /// The window's start ([`crate::history::WindowRecord::weekly_start`]).
+    pub started_at: DateTime<Utc>,
+    /// The window's reset.
+    pub resets_at: DateTime<Utc>,
+    /// The account's API value from `started_at` to now by project, in
+    /// percent of its total, the three largest then `other`
+    /// ([`api_shares`]); empty while the value is unknown or 0.
+    pub projects: Vec<(String, f64)>,
 }
 
 /// The five numbers of the page.
@@ -92,7 +161,8 @@ pub struct BlockedBefore {
     pub hours: f64,
 }
 
-/// One calendar week of the range, with the account weeks that fall in it.
+/// One calendar week of the range, with the finished account weeks that fall
+/// in it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OverviewWeek {
@@ -109,7 +179,7 @@ pub struct OverviewWeek {
     pub expired_share: Option<f64>,
 }
 
-/// One account's week as the Overview shows it.
+/// One account's finished week as the Overview shows it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WeekAccount {
@@ -123,8 +193,9 @@ pub struct WeekAccount {
     pub uncertain: bool,
 }
 
-/// A moment the page marks on its chart: an account was added, or auto-burn
-/// was switched on or off.
+/// What the page marks on its chart in one calendar week: the accounts added
+/// and the auto-burn switches of that week, in one label, at the first of them
+/// ([`week_marks`]).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Mark {
@@ -310,30 +381,7 @@ pub(crate) fn overview_in<Tz: TimeZone + Copy>(
             .projects = top_three(sums.into_iter().collect());
     }
 
-    let mut marks = Vec::new();
-    for hosted in &events.records {
-        let at = hosted.record.t;
-        if at < range.from || at >= range.to {
-            continue;
-        }
-        match &hosted.record.kind {
-            EventKind::AccountAdded { account, .. } => {
-                let label = account_abbr(ctx, account);
-                marks.push(Mark {
-                    at,
-                    label: format!("{label} added"),
-                });
-            }
-            EventKind::AutoBurnSet { on } => {
-                let label = if *on { "auto-burn on" } else { "auto-burn off" };
-                marks.push(Mark {
-                    at,
-                    label: label.to_string(),
-                });
-            }
-            _ => {}
-        }
-    }
+    let marks = week_marks(ctx, range, &events.records);
 
     let weeks: Vec<OverviewWeek> = weeks_by_start.into_values().collect();
     let mut findings = Vec::new();
@@ -358,12 +406,151 @@ pub(crate) fn overview_in<Tz: TimeZone + Copy>(
     }
 
     Ok(Overview {
-        currency,
         without_price,
         kpis,
         weeks,
         marks,
         findings,
+    })
+}
+
+/// The This-week card: the chosen accounts' running weekly windows, each with
+/// its use so far, its money and the projects its API value went to, from the
+/// window's start to now; and the work of every other provider (Codex,
+/// Ollama) from Monday 00:00 of the current calendar week to now, valued at
+/// API prices. The host filter applies to the token records, as the Weeks
+/// summary filters them; the range in `q` does not apply, so a range that
+/// holds no record still has the card. A Claude record counts in its
+/// account's running window; a record of another provider uses no account's
+/// week and is not filtered by the account chips.
+pub fn this_week_card<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
+    q: &Query,
+) -> Result<ThisWeek, StatsError> {
+    // A running weekly window began at most seven days back, and so did this
+    // calendar week's Monday.
+    let valuer = Valuer::build(
+        ctx.history,
+        &Range {
+            from: ctx.now - Duration::days(7),
+            to: ctx.now,
+        },
+        ctx.prices,
+        ctx.fx,
+        ctx.settings,
+        ctx.accounts,
+        ctx.warnings,
+    )?;
+    let running = running_account_weeks(ctx, q, &valuer);
+    let calendar_week = week_start(ctx.now, &ctx.zone);
+    let from = running
+        .iter()
+        .map(|week| week.window.weekly_start())
+        .fold(calendar_week, DateTime::min);
+    let tokens = keep_warnings(ctx.warnings, || {
+        ctx.history.read::<TokenRecord>(
+            &Range {
+                from: from.min(ctx.now),
+                to: ctx.now,
+            },
+            &Hosts::All,
+        )
+    })?;
+
+    // Each account's and each other provider's API value and its split by
+    // project, and the same over all of them together.
+    let mut by_account: BTreeMap<AccountRef, (Option<Values>, BTreeMap<String, Values>)> =
+        BTreeMap::new();
+    let mut by_provider: BTreeMap<Provider, (Option<Values>, BTreeMap<String, Values>)> =
+        BTreeMap::new();
+    let mut total: Option<Values> = None;
+    let mut by_project: BTreeMap<String, Values> = BTreeMap::new();
+    for hosted in &tokens.records {
+        if q.host.as_ref().is_some_and(|host| host != &hosted.host) {
+            continue;
+        }
+        let record = &hosted.record;
+        if record.t > ctx.now {
+            continue;
+        }
+        let value = valuer.value(&hosted.host, record);
+        let own = match value.provider {
+            Provider::Claude => {
+                let Some(account) = value.account.as_ref() else {
+                    continue;
+                };
+                let Some(week) = running.iter().find(|week| &week.account == account) else {
+                    continue;
+                };
+                if record.t < week.window.weekly_start() {
+                    continue;
+                }
+                by_account.entry(account.clone()).or_default()
+            }
+            provider => {
+                if record.t < calendar_week {
+                    continue;
+                }
+                by_provider.entry(provider).or_default()
+            }
+        };
+        let name = ctx
+            .projects
+            .of(&ProjectId::of(&record.project, &hosted.host))
+            .name;
+        let record_values = Values::of(std::slice::from_ref(&value), ctx.settings, ctx.fx, ctx.now);
+        add_opt_value(&mut own.0, &record_values);
+        add_value(&mut own.1, name.clone(), &record_values);
+        add_opt_value(&mut total, &record_values);
+        add_value(&mut by_project, name, &record_values);
+    }
+
+    let mut accounts = Vec::with_capacity(running.len());
+    for week in &running {
+        let money = money_of(week)?;
+        // An account without a token record in its window has no split yet.
+        let projects = match by_account.remove(&week.account) {
+            Some((Some(own_total), own_projects)) => api_shares(own_projects, &own_total),
+            _ => Vec::new(),
+        };
+        accounts.push(ThisWeekAccount {
+            id: account_id(ctx, &week.account),
+            used: week.used,
+            now: week.window.final_percent,
+            money: money.map(|money| money.used),
+            money_missing: week.price_missing.as_ref().map(ToString::to_string),
+            started_at: week.window.weekly_start(),
+            resets_at: week.window.end,
+            projects,
+        });
+    }
+    accounts.sort_by(|a, b| {
+        account_position(ctx, &a.id)
+            .cmp(&account_position(ctx, &b.id))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let providers = by_provider
+        .into_iter()
+        .filter_map(|(provider, (own_total, own_projects))| {
+            // Every provider in the map has at least one record.
+            let own_total = own_total?;
+            Some(ThisWeekProvider {
+                name: provider.name().to_string(),
+                api: own_total.api,
+                api_currency: own_total.api_currency.clone(),
+                api_missing: own_total.api_missing.clone(),
+                projects: api_shares(own_projects, &own_total),
+            })
+        })
+        .collect();
+    let projects = match total {
+        Some(total) => api_shares(by_project, &total),
+        None => Vec::new(),
+    };
+    Ok(ThisWeek {
+        accounts,
+        providers,
+        projects,
     })
 }
 
@@ -438,6 +625,74 @@ fn last_account_added<Tz: TimeZone + Copy>(
     latest
 }
 
+/// The chart's marks: one per calendar week that holds an `AccountAdded` or
+/// `AutoBurnSet` event of the range, at the week's first such event. The chart
+/// puts a mark at its week's column, so two marks of one week would print on
+/// top of each other; one mark names them all instead: the accounts added, in
+/// time order, as `PR, AC added`, then each auto-burn switch, joined by ` · `.
+fn week_marks<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
+    range: &Range,
+    events: &[Hosted<Event>],
+) -> Vec<Mark> {
+    let mut chosen: Vec<&Event> = events
+        .iter()
+        .map(|hosted| &hosted.record)
+        .filter(|event| range.from <= event.t && event.t < range.to)
+        .filter(|event| {
+            matches!(
+                event.kind,
+                EventKind::AccountAdded { .. } | EventKind::AutoBurnSet { .. }
+            )
+        })
+        .collect();
+    chosen.sort_by_key(|event| event.t);
+    /// One week's marked events: its first event's time, the accounts added
+    /// and the auto-burn switches, each in time order.
+    struct WeekEvents {
+        at: DateTime<Utc>,
+        added: Vec<String>,
+        auto_burn: Vec<&'static str>,
+    }
+    let mut weeks: BTreeMap<DateTime<Utc>, WeekEvents> = BTreeMap::new();
+    for event in chosen {
+        let week = weeks
+            .entry(week_start(event.t, &ctx.zone))
+            .or_insert_with(|| WeekEvents {
+                at: event.t,
+                added: Vec::new(),
+                auto_burn: Vec::new(),
+            });
+        match &event.kind {
+            EventKind::AccountAdded { account, .. } => {
+                let name = account_abbr(ctx, account);
+                if !week.added.contains(&name) {
+                    week.added.push(name);
+                }
+            }
+            EventKind::AutoBurnSet { on } => {
+                week.auto_burn
+                    .push(if *on { "auto-burn on" } else { "auto-burn off" });
+            }
+            _ => {}
+        }
+    }
+    weeks
+        .into_values()
+        .map(|week| {
+            let mut parts: Vec<String> = Vec::new();
+            if !week.added.is_empty() {
+                parts.push(format!("{} added", week.added.join(", ")));
+            }
+            parts.extend(week.auto_burn.into_iter().map(str::to_string));
+            Mark {
+                at: week.at,
+                label: parts.join(" · "),
+            }
+        })
+        .collect()
+}
+
 /// A week with no accounts yet.
 fn empty_week(week: DateTime<Utc>) -> OverviewWeek {
     OverviewWeek {
@@ -459,19 +714,15 @@ fn switch_cost_percent<Tz: TimeZone + Copy>(
     samples: &Read<Sample>,
     tokens: &Read<TokenRecord>,
 ) -> Option<f64> {
-    let mut learned: BTreeMap<AccountRef, Rates> = BTreeMap::new();
-    for account in ctx.accounts {
-        let reference = AccountRef::of(account);
-        if let Some(rates) = rates::rates(
-            &reference,
-            &samples.records,
-            &tokens.records,
-            &events.records,
-            range.to,
-        ) {
-            learned.insert(reference, rates);
-        }
-    }
+    let rate_accounts: Vec<rates::RateAccount> =
+        ctx.accounts.iter().map(rates::RateAccount::of).collect();
+    let learned: BTreeMap<AccountRef, Rates> = rates::rates(
+        &rate_accounts,
+        &samples.records,
+        &tokens.records,
+        &events.records,
+        range.to,
+    );
     let cost = switch_cost(
         &events.records,
         &samples.records,
@@ -689,7 +940,6 @@ mod tests {
         assert_eq!(page.kpis.switches.auto, 1);
         assert_eq!(page.kpis.switches.agent, 1);
         assert_eq!(page.kpis.switches.external, 0);
-        assert_eq!(page.currency.as_deref(), Some("EUR"));
         assert!(page.without_price.is_empty());
     }
 
@@ -955,7 +1205,7 @@ mod tests {
                 t: utc("2026-11-05T00:00:00Z"),
                 kind: EventKind::AccountAdded {
                     account: tiny.ac_ref(),
-                    plan: Some("Team 5x".to_string()),
+                    plan: Some("Team Premium".to_string()),
                 },
             })
             .expect("AC added");
@@ -967,6 +1217,517 @@ mod tests {
             .find(|mark| mark.label == "AC added")
             .expect("AC's mark");
         assert_eq!(mark.at, utc("2026-11-05T00:00:00Z"));
+    }
+
+    /// The fixture's running weekly windows on the This-week card: LB at 30 %
+    /// and AC at 40 %, each from its start to its reset, with the money of its
+    /// use so far at its price. No token record lies in them yet, so neither
+    /// has a project split.
+    #[test]
+    fn the_card_lists_the_running_windows() {
+        let tiny = tiny();
+        let card = this_week_card(&tiny.ctx(), &all()).unwrap();
+
+        let money: Vec<f64> = card
+            .accounts
+            .iter()
+            .map(|account| account.money.expect("a priced window"))
+            .collect();
+        assert_eq!(money.len(), 2);
+        assert!(
+            close(money[0], 0.30 * 180.0 * 12.0 / 52.0),
+            "LB {}",
+            money[0]
+        );
+        assert!(
+            close(money[1], 0.40 * 140.0 * 12.0 / 52.0),
+            "AC {}",
+            money[1]
+        );
+        let without_money: Vec<ThisWeekAccount> = card
+            .accounts
+            .iter()
+            .map(|account| ThisWeekAccount {
+                money: None,
+                ..account.clone()
+            })
+            .collect();
+        assert_eq!(
+            without_money,
+            vec![
+                ThisWeekAccount {
+                    id: tiny.lb().id.clone(),
+                    used: 30.0,
+                    now: 30.0,
+                    money: None,
+                    money_missing: None,
+                    started_at: utc("2026-11-16T17:00:00Z"),
+                    resets_at: utc("2026-11-23T17:00:00Z"),
+                    projects: Vec::new(),
+                },
+                ThisWeekAccount {
+                    id: tiny.ac().id.clone(),
+                    used: 40.0,
+                    now: 40.0,
+                    money: None,
+                    money_missing: None,
+                    started_at: utc("2026-11-16T02:00:00Z"),
+                    resets_at: utc("2026-11-23T02:00:00Z"),
+                    projects: Vec::new(),
+                },
+            ]
+        );
+        assert!(card.projects.is_empty());
+    }
+
+    /// The card ignores the range: a query for last week or for the last
+    /// twelve months still lists the windows running now.
+    #[test]
+    fn the_card_ignores_the_range() {
+        let tiny = tiny();
+        for range in [RangeKey::LastWeek, RangeKey::Months12] {
+            let query = Query { range, ..all() };
+            let card = this_week_card(&tiny.ctx(), &query).unwrap();
+            let listed: Vec<(&str, f64)> = card
+                .accounts
+                .iter()
+                .map(|account| (account.id.as_str(), account.used))
+                .collect();
+            assert_eq!(
+                listed,
+                vec![(tiny.lb().id.as_str(), 30.0), (tiny.ac().id.as_str(), 40.0)],
+                "the card of the range {range:?}"
+            );
+        }
+    }
+
+    /// The history counts finished windows only: the week that holds now has
+    /// no account week while its windows run, the KPIs count nothing of them
+    /// and no finding counts the running week.
+    #[test]
+    fn the_history_does_not_count_a_running_window() {
+        let tiny = tiny();
+        let this_week = Range {
+            from: utc("2026-11-16T00:00:00Z"),
+            to: tiny.now,
+        };
+        let page = overview_in(&tiny.ctx(), &this_week, &all()).unwrap();
+
+        assert_eq!(page.kpis.used, 0.0);
+        assert_eq!(page.kpis.paid, 0.0);
+        assert_eq!(page.kpis.expired, 0.0);
+        assert_eq!(page.kpis.used_percent, None);
+        assert_eq!(page.kpis.expired_percent, None);
+        assert_eq!(page.weeks.len(), 1);
+        assert!(page.weeks[0].accounts.is_empty());
+        assert!(page.without_price.is_empty());
+        assert!(
+            page.findings.iter().all(|text| !text.contains("full in")),
+            "findings: {:#?}",
+            page.findings
+        );
+    }
+
+    /// A reset began AC's running window: the card counts its use from the
+    /// reading the reset began it at (60 − 45 = 15 %), not the newest
+    /// reading, and starts it at the reset. LB has no reading in this
+    /// history and is not listed.
+    #[test]
+    fn the_card_counts_the_use_since_a_reset() {
+        let tiny = tiny();
+        let dir = tempdir().expect("a temp history");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let reset_at = utc("2026-11-18T08:30:00Z");
+        let next_reset = utc("2026-11-25T08:30:00Z");
+        let weekly = |t: DateTime<Utc>, p: f64| Sample {
+            t,
+            account: tiny.ac_ref(),
+            src: crate::history::Source::Poll,
+            l: vec![crate::history::LimitSample {
+                k: LimitKind::WeeklyAll,
+                m: None,
+                p,
+                r: Some(next_reset),
+                b: true,
+            }],
+        };
+        history
+            .append(&WindowRecord {
+                account: tiny.ac_ref(),
+                k: LimitKind::WeeklyAll,
+                m: None,
+                start: Some(utc("2026-11-16T02:00:00Z")),
+                end: reset_at,
+                final_percent: 70.0,
+                lost: None,
+                last_sample: utc("2026-11-18T08:00:00Z"),
+                plan: Some("Team Premium".to_string()),
+                uncertain: false,
+                reset: true,
+                from: None,
+            })
+            .expect("the reset window");
+        history
+            .append_many(&[weekly(reset_at, 45.0), weekly(tiny.now, 60.0)])
+            .expect("AC's readings after the reset");
+        let ctx = Ctx {
+            history: &history,
+            ..tiny.ctx()
+        };
+
+        let card = this_week_card(&ctx, &all()).unwrap();
+        assert_eq!(card.accounts.len(), 1, "only AC has a reading");
+        let ac = &card.accounts[0];
+        assert_eq!(ac.id, tiny.ac().id);
+        assert_eq!(ac.used, 15.0, "60 % now minus the 45 % the reset began at");
+        assert_eq!(ac.now, 60.0);
+        assert_eq!(ac.started_at, reset_at);
+        assert_eq!(ac.resets_at, next_reset);
+        assert!(
+            close(ac.money.expect("AC's price"), 0.15 * 140.0 * 12.0 / 52.0),
+            "money {:?}",
+            ac.money
+        );
+    }
+
+    /// An account without any usage reading has no running window: the card
+    /// does not list it, and a history without any reading has an empty card.
+    #[test]
+    fn an_account_without_a_reading_is_not_listed() {
+        let tiny = tiny();
+        let dir = tempdir().expect("a temp history");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let ctx = Ctx {
+            history: &history,
+            ..tiny.ctx()
+        };
+        let card = this_week_card(&ctx, &all()).unwrap();
+        assert!(card.accounts.is_empty());
+        assert!(card.projects.is_empty());
+
+        let only_lb = Query {
+            range: RangeKey::All,
+            accounts: vec![tiny.lb().id.clone()],
+            host: None,
+        };
+        let card = this_week_card(&tiny.ctx(), &only_lb).unwrap();
+        let listed: Vec<&str> = card
+            .accounts
+            .iter()
+            .map(|account| account.id.as_str())
+            .collect();
+        assert_eq!(
+            listed,
+            vec![tiny.lb().id.as_str()],
+            "the chosen account only"
+        );
+    }
+
+    /// Each account's API value in its running window by project, and all
+    /// listed accounts' and providers' together. AC worked 3 M output tokens
+    /// on atlas and 1 M on acme-kb (60 and 20 EUR), LB 2 M on atlas (40 EUR).
+    /// A flash worker's 9 M on acme-kb (18 EUR) is no account's: it is the
+    /// Ollama row, and in the combined legend. A record before AC's window
+    /// and one of another host's filter are left out.
+    ///
+    /// Until 1.2.1 this test asserted that the flash record was left out of
+    /// the card altogether; it is now the Ollama row.
+    #[test]
+    fn the_card_splits_each_account_by_project() {
+        let mut tiny = tiny();
+        price_flash_and_codex(&mut tiny);
+        let atlas = crate::project::ProjectKey::Repo("github.com/sam/atlas".to_string());
+        let acme_kb = crate::project::ProjectKey::Repo("github.com/acme/acme-kb".to_string());
+        let token =
+            |t: &str, project: &crate::project::ProjectKey, model: &str, out: u64| TokenRecord {
+                t: utc(t),
+                session: "4a1f9c2e-6b3d-4e8a-9f7c-1d2e3b4a5c6d".to_string(),
+                cwd: "/home/sam/projects/atlas/engine".to_string(),
+                project: project.clone(),
+                model: model.to_string(),
+                input: 0,
+                out,
+                cw: 0,
+                cr: 0,
+                answers: 1,
+                agent_answers: 0,
+            };
+        tiny.history
+            .append_many(&[
+                // In AC's finished window, before its running one began.
+                token("2026-11-16T01:00:00Z", &atlas, "claude-opus-5-5", 5_000_000),
+                token("2026-11-17T10:00:00Z", &atlas, "claude-opus-5-5", 3_000_000),
+                token(
+                    "2026-11-17T12:00:00Z",
+                    &acme_kb,
+                    "claude-opus-5-5",
+                    1_000_000,
+                ),
+                token(
+                    "2026-11-17T13:00:00Z",
+                    &acme_kb,
+                    "deepseek-v4.1-flash:cloud",
+                    9_000_000,
+                ),
+                token("2026-11-18T10:00:00Z", &atlas, "claude-opus-5-5", 2_000_000),
+            ])
+            .expect("the tokens of this week");
+        tiny.history
+            .append(&Event {
+                t: utc("2026-11-18T09:00:00Z"),
+                kind: EventKind::Switch {
+                    from: Some(tiny.ac_ref()),
+                    to: tiny.lb_ref(),
+                    by: crate::history::By::User,
+                    reason: None,
+                    cwd: None,
+                    sessions: None,
+                    waited_secs: None,
+                },
+            })
+            .expect("the switch to LB");
+
+        let card = this_week_card(&tiny.ctx(), &all()).unwrap();
+        let split = |id: &str| -> Vec<(String, f64)> {
+            card.accounts
+                .iter()
+                .find(|account| account.id == id)
+                .unwrap_or_else(|| panic!("{id} on the card"))
+                .projects
+                .clone()
+        };
+        assert_eq!(split(&tiny.lb().id), vec![("atlas".to_string(), 100.0)]);
+        let ac = split(&tiny.ac().id);
+        assert_eq!(ac.len(), 2, "AC's split: {ac:?}");
+        assert_eq!(ac[0].0, "atlas");
+        assert!(close(ac[0].1, 75.0), "atlas {}", ac[0].1);
+        assert_eq!(ac[1].0, "acme-kb");
+        assert!(close(ac[1].1, 25.0), "acme-kb {}", ac[1].1);
+        assert_eq!(card.providers.len(), 1, "providers: {:?}", card.providers);
+        let ollama = &card.providers[0];
+        assert_eq!(ollama.name, "Ollama");
+        assert!(close(ollama.api.expect("the flash price"), 18.0));
+        assert_eq!(ollama.api_currency.as_deref(), Some("EUR"));
+        assert_eq!(ollama.api_missing, None);
+        assert_eq!(ollama.projects, vec![("acme-kb".to_string(), 100.0)]);
+        assert_eq!(card.projects.len(), 2, "all: {:?}", card.projects);
+        assert_eq!(card.projects[0].0, "atlas");
+        assert!(close(card.projects[0].1, 100.0 / 138.0 * 100.0));
+        assert_eq!(card.projects[1].0, "acme-kb");
+        assert!(close(card.projects[1].1, 38.0 / 138.0 * 100.0));
+
+        // vega has none of these records: the windows stay, the split goes.
+        let vega = Query {
+            range: RangeKey::All,
+            accounts: Vec::new(),
+            host: Some("vega".to_string()),
+        };
+        let card = this_week_card(&tiny.ctx(), &vega).unwrap();
+        assert_eq!(card.accounts.len(), 2);
+        assert!(card
+            .accounts
+            .iter()
+            .all(|account| account.projects.is_empty()));
+        assert!(card.providers.is_empty());
+        assert!(card.projects.is_empty());
+    }
+
+    /// The flash model's and Codex's prices, so their records have an API value:
+    /// 2 and 10 USD per million output tokens, at the fixture's rate of 1.
+    fn price_flash_and_codex(tiny: &mut crate::stats::tests::Tiny) {
+        tiny.prices.models.insert(
+            crate::money::price_key("ollama-cloud", "deepseek-v4.1-flash"),
+            vec![crate::money::PricePoint {
+                from: utc("2026-01-01T00:00:00Z"),
+                price: crate::money::ModelPrice {
+                    input: 0.5,
+                    output: 2.0,
+                    cache_write: 0.0,
+                    cache_read: 0.0,
+                    tiered: false,
+                },
+            }],
+        );
+        tiny.prices.models.insert(
+            crate::money::price_key("openai", "gpt-6.1-sol"),
+            vec![crate::money::PricePoint {
+                from: utc("2026-01-01T00:00:00Z"),
+                price: crate::money::ModelPrice {
+                    input: 1.25,
+                    output: 10.0,
+                    cache_write: 0.0,
+                    cache_read: 0.125,
+                    tiered: false,
+                },
+            }],
+        );
+    }
+
+    /// A token line of this week for the provider tests.
+    fn week_token(
+        t: &str,
+        project: &crate::project::ProjectKey,
+        model: &str,
+        out: u64,
+    ) -> TokenRecord {
+        TokenRecord {
+            t: utc(t),
+            session: "019a7c3e-4b2a-7d3f-9e6a-b8c52f0a1d7e".to_string(),
+            cwd: "/home/sam/projects/atlas".to_string(),
+            project: project.clone(),
+            model: model.to_string(),
+            input: 0,
+            out,
+            cw: 0,
+            cr: 0,
+            answers: 1,
+            agent_answers: 0,
+        }
+    }
+
+    /// A Codex record done while AC was live is the Codex row, valued at API
+    /// prices from Monday 00:00 of this calendar week: a record of last week
+    /// is not in it. The account chips do not filter it out, the host filter
+    /// does. AC's own split stays without it.
+    #[test]
+    fn the_card_lists_a_codex_row() {
+        let mut tiny = tiny();
+        price_flash_and_codex(&mut tiny);
+        let atlas = crate::project::ProjectKey::Repo("github.com/sam/atlas".to_string());
+        let ledger = crate::project::ProjectKey::Repo("github.com/sam/ledger".to_string());
+        tiny.history
+            .append_many(&[
+                // Last week (Sun 15 Nov): before this calendar week.
+                week_token("2026-11-15T20:00:00Z", &atlas, "gpt-6.1-sol", 4_000_000),
+                week_token("2026-11-17T09:00:00Z", &atlas, "gpt-6.1-sol", 3_000_000),
+                week_token("2026-11-18T09:00:00Z", &ledger, "gpt-6.1-sol", 1_000_000),
+                week_token("2026-11-17T11:00:00Z", &atlas, "claude-opus-5-5", 1_000_000),
+            ])
+            .expect("this week's tokens");
+        let only_lb = Query {
+            range: RangeKey::All,
+            accounts: vec![tiny.lb().id.clone()],
+            host: None,
+        };
+
+        for query in [all(), only_lb] {
+            let card = this_week_card(&tiny.ctx(), &query).unwrap();
+            assert_eq!(card.providers.len(), 1, "providers: {:?}", card.providers);
+            let codex = &card.providers[0];
+            assert_eq!(codex.name, "Codex");
+            assert!(
+                close(codex.api.expect("Codex's price"), 40.0),
+                "4 M output at 10 USD per million: {:?}",
+                codex.api
+            );
+            assert_eq!(codex.api_missing, None);
+            assert_eq!(codex.projects.len(), 2, "{:?}", codex.projects);
+            assert_eq!(codex.projects[0].0, "atlas");
+            assert!(close(codex.projects[0].1, 75.0));
+            assert_eq!(codex.projects[1].0, "ledger");
+            assert!(close(codex.projects[1].1, 25.0));
+            assert!(card.projects.iter().any(|(name, _)| name == "ledger"));
+        }
+
+        let card = this_week_card(&tiny.ctx(), &all()).unwrap();
+        let ac = card
+            .accounts
+            .iter()
+            .find(|account| account.id == tiny.ac().id)
+            .expect("AC on the card");
+        assert_eq!(
+            ac.projects,
+            vec![("atlas".to_string(), 100.0)],
+            "AC's split has no Codex work"
+        );
+
+        let vega = Query {
+            range: RangeKey::All,
+            accounts: Vec::new(),
+            host: Some("vega".to_string()),
+        };
+        let card = this_week_card(&tiny.ctx(), &vega).unwrap();
+        assert!(card.providers.is_empty(), "the host filter applies");
+    }
+
+    /// A provider's model without a price leaves its row's API value unknown,
+    /// with the model named, and the combined legend unknown with it.
+    #[test]
+    fn an_unpriced_provider_row_names_its_reason() {
+        let tiny = tiny();
+        let atlas = crate::project::ProjectKey::Repo("github.com/sam/atlas".to_string());
+        tiny.history
+            .append(&week_token(
+                "2026-11-18T09:00:00Z",
+                &atlas,
+                "glm-5:cloud",
+                1_000_000,
+            ))
+            .expect("an Ollama record");
+        let card = this_week_card(&tiny.ctx(), &all()).unwrap();
+        assert_eq!(card.providers.len(), 1);
+        let ollama = &card.providers[0];
+        assert_eq!(ollama.name, "Ollama");
+        assert_eq!(ollama.api, None);
+        assert_eq!(ollama.api_currency, None);
+        assert_eq!(
+            ollama.api_missing.as_deref(),
+            Some("no price for glm-5:cloud")
+        );
+        assert!(ollama.projects.is_empty());
+        assert!(
+            card.projects.is_empty(),
+            "an unknown part makes the share unknown"
+        );
+    }
+
+    /// Two accounts added and auto-burn switched on in one calendar week are
+    /// one mark at the first of them, so their labels never print on top of
+    /// each other; a mark of another week stays its own.
+    #[test]
+    fn marks_of_one_week_are_one_label() {
+        let tiny = tiny();
+        tiny.history
+            .append_many(&[
+                Event {
+                    t: utc("2026-11-04T09:00:00Z"),
+                    kind: EventKind::AccountAdded {
+                        account: tiny.lb_ref(),
+                        plan: Some("Max".to_string()),
+                    },
+                },
+                Event {
+                    t: utc("2026-11-04T09:03:00Z"),
+                    kind: EventKind::AccountAdded {
+                        account: tiny.ac_ref(),
+                        plan: Some("Team Premium".to_string()),
+                    },
+                },
+                Event {
+                    t: utc("2026-11-06T17:00:00Z"),
+                    kind: EventKind::AutoBurnSet { on: true },
+                },
+                Event {
+                    t: utc("2026-11-10T08:00:00Z"),
+                    kind: EventKind::AutoBurnSet { on: false },
+                },
+            ])
+            .expect("the marked events");
+
+        let page = overview_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        assert_eq!(
+            page.marks,
+            vec![
+                Mark {
+                    at: utc("2026-11-04T09:00:00Z"),
+                    label: "LB, AC added · auto-burn on".to_string(),
+                },
+                Mark {
+                    at: utc("2026-11-10T08:00:00Z"),
+                    label: "auto-burn off".to_string(),
+                },
+            ]
+        );
     }
 
     /// An October range has history in none of its calendar weeks: every week
@@ -1247,7 +2008,7 @@ mod tests {
                 t: utc("2026-11-12T00:00:00Z"),
                 kind: EventKind::AccountAdded {
                     account: tiny.ac_ref(),
-                    plan: Some("Team 5x".to_string()),
+                    plan: Some("Team Premium".to_string()),
                 },
             })
             .expect("AC added");

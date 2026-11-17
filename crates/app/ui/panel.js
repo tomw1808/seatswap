@@ -299,7 +299,10 @@ function waitingTarget(sessions) {
 // The running sessions and the number that wait for you (spec §4.1). The strip
 // carries the same line while auto-burn has a view; the footer keeps it
 // otherwise. "N sessions" opens Sessions, "N waiting for you" Sessions at that
-// session, and "see the plan" Statistics' Forecast.
+// session, and "see the plan" Statistics' Forecast. The plan link shows only
+// while auto-burn has a plan: its view has measured something exactly when it
+// had a situation to plan from (`burn_rt.rs`), so a new install or an account
+// still waiting for its first reading has no link to an empty Forecast.
 function sessionsLineNode(sessions, className) {
   if (sessions.unavailable != null) {
     return h("span", { class: className, text: String(sessions.unavailable) });
@@ -315,8 +318,11 @@ function sessionsLineNode(sessions, className) {
       linkButton(`${waiting} waiting for you`, waitingTarget(sessions), "footer-waiting")
     );
   }
-  line.appendChild(document.createTextNode(" · "));
-  line.appendChild(linkButton("see the plan", "statistics/forecast"));
+  const burn = state.snapshot ? state.snapshot.burn : null;
+  if (isObject(burn) && burn.measured != null) {
+    line.appendChild(document.createTextNode(" · "));
+    line.appendChild(linkButton("see the plan", "statistics/forecast"));
+  }
   return line;
 }
 
@@ -561,6 +567,17 @@ function renderBanners(container) {
 
   if (snapshot.secretsWarning) {
     container.appendChild(banner("warn", "⚠", String(snapshot.secretsWarning)));
+  }
+
+  // Claude Code's folder does not exist yet: a normal state, not an error.
+  if (snapshot.claudeNotSetUp) {
+    container.appendChild(
+      banner("info", "ℹ", [
+        "Claude Code is not set up on this machine yet. In a terminal run ",
+        h("code", { text: "claude" }),
+        " and log in; seatswap notices the login by itself.",
+      ])
+    );
   }
 
   if (snapshot.pending) {

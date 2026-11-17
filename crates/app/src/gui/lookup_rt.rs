@@ -96,6 +96,9 @@ enum LookupCommand {
     },
     /// A session met a model without a price (the sessions thread sends it).
     PriceWanted(String),
+    /// The settings were saved or a shared setting arrived from another host:
+    /// the currency may be new, so the rate part runs at once.
+    SettingsSaved,
     Stop,
 }
 
@@ -136,6 +139,12 @@ impl LookupClient {
         let _ = self
             .commands
             .send(LookupCommand::PriceWanted(model.to_string()));
+    }
+
+    /// The settings changed (saved here or shared from another host): ask the
+    /// rate at once when it is due, instead of at the next rate wake.
+    pub(crate) fn settings_saved(&self) -> Result<(), String> {
+        super::send_to_worker(self.commands.send(LookupCommand::SettingsSaved))
     }
 }
 
@@ -215,6 +224,10 @@ fn run(
             }
             Ok(LookupCommand::PriceWanted(model)) => {
                 runtime.price_wanted(&model, Utc::now());
+            }
+            Ok(LookupCommand::SettingsSaved) => {
+                one_rate_round(&mut runtime, &app, Utc::now());
+                next_rate = Instant::now() + RATE_EVERY;
             }
             Ok(LookupCommand::Stop) | Err(RecvTimeoutError::Disconnected) => return,
             Err(RecvTimeoutError::Timeout) => {
@@ -353,7 +366,8 @@ impl LookupRuntime {
     /// when it asked, `Ok(false)` when nothing was due; the error text is what
     /// the rate row shows. Only an answer records the ask, so a failed request
     /// makes the next rate wake ask again (spec §1.4: due once per Frankfurt
-    /// day as today).
+    /// day as today). Until a first answer since the app started (for this
+    /// currency) it is always due: every start, and every new currency, asks.
     fn ask_rate(&mut self, settings: &Settings, now: DateTime<Utc>) -> Result<bool, String> {
         if !settings.look_up_prices {
             return Ok(false);
@@ -377,8 +391,9 @@ impl LookupRuntime {
             .as_ref()
             .filter(|(_, answered)| answered == &currency)
             .map(|(at, _)| *at);
-        let due = money::rate_due(now, stored, last_ask)
-            .map_err(|failure| format!("the dollar rate: {failure}"))?;
+        let due = last_ask.is_none()
+            || money::rate_due(now, stored, last_ask)
+                .map_err(|failure| format!("the dollar rate: {failure}"))?;
         if !due {
             return Ok(false);
         }
@@ -1286,6 +1301,49 @@ mod tests {
         // 16:31 in Frankfurt (15:31 UTC): the afternoon retry asks again.
         runtime.round(&settings, utc("2026-11-16T15:31:00Z"));
         assert_eq!(rate_asks(&paths), 1, "the afternoon did not ask again");
+    }
+
+    /// Every start asks the rate once, even when `fx.json` already holds a rate
+    /// with today's date (another start the same day, or a copy from another
+    /// machine); after that answer the day's schedule applies again.
+    #[test]
+    fn every_start_asks_the_rate_once() {
+        let dir = tempdir().expect("tempdir");
+        let app = AppPaths::at(&dir.path().join("data"));
+        let mut fx = Fx {
+            currency: "EUR".to_string(),
+            ..Fx::default()
+        };
+        fx.take_fetched(
+            NaiveDate::from_ymd_opt(2026, 11, 14).expect("a date"),
+            0.9,
+            Some(utc("2026-11-14T08:00:00Z")),
+        );
+        fx.save(&app).expect("fx.json");
+        let (base, paths, _handle) = path_server(200, 200, RATE_BODY);
+        let settings = Settings {
+            currency: Some("EUR".to_string()),
+            look_up_prices: true,
+            ..Settings::default()
+        };
+
+        // Sat 14 Nov 2026, 11:00 in Frankfurt: today's rate is stored, but this
+        // is the first round since the start.
+        let mut runtime = runtime(app, lookup_api(&base));
+        assert!(
+            runtime
+                .rate_round(&settings, utc("2026-11-14T10:00:00Z"))
+                .is_some(),
+            "the start's first rate wake did nothing"
+        );
+        assert_eq!(rate_asks(&paths), 1, "the start did not ask the rate");
+        assert!(
+            runtime
+                .rate_round(&settings, utc("2026-11-14T10:30:00Z"))
+                .is_none(),
+            "the second wake of the day asked again"
+        );
+        assert_eq!(rate_asks(&paths), 0);
     }
 
     /// The rate asked for today was answered for EUR; a new currency has no

@@ -656,8 +656,16 @@ pub enum WatchError { Notify(#[from] notify::Error), Io { path: PathBuf, source:
 /// relevant event: wait until DEBOUNCE passes without another one, then until
 /// locks::claude_locks_busy() is false (re-checked every BUSY_RECHECK), then call `on_change` once.
 /// The callback runs on the watcher's own thread, never concurrently with itself. A missing folder
-/// is an error (no create). Drop stops the watching and joins the thread.
+/// is not an error: Claude Code has not been set up (WatchState::NotSetUp); its nearest existing
+/// parent is watched, and when the folder appears the watch moves to it and `on_change` is called;
+/// a removed folder moves the watch back up. No folder is created. A path that exists but is not a
+/// folder, or cannot be read, is an error (at run time WatchState::Failed(text), shown as
+/// "file watcher: …"). Drop stops the watching and joins the thread.
+pub enum WatchState { Watching, NotSetUp, Failed(String) }
 pub struct Watcher { /* … */ }
+impl Watcher { pub fn state(&self) -> WatchState; }
+// gui: apply_snapshot(Shown::New(snapshot) | Shown::Again) adds the start-up errors, the watch
+// state and `claudeNotSetUp` only to a new snapshot, never to the stored one shown again.
 pub fn watch(claude: &ClaudePaths, on_change: impl Fn() + Send + 'static) -> Result<Watcher, WatchError>;
 /// One folder, non-recursive, read access ignored: `on_change` after DEBOUNCE quiet, or at the
 /// latest DEBOUNCE_MAX after a burst's first change (a transcript folder written every 200 ms
@@ -1536,16 +1544,24 @@ heartbeat: it rewrites the same account and time at least this often so a runnin
 pub fn rhythm<Tz: TimeZone + Copy>(tokens: &[Hosted<TokenRecord>], now: DateTime<Utc>,
                                    zone: &Tz) -> Rhythm;
 pub fn account_at(events: &[Hosted<Event>], host: &str, t: DateTime<Utc>) -> Option<AccountRef>;
-pub fn rates(account: &AccountRef, samples: &[Hosted<Sample>], tokens: &[Hosted<TokenRecord>],
-             events: &[Hosted<Event>], now: DateTime<Utc>) -> Option<Rates>;
+pub struct RateAccount { pub account: AccountRef, pub capacity: Option<f64> }
+impl RateAccount { pub fn of(account: &Account) -> RateAccount; }   // Account::capacity()
+pub fn rates(accounts: &[RateAccount], samples: &[Hosted<Sample>], tokens: &[Hosted<TokenRecord>],
+             events: &[Hosted<Event>], now: DateTime<Utc>) -> BTreeMap<AccountRef, Rates>;
 ```
 
 `rhythm` spreads a record's hour over the local clock hours it covers with the zone's offset at
 each instant. `rates` pairs consecutive
-samples of the same weekly window at most 6 h apart in the last 14 days, counts the work of token
-records whose host had the account live, and returns `None` until the week's work reaches
-`LEARN_MIN_WU`; `s` is `None` for an uncapped account or too little session work. A pair whose
-earlier sample is at 100 % is left out; a rate at or below 0 is unknown (`None`), never a number.
+samples of the same weekly window at most 6 h apart in the last 14 days, drops a pair in which the
+account was live on no host, and counts the work of token records whose host had the account live.
+An account with a capacity starts from `ASSUMED_WEEK_PERCENT_PER_WU` (1.235, % per work unit at
+capacity 1) joined with every capacity account's measurement (gain × capacity over work), divided
+by its capacity and weighed as `LEARN_MIN_WU` work units next to its own measurement; `s` likewise
+from the measured windows only, for an account whose latest sample has a session limit. Without a
+capacity an account has rates only once its work reaches `LEARN_MIN_WU`. A pair whose earlier sample
+is at 100 % is left out; a rate at or below 0 is unknown, never a number. `Account::capacity()`
+reads `oauthAccount.userRateLimitTier`, else `organizationRateLimitTier` (`store::tier_capacity`:
+`_<n>x` → n). `rates_known` needs only `c`: an unknown `s` plays as 0.
 
 ## burn/plan.rs — slack, choice and the two plans (step B)
 
@@ -1565,7 +1581,7 @@ pub enum PlanError { InvalidPercent{account,limit,percent}, SessionWithoutReset{
 pub fn blocked(account: &AccountState, at: DateTime<Utc>) -> bool;
 pub fn usable(account: &AccountState, at: DateTime<Utc>) -> bool;       // may_use && !blocked
 pub fn usable_again(account: &AccountState, at: DateTime<Utc>) -> Option<DateTime<Utc>>;
-pub fn rates_known(account: &AccountState) -> bool;
+pub fn rates_known(account: &AccountState) -> bool;               // c known; s may be missing
 pub fn slack(account: &AccountState, inputs: &Inputs) -> Option<f64>;
 pub fn choose(inputs: &Inputs, at: DateTime<Utc>) -> Option<String>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum Policy { Lazy, Eager }
@@ -1832,7 +1848,7 @@ calls `duration_text` (`2h 31min`, `3d 16h`); `week` chooses days/hours, otherwi
 pub struct SwitchSuggestion { pub to: String, pub text: String }
 pub fn abbr(views: &[AccountView], id: &str) -> Result<String, TextError>;
 pub fn unread_line(views: &[AccountView], accounts: &[String]) -> Result<String, TextError>;
-pub fn no_accounts_line() -> &'static str;
+pub fn no_accounts_line(accounts: &[Account]) -> Vec<BurnPart>;
 pub fn why(why: RegimeWhy) -> &'static str;
 pub fn segment_line(account: Option<&str>, views: &[AccountView], from: DateTime<Utc>,
                     to: DateTime<Utc>, now: DateTime<Utc>, offset: FixedOffset) -> Result<String, TextError>;
@@ -1851,8 +1867,8 @@ pub fn suggestion(decision: &Decision, inputs: &Inputs, active: Option<&str>, vi
 
 Every text is here; the tray app and the CLI do not keep a second copy. Missing values are
 `TextError`, never a guessed abbreviation or time. `unread_line` is
-`Waiting for a first reading of AC, LB.` in account order; `no_accounts_line` is the fixed
-`No account auto-burn may use has a working login.` `why(SessionsOff)` is
+`Waiting for a first reading of AC, LB.` in account order; `no_accounts_line` is
+`Save an account to start.` without a stored account, else `No account auto-burn may use has a working login.` `why(SessionsOff)` is
 `reading sessions is off: no rates are learned`. `suggestion` returns `Some` only for `Switch`
 and `Wait`, and chooses the plan for its "Staying on … is expected to let … expire" sentence
 itself: `follow(inputs, Policy::Lazy)`, the plan that switches only at 100 %, never the plan
@@ -2191,9 +2207,10 @@ pub struct Settings {
 pub struct LoginNote { pub changed: bool, pub plan_changed: bool, pub previous_plan: Option<String> }
 impl Account { pub fn note_stored_login(&mut self, login: &Login) -> LoginNote; }
 
-/// The identity's planDisplayName, else subscriptionType capitalised plus its level:
-/// "_<n>x" → " <n>x" ("Team 5x"); another tier → " (<tier without default_claude_>)";
-/// no tier → nothing.
+/// The identity's planDisplayName, else Claude's current name from PLAN_NAMES
+/// (max+5x "Max", max+20x "Ultra", team+5x "Team Premium"), else subscriptionType
+/// capitalised plus its level: "_<n>x" → " <n>x" ("Enterprise 20x"); another tier →
+/// " (<tier without default_claude_>)"; no tier → nothing.
 pub fn plan_label(login: &Login, identity: &OAuthAccount) -> Option<String>;
 /// A price is None or a finite number above 0; anything else is StoreError::InvalidPrice.
 pub fn validate_price(price: Option<f64>) -> Result<Option<f64>, StoreError>;
@@ -2337,10 +2354,17 @@ pub fn look_up_rate(api: &Api, app: &AppPaths, currency: &str, now: DateTime<Utc
 pub fn prices_from_models_dev(body: &serde_json::Value) -> Result<ModelsDevList, MoneyError>;
 pub fn price_key(provider: &str, model_id: &str) -> String; // "<provider>/<model id>"
 
-/// The one plan-model rule: a model whose id starts with `claude-`. Only such a record enters a
-/// Claude account's week; any other model id (Codex's, Harness's, flash's, a non-Claude model) gets
-/// the subscription value 0, adds nothing to the week's split and never makes the week's
-/// subscription value unknown. Its API value still follows the price rule.
+/// Who a record's model belongs to (serde camelCase). `of_model` is the one rule: `claude-*` →
+/// Claude, `<name>:cloud` / `<name>:<tag>-cloud` (name and tag not empty) → Ollama, any other id
+/// → Codex; `model_price_key` and `is_plan_model` both follow it (one private decision,
+/// `priced_as`, gives the provider and its id in the provider's models.dev list). `name()` is
+/// "Claude", "Codex" or "Ollama".
+pub enum Provider { Claude, Codex, Ollama }
+impl Provider { pub fn of_model(model: &str) -> Provider; pub fn name(&self) -> &'static str; }
+/// The one plan-model rule: `Provider::of_model(model) == Provider::Claude`. Only such a record
+/// enters a Claude account's week; any other model id (Codex's, Harness's, flash's, a non-Claude
+/// model) gets the subscription value 0, adds nothing to the week's split and never makes the
+/// week's subscription value unknown. Its API value still follows the price rule.
 pub fn is_plan_model(model: &str) -> bool;
 /// One record at API prices, in USD; None when its model has no price. Of_model, so the model is
 /// priced as an Anthropic model. A record with four zero counts costs 0 even with no price.
@@ -2354,8 +2378,10 @@ pub(crate) struct WindowMoney { pub(crate) used: f64, pub(crate) paid: f64, pub(
 /// percent) × pv, used = paid − expired.
 pub(crate) fn window_money(price: f64, percent: f64) -> WindowMoney;
 
+/// `account` is the Claude account live on the record's host at its time, always `None` for a
+/// Codex or Ollama record (it uses no Claude account); `provider` is `Provider::of_model`.
 pub struct Valued { pub api: Option<f64>, pub subscription: Option<f64>,
-    pub account: Option<AccountRef>, pub api_currency: Option<String>,
+    pub account: Option<AccountRef>, pub provider: Provider, pub api_currency: Option<String>,
     pub api_missing: Option<Missing>, pub subscription_missing: Option<Missing> }
 
 pub struct Valuer { … }
@@ -2686,7 +2712,7 @@ settings` sends `window settings` instead of a pop-up view.
   atomic through `atomic::append_lines`.
 - **History events**: `{"t":"…","type":"priceChanged","account":{"acc":"…","org":"…"},
   "amount":180.0,"currency":"EUR"}` when an account's price changes (amount and currency omitted
-  when null); `{"t":"…","type":"planChanged","account":{…},"from":"Team","to":"Team 5x"}` when a
+  when null); `{"t":"…","type":"planChanged","account":{…},"from":"Team","to":"Team Premium"}` when a
   stored login changes the plan label.
 
 ## Step C2: the Sessions area and the other hosts (spec §3.8, §4.1)
@@ -3120,9 +3146,13 @@ pub(crate) fn previous_week_start<Tz: TimeZone + Copy>(week: DateTime<Utc>, zone
     -> DateTime<Utc>;
 
 pub struct AccountWeek { pub week: DateTime<Utc>, pub account: AccountRef,
-    /// Every finished weekly window of the account whose midpoint falls in this calendar week,
-    /// oldest end first. A week with a reset holds both windows.
+    /// Every weekly window of the account whose midpoint falls in this calendar week, oldest end
+    /// first: the finished ones, and with `account_weeks_so_far` the running one last. A week with
+    /// a reset holds both windows.
     pub windows: Vec<WindowRecord>,
+    /// The last of `windows` still runs (`Valuer::running_windows`): its use is the use so far
+    /// and it has expired nothing yet.
+    pub running: bool,
     /// The last of `windows`: the one whose end, lost percent and plan the week shows.
     pub window: WindowRecord,
     /// The sum of the windows' use, each `final − from` (`from` 0 when absent); it may pass 100.
@@ -3133,6 +3163,16 @@ pub fn account_weeks(ctx: &Ctx<Tz>, range: &Range, q: &Query)
     -> Result<Vec<AccountWeek>, StatsError>;
 pub(crate) fn account_weeks_valued(ctx: &Ctx<Tz>, range: &Range, q: &Query, valuer: &Valuer)
     -> Result<Vec<AccountWeek>, StatsError>;
+/// `account_weeks_valued` with the windows running at `ctx.now`, each placed by its midpoint.
+pub(crate) fn account_weeks_so_far(ctx: &Ctx<Tz>, range: &Range, q: &Query, valuer: &Valuer)
+    -> Result<Vec<AccountWeek>, StatsError>;
+/// Only the chosen accounts' running windows, one account week each, wherever their midpoint lies.
+pub(crate) fn running_account_weeks(ctx: &Ctx<Tz>, q: &Query, valuer: &Valuer) -> Vec<AccountWeek>;
+/// For a range that holds now: one sentence per week outside the range that a running window
+/// counts in, e.g. `The running weekly windows of AC and LB count in last week, the week that holds
+/// their middle.`; empty otherwise.
+pub(crate) fn running_elsewhere(ctx: &Ctx<Tz>, range: &Range, q: &Query, valuer: &Valuer)
+    -> Vec<String>;
 
 /// The statistics frame: every host, when the history's subscription values begin and its size.
 pub struct StatsFrame { pub hosts: Vec<String>, pub history_start: Option<DateTime<Utc>>,
@@ -3162,6 +3202,14 @@ pub fn empty(ctx: &Ctx<Tz>, range: &Range) -> Result<Option<Empty>, StatsError>;
   and its `used` can pass 100 (spec §1.4). The cross-host rule (same account and end: the latest
   `lastSample`) is `HistoryDir::finished_windows`'s. A window whose end is below its start has no
   use: it adds 0 and is named once in the read's warnings.
+- `account_weeks_so_far` adds `Valuer::running_windows(ctx.now)` to the finished windows. A running
+  window goes into the week of its midpoint like a finished one (its start is seven days before its
+  reset), so it never moves when it ends; its week is `running`, it offers one week's price and it
+  expires nothing (`week_lost_percent` leaves the running window out). The Weeks page's summary uses
+  it; Overview's history does not. `running_account_weeks` builds the account weeks of the running
+  windows alone, over every week (Overview's This-week card). `running_elsewhere` names the running
+  windows whose midpoint lies in last or next week when the range holds now and does not show that
+  week.
 - `blocked_spans` reads all events, builds each host's blocked intervals for every limit kind and
   each host's account timeline (the last `Live` or `Switch`), and cuts every interval at the range,
   at every change of the account in use and at an `Unblocked`. Only a piece with
@@ -3181,7 +3229,8 @@ The shared helpers, used by more than one page:
 | Helper | Job |
 |---|---|
 | `accounts_without_price` | the account ids with at least one account week that has no price: stored accounts in `Ctx::accounts` order, then removed accounts by id |
-| `money_of` | the week's money: `paid = 100 × pv` for one week, `expired = the sum of every window's lost × pv`, `used = the week's summed use × pv`; `None` without a price. `offered_money` is `paid × the number of windows`, and `percent_of_offered` is the one Used/Expired share denominator |
+| `money_of` | the week's money: `paid = 100 × pv` for one week, `expired = the sum of every window's lost × pv`, `used = the week's summed use × pv`; `None` without a price. `offered_money` is `paid × the number of windows`, `offered_finished_money` the same without a running window (the Expired share's denominator), and `percent_of_offered` is the one Used/Expired share rule |
+| `api_shares` | each project's share of a total's API value in percent, through `top_three`; empty when the total's API value is unknown or 0. The Weeks summary's top projects and the This-week card use it |
 | `lost_percent` | the window's `lost`; a reset window's absent `lost` is 0, and any other window without it is an error, because seatswap always writes it |
 | `SwitchCounts`, `switch_counts` | `Switch` events of a range and host by `By::{User, Cli, Auto, Agent, External}` |
 | `week_columns` | Monday 00:00 local of the week holding `range.from`, then each following Monday 00:00 local while the start is before `range.to` |
@@ -3198,8 +3247,32 @@ taking a `Range` for their tests; each produces one serde camelCase struct:
 
 ```rust
 // overview.rs
-pub struct Overview { pub currency: Option<String>, pub without_price: Vec<String>,
+/// `kpis` and `weeks` count finished windows only; the windows running now are the card's
+/// (`this_week_card`).
+pub struct Overview { pub without_price: Vec<String>,
     pub kpis: Kpis, pub weeks: Vec<OverviewWeek>, pub marks: Vec<Mark>, pub findings: Vec<String> }
+/// One entry per chosen account with a running weekly window (`running_account_weeks`), stored
+/// accounts' order then others by id; one per other provider with records this calendar week, in
+/// `Provider` order; `projects` is the API-value split of all listed accounts and providers
+/// together (`api_shares`).
+pub struct ThisWeek { pub accounts: Vec<ThisWeekAccount>, pub providers: Vec<ThisWeekProvider>,
+    pub projects: Vec<(String, f64)> }
+/// A Codex or Ollama row: its records of `[week_start(now), now]`, host filter applied, account
+/// chips ignored, summed with `Values::of` / `Values::sum`. `api` is `None` with `api_missing` when
+/// a record has no price; `api_currency` is the sum's (the settings' currency, "USD" without a
+/// rate). `projects` is `api_shares` of the provider's records.
+pub struct ThisWeekProvider { pub name: String, pub api: Option<f64>,
+    pub api_currency: Option<String>, pub api_missing: Option<String>,
+    pub projects: Vec<(String, f64)> }
+pub struct ThisWeekAccount { pub id: String,
+    /// Use so far, `final − from` (`window_used`); `now` is the newest reading's percent.
+    pub used: f64, pub now: f64,
+    /// `money_of` of the running account week: `used × pv` at the window's price; `None` with
+    /// the price's `Missing` text in `money_missing`.
+    pub money: Option<f64>, pub money_missing: Option<String>,
+    pub started_at: DateTime<Utc>, pub resets_at: DateTime<Utc>,
+    /// `api_shares` of the account's token records in `[started_at, now]`.
+    pub projects: Vec<(String, f64)> }
 pub struct Kpis { pub used: f64, pub paid: f64, pub expired: f64,
     /// The used and expired parts of the weeks the range offered, in percent. Every finished window
     /// offers one week of its account's price, so a reset week offers two. A window above 100 %
@@ -3216,13 +3289,17 @@ pub struct WeekAccount { pub id: String, pub used_percent: f64, pub used: Option
     pub expired_percent: f64, pub expired: Option<f64>, pub uncertain: bool }
 pub struct Mark { pub at: DateTime<Utc>, pub label: String }
 pub fn overview(ctx: &Ctx<Tz>, q: &Query) -> Result<Overview, StatsError>;
+/// The This-week card on top of the Overview: ignores `q.range`, keeps its accounts and host.
+pub fn this_week_card(ctx: &Ctx<Tz>, q: &Query) -> Result<ThisWeek, StatsError>;
 
 // weeks.rs
 pub struct WeeksPage { pub week_starts: Vec<DateTime<Utc>>, pub running: Vec<bool>,
     pub rows: Vec<WeeksRow>, pub blocked: Vec<f64>, pub recent: Vec<Curve>,
     pub now: DateTime<Utc> }
 pub struct WeeksRow { pub id: String, pub plan: Option<String>, pub cells: Vec<Option<WeekCell>>,
-    pub now_percent: Option<f64> }
+    /// The running window's newest percent, and the calendar week it counts in (its midpoint's
+    /// week, maybe last or next week): the row's "now" cell opens that week's summary.
+    pub now_percent: Option<f64>, pub now_week: Option<DateTime<Utc>> }
 pub struct WeekCell { pub end: DateTime<Utc>, pub used: f64,
     /// One part per window of the account week, oldest first; their sum is `used`, and the page
     /// draws one stack per part (a reset week has two). A part that ended below its start is 0.
@@ -3236,9 +3313,14 @@ pub struct WeekSummary { pub week: DateTime<Utc>,
     /// `used / offered × 100`, where the week offered one week's price per window (so a reset
     /// week offers two); never divided by the one-week `paid`.
     pub used_percent_of_paid: Option<f64>, pub used: Option<f64>, pub expired: Option<f64>,
-    pub money_missing: Option<String>, pub blocked_hours: f64, pub switches: SwitchCounts,
+    /// For the week that holds now without a window: the `running_elsewhere` sentences.
+    pub money_missing: Option<String>,
+    /// A window of the week still runs (`account_weeks_so_far`): its use is so far, and
+    /// `used_change_percent` is `None`.
+    pub running: bool,
+    pub blocked_hours: f64, pub switches: SwitchCounts,
     pub switches_total: u64, pub per_account_percent: Vec<(String, f64)>,
-    /// `expired / offered × 100`, the same offered denominator as `used_percent_of_paid`.
+    /// `expired / offered × 100` over the finished windows' offer only (`offered_finished_money`).
     pub expired_percent_of_paid: Option<f64>,
     pub top_projects: Vec<(String, f64)>, pub tokens: Tokens, pub values: Values,
     pub used_change_percent: Option<f64>, pub conclusion: Vec<String> }
@@ -3262,7 +3344,11 @@ pub enum NodeKind { Org, Project, Folder }
 pub struct Node { pub kind: NodeKind, pub level: u8, pub name: String,
     pub key: Option<ProjectKey>, pub org_accounts: Vec<String>, pub tokens: Tokens,
     pub share: f64, pub subscription: Option<f64>, pub api: Option<f64>,
-    pub by_account: Vec<(Option<String>, f64)>, pub sessions: u32 }
+    /// Claude accounts only (`None`: a Claude record without a known account); `by_provider`
+    /// is each other provider's share by `Provider::name`, largest first. Together they make up
+    /// the node's API value.
+    pub by_account: Vec<(Option<String>, f64)>, pub by_provider: Vec<(String, f64)>,
+    pub sessions: u32 }
 pub struct ProjectsPage { pub nodes: Vec<Node>, pub matrix: Matrix,
     pub tokens_per_percent: Vec<(String, f64)>, pub unknown_account_tokens: Tokens,
     pub without_price: Vec<String>, pub notes: Vec<String> }
@@ -3338,15 +3424,9 @@ pub struct ActivityPage { pub lanes: Vec<HostLane>, pub days: Vec<DayTokens>,
     pub total_tokens: Tokens, pub total_values: Values,
     pub per_working_hour: Option<f64>, pub what_it_shows: String,
     pub ollama: OllamaUse }
-/// One hour of Ollama's own usage beside the known sessions on Ollama models. `t` is the local lane
-/// hour in which the UTC hour's start falls; `total` the largest Ollama line of that UTC hour over
-/// every host (never a sum); `tracked` the input + output of every known session on an Ollama model
-/// (`…:cloud`) in the same UTC hour; `other` their difference when `total` is at least `tracked`,
-/// else `None` with `note`. Both name the same UTC hour, never two local hours that look equal.
-pub struct OllamaHour { pub t: DateTime<Utc>, pub total: Option<u64>, pub tracked: u64,
-    pub other: Option<u64>, pub note: Option<String> }
-pub struct OllamaUse { pub hours: Vec<OllamaHour>, pub other_tokens: u64,
-    pub hours_without_figure: u32, pub more_tracked_hours: u32, pub reported_hours: u32 }
+/// What Ollama counted beyond the known sessions on Ollama models, for the one-line note under
+/// the hour chart; serde `{"otherTokens": 1234567}`.
+pub struct OllamaUse { pub other_tokens: u64 }
 pub fn rhythm(ctx: &Ctx<Tz>, q: &Query) -> Result<RhythmPage, StatsError>;
 pub fn activity(ctx: &Ctx<Tz>, q: &Query) -> Result<ActivityPage, StatsError>;
 ```
@@ -3356,14 +3436,25 @@ Page details that are easy to miss:
 - `Overview::expired_share` is `Option` (a week without a priced account week has none); the four
   findings are the only sentences and are built in the fixed order above, each `None` when its data
   is missing. `Kpis::blocked_before_added` names the added account by its short name, also when the
-  page's account filter leaves that account out.
+  page's account filter leaves that account out. `this_week_card` ignores the range: it builds its
+  own `Valuer` over `[now − 7 d, now]`, which holds the running windows and this calendar week; the
+  Overview's `Valuer` covers only the range. The card's project split reads the token records of `[min(earliest running start, this week's
+  Monday), now]`, keeps the query's host, values each with `Valuer::value` and `Values::of` as the
+  Weeks summary does, and shares them with `api_shares`: a Claude record in its account's running
+  window, a Codex or Ollama record (`Valued.provider`) from `week_start(now)` on in its provider's
+  `ThisWeekProvider`.
+- Pages of project work (Projects, project detail, Weeks summary, Activity) choose a record with
+  `stats::record_chosen(ctx, q, &Valued)`: a Claude record by `account_chosen`, another provider's
+  always. Pages about a Claude account's week (Subscriptions, tokens per percent, the matrix, the
+  Overview's weekly project chart) need `Valued.account` and so leave other providers out.
+  `burn::rates::rhythm` and `work_in` (rates, switch cost) count `is_plan_model` records only.
 - `WeeksRow.cells` is one entry per `week_starts`; `None` means no finished window that week.
   A cell's `used` is the sum of its `parts`, one per window of the account week; a reset week has
   two parts and the page draws one bar with both. `WeeksPage.running` has one flag per column:
   `true` for the calendar week `Ctx::now` falls in; the page draws the "now" cell there and needs
-  no browser clock. `now_percent` is the newest weekly sample of an account whose window is still
-  running. `recent` covers the last 14 days. `session_windows_used` counts finished `session`
-  windows with `final > 0` that ended inside the weekly window. `blocked_hours_after` uses the
+  no browser clock. `now_percent` is the `final` of the account's window in
+  `Valuer::running_windows(ctx.now)`, and `now_week` the week of that window's midpoint. `recent`
+  covers the last 14 days. `session_windows_used` counts finished `session` windows with `final > 0` that ended inside the weekly window. `blocked_hours_after` uses the
   rhythm of the four weeks before `Ctx::now`, because a single window has no range of its own. The
   detail card's 5h windows line says "N used, more than the about M your usual working hours hold"
   when `used_more_than_possible` is true, and "of about M possible" otherwise.
@@ -3372,7 +3463,9 @@ Page details that are easy to miss:
   value over the page's. `tokens_per_percent` sums an account's output tokens over all its finished
   weeks and divides by the sum of those weeks' final percents; an account without a week, or whose
   weeks total 0 %, is left out. `notes` always carries the "use that leaves no transcript" text and
-  adds the unknown-account and no-subscription-value sentences when they have counts.
+  adds the unknown-account and no-subscription-value sentences when they have counts, and
+  `{providers} work is valued at API prices only; it uses no Claude account.` when the page has
+  Codex or Ollama records. `unknown_account_tokens` counts Claude records only.
   `project_detail` filters by `q.host`, so a folder key's detail counts every host's folder of that
   name only with all hosts chosen.
 - `subscriptions`' `since` is the first period of the whole history, not of the range; `plan` and
@@ -3394,13 +3487,13 @@ Page details that are easy to miss:
   tokens over its working hours (`None` without one); `BigSession::agents` is `None` while the
   session has no `SessionRecord`; `BigSession::title` is the newest record's title. The "What it shows" sentence says "night(s) with work on <host>";
   the hour lanes carry no agent data.
-- `ActivityPage::ollama` is Ollama's own use: Ollama's hourly line (input + output) minus the tokens
-  of every known session on an Ollama model in that UTC hour, over every host whatever the page's
-  host filter, because the Ollama line is the whole account's. Ollama's lines are UTC hours; the
-  chart puts each in the local hour cell where the UTC hour starts. An hour where the known sessions
-  used more than Ollama reported has no `other` and a `note`, never a negative value. `reported_hours`
-  is how many UTC hours of the page's range have an Ollama line: with 0 the page shows no Ollama KPI,
-  lane or legend entry.
+- `ActivityPage::ollama.other_tokens` sums, over the UTC hours whose start is inside the page's
+  range, Ollama's hourly line (input + output; the largest line of that UTC hour over every host,
+  never a sum) minus the input + output of every known session on an Ollama model (`…:cloud`) in
+  that same UTC hour, over every host whatever the page's host filter, because the Ollama line is
+  the whole account's. An hour where the known sessions used more than Ollama reported adds
+  nothing, never a negative; an hour without an Ollama line adds nothing. The chart has no Ollama
+  lane: the page shows the number only as a muted note under the hour lanes, and none when it is 0.
 
 ## `stats_*` commands in `gui/window.rs` (step C3)
 
@@ -3439,6 +3532,10 @@ Each page has a plain testable function and one async command. Every page comman
 ```rust
 pub(crate) fn stats_overview_at<Tz: TimeZone + Copy>(parts, history, now, zone, query)
     -> Result<Page<overview::Overview>, String>;
+// The card ignores the range, so it never says "nothing recorded": it does not go through
+// `stats_page` and answers the card itself, empty lists without a running window.
+pub(crate) fn stats_this_week_at<Tz: TimeZone + Copy>(parts, history, now, zone, query)
+    -> Result<overview::ThisWeek, String>;
 pub(crate) fn stats_weeks_at<Tz: TimeZone + Copy>(parts, history, now, zone, query)
     -> Result<Page<weeks::WeeksPage>, String>;
 pub(crate) fn stats_week_summary_at<Tz: TimeZone + Copy>(parts, history, now, zone, query, week: DateTime<Utc>)
@@ -3454,7 +3551,11 @@ pub(crate) fn stats_subscriptions_at<Tz: TimeZone + Copy>(parts, history, now, z
 pub(crate) fn stats_what_if_at<Tz: TimeZone + Copy>(parts, history, now, zone, query, without: &str)
     -> Result<Page<subscriptions::WhatIf>, String>;
 pub(crate) fn stats_forecast_at<Tz: TimeZone + Copy>(parts, history, now, zone,
-    kept: Option<KeptForecast>) -> Result<Page<forecast::Forecast>, String>;
+    kept: Option<KeptForecast>, no_plan: String) -> Result<Page<forecast::Forecast>, String>;
+// no_plan = no_plan_text(burn, views): NO_PLAN, plus `: {abbrs} has/have none yet; it comes/they
+// come with the next usage poll` while the burn view's `unread` (the accounts auto-burn waits for a
+// first reading of) is not empty. forecast.js shows NO_PLAN, and every error starting `NO_PLAN: `,
+// as a plain line.
 pub(crate) fn stats_rhythm_at<Tz: TimeZone + Copy>(parts, history, now, zone, query)
     -> Result<Page<activity::RhythmPage>, String>;
 pub(crate) fn stats_activity_at<Tz: TimeZone + Copy>(parts, history, now, zone, query)
@@ -3481,7 +3582,7 @@ where T: Send + 'static,
 It clones the app paths and the history handle, and inside `spawn_blocking` loads `StatsParts`,
 takes `Utc::now()` and `Local`, the computer's time zone, and runs the page's function. The files are thus
 read on the blocking thread, not on the async one. The async commands `stats_overview`,
-`stats_weeks`, `stats_week_summary`, `stats_window_detail`, `stats_projects`,
+`stats_this_week`, `stats_weeks`, `stats_week_summary`, `stats_window_detail`, `stats_projects`,
 `stats_project_detail`, `stats_subscriptions`, `stats_what_if`, `stats_forecast`, `stats_rhythm`,
 `stats_activity` and `stats_frame` are registered in `gui/mod.rs`'s handler list; `stats_forecast`
 reads the kept `(Inputs, Regime)` from `GuiState` before it enters the helper; `stats_frame` needs
@@ -3537,7 +3638,7 @@ pub fn write(root: &Path) -> Result<Tiny, String>;
 under `AppPaths::at(root)`'s history folder for host `atlas`, `accounts.json`, `prices.json` and
 `fx.json`, each through the module that owns that file (`history`, `store`, `money`; never a second
 writer). The fixture is the plan's: host `atlas`, local offset +00:00, "now" Thu 19 Nov 2026 10:00,
-accounts LB (Max, 180 EUR) and AC (Team 5x, 140 EUR), their four finished windows and the events,
+accounts LB (Max, 180 EUR) and AC (Team Premium, 140 EUR), their four finished windows and the events,
 token and session records of `step-c3.md`. `Tiny.dir` is the history root. The test helper
 `stats::tests::tiny()` writes the fixture into a `tempfile::tempdir()` and keeps the `TempDir` in
 `TinyDir`'s optional guard, so the folder is removed with the fixture; `fixture.rs` itself does not
@@ -3561,7 +3662,7 @@ here; a mark with a `tip` shows it on hover and on keyboard focus.
 ```js
 export function stackedColumns({ columns, marks } = {});
 export function lines({ series, yMax, marks, ySuffix, yDecimals, yFormat } = {});
-export function bars({ categories, series, labelEvery } = {});
+export function bars({ categories, series } = {});
 export function grid({ rows, headers } = {});
 export function heat({ rows = 7, cols = 24, values, tip } = {});
 export function lanes({ lanes, from, to, ticks } = {});
@@ -3579,7 +3680,7 @@ export { attachTip, hideTip, showTip };
   `[time, value]` the Rust structs serialise; points become focusable buttons, a `null` value
   breaks the line, and the x axis is the first, middle and last valid time.
 - `bars`: `categories: [label]`, `series: [{ name, color, values: [number],
-  unit?, tip(category, value)? }]`, `labelEvery` for a sparse category axis.
+  unit?, tip(category, value)? }]`.
 - `grid`: `rows: [{ label, cells: [{ fill?, hatch?, full?, uncertain?, current?, color?,
   textColor?, text?, tip?, onClick? }] }]`, `headers: [label | { label, tip?, onClick?, selected?,
   current? }]`. A cell without `fill` is plain; the fill is its height in percent.
@@ -3591,6 +3692,15 @@ export { attachTip, hideTip, showTip };
 - `hours`: `lanes: [{ label, cells: [{ state: "work"|"idle"|"off"|"unknown", stack:
   [{ value, color }], strip?, tip? }] }]`, `days: [{ label, span }]`. The stack is scaled to the
   tallest hour, the strip to the most sessions.
+- **Fitting.** Every chart fits its text to the width it gets, once its width is known and again
+  when it changes; fitting only shows, hides or rewords text, never resizes the chart. Axis labels
+  show all, else every second counted from the newest, else (on a dated axis) month starts (`Oct`,
+  `Nov`, the year at January), dropping touching ones oldest first; an edge label turns inwards. A
+  group of numbers under or inside columns shows all or none (a short form first, `11h blocked` →
+  `11h`); the tooltip always has them. A mark label takes the first of two lines where it touches
+  nothing, else becomes a dot on its line with the text in its tooltip. Line charts draw their dots
+  only on hover or focus when points are closer than 14 px. The Weeks grid narrows its columns to
+  12 px and then scrolls only itself, keeping the row labels in view.
 - Every builder throws on a missing required list; unreadable points are skipped by the builder
   that takes them (except `lanes`' `from`/`to`, which is an error). Nothing is clamped silently
   except a percent into 0..100 for a CSS position.
@@ -3617,13 +3727,16 @@ the frame and chips and reloads the page when the stored account set changes, no
 snapshot. `env` is:
 
 ```js
-{ query, call, accounts, open, currency }
+{ query, call, ask, accounts, open, currency }
 ```
 
 `query` is `{ range, accounts, host }`; the account list is empty while no chip is excluded, else
 the remaining stored ids; `host` is `null` for all hosts. `call(command, extra?)` invokes a
 `stats_*` command, throws an `EmptyRange` error for a `{"empty": …}` reply (carrying `recordingSince`)
-and returns `reply.data` otherwise. `accounts` are the chosen snapshot views, `open(page)` asks
+and returns `reply.data` otherwise; `ask(command, extra?)` returns the reply as it comes, for
+`stats_this_week`, which never answers "empty". The Overview asks `stats_this_week` and
+`stats_overview` together and draws the card first; when `stats_overview` throws `EmptyRange`, the
+card stays and the same "Nothing recorded yet…" line stands below it. `accounts` are the chosen snapshot views, `open(page)` asks
 the area to switch page, `currency` is the snapshot's settings currency. A page draws into its own
 stage and is swapped in only when its load still wins, so a slow page cannot overwrite a newer one.
 An `EmptyRange` becomes the plain "Nothing recorded yet…" line; any other error becomes the area's
@@ -4862,7 +4975,15 @@ it move, and it never takes `gui.lock`.
 (`show_or_create`, one at a time): building a web view on the main thread or in a synchronous
 command deadlocks on Windows (Tauri's `WebviewWindowBuilder::new`, "Known issues"). An error from
 that thread goes through `gui::report_error` (the one `ReportedErrors`; printed only before it is
-managed).
+managed). The window is built hidden and shown and focused once its page reports
+`PageLoadEvent::Finished` (once; a failed load ends with Finished too), so it never shows an empty
+frame. On Linux `build` runs on the main thread (`run_on_main_thread`; the window thread waits on a
+channel, so one build at a time still holds), makes sure the pop-up exists (`panel::preload`) and
+builds the window `with_related_view` of the pop-up's web view: both share one WebKit web process.
+A new web process cost about 0.6 s, and on a hybrid laptop its graphics set-up waited about 2 s for
+a suspended NVIDIA card to wake (strace on the bench, 2026-11-17). The cost: the shared process keeps
+about 180 MB after the window closes, and a long script in one page delays the other. Other systems
+build on the window thread as before.
 
 **gui/tray.rs.** The menu is a list of `MenuEntry` (`menu_entries(snapshot, now)`); `apply_menu`
 replaces the tray's menu only when items come, go or move (`menu_change`) and otherwise sets changed
