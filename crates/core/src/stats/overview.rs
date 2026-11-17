@@ -304,8 +304,7 @@ pub(crate) fn overview_in<Tz: TimeZone + Copy>(
 
     let blocked_weeks = blocked_by_week(&spans, &rhythm, &ctx.zone);
     let switches = switch_counts(&events.records, range, q.host.as_deref());
-    let switches_total =
-        switches.user + switches.cli + switches.auto + switches.agent + switches.external;
+    let switches_total = switches.total();
     let mut kpis = Kpis {
         used,
         paid,

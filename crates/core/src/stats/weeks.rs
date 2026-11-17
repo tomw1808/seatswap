@@ -19,12 +19,12 @@ use crate::transcripts::Tokens;
 
 use super::{
     account_abbr, account_chosen, account_id, account_position, account_weeks_so_far,
-    account_weeks_valued, api_shares, blocked_by_week, blocked_spans, hours_text, keep_warnings,
-    lost_percent, money_at, money_of, money_text, next_week_start, offered_finished_money,
-    offered_money, percent_of_offered, percent_text, previous_week_start, range_of, record_chosen,
-    running_elsewhere, switch_counts, week_columns, week_lost_percent, week_start, window_midpoint,
-    window_used, working_hours, working_rhythm, AccountWeek, Ctx, Query, RangeKey, StatsError,
-    SwitchCounts,
+    account_weeks_valued, add_opt_value, add_value, api_shares, blocked_by_week, blocked_spans,
+    hours_text, keep_warnings, lost_percent, money_at, money_of, money_text, next_week_start,
+    offered_finished_money, offered_money, percent_of_offered, percent_text, previous_week_start,
+    range_of, record_chosen, running_elsewhere, switch_counts, week_columns, week_lost_percent,
+    week_start, window_midpoint, window_used, working_hours, working_rhythm, AccountWeek, Ctx,
+    Query, RangeKey, StatsError, SwitchCounts,
 };
 
 /// The Weeks page: the grid of account weeks and the curves of the last 14
@@ -553,26 +553,12 @@ pub fn week_summary<Tz: TimeZone + Copy>(
         }
         tokens += Tokens::from(record);
         let record_values = Values::of(std::slice::from_ref(&value), ctx.settings, ctx.fx, ctx.now);
-        match &mut values {
-            Some(values) => {
-                let sum = Values::sum(&[&*values, &record_values]);
-                *values = sum;
-            }
-            None => values = Some(record_values.clone()),
-        }
+        add_opt_value(&mut values, &record_values);
         let name = ctx
             .projects
             .of(&ProjectId::of(&record.project, &hosted.host))
             .name;
-        match by_project.get_mut(&name) {
-            Some(project) => {
-                let sum = Values::sum(&[&*project, &record_values]);
-                *project = sum;
-            }
-            None => {
-                by_project.insert(name, record_values);
-            }
-        }
+        add_value(&mut by_project, name, &record_values);
     }
     let values = values.unwrap_or_else(|| Values::sum(&[]));
     // A share of nothing is no share: a week without API value lists none.
@@ -597,11 +583,7 @@ pub fn week_summary<Tz: TimeZone + Copy>(
     // The same denominator as Overview's Expired share: the money the week's
     // finished windows offered, one week's price for each of them.
     let expired_percent_of_paid = percent_of_offered(expired, offered_finished);
-    let switches_total = u64::from(switches.user)
-        + u64::from(switches.cli)
-        + u64::from(switches.auto)
-        + u64::from(switches.agent)
-        + u64::from(switches.external);
+    let switches_total = u64::from(switches.total());
 
     let mut conclusion = Vec::new();
     if blocked_hours <= 0.0 {

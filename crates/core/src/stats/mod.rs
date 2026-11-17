@@ -659,6 +659,14 @@ pub struct SwitchCounts {
     pub external: u32,
 }
 
+impl SwitchCounts {
+    /// Every kind of switch added up. `u32` is what each kind counts; a range
+    /// with more than `u32::MAX` switches of one kind is not a practical case.
+    pub fn total(&self) -> u32 {
+        self.user + self.cli + self.auto + self.agent + self.external
+    }
+}
+
 /// The `Switch` events of `range`, only of `host` when it is set, by their
 /// `by`.
 pub(crate) fn switch_counts(
@@ -2697,5 +2705,18 @@ pub(crate) mod tests {
         assert_eq!(hours_text(-2.0), "-2 h");
         assert_eq!(hours_text(f64::INFINITY), "inf h");
         assert_eq!(hours_text(f64::NAN), "NaN h");
+    }
+
+    /// Every kind of switch counts once in the total.
+    #[test]
+    fn switch_counts_total_adds_every_kind() {
+        let counts = SwitchCounts {
+            user: 1,
+            cli: 2,
+            auto: 3,
+            agent: 4,
+            external: 5,
+        };
+        assert_eq!(counts.total(), 15);
     }
 }
