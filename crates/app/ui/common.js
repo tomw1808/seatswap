@@ -887,12 +887,26 @@ function accountName(views, id, className) {
   });
 }
 
-// The one provider tag of the window: a provider other than Claude (Codex,
+// The company names the JSON writes, by the company key of `Company` (serde
+// lowercase). Every company field of the JSON uses that key; any other value is
+// an error rather than a tag of its own.
+const COMPANY_NAMES = {
+  anthropic: "Anthropic",
+  openai: "OpenAI",
+  ollama: "Ollama",
+};
+
+// The one company tag of the window: a provider other than Claude (OpenAI,
 // Ollama) by its name, in the account tag's shape but neutral, since its work
-// uses no Claude account. `title` says what the tag stands for where it is.
-function providerName(name, title) {
-  if (typeof name !== "string" || name === "") {
-    throw new Error(`a provider tag needs the provider's name, not ${JSON.stringify(name)}`);
+// uses no Claude account. `company` is the JSON company key; `title` says what
+// the tag stands for where it is.
+function providerName(company, title) {
+  if (typeof company !== "string" || company === "") {
+    throw new Error(`a provider tag needs the company's key, not ${JSON.stringify(company)}`);
+  }
+  const name = COMPANY_NAMES[company];
+  if (typeof name !== "string") {
+    throw new Error(`unknown company ${JSON.stringify(company)}: use anthropic, openai or ollama`);
   }
   return h("span", { class: "stats-acc stats-provider", text: name, title });
 }

@@ -87,35 +87,54 @@ export function holdsNow(index) {
   return weekTime(index) <= NOW_MS && NOW_MS < weekTime(index + 1);
 }
 
+function weekRow(account, indexes) {
+  return {
+    id: account.id,
+    plan: account.plan,
+    cells: indexes.map((index) => {
+      const windows = windowsOfWeek(account, index);
+      if (windows.length === 0) return null;
+      const used = sum(windows.map((window) => window.used));
+      return {
+        end: windows[windows.length - 1].end,
+        used,
+        parts: windows.map((window) => window.used),
+        windowEnds: windows.map((window) => window.end),
+        expired: weekExpiredPercent(account, index),
+        expiredMoney: weekExpiredMoney(account, index),
+        full: used >= 100,
+        uncertain: false,
+      };
+    }),
+    nowPercent: account.now,
+    nowWeek: nowWeek(account),
+  };
+}
+
+// A provider subscription's weekly windows: OpenAI's `weekly_all` week. Ollama
+// counts per month, so it has no week row of this grid.
+function providerWeekRows(chosenSubscriptions, indexes) {
+  return chosenSubscriptions
+    .filter((subscription) => subscription.company === "openai")
+    .map((subscription) => weekRow(subscription, indexes));
+}
+
 export function weeks(query) {
-  const { indexes, chosen } = chosenAccounts(query);
+  const { indexes, chosen, chosenSubscriptions } = chosenAccounts(query);
+  const rows = chosen.map((account) => weekRow(account, indexes));
+  rows.push(...providerWeekRows(chosenSubscriptions, indexes));
+  const recent = chosen.map((account) => ({ id: account.id, points: recentCurve(account) }));
+  for (const subscription of chosenSubscriptions) {
+    if (subscription.company !== "openai") continue;
+    recent.push({ id: subscription.id, points: recentCurve(subscription) });
+  }
   return {
     weekStarts: indexes.map(weekIso),
     // The column that holds the fixture's now; its week has no finished window.
     running: indexes.map(holdsNow),
-    rows: chosen.map((account) => ({
-      id: account.id,
-      plan: account.plan,
-      cells: indexes.map((index) => {
-        const windows = windowsOfWeek(account, index);
-        if (windows.length === 0) return null;
-        const used = sum(windows.map((window) => window.used));
-        return {
-          end: windows[windows.length - 1].end,
-          used,
-          parts: windows.map((window) => window.used),
-          windowEnds: windows.map((window) => window.end),
-          expired: weekExpiredPercent(account, index),
-          expiredMoney: weekExpiredMoney(account, index),
-          full: used >= 100,
-          uncertain: false,
-        };
-      }),
-      nowPercent: account.now,
-      nowWeek: nowWeek(account),
-    })),
+    rows,
     blocked: indexes.map((index) => BLOCKED[index]),
-    recent: chosen.map((account) => ({ id: account.id, points: recentCurve(account) })),
+    recent,
     now: new Date(NOW_MS).toISOString(),
   };
 }
@@ -275,8 +294,10 @@ function noteFor(account, index, window) {
 }
 
 export function windowDetail(query, accountId, end) {
-  const { indexes, chosen } = chosenAccounts(query);
-  const account = chosen.find((candidate) => candidate.id === accountId);
+  const { indexes, chosen, chosenSubscriptions } = chosenAccounts(query);
+  const account =
+    chosen.find((candidate) => candidate.id === accountId) ||
+    chosenSubscriptions.find((candidate) => candidate.id === accountId);
   if (!account) throw new Error(`unknown account ${JSON.stringify(accountId)}`);
   let found = null;
   for (const index of indexes) {

@@ -63,19 +63,19 @@ function visibleRows(nodes, mode, collapsed) {
 // What a row stands for, in a provider tag's tooltip.
 const NODE_NOUN = { org: "organization", project: "project", folder: "folder" };
 
-// What a provider's part of a row says: its share of the row's API value, and
-// that it has no subscription price (projects.rs values it at API prices and
-// in no Claude account).
+// What a provider's part of a row says: its share of the row's API value. The
+// work belongs to the provider's subscription when that has a price (its value
+// is in the Subscr. column), and is valued at API prices only when it has none.
 function providerTip(node, name, percent) {
   const noun = NODE_NOUN[node.kind];
   if (!noun) throw new Error(`unknown row kind ${JSON.stringify(node.kind)}`);
-  return `${name} · ${percentText(percent)} of this ${noun}'s API value · no subscription price yet`;
+  return `${name} · ${percentText(percent)} of this ${noun}'s API value · its provider subscription when it has a price, otherwise API prices only`;
 }
 
 // The tree's by-account bar. Every account's part is in its account's own
 // colour from the snapshot, through the helper the other statistics pages use
 // (`accountView` and `isColor`); an account the snapshot does not know is the
-// muted colour. Another provider's part (Codex, Ollama) follows, neutral and
+// muted colour. Another company's part (OpenAI, Ollama) follows, neutral and
 // faded: it is no account's.
 function splitBar(node, env) {
   const bar = h("span", { class: "stats-split" });

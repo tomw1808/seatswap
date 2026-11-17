@@ -19,6 +19,7 @@ import {
   findingFull,
   marksOf,
   resetEnd,
+  round1,
   sum,
   switchesOf,
   topProjects,
@@ -70,36 +71,67 @@ function runningWindow(account) {
   }
 }
 
-// The other providers' work since Monday, at API prices in EUR: a Codex
-// session on atlas and ledger, flash workers on ledger and notes. The account
-// chips do not filter them.
-const PROVIDERS = [
-  {
-    name: "Codex",
-    api: 34.1,
+// The provider rows since Monday, at API prices in EUR: OA's week on atlas and
+// ledger, O2's (no price) on notes, OL's month on ledger and notes, and one OpenAI record whose
+// subscription cannot be named (the company row). The account chips choose the
+// subscriptions; the unnamed company row stays, because no chip owns it.
+const PROVIDER_PROJECTS = {
+  OA: [
+    ["atlas", 72],
+    ["ledger", 28],
+  ],
+  O2: [["notes", 100]],
+  OL: [
+    ["ledger", 64],
+    ["notes", 36],
+  ],
+  OpenAI: [["atlas", 100]],
+};
+const PROVIDER_API = { OA: 34.1, O2: 3.05, OL: 6.85, OpenAI: 4.2 };
+
+function providerRows(subscriptions) {
+  const rows = subscriptions.map((subscription) => {
+    const projects = PROVIDER_PROJECTS[subscription.abbr];
+    if (!projects) {
+      throw new Error(`no provider projects for ${subscription.abbr}`);
+    }
+    const priced = subscription.price !== null;
+    return {
+      name: subscription.abbr,
+      company: subscription.company,
+      api: PROVIDER_API[subscription.abbr],
+      apiCurrency: "EUR",
+      apiMissing: null,
+      projects,
+      used: subscription.now,
+      money: priced ? (subscription.now / 100) * weeklyPrice(subscription) : null,
+      moneyMissing: priced ? null : "the account has no monthly price",
+      resetsAt:
+        subscription.monthEnd !== null
+          ? subscription.monthEnd
+          : new Date(Date.parse(resetEnd(subscription, 12))).toISOString(),
+    };
+  });
+  rows.push({
+    name: "OpenAI",
+    company: "openai",
+    api: PROVIDER_API.OpenAI,
     apiCurrency: "EUR",
     apiMissing: null,
-    projects: [
-      ["atlas", 72],
-      ["ledger", 28],
-    ],
-  },
-  {
-    name: "Ollama",
-    api: 6.85,
-    apiCurrency: "EUR",
-    apiMissing: null,
-    projects: [
-      ["ledger", 64],
-      ["notes", 36],
-    ],
-  },
-];
+    projects: PROVIDER_PROJECTS.OpenAI,
+    used: null,
+    money: null,
+    moneyMissing: "no account was in use at that time",
+    resetsAt: null,
+  });
+  return rows;
+}
 
 // The card ignores the range, so it never answers "empty".
 export function thisWeek(query) {
-  const { chosen } = chosenAccounts(query);
+  const { chosen, chosenSubscriptions } = chosenAccounts(query);
   if (variant() === "stats-no-running") return { accounts: [], providers: [], projects: [] };
+  const providers = providerRows(chosenSubscriptions);
   const accounts = chosen.map((account) => {
     const window = runningWindow(account);
     const projects = RUNNING_PROJECTS[account.abbr];
@@ -118,7 +150,8 @@ export function thisWeek(query) {
   // All listed accounts and providers together, each weighted by its value
   // this week (an account's money stands in for its API value here).
   const total =
-    sum(accounts.map((account) => account.money)) + sum(PROVIDERS.map((provider) => provider.api));
+    sum(accounts.map((account) => account.money)) +
+    sum(providers.map((provider) => provider.api));
   const byProject = new Map();
   const add = (weight, projects) => {
     for (const [name, share] of projects) {
@@ -128,8 +161,8 @@ export function thisWeek(query) {
   for (const account of chosen) {
     add((account.now / 100) * weeklyPrice(account), RUNNING_PROJECTS[account.abbr]);
   }
-  for (const provider of PROVIDERS) add(provider.api, provider.projects);
-  return { accounts, providers: PROVIDERS, projects: topThree([...byProject.entries()]) };
+  for (const provider of providers) add(provider.api, provider.projects);
+  return { accounts, providers, projects: topThree([...byProject.entries()]) };
 }
 
 export function overview(query) {
@@ -181,6 +214,12 @@ export function overview(query) {
   const switchesTotal =
     switches.user + switches.cli + switches.auto + switches.agent + switches.external;
   const blockedHours = sum(indexes.map((index) => BLOCKED[index]));
+  // One figure per company, Anthropic first (the core's `blockedByCompany`):
+  // the provider's blocked hours never add to Claude's.
+  const blockedByCompany = [
+    { company: "anthropic", hours: blockedHours },
+    { company: "openai", hours: round1(indexes.length * 0.5) },
+  ];
   const avoidableHours = blockedHours > 0 ? (blockedHours / 57) * 6 : 0;
   // The mock-up's percentages: the used and expired money of the priced weeks
   // over the money their windows offered, the same rule as the Rust page.
@@ -217,7 +256,7 @@ export function overview(query) {
       usedPercent,
       expiredPercent,
       expiredByAccount: expiredByAccount(finished, chosen),
-      blockedHours,
+      blockedByCompany,
       blockedBeforeAdded,
       avoidableHours,
       switches,

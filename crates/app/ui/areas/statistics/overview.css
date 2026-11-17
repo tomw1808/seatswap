@@ -113,6 +113,15 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* The one line that explains a paler provider bar; no separate colour box,
+   because the paler row keeps its projects' colours at half opacity. */
+.stats-tw-paler {
+  color: var(--muted);
+  font-size: 10px;
+  font-style: italic;
+  white-space: nowrap;
+}
+
 .stats-tw-empty {
   margin: 0;
   padding: 2px 12px 10px;
@@ -170,6 +179,44 @@
   font-size: 12px;
   font-weight: 400;
   color: var(--muted);
+}
+
+/* A company name inside the Blocked KPI: plain text at the figure's size, not
+   the tag the rows use. */
+.stats-kpi-value .stats-provider {
+  background: none;
+  box-shadow: none;
+  color: inherit;
+  font-size: inherit;
+  font-weight: 600;
+  min-width: 0;
+  height: auto;
+  padding: 0;
+}
+
+/* The Blocked KPI never ends in an ellipsis: each company's figure gets its own
+   line and the tile clips rather than shortening it. */
+.stats-kpi-value.stats-kpi-blocked {
+  overflow: hidden;
+  text-overflow: clip;
+}
+
+/* One company per line. With two or three the lines take a smaller size, so
+   "Anthropic 2h" and "OpenAI 30min" both fit the tile at a narrow window. */
+.stats-blocked-companies {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  min-width: 0;
+}
+
+.stats-blocked-company {
+  white-space: nowrap;
+}
+
+.stats-blocked-many {
+  font-size: 15px;
+  line-height: 19px;
 }
 
 .stats-kpi-sub {

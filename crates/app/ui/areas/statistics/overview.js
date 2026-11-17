@@ -64,23 +64,32 @@ function barWidth(value) {
   return `${Math.min(value, 100)}%`;
 }
 
-// One other provider's row of the This-week card (Codex, Ollama): its work
-// since Monday split by project, valued at API prices. There is no limit to
-// fill, so the pieces span the whole bar, faded, and never read as a share
-// of a limit used.
-function providerRow(provider, colours) {
-  const tip = `${provider.name} this week: no subscription price yet, valued at API prices`;
-  const row = h("div", { class: "stats-tw-row stats-tw-row-api" }, [
-    h("div", { class: "stats-tw-account" }, [providerName(provider.name, tip)]),
-  ]);
+// The subscription behind a This-week provider row: the frame's view for its
+// abbreviation, or null for a company row (work whose subscription is not
+// known), which `providerName` names.
+function providerSubscription(provider, env) {
+  if (typeof provider.name !== "string" || provider.name === "") return null;
+  return env.accounts.find((view) => view.abbr === provider.name) || null;
+}
+
+// Whether a provider row has no subscription value to fill a bar with: a
+// company row (no subscription) and a subscription whose view has no price are
+// the paler kind. The frame's view carries the snapshot's monthly price.
+function providerIsPale(view) {
+  return view === null || view.price === null;
+}
+
+// The pieces of a provider row's bar by project, as the account rows draw them.
+function providerFill(provider, used, color, colours, tip) {
   const fill = h("div", { class: "stats-tw-fill" });
+  if (typeof used === "number") fill.style.width = barWidth(used);
   if (provider.projects.length === 0) {
     const reason =
       typeof provider.apiMissing === "string" ? provider.apiMissing : "no API value this week";
     fill.appendChild(
       h("i", {
         class: "stats-tw-seg",
-        style: { flexGrow: "1", background: "var(--muted)" },
+        style: { flexGrow: "1", background: color },
         title: `${tip} | no project split: ${reason}`,
       })
     );
@@ -98,7 +107,70 @@ function providerRow(provider, colours) {
       })
     );
   }
-  row.appendChild(h("div", { class: "stats-tw-bar stats-tw-bar-api" }, [fill]));
+  return fill;
+}
+
+// A provider subscription's row of the This-week card: the account row's code
+// (chip, used bar, money, reset). Without a price the bar is the paler kind and
+// its money is "—" titled with the reason.
+function subscriptionRow(provider, view, colours, currency, env) {
+  const name = accountNameText(env.accounts, view.id);
+  const color = isColor(view.color) ? view.color : "var(--muted)";
+  const used = typeof provider.used === "number" ? provider.used : null;
+  const tip =
+    used === null
+      ? `${name} this week: no running window of this subscription`
+      : `${name} this week: used ${percentText(used)} so far`;
+  const pale = providerIsPale(view);
+  const row = h("div", { class: `stats-tw-row${pale ? " stats-tw-row-api" : ""}` }, [
+    h("div", { class: "stats-tw-account" }, [
+      accountName(env.accounts, view.id),
+      accountPlan(env.accounts, view.id),
+    ]),
+  ]);
+  row.appendChild(
+    h("div", { class: `stats-tw-bar${pale ? " stats-tw-bar-api" : ""}` }, [
+      providerFill(provider, used, color, colours, tip),
+    ])
+  );
+  const amount = amountNode(provider.money, currency);
+  if (provider.money === null && typeof provider.moneyMissing === "string") {
+    amount.title = provider.moneyMissing;
+  }
+  const valueTitle = [tip, provider.moneyMissing].filter(Boolean).join(" | ");
+  row.appendChild(
+    h("span", { class: "stats-tw-figure", title: valueTitle }, [
+      `${used === null ? "—" : percentText(used)} · `,
+      amount,
+    ])
+  );
+  const reset =
+    typeof provider.resetsAt === "string"
+      ? {
+          text: `resets ${weekdayTimeText(provider.resetsAt)}`,
+          title: `resets ${dateTimeText(provider.resetsAt)}`,
+        }
+      : {
+          text: "resets —",
+          title: provider.moneyMissing || "no running window of this subscription",
+        };
+  row.appendChild(h("span", { class: "stats-tw-reset", text: reset.text, title: reset.title }));
+  return row;
+}
+
+// A company row of the This-week card (work whose subscription is not known):
+// its API value since Monday by project, with no limit to fill, so the pieces
+// span the whole paler bar and never read as a share of a limit used.
+function companyRow(provider, colours) {
+  const tip = `${provider.company} this week: no subscription, valued at API prices`;
+  const row = h("div", { class: "stats-tw-row stats-tw-row-api" }, [
+    h("div", { class: "stats-tw-account" }, [providerName(provider.company, tip)]),
+  ]);
+  row.appendChild(
+    h("div", { class: "stats-tw-bar stats-tw-bar-api" }, [
+      providerFill(provider, null, "var(--muted)", colours, tip),
+    ])
+  );
   const amount = amountNode(provider.api, provider.apiCurrency);
   if (provider.api === null && typeof provider.apiMissing === "string") {
     amount.title = provider.apiMissing;
@@ -116,6 +188,15 @@ function providerRow(provider, colours) {
   return row;
 }
 
+// One other provider's row of the This-week card: a subscription row when the
+// frame knows the subscription its name is, else the company row.
+function providerRow(provider, colours, currency, env) {
+  const view = providerSubscription(provider, env);
+  return view === null
+    ? companyRow(provider, colours)
+    : subscriptionRow(provider, view, colours, currency, env);
+}
+
 // The This-week card: each account's weekly window running now, its use so
 // far split by project, its money and its reset; then each other provider's
 // work of this calendar week at API prices. It ignores the range.
@@ -123,7 +204,10 @@ function thisWeekCard(card, currency, colours, env) {
   const node = h("div", { class: "hcard stats-tw-card" }, [
     h("div", { class: "ch" }, [
       h("span", { class: "t", text: "This week · so far" }),
-      h("span", { class: "s", text: "each account's current weekly window, by project" }),
+      h("span", {
+        class: "s",
+        text: "each account's and subscription's current window, by project",
+      }),
     ]),
   ]);
   if (card.accounts.length === 0) {
@@ -204,7 +288,9 @@ function thisWeekCard(card, currency, colours, env) {
     );
     rows.appendChild(row);
   }
-  for (const provider of card.providers) rows.appendChild(providerRow(provider, colours));
+  for (const provider of card.providers) {
+    rows.appendChild(providerRow(provider, colours, currency, env));
+  }
   node.appendChild(rows);
 
   // The legend names every colour the bars show: the projects of all listed
@@ -227,6 +313,16 @@ function thisWeekCard(card, currency, colours, env) {
       item.title = `${project} | in "other" over all listed accounts and providers`;
       legend.appendChild(item);
     }
+  }
+  // The paler bar means no subscription value: say so once, only when a row
+  // draws one.
+  if (card.providers.some((provider) => providerIsPale(providerSubscription(provider, env)))) {
+    legend.appendChild(
+      h("span", {
+        class: "stats-tw-paler",
+        text: "paler: valued at API prices only, no price entered",
+      })
+    );
   }
   if (legend.childNodes.length > 0) node.appendChild(legend);
   return node;
@@ -315,21 +411,46 @@ export async function show(container, env) {
       "Expired unused | quota left at a weekly reset, in money; per account, largest first"
     )
   );
+  if (!Array.isArray(data.kpis.blockedByCompany)) {
+    throw new Error("stats_overview returned no blockedByCompany");
+  }
   const blockedBefore = data.kpis.blockedBeforeAdded;
   const blockedSub = blockedBefore
     ? [
         durationText(Math.round(blockedBefore.hours * 3600)),
-        " of them before ",
+        " of Anthropic's before ",
         blockedBefore.name,
         " was added",
       ]
-    : "working hours the active account was full";
+    : "working hours each company was blocked";
+  // One figure per company, each on its own line: a provider's blocked hours
+  // are not Anthropic's, so they are never added up, and no figure is cut off.
+  const blocked = data.kpis.blockedByCompany;
+  const blockedValue =
+    blocked.length === 0
+      ? durationText(0)
+      : h(
+          "span",
+          {
+            class: `stats-blocked-companies${blocked.length > 1 ? " stats-blocked-many" : ""}`,
+          },
+          blocked.map((entry) =>
+            h("span", { class: "stats-blocked-company" }, [
+              providerName(
+                entry.company,
+                "working hours blocked at 100 % of this company's limit"
+              ),
+              ` ${durationText(Math.round(entry.hours * 3600))}`,
+            ])
+          )
+        );
   kpis.appendChild(
     kpi(
       "Blocked",
-      durationText(Math.round(data.kpis.blockedHours * 3600)),
+      blockedValue,
       blockedSub,
-      "Blocked | working hours in which the active account was at 100 %"
+      "Blocked | working hours in which each company's account was at 100 % of its limit; one figure per company, never a sum",
+      "stats-kpi-blocked"
     )
   );
   kpis.appendChild(

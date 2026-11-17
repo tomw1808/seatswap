@@ -113,9 +113,46 @@ class EmptyRange extends Error {
   }
 }
 
+// The one list of views the frame and every page use: the stored accounts and,
+// after them, one view per provider subscription. A provider subscription's id
+// is its `account.acc`, the id its weeks and This-week rows carry. `price` is
+// the snapshot's monthly price, `null` when none is entered.
 function accountsFrom(snapshot) {
-  if (!isObject(snapshot) || !Array.isArray(snapshot.views)) return [];
-  return snapshot.views.filter((view) => isObject(view) && typeof view.id === "string");
+  if (!isObject(snapshot)) return [];
+  const views = [];
+  if (Array.isArray(snapshot.accounts)) {
+    for (const account of snapshot.accounts) {
+      if (!isObject(account) || typeof account.id !== "string") continue;
+      views.push({
+        id: account.id,
+        abbr: account.abbr,
+        label: account.label,
+        color: account.color,
+        plan: account.plan,
+        price: typeof account.price === "number" ? account.price : null,
+      });
+    }
+  }
+  if (Array.isArray(snapshot.providerSubscriptions)) {
+    for (const subscription of snapshot.providerSubscriptions) {
+      if (
+        !isObject(subscription) ||
+        !isObject(subscription.account) ||
+        typeof subscription.account.acc !== "string"
+      ) {
+        continue;
+      }
+      views.push({
+        id: subscription.account.acc,
+        abbr: subscription.abbr,
+        label: subscription.label,
+        color: subscription.color,
+        plan: subscription.plan,
+        price: typeof subscription.price === "number" ? subscription.price : null,
+      });
+    }
+  }
+  return views;
 }
 
 function pageFromSub(sub) {
@@ -294,7 +331,7 @@ function renderFrame() {
 
   const accounts = state.accounts.length;
   const meta = [
-    plural(accounts, "account", "accounts"),
+    plural(accounts, "subscription", "subscriptions"),
     Array.isArray(state.hosts) ? plural(state.hosts.length, "host", "hosts") : "— hosts",
   ];
   if (typeof state.historyStart === "string") {

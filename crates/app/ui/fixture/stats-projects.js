@@ -39,16 +39,17 @@ function sameKey(first, second) {
 }
 
 // The work of other providers than Claude, in % of a row's API value, by the
-// row's level and name: a Codex session in atlas/engine and flash workers in
-// ledger. projects.rs sends them as `byProvider`, beside the accounts' split.
+// row's level and name: OpenAI sessions in atlas/engine and Ollama work in
+// ledger. projects.rs sends them as `byProvider` by company key, beside the
+// accounts' split.
 const PROVIDERS = {
   "0:sam": [
-    ["Codex", 6.8],
-    ["Ollama", 2.6],
+    ["openai", 6.8],
+    ["ollama", 2.6],
   ],
-  "1:atlas": [["Codex", 11.7]],
-  "2:engine": [["Codex", 19]],
-  "1:ledger": [["Ollama", 9]],
+  "1:atlas": [["openai", 11.7]],
+  "2:engine": [["openai", 19]],
+  "1:ledger": [["ollama", 9]],
 };
 
 function providersOf(entry) {
@@ -243,7 +244,7 @@ export function projects(query) {
     usdRate: USD_RATE,
     notes: [
       "Not in any project: use of these accounts without a session file on a host with seatswap (claude.ai in the browser, the phone).",
-      "Codex and Ollama work is valued at API prices only; it uses no Claude account.",
+      "OpenAI and Ollama work belongs to its provider subscription, not to a Claude account.",
     ],
   };
 }

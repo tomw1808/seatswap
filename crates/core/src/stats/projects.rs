@@ -57,10 +57,10 @@ pub struct Node {
     /// first; `None` is a Claude record without a known account.
     pub by_account: Vec<(Option<String>, f64)>,
     /// Each other company's share of this node's API value, in %, largest
-    /// first, by [`Company::name`] (`OpenAI`, `Ollama`): its work belongs to
-    /// its provider subscription, not to a Claude account. With `by_account` it
-    /// makes up the node's API value.
-    pub by_provider: Vec<(String, f64)>,
+    /// first, by the company's lowercase JSON key (`openai`, `ollama`): its
+    /// work belongs to its provider subscription, not to a Claude account. With
+    /// `by_account` it makes up the node's API value.
+    pub by_provider: Vec<(Company, f64)>,
     /// The distinct sessions of the node's records.
     pub sessions: u32,
 }
@@ -869,21 +869,17 @@ fn by_account<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, sums: &Sums) -> Vec<(Option<St
 }
 
 /// Each other provider's share of the node's API value, largest first, then
-/// by name.
-fn by_provider(sums: &Sums) -> Vec<(String, f64)> {
+/// by name; the company is serialized as its lowercase JSON key.
+fn by_provider(sums: &Sums) -> Vec<(Company, f64)> {
     let Some(api) = sums.api().filter(|api| *api > 0.0) else {
         return Vec::new();
     };
-    let mut shares: Vec<(String, f64)> = sums
+    let mut shares: Vec<(Company, f64)> = sums
         .api_by_provider
         .iter()
-        .filter_map(|(provider, values)| {
-            values
-                .api
-                .map(|value| (provider.name().to_string(), value / api * 100.0))
-        })
+        .filter_map(|(provider, values)| values.api.map(|value| (*provider, value / api * 100.0)))
         .collect();
-    shares.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    shares.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.name().cmp(b.0.name())));
     shares
 }
 
@@ -1657,7 +1653,13 @@ mod tests {
             Some(150.0),
             "120 EUR of Claude, 30 of Codex"
         );
-        assert_eq!(atlas_node.by_provider, vec![("OpenAI".to_string(), 20.0)]);
+        assert_eq!(atlas_node.by_provider, vec![(Company::OpenAI, 20.0)]);
+        let json = serde_json::to_value(atlas_node).expect("the node's JSON shape");
+        assert_eq!(
+            json["byProvider"],
+            serde_json::json!([["openai", 20.0]]),
+            "the company is the lowercase JSON key"
+        );
         assert_eq!(
             atlas_node.by_account.len(),
             2,

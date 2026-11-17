@@ -127,21 +127,94 @@ export const ACCOUNTS = [
   },
 ];
 
+// The weeks of a subscription that has no row in a given week (one per entry
+// of WEEKS), so a provider's array stays as long as the accounts'.
+const EMPTY_WEEKS = [...yearValues(() => null), ...Array(12).fill(null)];
+
+// The provider subscriptions the built-in snapshot stores: OA's weekly window
+// and OL's monthly one are the page's made-up rows (OA one finished week and a
+// running window; O2, the second Codex login of the pop-up's fixture, only a
+// running window and no price; OL has no weekly window, only its monthly credits).
+export const SUBSCRIPTIONS = [
+  {
+    id: null,
+    abbr: "OA",
+    label: "OpenAI",
+    plan: "Plus",
+    color: "#db2777",
+    price: 23,
+    company: "openai",
+    used: [...EMPTY_WEEKS.slice(0, -1), 46],
+    now: 61,
+    resetDay: 5,
+    resetHour: 19,
+    monthEnd: null,
+  },
+  {
+    id: null,
+    abbr: "O2",
+    label: "OpenAI",
+    plan: "Pro",
+    color: "#db2777",
+    price: null,
+    company: "openai",
+    used: EMPTY_WEEKS,
+    now: 20,
+    resetDay: 2,
+    resetHour: 16,
+    monthEnd: null,
+  },
+  {
+    id: null,
+    abbr: "OL",
+    label: "Ollama",
+    plan: null,
+    color: "#ea580c",
+    price: null,
+    company: "ollama",
+    used: EMPTY_WEEKS,
+    now: 34,
+    resetDay: null,
+    resetHour: null,
+    monthEnd: "2026-12-03T00:00:00.000Z",
+  },
+];
+
 // Each answer names the built-in snapshot's accounts: their ids come from its
-// views by abbreviation, never from ids of the fixture's own.
+// stored rows by abbreviation, never from ids of the fixture's own. A provider
+// subscription's id is its `account.acc`, as the snapshot's rows carry it.
 export function resolveIds() {
   const fixture = ensureFixture();
-  if (!fixture || !Array.isArray(fixture.views)) {
-    throw new Error("the built-in snapshot has no account views");
+  if (!fixture || !Array.isArray(fixture.accounts)) {
+    throw new Error("the built-in snapshot has no account rows");
+  }
+  if (!Array.isArray(fixture.providerSubscriptions)) {
+    throw new Error("the built-in snapshot has no provider subscriptions");
   }
   for (const account of ACCOUNTS) {
-    const view = fixture.views.find(
+    const row = fixture.accounts.find(
       (candidate) => candidate && candidate.abbr === account.abbr
     );
-    if (!view || typeof view.id !== "string" || view.id === "") {
+    if (!row || typeof row.id !== "string" || row.id === "") {
       throw new Error(`the built-in snapshot has no account ${JSON.stringify(account.abbr)}`);
     }
-    account.id = view.id;
+    account.id = row.id;
+  }
+  for (const subscription of SUBSCRIPTIONS) {
+    const row = fixture.providerSubscriptions.find(
+      (candidate) => candidate && candidate.abbr === subscription.abbr
+    );
+    if (
+      !row ||
+      !row.account ||
+      typeof row.account.acc !== "string" ||
+      row.account.acc === ""
+    ) {
+      throw new Error(
+        `the built-in snapshot has no provider subscription ${JSON.stringify(subscription.abbr)}`
+      );
+    }
+    subscription.id = row.account.acc;
   }
 }
 
@@ -358,17 +431,35 @@ function rangeIndexes(range) {
   }
 }
 
+export function subscriptionById(id) {
+  return SUBSCRIPTIONS.find((subscription) => subscription.id === id) || null;
+}
+
+// The chosen Claude accounts and provider subscriptions. An empty
+// `query.accounts` is every one of both lists; an id names either an account
+// or a provider subscription (a provider week's id is its `account.acc`).
 export function chosenAccounts(query) {
   if (!query || typeof query !== "object") throw new Error("a statistics query is missing");
   const indexes = rangeIndexes(query.range);
   if (!Array.isArray(query.accounts)) throw new Error("query.accounts must be a list");
-  const ids = query.accounts.length === 0 ? viewOrder() : query.accounts;
   const chosen = [];
-  for (const id of ids) {
-    if (!accountById(id)) throw new Error(`unknown account ${JSON.stringify(id)}`);
-    if (!chosen.includes(id)) chosen.push(id);
+  const subscriptions = [];
+  if (query.accounts.length === 0) {
+    chosen.push(...viewOrder().map(accountById));
+    subscriptions.push(...SUBSCRIPTIONS);
+  } else {
+    for (const id of query.accounts) {
+      const account = accountById(id);
+      if (account) {
+        if (!chosen.includes(account)) chosen.push(account);
+        continue;
+      }
+      const subscription = subscriptionById(id);
+      if (!subscription) throw new Error(`unknown account ${JSON.stringify(id)}`);
+      if (!subscriptions.includes(subscription)) subscriptions.push(subscription);
+    }
   }
-  return { indexes, chosen: chosen.map(accountById) };
+  return { indexes, chosen, chosenSubscriptions: subscriptions };
 }
 
 function totalUsedMoney(index) {
