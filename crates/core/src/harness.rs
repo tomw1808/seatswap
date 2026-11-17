@@ -355,9 +355,7 @@ pub fn sessions(paths: &HarnessPaths, since: DateTime<Utc>) -> HarnessRead {
                 Ok(Some(mut session)) => {
                     // Keep the file relative to the store, so a saved total
                     // finds it again also when the store moves.
-                    if let Ok(relative) = file.strip_prefix(&paths.sessions) {
-                        session.file = relative.to_path_buf();
-                    }
+                    session.file = crate::transcripts::file_below(&paths.sessions, &file);
                     read.sessions.push(session);
                 }
                 Ok(None) => {}

@@ -1392,9 +1392,10 @@ const CODEX_LAST_HOUR_UNKNOWN: &str =
 /// open. The two rules are Harness's running rule without its finished test: a
 /// Codex session between two tasks is still open, only idle.
 ///
-/// Only running sessions are rows. This task writes no Codex session or token
-/// record to the history, so a closed Codex session has no closed row to read;
-/// the providers' readings already count Codex use.
+/// Only running sessions are rows, and the row keeps the session's live total.
+/// The sessions thread writes the token lines of these sessions from their
+/// series; a closed Codex session has no session record of its own here, so it
+/// has no closed row to read.
 ///
 /// The values use the same [`Pricing`] and [`Valuer`] as the other rows: a
 /// session's tokens at its model, dated at its last event, and its `last_hour`
@@ -3762,10 +3763,12 @@ mod tests {
                 cw: 0,
                 cr: 500,
             },
+            series: Vec::new(),
             last_hour: Some(Tokens::default()),
             busy: false,
             title: Some("raspberry".to_string()),
             file: PathBuf::from("/home/sam/.codex/sessions/2026/11/14/rollout-now.jsonl"),
+            recorded_file: PathBuf::from("2026/11/14/rollout-now.jsonl"),
         };
         let codex = codex_rows(
             &[session],
@@ -5126,6 +5129,7 @@ mod tests {
                 cw: 300,
                 cr: 8000,
             },
+            series: Vec::new(),
             last_hour: Some(Tokens {
                 input: 1200,
                 out: 90,
@@ -5135,6 +5139,7 @@ mod tests {
             busy: true,
             title: None,
             file: PathBuf::from("/home/sam/.codex/sessions/2026/11/14/rollout-old.jsonl"),
+            recorded_file: PathBuf::from("2026/11/14/rollout-old.jsonl"),
         };
 
         let quiet = codex_rows(
@@ -5222,6 +5227,7 @@ mod tests {
                 cw: 0,
                 cr: 500,
             },
+            series: Vec::new(),
             last_hour: Some(Tokens {
                 input: 400,
                 out: 40,
@@ -5231,6 +5237,7 @@ mod tests {
             busy: false,
             title: None,
             file: PathBuf::from("/home/sam/.codex/sessions/2026/11/14/rollout-now.jsonl"),
+            recorded_file: PathBuf::from("2026/11/14/rollout-now.jsonl"),
         };
 
         let rows = codex_rows(

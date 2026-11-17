@@ -32,7 +32,13 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 
-use crate::transcripts::Tokens;
+use crate::history::TokenRecord;
+use crate::project;
+use crate::transcripts::{bucket_start, CodexRecorded, Tokens, TOKEN_BUCKET_MINUTES};
+
+/// One `token_count` line: its time, the model of the latest `turn_context`
+/// before it, and its running total as [`Tokens`] maps Codex's fields.
+pub type CodexTokenPoint = (DateTime<Utc>, Option<String>, Tokens);
 
 /// One Codex session, as its rollout file gives it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +58,12 @@ pub struct CodexSession {
     /// all the session's files, mapped as the module doc says; zero before the
     /// first `token_count`, so a file without a total never resets it.
     pub tokens: Tokens,
+    /// Every `token_count` line in time order over all the session's files: its
+    /// time, the model of the latest `turn_context` before it in time over all
+    /// those files (`None` before the first one), and its running total. This is
+    /// what the token lines are the growth of; a total equal to the previous one
+    /// records nothing.
+    pub series: Vec<CodexTokenPoint>,
     /// The newest total minus the newest total at or before `now - 60 min`; the
     /// whole newest total when there is none. `None` when the newest total is
     /// lower than that baseline in a field, so the last hour is not known; the
@@ -65,6 +77,9 @@ pub struct CodexSession {
     /// The rollout file this session came from, so the process walk's open
     /// files can be matched to it. Not part of the page's shape.
     pub(crate) file: PathBuf,
+    /// The rollout file below `<codex home>/sessions`, as `codex.json` keeps it,
+    /// so a moved store finds it again. Not part of the page's shape.
+    pub(crate) recorded_file: PathBuf,
 }
 
 /// What one read of Codex's session folder found, and what it could not read.
@@ -99,7 +114,7 @@ pub struct CodexRead {
 /// naming the file and the line, and the rest of the file is still read. A file
 /// without a `session_meta` line is a warning and no session.
 pub fn sessions(codex_home: &Path, since: DateTime<Utc>, now: DateTime<Utc>) -> CodexRead {
-    let root = codex_home.join("sessions");
+    let root = crate::paths::CodexPaths::at(codex_home).sessions_dir();
     let mut read = CodexRead::default();
     let mut rollouts = Vec::new();
     for day in day_folders(&root, &mut read.warnings) {
@@ -153,7 +168,10 @@ pub fn sessions(codex_home: &Path, since: DateTime<Utc>, now: DateTime<Utc>) -> 
                     continue;
                 }
             }
-            if let Some(rollout) = read_one(&file, &mut read.warnings) {
+            if let Some(mut rollout) = read_one(&file, &mut read.warnings) {
+                // Keep the file relative to the store, as Harness does, so a
+                // saved total finds it again when the store moves.
+                rollout.recorded_file = crate::transcripts::file_below(&root, &rollout.file);
                 rollouts.push(rollout);
             }
         }
@@ -367,7 +385,8 @@ fn read_one(file: &Path, warnings: &mut Vec<String>) -> Option<Rollout> {
     let mut meta: Option<(String, PathBuf, DateTime<Utc>)> = None;
     let mut meta_seen = false;
     let mut model = None;
-    let mut totals = Vec::new();
+    let mut models = Vec::new();
+    let mut series = Vec::new();
     let mut busy = false;
     let mut newest: Option<DateTime<Utc>> = None;
     for (index, raw) in bytes[..end].split(|byte| *byte == b'\n').enumerate() {
@@ -430,6 +449,7 @@ fn read_one(file: &Path, warnings: &mut Vec<String>) -> Option<Rollout> {
                 if let Some(value) = line.payload.and_then(|payload| payload.model) {
                     // An empty or all-space model names nothing, as in harness.rs.
                     if !value.trim().is_empty() {
+                        models.push((at, value.clone()));
                         model = Some(value);
                     }
                 }
@@ -484,8 +504,9 @@ fn read_one(file: &Path, warnings: &mut Vec<String>) -> Option<Rollout> {
                         // `cache_write_input_tokens` is absent from Codex's real
                         // lines (OpenAI bills no cache write), so a missing one
                         // is 0 by the documented rule in the module doc.
-                        totals.push((
+                        series.push((
                             at,
+                            model.clone(),
                             Tokens {
                                 input: input - cached,
                                 out: output,
@@ -517,7 +538,9 @@ fn read_one(file: &Path, warnings: &mut Vec<String>) -> Option<Rollout> {
         last,
         busy,
         file: file.to_path_buf(),
-        totals,
+        recorded_file: file.to_path_buf(),
+        series,
+        models,
     })
 }
 
@@ -531,8 +554,14 @@ struct Rollout {
     last: DateTime<Utc>,
     busy: bool,
     file: PathBuf,
-    /// The totals of every `token_count` line with that line's time.
-    totals: Vec<(DateTime<Utc>, Tokens)>,
+    /// The file below the sessions folder, as `codex.json` keeps it.
+    recorded_file: PathBuf,
+    /// The totals of every `token_count` line, each with its time and the model
+    /// of the latest `turn_context` before it in this file.
+    series: Vec<CodexTokenPoint>,
+    /// Every `turn_context` model of this file, with its time: the model of a
+    /// point is taken from all the session's files together.
+    models: Vec<(DateTime<Utc>, String)>,
 }
 
 /// Turn the read files into sessions, one per id. The file whose last event is
@@ -540,7 +569,9 @@ struct Rollout {
 /// path, so the read order cannot change the result), and `started` is the
 /// earlier of the files. The tokens are the newest total in time over all the
 /// files, so a newer file without a total keeps the older file's total and no
-/// file ever resets it to zero; a session with no total at all has zero.
+/// file ever resets it to zero; a session with no total at all has zero. The
+/// model of each point is the latest `turn_context` before it in time over all
+/// the files, so a session merged from two files keeps its model.
 ///
 /// Every file's totals are put in time order for the last hour, which compares
 /// two of them: the newest total minus the newest total at or before
@@ -574,9 +605,9 @@ fn merge_rollouts(
             .iter()
             .flat_map(|rollout| {
                 rollout
-                    .totals
+                    .series
                     .iter()
-                    .map(move |(at, tokens)| (*at, rollout.file.clone(), *tokens))
+                    .map(move |(at, _, tokens)| (*at, rollout.file.clone(), *tokens))
             })
             .collect();
         totals.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
@@ -594,6 +625,29 @@ fn merge_rollouts(
             None => Some(tokens),
             Some(baseline) => subtract(tokens, baseline),
         };
+        // The model of a point is the latest `turn_context` before it in time
+        // over all the session's files, so a session merged from two files
+        // keeps its model.
+        let mut models: Vec<(DateTime<Utc>, PathBuf, String)> = group
+            .iter()
+            .flat_map(|rollout| {
+                rollout
+                    .models
+                    .iter()
+                    .map(move |(at, model)| (*at, rollout.file.clone(), model.clone()))
+            })
+            .collect();
+        models.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let mut series = Vec::with_capacity(totals.len());
+        let mut next_model = 0;
+        let mut model = None;
+        for (at, _, total) in totals {
+            while next_model < models.len() && models[next_model].0 <= at {
+                model = Some(models[next_model].2.clone());
+                next_model += 1;
+            }
+            series.push((at, model.clone(), total));
+        }
         if last_hour.is_none() {
             warnings.push(format!(
                 "Codex session {id}'s token total went down; its last hour is not known"
@@ -606,10 +660,12 @@ fn merge_rollouts(
             started,
             last: giver.last,
             tokens,
+            series,
             last_hour,
             busy: giver.busy,
             title: None,
             file: giver.file.clone(),
+            recorded_file: giver.recorded_file.clone(),
         });
     }
     sessions
@@ -624,6 +680,197 @@ fn subtract(newer: Tokens, older: Tokens) -> Option<Tokens> {
         cw: newer.cw.checked_sub(older.cw)?,
         cr: newer.cr.checked_sub(older.cr)?,
     })
+}
+
+/// The token lines of the Codex sessions: the growth of each `token_count`
+/// line over the previous one, per 5-minute bucket and the model of the latest
+/// `turn_context` before it (R5), and the warnings about what could not be
+/// recorded.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CodexLines {
+    pub lines: Vec<TokenRecord>,
+    pub warnings: Vec<String>,
+}
+
+/// The token lines of the Codex sessions, and what could not be recorded.
+///
+/// `recorded` holds what the history already has; on return it holds the
+/// session's high-water mark, the time the pass reached and the rollout file.
+/// A line at or before a session's `last_at` is never counted again. A session
+/// never recorded before counts its whole growth from zero, but only from
+/// `since` (the start of the 24 h the Sessions scan reads): the newest total
+/// before `since` is its starting point, not a line.
+///
+/// Growth counts only above the highest total the session has reached, per
+/// token kind, so a rollout that repeats earlier totals counts nothing twice.
+/// A total below that mark is a warning and records nothing for that line. A
+/// grown line without a `turn_context` model is a warning; its total, the line
+/// time and everything after it in that session are kept back for a later pass,
+/// so it is recorded once a model is known, never dropped.
+///
+/// `home` is the user's home, as in `transcripts::token_records`, so a Codex
+/// line names the same project as its row ([`crate::project::identify`]).
+pub fn codex_token_lines(
+    sessions: &[CodexSession],
+    recorded: &mut BTreeMap<String, CodexRecorded>,
+    home: &Path,
+    since: DateTime<Utc>,
+) -> CodexLines {
+    let mut result = CodexLines::default();
+    let mut groups: BTreeMap<(DateTime<Utc>, String, String), (Tokens, u32)> = BTreeMap::new();
+    let mut places: BTreeMap<String, (String, project::ProjectKey)> = BTreeMap::new();
+    for session in sessions {
+        let Some(cwd) = session.cwd.to_str() else {
+            result.warnings.push(format!(
+                "Codex session {} has a folder that is not text; its tokens are not recorded",
+                session.id
+            ));
+            continue;
+        };
+        let project = project::identify(Path::new(cwd), home);
+        places.insert(session.id.clone(), (cwd.to_string(), project));
+        let previous = recorded.get(&session.id).cloned();
+        let cutoff = previous.as_ref().map(|recorded| recorded.last_at);
+        // The series of a merged session is in time order; sorting here keeps
+        // a hand-built `CodexSession` from changing the result.
+        let mut points: Vec<&CodexTokenPoint> = session.series.iter().collect();
+        points.sort_by_key(|point| point.0);
+        // A session not recorded before starts at the newest total before the
+        // scan's window; a session that started inside the window starts at
+        // zero, so its first total is recorded whole.
+        let starting = match &previous {
+            Some(recorded) => recorded.total,
+            None => points
+                .iter()
+                .rev()
+                .find(|(at, _, _)| *at < since)
+                .map(|(_, _, total)| *total)
+                .unwrap_or_default(),
+        };
+        let mut mark = starting;
+        let mut last_at = previous
+            .as_ref()
+            .map(|recorded| recorded.last_at)
+            .unwrap_or_else(|| {
+                points
+                    .iter()
+                    .rev()
+                    .find(|(at, _, _)| *at < since)
+                    .map(|(at, _, _)| *at)
+                    .unwrap_or(since)
+            });
+        let mut insert = previous.is_some() || points.iter().any(|(at, _, _)| *at < since);
+        for (at, model, total) in points {
+            if cutoff.is_some_and(|cutoff| *at <= cutoff) {
+                continue;
+            }
+            if previous.is_none() && *at < since {
+                // Only the newest total before the window is the start.
+                continue;
+            }
+            if total_below(*total, mark) {
+                let mut above = mark;
+                high_water(&mut above, *total);
+                result.warnings.push(format!(
+                    "Codex session {}'s token total went down from {} to {}; growth counts again above {}",
+                    session.id,
+                    counts(mark),
+                    counts(*total),
+                    counts(above)
+                ));
+                mark = above;
+                last_at = last_at.max(*at);
+                insert = true;
+                continue;
+            }
+            // No count is below the mark, so this cannot underflow.
+            let delta = Tokens {
+                input: total.input - mark.input,
+                out: total.out - mark.out,
+                cw: total.cw - mark.cw,
+                cr: total.cr - mark.cr,
+            };
+            if delta == Tokens::default() {
+                last_at = last_at.max(*at);
+                insert = true;
+                continue;
+            }
+            let Some(model) = model.as_deref().filter(|model| !model.trim().is_empty()) else {
+                result.warnings.push(format!(
+                    "Codex session {} has a grown token_count without a turn_context model; its growth is kept back until a model is known",
+                    session.id
+                ));
+                break;
+            };
+            let group = groups
+                .entry((bucket_start(*at), session.id.clone(), model.to_string()))
+                .or_default();
+            group.0 += delta;
+            group.1 = group.1.saturating_add(1);
+            mark = *total;
+            last_at = last_at.max(*at);
+            insert = true;
+        }
+        if insert {
+            recorded.insert(
+                session.id.clone(),
+                CodexRecorded {
+                    total: mark,
+                    last_at,
+                    file: session.recorded_file.clone(),
+                },
+            );
+        }
+    }
+    let mut lines = Vec::with_capacity(groups.len());
+    for ((t, session, model), (tokens, answers)) in groups {
+        let Some((cwd, project)) = places.get(&session) else {
+            continue;
+        };
+        lines.push(TokenRecord {
+            t,
+            minutes: TOKEN_BUCKET_MINUTES as u32,
+            session,
+            cwd: cwd.clone(),
+            project: project.clone(),
+            model,
+            input: tokens.input,
+            out: tokens.out,
+            cw: tokens.cw,
+            cr: tokens.cr,
+            answers,
+            agent_answers: 0,
+        });
+    }
+    lines.sort_by(|a, b| {
+        a.session
+            .cmp(&b.session)
+            .then_with(|| a.t.cmp(&b.t))
+            .then_with(|| a.model.cmp(&b.model))
+    });
+    result.lines = lines;
+    result
+}
+
+/// Whether a total is below a high-water mark in any token kind.
+fn total_below(total: Tokens, mark: Tokens) -> bool {
+    total.input < mark.input || total.out < mark.out || total.cw < mark.cw || total.cr < mark.cr
+}
+
+/// Raise a high-water mark to a total, one token kind at a time.
+fn high_water(mark: &mut Tokens, total: Tokens) {
+    mark.input = mark.input.max(total.input);
+    mark.out = mark.out.max(total.out);
+    mark.cw = mark.cw.max(total.cw);
+    mark.cr = mark.cr.max(total.cr);
+}
+
+/// The four counts of a total for a warning: counts only, never text.
+fn counts(tokens: Tokens) -> String {
+    format!(
+        "input {}, output {}, cache write {}, cache read {}",
+        tokens.input, tokens.out, tokens.cw, tokens.cr
+    )
 }
 
 /// One line of a rollout, as far as this module looks at it.
@@ -837,12 +1084,7 @@ mod tests {
         lines: &[String],
         modified: &str,
     ) -> PathBuf {
-        let dir = paths
-            .home
-            .join("sessions")
-            .join(day[0])
-            .join(day[1])
-            .join(day[2]);
+        let dir = paths.sessions_dir().join(day[0]).join(day[1]).join(day[2]);
         write_in(&dir, start, id, lines, modified)
     }
 
@@ -2025,12 +2267,7 @@ mod tests {
             ],
             "2026-11-14T11:56:00Z",
         );
-        let day = paths
-            .home
-            .join("sessions")
-            .join("2026")
-            .join("11")
-            .join("14");
+        let day = paths.sessions_dir().join("2026").join("11").join("14");
         fs::create_dir_all(day.parent().expect("a month folder")).expect("a month folder");
         symlink(&moved, &day).expect("a day folder link");
 
@@ -2060,7 +2297,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let (_tmp, paths) = store();
-        let month = paths.home.join("sessions").join("2026").join("11");
+        let month = paths.sessions_dir().join("2026").join("11");
         fs::create_dir_all(&month).expect("a month folder");
         let note = paths.home.join("not-a-folder.json");
         fs::write(&note, "{}\n").expect("a file");
@@ -2090,6 +2327,506 @@ mod tests {
                 .any(|warning| warning.contains(broken.to_str().expect("a text path"))),
             "the broken link is named: {:?}",
             read.warnings
+        );
+    }
+
+    /// A total for the tests: input, output and cache read; Codex never writes
+    /// a cache-write count.
+    fn tokens(input: u64, out: u64, cr: u64) -> Tokens {
+        Tokens {
+            input,
+            out,
+            cw: 0,
+            cr,
+        }
+    }
+
+    /// A session recorded in an earlier pass: its high-water total at `last_at`,
+    /// dated just before the first line of the rollout under test.
+    fn seeded(total: Tokens, last_at: &str) -> BTreeMap<String, CodexRecorded> {
+        BTreeMap::from([(
+            ATLAS.to_string(),
+            CodexRecorded {
+                total,
+                last_at: utc(last_at),
+                file: PathBuf::from("2026/11/14/earlier.jsonl"),
+            },
+        )])
+    }
+
+    /// Read the one rollout written by `write` and turn it into token lines.
+    fn read_and_record_since(
+        paths: &CodexPaths,
+        recorded: &mut BTreeMap<String, CodexRecorded>,
+        since: DateTime<Utc>,
+    ) -> CodexLines {
+        let read = sessions(&paths.home, since, utc("2026-11-14T12:00:00Z"));
+        assert!(read.warnings.is_empty(), "{:?}", read.warnings);
+        codex_token_lines(&read.sessions, recorded, &paths.home, since)
+    }
+
+    fn read_and_record(
+        paths: &CodexPaths,
+        recorded: &mut BTreeMap<String, CodexRecorded>,
+    ) -> CodexLines {
+        read_and_record_since(paths, recorded, utc("2026-11-14T00:00:00Z"))
+    }
+
+    #[test]
+    fn codex_token_lines_are_the_growth_per_bucket_and_model() {
+        let (_tmp, paths) = store();
+        write(
+            &paths,
+            ["2026", "11", "14"],
+            "2026-11-14T09-55-00",
+            ATLAS,
+            &[
+                meta("2026-11-14T09:55:00.000Z", ATLAS),
+                turn_context("2026-11-14T09:56:00.000Z", 1, MODEL),
+                token_count_without_cache_write("2026-11-14T10:01:00.000Z", 2, 1000, 0, 100),
+                token_count_without_cache_write("2026-11-14T10:03:00.000Z", 3, 3000, 0, 200),
+                token_count_without_cache_write("2026-11-14T10:07:00.000Z", 4, 3500, 0, 300),
+            ],
+            "2026-11-14T10:08:00Z",
+        );
+        // The first line's total was recorded in an earlier pass, just before
+        // it: this pass counts only what grew after that recording.
+        let mut recorded = seeded(tokens(1000, 100, 0), "2026-11-14T10:00:00Z");
+
+        let built = read_and_record(&paths, &mut recorded);
+        let lines = built.lines;
+
+        assert_eq!(lines.len(), 2, "{lines:#?}");
+        assert_eq!(lines[0].t, utc("2026-11-14T10:00:00Z"));
+        assert_eq!(lines[0].model, MODEL);
+        assert_eq!(lines[0].input, 2000, "3000 - 1000");
+        assert_eq!(lines[0].out, 100);
+        assert_eq!(lines[0].answers, 1);
+        assert_eq!(lines[0].minutes, TOKEN_BUCKET_MINUTES as u32);
+        assert_eq!(lines[0].agent_answers, 0, "Codex has no agents of ours");
+        assert_eq!(lines[1].t, utc("2026-11-14T10:05:00Z"));
+        assert_eq!(lines[1].model, MODEL);
+        assert_eq!(lines[1].input, 500, "3500 - 3000");
+        assert_eq!(lines[1].out, 100);
+        assert_eq!(lines[1].answers, 1);
+        let saved = recorded.get(ATLAS).expect("the session's recorded total");
+        assert_eq!(saved.total.input, 3500);
+        assert_eq!(saved.last_at, utc("2026-11-14T10:07:00Z"));
+        assert_eq!(
+            saved.file,
+            PathBuf::from(format!(
+                "2026/11/14/rollout-2026-11-14T09-55-00-{ATLAS}.jsonl"
+            )),
+            "the rollout is stored below the sessions folder"
+        );
+    }
+
+    #[test]
+    fn repeated_equal_totals_record_nothing() {
+        let (_tmp, paths) = store();
+        write(
+            &paths,
+            ["2026", "11", "14"],
+            "2026-11-14T09-55-00",
+            ATLAS,
+            &[
+                meta("2026-11-14T09:55:00.000Z", ATLAS),
+                turn_context("2026-11-14T09:56:00.000Z", 1, MODEL),
+                token_count_without_cache_write("2026-11-14T10:01:00.000Z", 2, 1000, 0, 100),
+                token_count_without_cache_write("2026-11-14T10:03:00.000Z", 3, 1000, 0, 100),
+                token_count_without_cache_write("2026-11-14T10:05:00.000Z", 4, 1000, 0, 100),
+            ],
+            "2026-11-14T10:06:00Z",
+        );
+        // The first line's total was recorded in an earlier pass, just before
+        // it: every line here repeats it.
+        let mut recorded = seeded(tokens(1000, 100, 0), "2026-11-14T10:00:00Z");
+
+        let built = read_and_record(&paths, &mut recorded);
+
+        assert!(built.lines.is_empty(), "{:#?}", built.lines);
+        let saved = recorded.get(ATLAS).expect("the session's recorded total");
+        assert_eq!(saved.total.input, 1000);
+        assert_eq!(saved.last_at, utc("2026-11-14T10:05:00Z"));
+    }
+
+    #[test]
+    fn a_resumed_codex_session_records_only_its_growth() {
+        let (_tmp, paths) = store();
+        write(
+            &paths,
+            ["2026", "11", "14"],
+            "2026-11-14T09-55-00",
+            ATLAS,
+            &[
+                meta("2026-11-14T09:55:00.000Z", ATLAS),
+                turn_context("2026-11-14T09:56:00.000Z", 1, MODEL),
+                token_count_without_cache_write("2026-11-14T09:56:00.000Z", 2, 3500, 0, 100),
+                token_count_without_cache_write("2026-11-14T10:06:00.000Z", 3, 4000, 0, 200),
+            ],
+            "2026-11-14T10:07:00Z",
+        );
+        // The first line's total was recorded in an earlier pass, just before
+        // it: the resumed file counts only the growth to 4,000.
+        let mut recorded = seeded(tokens(3500, 100, 0), "2026-11-14T09:55:00Z");
+
+        let built = read_and_record(&paths, &mut recorded);
+        let lines = built.lines;
+
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert_eq!(lines[0].t, utc("2026-11-14T10:05:00Z"));
+        assert_eq!(lines[0].input, 500, "4000 - 3500, not the whole total");
+        assert_eq!(lines[0].out, 100);
+        assert_eq!(lines[0].answers, 1);
+        let saved = recorded.get(ATLAS).expect("the session's recorded total");
+        assert_eq!(saved.total.input, 4000);
+        assert_eq!(saved.last_at, utc("2026-11-14T10:06:00Z"));
+    }
+
+    #[test]
+    fn the_model_of_each_turn_is_kept() {
+        let (_tmp, paths) = store();
+        write(
+            &paths,
+            ["2026", "11", "14"],
+            "2026-11-14T09-55-00",
+            ATLAS,
+            &[
+                meta("2026-11-14T09:55:00.000Z", ATLAS),
+                turn_context("2026-11-14T10:00:00.000Z", 1, "gpt-6.1-sol"),
+                token_count_without_cache_write("2026-11-14T10:01:00.000Z", 2, 1000, 0, 0),
+                token_count_without_cache_write("2026-11-14T10:02:00.000Z", 3, 1500, 0, 0),
+                turn_context("2026-11-14T10:03:00.000Z", 4, "gpt-6.2-sol"),
+                token_count_without_cache_write("2026-11-14T10:04:00.000Z", 5, 3000, 0, 0),
+            ],
+            "2026-11-14T10:05:00Z",
+        );
+        // The first line's total was recorded in an earlier pass, just before
+        // it: the two turns' growth must still carry their own models.
+        let mut recorded = seeded(tokens(1000, 0, 0), "2026-11-14T10:00:00Z");
+
+        let built = read_and_record(&paths, &mut recorded);
+        let lines = built.lines;
+
+        assert_eq!(lines.len(), 2, "{lines:#?}");
+        assert_eq!(lines[0].t, utc("2026-11-14T10:00:00Z"));
+        assert_eq!(lines[0].model, "gpt-6.1-sol");
+        assert_eq!(lines[0].input, 500);
+        assert_eq!(lines[1].t, utc("2026-11-14T10:00:00Z"));
+        assert_eq!(lines[1].model, "gpt-6.2-sol");
+        assert_eq!(lines[1].input, 1500);
+    }
+
+    #[test]
+    fn cached_input_is_a_cache_read_and_not_input() {
+        let (_tmp, paths) = store();
+        write(
+            &paths,
+            ["2026", "11", "14"],
+            "2026-11-14T09-55-00",
+            ATLAS,
+            &[
+                meta("2026-11-14T09:55:00.000Z", ATLAS),
+                turn_context("2026-11-14T09:56:00.000Z", 1, MODEL),
+                token_count_without_cache_write("2026-11-14T10:01:00.000Z", 2, 12000, 8000, 900),
+                token_count_without_cache_write("2026-11-14T10:02:00.000Z", 3, 16000, 10000, 1100),
+            ],
+            "2026-11-14T10:03:00Z",
+        );
+        // The first line's total was recorded in an earlier pass, just before
+        // it: only the growth of the cached and uncached input is a line.
+        let mut recorded = seeded(tokens(4000, 900, 8000), "2026-11-14T10:00:00Z");
+
+        let built = read_and_record(&paths, &mut recorded);
+        let lines = built.lines;
+
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert_eq!(
+            lines[0].input, 2000,
+            "input_tokens minus cached_input_tokens, growth only"
+        );
+        assert_eq!(lines[0].cr, 2000, "the cached input is a cache read");
+        assert_eq!(lines[0].out, 200);
+        assert_eq!(lines[0].cw, 0, "OpenAI bills no cache write");
+    }
+
+    /// A session that started inside the scan's window is recorded whole: with
+    /// no recorded total its first total counts from zero.
+    #[test]
+    fn a_new_codex_session_counts_its_first_total_from_zero() {
+        let (_tmp, paths) = store();
+        write(
+            &paths,
+            ["2026", "11", "14"],
+            "2026-11-14T09-55-00",
+            ATLAS,
+            &[
+                meta("2026-11-14T09:55:00.000Z", ATLAS),
+                turn_context("2026-11-14T09:56:00.000Z", 1, MODEL),
+                token_count_without_cache_write("2026-11-14T10:01:00.000Z", 2, 1000, 0, 100),
+                token_count_without_cache_write("2026-11-14T10:03:00.000Z", 3, 3000, 0, 300),
+            ],
+            "2026-11-14T10:04:00Z",
+        );
+        let mut recorded = BTreeMap::new();
+
+        let built = read_and_record(&paths, &mut recorded);
+        let lines = built.lines;
+
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert_eq!(lines[0].t, utc("2026-11-14T10:00:00Z"));
+        assert_eq!(lines[0].input, 3000, "the whole total, from zero");
+        assert_eq!(lines[0].out, 300);
+        assert_eq!(lines[0].answers, 2, "both grown token_count lines");
+        let saved = recorded.get(ATLAS).expect("the session's recorded total");
+        assert_eq!(saved.total.input, 3000);
+        assert_eq!(saved.last_at, utc("2026-11-14T10:03:00Z"));
+    }
+
+    /// An older session is recorded from the scan's start on: the newest total
+    /// before `since` is its starting point, not a line.
+    #[test]
+    fn lines_before_since_are_the_starting_point() {
+        let (_tmp, paths) = store();
+        write(
+            &paths,
+            ["2026", "11", "14"],
+            "2026-11-14T09-55-00",
+            ATLAS,
+            &[
+                meta("2026-11-14T08:55:00.000Z", ATLAS),
+                turn_context("2026-11-14T08:56:00.000Z", 1, MODEL),
+                token_count_without_cache_write("2026-11-14T09:00:00.000Z", 2, 1000, 0, 100),
+                token_count_without_cache_write("2026-11-14T10:01:00.000Z", 3, 3000, 0, 300),
+            ],
+            "2026-11-14T10:02:00Z",
+        );
+        let mut recorded = BTreeMap::new();
+
+        let built = read_and_record_since(&paths, &mut recorded, utc("2026-11-14T10:00:00Z"));
+        let lines = built.lines;
+
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert_eq!(lines[0].t, utc("2026-11-14T10:00:00Z"));
+        assert_eq!(lines[0].input, 2000, "3000 from the 1000 before since");
+        assert_eq!(lines[0].out, 200);
+        let saved = recorded.get(ATLAS).expect("the session's recorded total");
+        assert_eq!(saved.total.input, 3000);
+        assert_eq!(saved.last_at, utc("2026-11-14T10:01:00Z"));
+    }
+
+    /// Review Focus 3: a rollout that replays earlier totals under new times
+    /// records no growth for the dip, and counts again only above the highest
+    /// total the session had reached.
+    #[test]
+    fn a_replayed_dip_does_not_count_again() {
+        let (_tmp, paths) = store();
+        write(
+            &paths,
+            ["2026", "11", "14"],
+            "2026-11-14T09-55-00",
+            ATLAS,
+            &[
+                meta("2026-11-14T09:55:00.000Z", ATLAS),
+                turn_context("2026-11-14T09:56:00.000Z", 1, MODEL),
+                token_count_without_cache_write("2026-11-14T10:01:00.000Z", 2, 1000, 0, 100),
+                token_count_without_cache_write("2026-11-14T10:03:00.000Z", 3, 3000, 0, 200),
+                token_count_without_cache_write("2026-11-14T10:05:00.000Z", 4, 3500, 0, 250),
+                token_count_without_cache_write("2026-11-14T10:07:00.000Z", 5, 4000, 0, 300),
+            ],
+            "2026-11-14T10:08:00Z",
+        );
+        let mut recorded = seeded(tokens(3500, 250, 0), "2026-11-14T10:00:00Z");
+
+        let built = read_and_record(&paths, &mut recorded);
+        let lines = built.lines;
+
+        assert_eq!(lines.len(), 1, "only the growth above 3,500: {lines:#?}");
+        assert_eq!(lines[0].t, utc("2026-11-14T10:05:00Z"));
+        assert_eq!(
+            lines[0].input, 500,
+            "4000 - 3500, the replay counts nothing"
+        );
+        assert_eq!(lines[0].out, 50);
+        assert_eq!(lines[0].answers, 1);
+        assert!(
+            built
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("went down")),
+            "{:?}",
+            built.warnings
+        );
+        let saved = recorded.get(ATLAS).expect("the session's recorded total");
+        assert_eq!(saved.total.input, 4000);
+        assert_eq!(saved.total.out, 300);
+    }
+
+    /// The model of a point is the latest `turn_context` before it over all the
+    /// session's rollout files, so a session merged from two files keeps it.
+    #[test]
+    fn a_model_carries_over_between_the_files_of_one_session() {
+        let (_tmp, paths) = store();
+        write(
+            &paths,
+            ["2026", "11", "14"],
+            "2026-11-14T09-55-00",
+            ATLAS,
+            &[
+                meta("2026-11-14T09:55:00.000Z", ATLAS),
+                turn_context("2026-11-14T09:59:00.000Z", 1, MODEL),
+                token_count_without_cache_write("2026-11-14T10:01:00.000Z", 2, 1000, 0, 100),
+            ],
+            "2026-11-14T10:02:00Z",
+        );
+        // The second file of the same session has no turn_context of its own.
+        write(
+            &paths,
+            ["2026", "11", "14"],
+            "2026-11-14T10-02-00",
+            ATLAS,
+            &[
+                meta("2026-11-14T10:02:00.000Z", ATLAS),
+                token_count_without_cache_write("2026-11-14T10:03:00.000Z", 3, 3000, 0, 300),
+            ],
+            "2026-11-14T10:04:00Z",
+        );
+        let mut recorded = BTreeMap::new();
+
+        let built = read_and_record(&paths, &mut recorded);
+        let lines = built.lines;
+
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert_eq!(lines[0].t, utc("2026-11-14T10:00:00Z"));
+        assert_eq!(
+            lines[0].model, MODEL,
+            "the model of the first file carries over"
+        );
+        assert_eq!(lines[0].input, 3000);
+        assert_eq!(lines[0].answers, 2);
+    }
+
+    /// A grown line without a model is kept back: the recorded total and time
+    /// stop before it, and a later pass with a model records it, never drops it.
+    #[test]
+    fn growth_without_a_model_is_kept_back_not_dropped() {
+        let (_tmp, paths) = store();
+        let lines_without_model = [
+            meta("2026-11-14T09:55:00.000Z", ATLAS),
+            token_count_without_cache_write("2026-11-14T10:01:00.000Z", 2, 1000, 0, 100),
+            token_count_without_cache_write("2026-11-14T10:03:00.000Z", 3, 3000, 0, 300),
+        ];
+        write(
+            &paths,
+            ["2026", "11", "14"],
+            "2026-11-14T09-55-00",
+            ATLAS,
+            &lines_without_model,
+            "2026-11-14T10:04:00Z",
+        );
+        let mut recorded = seeded(tokens(1000, 100, 0), "2026-11-14T10:00:00Z");
+
+        let built = read_and_record(&paths, &mut recorded);
+
+        assert!(
+            built.lines.is_empty(),
+            "a grown line without a model is not recorded: {:#?}",
+            built.lines
+        );
+        assert!(
+            built
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(ATLAS) && warning.contains("kept back")),
+            "{:?}",
+            built.warnings
+        );
+        let saved = recorded.get(ATLAS).expect("the session's recorded total");
+        assert_eq!(saved.total.input, 1000, "the total stops before the line");
+        assert_eq!(
+            saved.last_at,
+            utc("2026-11-14T10:01:00Z"),
+            "the time stops before the grown line at 10:03"
+        );
+
+        // A later pass finds the model (here the rollout is rewritten with its
+        // turn_context) and records the kept-back growth.
+        write(
+            &paths,
+            ["2026", "11", "14"],
+            "2026-11-14T09-55-00",
+            ATLAS,
+            &[
+                meta("2026-11-14T09:55:00.000Z", ATLAS),
+                turn_context("2026-11-14T09:59:00.000Z", 1, MODEL),
+                token_count_without_cache_write("2026-11-14T10:01:00.000Z", 2, 1000, 0, 100),
+                token_count_without_cache_write("2026-11-14T10:03:00.000Z", 3, 3000, 0, 300),
+            ],
+            "2026-11-14T10:05:00Z",
+        );
+
+        let built = read_and_record(&paths, &mut recorded);
+        let lines = built.lines;
+
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert_eq!(lines[0].model, MODEL);
+        assert_eq!(lines[0].input, 2000, "3000 - 1000, the kept-back growth");
+        assert_eq!(lines[0].out, 200);
+    }
+
+    #[test]
+    fn a_total_that_went_down_is_a_warning_and_records_nothing() {
+        let (_tmp, paths) = store();
+        write(
+            &paths,
+            ["2026", "11", "14"],
+            "2026-11-14T09-55-00",
+            ATLAS,
+            &[
+                meta("2026-11-14T09:55:00.000Z", ATLAS),
+                turn_context("2026-11-14T09:56:00.000Z", 1, MODEL),
+                token_count_without_cache_write("2026-11-14T10:05:00.000Z", 2, 4000, 0, 100),
+            ],
+            "2026-11-14T10:06:00Z",
+        );
+        let read = sessions(
+            &paths.home,
+            utc("2026-11-14T00:00:00Z"),
+            utc("2026-11-14T12:00:00Z"),
+        );
+        assert!(read.warnings.is_empty(), "{:?}", read.warnings);
+        let mut recorded = BTreeMap::from([(
+            ATLAS.to_string(),
+            CodexRecorded {
+                total: tokens(5000, 100, 0),
+                last_at: utc("2026-11-14T10:00:00Z"),
+                file: PathBuf::from("2026/11/14/old.jsonl"),
+            },
+        )]);
+
+        let built = codex_token_lines(
+            &read.sessions,
+            &mut recorded,
+            &paths.home,
+            utc("2026-11-14T00:00:00Z"),
+        );
+
+        assert!(built.lines.is_empty(), "{:#?}", built.lines);
+        assert_eq!(built.warnings.len(), 1, "{:?}", built.warnings);
+        assert!(built.warnings[0].contains(ATLAS), "{}", built.warnings[0]);
+        assert!(
+            built.warnings[0].contains("went down"),
+            "{}",
+            built.warnings[0]
+        );
+        assert_eq!(
+            recorded.get(ATLAS).map(|saved| saved.total.input),
+            Some(5000),
+            "the high-water total is kept, so growth counts again above it"
+        );
+        assert_eq!(
+            recorded.get(ATLAS).map(|saved| saved.last_at),
+            Some(utc("2026-11-14T10:05:00Z"))
         );
     }
 }

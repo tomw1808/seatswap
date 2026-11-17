@@ -212,6 +212,11 @@ impl CodexPaths {
             auth_file: home.join("auth.json"),
         }
     }
+
+    /// Codex's rollout files: `<home>/sessions`.
+    pub fn sessions_dir(&self) -> PathBuf {
+        self.home.join("sessions")
+    }
 }
 
 /// The DeepSeek Harness sessions folder and the flash-agents reports folder,

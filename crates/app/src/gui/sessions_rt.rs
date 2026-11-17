@@ -1539,18 +1539,27 @@ pub(crate) fn run_pass(
 
     // The Codex sessions of the same live window. The process table is walked
     // for them together with the Harness sessions below, never twice.
+    let since = now - ChronoDuration::hours(HARNESS_SINCE_HOURS);
     if let Some(error) = &memory.codex_error {
         add_warning(&mut summary, error.clone());
     }
     let codex_sessions = match &memory.codex_paths {
         Some(paths) => {
-            let read = codex_sessions::sessions(
-                &paths.home,
-                now - ChronoDuration::hours(HARNESS_SINCE_HOURS),
-                now,
-            );
+            let sessions = paths.sessions_dir();
+            let read = codex_sessions::sessions(&paths.home, since, now);
             for warning in &read.warnings {
                 add_warning(&mut summary, warning.clone());
+            }
+            // A recorded total goes only when its rollout file has left the
+            // store and no rollout of its session was read in this pass; the
+            // window and a failed read keep it.
+            if sessions.exists() {
+                let read_ids: BTreeSet<String> = read
+                    .sessions
+                    .iter()
+                    .map(|session| session.id.clone())
+                    .collect();
+                state.prune_codex_recorded(&sessions, &read_ids);
             }
             read.sessions
         }
@@ -1565,8 +1574,7 @@ pub(crate) fn run_pass(
     let (harness_sessions, mut harness_owners, claude_cwd, harness_recorded, harness_walk) =
         match &memory.harness_paths {
             Some(paths) => {
-                let read =
-                    harness::sessions(paths, now - ChronoDuration::hours(HARNESS_SINCE_HOURS));
+                let read = harness::sessions(paths, since);
                 for warning in &read.warnings {
                     add_warning(&mut summary, warning.clone());
                 }
@@ -1754,6 +1762,21 @@ pub(crate) fn run_pass(
         recorded: harness_recorded,
         linked: harness_agent_counts,
     } = live;
+    // The Codex lines are the growth of each rollout's token_count lines since
+    // the recorded totals, per 5-minute bucket and model. They are written
+    // below in the Harness order, through the same sequence.
+    let codex_recorded = {
+        let mut recorded = state.codex_recorded.clone();
+        let built = if codex_sessions.is_empty() {
+            codex_sessions::CodexLines::default()
+        } else {
+            codex_sessions::codex_token_lines(&codex_sessions, &mut recorded, &memory.home, since)
+        };
+        for warning in built.warnings {
+            add_warning(&mut summary, warning);
+        }
+        (built.lines, recorded)
+    };
     // Item 6: the status line's cost of a Claude Code session is its API value,
     // and a model without a price is asked for (items 4 and 6).
     if let Some(rows) = rows.as_mut() {
@@ -1899,46 +1922,40 @@ pub(crate) fn run_pass(
             }
         }
     }
-    // The Harness tokens reach the history like an agent's: only what grew.
-    // The totals are saved before the lines are written, as S-1 saves its scan
-    // state before writing: a crash between the two loses a delta, never counts
-    // it twice. A state that could not be loaded keeps every Harness line back,
+    // The Harness and Codex tokens reach the history like an agent's: only what
+    // grew. The totals are saved before the lines are written, as S-1 saves its
+    // scan state before writing: a crash between the two loses a delta, never
+    // counts it twice. A state that could not be loaded keeps every line back,
     // so nothing is counted and forgotten.
     if state_error.is_none() {
-        if harness_tokens.is_empty() {
-            state.set_harness_recorded(&harness_recorded);
-        } else if let Some(recorder) = recorder {
-            let previous = state.harness_recorded.clone();
-            state.set_harness_recorded(&harness_recorded);
-            match state.save(claude, app, now) {
-                Ok(_) => {
-                    if let Err(error) = recorder.tokens(&harness_tokens) {
-                        add_history_error(&mut summary, error);
-                        // The lines are not written: put the old totals back on
-                        // disk, as the transcript scan puts its offsets back, so
-                        // the next pass writes this delta and none is lost.
-                        state.set_harness_recorded(&previous);
-                        if let Err(error) = state.save(claude, app, now) {
-                            add_warning(
-                                &mut summary,
-                                format!("the Harness token totals cannot be written back: {error}"),
-                            );
-                        }
-                    } else {
-                        recorded_lines_written(memory, &harness_tokens);
-                    }
-                }
-                Err(error) => {
-                    // Nothing was written: put the old totals back, so this
-                    // pass writes no line and the next one tries again.
-                    state.set_harness_recorded(&previous);
-                    add_warning(
-                        &mut summary,
-                        format!("the Harness token totals cannot be written: {error}"),
-                    );
-                }
-            }
-        }
+        write_token_lines(
+            recorder,
+            state,
+            claude,
+            app,
+            now,
+            &harness_tokens,
+            &harness_recorded,
+            |state| state.harness_recorded.clone(),
+            |state, recorded| state.set_harness_recorded(recorded),
+            "Harness",
+            memory,
+            &mut summary,
+        );
+        write_token_lines(
+            recorder,
+            state,
+            claude,
+            app,
+            now,
+            &codex_recorded.0,
+            &codex_recorded.1,
+            |state| state.codex_recorded.clone(),
+            |state, recorded| state.set_codex_recorded(recorded),
+            "Codex",
+            memory,
+            &mut summary,
+        );
     }
     if let Some(rows) = &rows {
         for warning in &rows.warnings {
@@ -2398,6 +2415,65 @@ fn recorded_lines_written(memory: &mut SessionMemory, lines: &[TokenRecord]) {
         .and_then(|context| context.recorded.as_mut())
     {
         built.tokens.add(lines);
+    }
+}
+
+/// Write one store's token lines in the one order both stores use: save the
+/// recorded totals, write the lines, and put the old totals back when either
+/// step fails, so the next pass writes the same delta and none is lost. A pass
+/// with no line saves the totals at once: there is no line to lose. Without a
+/// recorder nothing is written and no total advances.
+#[allow(clippy::too_many_arguments)]
+fn write_token_lines<T: Clone + PartialEq>(
+    recorder: Option<&Recorder>,
+    state: &mut ScanState,
+    claude: &ClaudePaths,
+    app: &AppPaths,
+    now: DateTime<Utc>,
+    tokens: &[TokenRecord],
+    recorded: &BTreeMap<String, T>,
+    get: impl Fn(&ScanState) -> BTreeMap<String, T>,
+    set: impl Fn(&mut ScanState, &BTreeMap<String, T>),
+    what: &str,
+    memory: &mut SessionMemory,
+    summary: &mut SessionsSummary,
+) {
+    if tokens.is_empty() {
+        set(state, recorded);
+        return;
+    }
+    let Some(recorder) = recorder else {
+        return;
+    };
+    let previous = get(state);
+    set(state, recorded);
+    match state.save(claude, app, now) {
+        Ok(_) => {
+            if let Err(error) = recorder.tokens(tokens) {
+                add_history_error(summary, error);
+                // The lines are not written: put the old totals back on disk,
+                // as the transcript scan puts its offsets back, so the next
+                // pass writes this delta and none is lost.
+                set(state, &previous);
+                if let Err(error) = state.save(claude, app, now) {
+                    add_warning(
+                        summary,
+                        format!("the {what} token totals cannot be written back: {error}"),
+                    );
+                }
+            } else {
+                recorded_lines_written(memory, tokens);
+            }
+        }
+        Err(error) => {
+            // Nothing was written: put the old totals back, so this pass
+            // writes no line and the next one tries again.
+            set(state, &previous);
+            add_warning(
+                summary,
+                format!("the {what} token totals cannot be written: {error}"),
+            );
+        }
     }
 }
 
@@ -6889,12 +6965,7 @@ mod tests {
         let (tmp, claude, app) = fixture();
         let now = time("2026-11-16T14:00:00Z");
         let codex = CodexPaths::at(&tmp.path().join("codex"));
-        let day = codex
-            .home
-            .join("sessions")
-            .join("2026")
-            .join("11")
-            .join("16");
+        let day = codex.sessions_dir().join("2026").join("11").join("16");
         fs::create_dir_all(&day).unwrap();
         let id = "3f7b2c1e-9a4d-4e8f-8b6a-2c5d9e1f7a30";
         let event = |timestamp: &str, ordinal: u32, kind: &str, payload: serde_json::Value| {
@@ -7240,6 +7311,138 @@ mod tests {
                 .map(|recorded| recorded.messages),
             Some(2),
             "the totals are on disk before the next pass"
+        );
+    }
+
+    /// A Codex write failure rolls back only the Codex totals: the Harness
+    /// totals of the same pass stay on disk.
+    #[test]
+    fn a_codex_write_failure_puts_back_only_the_codex_totals() {
+        let (tmp, claude, app) = fixture();
+        let now = time("2026-11-16T14:00:00Z");
+        let paths = harness_paths(&tmp);
+        write_harness(&paths, HARNESS_JOB, None, 0, 2, now, true);
+        let codex = CodexPaths::at(&tmp.path().join("codex"));
+        let id = "3f7b2c1e-9a4d-4e8f-8b6a-2c5d9e1f7a30";
+        let day = codex.sessions_dir().join("2026").join("11").join("16");
+        fs::create_dir_all(&day).unwrap();
+        let event = |timestamp: &str, ordinal: u32, kind: &str, payload: serde_json::Value| {
+            serde_json::json!({
+                "timestamp": timestamp,
+                "ordinal": ordinal,
+                "type": kind,
+                "payload": payload,
+            })
+            .to_string()
+        };
+        let text = [
+            event(
+                "2026-11-16T13:50:00.000Z",
+                0,
+                "session_meta",
+                serde_json::json!({
+                    "id": id,
+                    "session_id": id,
+                    "cwd": "/home/sam/projects/atlas",
+                    "originator": "codex-tui",
+                    "source": "cli",
+                    "cli_version": "0.51.0",
+                    "model_provider": "openai",
+                }),
+            ),
+            event(
+                "2026-11-16T13:59:00.000Z",
+                1,
+                "turn_context",
+                serde_json::json!({
+                    "turn_id": "9b8a7c6d-5e4f-4a3b-2c1d-0e9f8a7b6c5d",
+                    "cwd": "/home/sam/projects/atlas",
+                    "model": "gpt-6.1-sol",
+                    "effort": "high",
+                }),
+            ),
+            event(
+                "2026-11-16T14:00:00.000Z",
+                2,
+                "event_msg",
+                serde_json::json!({
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 12000,
+                            "cached_input_tokens": 8000,
+                            "output_tokens": 700,
+                            "reasoning_output_tokens": 100,
+                            "total_tokens": 12700,
+                        },
+                    },
+                }),
+            ),
+        ]
+        .map(|line| format!("{line}\n"))
+        .join("");
+        let file = day.join(format!("rollout-2026-11-16T13-50-00-{id}.jsonl"));
+        fs::write(&file, text).unwrap();
+        set_mtime(&file, now - ChronoDuration::hours(1));
+
+        // A file where the history folder belongs: the token line cannot be
+        // written, but the state save can.
+        let history_root = tmp.path().join("history");
+        fs::write(&history_root, "not a folder").expect("a blocking file");
+        let recorder = Recorder::new(history(&history_root));
+        let mut state = ScanState::default();
+        state.set_harness_recorded(&BTreeMap::from([(
+            HARNESS_JOB.to_string(),
+            HarnessRecorded {
+                tokens: seatswap_core::transcripts::Tokens {
+                    input: 200,
+                    out: 100,
+                    cw: 0,
+                    cr: 0,
+                },
+                messages: 2,
+                file: Some(PathBuf::from(format!(
+                    "{HARNESS_KEY}/{HARNESS_JOB}/session.v4.jsonl.zstd"
+                ))),
+            },
+        )]));
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        memory.harness_paths = Some(paths);
+        memory.codex_paths = Some(codex);
+
+        run_pass(
+            &app,
+            &claude,
+            &probe(&[]),
+            &NoProc,
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            now,
+            None,
+        );
+
+        assert!(
+            !state.codex_recorded.contains_key(id),
+            "a Codex total whose line was not written is not recorded"
+        );
+        assert_eq!(
+            state.harness_recorded.get(HARNESS_JOB).map(|r| r.messages),
+            Some(2),
+            "the Harness totals are not rolled back with the Codex ones"
+        );
+        let on_disk = ScanState::load(&app).expect("the saved state");
+        assert!(
+            !on_disk.codex_recorded.contains_key(id),
+            "the old Codex totals were put back on disk"
+        );
+        assert_eq!(
+            on_disk
+                .harness_recorded
+                .get(HARNESS_JOB)
+                .map(|r| r.messages),
+            Some(2),
+            "the Harness totals stay on disk"
         );
     }
 

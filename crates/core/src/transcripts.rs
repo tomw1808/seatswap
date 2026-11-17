@@ -58,6 +58,19 @@ const FLASH_TOOLS: [&str; 4] = [
 /// The state file that remembers which Harness session tokens were already
 /// written to the history, beside the per-folder state files.
 const HARNESS_STATE_FILE: &str = "harness.json";
+/// The state file that remembers which Codex rollout totals were already
+/// written to the history, beside the Harness state file.
+const CODEX_STATE_FILE: &str = "codex.json";
+
+/// `file` below `root`, so a saved total finds the file again when the store
+/// moves; a file outside `root` is kept as it is. The one relative-path helper
+/// of the Harness and Codex stores.
+pub(crate) fn file_below(root: &Path, file: &Path) -> PathBuf {
+    match file.strip_prefix(root) {
+        Ok(relative) => relative.to_path_buf(),
+        Err(_) => file.to_path_buf(),
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum TranscriptError {
@@ -143,6 +156,22 @@ pub struct HarnessRecorded {
     /// file means the file is not known, so the total is kept.
     #[serde(default)]
     pub file: Option<PathBuf>,
+}
+
+/// What one Codex rollout already has in the history: its newest
+/// `info.total_token_usage`, mapped as [`Tokens`] maps Codex's fields, the time
+/// of that `token_count` line, and the rollout file below Codex's sessions
+/// folder. A later read writes only the growth after `last_at`; a total that is
+/// equal records nothing and a total that went down is a warning, never a
+/// negative line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexRecorded {
+    pub total: Tokens,
+    pub last_at: DateTime<Utc>,
+    /// The rollout file below `<codex home>/sessions`; an absolute path from an
+    /// old or hand-written state file is used as it is.
+    pub file: PathBuf,
 }
 
 /// A flash job link kept after its Claude Code session left the scan state: the
@@ -332,12 +361,21 @@ pub struct ScanState {
     /// means none.
     #[serde(default)]
     pub closed_flash_jobs: BTreeMap<String, ClosedJob>,
+    /// The newest tokens and line time of each Codex rollout already written to
+    /// the history, so a pass writes only what grew. Kept in its own
+    /// `codex.json` beside the Harness totals; absent in an old state folder
+    /// means none.
+    #[serde(default)]
+    pub codex_recorded: BTreeMap<String, CodexRecorded>,
     /// The project folders whose state changed since the last save.
     #[serde(skip)]
     changed: BTreeSet<String>,
     /// Whether `harness_recorded` changed since the last save.
     #[serde(skip)]
     harness_changed: bool,
+    /// Whether `codex_recorded` changed since the last save.
+    #[serde(skip)]
+    codex_changed: bool,
 }
 
 impl ScanState {
@@ -369,9 +407,12 @@ impl ScanState {
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                 continue;
             }
-            if path.file_name().and_then(|name| name.to_str()) == Some(HARNESS_STATE_FILE) {
-                // The Harness token memory is read on its own, and a transcript
-                // load must not delete it.
+            if matches!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some(HARNESS_STATE_FILE) | Some(CODEX_STATE_FILE)
+            ) {
+                // The Harness and Codex token memories are read on their own,
+                // and a transcript load must not delete them.
                 continue;
             }
             let kind = entry.file_type().map_err(|source| TranscriptError::Io {
@@ -384,39 +425,19 @@ impl ScanState {
         }
         paths.sort();
         let harness_path = dir.join(HARNESS_STATE_FILE);
-        if harness_path.exists() {
-            let bytes = fs::read(&harness_path).map_err(|source| TranscriptError::Io {
-                path: harness_path.clone(),
-                source,
-            })?;
-            let header: StateVersion =
-                serde_json::from_slice(&bytes).map_err(|source| TranscriptError::State {
-                    path: harness_path.clone(),
+        let mut harness_extra =
+            RecordedTotals::of(&mut state.harness_recorded, &mut state.harness_changed)
+                .load(&harness_path)?;
+        if let Some(value) = harness_extra.remove("closedFlashJobs") {
+            state.closed_flash_jobs =
+                serde_json::from_value(value).map_err(|source| TranscriptError::State {
+                    path: harness_path,
                     source,
                 })?;
-            match header.version {
-                // `harness.json` came with version 2 (1.1.0 had none), so
-                // version 2 is the only one it can hold.
-                STATE_VERSION => {
-                    let file: HarnessState = serde_json::from_slice(&bytes).map_err(|source| {
-                        TranscriptError::State {
-                            path: harness_path.clone(),
-                            source,
-                        }
-                    })?;
-                    state.harness_recorded = file.recorded;
-                    state.closed_flash_jobs = file.closed_flash_jobs;
-                }
-                found => {
-                    return Err(TranscriptError::UnsupportedStateVersion {
-                        path: harness_path,
-                        found,
-                        current: STATE_VERSION,
-                        newer: newer_version(found),
-                    })
-                }
-            }
         }
+        let codex_path = dir.join(CODEX_STATE_FILE);
+        RecordedTotals::of(&mut state.codex_recorded, &mut state.codex_changed)
+            .load(&codex_path)?;
 
         for path in &paths {
             let bytes = fs::read(path).map_err(|source| TranscriptError::Io {
@@ -459,10 +480,7 @@ impl ScanState {
     /// next pass writes only what grew. The state is saved with the next
     /// [`save`](Self::save).
     pub fn set_harness_recorded(&mut self, recorded: &BTreeMap<String, HarnessRecorded>) {
-        if &self.harness_recorded != recorded {
-            self.harness_recorded = recorded.clone();
-            self.harness_changed = true;
-        }
+        RecordedTotals::of(&mut self.harness_recorded, &mut self.harness_changed).set(recorded);
     }
 
     /// Drop a recorded Harness total when its session's file no longer exists
@@ -470,30 +488,31 @@ impl ScanState {
     /// a file that cannot be read is still there, so a failed read never drops
     /// a total. A total without a known file (an old state file) is kept.
     pub fn prune_harness_recorded(&mut self, sessions: &Path) {
-        let mut dropped = false;
-        self.harness_recorded.retain(|_, recorded| {
-            let Some(file) = &recorded.file else {
-                return true;
-            };
-            let path = if file.is_absolute() {
-                file.clone()
-            } else {
-                sessions.join(file)
-            };
-            match fs::metadata(&path) {
-                Ok(_) => true,
-                Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                    dropped = true;
-                    false
-                }
-                // The file cannot be checked (a permission or an I/O error):
-                // it is not known to be gone, so its total stays.
-                Err(_) => true,
-            }
-        });
-        if dropped {
-            self.harness_changed = true;
-        }
+        RecordedTotals::of(&mut self.harness_recorded, &mut self.harness_changed).prune(
+            sessions,
+            &BTreeSet::new(),
+            |recorded| recorded.file.as_deref(),
+        );
+    }
+
+    /// Remember which Codex rollout totals were written to the history, so the
+    /// next pass writes only what grew. The state is saved with the next
+    /// [`save`](Self::save).
+    pub fn set_codex_recorded(&mut self, recorded: &BTreeMap<String, CodexRecorded>) {
+        RecordedTotals::of(&mut self.codex_recorded, &mut self.codex_changed).set(recorded);
+    }
+
+    /// Drop a recorded Codex total when its rollout file no longer exists below
+    /// `sessions` **and** no rollout of its session id was read in this pass.
+    /// One metadata call per recorded id; a file that cannot be read is still
+    /// there, so a failed read never drops a total. An absolute path from an old
+    /// state file is checked as it is.
+    pub fn prune_codex_recorded(&mut self, sessions: &Path, read_ids: &BTreeSet<String>) {
+        RecordedTotals::of(&mut self.codex_recorded, &mut self.codex_changed).prune(
+            sessions,
+            read_ids,
+            |recorded| Some(recorded.file.as_path()),
+        );
     }
 
     /// Drop the job links of Claude Code sessions that last answered more than
@@ -635,7 +654,7 @@ impl ScanState {
         }
 
         let dir = app.transcripts_state_dir();
-        if !self.changed.is_empty() || self.harness_changed {
+        if !self.changed.is_empty() || self.harness_changed || self.codex_changed {
             atomic::ensure_private_dir(&dir).map_err(|source| TranscriptError::Io {
                 path: dir.clone(),
                 source,
@@ -668,35 +687,26 @@ impl ScanState {
         }
         if self.harness_changed {
             let path = dir.join(HARNESS_STATE_FILE);
-            if self.harness_recorded.is_empty() && self.closed_flash_jobs.is_empty() {
-                match fs::remove_file(&path) {
-                    Ok(()) => written += 1,
-                    Err(source) if source.kind() == io::ErrorKind::NotFound => {}
-                    Err(source) => return Err(TranscriptError::Io { path, source }),
-                }
+            let extra = if self.harness_recorded.is_empty() && self.closed_flash_jobs.is_empty() {
+                None
             } else {
-                let state = HarnessState {
-                    version: STATE_VERSION,
-                    recorded: self.harness_recorded.clone(),
-                    closed_flash_jobs: self.closed_flash_jobs.clone(),
-                };
-                let bytes =
-                    serde_json::to_vec(&state).map_err(|source| TranscriptError::State {
-                        path: path.clone(),
-                        source,
-                    })?;
-                atomic::write_atomic(&path, &bytes, Access::Private).map_err(|source| {
-                    TranscriptError::Io {
-                        path: path.clone(),
-                        source,
-                    }
-                })?;
-                written += 1;
-            }
+                Some(harness_extra(&self.closed_flash_jobs, &path)?)
+            };
+            written += RecordedTotals::of(&mut self.harness_recorded, &mut self.harness_changed)
+                .save(&path, extra)?;
+        }
+        if self.codex_changed {
+            let path = dir.join(CODEX_STATE_FILE);
+            let extra = if self.codex_recorded.is_empty() {
+                None
+            } else {
+                Some(BTreeMap::new())
+            };
+            written += RecordedTotals::of(&mut self.codex_recorded, &mut self.codex_changed)
+                .save(&path, extra)?;
         }
         self.version = STATE_VERSION;
         self.changed.clear();
-        self.harness_changed = false;
         Ok(written)
     }
 
@@ -1477,15 +1487,182 @@ impl From<StateFileV1> for StateFile {
     }
 }
 
-/// `harness.json`: the Harness sessions' tokens already in the history, and the
-/// job links of Claude Code sessions that left the scan state.
+/// One recorded-totals state file: `harness.json` or `codex.json`. Both hold
+/// the version, the recorded totals and, for the Harness store, the job links
+/// of Claude Code sessions that left the scan state. The extra keys come after
+/// `recorded`, as `harness.json` has always written them.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct HarnessState {
+struct RecordedFile<T> {
     version: u32,
-    recorded: BTreeMap<String, HarnessRecorded>,
-    #[serde(default)]
-    closed_flash_jobs: BTreeMap<String, ClosedJob>,
+    recorded: BTreeMap<String, T>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// One store's recorded token totals, seen through the map and changed flag it
+/// lives in. The loader, saver, setter and pruner are written once here for
+/// both `harness.json` and `codex.json`.
+struct RecordedTotals<'a, T> {
+    recorded: &'a mut BTreeMap<String, T>,
+    /// Whether `recorded` changed since the last save.
+    changed: &'a mut bool,
+}
+
+impl<'a, T> RecordedTotals<'a, T>
+where
+    T: Clone + PartialEq + Serialize + serde::de::DeserializeOwned,
+{
+    fn of(recorded: &'a mut BTreeMap<String, T>, changed: &'a mut bool) -> Self {
+        RecordedTotals { recorded, changed }
+    }
+
+    /// Read `path` into `recorded` and return its extra top-level keys. A
+    /// missing file is no totals and no warning. A file of another version is
+    /// an error, never a silent rebuild: rebuilding writes the history it
+    /// already holds a second time.
+    fn load(self, path: &Path) -> Result<BTreeMap<String, serde_json::Value>, TranscriptError> {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                return Ok(BTreeMap::new());
+            }
+            Err(source) => {
+                return Err(TranscriptError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })
+            }
+        };
+        let header: StateVersion =
+            serde_json::from_slice(&bytes).map_err(|source| TranscriptError::State {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if header.version != STATE_VERSION {
+            return Err(TranscriptError::UnsupportedStateVersion {
+                path: path.to_path_buf(),
+                found: header.version,
+                current: STATE_VERSION,
+                newer: newer_version(header.version),
+            });
+        }
+        let file: RecordedFile<T> =
+            serde_json::from_slice(&bytes).map_err(|source| TranscriptError::State {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        *self.recorded = file.recorded;
+        Ok(file.extra)
+    }
+
+    /// Remember a store's totals for the next [`save`](ScanState::save).
+    fn set(&mut self, recorded: &BTreeMap<String, T>) {
+        if *self.recorded != *recorded {
+            *self.recorded = recorded.clone();
+            *self.changed = true;
+        }
+    }
+
+    /// Drop a recorded total when its file no longer exists below `root` and no
+    /// rollout of its session id was read in this pass. One metadata call per
+    /// recorded id; a file that cannot be read is still there, so a failed read
+    /// never drops a total.
+    fn prune(
+        &mut self,
+        root: &Path,
+        read_ids: &BTreeSet<String>,
+        file_of: impl Fn(&T) -> Option<&Path>,
+    ) {
+        let mut dropped = false;
+        self.recorded.retain(|id, recorded| {
+            if read_ids.contains(id) {
+                return true;
+            }
+            let Some(file) = file_of(recorded) else {
+                return true;
+            };
+            let path = if file.is_absolute() {
+                file.to_path_buf()
+            } else {
+                root.join(file)
+            };
+            match fs::metadata(&path) {
+                Ok(_) => true,
+                Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                    dropped = true;
+                    false
+                }
+                // The file cannot be checked (a permission or an I/O error):
+                // it is not known to be gone, so its total stays.
+                Err(_) => true,
+            }
+        });
+        if dropped {
+            *self.changed = true;
+        }
+    }
+
+    /// Write the store's file when it changed, or remove it when it holds
+    /// nothing. `extra` is `None` when the store has no other value to keep, so
+    /// an empty file is removed as it always was; `Some` writes those keys after
+    /// `recorded`, even when the map is empty. Returns 1 when the file was
+    /// written or removed.
+    fn save(
+        &mut self,
+        path: &Path,
+        extra: Option<BTreeMap<String, serde_json::Value>>,
+    ) -> Result<u32, TranscriptError> {
+        if !*self.changed {
+            return Ok(0);
+        }
+        let written = match extra {
+            None if self.recorded.is_empty() => match fs::remove_file(path) {
+                Ok(()) => 1,
+                Err(source) if source.kind() == io::ErrorKind::NotFound => 0,
+                Err(source) => {
+                    return Err(TranscriptError::Io {
+                        path: path.to_path_buf(),
+                        source,
+                    })
+                }
+            },
+            extra => {
+                let state = RecordedFile {
+                    version: STATE_VERSION,
+                    recorded: self.recorded.clone(),
+                    extra: extra.unwrap_or_default(),
+                };
+                let bytes =
+                    serde_json::to_vec(&state).map_err(|source| TranscriptError::State {
+                        path: path.to_path_buf(),
+                        source,
+                    })?;
+                atomic::write_atomic(path, &bytes, Access::Private).map_err(|source| {
+                    TranscriptError::Io {
+                        path: path.to_path_buf(),
+                        source,
+                    }
+                })?;
+                1
+            }
+        };
+        *self.changed = false;
+        Ok(written)
+    }
+}
+
+/// The extra top-level keys of `harness.json` after `recorded`: the links of
+/// code sessions that left the scan state.
+fn harness_extra(
+    closed: &BTreeMap<String, ClosedJob>,
+    path: &Path,
+) -> Result<BTreeMap<String, serde_json::Value>, TranscriptError> {
+    let value = serde_json::to_value(closed).map_err(|source| TranscriptError::State {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(BTreeMap::from([("closedFlashJobs".to_string(), value)]))
 }
 
 /// A transcript that may have new bytes.
@@ -5464,5 +5641,120 @@ mod tests {
                 seen.flash_jobs
             );
         }
+    }
+
+    /// `harness.json` keeps the shape it has always had, byte for byte: the
+    /// version, the recorded totals and then the closed job links.
+    #[test]
+    fn harness_json_is_unchanged() {
+        let (_tmp, claude, app) = fixture();
+        let mut state = ScanState::default();
+        state.set_harness_recorded(&BTreeMap::from([(
+            SESSION.to_string(),
+            HarnessRecorded {
+                tokens: Tokens {
+                    input: 2,
+                    out: 166,
+                    cw: 26173,
+                    cr: 28126,
+                },
+                messages: 2,
+                file: Some(PathBuf::from("session.jsonl")),
+            },
+        )]));
+        state.closed_flash_jobs.insert(
+            "flash-task-5c974a53-178a-4254-93b2-b804a111414a".to_string(),
+            ClosedJob {
+                session: SESSION.to_string(),
+                last: at(AT),
+            },
+        );
+
+        let written = state
+            .save(&claude, &app, at("2026-11-12T10:00:00Z"))
+            .expect("the Harness state is written");
+
+        assert_eq!(written, 1);
+        let text = fs::read_to_string(app.transcripts_state_dir().join("harness.json"))
+            .expect("the written Harness state");
+        assert_eq!(
+            text,
+            format!(
+                r#"{{"version":2,"recorded":{{"{SESSION}":{{"tokens":{{"input":2,"out":166,"cw":26173,"cr":28126}},"messages":2,"file":"session.jsonl"}}}},"closedFlashJobs":{{"flash-task-5c974a53-178a-4254-93b2-b804a111414a":{{"session":"{SESSION}","last":"{AT}"}}}}}}"#
+            ),
+            "harness.json's bytes are the shape it has always had"
+        );
+    }
+
+    /// `codex.json` holds the Codex rollouts' totals and reads back what it
+    /// wrote.
+    #[test]
+    fn codex_json_round_trips() {
+        let (_tmp, claude, app) = fixture();
+        let recorded = BTreeMap::from([(
+            SESSION.to_string(),
+            CodexRecorded {
+                total: Tokens {
+                    input: 3500,
+                    out: 300,
+                    cw: 0,
+                    cr: 800,
+                },
+                last_at: at("2026-11-14T10:07:00Z"),
+                file: PathBuf::from("2026/11/14/rollout-2026-11-14T09-55-00-session.jsonl"),
+            },
+        )]);
+        let mut state = ScanState::default();
+        state.set_codex_recorded(&recorded);
+        state
+            .save(&claude, &app, at("2026-11-14T10:08:00Z"))
+            .expect("the Codex state is written");
+
+        let loaded = ScanState::load(&app).expect("the Codex state is read");
+
+        assert_eq!(loaded.codex_recorded, recorded);
+    }
+
+    /// A recorded total is pruned only when its file is gone and no rollout of
+    /// its session id was read in this pass.
+    #[test]
+    fn a_total_stays_while_another_file_of_its_session_exists() {
+        let (_tmp, _claude, app) = fixture();
+        let sessions = app.transcripts_state_dir().join("sessions");
+        let day = sessions.join("2026").join("11").join("14");
+        fs::create_dir_all(&day).expect("the Codex day folder");
+        fs::write(
+            day.join(format!("rollout-2026-11-14T09-55-00-{SESSION}.jsonl")),
+            "",
+        )
+        .expect("another rollout of the session");
+        let mut state = ScanState::default();
+        state.codex_recorded.insert(
+            SESSION.to_string(),
+            CodexRecorded {
+                total: Tokens::default(),
+                last_at: at("2026-11-14T10:07:00Z"),
+                file: PathBuf::from("2026/11/14/gone.jsonl"),
+            },
+        );
+        state.codex_recorded.insert(
+            SESSION_B.to_string(),
+            CodexRecorded {
+                total: Tokens::default(),
+                last_at: at("2026-11-14T10:07:00Z"),
+                file: PathBuf::from("2026/11/14/also-gone.jsonl"),
+            },
+        );
+
+        state.prune_codex_recorded(&sessions, &BTreeSet::from([SESSION.to_string()]));
+
+        assert!(
+            state.codex_recorded.contains_key(SESSION),
+            "another file of the session still exists"
+        );
+        assert!(
+            !state.codex_recorded.contains_key(SESSION_B),
+            "a total whose file is gone and whose session was not read goes"
+        );
     }
 }
