@@ -75,6 +75,11 @@ const state = {
   confirmRemoveOrgId: null,
   right: null,
   errors: Object.create(null),
+  // "seatswap <version>" above the Money section: the command is asked once
+  // when the area mounts, never again on a snapshot or a group change.
+  version: null,
+  versionError: null,
+  versionLoaded: false,
   // The account ids the last snapshot held: only a change in this list makes
   // the Accounts group read the projects again.
   accountIds: null,
@@ -183,12 +188,44 @@ function providerSubscriptionRows() {
   return providerSubscriptionsOf(state.snapshot || {});
 }
 
+// The crate's version, asked once when the Settings area mounts. A refused
+// command keeps the line and puts its reason in the tooltip; it is never a
+// silent blank.
+async function loadVersion(context) {
+  if (state.versionLoaded || !context) return;
+  state.versionLoaded = true;
+  try {
+    const version = await context.invoke("app_version", {});
+    if (typeof version !== "string" || version === "") {
+      throw new Error("app_version returned an unexpected reply");
+    }
+    state.version = version;
+    state.versionError = null;
+  } catch (error) {
+    state.version = null;
+    state.versionError = errorMessage(error);
+  }
+}
+
+// The card's first body line, above the Money section (R7).
+function versionLine() {
+  if (typeof state.version === "string" && state.version !== "") {
+    return h("div", { class: "lr mf", text: `seatswap ${state.version}` });
+  }
+  return h("div", {
+    class: "lr mf",
+    title: state.versionError || "the app did not report its version",
+    text: "seatswap — version not known",
+  });
+}
+
 // Open a group: replace the old content only once the views it needs are
 // stored, so the old group stays visible while it loads.
 export async function render(container, context) {
   const snapshot = isObject(context.snapshot) ? context.snapshot : {};
   const parsed = groupFrom(context.sub);
   const group = parsed.group;
+  if (!state.versionLoaded) await loadVersion(context);
   const groupChanged = group !== state.group;
   const sameTarget = state.sub === context.sub;
   const openRequest = context.fromOpen === true;
@@ -2452,6 +2489,9 @@ function generalCard() {
   ]);
   const body = card.querySelector(".settings-body");
 
+  // The card's first line, above the Money section (R7).
+  body.appendChild(versionLine());
+
   // Money is the first section, as in the mock-up. Its rows are built (and
   // their times filled) only when the money view changed (decision 25).
   body.appendChild(moneyRows());
@@ -3305,4 +3345,8 @@ function importRow() {
 // menu stayed fixed only while this page showed (item 27).
 export function unmount() {
   if (state.container) state.container.classList.remove("settings-fixed");
+  // The next mount asks the version again, once (R7).
+  state.version = null;
+  state.versionError = null;
+  state.versionLoaded = false;
 }

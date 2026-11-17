@@ -999,6 +999,10 @@ export async function fixtureInvoke(command, args) {
       return snapshot;
     }
 
+    case "app_version":
+      // A made-up version for the page pictures; the app answers with its crate version.
+      return "1.3.0";
+
     case "refresh_now":
       fixture.lastPollAt = new Date().toISOString();
       for (const view of fixture.views) {

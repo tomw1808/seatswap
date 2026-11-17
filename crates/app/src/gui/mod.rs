@@ -254,6 +254,7 @@ pub(crate) fn run(
             )
         })
         .invoke_handler(tauri::generate_handler![
+            panel::app_version,
             panel::get_snapshot,
             panel::refresh_now,
             panel::switch_account,

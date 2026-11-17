@@ -502,6 +502,12 @@ pub(crate) fn get_snapshot(state: State<'_, GuiState>) -> Result<Snapshot, Strin
     state.snapshot()
 }
 
+/// The crate's version, shown as the first line of Settings → General (R7).
+#[tauri::command]
+pub(crate) fn app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
 #[tauri::command]
 pub(crate) fn refresh_now(state: State<'_, GuiState>) -> Result<(), String> {
     super::send_to_worker(state.engine.send(EngineCommand::Poll(PollReason::Wake)))
@@ -1912,5 +1918,26 @@ mod tests {
         let (x, y) = place_panel((10.0, 10.0), monitor(), (380.0, 400.0), true);
         assert_eq!(x, (1920.0 - 380.0) / 2.0);
         assert_eq!(y, (1080.0 - 400.0) / 2.0);
+    }
+
+    /// The Settings page's first line is built from this one string; it must be
+    /// the crate's version and read as three numbers (R7).
+    #[test]
+    fn app_version_is_the_crate_version() {
+        let version = app_version();
+        assert_eq!(version, env!("CARGO_PKG_VERSION"));
+        assert!(!version.is_empty(), "the version is empty");
+        let parts: Vec<&str> = version.split('.').collect();
+        assert_eq!(
+            parts.len(),
+            3,
+            "not three dot-separated numbers: {version:?}"
+        );
+        for part in parts {
+            assert!(
+                !part.is_empty() && part.chars().all(|digit| digit.is_ascii_digit()),
+                "not a number in {version:?}"
+            );
+        }
     }
 }
