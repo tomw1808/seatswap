@@ -97,6 +97,47 @@ impl Login {
     }
 }
 
+/// One Codex login: the whole `auth.json` object, every key in its order, as
+/// Codex wrote it (R8). Stored and restored whole, so no field seatswap does not
+/// use is lost.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CodexLogin(pub Map<String, Value>);
+
+impl CodexLogin {
+    fn s(&self, key: &str) -> Option<&str> {
+        self.0.get(key)?.as_str()
+    }
+
+    /// `tokens.account_id`: the account the login belongs to.
+    pub fn account_id(&self) -> Option<&str> {
+        self.tokens()?.get("account_id")?.as_str()
+    }
+
+    /// `auth_mode`: `"chatgpt"` for a ChatGPT login, `"apikey"` for an API key.
+    pub fn auth_mode(&self) -> Option<&str> {
+        self.s("auth_mode")
+    }
+
+    /// The `tokens` object, when the file has one. A `chatgpt` login without it
+    /// is a login Codex keeps in the OS keyring (spec §7.9).
+    pub fn tokens(&self) -> Option<&Map<String, Value>> {
+        self.0.get("tokens")?.as_object()
+    }
+
+    /// True when both logins hold the same `tokens` object: the same keys with
+    /// the same values, in any order. `last_refresh` lies outside `tokens` and is
+    /// not compared, so a login Codex renewed is a different one and a poll that
+    /// changed nothing is not. Two logins without a `tokens` object are never
+    /// the same.
+    pub fn same_tokens(&self, other: &CodexLogin) -> bool {
+        match (self.tokens(), other.tokens()) {
+            (Some(mine), Some(theirs)) => mine == theirs,
+            _ => false,
+        }
+    }
+}
+
 /// The `oauthAccount` object of `.claude.json`: the account identity.
 /// Kept whole as Claude Code wrote it; accessors read the fields we need.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

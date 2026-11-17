@@ -1074,7 +1074,8 @@ mod tests {
         assert_eq!(
             view.error.as_deref(),
             Some(
-                "Codex keeps its login in the system keyring. seatswap reads the login file only."
+                "Codex keeps its login in the system keyring. To switch Codex logins, set \
+                 cli_auth_credentials_store = \"file\" in Codex's config.toml and sign in again."
             )
         );
 

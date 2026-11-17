@@ -18,6 +18,9 @@ pub const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 /// Codex's own usage endpoint (spec §7.2); the token and account id come from
 /// Codex's `auth.json` and are only read by `providers::codex`.
 pub const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+/// Where Codex renews a login (R8): the issuer its own `auth.json` names. A
+/// saved Codex login's refresh token goes here and nowhere else.
+pub const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 pub const OAUTH_BETA: &str = "oauth-2025-04-20";
 pub const MODELS_DEV_URL: &str = "https://models.dev/api.json";
@@ -93,6 +96,7 @@ pub struct Api {
     usage_url: String,
     token_url: String,
     codex_usage_url: String,
+    codex_token_url: String,
     models_dev_url: String,
     frankfurter_url: String,
 }
@@ -105,6 +109,7 @@ impl Api {
             usage_url: USAGE_URL.to_string(),
             token_url: TOKEN_URL.to_string(),
             codex_usage_url: CODEX_USAGE_URL.to_string(),
+            codex_token_url: CODEX_TOKEN_URL.to_string(),
             models_dev_url: MODELS_DEV_URL.to_string(),
             frankfurter_url: FRANKFURTER_URL.to_string(),
         }
@@ -118,6 +123,7 @@ impl Api {
             usage_url: usage_url.to_string(),
             token_url: token_url.to_string(),
             codex_usage_url: CODEX_USAGE_URL.to_string(),
+            codex_token_url: CODEX_TOKEN_URL.to_string(),
             models_dev_url: MODELS_DEV_URL.to_string(),
             frankfurter_url: FRANKFURTER_URL.to_string(),
         }
@@ -126,6 +132,12 @@ impl Api {
     /// The Codex usage URL pointed at a local fake server (tests).
     pub fn with_codex_url(mut self, url: &str) -> Api {
         self.codex_usage_url = url.to_string();
+        self
+    }
+
+    /// The Codex token URL pointed at a local fake server (tests).
+    pub fn with_codex_token_url(mut self, url: &str) -> Api {
+        self.codex_token_url = url.to_string();
         self
     }
 
@@ -162,6 +174,39 @@ impl Api {
             .set("Authorization", &format!("Bearer {access_token}"))
             .set("chatgpt-account-id", account_id);
         get_json_no_redirect(request, CODEX)
+    }
+
+    /// POST a saved Codex login's refresh token for new tokens (R8), at
+    /// [`CODEX_TOKEN_URL`] and through the no-redirect agent, so the token goes to
+    /// Codex's own issuer and to no other host. The caller checks the issuer
+    /// before it asks; a 401 or 400 answer is an [`ApiError`] it turns into its
+    /// own failure. Neither the refresh token nor any token of the answer enters
+    /// an error text.
+    pub fn codex_refresh(
+        &self,
+        client_id: &str,
+        refresh_token: &str,
+    ) -> Result<serde_json::Value, ApiError> {
+        let request = serde_json::json!({
+            "client_id": client_id,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "scope": "openid profile email",
+        });
+        let response = self
+            .lookup_agent
+            .post(&self.codex_token_url)
+            .set("User-Agent", USER_AGENT)
+            .set("Content-Type", "application/json")
+            .send_json(request);
+        let response = match response {
+            Ok(response) => response,
+            Err(ureq::Error::Status(status, response)) => {
+                return Err(status_error(status, response, CODEX))
+            }
+            Err(ureq::Error::Transport(error)) => return Err(transport_error(error)),
+        };
+        read_json(no_redirect(response)?)
     }
 
     /// GET Ollama's cloud balance from the server at `base_url`.

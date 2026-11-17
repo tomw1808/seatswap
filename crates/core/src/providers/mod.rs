@@ -1,8 +1,10 @@
-//! The other providers (spec §7): one reader per provider, read-only, into
-//! seatswap's own `Usage` and `Limit` types so cards, colours and history
-//! need no second implementation. Codex's `auth.json` is only ever read and
-//! Ollama's own server is only ever asked for its balance and usage; no token
-//! is refreshed, stored or printed, and nothing of a provider is written.
+//! The other providers (spec §7, R8): one reader per provider into seatswap's
+//! own `Usage` and `Limit` types so cards, colours and history need no second
+//! implementation. Ollama's own server is only ever asked for its balance and
+//! usage. Codex's `auth.json` is read at every poll and the login it holds is
+//! kept in the secrets store; seatswap writes `auth.json` only when switching
+//! between two saved Codex logins, under Codex's own two locks, and it writes no
+//! login it has not saved first. No token is printed or put in an error text.
 
 use std::io;
 use std::path::PathBuf;
@@ -12,6 +14,7 @@ use serde::Serialize;
 
 use crate::api::{ApiError, Usage};
 use crate::history::{AccountRef, OllamaHourRecord};
+use crate::locks::LockError;
 
 pub mod codex;
 pub mod ollama;
@@ -25,8 +28,26 @@ pub const OLLAMA_ORG: &str = "ollama";
 pub enum ProviderError {
     #[error("No Codex login found in {path}. If Codex keeps its login in the system keyring, seatswap cannot read it.")]
     NoLogin { path: PathBuf },
-    #[error("Codex keeps its login in the system keyring. seatswap reads the login file only.")]
+    /// R8's text: the user's next step is Codex's own `config.toml`.
+    #[error("Codex keeps its login in the system keyring. To switch Codex logins, set cli_auth_credentials_store = \"file\" in Codex's config.toml and sign in again.")]
     KeyringLogin,
+    /// An API key is no subscription and is neither saved nor switched (R8).
+    #[error("Codex is signed in with an API key. An API key is no subscription; seatswap neither saves nor switches it.")]
+    ApiKeyLogin,
+    /// A switch to a login seatswap has never stored; `acc` is the account id.
+    #[error("No saved Codex login for {acc}. Sign in with codex login once while seatswap runs.")]
+    NotSaved { acc: String },
+    /// A stored Codex login could not be renewed (R8).
+    #[error("{0}")]
+    RenewFailed(String),
+    /// A file lock could not be taken — seatswap's own app lock, or Codex's
+    /// `auth.lock` or `auth.json.lock` during a switch (R8); the text names the
+    /// file.
+    #[error(transparent)]
+    Lock(#[from] LockError),
+    /// The secrets store failed; the text names which one it was.
+    #[error("the Codex login store: {0}")]
+    Store(#[from] crate::store::StoreError),
     #[error("Codex's login has expired. Run codex once to renew it.")]
     LoginExpired,
     #[error("Ollama is not running on {url}.")]

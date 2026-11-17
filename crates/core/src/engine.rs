@@ -1640,6 +1640,14 @@ mod tests {
     }
 
     impl crate::store::SecretStore for FailingSetSecrets {
+        fn get_value(&self, id: &str) -> Result<Option<Value>, StoreError> {
+            self.inner.get_value(id)
+        }
+
+        fn set_value(&self, id: &str, value: &Value) -> Result<(), StoreError> {
+            self.inner.set_value(id, value)
+        }
+
         fn get(&self, id: &str) -> Result<Option<Login>, StoreError> {
             self.inner.get(id)
         }
@@ -1681,6 +1689,14 @@ mod tests {
     }
 
     impl crate::store::SecretStore for SwappingSecrets {
+        fn get_value(&self, id: &str) -> Result<Option<Value>, StoreError> {
+            self.inner.get_value(id)
+        }
+
+        fn set_value(&self, id: &str, value: &Value) -> Result<(), StoreError> {
+            self.inner.set_value(id, value)
+        }
+
         fn get(&self, id: &str) -> Result<Option<Login>, StoreError> {
             if id == self.id && self.gets.fetch_add(1, Ordering::SeqCst) == 1 {
                 return Ok(Some(self.newer.clone()));

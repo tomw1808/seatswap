@@ -309,6 +309,17 @@ pub enum EventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         waited_secs: Option<u64>,
     },
+    /// A switch between two saved Codex logins (R8): the field shapes are the
+    /// `switch` event's, the type is its own. It is not a Claude switch: every
+    /// reader of switches, timelines and switch counts reads
+    /// [`EventKind::Switch`] only, and this event names Codex accounts, so
+    /// `read_claude` leaves it out too.
+    ProviderSwitch {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<AccountRef>,
+        to: AccountRef,
+        by: By,
+    },
     Blocked {
         account: AccountRef,
         #[serde(with = "limit_kind")]
@@ -405,11 +416,13 @@ pub enum EventKind {
 }
 
 impl EventKind {
-    /// The accounts an event names. A `Live` or a `Switch` may name two; an
-    /// event about neither account names none.
+    /// The accounts an event names. A `Live`, a `Switch` or a `ProviderSwitch`
+    /// may name two; an event about neither account names none.
     pub fn accounts(&self) -> Vec<&AccountRef> {
         match self {
-            EventKind::Switch { from, to, .. } => from.iter().chain(std::iter::once(to)).collect(),
+            EventKind::Switch { from, to, .. } | EventKind::ProviderSwitch { from, to, .. } => {
+                from.iter().chain(std::iter::once(to)).collect()
+            }
             EventKind::Blocked { account, .. }
             | EventKind::Unblocked { account, .. }
             | EventKind::AccountAdded { account, .. }
@@ -1153,6 +1166,100 @@ mod tests {
 
         let read = history.read::<Event>(&wide_range(), &Hosts::All).unwrap();
         assert_eq!(read.records.len(), 1);
+    }
+
+    /// A Codex switch is its own event type (R8): Claude's readers (`read_claude`,
+    /// the switch counts, the timelines) never see it, and a 1.2 reader meets an
+    /// unknown `type` and skips the line with a warning.
+    #[test]
+    fn a_provider_switch_is_not_a_claude_switch() {
+        const OA: &str = "6a1d4c8e-2f5b-4d3a-9e7c-1b0a5f2d8c64";
+        const OA2: &str = "c3e8f1a2-7b4d-4a69-8f2e-5d0c9b1a3e47";
+        let dir = tempdir().unwrap();
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let claude = atlas_account();
+        let oa = AccountRef {
+            acc: OA.to_string(),
+            org: crate::providers::CODEX_ORG.to_string(),
+        };
+        let oa2 = AccountRef {
+            acc: OA2.to_string(),
+            org: crate::providers::CODEX_ORG.to_string(),
+        };
+
+        history
+            .append(&Event {
+                t: utc("2026-11-14T10:00:00Z"),
+                kind: EventKind::Live {
+                    account: Some(claude.clone()),
+                },
+            })
+            .unwrap();
+        history
+            .append(&Event {
+                t: utc("2026-11-14T11:00:00Z"),
+                kind: EventKind::ProviderSwitch {
+                    from: Some(oa),
+                    to: oa2.clone(),
+                    by: By::User,
+                },
+            })
+            .unwrap();
+
+        // The line is its own type and reads back.
+        let text = fs::read_to_string(dir.path().join("atlas/events-2026-11.jsonl")).unwrap();
+        assert!(text.contains("\"type\":\"providerSwitch\""), "{text}");
+        assert!(text.contains("\"by\":\"user\""), "{text}");
+        let read = history.read::<Event>(&wide_range(), &Hosts::All).unwrap();
+        assert_eq!(read.records.len(), 2);
+        assert!(
+            read.records.iter().any(|hosted| matches!(
+                &hosted.record.kind,
+                EventKind::ProviderSwitch { to, by: By::User, .. } if to.acc == OA2
+            )),
+            "the provider switch does not read back: {read:?}"
+        );
+
+        // Claude's readers leave it out: it names no Claude account.
+        let claude_only = history
+            .read_claude::<Event>(&wide_range(), &Hosts::All)
+            .unwrap();
+        assert_eq!(claude_only.records.len(), 1);
+        assert!(matches!(
+            &claude_only.records[0].record.kind,
+            EventKind::Live { .. }
+        ));
+
+        // The statistics' switch counts count no Codex switch.
+        assert_eq!(
+            crate::stats::switch_counts(&read.records, &wide_range(), None),
+            crate::stats::SwitchCounts::default()
+        );
+
+        // A line of a type this version does not know -- what a 1.2 reader
+        // meets with this event -- is skipped with a warning, never an error.
+        let path = dir.path().join("atlas/events-2026-11.jsonl");
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"{\"t\":\"2026-11-14T13:00:00Z\",\"type\":\"somethingNew\"}\n")
+            .unwrap();
+        drop(file);
+        let after = history.read::<Event>(&wide_range(), &Hosts::All).unwrap();
+        assert_eq!(after.records.len(), 2);
+        assert!(
+            after
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("unknown variant")),
+            "{:?}",
+            after.warnings
+        );
+
+        // The timelines keep the live account: `Timeline::of` reads `Live` and
+        // `Switch` only, and here through its one public door.
+        assert_eq!(
+            crate::burn::rates::account_at(&read.records, "atlas", utc("2026-11-14T12:00:00Z")),
+            Some(claude)
+        );
     }
 
     #[test]

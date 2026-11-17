@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::atomic::{self, write_atomic, Access};
 use crate::history::AccountRef;
@@ -83,6 +84,10 @@ pub enum StoreError {
     InvalidPrice(f64),
     #[error("invalid account id {0:?}: expected 32 lower-case hex characters")]
     InvalidId(String),
+    /// A stored secret that is valid JSON but not a JSON object, so no login of
+    /// any kind can be read from it.
+    #[error("{id}: the stored login is not a JSON object")]
+    NotLogin { id: String },
     #[error("{0} is not a provider account: its org is neither codex nor ollama")]
     NotProvider(String),
     #[error("Claude Code's account identity (oauthAccount in {path}) is missing or incomplete")]
@@ -1502,12 +1507,46 @@ impl AccountsFile {
 
 /// Where one account's login lives. `encrypted()` false means the UI warns that
 /// the fallback files are not encrypted (spec §5).
+///
+/// The stored value is one JSON value, kept whole and in its key order: a
+/// Claude [`Login`], a Codex [`crate::types::CodexLogin`] (R8), or anything else
+/// a later version stores. The value methods are the ones an implementation
+/// writes; the typed methods on top are the same for every store, so the text a
+/// Claude login is stored as does not depend on which one is used.
 pub trait SecretStore: Send + Sync {
-    fn get(&self, id: &str) -> Result<Option<Login>, StoreError>;
-    fn set(&self, id: &str, login: &Login) -> Result<(), StoreError>;
+    /// The stored value for `id`, exactly as it was stored.
+    fn get_value(&self, id: &str) -> Result<Option<Value>, StoreError>;
+    fn set_value(&self, id: &str, value: &Value) -> Result<(), StoreError>;
     /// Deleting a login that is not there is fine.
     fn delete(&self, id: &str) -> Result<(), StoreError>;
     fn encrypted(&self) -> bool;
+
+    /// A stored Claude [`Login`].
+    fn get(&self, id: &str) -> Result<Option<Login>, StoreError> {
+        match self.get_value(id)? {
+            None => Ok(None),
+            Some(Value::Object(map)) => Ok(Some(Login(map))),
+            Some(_) => Err(StoreError::NotLogin { id: id.to_string() }),
+        }
+    }
+
+    /// Store a Claude [`Login`] as the compact JSON of its keys, in their order.
+    fn set(&self, id: &str, login: &Login) -> Result<(), StoreError> {
+        self.set_value(id, &Value::Object(login.0.clone()))
+    }
+
+    /// A stored Codex [`crate::types::CodexLogin`]: `auth.json` whole.
+    fn get_codex(&self, id: &str) -> Result<Option<crate::types::CodexLogin>, StoreError> {
+        match self.get_value(id)? {
+            None => Ok(None),
+            Some(Value::Object(map)) => Ok(Some(crate::types::CodexLogin(map))),
+            Some(_) => Err(StoreError::NotLogin { id: id.to_string() }),
+        }
+    }
+
+    fn set_codex(&self, id: &str, login: &crate::types::CodexLogin) -> Result<(), StoreError> {
+        self.set_value(id, &Value::Object(login.0.clone()))
+    }
 }
 
 /// The OS keyring: service `seatswap`, user = account id, value = the login
@@ -1522,7 +1561,7 @@ impl KeyringSecrets {
 }
 
 impl SecretStore for KeyringSecrets {
-    fn get(&self, id: &str) -> Result<Option<Login>, StoreError> {
+    fn get_value(&self, id: &str) -> Result<Option<Value>, StoreError> {
         match Self::entry(id)?.get_password() {
             Ok(text) => serde_json::from_str(&text)
                 .map(Some)
@@ -1532,8 +1571,8 @@ impl SecretStore for KeyringSecrets {
         }
     }
 
-    fn set(&self, id: &str, login: &Login) -> Result<(), StoreError> {
-        let text = serde_json::to_string(login)
+    fn set_value(&self, id: &str, value: &Value) -> Result<(), StoreError> {
+        let text = serde_json::to_string(value)
             .map_err(|e| StoreError::Keyring(format!("cannot encode login for {id}: {e}")))?;
         Self::entry(id)?
             .set_password(&text)
@@ -1584,7 +1623,7 @@ impl FileSecrets {
 }
 
 impl SecretStore for FileSecrets {
-    fn get(&self, id: &str) -> Result<Option<Login>, StoreError> {
+    fn get_value(&self, id: &str) -> Result<Option<Value>, StoreError> {
         let path = self.path_for(id)?;
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -1596,10 +1635,10 @@ impl SecretStore for FileSecrets {
             .map_err(|_| StoreError::Corrupt { path })
     }
 
-    fn set(&self, id: &str, login: &Login) -> Result<(), StoreError> {
+    fn set_value(&self, id: &str, value: &Value) -> Result<(), StoreError> {
         let path = self.path_for(id)?;
         self.ensure_dir()?;
-        let bytes = serde_json::to_vec(login).map_err(|e| StoreError::Io {
+        let bytes = serde_json::to_vec(value).map_err(|e| StoreError::Io {
             path: path.clone(),
             source: io::Error::new(io::ErrorKind::InvalidData, e),
         })?;
@@ -3498,6 +3537,41 @@ mod tests {
         assert!(!path.exists());
         // Deleting a missing login is fine.
         secrets.delete(ONE_ID).unwrap();
+    }
+
+    /// A Claude login is still stored as the compact JSON of its keys in their
+    /// order: the bytes 1.2.2 wrote. `get`/`set` became provided methods over
+    /// the value methods; the text did not change. The keyring writes the same
+    /// text (`serde_json::to_string` of the same value).
+    #[test]
+    fn a_claude_login_is_stored_as_before() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("secrets");
+        let secrets = FileSecrets::new(dir.clone());
+        let access = format!("sk-ant-oat01-{}", "a".repeat(95));
+        let refresh = format!("sk-ant-ort01-{}", "b".repeat(95));
+        let mut oauth = serde_json::Map::new();
+        oauth.insert("accessToken".to_string(), json!(access));
+        oauth.insert("refreshToken".to_string(), json!(refresh));
+        oauth.insert("expiresAt".to_string(), json!(1_795_000_000_000i64));
+        oauth.insert(
+            "scopes".to_string(),
+            json!(["user:profile", "user:inference"]),
+        );
+        oauth.insert("subscriptionType".to_string(), json!("max"));
+        let mut map = serde_json::Map::new();
+        map.insert("claudeAiOauth".to_string(), Value::Object(oauth));
+        map.insert("organizationUuid".to_string(), json!(ONE_ORG_UUID));
+        let login = Login(map);
+
+        secrets.set(ONE_ID, &login).unwrap();
+
+        let expected = format!(
+            "{{\"claudeAiOauth\":{{\"accessToken\":\"{access}\",\"refreshToken\":\"{refresh}\",\"expiresAt\":1795000000000,\"scopes\":[\"user:profile\",\"user:inference\"],\"subscriptionType\":\"max\"}},\"organizationUuid\":\"{ONE_ORG_UUID}\"}}"
+        );
+        let path = dir.join(format!("{ONE_ID}.json"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+        assert_eq!(secrets.get(ONE_ID).unwrap(), Some(login));
     }
 
     #[test]

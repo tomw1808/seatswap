@@ -165,13 +165,21 @@ impl ClaudePaths {
     }
 }
 
-/// Codex's login file (spec §7.2).
+/// Codex's login file and the two locks Codex takes to write it (spec §7.2, R8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexPaths {
-    /// `~/.codex`, or `$CODEX_HOME`; seatswap only ever reads here.
+    /// `~/.codex`, or `$CODEX_HOME`. seatswap reads the login here and writes it
+    /// only when switching, under Codex's two locks.
     pub home: PathBuf,
-    /// `<home>/auth.json`: the login seatswap reads, never writes.
+    /// `<home>/auth.json`: the login seatswap reads at every poll and writes only
+    /// when switching, from the stored copy of the target login.
     pub auth_file: PathBuf,
+    /// `<home>/auth.lock`: Codex's first write lock; seatswap takes it before
+    /// `auth_json_lock` when it switches.
+    pub auth_lock: PathBuf,
+    /// `<home>/auth.json.lock`: Codex's second write lock, held while it replaces
+    /// `auth.json`; seatswap takes it after `auth_lock`.
+    pub auth_json_lock: PathBuf,
 }
 
 impl CodexPaths {
@@ -205,11 +213,14 @@ impl CodexPaths {
         Ok(Self::at(&dir))
     }
 
-    /// The files of a given Codex folder: the login is `<home>/auth.json`.
+    /// The files of a given Codex folder: the login is `<home>/auth.json`, and
+    /// Codex's two write locks sit beside it.
     pub fn at(home: &Path) -> CodexPaths {
         CodexPaths {
             home: home.to_path_buf(),
             auth_file: home.join("auth.json"),
+            auth_lock: home.join("auth.lock"),
+            auth_json_lock: home.join("auth.json.lock"),
         }
     }
 
@@ -750,6 +761,8 @@ mod tests {
         let p = CodexPaths::at(Path::new("/x/codex"));
         assert_eq!(p.home, Path::new("/x/codex"));
         assert_eq!(p.auth_file, Path::new("/x/codex/auth.json"));
+        assert_eq!(p.auth_lock, Path::new("/x/codex/auth.lock"));
+        assert_eq!(p.auth_json_lock, Path::new("/x/codex/auth.json.lock"));
     }
 
     #[test]
