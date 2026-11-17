@@ -50,7 +50,8 @@ use seatswap_core::stats::{
 };
 #[cfg(feature = "gui")]
 use seatswap_core::store::{
-    self, Account, KindSpec, SegmentKind, Settings, StatuslineConfig, StatuslineInstall,
+    self, Account, KindSpec, ProviderSubscription, SegmentKind, Settings, StatuslineConfig,
+    StatuslineInstall,
 };
 #[cfg(feature = "gui")]
 use seatswap_core::switcher::LiveState;
@@ -723,6 +724,9 @@ pub(crate) enum Page<T> {
 #[derive(Debug)]
 pub(crate) struct StatsParts {
     accounts: Vec<Account>,
+    /// The provider subscriptions the same `accounts.json` stores (decision
+    /// P-2 1): their prices and the OpenAI logins a record may belong to.
+    provider_subscriptions: Vec<ProviderSubscription>,
     settings: Settings,
     prices: Prices,
     fx: Fx,
@@ -743,6 +747,7 @@ impl StatsParts {
         Ctx {
             history,
             accounts: &self.accounts,
+            provider_subscriptions: &self.provider_subscriptions,
             settings: &self.settings,
             prices: &self.prices,
             fx: &self.fx,
@@ -780,6 +785,7 @@ pub(crate) fn stats_ctx_parts(app: &AppPaths, history: &HistoryDir) -> Result<St
         .map_err(|error| format!("the projects cannot be read: {error}"))?;
     Ok(StatsParts {
         accounts: file.accounts,
+        provider_subscriptions: file.provider_subscriptions,
         settings: file.settings,
         prices,
         fx,

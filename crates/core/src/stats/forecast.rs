@@ -143,6 +143,7 @@ pub fn forecast<Tz: TimeZone + Copy>(
         ctx.fx,
         ctx.settings,
         ctx.accounts,
+        ctx.provider_subscriptions,
         ctx.warnings,
     )?;
 

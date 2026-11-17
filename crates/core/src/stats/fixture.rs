@@ -16,7 +16,9 @@ use crate::history::{
 use crate::money::{price_key, Fx, ModelPrice, PricePoint, Prices};
 use crate::project::ProjectKey;
 use crate::projects::{self, Projects};
-use crate::store::{Account, AccountsFile, FileSecrets, LoginState, Settings, Store};
+use crate::store::{
+    Account, AccountsFile, FileSecrets, LoginState, ProviderSubscription, Settings, Store,
+};
 use crate::types::OAuthAccount;
 
 #[cfg(test)]
@@ -59,6 +61,9 @@ pub struct Tiny {
     pub dir: TinyDir,
     pub history: HistoryDir,
     pub accounts: Vec<Account>,
+    /// The provider subscriptions `accounts.json` stores; a test adds them
+    /// when its records belong to one (decision P-2 1).
+    pub provider_subscriptions: Vec<ProviderSubscription>,
     pub settings: Settings,
     pub prices: Prices,
     pub fx: Fx,
@@ -76,6 +81,7 @@ impl Tiny {
         Ctx {
             history: &self.history,
             accounts: &self.accounts,
+            provider_subscriptions: &self.provider_subscriptions,
             settings: &self.settings,
             prices: &self.prices,
             fx: &self.fx,
@@ -411,6 +417,7 @@ pub fn write(root: &Path) -> Result<Tiny, String> {
         },
         history,
         accounts,
+        provider_subscriptions: Vec::new(),
         settings,
         prices,
         fx,

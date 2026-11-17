@@ -10,7 +10,7 @@ use crate::api::LimitKind;
 use crate::history::{
     is_early_reset, same_reset, AccountRef, Event, EventKind, Hosted, Sample, TokenRecord,
 };
-use crate::money::{api_usd, is_plan_model, Prices};
+use crate::money::{api_usd, is_plan_model, Company, Prices};
 use crate::store::Account;
 
 use crate::stats::{local_hour_of_week, local_hour_start};
@@ -41,6 +41,19 @@ pub fn rhythm<Tz: TimeZone + Copy>(
     zone: &Tz,
     prices: &Prices,
 ) -> Rhythm {
+    rhythm_of_company(tokens, now, zone, prices, Company::Anthropic)
+}
+
+/// [`rhythm`] of one company's models (R4): the hours that hold work of the
+/// models [`Company::of_model`] gives the company. `rhythm` is the Anthropic
+/// case, so auto-burn keeps counting Claude records only.
+pub(crate) fn rhythm_of_company<Tz: TimeZone + Copy>(
+    tokens: &[Hosted<TokenRecord>],
+    now: DateTime<Utc>,
+    zone: &Tz,
+    prices: &Prices,
+    company: Company,
+) -> Rhythm {
     let mut weighted = [0.0f64; super::HOURS];
     let weight_sum: f64 = (0..RHYTHM_WEEKS).map(week_weight).sum();
     let unpriced = unpriced_models(tokens, prices);
@@ -54,7 +67,7 @@ pub fn rhythm<Tz: TimeZone + Copy>(
         }
         let week = age.num_days() / 7;
         let record = &hosted.record;
-        if !is_plan_model(&record.model) || unpriced.contains(&record.model) {
+        if Company::of_model(&record.model) != company || unpriced.contains(&record.model) {
             continue;
         }
         let Some(usd) = api_usd(record, prices) else {
@@ -467,6 +480,10 @@ fn session_gain(before: &Sample, after: &Sample) -> Option<f64> {
 /// it, so the account between two changes is the one of the earlier change.
 pub(crate) struct Timeline {
     changes: Vec<(DateTime<Utc>, Option<AccountRef>)>,
+    /// The account in use before the first change, when the constructor knows
+    /// it (only [`Timeline::provider_switches`] does: the first
+    /// `providerSwitch`'s `from`).
+    before: Option<Option<AccountRef>>,
 }
 
 impl Timeline {
@@ -481,7 +498,50 @@ impl Timeline {
             })
             .collect();
         changes.sort_by_key(|change| change.0);
-        Timeline { changes }
+        Timeline {
+            changes,
+            before: None,
+        }
+    }
+
+    /// The same timeline for a provider subscription (decision P-2 2): every
+    /// `providerSwitch` event of `host` changes which OpenAI login is in use.
+    /// A `switch` event stays Claude-only and changes nothing here, and
+    /// [`Timeline::of`] ignores a `providerSwitch` in the same way.
+    pub(crate) fn provider_switches(events: &[Hosted<Event>], host: &str) -> Timeline {
+        let mut switches: Vec<(DateTime<Utc>, Option<AccountRef>, AccountRef)> = events
+            .iter()
+            .filter(|hosted| hosted.host == host)
+            .filter_map(|hosted| match &hosted.record.kind {
+                EventKind::ProviderSwitch { from, to, .. } => {
+                    Some((hosted.record.t, from.clone(), to.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        switches.sort_by_key(|change| change.0);
+        // Before the first switch the login in use is that event's `from`.
+        let before = switches.first().map(|(_, from, _)| from.clone());
+        Timeline {
+            changes: switches
+                .into_iter()
+                .map(|(at, _, to)| (at, Some(to)))
+                .collect(),
+            before,
+        }
+    }
+
+    /// The account in use before the first change, when the constructor knows
+    /// it: the first `providerSwitch`'s `from` for
+    /// [`Timeline::provider_switches`], and `None` for a live timeline or a
+    /// timeline with no event.
+    pub(crate) fn before_first(&self) -> Option<&AccountRef> {
+        self.before.as_ref().and_then(Option::as_ref)
+    }
+
+    /// Whether the timeline holds no change: no event of its kind on the host.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.changes.is_empty()
     }
 
     pub(crate) fn at(&self, t: DateTime<Utc>) -> Option<&AccountRef> {

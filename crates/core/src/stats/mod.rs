@@ -21,7 +21,7 @@ use crate::money::{
     window_money, Company, Fx, Missing, MoneyError, Prices, Valued, Valuer, WindowMoney,
 };
 use crate::projects::{Projects, ProjectsLogRecord};
-use crate::store::{Account, Settings};
+use crate::store::{Account, ProviderSubscription, Settings};
 
 pub mod activity;
 #[cfg(any(test, feature = "fixtures"))]
@@ -125,6 +125,10 @@ pub struct Query {
 pub struct Ctx<'a, Tz: TimeZone + Copy = FixedOffset> {
     pub history: &'a HistoryDir,
     pub accounts: &'a [Account],
+    /// The provider subscriptions `accounts.json` stores beside the accounts
+    /// (decision P-2 1): their prices and looks, and the OpenAI logins a record
+    /// may belong to.
+    pub provider_subscriptions: &'a [ProviderSubscription],
     pub settings: &'a Settings,
     pub prices: &'a Prices,
     pub fx: &'a Fx,
@@ -400,6 +404,7 @@ pub fn account_weeks<Tz: TimeZone + Copy>(
         ctx.fx,
         ctx.settings,
         ctx.accounts,
+        ctx.provider_subscriptions,
         ctx.warnings,
     )?;
     account_weeks_valued(ctx, range, q, &valuer)
@@ -409,7 +414,10 @@ pub fn account_weeks<Tz: TimeZone + Copy>(
 /// range, so a page that values token records too builds only one. One entry
 /// per account and calendar week: every window whose midpoint falls in that
 /// week is kept in `windows`, oldest first; `used` sums their use and `window`
-/// is the last.
+/// is the last. The windows are every company's: a Claude account's week and an
+/// OpenAI subscription's `weekly_all` week (an Ollama subscription counts per
+/// month, [`subscription_months`]). A page that serves Claude's accounts alone
+/// leaves the provider weeks out by [`Company::of_account`].
 pub(crate) fn account_weeks_valued<Tz: TimeZone + Copy>(
     ctx: &Ctx<Tz>,
     range: &Range,
@@ -417,8 +425,7 @@ pub(crate) fn account_weeks_valued<Tz: TimeZone + Copy>(
     valuer: &Valuer,
 ) -> Result<Vec<AccountWeek>, StatsError> {
     let windows = keep_warnings(ctx.warnings, || {
-        ctx.history
-            .finished_claude_windows(&Range::ALL, &Hosts::All)
+        ctx.history.finished_windows(&Range::ALL, &Hosts::All)
     })?;
     let finished = windows
         .records
@@ -440,8 +447,7 @@ pub(crate) fn account_weeks_so_far<Tz: TimeZone + Copy>(
     valuer: &Valuer,
 ) -> Result<Vec<AccountWeek>, StatsError> {
     let windows = keep_warnings(ctx.warnings, || {
-        ctx.history
-            .finished_claude_windows(&Range::ALL, &Hosts::All)
+        ctx.history.finished_windows(&Range::ALL, &Hosts::All)
     })?;
     let finished = windows
         .records
@@ -463,8 +469,10 @@ pub(crate) fn account_weeks_so_far<Tz: TimeZone + Copy>(
 /// The chosen accounts' weekly windows still running at `ctx.now`
 /// ([`Valuer::running_windows`]), one account week each, wherever their
 /// midpoint lies: the windows Overview's This-week card shows, whatever range
-/// the page has. Each is priced at its own midpoint like any account week; its
-/// use is the use so far (`final − from`) and it has expired nothing yet.
+/// the page has. Claude's accounts alone: a provider subscription's running
+/// week is that card's provider row, not an account row. Each is priced at its
+/// own midpoint like any account week; its use is the use so far (`final −
+/// from`) and it has expired nothing yet.
 pub(crate) fn running_account_weeks<Tz: TimeZone + Copy>(
     ctx: &Ctx<Tz>,
     q: &Query,
@@ -473,8 +481,72 @@ pub(crate) fn running_account_weeks<Tz: TimeZone + Copy>(
     let running = valuer
         .running_windows(ctx.now)
         .into_iter()
+        .filter(|window| Company::of_account(&window.account) == Company::Anthropic)
         .map(|window| (window, true));
     weeks_of_windows(ctx, &Range::ALL, q, valuer, running)
+}
+
+/// One month of an Ollama subscription (decision P-2 9): the share of the
+/// month's credits used, the money of that use and the money the finished month
+/// left unused.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MonthValued {
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+    /// The share of the month's credits used, in percent: the newest reading's
+    /// percent minus the reading a reset began the month at.
+    pub used_percent: f64,
+    /// The money of `used_percent` at the subscription's price for the month;
+    /// `None` without a price, never 0.
+    pub money: Option<f64>,
+    /// The money the finished month left unused; `Some(0.0)` while the month
+    /// runs, because it has expired nothing yet; `None` without a price.
+    pub expired: Option<f64>,
+}
+
+/// The finished and running months of the Ollama subscription `account` that
+/// overlap `range`, oldest end first (decision P-2 9). An Ollama subscription
+/// counts per month, not per week: `used_percent` is the share of the credits
+/// used, not a week's use. Like every page function it takes a range, and
+/// [`Valuer::build`] reads every month that overlaps it whole (decision P-2 2).
+pub fn subscription_months<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
+    range: &Range,
+    account: &AccountRef,
+) -> Result<Vec<MonthValued>, StatsError> {
+    let valuer = Valuer::build(
+        ctx.history,
+        range,
+        ctx.prices,
+        ctx.fx,
+        ctx.settings,
+        ctx.accounts,
+        ctx.provider_subscriptions,
+        ctx.warnings,
+    )?;
+    Ok(valuer
+        .month_windows(account)
+        .into_iter()
+        .filter(|month| month.end > range.from && month.start < range.to)
+        .map(|month| {
+            let running = month.end > ctx.now;
+            let (money, expired) = match month.money {
+                Some(money) => (
+                    Some(money.used),
+                    Some(if running { 0.0 } else { money.expired }),
+                ),
+                None => (None, None),
+            };
+            MonthValued {
+                start: month.start,
+                end: month.end,
+                used_percent: month.used,
+                money,
+                expired,
+            }
+        })
+        .collect())
 }
 
 /// What a range that holds now says about the chosen accounts' running weekly
@@ -639,7 +711,11 @@ pub(crate) fn accounts_without_price<Tz: TimeZone + Copy>(
         .collect();
     let mut removed: Vec<String> = weeks
         .iter()
-        .filter(|week| week.price.is_none() && stored_account(ctx, &week.account).is_none())
+        .filter(|week| {
+            week.price.is_none()
+                && Company::of_account(&week.account) == Company::Anthropic
+                && stored_account(ctx, &week.account).is_none()
+        })
         .map(|week| account_id(ctx, &week.account))
         .collect();
     removed.sort();
@@ -899,34 +975,40 @@ pub(crate) fn account_chosen<Tz: TimeZone + Copy>(
     q.accounts.iter().any(|chosen| chosen == &id)
 }
 
-/// Whether the query chooses a valued token record on a page of project work:
-/// a Claude record by its account ([`account_chosen`], so a Claude record
-/// without a known account is left out by a filter), while a record of
-/// another company (OpenAI, Ollama) uses no Claude account and is chosen
-/// whatever the account chips say.
+/// Whether the query chooses a valued token record on a page of project work,
+/// by its [`Valued::account`] ([`account_chosen`]): a Claude record's account,
+/// or a provider record's subscription (decision P-2 8). A record without a
+/// known account is chosen only while no chip is taken out; a provider record
+/// whose subscription is not chosen is left out like an account's.
 pub(crate) fn record_chosen<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, q: &Query, value: &Valued) -> bool {
-    match value.company {
-        Company::Anthropic => account_chosen(ctx, q, value.account.as_ref()),
-        Company::OpenAI | Company::Ollama => true,
-    }
+    account_chosen(ctx, q, value.account.as_ref())
 }
 
-/// The abbreviation a page writes for `reference`: the stored account's, or the
-/// first 8 characters of the id `account_id` gives it when it is no longer
-/// stored (the rule `crates/app/ui/common.js` uses for an unknown account).
+/// The abbreviation a page writes for `reference`: the stored account's, a
+/// stored provider subscription's, or the first 8 characters of the id
+/// `account_id` gives it when neither is stored (the rule
+/// `crates/app/ui/common.js` uses for an unknown account).
 pub(crate) fn account_abbr<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, reference: &AccountRef) -> String {
-    match stored_account(ctx, reference) {
-        Some(account) => account.abbr.clone(),
-        None => reference.acc.chars().take(8).collect(),
+    if let Some(account) = stored_account(ctx, reference) {
+        return account.abbr.clone();
     }
+    if let Some(subscription) = stored_subscription(ctx, reference) {
+        return subscription.abbr.clone();
+    }
+    reference.acc.chars().take(8).collect()
 }
 
-/// Where an account id stands in the stored accounts' order; an id that is no
-/// longer stored sorts after all of them.
+/// Where an account id stands in the stored accounts' order, then the provider
+/// subscriptions' order; an id that is no longer stored sorts after all of
+/// them.
 pub(crate) fn account_position<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, id: &str) -> usize {
-    ctx.accounts
+    if let Some(position) = ctx.accounts.iter().position(|account| account.id == id) {
+        return position;
+    }
+    ctx.provider_subscriptions
         .iter()
-        .position(|account| account.id == id)
+        .position(|subscription| subscription.account.acc == id)
+        .map(|position| ctx.accounts.len() + position)
         .unwrap_or(usize::MAX)
 }
 
@@ -1050,38 +1132,57 @@ pub struct Empty {
     pub recording_since: Option<DateTime<Utc>>,
 }
 
-/// The blocked time of the chosen hosts in the range. Only the time the blocked
-/// account was the one in use counts, and only in the working hours of the
-/// rhythm of the four weeks before the range's end. A host's spans come only from
-/// the blocks that host recorded and the account that host had in use, so two
-/// hosts blocked at the same time each have their span.
+/// The blocked time of one company in the range (decision P-2 5): the
+/// company's own blocks inside that company's working hours. Claude's accounts
+/// count only while the blocked account was the live one, any limit kind; their
+/// avoidable hours are auto-burn's. OpenAI's `session` and `weekly_all` blocks
+/// count only while the blocked subscription was the one in use on the block's
+/// host (the `providerSwitch` rule of decision P-2 2); Ollama has one
+/// subscription, so its `monthly_credits` block always counts. No sum across
+/// companies.
 pub fn blocked_spans<Tz: TimeZone + Copy>(
     ctx: &Ctx<Tz>,
     range: &Range,
     q: &Query,
+    company: Company,
 ) -> Result<Vec<BlockedSpan>, StatsError> {
     let events = keep_warnings(ctx.warnings, || {
-        ctx.history.read_claude::<Event>(&Range::ALL, &Hosts::All)
+        ctx.history.read::<Event>(&Range::ALL, &Hosts::All)
     })?;
-    let intervals = block_intervals(&events.records, range.to);
+    let block_events: Vec<Hosted<Event>> = events
+        .records
+        .iter()
+        .filter(|hosted| match &hosted.record.kind {
+            EventKind::Blocked { account, k, .. } | EventKind::Unblocked { account, k, .. } => {
+                Company::of_account(account) == company && blocks_whole_account(company, k)
+            }
+            _ => false,
+        })
+        .cloned()
+        .collect();
+    let intervals = block_intervals(&block_events, range.to);
     let mut weekly = Vec::new();
     let windows = keep_warnings(ctx.warnings, || {
-        ctx.history
-            .finished_claude_windows(&Range::ALL, &Hosts::All)
+        ctx.history.finished_windows(&Range::ALL, &Hosts::All)
     })?;
     for hosted in windows.records {
-        if hosted.record.k == LimitKind::WeeklyAll {
+        if hosted.record.k == LimitKind::WeeklyAll
+            && Company::of_account(&hosted.record.account) == Company::Anthropic
+        {
             weekly.push(hosted);
         }
     }
-    let rhythm = working_rhythm(ctx, range)?;
-    let timelines = rates::timelines(&events.records);
+    let rhythm = working_rhythm(ctx, range, company)?;
+    let claude_timelines = rates::timelines(&events.records);
+    // OpenAI's blocks follow the one rule that names a record's subscription.
+    let provider_timelines = crate::money::provider_switch_timelines(&events.records);
+    let openai_stored = crate::money::openai_subscriptions(ctx.provider_subscriptions);
 
     let mut spans = Vec::new();
-    for host in hosts_of(q, &events.records) {
-        let Some(timeline) = timelines.get(&host) else {
+    for host in hosts_of(q, &block_events) {
+        if company == Company::Anthropic && !claude_timelines.contains_key(&host) {
             continue;
-        };
+        }
         for (interval_host, account, blocked_from, blocked_to) in &intervals {
             if interval_host != &host {
                 continue;
@@ -1095,13 +1196,46 @@ pub fn blocked_spans<Tz: TimeZone + Copy>(
                 continue;
             }
             let mut points = vec![start];
-            points.extend(timeline.changes_between(start, end));
+            match company {
+                Company::Anthropic => {
+                    let Some(timeline) = claude_timelines.get(&host) else {
+                        continue;
+                    };
+                    points.extend(timeline.changes_between(start, end));
+                }
+                Company::OpenAI => {
+                    if let Some(timeline) = provider_timelines.get(&host) {
+                        points.extend(timeline.changes_between(start, end));
+                    }
+                }
+                Company::Ollama => {}
+            }
             points.push(end);
             points.sort_unstable();
             points.dedup();
             for pair in points.windows(2) {
                 let (from, to) = (pair[0], pair[1]);
-                if from >= to || timeline.at(from) != Some(account) {
+                if from >= to {
+                    continue;
+                }
+                let in_use = match company {
+                    Company::Anthropic => claude_timelines
+                        .get(&host)
+                        .is_some_and(|timeline| timeline.at(from) == Some(account)),
+                    Company::OpenAI => {
+                        crate::money::openai_subscription_at(
+                            &provider_timelines,
+                            &openai_stored,
+                            &host,
+                            from,
+                        )
+                        .ok()
+                        .as_ref()
+                            == Some(account)
+                    }
+                    Company::Ollama => true,
+                };
+                if !in_use {
                     continue;
                 }
                 spans.push(BlockedSpan {
@@ -1110,15 +1244,20 @@ pub fn blocked_spans<Tz: TimeZone + Copy>(
                     from,
                     to,
                     hours: working_hours(from, to, &rhythm, &ctx.zone),
-                    avoidable_hours: avoidable_hours(
-                        ctx,
-                        &host,
-                        account,
-                        Range { from, to },
-                        &intervals,
-                        &weekly,
-                        &rhythm,
-                    ),
+                    // Auto-burn's avoidable hours are Claude accounts' alone.
+                    avoidable_hours: if company == Company::Anthropic {
+                        avoidable_hours(
+                            ctx,
+                            &host,
+                            account,
+                            Range { from, to },
+                            &intervals,
+                            &weekly,
+                            &rhythm,
+                        )
+                    } else {
+                        0.0
+                    },
                 });
             }
         }
@@ -1130,6 +1269,20 @@ pub fn blocked_spans<Tz: TimeZone + Copy>(
             .then_with(|| a.account.cmp(&b.account))
     });
     Ok(spans)
+}
+
+/// Whether a limit of `company` blocks the whole account when it is at 100 %
+/// (decision P-2 5): every kind for Claude (today's rule), the 5 h session and
+/// the week of all models for OpenAI, Ollama's credits month.
+fn blocks_whole_account(company: Company, kind: &LimitKind) -> bool {
+    match company {
+        Company::Anthropic => true,
+        Company::OpenAI => matches!(kind, LimitKind::Session | LimitKind::WeeklyAll),
+        Company::Ollama => matches!(
+            kind,
+            LimitKind::Other(name) if name == "monthly_credits"
+        ),
+    }
 }
 
 /// Whether the history holds no record in the range; then the page says since
@@ -1204,6 +1357,17 @@ pub(crate) fn stored_account<'a, Tz: TimeZone + Copy>(
     })
 }
 
+/// The stored provider subscription `reference` names, if any (decision P-2 1):
+/// its look is the one a page writes for the subscription's own work.
+pub(crate) fn stored_subscription<'a, Tz: TimeZone + Copy>(
+    ctx: &Ctx<'a, Tz>,
+    reference: &AccountRef,
+) -> Option<&'a ProviderSubscription> {
+    ctx.provider_subscriptions
+        .iter()
+        .find(|subscription| &subscription.account == reference)
+}
+
 fn hosts_of(q: &Query, events: &[Hosted<Event>]) -> Vec<String> {
     match &q.host {
         Some(host) => vec![host.clone()],
@@ -1216,19 +1380,27 @@ fn hosts_of(q: &Query, events: &[Hosted<Event>]) -> Vec<String> {
     }
 }
 
-/// The working hours of the range: the hours of the week whose value in the
-/// rhythm of the four weeks before `range.to` is above 0.
-fn working_rhythm<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, range: &Range) -> Result<Rhythm, StatsError> {
+/// The working hours of one company in the range (decision P-2 5): the hours of
+/// the week whose value in the rhythm of the four weeks before `range.to` is
+/// above 0, learned from the token records of that company's models alone. No
+/// sum across companies: a company's blocked time counts in its own working
+/// hours only.
+pub(crate) fn working_rhythm<Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
+    range: &Range,
+    company: Company,
+) -> Result<Rhythm, StatsError> {
     let from = range.to - Duration::weeks(RHYTHM_WEEKS);
     let read = keep_warnings(ctx.warnings, || {
         ctx.history
             .read::<TokenRecord>(&Range { from, to: range.to }, &Hosts::All)
     })?;
-    Ok(rates::rhythm(
+    Ok(rates::rhythm_of_company(
         &read.records,
         range.to,
         &ctx.zone,
         ctx.prices,
+        company,
     ))
 }
 
@@ -1430,13 +1602,29 @@ pub(crate) mod tests {
         text.parse::<DateTime<Utc>>().expect("test date")
     }
 
-    /// A Codex sample, window and event beside the Claude records: a Claude
-    /// reader must give the same answer with and without them (step-d.md Task 4).
+    /// A stored provider subscription with `abbr` and an optional monthly price,
+    /// as `accounts.json` holds it (decision P-2 1).
+    pub(crate) fn provider_subscription(
+        account: &AccountRef,
+        abbr: &str,
+        price: Option<f64>,
+    ) -> crate::store::ProviderSubscription {
+        crate::store::ProviderSubscription {
+            account: account.clone(),
+            label: abbr.to_string(),
+            abbr: abbr.to_string(),
+            color: "#4a6f8c".to_string(),
+            plan: Some("Plus".to_string()),
+            price,
+            price_currency: price.map(|_| "EUR".to_string()),
+        }
+    }
+
+    /// A Codex sample, window and event beside the Claude records. A reader
+    /// that serves every company now sees them (P-2); a Claude-only reader must
+    /// give the same answer with and without them (step-d.md Task 4).
     pub(crate) fn append_codex_records(history: &HistoryDir, at: DateTime<Utc>) {
-        let account = AccountRef {
-            acc: "0f3a6c2e-7b1d-4e9a-8c5f-2d4b6a8e0c13".to_string(),
-            org: crate::providers::CODEX_ORG.to_string(),
-        };
+        let account = codex_ref();
         history
             .append(&Sample {
                 t: at,
@@ -1459,7 +1647,9 @@ pub(crate) mod tests {
                 start: Some(at - Duration::days(7)),
                 end: at,
                 final_percent: 12.0,
-                lost: None,
+                // A Codex week record carries the unused share, as `window_of`
+                // writes it; a month has none.
+                lost: Some(88.0),
                 last_sample: at,
                 plan: Some("Plus".to_string()),
                 uncertain: false,
@@ -1632,6 +1822,7 @@ pub(crate) mod tests {
         Ctx {
             history: &tiny.history,
             accounts: &tiny.accounts,
+            provider_subscriptions: &tiny.provider_subscriptions,
             settings: &tiny.settings,
             prices: &tiny.prices,
             fx: &tiny.fx,
@@ -1773,6 +1964,7 @@ pub(crate) mod tests {
             &tiny.fx,
             &tiny.settings,
             &tiny.accounts,
+            &[],
             &tiny.warnings,
         )
         .expect("a valuer");
@@ -1906,6 +2098,7 @@ pub(crate) mod tests {
             ctx.fx,
             ctx.settings,
             ctx.accounts,
+            &[],
             ctx.warnings,
         )
         .expect("the valuer");
@@ -2268,7 +2461,7 @@ pub(crate) mod tests {
     #[test]
     fn blocked_time_counts_only_working_hours_of_the_active_account() {
         let tiny = tiny();
-        let spans = blocked_spans(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        let spans = blocked_spans(&tiny.ctx(), &two_weeks(), &all(), Company::Anthropic).unwrap();
         assert_eq!(spans.len(), 2);
 
         let lb = spans
@@ -2296,7 +2489,7 @@ pub(crate) mod tests {
     #[test]
     fn blocked_while_not_the_active_account_does_not_count() {
         let tiny = tiny();
-        let spans = blocked_spans(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        let spans = blocked_spans(&tiny.ctx(), &two_weeks(), &all(), Company::Anthropic).unwrap();
         let lb: Vec<&BlockedSpan> = spans
             .iter()
             .filter(|span| span.account == tiny.lb_ref())
@@ -2429,7 +2622,7 @@ pub(crate) mod tests {
         )
         .expect("the vega marker");
 
-        let spans = blocked_spans(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        let spans = blocked_spans(&tiny.ctx(), &two_weeks(), &all(), Company::Anthropic).unwrap();
         let vega_spans: Vec<&BlockedSpan> =
             spans.iter().filter(|span| span.host == "vega").collect();
         assert_eq!(vega_spans.len(), 1, "vega's spans: {vega_spans:#?}");
@@ -2474,7 +2667,7 @@ pub(crate) mod tests {
             from: utc("2026-11-07T11:30:00Z"),
             to: utc("2026-11-16T00:00:00Z"),
         };
-        let spans = blocked_spans(&tiny.ctx(), &half_hour, &all()).unwrap();
+        let spans = blocked_spans(&tiny.ctx(), &half_hour, &all(), Company::Anthropic).unwrap();
         let lb: Vec<&BlockedSpan> = spans
             .iter()
             .filter(|span| span.account == tiny.lb_ref())
@@ -2613,23 +2806,464 @@ pub(crate) mod tests {
         assert!((hours - 25.0).abs() < 1e-9, "{hours}");
     }
 
+    /// The fixture's Codex account: the one OpenAI subscription of the P-2
+    /// tests.
+    pub(crate) fn codex_ref() -> AccountRef {
+        AccountRef {
+            acc: "0f3a6c2e-7b1d-4e9a-8c5f-2d4b6a8e0c13".to_string(),
+            org: crate::providers::CODEX_ORG.to_string(),
+        }
+    }
+
+    /// A Codex token record of `in` input tokens and no output.
+    pub(crate) fn codex_token(t: &str, model: &str, input: u64) -> TokenRecord {
+        TokenRecord {
+            t: utc(t),
+            minutes: 60,
+            session: "3f7b2c1e-9a4d-4e8f-8b6a-2c5d9e1f7a30".to_string(),
+            cwd: "/home/sam/projects/atlas".to_string(),
+            project: ProjectKey::Repo("github.com/acme/atlas".to_string()),
+            model: model.to_string(),
+            input,
+            out: 0,
+            cw: 0,
+            cr: 0,
+            answers: 1,
+            agent_answers: 0,
+        }
+    }
+
+    /// Price the Codex model `gpt-6.2-codex` at 10 USD a million input tokens.
+    pub(crate) fn codex_prices(prices: &mut Prices) {
+        prices.take(
+            BTreeMap::from([(
+                "openai/gpt-6.2-codex".to_string(),
+                crate::money::ModelPrice {
+                    input: 10.0,
+                    output: 0.0,
+                    cache_write: 0.0,
+                    cache_read: 0.0,
+                    tiered: false,
+                },
+            )]),
+            utc("2026-01-01T00:00:00Z"),
+        );
+    }
+
+    /// P-2 counts an OpenAI subscription's finished week as an account week; the
+    /// Claude accounts' weeks and blocked spans stay what they were.
     #[test]
-    fn provider_records_do_not_change_the_account_weeks() {
+    fn provider_records_do_not_change_the_claude_account_weeks() {
         let without = tiny();
         let with = tiny();
         append_codex_records(&with.history, utc("2026-11-14T09:00:00Z"));
 
         let before = account_weeks(&without.ctx(), &two_weeks(), &all()).expect("the weeks");
         let after = account_weeks(&with.ctx(), &two_weeks(), &all()).expect("the weeks");
+        let claude = |weeks: &[AccountWeek]| {
+            weeks
+                .iter()
+                .filter(|week| Company::of_account(&week.account) == Company::Anthropic)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            claude(&after),
+            claude(&before),
+            "a Codex window changed the Claude weeks"
+        );
+        assert!(
+            after
+                .iter()
+                .any(|week| Company::of_account(&week.account) == Company::OpenAI),
+            "the Codex week is an account week (P-2)"
+        );
 
-        assert_eq!(after, before, "a Codex window changed the Claude weeks");
-
-        let before = blocked_spans(&without.ctx(), &two_weeks(), &all()).expect("the spans");
-        let after = blocked_spans(&with.ctx(), &two_weeks(), &all()).expect("the spans");
+        let before = blocked_spans(&without.ctx(), &two_weeks(), &all(), Company::Anthropic)
+            .expect("the spans");
+        let after = blocked_spans(&with.ctx(), &two_weeks(), &all(), Company::Anthropic)
+            .expect("the spans");
         assert_eq!(
             after, before,
             "a Codex event changed the Claude blocked spans"
         );
+    }
+
+    /// An OpenAI block counts in OpenAI's working hours only: a block at an hour
+    /// where only Claude worked has no OpenAI hours, one at an hour of Codex work
+    /// has. The Claude side never counts an OpenAI block (decision P-2 5).
+    #[test]
+    fn openai_blocked_hours_count_in_openai_working_hours_only() {
+        let mut tiny = tiny();
+        let codex = codex_ref();
+        tiny.provider_subscriptions = vec![provider_subscription(&codex, "OA", None)];
+        codex_prices(&mut tiny.prices);
+        // Codex works at 14:00, when no Claude record is; the Claude accounts
+        // work at 09:00 that day.
+        tiny.history
+            .append(&codex_token(
+                "2026-11-11T14:00:00Z",
+                "gpt-6.2-codex",
+                1_000_000,
+            ))
+            .expect("the Codex record");
+        for at in ["2026-11-11T09:00:00Z", "2026-11-11T14:00:00Z"] {
+            let from = utc(at);
+            tiny.history
+                .append(&Event {
+                    t: from,
+                    kind: EventKind::Blocked {
+                        account: codex.clone(),
+                        k: LimitKind::Session,
+                        m: None,
+                    },
+                })
+                .expect("the OpenAI block");
+            tiny.history
+                .append(&Event {
+                    t: from + Duration::hours(1),
+                    kind: EventKind::Unblocked {
+                        account: codex.clone(),
+                        k: LimitKind::Session,
+                        m: None,
+                    },
+                })
+                .expect("the OpenAI unblock");
+        }
+
+        let openai = blocked_spans(&tiny.ctx(), &two_weeks(), &all(), Company::OpenAI)
+            .expect("the OpenAI spans");
+        assert_eq!(openai.len(), 2, "both blocks are OpenAI spans");
+        let hours: f64 = openai.iter().map(|span| span.hours).sum();
+        assert!(
+            close(hours, 1.0),
+            "only the hour of Codex work counts: {hours}"
+        );
+        let claude_hour = openai
+            .iter()
+            .find(|span| span.from == utc("2026-11-11T09:00:00Z"))
+            .expect("the 09:00 block is an OpenAI span");
+        assert_eq!(
+            claude_hour.hours, 0.0,
+            "09:00 is Claude working time, not OpenAI's"
+        );
+
+        let claude = blocked_spans(&tiny.ctx(), &two_weeks(), &all(), Company::Anthropic)
+            .expect("the Claude spans");
+        assert!(
+            claude.iter().all(|span| span.account != codex),
+            "a Claude span holds an OpenAI block"
+        );
+    }
+
+    /// Claude's blocked hours ignore Codex work: a Claude block in an hour where
+    /// only Codex worked has no Claude hours, and an OpenAI span never holds a
+    /// Claude block (decision P-2 5).
+    #[test]
+    fn claude_blocked_hours_ignore_codex_work() {
+        let mut tiny = tiny();
+        codex_prices(&mut tiny.prices);
+        // Codex works at 14:00; no Claude record is there, LB is live.
+        tiny.history
+            .append(&codex_token(
+                "2026-11-11T14:00:00Z",
+                "gpt-6.2-codex",
+                1_000_000,
+            ))
+            .expect("the Codex record");
+        let live = tiny.lb_ref();
+        tiny.history
+            .append(&Event {
+                t: utc("2026-11-11T14:00:00Z"),
+                kind: EventKind::Blocked {
+                    account: live.clone(),
+                    k: LimitKind::Session,
+                    m: None,
+                },
+            })
+            .expect("the Claude block");
+        tiny.history
+            .append(&Event {
+                t: utc("2026-11-11T15:00:00Z"),
+                kind: EventKind::Unblocked {
+                    account: live.clone(),
+                    k: LimitKind::Session,
+                    m: None,
+                },
+            })
+            .expect("the Claude unblock");
+
+        let claude = blocked_spans(&tiny.ctx(), &two_weeks(), &all(), Company::Anthropic)
+            .expect("the Claude spans");
+        let block = claude
+            .iter()
+            .find(|span| span.from == utc("2026-11-11T14:00:00Z"))
+            .expect("the Claude block is a span");
+        assert_eq!(
+            block.hours, 0.0,
+            "14:00 is Codex working time, not Claude's"
+        );
+
+        let openai = blocked_spans(&tiny.ctx(), &two_weeks(), &all(), Company::OpenAI)
+            .expect("the OpenAI spans");
+        assert!(
+            openai.iter().all(|span| span.account != live),
+            "an OpenAI span holds a Claude block"
+        );
+    }
+
+    /// An Ollama subscription counts per month: `used_percent` is the share of
+    /// the month's credits used, its money a hundredth of the month's price per
+    /// percent, and a finished month's unused credits are its expired money
+    /// (decision P-2 3, 9).
+    #[test]
+    fn ollama_month_use_is_the_share_of_credits_used() {
+        let tiny = tiny();
+        let ollama = crate::money::ollama_subscription();
+        let month = |t: &str, percent: f64, until: &str| Sample {
+            t: utc(t),
+            account: ollama.clone(),
+            src: crate::history::Source::Poll,
+            l: vec![crate::history::LimitSample {
+                k: LimitKind::Other("monthly_credits".to_string()),
+                m: None,
+                p: percent,
+                r: Some(utc(until)),
+                b: false,
+            }],
+        };
+        // October ended with 40 % of its credits used; November has used 60 % so
+        // far, with no finished window record.
+        tiny.history
+            .append(&month("2026-10-20T00:00:00Z", 40.0, "2026-11-01T00:00:00Z"))
+            .expect("October's reading");
+        tiny.history
+            .append(&month("2026-11-10T00:00:00Z", 25.0, "2026-12-01T00:00:00Z"))
+            .expect("November's first reading");
+        tiny.history
+            .append(&month("2026-11-15T00:00:00Z", 60.0, "2026-12-01T00:00:00Z"))
+            .expect("November's newest reading");
+        tiny.history
+            .append(&Event {
+                t: utc("2026-10-01T00:00:00Z"),
+                kind: EventKind::PriceChanged {
+                    account: ollama.clone(),
+                    amount: Some(20.0),
+                    currency: Some("EUR".to_string()),
+                },
+            })
+            .expect("the subscription's price");
+
+        let months = subscription_months(
+            &tiny.ctx(),
+            &Range {
+                from: utc("2026-10-01T00:00:00Z"),
+                to: utc("2026-12-02T00:00:00Z"),
+            },
+            &ollama,
+        )
+        .expect("the months");
+        assert_eq!(months.len(), 2, "{months:?}");
+        assert_eq!(months[0].end, utc("2026-11-01T00:00:00Z"));
+        assert_eq!(months[0].used_percent, 40.0);
+        assert_eq!(months[0].money, Some(8.0), "40 % of 20 EUR");
+        assert_eq!(months[0].expired, Some(12.0), "the unused 60 %");
+        assert_eq!(months[1].start, utc("2026-11-01T00:00:00Z"));
+        assert_eq!(months[1].end, utc("2026-12-01T00:00:00Z"));
+        assert_eq!(months[1].used_percent, 60.0);
+        assert_eq!(months[1].money, Some(12.0), "60 % of 20 EUR");
+        assert_eq!(
+            months[1].expired,
+            Some(0.0),
+            "a running month has expired nothing yet"
+        );
+    }
+
+    /// An Ollama month's value is the same whether the page's range covers the
+    /// whole month or only its last days: the valuer reads every overlapping
+    /// month by the longest window it values (decision P-2 2, review A).
+    #[test]
+    fn ollama_month_value_does_not_depend_on_the_range() {
+        let mut tiny = tiny();
+        let ollama = crate::money::ollama_subscription();
+        tiny.provider_subscriptions = vec![provider_subscription(&ollama, "OL", Some(20.0))];
+        tiny.prices.take(
+            BTreeMap::from([(
+                "ollama-cloud/deepseek-v4.1-flash".to_string(),
+                crate::money::ModelPrice {
+                    input: 1.0,
+                    output: 0.0,
+                    cache_write: 0.0,
+                    cache_read: 0.0,
+                    tiered: false,
+                },
+            )]),
+            utc("2026-01-01T00:00:00Z"),
+        );
+        let month = |t: &str, percent: f64| Sample {
+            t: utc(t),
+            account: ollama.clone(),
+            src: crate::history::Source::Poll,
+            l: vec![crate::history::LimitSample {
+                k: LimitKind::Other("monthly_credits".to_string()),
+                m: None,
+                p: percent,
+                r: Some(utc("2026-12-01T00:00:00Z")),
+                b: false,
+            }],
+        };
+        tiny.history
+            .append(&month("2026-11-02T00:00:00Z", 10.0))
+            .expect("the first reading");
+        tiny.history
+            .append(&month("2026-11-28T00:00:00Z", 60.0))
+            .expect("the newest reading");
+        let first = codex_token(
+            "2026-11-02T10:00:00Z",
+            "deepseek-v4.1-flash:cloud",
+            1_000_000,
+        );
+        let second = codex_token(
+            "2026-11-28T10:00:00Z",
+            "deepseek-v4.1-flash:cloud",
+            1_000_000,
+        );
+        tiny.history.append(&first).expect("a record on 2 Nov");
+        tiny.history.append(&second).expect("a record on 28 Nov");
+
+        for range in [
+            Range {
+                from: utc("2026-11-01T00:00:00Z"),
+                to: utc("2026-12-01T00:00:00Z"),
+            },
+            Range {
+                from: utc("2026-11-25T00:00:00Z"),
+                to: utc("2026-12-01T00:00:00Z"),
+            },
+        ] {
+            let valuer = Valuer::build(
+                &tiny.history,
+                &range,
+                &tiny.prices,
+                &tiny.fx,
+                &tiny.settings,
+                &tiny.accounts,
+                &tiny.provider_subscriptions,
+                &RefCell::new(Vec::new()),
+            )
+            .expect("a valuer");
+            for record in [&first, &second] {
+                let value = valuer.value("atlas", record);
+                assert_eq!(value.account, Some(ollama.clone()));
+                assert!(
+                    (value.subscription.expect("a value") - 6.0).abs() < 1e-9,
+                    "each equal record is half of 60 % of 20 EUR: {:?}",
+                    value.subscription
+                );
+            }
+        }
+    }
+
+    /// An Ollama month starts one calendar month before its reset, never 30
+    /// days before it: a 31-day month keeps its day 1 (decision P-2 3, review
+    /// H).
+    #[test]
+    fn an_ollama_month_starts_one_calendar_month_before_its_reset() {
+        let tiny = tiny();
+        let ollama = crate::money::ollama_subscription();
+        tiny.history
+            .append(&Sample {
+                t: utc("2026-12-15T10:00:00Z"),
+                account: ollama.clone(),
+                src: crate::history::Source::Poll,
+                l: vec![crate::history::LimitSample {
+                    k: LimitKind::Other("monthly_credits".to_string()),
+                    m: None,
+                    p: 30.0,
+                    r: Some(utc("2027-01-01T00:00:00Z")),
+                    b: false,
+                }],
+            })
+            .expect("December's reading");
+
+        let months = subscription_months(
+            &tiny.ctx(),
+            &Range {
+                from: utc("2026-12-01T00:00:00Z"),
+                to: utc("2027-01-02T00:00:00Z"),
+            },
+            &ollama,
+        )
+        .expect("the months");
+        assert_eq!(months.len(), 1, "{months:?}");
+        assert_eq!(
+            months[0].start,
+            utc("2026-12-01T00:00:00Z"),
+            "December has 31 days: the month starts on day 1, not 2 December"
+        );
+        assert_eq!(months[0].end, utc("2027-01-01T00:00:00Z"));
+        assert_eq!(months[0].used_percent, 30.0);
+    }
+
+    /// A provider's block counts only while that subscription was the one in
+    /// use: after the switch to OA2 at 13:00, OA's 13:00-16:00 block has no
+    /// OpenAI hours (decision P-2 5, review D).
+    #[test]
+    fn an_openai_block_counts_only_while_its_subscription_was_in_use() {
+        let mut tiny = tiny();
+        let oa = codex_ref();
+        let oa2 = AccountRef {
+            acc: "5d2e7a1c-3b4f-4a6e-9c8d-1f2a3b4c5d6e".to_string(),
+            org: crate::providers::CODEX_ORG.to_string(),
+        };
+        tiny.provider_subscriptions = vec![
+            provider_subscription(&oa, "OA", None),
+            provider_subscription(&oa2, "OA2", None),
+        ];
+        codex_prices(&mut tiny.prices);
+        // Codex works at 14:00, inside the block.
+        tiny.history
+            .append(&codex_token(
+                "2026-11-12T14:00:00Z",
+                "gpt-6.2-codex",
+                1_000_000,
+            ))
+            .expect("the Codex record");
+        tiny.history
+            .append(&Event {
+                t: utc("2026-11-12T13:00:00Z"),
+                kind: EventKind::ProviderSwitch {
+                    from: Some(oa.clone()),
+                    to: oa2,
+                    by: By::User,
+                },
+            })
+            .expect("the switch to OA2");
+        tiny.history
+            .append(&Event {
+                t: utc("2026-11-12T13:00:00Z"),
+                kind: EventKind::Blocked {
+                    account: oa,
+                    k: LimitKind::Session,
+                    m: None,
+                },
+            })
+            .expect("OA's block");
+        tiny.history
+            .append(&Event {
+                t: utc("2026-11-12T16:00:00Z"),
+                kind: EventKind::Unblocked {
+                    account: codex_ref(),
+                    k: LimitKind::Session,
+                    m: None,
+                },
+            })
+            .expect("OA's unblock");
+
+        let spans = blocked_spans(&tiny.ctx(), &two_weeks(), &all(), Company::OpenAI)
+            .expect("the OpenAI spans");
+        let hours: f64 = spans.iter().map(|span| span.hours).sum();
+        assert_eq!(hours, 0.0, "OA2 was in use during OA's block: {spans:?}");
     }
 
     // ---- proof tests of the review ----
@@ -2649,6 +3283,7 @@ pub(crate) mod tests {
         let ctx = Ctx {
             history: &history,
             accounts: &tiny.accounts,
+            provider_subscriptions: &tiny.provider_subscriptions,
             settings: &tiny.settings,
             prices: &tiny.prices,
             fx: &tiny.fx,
@@ -2679,6 +3314,7 @@ pub(crate) mod tests {
         let ctx = Ctx {
             history: &history,
             accounts: &tiny.accounts,
+            provider_subscriptions: &tiny.provider_subscriptions,
             settings: &tiny.settings,
             prices: &tiny.prices,
             fx: &tiny.fx,

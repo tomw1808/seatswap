@@ -721,6 +721,7 @@ fn build_pricing(
         &fx,
         &file.settings,
         &file.accounts,
+        &file.provider_subscriptions,
         &RefCell::new(Vec::new()),
     )
     .map_err(|error| format!("the values cannot be read: {error}"))?;

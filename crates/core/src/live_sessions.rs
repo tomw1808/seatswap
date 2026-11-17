@@ -2179,6 +2179,7 @@ mod tests {
             &fx_eur(),
             settings,
             accounts,
+            &[],
             &std::cell::RefCell::new(Vec::new()),
         )
         .expect("a valuer")
@@ -3554,9 +3555,17 @@ mod tests {
         assert_eq!(running_row.tokens, closed_row.tokens);
         assert_eq!(running_row.values, closed_row.values);
         assert!(
-            running_row.values.api.is_some() && running_row.values.subscription.is_some(),
-            "both values are known: {:?}",
+            running_row.values.api.is_some(),
+            "the API value is known: {:?}",
             running_row.values
+        );
+        assert_eq!(
+            running_row.values.subscription, None,
+            "the worker's Ollama month has no reading here, so its share is unknown"
+        );
+        assert_eq!(
+            running_row.values.subscription_missing.as_deref(),
+            Some("no reading of this month's usage")
         );
     }
 
@@ -3714,7 +3723,7 @@ mod tests {
     /// A Codex row's subscription is a known 0, so it never blanks the Claude
     /// totals; its API half still says why it has no price.
     #[test]
-    fn a_codex_row_does_not_blank_a_claude_total() {
+    fn a_codex_row_without_a_price_has_no_known_subscription() {
         let dir = tempdir().expect("tempdir");
         let history = HistoryDir::at(dir.path(), "atlas");
         let settings = settings_eur();
@@ -3786,9 +3795,13 @@ mod tests {
             "Codex's thread name names the row"
         );
         assert_eq!(
-            codex.values.subscription,
-            Some(0.0),
-            "Codex uses no share of a Claude account's week"
+            codex.values.subscription, None,
+            "Codex's share of its own subscription is unknown here, never a 0"
+        );
+        assert_eq!(
+            codex.values.subscription_missing.as_deref(),
+            Some("no price for gpt-6.1-sol"),
+            "the subscription half names why it cannot be split"
         );
         assert_eq!(
             codex.values.api_missing.as_deref(),
@@ -3796,9 +3809,14 @@ mod tests {
             "the API half keeps the price rule's reason"
         );
 
+        // P-2: a provider row's subscription is its own, so a row without one
+        // leaves the total's subscription unknown instead of a known 0.
         let all = Values::sum(&[&claude.values, &codex.values]);
-        assert_eq!(all.subscription, claude.values.subscription);
-        assert_eq!(all.subscription_missing, None);
+        assert_eq!(all.subscription, None);
+        assert_eq!(
+            all.subscription_missing.as_deref(),
+            Some("no price for gpt-6.1-sol")
+        );
         assert_eq!(all.api_missing.as_deref(), Some("no price for gpt-6.1-sol"));
     }
 

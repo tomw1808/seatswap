@@ -13,7 +13,7 @@ use crate::history::{
     same_reset, AccountRef, By, Event, EventKind, Hosted, Hosts, Range, Sample, WindowRecord,
 };
 use crate::live_sessions::Values;
-use crate::money::Valuer;
+use crate::money::{Company, Valuer};
 use crate::projects::ProjectId;
 use crate::transcripts::Tokens;
 
@@ -230,11 +230,12 @@ pub(crate) fn weeks_in<Tz: TimeZone + Copy>(
         ctx.fx,
         ctx.settings,
         ctx.accounts,
+        ctx.provider_subscriptions,
         ctx.warnings,
     )?;
     let finished = account_weeks_valued(ctx, range, q, &valuer)?;
-    let spans = blocked_spans(ctx, range, q)?;
-    let rhythm = working_rhythm(ctx, range)?;
+    let spans = blocked_spans(ctx, range, q, Company::Anthropic)?;
+    let rhythm = working_rhythm(ctx, range, Company::Anthropic)?;
     let blocked_weeks = blocked_by_week(&spans, &rhythm, &ctx.zone);
     let week_starts = week_columns(range, &ctx.zone);
     // The samples of the last 14 days and the newest one before now: one read
@@ -455,6 +456,7 @@ pub fn week_summary<Tz: TimeZone + Copy>(
         ctx.fx,
         ctx.settings,
         ctx.accounts,
+        ctx.provider_subscriptions,
         ctx.warnings,
     )?;
     // Every window, the running ones with their use so far: the week that
@@ -523,8 +525,8 @@ pub fn week_summary<Tz: TimeZone + Copy>(
         from: range.from.min(week_range.from),
         to: range.to.max(week_range.to),
     };
-    let spans = blocked_spans(ctx, &blocked_range, q)?;
-    let rhythm = working_rhythm(ctx, &range)?;
+    let spans = blocked_spans(ctx, &blocked_range, q, Company::Anthropic)?;
+    let rhythm = working_rhythm(ctx, &range, Company::Anthropic)?;
     let blocked_hours = blocked_by_week(&spans, &rhythm, &ctx.zone)
         .get(&week)
         .copied()
@@ -638,17 +640,18 @@ pub fn week_summary<Tz: TimeZone + Copy>(
     })
 }
 
-/// The finished account week of `week` with the largest expired share; a
-/// running week has expired nothing yet and is not compared.
+/// The finished account week of `week` with the largest expired share among the
+/// weeks whose expired money is known: a week without a price is left out, so
+/// an unpriced provider week can never hide a priced week's sentence. A running
+/// week has expired nothing yet and is not compared.
 fn most_expired(
     weeks: &[AccountWeek],
     week: DateTime<Utc>,
 ) -> Result<Option<(f64, &AccountWeek)>, StatsError> {
     let mut largest: Option<(f64, &AccountWeek)> = None;
-    for account_week in weeks
-        .iter()
-        .filter(|account_week| account_week.week == week && !account_week.running)
-    {
+    for account_week in weeks.iter().filter(|account_week| {
+        account_week.week == week && !account_week.running && account_week.price.is_some()
+    }) {
         let share = week_lost_percent(account_week)?;
         if largest.is_none_or(|(best, _)| share > best) {
             largest = Some((share, account_week));
@@ -820,6 +823,7 @@ pub fn window_detail<Tz: TimeZone + Copy>(
         ctx.fx,
         ctx.settings,
         ctx.accounts,
+        ctx.provider_subscriptions,
         ctx.warnings,
     )?;
     let query = Query {
@@ -878,7 +882,7 @@ pub fn window_detail<Tz: TimeZone + Copy>(
     // Rhythm pages take, over the four weeks before the window's reset. The row
     // is a session-limit row, so it is absent without a session window.
     let possible_session_windows = if session_windows_used.is_some() {
-        let rhythm = working_rhythm(ctx, &reading)?;
+        let rhythm = working_rhythm(ctx, &reading, Company::Anthropic)?;
         possible_5h_windows(
             &rhythm,
             window.end - Duration::weeks(1),
@@ -1013,8 +1017,8 @@ fn blocked_hours_after<Tz: TimeZone + Copy>(
         accounts: vec![account_id(ctx, reference)],
         host: None,
     };
-    let spans = blocked_spans(ctx, &range, &query)?;
-    let rhythm = working_rhythm(ctx, &range)?;
+    let spans = blocked_spans(ctx, &range, &query, Company::Anthropic)?;
+    let rhythm = working_rhythm(ctx, &range, Company::Anthropic)?;
     Ok(spans
         .iter()
         .map(|span| {
@@ -1036,7 +1040,9 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::history::{Event, EventKind, HistoryDir, LimitSample, Sample, Source};
-    use crate::stats::tests::{all, append_codex_records, tiny, utc};
+    use crate::stats::tests::{
+        all, append_codex_records, codex_ref, provider_subscription, tiny, utc,
+    };
 
     /// The plan's range: 2 Nov .. 16 Nov.
     fn two_weeks() -> Range {
@@ -1931,6 +1937,7 @@ mod tests {
                 from: start,
                 to: end,
             },
+            Company::Anthropic,
         )
         .expect("the rhythm");
         let working = working_hours(end - Duration::weeks(1), end, &rhythm, &ctx.zone);
@@ -2582,19 +2589,101 @@ mod tests {
         assert_eq!(after, before, "a Codex record changed a Claude window");
 
         let before = weeks_in(&without.ctx(), &two_weeks(), &all()).expect("the page");
-        let after = weeks_in(&with.ctx(), &two_weeks(), &all()).expect("the page");
+        let mut after = weeks_in(&with.ctx(), &two_weeks(), &all()).expect("the page");
+        // P-2 counts the OpenAI subscription's week as an account week, so the
+        // grid gains its row; every Claude figure stays what it was.
+        let codex_id = "0f3a6c2e-7b1d-4e9a-8c5f-2d4b6a8e0c13";
+        let index = after
+            .rows
+            .iter()
+            .position(|row| row.id == codex_id)
+            .expect("the Codex week is a row of the grid");
+        let codex_row = after.rows.remove(index);
+        after.recent.retain(|curve| curve.id != codex_id);
         assert_eq!(
             after, before,
-            "a Codex record changed the Claude weeks page"
+            "a Codex record changed a Claude figure of the weeks page"
         );
+        let cell = codex_row.cells[1]
+            .as_ref()
+            .expect("the Codex cell of the week it ended in");
+        assert_eq!(cell.used, 12.0);
+        assert_eq!(cell.expired_money, None, "the subscription has no price");
+
+        let before =
+            week_summary(&without.ctx(), &all(), utc("2026-11-09T00:00:00Z")).expect("the summary");
+        let mut after =
+            week_summary(&with.ctx(), &all(), utc("2026-11-09T00:00:00Z")).expect("the summary");
+        // P-2 adds the Codex week to the week's account percents. It has no
+        // price, so no money sentence names it; the priced Claude week keeps
+        // its sentence instead of being hidden by the unpriced provider week
+        // (review C).
+        assert_eq!(
+            after.per_account_percent.pop(),
+            Some((codex_id.to_string(), 12.0)),
+            "the Codex week is in the week's account percents"
+        );
+        assert_eq!(
+            after.conclusion,
+            vec![
+                "No hour blocked.".to_string(),
+                "20 % of LB's week expired, 8.31 EUR.".to_string(),
+                "Auto-burn held back 1 planned switch, 2 minutes in total.".to_string(),
+            ],
+            "an unpriced provider week does not hide the priced week's sentence"
+        );
+        after.per_account_percent = before.per_account_percent.clone();
+        after.conclusion = before.conclusion.clone();
+        assert_eq!(
+            after, before,
+            "a Codex record changed a Claude figure of the week summary"
+        );
+    }
+
+    /// An unpriced provider week never hides a priced week's sentence: the
+    /// conclusion is the same with and without the Codex week (review C).
+    #[test]
+    fn an_unpriced_codex_week_does_not_hide_the_claude_sentence() {
+        let without = tiny();
+        let with = tiny();
+        append_codex_records(&with.history, utc("2026-11-14T09:00:00Z"));
 
         let before =
             week_summary(&without.ctx(), &all(), utc("2026-11-09T00:00:00Z")).expect("the summary");
         let after =
             week_summary(&with.ctx(), &all(), utc("2026-11-09T00:00:00Z")).expect("the summary");
         assert_eq!(
-            after, before,
-            "a Codex record changed a Claude week summary"
+            after.conclusion, before.conclusion,
+            "an unpriced Codex week changed the conclusion"
+        );
+    }
+
+    /// A priced provider week's sentence names the subscription's abbreviation,
+    /// never its id (decision P-2 1, 4, review C).
+    #[test]
+    fn a_priced_codex_week_is_named_by_its_subscription() {
+        let mut tiny = tiny();
+        let codex = codex_ref();
+        tiny.provider_subscriptions = vec![provider_subscription(&codex, "OA", Some(23.0))];
+        append_codex_records(&tiny.history, utc("2026-11-14T09:00:00Z"));
+
+        let summary =
+            week_summary(&tiny.ctx(), &all(), utc("2026-11-09T00:00:00Z")).expect("the summary");
+        assert!(
+            summary
+                .conclusion
+                .iter()
+                .any(|line| line.contains("88 % of OA's week expired")),
+            "the priced Codex week is named OA: {:?}",
+            summary.conclusion
+        );
+        assert!(
+            summary
+                .conclusion
+                .iter()
+                .all(|line| !line.contains("0f3a6c2e")),
+            "no sentence names the Codex account by its id: {:?}",
+            summary.conclusion
         );
     }
 }

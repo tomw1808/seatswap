@@ -99,6 +99,10 @@ pub struct Read<R> {
 }
 
 impl HistoryDir {
+    /// Every company's records of the range on the chosen hosts: Claude's
+    /// token records, window records and events beside Codex's and Ollama's.
+    /// This never filters by company. A reader that serves Claude's accounts
+    /// alone uses [`read_claude`](HistoryDir::read_claude).
     pub fn read<R: Record>(&self, range: &Range, hosts: &Hosts) -> Result<Read<R>, HistoryError> {
         let mut files = Vec::new();
         for host in self.hosts_to_read(hosts)? {
@@ -131,9 +135,9 @@ impl HistoryDir {
 
     /// The Claude records of the range: [`read`](HistoryDir::read) with the
     /// Codex and Ollama readings left out, warnings kept. Every reader that
-    /// serves Claude's accounts uses this; `read` stays for the recorder (it
-    /// loads a provider's own last line), the export, the import and the
-    /// tests.
+    /// serves Claude's accounts alone uses this; a reader that serves every
+    /// company (the statistics' valuation, the charts that count provider
+    /// work) uses `read`, which already returns every company's records.
     pub fn read_claude<R: Record>(
         &self,
         range: &Range,
@@ -144,10 +148,12 @@ impl HistoryDir {
         Ok(read)
     }
 
-    /// The window records of the range, one per window (account, kind, model,
-    /// and an end within `same_reset`, or for a reset seen by two hosts
-    /// overlapping spans; [`same_window`]): the one with the latest
-    /// `last_sample` counts (spec §1.5).
+    /// The window records of the range of every company, one per window
+    /// (account, kind, model, and an end within `same_reset`, or for a reset
+    /// seen by two hosts overlapping spans; [`same_window`]): the one with the
+    /// latest `last_sample` counts (spec §1.5). A reader that serves Claude's
+    /// accounts alone uses
+    /// [`finished_claude_windows`](HistoryDir::finished_claude_windows).
     /// On a tie the host name that sorts first wins, so the result does not
     /// depend on read order. Sorted by end, then account. The read's warnings
     /// are kept, so a caller that shows them gets them here too.
@@ -165,8 +171,9 @@ impl HistoryDir {
 
     /// The Claude windows of the range: [`finished_windows`] with the Codex
     /// and Ollama windows left out. Every reader that serves Claude's accounts
-    /// uses this; `finished_windows` stays for the export, the import and the
-    /// tests.
+    /// alone uses this; a reader that serves every company (the statistics'
+    /// valuation, which prices each provider subscription's own window) uses
+    /// `finished_windows`, which already returns every company's windows.
     pub fn finished_claude_windows(
         &self,
         range: &Range,

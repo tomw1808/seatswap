@@ -23,8 +23,8 @@ use super::{
     add_opt_value, add_value, api_shares, blocked_by_week, blocked_spans, date_text, hours_text,
     keep_warnings, money_of, money_text, offered_money, percent_of_offered, percent_text, range_of,
     running_account_weeks, switch_counts, top_three, week_columns, week_lost_percent,
-    week_of_record, week_span, week_start, working_rhythm, AccountWeek, Ctx, Query, StatsError,
-    SwitchCounts,
+    week_of_record, week_span, week_start, window_used, working_rhythm, AccountWeek, Ctx, Query,
+    StatsError, SwitchCounts,
 };
 
 /// The Overview page's numbers for one range (spec §3.1).
@@ -62,15 +62,23 @@ pub struct ThisWeek {
     pub projects: Vec<(String, f64)>,
 }
 
-/// One other company's work on the This-week card: its token records from
-/// Monday 00:00 of the current calendar week ([`week_start`]) to now. It has
-/// no subscription price yet, so it is valued at API prices only, and it uses
-/// no Claude account, so the account chips do not filter it.
+/// One provider subscription's work on the This-week card: its records from its
+/// running window's start (OpenAI: its `weekly_all` week; Ollama: its
+/// `monthly_credits` month) to now, exactly as an account row sums from its
+/// window's start (decision P-2 6). The window's use, money and reset are the
+/// subscription row's, filled like an account row's when it has a price; without
+/// one `money_missing` says why while the API value stays. Its records belong to
+/// its subscription, so the account chips choose them like an account's
+/// (decision P-2 8). A record whose subscription cannot be named is one more row
+/// per company, named by the company, with its API value and the reason.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThisWeekProvider {
-    /// [`Company::name`]: `OpenAI` or `Ollama`.
+    /// The subscription's stored abbreviation (`OA`, `OA2`, `OL`), or the
+    /// company's name for a record whose subscription cannot be named.
     pub name: String,
+    /// The subscription's company: `openai` or `ollama`.
+    pub company: Company,
     /// The records' API value, summed with [`Values::sum`]; `None` when a
     /// record's is unknown.
     pub api: Option<f64>,
@@ -82,6 +90,18 @@ pub struct ThisWeekProvider {
     /// The API value by project, in percent of `api`, the three largest then
     /// `other` ([`api_shares`]); empty while the value is unknown or 0.
     pub projects: Vec<(String, f64)>,
+    /// The running window's use so far, in percent: OpenAI's `weekly_all` week
+    /// or Ollama's `monthly_credits` month; `None` while the subscription has
+    /// no running window.
+    pub used: Option<f64>,
+    /// The money of `used` at the subscription's price; `None` without a price
+    /// or without a running window.
+    pub money: Option<f64>,
+    /// Why `money` is `None`, in the words [`ThisWeekAccount::money_missing`]
+    /// uses; `None` when it has a value.
+    pub money_missing: Option<String>,
+    /// The running window's reset; `None` without a running window.
+    pub resets_at: Option<DateTime<Utc>>,
 }
 
 /// One account's running weekly window on the This-week card.
@@ -133,12 +153,14 @@ pub struct Kpis {
     pub expired_percent: Option<f64>,
     /// The expired money per account id, largest first.
     pub expired_by_account: Vec<(String, f64)>,
-    /// The working hours blocked in the range.
-    pub blocked_hours: f64,
+    /// The working hours blocked in the range, one entry per company that has
+    /// working hours in it, Anthropic first (decision P-2 5, 6): no sum across
+    /// companies, because a provider's block is not an Anthropic one.
+    pub blocked_by_company: Vec<BlockedByCompany>,
     /// The hours blocked in the calendar weeks before the last account added
     /// in the range was added; `None` when the range holds no such account.
     pub blocked_before_added: Option<BlockedBefore>,
-    /// The part of `blocked_hours` in which other quota expired.
+    /// The part of Claude's blocked hours in which other quota expired.
     pub avoidable_hours: f64,
     pub switches: SwitchCounts,
     /// The five switch counts added up.
@@ -148,6 +170,16 @@ pub struct Kpis {
     pub switch_cost_percent_of_window: Option<f64>,
     /// The calendar weeks the page shows: the weeks of the range.
     pub weeks: u32,
+}
+
+/// One company's working hours blocked in the range (decision P-2 6).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockedByCompany {
+    /// [`Company`]'s lowercase JSON name: `anthropic`, `openai`, `ollama`.
+    pub company: Company,
+    /// The company's blocked hours inside its own working hours.
+    pub hours: f64,
 }
 
 /// The blocked hours of the weeks before an account was added, and the account.
@@ -222,11 +254,12 @@ pub(crate) fn overview_in<Tz: TimeZone + Copy>(
         ctx.fx,
         ctx.settings,
         ctx.accounts,
+        ctx.provider_subscriptions,
         ctx.warnings,
     )?;
     let finished = account_weeks_valued(ctx, range, q, &valuer)?;
-    let spans = blocked_spans(ctx, range, q)?;
-    let rhythm = working_rhythm(ctx, range)?;
+    let spans = blocked_spans(ctx, range, q, Company::Anthropic)?;
+    let rhythm = working_rhythm(ctx, range, Company::Anthropic)?;
     let currency = ctx.settings.currency.clone();
 
     let events = keep_warnings(ctx.warnings, || {
@@ -303,6 +336,25 @@ pub(crate) fn overview_in<Tz: TimeZone + Copy>(
     }
 
     let blocked_weeks = blocked_by_week(&spans, &rhythm, &ctx.zone);
+    // One entry per company that has working hours in the range, Anthropic
+    // first: a company's blocked hours count in its own working hours only,
+    // never summed with another's (decision P-2 5, 6).
+    let mut blocked_by_company = Vec::new();
+    for company in [Company::Anthropic, Company::OpenAI, Company::Ollama] {
+        let company_rhythm = working_rhythm(ctx, range, company)?;
+        if !company_rhythm.usd.iter().any(|usd| *usd > 0.0) {
+            continue;
+        }
+        let hours = if company == Company::Anthropic {
+            // The page's own spans, which its weeks and findings count too.
+            spans.iter().fold(0.0, |sum, span| sum + span.hours)
+        } else {
+            blocked_spans(ctx, range, q, company)?
+                .iter()
+                .fold(0.0, |sum, span| sum + span.hours)
+        };
+        blocked_by_company.push(BlockedByCompany { company, hours });
+    }
     let switches = switch_counts(&events.records, range, q.host.as_deref());
     let switches_total = switches.total();
     let mut kpis = Kpis {
@@ -315,7 +367,7 @@ pub(crate) fn overview_in<Tz: TimeZone + Copy>(
             .into_iter()
             .map(|(reference, expired)| (account_id(ctx, &reference), expired))
             .collect(),
-        blocked_hours: spans.iter().fold(0.0, |sum, span| sum + span.hours),
+        blocked_by_company,
         blocked_before_added: blocked_before_added(ctx, range, &events.records, &blocked_weeks),
         avoidable_hours: spans
             .iter()
@@ -438,13 +490,55 @@ pub fn this_week_card<Tz: TimeZone + Copy>(
         ctx.fx,
         ctx.settings,
         ctx.accounts,
+        ctx.provider_subscriptions,
         ctx.warnings,
     )?;
     let running = running_account_weeks(ctx, q, &valuer);
     let calendar_week = week_start(ctx.now, &ctx.zone);
+    // Every provider subscription the page can show: the stored ones, the
+    // OpenAI weeks and Ollama month running now, and (once the records are
+    // read) every subscription a record names. `None` means no running window.
+    let mut provider_runs: BTreeMap<AccountRef, (Company, Option<ProviderRun>)> = BTreeMap::new();
+    for subscription in ctx.provider_subscriptions {
+        let company = Company::of_account(&subscription.account);
+        if company != Company::Anthropic {
+            provider_runs.insert(subscription.account.clone(), (company, None));
+        }
+    }
+    for window in valuer.running_windows(ctx.now) {
+        let company = Company::of_account(&window.account);
+        if company == Company::Anthropic {
+            continue;
+        }
+        let run = ProviderRun {
+            start: window.weekly_start(),
+            end: window.end,
+            used: window_used(&window),
+        };
+        provider_runs.insert(window.account.clone(), (company, Some(run)));
+    }
+    let ollama = crate::money::ollama_subscription();
+    if let Some(month) = valuer.running_month(&ollama, ctx.now) {
+        provider_runs.insert(
+            ollama,
+            (
+                Company::Ollama,
+                Some(ProviderRun {
+                    start: month.start,
+                    end: month.end,
+                    used: Some(month.used),
+                }),
+            ),
+        );
+    }
     let from = running
         .iter()
         .map(|week| week.window.weekly_start())
+        .chain(
+            provider_runs
+                .values()
+                .filter_map(|(_, run)| run.as_ref().map(|run| run.start)),
+        )
         .fold(calendar_week, DateTime::min);
     let tokens = keep_warnings(ctx.warnings, || {
         ctx.history.read::<TokenRecord>(
@@ -456,12 +550,16 @@ pub fn this_week_card<Tz: TimeZone + Copy>(
         )
     })?;
 
-    // Each account's and each other provider's API value and its split by
-    // project, and the same over all of them together.
+    // Each account's and each provider subscription's API value and its split
+    // by project, the records no subscription can be named for by company, and
+    // the same over all of them together.
     let mut by_account: BTreeMap<AccountRef, (Option<Values>, BTreeMap<String, Values>)> =
         BTreeMap::new();
-    let mut by_provider: BTreeMap<Company, (Option<Values>, BTreeMap<String, Values>)> =
+    let mut by_provider: BTreeMap<AccountRef, (Option<Values>, BTreeMap<String, Values>)> =
         BTreeMap::new();
+    let mut unassigned: BTreeMap<Company, (Option<Values>, BTreeMap<String, Values>)> =
+        BTreeMap::new();
+    let mut unassigned_missing: BTreeMap<Company, crate::money::Missing> = BTreeMap::new();
     let mut total: Option<Values> = None;
     let mut by_project: BTreeMap<String, Values> = BTreeMap::new();
     for hosted in &tokens.records {
@@ -486,12 +584,33 @@ pub fn this_week_card<Tz: TimeZone + Copy>(
                 }
                 by_account.entry(account.clone()).or_default()
             }
-            company => {
-                if record.t < calendar_week {
-                    continue;
+            company => match value.account.as_ref() {
+                None => {
+                    if record.t < calendar_week {
+                        continue;
+                    }
+                    if let Some(missing) = &value.subscription_missing {
+                        unassigned_missing
+                            .entry(company)
+                            .or_insert_with(|| missing.clone());
+                    }
+                    unassigned.entry(company).or_default()
                 }
-                by_provider.entry(company).or_default()
-            }
+                Some(account) => {
+                    let start = provider_runs
+                        .get(account)
+                        .and_then(|(_, run)| run.as_ref())
+                        .map(|run| run.start)
+                        .unwrap_or(calendar_week);
+                    if record.t < start {
+                        continue;
+                    }
+                    provider_runs
+                        .entry(account.clone())
+                        .or_insert((company, None));
+                    by_provider.entry(account.clone()).or_default()
+                }
+            },
         };
         let name = ctx
             .projects
@@ -528,20 +647,71 @@ pub fn this_week_card<Tz: TimeZone + Copy>(
             .cmp(&account_position(ctx, &b.id))
             .then_with(|| a.id.cmp(&b.id))
     });
-    let providers = by_provider
-        .into_iter()
-        .filter_map(|(company, (own_total, own_projects))| {
-            // Every company in the map has at least one record.
-            let own_total = own_total?;
-            Some(ThisWeekProvider {
-                name: company.name().to_string(),
+
+    // The rows in the stored subscriptions' order, then the unnamed companies'.
+    let mut providers: Vec<(usize, String, ThisWeekProvider)> =
+        Vec::with_capacity(provider_runs.len());
+    for (account, (company, run)) in &provider_runs {
+        let (own_total, own_projects) = by_provider.remove(account).unwrap_or_default();
+        let (used, money, money_missing, resets_at) =
+            provider_row(&valuer, *company, account, run.as_ref());
+        let name = super::stored_subscription(ctx, account)
+            .map(|subscription| subscription.abbr.clone())
+            .unwrap_or_else(|| company.name().to_string());
+        providers.push((
+            account_position(ctx, &account.acc),
+            name.clone(),
+            ThisWeekProvider {
+                name,
+                company: *company,
+                api: own_total.as_ref().and_then(|total| total.api),
+                api_currency: own_total
+                    .as_ref()
+                    .and_then(|total| total.api_currency.clone()),
+                api_missing: own_total
+                    .as_ref()
+                    .and_then(|total| total.api_missing.clone()),
+                projects: match own_total {
+                    Some(total) => api_shares(own_projects, &total),
+                    None => Vec::new(),
+                },
+                used,
+                money,
+                money_missing,
+                resets_at,
+            },
+        ));
+    }
+    // A record whose subscription cannot be named is one row per company,
+    // named by the company, with its API value and the reason (decision P-2 6).
+    for (company, (own_total, own_projects)) in unassigned {
+        let Some(own_total) = own_total else {
+            continue;
+        };
+        let money_missing = unassigned_missing
+            .get(&company)
+            .map(ToString::to_string)
+            .or_else(|| Some(crate::money::Missing::NoAccount.to_string()));
+        let name = company.name().to_string();
+        providers.push((
+            usize::MAX,
+            name.clone(),
+            ThisWeekProvider {
+                name,
+                company,
                 api: own_total.api,
                 api_currency: own_total.api_currency.clone(),
                 api_missing: own_total.api_missing.clone(),
                 projects: api_shares(own_projects, &own_total),
-            })
-        })
-        .collect();
+                used: None,
+                money: None,
+                money_missing,
+                resets_at: None,
+            },
+        ));
+    }
+    providers.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let providers: Vec<ThisWeekProvider> = providers.into_iter().map(|(_, _, row)| row).collect();
     let projects = match total {
         Some(total) => api_shares(by_project, &total),
         None => Vec::new(),
@@ -551,6 +721,56 @@ pub fn this_week_card<Tz: TimeZone + Copy>(
         providers,
         projects,
     })
+}
+
+/// A provider subscription's running window on the This-week card.
+struct ProviderRun {
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    /// The window's use so far; `None` when the readings cannot compute it.
+    used: Option<f64>,
+}
+
+/// A provider row's four subscription fields (decision P-2 6, 7): filled like
+/// an account row's from the subscription's own running window, and
+/// `money_missing` with the reason when it has no price. A subscription with no
+/// running window gets its own reason, never four `None` fields without one:
+/// OpenAI's missing week, Ollama's missing month, or Ollama's reading without a
+/// monthly allowance. Never a 0 for an unknown.
+fn provider_row(
+    valuer: &Valuer,
+    company: Company,
+    account: &AccountRef,
+    run: Option<&ProviderRun>,
+) -> (
+    Option<f64>,
+    Option<f64>,
+    Option<String>,
+    Option<DateTime<Utc>>,
+) {
+    let Some(run) = run else {
+        let missing = match company {
+            Company::Ollama if valuer.month_windows(account).is_empty() => {
+                crate::money::Missing::NoMonthlyAllowance
+            }
+            Company::Ollama => crate::money::Missing::NoMonthReading,
+            _ => crate::money::Missing::NoWeekReading,
+        };
+        return (None, None, Some(missing.to_string()), None);
+    };
+    match valuer.window_price(account, run.start, run.end) {
+        Ok(price) => {
+            let money = match (company, run.used) {
+                // One percent of Ollama's month is a hundredth of the month's
+                // price; one percent of a week is a week's share of it.
+                (_, None) => None,
+                (Company::Ollama, Some(used)) => Some(crate::money::month_money(price, used).used),
+                (_, Some(used)) => Some(crate::money::window_money(price, used).used),
+            };
+            (run.used, money, None, Some(run.end))
+        }
+        Err(missing) => (run.used, None, Some(missing.to_string()), Some(run.end)),
+    }
 }
 
 /// The range the token and sample reads cover: the range itself, the 14 days
@@ -765,15 +985,23 @@ fn finding_expired<Tz: TimeZone + Copy>(
     ))
 }
 
-/// The second finding: the blocked time, over the weeks the page shows.
+/// The second finding: the blocked time, over the weeks the page shows. It
+/// speaks of Claude's accounts alone: auto-burn and the finding are
+/// Anthropic's, and no company's hours are added to another's (decision P-2 5).
 fn finding_blocked(kpis: &Kpis, weeks: &[OverviewWeek]) -> Option<String> {
-    if kpis.blocked_hours <= 0.0 || weeks.is_empty() {
+    let blocked = kpis
+        .blocked_by_company
+        .iter()
+        .find(|entry| entry.company == Company::Anthropic)
+        .map(|entry| entry.hours)
+        .unwrap_or(0.0);
+    if blocked <= 0.0 || weeks.is_empty() {
         return None;
     }
     let noun = if weeks.len() == 1 { "week" } else { "weeks" };
     Some(format!(
         "You were blocked {} in {} {noun}; {} of them while other quota expired.",
-        hours_text(kpis.blocked_hours),
+        hours_text(blocked),
         weeks.len(),
         hours_text(kpis.avoidable_hours)
     ))
@@ -901,8 +1129,12 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use crate::history::HistoryDir;
-    use crate::stats::tests::{all, append_codex_records, tiny, utc};
+    use crate::history::{HistoryDir, Source};
+    use crate::money::percent_value;
+    use crate::stats::tests::{
+        all, append_codex_records, codex_prices, codex_ref, codex_token, provider_subscription,
+        tiny, utc,
+    };
     use crate::stats::RangeKey;
 
     fn close(a: f64, b: f64) -> bool {
@@ -924,6 +1156,16 @@ mod tests {
             .unwrap_or_else(|| panic!("the week of {start}"))
     }
 
+    /// One company's blocked hours as the page's KPI shows them.
+    fn blocked(page: &Overview, company: Company) -> f64 {
+        page.kpis
+            .blocked_by_company
+            .iter()
+            .find(|entry| entry.company == company)
+            .map(|entry| entry.hours)
+            .unwrap_or(0.0)
+    }
+
     #[test]
     fn the_totals() {
         let tiny = tiny();
@@ -936,7 +1178,14 @@ mod tests {
             "expired {}",
             page.kpis.expired
         );
-        assert_eq!(page.kpis.blocked_hours, 2.0);
+        assert_eq!(
+            page.kpis.blocked_by_company,
+            vec![BlockedByCompany {
+                company: Company::Anthropic,
+                hours: 2.0,
+            }],
+            "one entry per company with working hours, Anthropic first"
+        );
         assert_eq!(page.kpis.avoidable_hours, 2.0);
         assert_eq!(page.kpis.switches.user, 1);
         assert_eq!(page.kpis.switches.cli, 0);
@@ -1757,7 +2006,10 @@ mod tests {
         assert_eq!(page.kpis.paid, 0.0);
         assert_eq!(page.kpis.expired, 0.0);
         assert!(page.kpis.expired_by_account.is_empty());
-        assert_eq!(page.kpis.blocked_hours, 0.0);
+        assert!(
+            page.kpis.blocked_by_company.is_empty(),
+            "a range with no work has no working hours and no company entry"
+        );
         assert_eq!(page.kpis.avoidable_hours, 0.0);
         assert_eq!(page.kpis.switches, SwitchCounts::default());
         assert_eq!(page.kpis.switch_cost_percent_of_window, None);
@@ -2048,9 +2300,9 @@ mod tests {
 
         let shown: f64 = page.weeks.iter().map(|week| week.blocked_hours).sum();
         assert!(
-            close(shown, page.kpis.blocked_hours),
+            close(shown, blocked(&page, Company::Anthropic)),
             "the weeks show {shown} hours, the page says {} hours",
-            page.kpis.blocked_hours
+            blocked(&page, Company::Anthropic)
         );
     }
 
@@ -2066,9 +2318,12 @@ mod tests {
         let page = overview_in(&tiny.ctx(), &october, &all()).unwrap();
 
         assert!(
-            page.kpis.blocked_hours.is_sign_positive(),
-            "blocked hours {}",
-            page.kpis.blocked_hours
+            page.kpis
+                .blocked_by_company
+                .iter()
+                .all(|entry| entry.hours.is_sign_positive()),
+            "blocked hours {:?}",
+            page.kpis.blocked_by_company
         );
         assert!(
             page.kpis.avoidable_hours.is_sign_positive(),
@@ -2077,16 +2332,217 @@ mod tests {
         );
     }
 
+    /// P-2 counts an OpenAI subscription's finished week as an account week, so
+    /// the Codex week joins the page as a row without a price; every Claude
+    /// figure stays what it was.
     #[test]
-    fn provider_records_do_not_change_the_overview() {
+    fn provider_records_add_a_provider_week_but_change_no_claude_figure() {
         let without = tiny();
         let with = tiny();
         append_codex_records(&with.history, utc("2026-11-14T09:00:00Z"));
 
         let before = overview_in(&without.ctx(), &two_weeks(), &all()).expect("the overview");
-        let after = overview_in(&with.ctx(), &two_weeks(), &all()).expect("the overview");
+        let mut after = overview_in(&with.ctx(), &two_weeks(), &all()).expect("the overview");
+        let provider_row = after
+            .weeks
+            .iter_mut()
+            .find_map(|week| {
+                let index = week
+                    .accounts
+                    .iter()
+                    .position(|row| row.id == "0f3a6c2e-7b1d-4e9a-8c5f-2d4b6a8e0c13")?;
+                Some(week.accounts.remove(index))
+            })
+            .expect("the Codex week is an account week on the page");
+        assert_eq!(provider_row.used_percent, 12.0);
+        assert_eq!(provider_row.used, None, "the subscription has no price");
+        assert_eq!(provider_row.expired, None);
 
-        assert_eq!(after, before, "a Codex record changed the Claude overview");
+        assert_eq!(
+            after, before,
+            "a Codex record changed a Claude figure of the overview"
+        );
+    }
+
+    /// A priced provider subscription fills its This-week row like an account's
+    /// row (decision P-2 7): the running week's use, its money, its reset. The
+    /// API value stays as it was.
+    #[test]
+    fn this_week_rows_for_providers_carry_subscription_money() {
+        let mut tiny = tiny();
+        let codex = codex_ref();
+        tiny.provider_subscriptions = vec![provider_subscription(&codex, "OA", None)];
+        codex_prices(&mut tiny.prices);
+        tiny.history
+            .append(&Sample {
+                t: utc("2026-11-17T09:00:00Z"),
+                account: codex.clone(),
+                src: Source::Poll,
+                l: vec![crate::history::LimitSample {
+                    k: LimitKind::WeeklyAll,
+                    m: None,
+                    p: 50.0,
+                    r: Some(utc("2026-11-23T10:00:00Z")),
+                    b: true,
+                }],
+            })
+            .expect("the Codex reading");
+        tiny.history
+            .append(&Event {
+                t: utc("2026-11-01T00:00:00Z"),
+                kind: EventKind::PriceChanged {
+                    account: codex,
+                    amount: Some(23.0),
+                    currency: Some("EUR".to_string()),
+                },
+            })
+            .expect("the subscription's price");
+        tiny.history
+            .append(&codex_token(
+                "2026-11-17T09:00:00Z",
+                "gpt-6.2-codex",
+                1_000_000,
+            ))
+            .expect("a Codex record of this week");
+        let card = this_week_card(&tiny.ctx(), &all()).expect("the This-week card");
+        let openai = card
+            .providers
+            .iter()
+            .find(|row| row.name == "OA")
+            .expect("the OA row");
+        assert_eq!(openai.used, Some(50.0), "the running week's use so far");
+        assert_eq!(openai.resets_at, Some(utc("2026-11-23T10:00:00Z")));
+        assert_eq!(openai.money_missing, None);
+        assert!(
+            close(openai.money.expect("money"), 50.0 * percent_value(23.0)),
+            "the used share of the week's 23 EUR: {:?}",
+            openai.money
+        );
+        assert_eq!(openai.api, Some(10.0), "the API value stays");
+    }
+
+    /// Each OpenAI login gets its own This-week row, summing its own records
+    /// from its own running week's start, with that week's use and money
+    /// (decision P-2 6, review F): OA and OA2, never one OpenAI row.
+    #[test]
+    fn two_openai_logins_have_one_this_week_row_each() {
+        let mut tiny = tiny();
+        let oa = codex_ref();
+        let oa2 = AccountRef {
+            acc: "5d2e7a1c-3b4f-4a6e-9c8d-1f2a3b4c5d6e".to_string(),
+            org: crate::providers::CODEX_ORG.to_string(),
+        };
+        tiny.provider_subscriptions = vec![
+            provider_subscription(&oa, "OA", Some(23.0)),
+            provider_subscription(&oa2, "OA2", Some(30.0)),
+        ];
+        codex_prices(&mut tiny.prices);
+        for (account, percent, reset) in [
+            (&oa, 50.0, "2026-11-23T10:00:00Z"),
+            (&oa2, 20.0, "2026-11-24T10:00:00Z"),
+        ] {
+            tiny.history
+                .append(&Sample {
+                    t: utc("2026-11-17T09:00:00Z"),
+                    account: account.clone(),
+                    src: Source::Poll,
+                    l: vec![crate::history::LimitSample {
+                        k: LimitKind::WeeklyAll,
+                        m: None,
+                        p: percent,
+                        r: Some(utc(reset)),
+                        b: true,
+                    }],
+                })
+                .expect("a running week");
+        }
+        tiny.history
+            .append(&Event {
+                t: utc("2026-11-17T13:00:00Z"),
+                kind: EventKind::ProviderSwitch {
+                    from: Some(oa.clone()),
+                    to: oa2.clone(),
+                    by: crate::history::By::User,
+                },
+            })
+            .expect("the switch to OA2");
+        tiny.history
+            .append(&codex_token(
+                "2026-11-17T12:00:00Z",
+                "gpt-6.2-codex",
+                1_000_000,
+            ))
+            .expect("OA's record");
+        tiny.history
+            .append(&codex_token(
+                "2026-11-17T14:00:00Z",
+                "gpt-6.2-codex",
+                1_000_000,
+            ))
+            .expect("OA2's record");
+
+        let card = this_week_card(&tiny.ctx(), &all()).expect("the This-week card");
+        assert_eq!(card.providers.len(), 2, "providers: {:?}", card.providers);
+        let oa_row = card
+            .providers
+            .iter()
+            .find(|row| row.name == "OA")
+            .expect("the OA row");
+        assert_eq!(oa_row.used, Some(50.0));
+        assert_eq!(oa_row.api, Some(10.0), "OA's own 12:00 record");
+        assert!(
+            close(oa_row.money.expect("money"), 50.0 * percent_value(23.0)),
+            "OA's used share: {:?}",
+            oa_row.money
+        );
+        let oa2_row = card
+            .providers
+            .iter()
+            .find(|row| row.name == "OA2")
+            .expect("the OA2 row");
+        assert_eq!(oa2_row.used, Some(20.0));
+        assert_eq!(oa2_row.api, Some(10.0), "OA2's own 14:00 record");
+        assert!(
+            close(oa2_row.money.expect("money"), 20.0 * percent_value(30.0)),
+            "OA2's used share: {:?}",
+            oa2_row.money
+        );
+    }
+
+    /// A provider row whose subscription has no running window still says why
+    /// its money is missing, in words for that subscription (decision P-2 7,
+    /// review E): never four `None` fields without a reason.
+    #[test]
+    fn a_provider_row_without_a_running_window_says_why() {
+        let mut tiny = tiny();
+        let oa = codex_ref();
+        let ollama = crate::money::ollama_subscription();
+        tiny.provider_subscriptions = vec![
+            provider_subscription(&oa, "OA", Some(23.0)),
+            provider_subscription(&ollama, "OL", Some(20.0)),
+        ];
+
+        let card = this_week_card(&tiny.ctx(), &all()).expect("the This-week card");
+        let oa_row = card
+            .providers
+            .iter()
+            .find(|row| row.name == "OA")
+            .expect("the OA row");
+        assert_eq!(oa_row.used, None);
+        assert_eq!(
+            oa_row.money_missing.as_deref(),
+            Some("no reading of this week's usage")
+        );
+        let ollama_row = card
+            .providers
+            .iter()
+            .find(|row| row.name == "OL")
+            .expect("the OL row");
+        assert_eq!(ollama_row.used, None);
+        assert_eq!(
+            ollama_row.money_missing.as_deref(),
+            Some("no monthly allowance in Ollama's reading")
+        );
     }
 
     /// A window that ended above 100 % used more than it was offered. Its whole

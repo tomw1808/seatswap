@@ -13,7 +13,7 @@ use crate::burn::replay::{replay_records, ReplayResult};
 use crate::burn::usd_hours;
 use crate::history::{AccountRef, Event, EventKind, Hosts, Range, Sample, TokenRecord};
 use crate::live_sessions::Values;
-use crate::money::{window_money, Valuer};
+use crate::money::{window_money, Company, Valuer};
 
 use super::{
     account_abbr, account_chosen, account_id, account_weeks_valued, accounts_without_price,
@@ -148,7 +148,7 @@ pub(crate) fn subscriptions_in<Tz: TimeZone + Copy>(
 ) -> Result<SubscriptionsPage, StatsError> {
     let valuer = build_valuer(ctx, range)?;
     let weeks = account_weeks_valued(ctx, range, q, &valuer)?;
-    let spans = blocked_spans(ctx, range, q)?;
+    let spans = blocked_spans(ctx, range, q, Company::Anthropic)?;
     let histories = account_histories(ctx)?;
     // A ratio divides each window by its own span, which can reach past the
     // range; the reads that serve it cover every chosen window whole.
@@ -266,7 +266,14 @@ pub(crate) fn subscriptions_in<Tz: TimeZone + Copy>(
     // gives it.
     let mut removed: Vec<AccountRef> = weeks_of_account
         .keys()
-        .filter(|reference| stored_account(ctx, reference).is_none())
+        .filter(|reference| {
+            // P-2 counts an OpenAI subscription's week as an account week;
+            // this page lists Claude's accounts only until M-2 gives it the
+            // provider subscriptions (R6). A provider week must not make it
+            // error for want of an `AccountAdded` period.
+            stored_account(ctx, reference).is_none()
+                && Company::of_account(reference) == Company::Anthropic
+        })
         .cloned()
         .collect();
     removed.sort();
@@ -345,8 +352,8 @@ pub(crate) fn what_if_in<Tz: TimeZone + Copy>(
 
     let valuer = build_valuer(ctx, range)?;
     let weeks = account_weeks_valued(ctx, range, q, &valuer)?;
-    let spans = blocked_spans(ctx, range, q)?;
-    let rhythm = working_rhythm(ctx, range)?;
+    let spans = blocked_spans(ctx, range, q, Company::Anthropic)?;
+    let rhythm = working_rhythm(ctx, range, Company::Anthropic)?;
     let recorded_weeks = blocked_by_week(&spans, &rhythm, &ctx.zone);
     // The recorded hours of every calendar week, computed once: the same values
     // serve the replay and the "not enough history" path.
@@ -506,6 +513,7 @@ fn build_valuer<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, range: &Range) -> Result<Val
         ctx.fx,
         ctx.settings,
         ctx.accounts,
+        ctx.provider_subscriptions,
         ctx.warnings,
     )?)
 }

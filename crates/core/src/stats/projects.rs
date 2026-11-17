@@ -57,8 +57,9 @@ pub struct Node {
     /// first; `None` is a Claude record without a known account.
     pub by_account: Vec<(Option<String>, f64)>,
     /// Each other company's share of this node's API value, in %, largest
-    /// first, by [`Company::name`] (`OpenAI`, `Ollama`): its work uses no
-    /// Claude account. With `by_account` it makes up the node's API value.
+    /// first, by [`Company::name`] (`OpenAI`, `Ollama`): its work belongs to
+    /// its provider subscription, not to a Claude account. With `by_account` it
+    /// makes up the node's API value.
     pub by_provider: Vec<(String, f64)>,
     /// The distinct sessions of the node's records.
     pub sessions: u32,
@@ -76,7 +77,8 @@ pub struct ProjectsPage {
     /// account; an account without a finished week of the range is left out.
     pub tokens_per_percent: Vec<(String, f64)>,
     /// The tokens of the Claude records whose account is unknown; a record of
-    /// another provider uses no Claude account and is not counted here.
+    /// another provider belongs to its provider subscription and is not
+    /// counted here.
     pub unknown_account_tokens: Tokens,
     /// The distinct models whose API value is missing because they have no
     /// price, sorted.
@@ -178,6 +180,7 @@ pub(crate) fn projects_page_in<Tz: TimeZone + Copy>(
         ctx.fx,
         ctx.settings,
         ctx.accounts,
+        ctx.provider_subscriptions,
         ctx.warnings,
     )?;
     let weeks = account_weeks_valued(ctx, range, q, &valuer)?;
@@ -421,21 +424,22 @@ pub(crate) fn projects_page_in<Tz: TimeZone + Copy>(
             thousands(unknown_total as i64)
         ));
     }
-    // The work of another provider is in the tree's API value and in no
-    // subscription value or matrix cell: the page says why.
+    // A provider's work is in the tree's API value and in its own
+    // subscription's value when that has a price; it is in no Claude account's
+    // matrix cell. The page says whose work it is.
     if !providers.is_empty() {
         let names: Vec<String> = providers
             .iter()
             .map(|company| company.name().to_string())
             .collect();
         notes.push(format!(
-            "{} work is valued at API prices only; it uses no Claude account.",
+            "{} work belongs to its provider subscription, not to a Claude account.",
             join_names(&names)
         ));
     }
-    // A Claude record with a known account can still have no subscription
-    // value; the page says how many tokens that leaves out and why. A record
-    // of another provider has no account and a known 0.
+    // A record with a known account can still have no subscription value (a
+    // Claude week without a reading, a provider subscription without a price);
+    // the page says how many tokens that leaves out and why.
     let mut without_subscription = Tokens::default();
     let mut reasons = BTreeSet::new();
     let mut has_unvalued = false;
@@ -590,6 +594,7 @@ pub(crate) fn project_detail_in<Tz: TimeZone + Copy>(
         ctx.fx,
         ctx.settings,
         ctx.accounts,
+        ctx.provider_subscriptions,
         ctx.warnings,
     )?;
     let read = keep_warnings(ctx.warnings, || {
@@ -1625,8 +1630,10 @@ mod tests {
 
     /// A Codex record on atlas belongs to Codex, not to the account that was
     /// live: it is in `by_provider`, not in `by_account`, not in the unknown
-    /// account's tokens and in no matrix cell; the page says why. The account
-    /// chips do not drop it.
+    /// account's tokens and in no matrix cell; the page says whose work it is.
+    /// The account chips choose each provider by its subscription (decision
+    /// P-2 8): this history names no OpenAI subscription, so choosing LB alone
+    /// leaves only LB's own work.
     #[test]
     fn codex_work_is_its_providers() {
         let mut tiny = tiny();
@@ -1665,7 +1672,7 @@ mod tests {
         assert_eq!(page.matrix, before.matrix, "Codex is in no matrix cell");
         assert!(
             page.notes.iter().any(|note| note
-                == "OpenAI work is valued at API prices only; it uses no Claude account."),
+                == "OpenAI work belongs to its provider subscription, not to a Claude account."),
             "notes: {:#?}",
             page.notes
         );
@@ -1680,12 +1687,12 @@ mod tests {
         let atlas_node = node(&page, "atlas");
         assert_eq!(
             atlas_node.values.api,
-            Some(90.0),
-            "LB's 60 EUR and Codex's 30: the chips do not drop Codex"
+            Some(60.0),
+            "only LB's own work: the Codex work's subscription is none the query names"
         );
         assert_eq!(atlas_node.by_account.len(), 1);
         let detail = project_detail_in(&tiny.ctx(), &two_weeks(), &only_lb, &atlas()).unwrap();
-        assert_eq!(detail.values.api, Some(90.0));
+        assert_eq!(detail.values.api, Some(60.0));
     }
 
     // ---- proof tests of the review ----

@@ -11,7 +11,7 @@ use crate::history::{
     Event, EventKind, Hosted, Hosts, OllamaHourRecord, Range, SessionRecord, TokenRecord, UpRecord,
 };
 use crate::live_sessions::{most_output, session_label, Values};
-use crate::money::{Valued, Valuer};
+use crate::money::{Company, Valued, Valuer};
 use crate::projects::ProjectId;
 use crate::transcripts::Tokens;
 
@@ -39,11 +39,12 @@ pub struct RhythmPage {
 pub struct DayRow {
     /// 0 = Monday.
     pub weekday: u8,
-    /// The distinct hours with tokens on that weekday, all chosen hosts
-    /// together, divided by the range's calendar weeks.
+    /// The distinct hours with Claude tokens on that weekday, all chosen hosts
+    /// together, divided by the range's calendar weeks. A provider's hours do
+    /// not count: the blocked hours beside it are Claude's too (decision P-2 5).
     pub working_hours: f64,
-    /// The hours blocked on that weekday, by the range's working rhythm,
-    /// divided by the range's calendar weeks.
+    /// The hours Claude was blocked on that weekday, inside Claude's working
+    /// hours, divided by the range's calendar weeks.
     pub blocked_hours: f64,
 }
 
@@ -215,6 +216,9 @@ pub(crate) fn rhythm_in<Tz: TimeZone + Copy>(
     let tokens = keep_warnings(ctx.warnings, || {
         ctx.history.read::<TokenRecord>(range, &Hosts::All)
     })?;
+    // The heat map counts every company's work, as it did before P-2: only the
+    // per-weekday working hours and the blocked hours use the Claude filter
+    // (review I, decision P-2 5).
     let entries = chosen_entries(ctx, q, range, &valuer, &tokens.records);
 
     let columns = week_columns(range, &ctx.zone);
@@ -233,14 +237,16 @@ pub(crate) fn rhythm_in<Tz: TimeZone + Copy>(
         let local = hour.with_timezone(&ctx.zone);
         let index = local.weekday().num_days_from_monday() as usize * 24 + local.hour() as usize;
         heat[index] += entry.record.out as f64;
-        hours_by_weekday[local.weekday().num_days_from_monday() as usize].insert(hour);
+        if entry.valued.company == Company::Anthropic {
+            hours_by_weekday[local.weekday().num_days_from_monday() as usize].insert(hour);
+        }
     }
     for value in &mut heat {
         *value /= weeks as f64;
     }
 
-    let spans = blocked_spans(ctx, range, q)?;
-    let rhythm = working_rhythm(ctx, range)?;
+    let spans = blocked_spans(ctx, range, q, Company::Anthropic)?;
+    let rhythm = working_rhythm(ctx, range, Company::Anthropic)?;
     let blocked = blocked_by_weekday(&spans, &rhythm, &ctx.zone);
 
     let mut per_day = Vec::with_capacity(7);
@@ -463,6 +469,7 @@ fn valuer<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, range: &Range) -> Result<Valuer, S
         ctx.fx,
         ctx.settings,
         ctx.accounts,
+        ctx.provider_subscriptions,
         ctx.warnings,
     )?)
 }
@@ -1008,9 +1015,10 @@ mod tests {
 
     use chrono::FixedOffset;
 
+    use crate::api::LimitKind;
     use crate::history::HistoryDir;
     use crate::project::ProjectKey;
-    use crate::stats::tests::{all, tiny, utc};
+    use crate::stats::tests::{all, codex_token, tiny, utc};
     use crate::stats::{Range, RangeKey};
 
     /// The plan's range: 2 Nov .. 16 Nov.
@@ -1099,6 +1107,25 @@ mod tests {
             accounts: Vec::new(),
             host: Some(host.to_string()),
         }
+    }
+
+    /// A Codex record still appears in the Rhythm heat map, as every company's
+    /// work did before P-2; only the per-weekday working hours and the blocked
+    /// hours use the Claude filter (review I).
+    #[test]
+    fn a_codex_record_still_appears_in_the_heat_map() {
+        let tiny = tiny();
+        let mut record = codex_token("2026-11-11T14:00:00Z", "gpt-6.2-codex", 1_000_000);
+        record.out = 2_000_000;
+        tiny.history.append(&record).expect("the Codex record");
+
+        let page = rhythm_in(&tiny.ctx(), &two_weeks(), &all()).expect("the Rhythm page");
+        let index = 2 * 24 + 14; // Wednesday 14:00 UTC
+        assert!(
+            close(page.heat[index], 1_000_000.0),
+            "the Codex hour is in the heat map over its two weeks: {:?}",
+            page.heat[index]
+        );
     }
 
     #[test]
@@ -1371,6 +1398,64 @@ mod tests {
             page.heat[24 + 10]
         );
         assert!(close(page.heat[24 + 9], 0.0));
+    }
+
+    /// The Rhythm page's working hours and blocked hours use one company
+    /// filter (decision P-2 5): a Codex hour is neither a working hour nor a
+    /// blocked one, while Claude's own block in a Claude hour counts.
+    #[test]
+    fn rhythm_working_hours_and_blocked_hours_use_one_company_filter() {
+        let mut tiny = tiny();
+        let codex = crate::stats::tests::codex_ref();
+        crate::stats::tests::codex_prices(&mut tiny.prices);
+        // Codex works on Wednesday at 10:00, when no Claude record is.
+        tiny.history
+            .append(&crate::stats::tests::codex_token(
+                "2026-11-04T10:00:00Z",
+                "gpt-6.2-codex",
+                1_000_000,
+            ))
+            .expect("the Codex record");
+        // A Claude block at Tuesday 10:00, a Claude working hour, and a Codex
+        // block at Wednesday 10:00, a Codex working hour.
+        let block = |at: &str, account: &crate::history::AccountRef, host: &HistoryDir| {
+            host.append(&Event {
+                t: utc(at),
+                kind: EventKind::Blocked {
+                    account: account.clone(),
+                    k: LimitKind::Session,
+                    m: None,
+                },
+            })
+            .expect("the block");
+            host.append(&Event {
+                t: utc(at) + Duration::hours(1),
+                kind: EventKind::Unblocked {
+                    account: account.clone(),
+                    k: LimitKind::Session,
+                    m: None,
+                },
+            })
+            .expect("the unblock");
+        };
+        block("2026-11-03T10:00:00Z", &tiny.lb_ref(), &tiny.history);
+        block("2026-11-04T10:00:00Z", &codex, &tiny.history);
+
+        // One calendar week, so the page divides by 1: Monday 2 Nov .. Monday
+        // 9 Nov.
+        let week = Range {
+            from: utc("2026-11-02T00:00:00Z"),
+            to: utc("2026-11-09T00:00:00Z"),
+        };
+        let page = rhythm_in(&tiny.ctx(), &week, &all()).unwrap();
+
+        // Tuesday holds Claude's two token hours, 09:00 and 10:00, and the
+        // Claude block in the 10:00 hour.
+        assert_eq!(page.per_day[1].working_hours, 2.0);
+        assert_eq!(page.per_day[1].blocked_hours, 1.0);
+        // Wednesday holds Codex work and a Codex block alone.
+        assert_eq!(page.per_day[2].working_hours, 0.0);
+        assert_eq!(page.per_day[2].blocked_hours, 0.0);
     }
 
     #[test]

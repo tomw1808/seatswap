@@ -9,10 +9,12 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, Timelike, Utc, Weekday};
+use chrono::{
+    DateTime, Datelike, Duration, Months, NaiveDate, NaiveDateTime, Timelike, Utc, Weekday,
+};
 use serde::{Deserialize, Serialize};
 
-use crate::api::{Api, ApiError, Fetched};
+use crate::api::{Api, ApiError, Fetched, LimitKind};
 use crate::atomic::{self, Access};
 use crate::burn::rates::{timelines, Timeline};
 use crate::history::{
@@ -22,7 +24,7 @@ use crate::history::{
 use crate::locks::{self, LockError};
 use crate::paths::AppPaths;
 use crate::stats::{warn_window_below_start, window_midpoint, window_used};
-use crate::store::{Account, Settings};
+use crate::store::{Account, ProviderSubscription, Settings};
 use crate::switcher::APP_LOCK_TIMEOUT;
 
 /// The models.dev providers seatswap reads prices from (spec §1.4.1).
@@ -30,6 +32,13 @@ pub const PRICE_PROVIDERS: [&str; 3] = ["anthropic", "openai", "ollama-cloud"];
 
 /// The version of `prices.json` and `fx.json` this build reads and writes.
 const MONEY_VERSION: u32 = 1;
+
+/// The longest window the [`Valuer`] values: Ollama's credits month, one
+/// calendar month of at most 31 days. A week is shorter. A window that overlaps
+/// a range begins at most this many days before it and ends at most this many
+/// days after it, so [`Valuer::build`] reads the range widened by them on both
+/// sides and every window it values is read whole.
+const LONGEST_WINDOW_DAYS: i64 = 31;
 
 const MICRO: f64 = 1_000_000.0;
 
@@ -57,6 +66,13 @@ pub enum MoneyError {
     Lock(#[from] LockError),
     #[error("{currency}'s dollar rate {rate} is not a number above 0")]
     BadRate { currency: String, rate: f64 },
+    #[error("the range {from} .. {to} lies too close to the end of time to read its windows")]
+    RangeTooWide {
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    },
+    #[error("the month ending {end} has no start one calendar month before it")]
+    MonthStart { end: DateTime<Utc> },
     #[error(transparent)]
     History(#[from] HistoryError),
 }
@@ -578,6 +594,78 @@ impl Company {
     }
 }
 
+/// The one Ollama subscription's account, as `providers_rt` creates it (R4,
+/// decision P-2 2): Ollama has one local server and one credit balance, so its
+/// readings all belong to this reference.
+pub(crate) fn ollama_subscription() -> AccountRef {
+    AccountRef {
+        acc: crate::providers::OLLAMA_ORG.to_string(),
+        org: crate::providers::OLLAMA_ORG.to_string(),
+    }
+}
+
+/// The OpenAI logins `accounts.json` stores (decision P-2 2): every provider
+/// subscription whose org is `codex`. This is what the no-`providerSwitch` rule
+/// counts, never a window or a sample of a page's read range.
+pub(crate) fn openai_subscriptions(subscriptions: &[ProviderSubscription]) -> BTreeSet<AccountRef> {
+    subscriptions
+        .iter()
+        .filter(|subscription| Company::of_account(&subscription.account) == Company::OpenAI)
+        .map(|subscription| subscription.account.clone())
+        .collect()
+}
+
+/// The `providerSwitch` timelines of every host the events name. A `switch`
+/// stays Claude-only, and [`Timeline::of`] ignores a `providerSwitch` in the
+/// same way.
+pub(crate) fn provider_switch_timelines(events: &[Hosted<Event>]) -> HashMap<String, Timeline> {
+    let mut hosts: BTreeSet<&str> = BTreeSet::new();
+    for hosted in events {
+        hosts.insert(hosted.host.as_str());
+    }
+    hosts
+        .into_iter()
+        .map(|host| (host.to_string(), Timeline::provider_switches(events, host)))
+        .collect()
+}
+
+/// Which OpenAI subscription a record on `host` at `t` belongs to (decision
+/// P-2 2): the `to` of the newest `providerSwitch` at or before it; before that
+/// host's first switch, that event's `from`; on a host with no switch at all,
+/// the only stored OpenAI subscription when there is exactly one, and
+/// [`Missing::NoAccount`] when there are several or none. Never a guess. The
+/// one rule [`Valuer::openai_subscription`] and the blocked spans use.
+pub(crate) fn openai_subscription_at(
+    timelines: &HashMap<String, Timeline>,
+    stored: &BTreeSet<AccountRef>,
+    host: &str,
+    t: DateTime<Utc>,
+) -> Result<AccountRef, Missing> {
+    if let Some(timeline) = timelines.get(host) {
+        if !timeline.is_empty() {
+            if let Some(account) = timeline.at(t) {
+                return Ok(account.clone());
+            }
+            return timeline.before_first().cloned().ok_or(Missing::NoAccount);
+        }
+    }
+    match stored.len() {
+        1 => stored.iter().next().cloned().ok_or(Missing::NoAccount),
+        _ => Err(Missing::NoAccount),
+    }
+}
+
+/// The limit kind of Ollama's month (R4): the credits' period.
+fn monthly_credits() -> LimitKind {
+    LimitKind::Other("monthly_credits".to_string())
+}
+
+/// Whether a window or limit kind is Ollama's month. The one rule the month
+/// windows and the week windows are told apart by.
+fn is_month_kind(kind: &LimitKind) -> bool {
+    matches!(kind, LimitKind::Other(name) if name == "monthly_credits")
+}
+
 /// A model id's company and its id in that company's models.dev list: the
 /// decision behind [`Company::of_model`] and [`model_price_key`]. An Ollama
 /// cloud id loses Ollama's `-cloud` marker there: `<name>:cloud` is `<name>`,
@@ -908,18 +996,48 @@ pub(crate) fn window_money(price: f64, percent: f64) -> WindowMoney {
     }
 }
 
+/// The money of one month of an Ollama subscription (R4, decision P-2 3): the
+/// month's credits are the whole of the monthly price, so one percent of them
+/// is `price / 100`, not a week's [`percent_value`]. A month above 100 % counts
+/// its whole use and expires nothing, as a week does.
+pub(crate) fn month_money(price: f64, percent: f64) -> WindowMoney {
+    let paid = price;
+    let used = percent / 100.0 * price;
+    let expired = (100.0 - percent).max(0.0) / 100.0 * price;
+    WindowMoney {
+        used,
+        paid,
+        expired,
+    }
+}
+
 /// Why a value is missing (spec §1.4: the window says so). `Display` is the text a page shows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum Missing {
     NoCurrency,
-    NoPrice { model: String },
+    NoPrice {
+        model: String,
+    },
     NoAccount,
     NoAccountPrice,
-    PriceInOtherCurrency { currency: String },
+    PriceInOtherCurrency {
+        currency: String,
+    },
     PriceWithoutCurrency,
     NoReading,
-    UnpricedInWeek { model: String },
+    UnpricedInWeek {
+        model: String,
+    },
+    /// Ollama's reading names no credits month, so there is no allowance to
+    /// take a share of.
+    NoMonthlyAllowance,
+    /// No running weekly window of an OpenAI subscription: there is no
+    /// reading of this week's usage.
+    NoWeekReading,
+    /// No running month of an Ollama subscription: there is no reading of this
+    /// month's usage.
+    NoMonthReading,
 }
 
 impl std::fmt::Display for Missing {
@@ -943,6 +1061,9 @@ impl std::fmt::Display for Missing {
                     "that week also has tokens of {model}, which has no price"
                 )
             }
+            Missing::NoMonthlyAllowance => f.write_str("no monthly allowance in Ollama's reading"),
+            Missing::NoWeekReading => f.write_str("no reading of this week's usage"),
+            Missing::NoMonthReading => f.write_str("no reading of this month's usage"),
         }
     }
 }
@@ -953,12 +1074,16 @@ pub struct Valued {
     /// The tokens at API prices, times the rate of the record's day. Without a
     /// rate of the settings' currency this is the USD value (spec §1.4).
     pub api: Option<f64>,
-    /// The share of the account's subscription that the record's week used;
-    /// a known 0 for a record of another provider than Claude.
+    /// The share of the record's own subscription that its window used: the
+    /// Claude account's week, the OpenAI subscription's `weekly_all` week, or
+    /// Ollama's `monthly_credits` month (R4). A record without tokens is a
+    /// known 0; without a subscription price it is `None` with
+    /// [`Self::subscription_missing`], never 0.
     pub subscription: Option<f64>,
-    /// The Claude account that was live on the record's host at its time;
-    /// always `None` for a record of another provider than Claude, which uses
-    /// no Claude account.
+    /// The subscription the record belongs to: the Claude account that was
+    /// live on its host at its time, or the provider subscription its work
+    /// belongs to (decision P-2 2, 4). `None` only for a Claude record without a
+    /// known account, or a provider record whose subscription cannot be named.
     pub account: Option<AccountRef>,
     /// The company of the record's model ([`Company::of_model`]).
     pub company: Company,
@@ -971,9 +1096,14 @@ pub struct Valued {
     pub subscription_missing: Option<Missing>,
 }
 
-/// One account's weekly window, with what its records are split by.
+/// One subscription's window, with what its records are split by: a Claude
+/// account's week, an OpenAI subscription's `weekly_all` week, or an Ollama
+/// subscription's `monthly_credits` month (R4).
 struct WeekWindow {
     account: AccountRef,
+    /// The limit the window belongs to: `weekly_all` for a week,
+    /// `monthly_credits` for Ollama's month.
+    kind: LimitKind,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
     /// The finished window's final percent, or a running window's last sample.
@@ -994,6 +1124,21 @@ struct WeekWindow {
     unpriced: Option<String>,
 }
 
+/// One month of an Ollama subscription (decision P-2 9): the use of the
+/// credits, its money and the last reading that named it. `money` is in the
+/// display currency; `None` with `price_missing` when the subscription has no
+/// price.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct MonthWindow {
+    pub(crate) start: DateTime<Utc>,
+    pub(crate) end: DateTime<Utc>,
+    /// The share of the month's credits used, in percent: `final − from`.
+    pub(crate) used: f64,
+    pub(crate) last_sample: DateTime<Utc>,
+    pub(crate) money: Option<WindowMoney>,
+    pub(crate) price_missing: Option<Missing>,
+}
+
 /// Every account's price changes, in time order: the moment, the monthly price
 /// and the currency it was entered in (`None` before a currency was set).
 type PriceChanges = BTreeMap<AccountRef, Vec<(DateTime<Utc>, Option<f64>, Option<String>)>>;
@@ -1002,13 +1147,22 @@ type PriceChanges = BTreeMap<AccountRef, Vec<(DateTime<Utc>, Option<f64>, Option
 /// of every record, its weekly window, and the window's price at its midpoint.
 pub struct Valuer {
     timelines: HashMap<String, Timeline>,
+    /// The `providerSwitch` timelines, per host: which OpenAI subscription a
+    /// record on that host belongs to (decision P-2 2).
+    provider_timelines: HashMap<String, Timeline>,
+    /// The OpenAI subscriptions the history names: the accounts of its provider
+    /// windows, samples and price changes, and the `from` and `to` logins of its
+    /// `providerSwitch` events. A host without a `providerSwitch` uses the one
+    /// of them when there is exactly one.
+    openai_accounts: BTreeSet<AccountRef>,
     windows: Vec<WeekWindow>,
     /// Each account's windows, by their place in `windows`, in the order they
     /// were added: a lookup reads only the account's own windows.
     account_windows: HashMap<AccountRef, Vec<usize>>,
-    /// For each reset window, the reading it began at, by the account and that
-    /// reading's time: the `from` of the running window it opened.
-    window_starts: HashMap<AccountRef, BTreeMap<DateTime<Utc>, f64>>,
+    /// For each reset window, the reading it began at, by the account, the
+    /// limit kind and that reading's time: the `from` of the running window it
+    /// opened.
+    window_starts: HashMap<AccountRef, BTreeMap<(String, DateTime<Utc>), f64>>,
     price_changes: PriceChanges,
     /// The price as `accounts.json` has it now and the currency it was entered
     /// in, for an account without changes.
@@ -1046,14 +1200,23 @@ fn open_window_used(
 }
 
 impl Valuer {
-    /// Reads samples, windows and tokens of `range` widened to whole weekly
-    /// windows: a week that holds a point of the range begins at most seven
-    /// days before it and ends at most seven days after it. Every event over
-    /// all of history is read too, because a record's account is the last
-    /// `Live`/`Switch` at or before it, and its window's price is the last
-    /// `PriceChanged` at or before the window's midpoint, which can be older
-    /// than the range; a price change after the range still names the first
-    /// price, which counts for the past.
+    /// Reads samples, windows and tokens of `range` widened to whole windows: a
+    /// window that overlaps a point of the range begins at most
+    /// [`LONGEST_WINDOW_DAYS`] before it and ends at most that many days after
+    /// it, so both the seven-day weeks and Ollama's calendar month are read
+    /// whole. Every event over all of history is read too, because a record's
+    /// account is the last `Live`/`Switch` at or before it, and its window's
+    /// price is the last `PriceChanged` at or before the window's midpoint,
+    /// which can be older than the range; a price change after the range still
+    /// names the first price, which counts for the past.
+    ///
+    /// `provider_subscriptions` is `accounts.json`'s list beside `accounts`
+    /// (decision P-2 1): their prices are the stored prices where no
+    /// `PriceChanged` names the subscription, and their OpenAI logins are the
+    /// subscriptions the no-switch rule may pick.
+    // The eight inputs are the valuer's whole context; a parameter struct no
+    // caller shares would only hide them (decision P-2 1).
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         history: &HistoryDir,
         range: &Range,
@@ -1061,45 +1224,65 @@ impl Valuer {
         fx: &Fx,
         settings: &Settings,
         accounts: &[Account],
+        provider_subscriptions: &[ProviderSubscription],
         warnings: &RefCell<Vec<String>>,
     ) -> Result<Valuer, MoneyError> {
         let widened = Range {
-            from: range.from - Duration::days(7),
-            to: range.to + Duration::days(7),
+            from: range
+                .from
+                .checked_sub_signed(Duration::days(LONGEST_WINDOW_DAYS))
+                .ok_or(MoneyError::RangeTooWide {
+                    from: range.from,
+                    to: range.to,
+                })?,
+            to: range
+                .to
+                .checked_add_signed(Duration::days(LONGEST_WINDOW_DAYS))
+                .ok_or(MoneyError::RangeTooWide {
+                    from: range.from,
+                    to: range.to,
+                })?,
         };
-        // Codex's and Ollama's readings share the files; a Claude window, sample
-        // or event is the only one this valuer prices (step-d.md Task 4).
-        let windows = keep_warnings(warnings, || {
-            history.finished_claude_windows(&widened, &Hosts::All)
-        })?;
-        let samples = keep_warnings(warnings, || {
-            history.read_claude::<Sample>(&widened, &Hosts::All)
-        })?;
-        let events = keep_warnings(warnings, || {
-            history.read_claude::<Event>(&Range::ALL, &Hosts::All)
-        })?;
+        // Codex's and Ollama's readings share the files. A Claude account's
+        // week, an OpenAI subscription's `weekly_all` week and Ollama's
+        // `monthly_credits` month are all read here, because a provider record's
+        // subscription value is the same share of its own subscription's
+        // window (R4).
+        let windows = keep_warnings(warnings, || history.finished_windows(&widened, &Hosts::All))?;
+        let samples = keep_warnings(warnings, || history.read::<Sample>(&widened, &Hosts::All))?;
+        let events = keep_warnings(warnings, || history.read::<Event>(&Range::ALL, &Hosts::All))?;
         let tokens = keep_warnings(warnings, || {
             history.read::<TokenRecord>(&widened, &Hosts::All)
         })?;
 
+        // The OpenAI subscriptions `accounts.json` stores: a host without a
+        // `providerSwitch` uses the one of them when there is exactly one
+        // (decision P-2 2). Neither a window nor a sample of the read range
+        // decides this, so a record's subscription does not depend on the
+        // page's range.
+        let openai_accounts = openai_subscriptions(provider_subscriptions);
+        let provider_timelines = provider_switch_timelines(&events.records);
+
         // A reset window says where the window that began at the reset started:
-        // the first weekly reading at or after the reset. That reading is the
-        // running window's `from`, so its use follows `stats::window_used`
-        // (`final − from`) instead of counting the tokens from before the reset.
-        // The reading's own reset time names the new window, so a reset that
-        // also moved the reset time is found too.
-        let mut window_starts: HashMap<AccountRef, BTreeMap<DateTime<Utc>, f64>> = HashMap::new();
+        // the first reading of the same limit at or after the reset. That
+        // reading is the running window's `from`, so its use follows
+        // `stats::window_used` (`final − from`) instead of counting the tokens
+        // from before the reset. The reading's own reset time names the new
+        // window, so a reset that also moved the reset time is found too. A
+        // week and Ollama's month both use the rule.
+        let mut window_starts: HashMap<AccountRef, BTreeMap<(String, DateTime<Utc>), f64>> =
+            HashMap::new();
         for hosted in &windows.records {
             let record = &hosted.record;
-            if record.k != crate::api::LimitKind::WeeklyAll || !record.reset {
+            if !matches!(record.k, LimitKind::WeeklyAll | LimitKind::Other(_)) || !record.reset {
                 continue;
             }
-            let weekly = |sample: &Hosted<Sample>| {
+            let start_of = |sample: &Hosted<Sample>| {
                 sample
                     .record
                     .l
                     .iter()
-                    .find(|limit| limit.k == crate::api::LimitKind::WeeklyAll && limit.r.is_some())
+                    .find(|limit| limit.k == record.k && limit.r.is_some())
                     .map(|limit| (sample.record.t, limit.p))
             };
             // The samples are sorted by time: the first one at or after the
@@ -1110,17 +1293,19 @@ impl Valuer {
             let first = samples.records[after..]
                 .iter()
                 .filter(|sample| sample.record.account == record.account)
-                .find_map(weekly);
+                .find_map(start_of);
             if let Some((t, percent)) = first {
                 window_starts
                     .entry(record.account.clone())
                     .or_default()
-                    .insert(t, percent);
+                    .insert((record.k.as_api().to_string(), t), percent);
             }
         }
 
         let mut valuer = Valuer {
             timelines: timelines(&events.records),
+            provider_timelines,
+            openai_accounts,
             windows: Vec::new(),
             account_windows: HashMap::new(),
             window_starts,
@@ -1135,6 +1320,14 @@ impl Valuer {
                             .map(|price| (price, account.price_currency.clone())),
                     )
                 })
+                .chain(provider_subscriptions.iter().map(|subscription| {
+                    (
+                        subscription.account.clone(),
+                        subscription
+                            .price
+                            .map(|price| (price, subscription.price_currency.clone())),
+                    )
+                }))
                 .collect(),
             prices: prices.clone(),
             fx: fx.clone(),
@@ -1153,10 +1346,10 @@ impl Valuer {
                 // names it with the same text, so the page shows it once.
                 warn_window_below_start(warnings, &hosted.record);
             }
-            valuer.finished_window(&hosted.record);
+            valuer.finished_window(&hosted.record)?;
         }
         for hosted in &samples.records {
-            valuer.sample_window(&hosted.record);
+            valuer.sample_window(&hosted.record)?;
         }
         valuer.sample_windows_used();
         for hosted in &events.records {
@@ -1179,18 +1372,20 @@ impl Valuer {
         Ok(valuer)
     }
 
-    /// The index of the account's window that ends like `end`, adding it when
-    /// it is new.
+    /// The index of the account's window of `kind` that ends like `end`, adding
+    /// it when it is new.
     fn window_index(
         &mut self,
         account: &AccountRef,
+        kind: &LimitKind,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> usize {
         let same = self.account_windows.get(account).and_then(|own| {
-            own.iter()
-                .copied()
-                .find(|index| same_reset(self.windows[*index].end, end))
+            own.iter().copied().find(|index| {
+                let window = &self.windows[*index];
+                window.kind == *kind && same_reset(window.end, end)
+            })
         });
         if let Some(index) = same {
             return index;
@@ -1201,6 +1396,7 @@ impl Valuer {
             .push(self.windows.len());
         self.windows.push(WeekWindow {
             account: account.clone(),
+            kind: kind.clone(),
             start,
             end,
             used: None,
@@ -1214,26 +1410,43 @@ impl Valuer {
         self.windows.len() - 1
     }
 
-    /// The account's first window, in the order they were added, that holds
-    /// `at` (`start <= at < end`).
-    fn window_holding(&self, account: &AccountRef, at: DateTime<Utc>) -> Option<usize> {
+    /// The account's first window of `kind`, in the order they were added, that
+    /// holds `at` (`start <= at < end`).
+    fn window_holding(
+        &self,
+        account: &AccountRef,
+        kind: &LimitKind,
+        at: DateTime<Utc>,
+    ) -> Option<usize> {
         self.account_windows
             .get(account)?
             .iter()
             .copied()
             .find(|index| {
                 let window = &self.windows[*index];
-                window.start <= at && at < window.end
+                window.kind == *kind && window.start <= at && at < window.end
             })
     }
 
-    fn finished_window(&mut self, record: &WindowRecord) {
-        if record.k != crate::api::LimitKind::WeeklyAll {
-            return;
+    /// The start of a month: one calendar month before its reset (documented
+    /// rule: Ollama's reply names the credits' period end, and the period is a
+    /// calendar month). A month that cannot be computed that far back is an
+    /// error, never a default of 30 days.
+    fn month_start(end: DateTime<Utc>) -> Result<DateTime<Utc>, MoneyError> {
+        end.checked_sub_months(Months::new(1))
+            .ok_or(MoneyError::MonthStart { end })
+    }
+
+    fn finished_window(&mut self, record: &WindowRecord) -> Result<(), MoneyError> {
+        if record.k != LimitKind::WeeklyAll && !is_month_kind(&record.k) {
+            return Ok(());
         }
         let end = record.end;
-        let start = record.weekly_start();
-        let index = self.window_index(&record.account, start, end);
+        let start = match &record.k {
+            LimitKind::WeeklyAll => record.weekly_start(),
+            _ => Self::month_start(end)?,
+        };
+        let index = self.window_index(&record.account, &record.k, start, end);
         let window = &mut self.windows[index];
         // A window that ends below its start has no use (`stats::window_used`
         // says `None`): it adds nothing to the week's use, and `Valuer::build`
@@ -1241,18 +1454,24 @@ impl Valuer {
         window.used = Some(window_used(record).unwrap_or(0.0));
         window.finished = true;
         window.last_sample = Some(record.last_sample);
+        Ok(())
     }
 
-    fn sample_window(&mut self, sample: &Sample) {
+    fn sample_window(&mut self, sample: &Sample) -> Result<(), MoneyError> {
         for limit in &sample.l {
-            if limit.k != crate::api::LimitKind::WeeklyAll {
+            let month = is_month_kind(&limit.k);
+            if limit.k != LimitKind::WeeklyAll && !month {
                 continue;
             }
             let Some(end) = limit.r else {
                 continue;
             };
-            let start = end - Duration::days(7);
-            let index = self.window_index(&sample.account, start, end);
+            let start = if month {
+                Self::month_start(end)?
+            } else {
+                end - Duration::days(7)
+            };
+            let index = self.window_index(&sample.account, &limit.k, start, end);
             let window = &mut self.windows[index];
             if window.finished {
                 continue;
@@ -1262,7 +1481,7 @@ impl Valuer {
                 if let Some(from) = self
                     .window_starts
                     .get(&sample.account)
-                    .and_then(|starts| starts.get(&sample.t))
+                    .and_then(|starts| starts.get(&(limit.k.as_api().to_string(), sample.t)))
                     .copied()
                 {
                     window.from = Some(from);
@@ -1271,6 +1490,7 @@ impl Valuer {
                 window.percent = Some(limit.p);
             }
         }
+        Ok(())
     }
 
     /// The use of every window the readings opened and no finished record
@@ -1289,27 +1509,30 @@ impl Valuer {
 
     fn add_to_window(&mut self, hosted: &Hosted<TokenRecord>, prices: &Prices) {
         let record = &hosted.record;
-        // A model outside the Claude plan (a flash worker, Codex, Ollama) uses no
-        // share of a Claude account's week: it adds no API money to the window
-        // and never makes the week's subscription value unknown.
-        if !is_plan_model(&record.model) {
-            return;
-        }
-        let Some(account) = self
-            .timelines
-            .get(&hosted.host)
-            .and_then(|timeline| timeline.at(record.t))
-            .cloned()
-        else {
-            return;
-        };
-        let Some(index) = self.window_holding(&account, record.t) else {
-            return;
-        };
         // A record without tokens adds nothing anywhere and is never "unpriced".
         if record.input == 0 && record.out == 0 && record.cw == 0 && record.cr == 0 {
             return;
         }
+        let company = Company::of_model(&record.model);
+        let (account, kind) = match company {
+            Company::Anthropic => match self
+                .timelines
+                .get(&hosted.host)
+                .and_then(|timeline| timeline.at(record.t))
+                .cloned()
+            {
+                Some(account) => (account, LimitKind::WeeklyAll),
+                None => return,
+            },
+            Company::OpenAI => match self.openai_subscription(&hosted.host, record.t) {
+                Ok(account) => (account, LimitKind::WeeklyAll),
+                Err(_) => return,
+            },
+            Company::Ollama => (ollama_subscription(), monthly_credits()),
+        };
+        let Some(index) = self.window_holding(&account, &kind, record.t) else {
+            return;
+        };
         match api_usd(record, prices) {
             Some(usd) => self.windows[index].api_sum += usd,
             None => {
@@ -1321,13 +1544,15 @@ impl Valuer {
         }
     }
 
-    /// The weekly windows still running at `now`, one per account at most, as
-    /// the records a finished window would have: of every window the readings
-    /// opened and no finished record closed, the account's one with the newest
-    /// reading, when its reset (`end`) lies after `now`. A reading of another
-    /// host whose clock runs a little ahead still counts. A window the
-    /// readings opened before an early reset that moved the reset time has an
-    /// older newest reading than the window after the reset, so it is never
+    /// The weekly windows still running at `now`, one per account and provider
+    /// subscription at most, as the records a finished window would have: of
+    /// every window the readings opened and no finished record closed, the
+    /// account's one with the newest reading, when its reset (`end`) lies after
+    /// `now`. A Claude account's week and an OpenAI subscription's `weekly_all`
+    /// week count alike; Ollama's month is not a week and stays out. A reading
+    /// of another host whose clock runs a little ahead still counts. A window
+    /// the readings opened before an early reset that moved the reset time has
+    /// an older newest reading than the window after the reset, so it is never
     /// taken for the running one. The record's `start` is seven days
     /// before `end`, `final` the newest reading's percent, `from` the reading a
     /// reset began it at (the `from` its use is counted with), `lastSample` that
@@ -1336,7 +1561,10 @@ impl Valuer {
     pub(crate) fn running_windows(&self, now: DateTime<Utc>) -> Vec<WindowRecord> {
         let mut newest: BTreeMap<&AccountRef, (&WeekWindow, DateTime<Utc>, f64)> = BTreeMap::new();
         for window in &self.windows {
-            if window.finished {
+            if window.finished || window.kind != LimitKind::WeeklyAll {
+                continue;
+            }
+            if Company::of_account(&window.account) == Company::Ollama {
                 continue;
             }
             let (Some(last_sample), Some(percent)) = (window.last_sample, window.percent) else {
@@ -1371,6 +1599,59 @@ impl Valuer {
         running
     }
 
+    /// The newest running month of `account` at `now`: Ollama's credits period,
+    /// or `None` when no reading of the account names a month that still runs.
+    pub(crate) fn running_month(
+        &self,
+        account: &AccountRef,
+        now: DateTime<Utc>,
+    ) -> Option<MonthWindow> {
+        self.month_windows(account)
+            .into_iter()
+            .filter(|month| month.end > now)
+            .max_by_key(|month| month.last_sample)
+    }
+
+    /// Every month of an Ollama subscription that the history holds, finished
+    /// and running, oldest end first: the use of the credits, the money of that
+    /// use at the month's price, and why the money is missing.
+    pub(crate) fn month_windows(&self, account: &AccountRef) -> Vec<MonthWindow> {
+        let mut months: Vec<MonthWindow> = self
+            .account_windows
+            .get(account)
+            .into_iter()
+            .flatten()
+            .filter_map(|index| {
+                let window = &self.windows[*index];
+                if !is_month_kind(&window.kind) {
+                    return None;
+                }
+                let used = window.used?;
+                let (money, price_missing) =
+                    match self.window_price(&window.account, window.start, window.end) {
+                        Ok(price) => (Some(month_money(price, used)), None),
+                        Err(missing) => (None, Some(missing)),
+                    };
+                Some(MonthWindow {
+                    start: window.start,
+                    end: window.end,
+                    used,
+                    last_sample: window.last_sample?,
+                    money,
+                    price_missing,
+                })
+            })
+            .collect();
+        months.sort_by(|a, b| a.end.cmp(&b.end).then_with(|| a.start.cmp(&b.start)));
+        months
+    }
+
+    /// Which OpenAI subscription a record on `host` at `t` belongs to; the rule
+    /// is [`openai_subscription_at`] over the stored subscriptions.
+    fn openai_subscription(&self, host: &str, t: DateTime<Utc>) -> Result<AccountRef, Missing> {
+        openai_subscription_at(&self.provider_timelines, &self.openai_accounts, host, t)
+    }
+
     /// The dollar rate this valuer was built with: the API column's rate at a
     /// record's day, and at the view's day for a list without records.
     pub fn fx(&self) -> &Fx {
@@ -1379,16 +1660,26 @@ impl Valuer {
 
     /// The money value of one token record of `host`. A record of another
     /// provider than Claude belongs to its provider and to no Claude account,
-    /// whichever account was live on its host.
+    /// whichever account was live on its host; it takes its share of that
+    /// provider subscription's own window (R4), and [`Valued::account`] is the
+    /// subscription's [`AccountRef`] (decision P-2 4).
     pub fn value(&self, host: &str, record: &TokenRecord) -> Valued {
         let company = Company::of_model(&record.model);
+        let mut account_missing = None;
         let account = match company {
             Company::Anthropic => self
                 .timelines
                 .get(host)
                 .and_then(|timeline| timeline.at(record.t))
                 .cloned(),
-            Company::OpenAI | Company::Ollama => None,
+            Company::OpenAI => match self.openai_subscription(host, record.t) {
+                Ok(account) => Some(account),
+                Err(missing) => {
+                    account_missing = Some(missing);
+                    None
+                }
+            },
+            Company::Ollama => Some(ollama_subscription()),
         };
         let usd = api_usd(record, &self.prices);
         let (api, api_currency, api_missing) = match usd {
@@ -1408,11 +1699,11 @@ impl Valuer {
         };
         // A record without tokens uses no share of any subscription, whether or
         // not an account was live: both halves are a known 0 (`api_usd` gives
-        // its 0 US dollars), never NoAccount. A model outside the Claude plan
-        // uses no share of any Claude account's week either: its subscription is
-        // a known 0; only its API half follows the price rule.
+        // its 0 US dollars), never NoAccount. A provider record takes its share
+        // of its own subscription's window, and without a price that share is
+        // missing with its reason while the API value stays (Review Focus 5).
         let no_tokens = record.input == 0 && record.out == 0 && record.cw == 0 && record.cr == 0;
-        let (subscription, subscription_missing) = if no_tokens || company != Company::Anthropic {
+        let (subscription, subscription_missing) = if no_tokens {
             (Some(0.0), None)
         } else {
             match (usd, &account) {
@@ -1422,11 +1713,17 @@ impl Valuer {
                         model: record.model.clone(),
                     }),
                 ),
-                (Some(_), None) => (None, Some(Missing::NoAccount)),
-                (Some(usd), Some(account)) => match self.subscription(account, record.t, usd) {
-                    Ok(value) => (Some(value), None),
-                    Err(missing) => (None, Some(missing)),
-                },
+                (Some(_), None) => (None, Some(account_missing.unwrap_or(Missing::NoAccount))),
+                (Some(usd), Some(account)) => {
+                    let kind = match company {
+                        Company::Anthropic | Company::OpenAI => LimitKind::WeeklyAll,
+                        Company::Ollama => monthly_credits(),
+                    };
+                    match self.subscription(account, &kind, record.t, usd) {
+                        Ok(value) => (Some(value), None),
+                        Err(missing) => (None, Some(missing)),
+                    }
+                }
             }
         };
         Valued {
@@ -1443,14 +1740,23 @@ impl Valuer {
     fn subscription(
         &self,
         account: &AccountRef,
+        kind: &LimitKind,
         at: DateTime<Utc>,
         usd: f64,
     ) -> Result<f64, Missing> {
+        // A record's missing window is worded for its subscription: Claude
+        // keeps "that week", OpenAI says "this week" and Ollama "this month"
+        // (decision P-2 7).
+        let no_reading = match Company::of_account(account) {
+            Company::Anthropic => Missing::NoReading,
+            Company::OpenAI => Missing::NoWeekReading,
+            Company::Ollama => Missing::NoMonthReading,
+        };
         let window = self
-            .window_holding(account, at)
+            .window_holding(account, kind, at)
             .map(|index| &self.windows[index])
-            .ok_or(Missing::NoReading)?;
-        let used = window.used.ok_or(Missing::NoReading)?;
+            .ok_or(no_reading.clone())?;
+        let used = window.used.ok_or(no_reading)?;
         let price = self.window_price(&window.account, window.start, window.end)?;
         if let Some(model) = &window.unpriced {
             return Err(Missing::UnpricedInWeek {
@@ -1462,7 +1768,13 @@ impl Valuer {
         if window.api_sum <= 0.0 {
             return Ok(0.0);
         }
-        Ok(usd / window.api_sum * window_money(price, used).used)
+        // One percent of a week is a week's share of the monthly price; one
+        // percent of Ollama's month is a hundredth of it (decision P-2 3).
+        let used_money = match kind {
+            LimitKind::WeeklyAll => window_money(price, used).used,
+            _ => month_money(price, used).used,
+        };
+        Ok(usd / window.api_sum * used_money)
     }
 
     /// The price of the window from `start` to `end`: the account's price at
@@ -1691,6 +2003,82 @@ pub(crate) mod tests {
         }
     }
 
+    /// The one Codex subscription the P-2 tests read under, as the provider
+    /// creates it.
+    fn codex() -> AccountRef {
+        AccountRef {
+            acc: "0f3a6c2e-7b1d-4e9a-8c5f-2d4b6a8e0c13".to_string(),
+            org: crate::providers::CODEX_ORG.to_string(),
+        }
+    }
+
+    /// A stored provider subscription with `abbr` and an optional monthly price,
+    /// as `accounts.json` holds it (decision P-2 1).
+    fn subscription(account: &AccountRef, abbr: &str, price: Option<f64>) -> ProviderSubscription {
+        ProviderSubscription {
+            account: account.clone(),
+            label: abbr.to_string(),
+            abbr: abbr.to_string(),
+            color: "#4a6f8c".to_string(),
+            plan: Some("Plus".to_string()),
+            price,
+            price_currency: price.map(|_| "EUR".to_string()),
+        }
+    }
+
+    fn provider_sample(
+        at: DateTime<Utc>,
+        account: &AccountRef,
+        end: DateTime<Utc>,
+        percent: f64,
+    ) -> Sample {
+        Sample {
+            t: at,
+            account: account.clone(),
+            src: Source::Poll,
+            l: vec![crate::history::LimitSample {
+                k: LimitKind::WeeklyAll,
+                m: None,
+                p: percent,
+                r: Some(end),
+                b: false,
+            }],
+        }
+    }
+
+    fn provider_price_changed(
+        at: DateTime<Utc>,
+        account: &AccountRef,
+        amount: f64,
+        currency: &str,
+    ) -> Event {
+        Event {
+            t: at,
+            kind: EventKind::PriceChanged {
+                account: account.clone(),
+                amount: Some(amount),
+                currency: Some(currency.to_string()),
+            },
+        }
+    }
+
+    fn provider_token(t: DateTime<Utc>, model: &str, input: u64) -> TokenRecord {
+        TokenRecord {
+            t,
+            minutes: 60,
+            session: "3f7b2c1e-9a4d-4e8f-8b6a-2c5d9e1f7a30".to_string(),
+            cwd: "/home/sam/projects/atlas".to_string(),
+            project: ProjectKey::Repo("github.com/acme/atlas".to_string()),
+            model: model.to_string(),
+            input,
+            out: 0,
+            cw: 0,
+            cr: 0,
+            answers: 1,
+            agent_answers: 0,
+        }
+    }
+
     fn weekly_window(start: DateTime<Utc>, end: DateTime<Utc>, final_percent: f64) -> WindowRecord {
         WindowRecord {
             account: ac(),
@@ -1835,6 +2223,7 @@ pub(crate) mod tests {
             &fx_eur(),
             &settings,
             &[],
+            &[],
             &RefCell::new(Vec::new()),
         )
         .expect("a valuer");
@@ -1843,7 +2232,11 @@ pub(crate) mod tests {
             &token(at, "deepseek-v4.1-flash:cloud", 0, 1_000_000, 0, 0),
         );
         assert_eq!(flash.api, Some(2.0));
-        assert_eq!(flash.subscription, Some(0.0), "outside the Claude plan");
+        assert_eq!(
+            flash.subscription, None,
+            "no month reading of Ollama's credits: never a 0"
+        );
+        assert_eq!(flash.subscription_missing, Some(Missing::NoMonthReading));
         let unpriced = valuer.value("atlas", &token(at, "glm-5:cloud", 0, 1_000_000, 0, 0));
         assert_eq!(unpriced.api, None);
         assert_eq!(
@@ -2020,6 +2413,7 @@ pub(crate) mod tests {
             &prices,
             &empty_fx(),
             &settings_eur(),
+            &[],
             &[],
             &RefCell::new(Vec::new()),
         )
@@ -2337,6 +2731,7 @@ pub(crate) mod tests {
             &empty_fx(),
             &settings_eur(),
             &[account],
+            &[],
             &RefCell::new(Vec::new()),
         )
         .expect("a valuer");
@@ -2380,6 +2775,7 @@ pub(crate) mod tests {
             &empty_fx(),
             &settings_eur(),
             &[account_with_price(Some(140.0))],
+            &[],
             &RefCell::new(Vec::new()),
         )
         .expect("a valuer");
@@ -2419,6 +2815,7 @@ pub(crate) mod tests {
             &empty_fx(),
             &settings_eur(),
             &[account_with_price(Some(140.0))],
+            &[],
             &warnings,
         )
         .expect("a valuer");
@@ -2450,6 +2847,7 @@ pub(crate) mod tests {
             &empty_fx(),
             &settings_eur(),
             &[account_with_price(Some(200.0))],
+            &[],
             &RefCell::new(Vec::new()),
         )
         .expect("a valuer");
@@ -2499,6 +2897,7 @@ pub(crate) mod tests {
             &empty_fx(),
             &settings_eur(),
             &[account_with_price(Some(140.0))],
+            &[],
             &RefCell::new(Vec::new()),
         )
         .expect("a valuer");
@@ -2544,6 +2943,7 @@ pub(crate) mod tests {
             &empty_fx(),
             &settings_eur(),
             &[account],
+            &[],
             &RefCell::new(Vec::new()),
         )
         .expect("a valuer");
@@ -2579,6 +2979,7 @@ pub(crate) mod tests {
             &empty_fx(),
             &settings_eur(),
             &[account],
+            &[],
             &RefCell::new(Vec::new()),
         )
         .expect("a valuer");
@@ -2606,6 +3007,7 @@ pub(crate) mod tests {
             &empty_fx(),
             &settings_eur(),
             &[account],
+            &[],
             &RefCell::new(Vec::new()),
         )
         .expect("a valuer");
@@ -2649,6 +3051,7 @@ pub(crate) mod tests {
             &empty_fx(),
             &settings_eur(),
             &[account],
+            &[],
             &RefCell::new(Vec::new()),
         )
         .expect("a valuer");
@@ -2847,6 +3250,7 @@ pub(crate) mod tests {
             &empty_fx(),
             &settings_eur(),
             &[account_with_price(Some(180.0))],
+            &[],
             &RefCell::new(Vec::new()),
         )
         .expect("a valuer");
@@ -2992,6 +3396,7 @@ pub(crate) mod tests {
                 &empty_fx(),
                 &settings_eur(),
                 &[account_with_price(None)],
+                &[],
                 &RefCell::new(Vec::new()),
             )
             .expect("a valuer")
@@ -3061,6 +3466,7 @@ pub(crate) mod tests {
             &empty_fx(),
             &settings_eur(),
             &[account_with_price(Some(140.0))],
+            &[],
             &RefCell::new(Vec::new()),
         )
         .expect("a valuer");
@@ -3105,6 +3511,7 @@ pub(crate) mod tests {
             &empty_fx(),
             &settings_eur(),
             &[account_with_price(Some(140.0))],
+            &[],
             &RefCell::new(Vec::new()),
         )
         .expect("a valuer");
@@ -3169,6 +3576,7 @@ pub(crate) mod tests {
                 &empty_fx(),
                 &settings_eur(),
                 &[account_with_price(Some(140.0))],
+                &[],
                 &RefCell::new(Vec::new()),
             )
             .expect("a valuer")
@@ -3216,6 +3624,7 @@ pub(crate) mod tests {
                 &empty_fx(),
                 &settings,
                 std::slice::from_ref(&account),
+                &[],
                 &RefCell::new(Vec::new()),
             )
             .expect("a valuer")
@@ -3264,6 +3673,7 @@ pub(crate) mod tests {
             &empty_fx(),
             &settings,
             &[account],
+            &[],
             &RefCell::new(Vec::new()),
         )
         .expect("a valuer");
@@ -3298,6 +3708,7 @@ pub(crate) mod tests {
             &empty_fx(),
             &settings_eur(),
             &[account_with_price(Some(140.0))],
+            &[],
             &RefCell::new(Vec::new()),
         )
         .expect("a valuer");
@@ -3344,6 +3755,18 @@ pub(crate) mod tests {
             "no reading of that week's usage"
         );
         assert_eq!(
+            Missing::NoMonthlyAllowance.to_string(),
+            "no monthly allowance in Ollama's reading"
+        );
+        assert_eq!(
+            Missing::NoWeekReading.to_string(),
+            "no reading of this week's usage"
+        );
+        assert_eq!(
+            Missing::NoMonthReading.to_string(),
+            "no reading of this month's usage"
+        );
+        assert_eq!(
             Missing::UnpricedInWeek {
                 model: "claude-unknown".to_string()
             }
@@ -3372,6 +3795,7 @@ pub(crate) mod tests {
                 &prices,
                 &fx_eur(),
                 settings,
+                &[],
                 &[],
                 &RefCell::new(Vec::new()),
             )
@@ -3423,6 +3847,7 @@ pub(crate) mod tests {
             &prices,
             &empty_fx(),
             &settings,
+            &[],
             &[],
             &RefCell::new(Vec::new()),
         )
@@ -3671,7 +4096,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn provider_records_do_not_change_the_valuer() {
+    fn provider_records_do_not_change_the_claude_windows() {
         let without = tiny();
         let with = tiny();
         append_codex_records(&with.history, utc("2026-11-14T09:00:00Z"));
@@ -3687,6 +4112,7 @@ pub(crate) mod tests {
             &without.fx,
             &without.settings,
             &without.accounts,
+            &[],
             &RefCell::new(Vec::new()),
         )
         .expect("the valuer");
@@ -3697,14 +4123,18 @@ pub(crate) mod tests {
             &with.fx,
             &with.settings,
             &with.accounts,
+            &[],
             &RefCell::new(Vec::new()),
         )
         .expect("the valuer");
 
+        // P-2 gives a provider subscription its own windows; the Claude
+        // accounts' windows must stay what they were.
         let windows = |valuer: &Valuer| {
             valuer
                 .windows
                 .iter()
+                .filter(|window| Company::of_account(&window.account) == Company::Anthropic)
                 .map(|window| {
                     (
                         window.account.clone(),
@@ -3725,6 +4155,278 @@ pub(crate) mod tests {
             "a Codex window changed the Claude windows"
         );
         assert_eq!(after.price_changes, before.price_changes);
+    }
+
+    /// A provider record takes its share of its own subscription's window (R4,
+    /// decision P-2 3): an OpenAI week 50 % used of a 23 EUR month price, with
+    /// two records 3:1 in API value, gives them 3:1 of the week's used money.
+    #[test]
+    fn a_provider_record_gets_its_share_of_the_subscription() {
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let account = codex();
+        history
+            .append(&provider_sample(
+                utc("2026-11-16T09:00:00Z"),
+                &account,
+                utc("2026-11-20T10:00:00Z"),
+                50.0,
+            ))
+            .expect("the Codex reading");
+        history
+            .append(&provider_price_changed(
+                utc("2026-11-01T00:00:00Z"),
+                &account,
+                23.0,
+                "EUR",
+            ))
+            .expect("the subscription's price");
+        let mut prices = Prices::default();
+        prices.take(
+            BTreeMap::from([(
+                "openai/gpt-6.2-codex".to_string(),
+                ModelPrice {
+                    input: 10.0,
+                    output: 0.0,
+                    cache_write: 0.0,
+                    cache_read: 0.0,
+                    tiered: false,
+                },
+            )]),
+            utc("2026-11-01T00:00:00Z"),
+        );
+        let big = provider_token(utc("2026-11-16T10:00:00Z"), "gpt-6.2-codex", 3_000_000);
+        let small = provider_token(utc("2026-11-16T11:00:00Z"), "gpt-6.2-codex", 1_000_000);
+        history.append(&big).expect("a Codex record");
+        history.append(&small).expect("a Codex record");
+        let valuer = Valuer::build(
+            &history,
+            &range("2026-11-16T00:00:00Z", "2026-11-17T00:00:00Z"),
+            &prices,
+            &empty_fx(),
+            &settings_eur(),
+            &[],
+            &[subscription(&account, "OA", None)],
+            &RefCell::new(Vec::new()),
+        )
+        .expect("a valuer");
+
+        let one = valuer.value("atlas", &big);
+        let two = valuer.value("atlas", &small);
+        assert_eq!(one.company, Company::OpenAI);
+        assert_eq!(one.account, Some(account.clone()));
+        assert_eq!(two.account, Some(account));
+        assert_eq!(one.api, Some(30.0));
+        assert_eq!(two.api, Some(10.0));
+        assert_eq!(one.subscription_missing, None);
+        assert_eq!(two.subscription_missing, None);
+
+        let week = 50.0 * percent_value(23.0);
+        assert!((one.subscription.expect("a value") - 0.75 * week).abs() < 1e-9);
+        assert!((two.subscription.expect("a value") - 0.25 * week).abs() < 1e-9);
+        assert!(
+            (one.subscription.expect("a value") + two.subscription.expect("a value") - week).abs()
+                < 1e-9
+        );
+    }
+
+    /// Without a price the subscription share is missing with its reason, and
+    /// the API value stays (decision P-2 3, Review Focus 5); never a 0.
+    #[test]
+    fn a_provider_without_a_price_has_no_subscription_value() {
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let account = codex();
+        history
+            .append(&provider_sample(
+                utc("2026-11-16T09:00:00Z"),
+                &account,
+                utc("2026-11-20T10:00:00Z"),
+                50.0,
+            ))
+            .expect("the Codex reading");
+        let mut prices = Prices::default();
+        prices.take(
+            BTreeMap::from([(
+                "openai/gpt-6.2-codex".to_string(),
+                ModelPrice {
+                    input: 10.0,
+                    output: 0.0,
+                    cache_write: 0.0,
+                    cache_read: 0.0,
+                    tiered: false,
+                },
+            )]),
+            utc("2026-11-01T00:00:00Z"),
+        );
+        let record = provider_token(utc("2026-11-16T10:00:00Z"), "gpt-6.2-codex", 3_000_000);
+        history.append(&record).expect("a Codex record");
+        let valuer = Valuer::build(
+            &history,
+            &range("2026-11-16T00:00:00Z", "2026-11-17T00:00:00Z"),
+            &prices,
+            &empty_fx(),
+            &settings_eur(),
+            &[],
+            &[subscription(&account, "OA", None)],
+            &RefCell::new(Vec::new()),
+        )
+        .expect("a valuer");
+
+        let value = valuer.value("atlas", &record);
+        assert_eq!(value.account, Some(account));
+        assert_eq!(value.api, Some(30.0), "the API value stays");
+        assert_eq!(value.subscription, None);
+        assert_eq!(value.subscription_missing, Some(Missing::NoAccountPrice));
+    }
+
+    /// A record's OpenAI subscription is the stored one the `providerSwitch`
+    /// rule names, never a window or a sample of the page's range (decision
+    /// P-2 1, review B): two stored logins with no switch are `NoAccount` for a
+    /// narrow and a wide range alike, and one stored login is chosen for both.
+    #[test]
+    fn a_records_openai_subscription_does_not_depend_on_the_range() {
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let oa = codex();
+        let oa2 = AccountRef {
+            acc: "5d2e7a1c-3b4f-4a6e-9c8d-1f2a3b4c5d6e".to_string(),
+            org: crate::providers::CODEX_ORG.to_string(),
+        };
+        // OA was read in October and OA2 on 16 November; neither reading may
+        // decide which login the record belongs to.
+        history
+            .append(&provider_sample(
+                utc("2026-10-20T09:00:00Z"),
+                &oa,
+                utc("2026-11-01T00:00:00Z"),
+                30.0,
+            ))
+            .expect("OA's October reading");
+        history
+            .append(&provider_sample(
+                utc("2026-11-16T09:00:00Z"),
+                &oa2,
+                utc("2026-11-20T10:00:00Z"),
+                40.0,
+            ))
+            .expect("OA2's reading");
+        let record = provider_token(utc("2026-11-16T10:00:00Z"), "gpt-6.2-codex", 1_000_000);
+        history.append(&record).expect("a Codex record");
+        let mut prices = Prices::default();
+        prices.take(
+            BTreeMap::from([(
+                "openai/gpt-6.2-codex".to_string(),
+                ModelPrice {
+                    input: 10.0,
+                    output: 0.0,
+                    cache_write: 0.0,
+                    cache_read: 0.0,
+                    tiered: false,
+                },
+            )]),
+            utc("2026-11-01T00:00:00Z"),
+        );
+        let narrow = range("2026-11-16T00:00:00Z", "2026-11-17T00:00:00Z");
+        let wide = range("2026-10-01T00:00:00Z", "2026-11-17T00:00:00Z");
+
+        for range in [&narrow, &wide] {
+            let two = [
+                subscription(&oa, "OA", None),
+                subscription(&oa2, "OA2", None),
+            ];
+            let valuer = Valuer::build(
+                &history,
+                range,
+                &prices,
+                &empty_fx(),
+                &settings_eur(),
+                &[],
+                &two,
+                &RefCell::new(Vec::new()),
+            )
+            .expect("a valuer");
+            let value = valuer.value("atlas", &record);
+            assert_eq!(
+                value.account, None,
+                "two stored OpenAI logins with no switch guess one"
+            );
+            assert_eq!(value.subscription_missing, Some(Missing::NoAccount));
+
+            let one = [subscription(&oa, "OA", None)];
+            let valuer = Valuer::build(
+                &history,
+                range,
+                &prices,
+                &empty_fx(),
+                &settings_eur(),
+                &[],
+                &one,
+                &RefCell::new(Vec::new()),
+            )
+            .expect("a valuer");
+            let value = valuer.value("atlas", &record);
+            assert_eq!(
+                value.account,
+                Some(oa.clone()),
+                "the only stored OpenAI login is the one for both ranges"
+            );
+        }
+    }
+
+    /// A subscription's stored monthly price is the price where no
+    /// `PriceChanged` names it, exactly as a Claude account's stored price is
+    /// (decision P-2 1).
+    #[test]
+    fn a_provider_price_without_an_event_is_the_stored_price() {
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let account = codex();
+        history
+            .append(&provider_sample(
+                utc("2026-11-16T09:00:00Z"),
+                &account,
+                utc("2026-11-20T10:00:00Z"),
+                50.0,
+            ))
+            .expect("the Codex reading");
+        let mut prices = Prices::default();
+        prices.take(
+            BTreeMap::from([(
+                "openai/gpt-6.2-codex".to_string(),
+                ModelPrice {
+                    input: 10.0,
+                    output: 0.0,
+                    cache_write: 0.0,
+                    cache_read: 0.0,
+                    tiered: false,
+                },
+            )]),
+            utc("2026-11-01T00:00:00Z"),
+        );
+        let record = provider_token(utc("2026-11-16T10:00:00Z"), "gpt-6.2-codex", 1_000_000);
+        history.append(&record).expect("a Codex record");
+        let stored = [subscription(&account, "OA", Some(23.0))];
+        let valuer = Valuer::build(
+            &history,
+            &range("2026-11-16T00:00:00Z", "2026-11-17T00:00:00Z"),
+            &prices,
+            &empty_fx(),
+            &settings_eur(),
+            &[],
+            &stored,
+            &RefCell::new(Vec::new()),
+        )
+        .expect("a valuer");
+
+        let value = valuer.value("atlas", &record);
+        assert_eq!(value.account, Some(account));
+        assert_eq!(value.subscription_missing, None);
+        assert!(
+            (value.subscription.expect("a value") - 50.0 * percent_value(23.0)).abs() < 1e-9,
+            "50 % of the stored 23 EUR: {:?}",
+            value.subscription
+        );
     }
 
     #[test]
@@ -3828,6 +4530,7 @@ pub(crate) mod tests {
             &empty_fx(),
             &settings_eur(),
             &[account_with_price(Some(140.0))],
+            &[],
             &RefCell::new(Vec::new()),
         )
         .expect("a valuer");
@@ -3836,15 +4539,30 @@ pub(crate) mod tests {
         assert_eq!(value.company, Company::OpenAI);
         assert_eq!(
             value.account, None,
-            "AC was live, but Codex uses no Claude account"
+            "AC was live, but Codex uses no Claude account; the history names \
+             no OpenAI subscription here, so none is guessed"
         );
-        assert_eq!(value.api, Some(20.0));
-        assert_eq!(value.subscription, Some(0.0));
-        assert_eq!(value.subscription_missing, None);
+        assert_eq!(
+            value.api,
+            Some(20.0),
+            "the API value stays (Review Focus 5)"
+        );
+        assert_eq!(value.subscription, None);
+        assert_eq!(value.subscription_missing, Some(Missing::NoAccount));
 
         let value = valuer.value("atlas", &flash);
         assert_eq!(value.company, Company::Ollama);
-        assert_eq!(value.account, None);
+        assert_eq!(value.account, Some(ollama_subscription()));
+        assert_eq!(
+            value.subscription, None,
+            "no month reading of Ollama's credits, and the model has no price"
+        );
+        assert_eq!(
+            value.subscription_missing,
+            Some(Missing::NoPrice {
+                model: "deepseek-v4.1-flash:cloud".to_string()
+            })
+        );
 
         let value = valuer.value("atlas", &opus);
         assert_eq!(value.company, Company::Anthropic);
@@ -3887,6 +4605,7 @@ pub(crate) mod tests {
             &empty_fx(),
             &settings_eur(),
             &[account_with_price(Some(140.0))],
+            &[],
             &RefCell::new(Vec::new()),
         )
         .expect("a valuer");
@@ -3901,11 +4620,21 @@ pub(crate) mod tests {
         }
         let worker_value = valuer.value("atlas", &worker);
         assert_eq!(
-            worker_value.subscription,
-            Some(0.0),
-            "a worker uses no share of the Claude account's week"
+            worker_value.account,
+            Some(ollama_subscription()),
+            "the worker belongs to Ollama's subscription, not to AC"
         );
-        assert_eq!(worker_value.subscription_missing, None);
+        assert_eq!(
+            worker_value.subscription, None,
+            "a worker uses no share of the Claude account's week; Ollama's month \
+             has no reading here, so its value is unknown, never a 0"
+        );
+        assert_eq!(
+            worker_value.subscription_missing,
+            Some(Missing::NoPrice {
+                model: "deepseek-v4.1-flash:cloud".to_string()
+            })
+        );
 
         let api_sum: f64 = valuer.windows.iter().map(|window| window.api_sum).sum();
         assert!(
@@ -3964,6 +4693,7 @@ pub(crate) mod tests {
             &empty_fx(),
             &settings_eur(),
             &[account_with_price(Some(140.0))],
+            &[],
             &RefCell::new(Vec::new()),
         )
         .expect("a valuer");
@@ -4015,6 +4745,7 @@ pub(crate) mod tests {
             &empty_fx(),
             &settings_eur(),
             &[account_with_price(Some(140.0))],
+            &[],
             &RefCell::new(Vec::new()),
         )
         .expect("a valuer");
@@ -4081,6 +4812,7 @@ pub(crate) mod tests {
             &empty_fx(),
             &settings_eur(),
             &[account_with_price(Some(140.0))],
+            &[],
             &RefCell::new(Vec::new()),
         )
         .expect("a valuer");
