@@ -652,7 +652,9 @@ pub enum WatchError { Notify(#[from] notify::Error), Io { path: PathBuf, source:
 
 /// Watches the folder holding credentials_file and the folder holding identity_file (non-recursive:
 /// Claude Code and seatswap replace the files by rename, so the folders are watched, not the
-/// files; one watch when both are the same folder). Events for other names are ignored. After a
+/// files; one watch when both are the same folder), plus the parent of each existing folder, where
+/// its removal shows up (on Windows a removed folder's own watch ends without an event). Events
+/// for other paths are ignored (a file of the same name in a parent is not the login). After a
 /// relevant event: wait until DEBOUNCE passes without another one, then until
 /// locks::claude_locks_busy() is false (re-checked every BUSY_RECHECK), then call `on_change` once.
 /// The callback runs on the watcher's own thread, never concurrently with itself. A missing folder

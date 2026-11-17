@@ -95,15 +95,16 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// Watch the folders that hold the credentials file and the identity file.
 /// Both are watched non-recursively (the files are replaced by rename); a folder
-/// that is the same for both files is watched once. Events for other file names,
-/// and pure read-access events, are ignored.
+/// that is the same for both files is watched once. Events for other files, and
+/// pure read-access events, are ignored.
 ///
 /// A missing folder is not an error: Claude Code has not been set up yet
 /// ([`WatchState::NotSetUp`]). Its nearest existing parent is watched instead,
 /// and when the folder appears the watch moves to it and `on_change` is called
 /// (files written before the new watch took hold are then read by the
-/// callback). A folder that goes away moves the watch back up the same way.
-/// No folder is created. A path that exists but is not a folder, or that
+/// callback). A folder that goes away moves the watch back up the same way: the
+/// parent of every existing folder is watched as well, because on Windows the
+/// watch of a removed folder ends without an event. No folder is created. A path that exists but is not a folder, or that
 /// cannot be read, is an error.
 pub fn watch(
     claude: &ClaudePaths,
@@ -264,7 +265,8 @@ fn same_paths(a: &[PathBuf], b: &[PathBuf]) -> bool {
 }
 
 /// Bring the backend's watches in line with the folders as they are now, and
-/// say whether every folder exists. New watches are added before old ones are
+/// say whether every folder exists. An existing folder is watched together with
+/// its parent, where its own removal shows up. New watches are added before old ones are
 /// removed, and the plan is checked again afterwards, so a folder that appears
 /// in between is still followed.
 fn follow_folders(
@@ -278,8 +280,11 @@ fn follow_folders(
         for folder in folders {
             let (point, present) = watch_point(folder)?;
             set_up &= present;
-            if !wanted.contains(&point) {
-                wanted.push(point);
+            let parent = folder.parent().filter(|_| present);
+            for path in std::iter::once(point).chain(parent.map(Path::to_path_buf)) {
+                if !wanted.contains(&path) {
+                    wanted.push(path);
+                }
             }
         }
         if same_paths(&wanted, watched) {
@@ -327,17 +332,21 @@ fn ensure_folder(path: &Path) -> Result<(), WatchError> {
     }
 }
 
-/// The two file names an event can be about.
+/// The two files an event can be about. A watched parent folder may hold
+/// another file with the same name (`~/.claude.json` beside a `CLAUDE_CONFIG_DIR`
+/// folder), so the whole path counts, not the name.
 struct WatchedNames {
-    credentials: std::ffi::OsString,
-    identity: std::ffi::OsString,
+    credentials: PathBuf,
+    identity: PathBuf,
 }
 
 impl WatchedNames {
     fn of(claude: &ClaudePaths) -> Result<WatchedNames, WatchError> {
+        file_name(&claude.credentials_file)?;
+        file_name(&claude.identity_file)?;
         Ok(WatchedNames {
-            credentials: file_name(&claude.credentials_file)?.to_os_string(),
-            identity: file_name(&claude.identity_file)?.to_os_string(),
+            credentials: claude.credentials_file.clone(),
+            identity: claude.identity_file.clone(),
         })
     }
 
@@ -352,9 +361,7 @@ impl WatchedNames {
     }
 
     fn is_watched(&self, path: &Path) -> bool {
-        path.file_name().is_some_and(|name| {
-            name == self.credentials.as_os_str() || name == self.identity.as_os_str()
-        })
+        path == self.credentials || path == self.identity
     }
 }
 
@@ -694,6 +701,24 @@ mod tests {
         assert!(
             received.recv_timeout(Duration::from_millis(1500)).is_err(),
             "an unrelated file must not call on_change"
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        drop(watcher);
+    }
+
+    #[test]
+    fn a_login_file_name_in_the_watched_parent_is_not_the_login() {
+        // The config folder's parent is watched for the folder's removal; the
+        // default `~/.claude.json` there is not this config folder's identity.
+        let tmp = TempDir::new().unwrap();
+        let paths = config_paths(&tmp);
+        let (watcher, count, received) = watched(&paths);
+        for name in [".claude.json", ".credentials.json"] {
+            atomic::write_atomic(&tmp.path().join(name), b"{}", atomic::Access::Private).unwrap();
+        }
+        assert!(
+            received.recv_timeout(Duration::from_millis(1500)).is_err(),
+            "a file of the same name beside the config folder must not call on_change"
         );
         assert_eq!(count.load(Ordering::SeqCst), 0);
         drop(watcher);
