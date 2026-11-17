@@ -21,7 +21,9 @@ use seatswap_core::codex_sessions::{self, CodexSession};
 use seatswap_core::feed;
 use seatswap_core::harness::{self, HarnessPaths, HarnessSession};
 use seatswap_core::history::{EventKind, HistoryDir, Range, Recorder, SessionRecord, TokenRecord};
-use seatswap_core::live_sessions::{self, LiveSession, LiveStatus, OtherHost, Rows};
+use seatswap_core::live_sessions::{
+    self, LiveSession, LiveStatus, OtherHost, RecordedTokens, Rows,
+};
 use seatswap_core::money::{is_plan_model, Fx, Prices, Valuer};
 use seatswap_core::paths::{AppPaths, ClaudePaths, CodexPaths};
 use seatswap_core::project::{self, ProjectKey};
@@ -172,9 +174,10 @@ impl ViewThrottle {
     }
 }
 
-/// The projects and the pricing the rows are built with. They are built and
-/// rebuilt apart from each other: a failing one does not keep the other from
-/// being built, and the rows are built with what is there.
+/// The projects, the pricing and the running sessions' token records the rows
+/// are built with. They are built and rebuilt apart from each other: a failing
+/// one does not keep the others from being built, and the rows are built with
+/// what is there.
 #[derive(Default)]
 struct RowsContext {
     projects: Option<ProjectsBuilt>,
@@ -183,6 +186,9 @@ struct RowsContext {
     pricing: Option<PricingBuilt>,
     /// Why the pricing could not be built, and when that was tried.
     pricing_failure: Option<ContextFailure>,
+    recorded: Option<RecordedBuilt>,
+    /// Why the token records could not be read, and when that was tried.
+    recorded_failure: Option<ContextFailure>,
     /// The settings' currency from the accounts file, read whether or not the
     /// prices could be read.
     currency: Option<String>,
@@ -205,6 +211,9 @@ struct ProjectsBuilt {
 }
 
 struct PricingBuilt {
+    /// The start of the range the valuer was built for: it values a record
+    /// of that range or later with its whole week.
+    from: DateTime<Utc>,
     valuer: Valuer,
     settings: Settings,
     /// The prices as they were read, so a model without one can be asked for
@@ -219,6 +228,26 @@ struct PricingBuilt {
 /// [`LookupClient::want_price`]). A type of its own so the memory's field stays
 /// readable.
 type WantPrice = Box<dyn Fn(&str)>;
+
+/// This host's token records of the running sessions: read from the history
+/// when built, then kept current with every line this host writes
+/// ([`RecordedTokens::add`]), so a pass does not read the history again.
+struct RecordedBuilt {
+    tokens: RecordedTokens,
+    /// The history read's warnings, shown on every pass like the projects'.
+    warnings: Vec<String>,
+    built: DateTime<Utc>,
+}
+
+/// What the rows of one pass are built with ([`prepare_rows_context`]).
+struct RowsInputs<'a> {
+    projects: Option<&'a projects::Projects>,
+    pricing: live_sessions::Pricing<'a>,
+    /// The settings' currency from the accounts file.
+    currency: Option<String>,
+    /// The running sessions' token records, or why they cannot be read.
+    recorded: Result<&'a RecordedTokens, String>,
+}
 
 struct ContextFailure {
     text: String,
@@ -257,6 +286,9 @@ pub(crate) struct SessionMemory {
     harness_paths: Option<HarnessPaths>,
     /// Why the Harness folders cannot be found, said in the view's warnings.
     harness_error: Option<String>,
+    /// flash-agents' job reports read so far: a job's Harness id and label.
+    /// The labels are task texts and live only here.
+    job_reports: harness::JobReports,
     /// Codex's home; `None` when it cannot be found, or in a test that does not
     /// build a store.
     codex_paths: Option<CodexPaths>,
@@ -302,6 +334,9 @@ pub(crate) struct SessionMemory {
     /// The models already asked for in this run, so an unpriced model is asked
     /// for once while that stays so.
     wanted_models: BTreeSet<String>,
+    /// The most transcript bytes one pass reads: [`SCAN_BUDGET`]. A test
+    /// lowers it to reach the limit with small transcripts.
+    scan_budget: u64,
 }
 
 impl SessionMemory {
@@ -321,6 +356,7 @@ impl SessionMemory {
             history_error: None,
             harness_paths: None,
             harness_error: None,
+            job_reports: harness::JobReports::default(),
             codex_paths: None,
             codex_error: None,
             rows: None,
@@ -339,6 +375,7 @@ impl SessionMemory {
             feed_costs: BTreeMap::new(),
             want_price: None,
             wanted_models: BTreeSet::new(),
+            scan_budget: SCAN_BUDGET,
         }
     }
 
@@ -436,28 +473,52 @@ fn part_needs_build(
     failure.is_none_or(|failure| is_due(Some(failure.tried), now, ROWS_CONTEXT_RETRY_SECS))
 }
 
-/// Build the two parts of the rows context that are due, show every failure
-/// that is still current once, and hand out the projects and the pricing the
-/// rows are built with.
+/// [`part_needs_build`] for a part built for a range: also when the part
+/// built does not reach back far enough (`short`). A failed build is tried
+/// again only after [`ROWS_CONTEXT_RETRY_SECS`] either way, so a range that
+/// cannot be built is not tried on every pass.
+fn ranged_part_needs_build(
+    built: Option<DateTime<Utc>>,
+    failure: Option<&ContextFailure>,
+    short: bool,
+    now: DateTime<Utc>,
+) -> bool {
+    let retry =
+        failure.is_none_or(|failure| is_due(Some(failure.tried), now, ROWS_CONTEXT_RETRY_SECS));
+    part_needs_build(built, failure, now) || (short && retry)
+}
+
+/// Build the parts of the rows context that are due, show every failure that
+/// is still current once, and hand out what the rows are built with.
+///
+/// `needed_from` is the first hour of the running sessions' token records
+/// ([`live_sessions::records_from`]); `None` when no session runs. The token records
+/// are read when they are due or do not reach back that far, and the valuer is
+/// built for a range that starts there too (or a day ago, whichever is
+/// earlier), so every record of a running session is valued with its whole
+/// week.
 fn prepare_rows_context<'a>(
     context: &'a mut RowsContext,
     app: &AppPaths,
     history: &HistoryDir,
+    needed_from: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
     summary: &mut SessionsSummary,
-) -> (
-    Option<&'a projects::Projects>,
-    live_sessions::Pricing<'a>,
-    Option<String>,
-) {
+) -> RowsInputs<'a> {
     let projects_due = part_needs_build(
         context.projects.as_ref().map(|built| built.built),
         context.projects_failure.as_ref(),
         now,
     );
-    let pricing_due = part_needs_build(
+    let day_ago = now - ChronoDuration::days(1);
+    let pricing_from = needed_from.map_or(day_ago, |from| from.min(day_ago));
+    let pricing_due = ranged_part_needs_build(
         context.pricing.as_ref().map(|built| built.built),
         context.pricing_failure.as_ref(),
+        context
+            .pricing
+            .as_ref()
+            .is_some_and(|built| built.from > pricing_from),
         now,
     );
     if projects_due || pricing_due {
@@ -501,13 +562,14 @@ fn prepare_rows_context<'a>(
                     app,
                     history,
                     &Range {
-                        from: now - ChronoDuration::days(1),
+                        from: pricing_from,
                         to: now,
                     },
                     file,
                 ) {
                     Ok((valuer, settings, prices, fx)) => {
                         context.pricing = Some(PricingBuilt {
+                            from: pricing_from,
                             valuer,
                             settings,
                             prices,
@@ -529,6 +591,7 @@ fn prepare_rows_context<'a>(
             }
         }
     }
+    prepare_recorded(context, history, needed_from, now);
 
     let projects_failure = context
         .projects_failure
@@ -547,23 +610,99 @@ fn prepare_rows_context<'a>(
             add_unavailable(summary, text.clone());
         }
     }
+    if let Some(failure) = &context.recorded_failure {
+        add_unavailable(summary, failure.text.clone());
+    }
     if let Some(built) = &context.projects {
         for warning in &built.warnings {
             add_warning(summary, warning.clone());
         }
     }
+    if let Some(built) = &context.recorded {
+        for warning in &built.warnings {
+            add_warning(summary, warning.clone());
+        }
+    }
     let projects = context.projects.as_ref().map(|built| &built.projects);
+    // A valuer built for a later start would value the older records without
+    // their weeks: it is not used then, as the records below.
     let pricing = match &context.pricing {
-        Some(built) => live_sessions::Pricing::Known {
+        Some(built) if built.from <= pricing_from => live_sessions::Pricing::Known {
             valuer: &built.valuer,
             settings: &built.settings,
         },
-        None => live_sessions::Pricing::Unknown {
+        _ => live_sessions::Pricing::Unknown {
             reason: pricing_failure.unwrap_or_else(|| "the values cannot be read".to_string()),
         },
     };
-    let currency = context.currency.clone();
-    (projects, pricing, currency)
+    // Records that do not reach back to every running session's first hour
+    // would count only part of a row: they are not used then.
+    let recorded = match (&context.recorded, &context.recorded_failure) {
+        (Some(built), _) if needed_from.is_none_or(|from| built.tokens.covers(from)) => {
+            Ok(&built.tokens)
+        }
+        (_, Some(failure)) => Err(failure.text.clone()),
+        (_, None) => Err("the sessions' token records are not read yet".to_string()),
+    };
+    RowsInputs {
+        projects,
+        pricing,
+        currency: context.currency.clone(),
+        recorded,
+    }
+}
+
+/// Read the running sessions' token records when they are due: never read,
+/// older than [`ROWS_CONTEXT_MAX_AGE_SECS`], or not reaching back to
+/// `needed_from`. A failed read is tried again after
+/// [`ROWS_CONTEXT_RETRY_SECS`]; the records kept until then stay current
+/// through the lines this host writes. Without a running session nothing is
+/// read; an empty set is kept, so the first session that runs reads its
+/// records.
+fn prepare_recorded(
+    context: &mut RowsContext,
+    history: &HistoryDir,
+    needed_from: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) {
+    let Some(from) = needed_from else {
+        if context.recorded.is_none() {
+            context.recorded = Some(RecordedBuilt {
+                tokens: RecordedTokens::default(),
+                warnings: Vec::new(),
+                built: now,
+            });
+        }
+        return;
+    };
+    let due = ranged_part_needs_build(
+        context.recorded.as_ref().map(|built| built.built),
+        context.recorded_failure.as_ref(),
+        context
+            .recorded
+            .as_ref()
+            .is_none_or(|built| !built.tokens.covers(from)),
+        now,
+    );
+    if !due {
+        return;
+    }
+    match RecordedTokens::read(history, from) {
+        Ok((tokens, warnings)) => {
+            context.recorded = Some(RecordedBuilt {
+                tokens,
+                warnings,
+                built: now,
+            });
+            context.recorded_failure = None;
+        }
+        Err(error) => {
+            context.recorded_failure = Some(ContextFailure {
+                text: format!("the sessions' token records cannot be read: {error}"),
+                tried: now,
+            });
+        }
+    }
 }
 
 /// Read the prices, the dollar rate and the accounts and build the valuer for
@@ -1233,10 +1372,13 @@ pub(crate) fn run_pass(
     }
 
     // Transcripts. A state that could not be read keeps the session counts but
-    // stops every transcript read, as the settings say.
+    // stops every transcript read, as the settings say. The token lines this
+    // pass reads but cannot write stay `unwritten`: their answers are read again
+    // next pass, and until then the running rows still count them.
     let mut scan_complete = true;
+    let mut unwritten: Vec<TokenRecord> = Vec::new();
     if state_error.is_none() {
-        match transcripts::scan(claude, state, SCAN_BUDGET) {
+        match transcripts::scan(claude, state, memory.scan_budget) {
             Ok(mut scan) => {
                 scan_complete = scan.complete;
                 let tokens = transcripts::token_records(&scan.answers, scan.state(), &memory.home);
@@ -1249,6 +1391,7 @@ pub(crate) fn run_pass(
                     // offsets stay where they were, so a later pass with a
                     // working history reads these answers again.
                     scan_complete = true;
+                    unwritten = tokens;
                 } else {
                     // Put the scanned offsets on disk before the token lines: a
                     // crash between the two steps loses those answers (the disk
@@ -1270,7 +1413,9 @@ pub(crate) fn run_pass(
                             };
                             if tokens_written {
                                 scan.commit(state);
+                                recorded_lines_written(memory, &tokens);
                             } else {
+                                unwritten = tokens.clone();
                                 // The token lines are not written: put the old
                                 // offsets back on disk, so a restart reads the
                                 // same answers again and nothing is counted
@@ -1298,8 +1443,19 @@ pub(crate) fn run_pass(
                                 format!("the transcript state cannot be written: {error}"),
                             );
                             scan_complete = true;
+                            unwritten = tokens;
                         }
                     }
+                }
+                // A scan that is not committed starts at the same offsets every
+                // pass, so a backlog past the budget is never read until its
+                // lines can be written: the running rows count only the part
+                // read, never a part twice. Say so, never show it as all.
+                if !unwritten.is_empty() && !scan.complete {
+                    add_warning(
+                        &mut summary,
+                        "the transcripts hold more new answers than one pass reads, and they cannot be recorded: the running sessions count only the part read until the history can be written".to_string(),
+                    );
                 }
             }
             Err(error) => {
@@ -1414,7 +1570,14 @@ pub(crate) fn run_pass(
                 for warning in &read.warnings {
                     add_warning(&mut summary, warning.clone());
                 }
-                let links = harness::links(paths, &state.sessions, &state.closed_flash_jobs);
+                for warning in memory.job_reports.refresh(paths) {
+                    add_warning(&mut summary, warning);
+                }
+                let links = harness::links(
+                    &memory.job_reports,
+                    &state.sessions,
+                    &state.closed_flash_jobs,
+                );
                 for warning in &links.warnings {
                     add_warning(&mut summary, warning.clone());
                 }
@@ -1519,27 +1682,36 @@ pub(crate) fn run_pass(
     // the projects' default names and says why the values are missing, so a
     // waiting session still notifies.
     let mut currency = None;
+    let harness = HarnessInputs {
+        sessions: &harness_sessions,
+        owners: &harness_owners,
+        claude_cwd: &claude_cwd,
+        locks: &harness_locks,
+        recorded: &harness_recorded,
+    };
     let (mut rows, live) = match recorder {
         Some(recorder) => {
             let mut context = memory.rows_context.take().unwrap_or_default();
             let (rows, live) = {
-                let (projects, pricing, settings_currency) =
-                    prepare_rows_context(&mut context, app, recorder.dir(), now, &mut summary);
-                currency = settings_currency;
+                let inputs = prepare_rows_context(
+                    &mut context,
+                    app,
+                    recorder.dir(),
+                    live_sessions::records_from(&running.sessions, state),
+                    now,
+                    &mut summary,
+                );
+                currency = inputs.currency.clone();
                 live_rows(
                     &running.sessions,
                     state,
                     memory,
                     &agents_by_session,
-                    projects,
-                    &pricing,
+                    &inputs,
+                    &unwritten,
                     recorder.dir().host(),
                     now,
-                    &harness_sessions,
-                    &harness_owners,
-                    &claude_cwd,
-                    &harness_locks,
-                    &harness_recorded,
+                    &harness,
                     &codex_sessions,
                     &codex_open_files,
                 )
@@ -1548,25 +1720,29 @@ pub(crate) fn run_pass(
             (Some(rows), live)
         }
         None => {
-            let pricing = live_sessions::Pricing::Unknown {
-                reason: memory.history_error.clone().unwrap_or_else(|| {
-                    "the history is not open, so the values are not known".to_string()
-                }),
+            // Without a history nothing is recorded: a running row counts its
+            // transcripts, and its values are unknown with the reason.
+            let reason = memory.history_error.clone().unwrap_or_else(|| {
+                "the history is not open, so the values are not known".to_string()
+            });
+            let inputs = RowsInputs {
+                projects: None,
+                pricing: live_sessions::Pricing::Unknown {
+                    reason: reason.clone(),
+                },
+                currency: None,
+                recorded: Err(reason),
             };
             let (rows, live) = live_rows(
                 &running.sessions,
                 state,
                 memory,
                 &agents_by_session,
-                None,
-                &pricing,
+                &inputs,
+                &unwritten,
                 "",
                 now,
-                &harness_sessions,
-                &harness_owners,
-                &claude_cwd,
-                &harness_locks,
-                &harness_recorded,
+                &harness,
                 &codex_sessions,
                 &codex_open_files,
             );
@@ -1748,6 +1924,8 @@ pub(crate) fn run_pass(
                                 format!("the Harness token totals cannot be written back: {error}"),
                             );
                         }
+                    } else {
+                        recorded_lines_written(memory, &harness_tokens);
                     }
                 }
                 Err(error) => {
@@ -1913,11 +2091,9 @@ fn pass_without_running(
             let mut context = memory.rows_context.take().unwrap_or_default();
             // The settings' currency, the projects and the pricing the closed
             // rows need; the running rows are not built.
-            let currency = {
-                let (_, _, currency) =
-                    prepare_rows_context(&mut context, app, recorder.dir(), now, &mut summary);
-                currency
-            };
+            let currency =
+                prepare_rows_context(&mut context, app, recorder.dir(), None, now, &mut summary)
+                    .currency;
             memory.rows_context = Some(context);
             currency
         }
@@ -2203,77 +2379,132 @@ struct SessionAgents<'a> {
     linked: AgentCounts,
 }
 
+/// The Harness store's part of a pass that the rows are built from.
+struct HarnessInputs<'a> {
+    sessions: &'a [HarnessSession],
+    owners: &'a BTreeMap<String, String>,
+    claude_cwd: &'a BTreeMap<String, String>,
+    locks: &'a BTreeSet<String>,
+    recorded: &'a BTreeMap<String, HarnessRecorded>,
+}
+
+/// Lines this host just wrote to the history: the running sessions' token
+/// records keep them, so the next pass counts them without reading the history
+/// again.
+fn recorded_lines_written(memory: &mut SessionMemory, lines: &[TokenRecord]) {
+    if let Some(built) = memory
+        .rows_context
+        .as_mut()
+        .and_then(|context| context.recorded.as_mut())
+    {
+        built.tokens.add(lines);
+    }
+}
+
 /// The rows of this host from the session files, with the project look-up the
-/// thread caches and the pricing that is known.
+/// thread caches and what [`prepare_rows_context`] built.
+///
+/// The Harness rows come first: their token lines are written after the rows,
+/// so a running Claude Code row counts its linked workers' growth of this pass
+/// from them, with `unwritten` (the transcript lines this pass could not
+/// write), beside the records the history holds; `running` puts its workers
+/// under it without adding their tokens again. Without records the rows count
+/// their transcripts ([`live_sessions::RowTokens::Transcripts`]).
 #[allow(clippy::too_many_arguments)]
 fn live_rows(
     files: &[SessionFile],
     state: &ScanState,
     memory: &mut SessionMemory,
     agents: &HashMap<String, Vec<transcripts::AgentMeta>>,
-    projects: Option<&projects::Projects>,
-    pricing: &live_sessions::Pricing,
+    inputs: &RowsInputs,
+    unwritten: &[TokenRecord],
     host: &str,
     now: DateTime<Utc>,
-    harness_sessions: &[HarnessSession],
-    harness_owners: &BTreeMap<String, String>,
-    claude_cwd: &BTreeMap<String, String>,
-    harness_locks: &BTreeSet<String>,
-    harness_recorded: &BTreeMap<String, HarnessRecorded>,
+    harness: &HarnessInputs,
     codex_sessions: &[CodexSession],
     codex_open_files: &BTreeSet<PathBuf>,
 ) -> (live_sessions::Rows, LiveParts) {
     let metas = |session: &str| agents.get(session).cloned().unwrap_or_default();
+    let reports = std::mem::take(&mut memory.job_reports);
     let project_of = {
-        let memory = RefCell::new(memory);
+        let memory = RefCell::new(&mut *memory);
         move |cwd: &str| memory.borrow_mut().project_for(cwd)
+    };
+    let projects = inputs.projects;
+    let pricing = &inputs.pricing;
+    let harness_rows = if harness.sessions.is_empty() {
+        None
+    } else {
+        Some(live_sessions::harness_rows(
+            harness.sessions,
+            harness.owners,
+            harness.claude_cwd,
+            harness.recorded,
+            harness.locks,
+            &reports,
+            projects,
+            pricing,
+            host,
+            now,
+            &project_of,
+        ))
+    };
+    let mut pending = unwritten.to_vec();
+    let no_agents = BTreeMap::new();
+    let linked = match &harness_rows {
+        Some(out) => {
+            pending.extend(out.tokens.iter().cloned());
+            &out.agents
+        }
+        None => &no_agents,
+    };
+    // Records that cannot be had leave the running rows' values unknown with
+    // that reason, never valued from part of their records.
+    let row_tokens = match &inputs.recorded {
+        Ok(recorded) => live_sessions::RowTokens::Recorded {
+            recorded,
+            pending: &pending,
+        },
+        Err(reason) => live_sessions::RowTokens::Transcripts { unwritten, reason },
     };
     let mut rows = live_sessions::running(
         files,
         state,
         &metas,
+        linked,
+        row_tokens,
         projects,
         pricing,
         host,
         now,
         &project_of,
     );
-    let parts = if harness_sessions.is_empty() {
-        LiveParts {
+    let parts = match harness_rows {
+        None => LiveParts {
             tokens: Vec::new(),
-            recorded: harness_recorded.clone(),
+            recorded: harness.recorded.clone(),
             linked: BTreeMap::new(),
-        }
-    } else {
-        let harness = live_sessions::harness_rows(
-            harness_sessions,
-            harness_owners,
-            claude_cwd,
-            harness_recorded,
-            harness_locks,
-            projects,
-            pricing,
-            host,
-            now,
-            &project_of,
-        );
-        // The same agents `add_agents` puts on the running row: a session record
-        // counts them too, so its agent counts do not change when it closes.
-        let mut linked: BTreeMap<String, AgentCounts> = BTreeMap::new();
-        for (session, agents) in harness.agents {
-            let started = agents.len();
-            let finished = agents.iter().filter(|agent| !agent.running).count();
-            linked.insert(session.clone(), AgentCounts { started, finished });
-            if let Some(row) = rows.sessions.iter_mut().find(|row| row.session == session) {
-                live_sessions::add_agents(row, agents);
+        },
+        Some(out) => {
+            // The same agents `running` puts on the running row: a session
+            // record counts them too, so its agent counts do not change when it
+            // closes.
+            let linked = out
+                .agents
+                .iter()
+                .map(|(session, agents)| {
+                    let started = agents.len();
+                    let finished = agents.iter().filter(|agent| !agent.running).count();
+                    (session.clone(), AgentCounts { started, finished })
+                })
+                .collect();
+            rows.warnings.extend(out.rows.warnings);
+            rows.sessions.extend(out.rows.sessions);
+            LiveParts {
+                tokens: out.tokens,
+                recorded: out.recorded,
+                linked,
             }
-        }
-        rows.warnings.extend(harness.rows.warnings);
-        rows.sessions.extend(harness.rows.sessions);
-        LiveParts {
-            tokens: harness.tokens,
-            recorded: harness.recorded,
-            linked,
         }
     };
     if !codex_sessions.is_empty() {
@@ -2289,6 +2520,8 @@ fn live_rows(
         rows.warnings.extend(codex.warnings);
         rows.sessions.extend(codex.sessions);
     }
+    drop(project_of);
+    memory.job_reports = reports;
     (rows, parts)
 }
 
@@ -5632,14 +5865,15 @@ mod tests {
         .unwrap();
     }
 
-    /// A `prices.json` with one price for `models` and nothing else.
+    /// A `prices.json` with one price for each of `models`, under the key the
+    /// valuer looks it up by, and nothing else.
     fn write_prices(app: &AppPaths, models: &[&str]) {
         let mut prices = Prices::default();
         let list = models
             .iter()
             .map(|model| {
                 (
-                    seatswap_core::money::price_key("anthropic", model),
+                    seatswap_core::money::model_price_key(model),
                     seatswap_core::money::ModelPrice {
                         input: 4.0,
                         output: 20.0,
@@ -5978,6 +6212,9 @@ mod tests {
         write_feed(&app, SESSION, f64::MAX);
         let mut state = ScanState::default();
         let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        // A fresh state reads the transcript again: a history of its own keeps
+        // its token lines from being counted beside the first pass's.
+        let recorder = Recorder::new(history(&tmp.path().join("history-again")));
         let outcome = run_pass(
             &app,
             &claude,
@@ -7310,6 +7547,480 @@ mod tests {
         assert!(
             !rows.sessions.iter().any(|row| row.session == HARNESS_JOB),
             "the job's owner was forgotten after an hour, so the job is its own row"
+        );
+    }
+
+    /// The output tokens of `session`'s token lines in this host's history.
+    fn recorded_out(root: &Path, session: &str) -> u64 {
+        history(root)
+            .read::<TokenRecord>(&Range::ALL, &seatswap_core::history::Hosts::All)
+            .expect("the token lines")
+            .records
+            .iter()
+            .filter(|hosted| hosted.record.session == session)
+            .map(|hosted| hosted.record.out)
+            .sum()
+    }
+
+    /// Fault B: a running row's tokens are its token lines in the history. A
+    /// line written in a later pass is counted at once, without the history
+    /// being read again, and never twice.
+    #[test]
+    fn a_running_row_counts_its_token_lines_across_passes() {
+        let (tmp, claude, app) = fixture();
+        write_eur_settings(&app);
+        write_prices(&app, &["claude-opus-5-5"]);
+        write_fx(&app, 1.0);
+        let root = tmp.path().join("history");
+        let recorder = Recorder::new(history(&root));
+        write_running_answer(&claude, 404, SESSION, "claude-opus-5-5");
+        let now = time("2026-11-14T10:00:00Z");
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        let pass = |state: &mut ScanState, memory: &mut SessionMemory, at: DateTime<Utc>| {
+            run_pass(
+                &app,
+                &claude,
+                &probe(&[404]),
+                &NoProc,
+                Some(&recorder),
+                state,
+                memory,
+                at,
+                None,
+            );
+            harness_row(memory, SESSION).tokens.out
+        };
+
+        assert_eq!(pass(&mut state, &mut memory, now), 166);
+        append_transcript(
+            &claude,
+            "-home-sam-projects-atlas",
+            SESSION,
+            &transcript_line(
+                SESSION,
+                "msg_02",
+                time("2026-11-14T09:58:00Z"),
+                "/home/sam/projects/atlas",
+                "claude-opus-5-5",
+                (3, 200, 0, 0),
+            ),
+        );
+        let later = now + ChronoDuration::seconds(1);
+        assert_eq!(
+            pass(&mut state, &mut memory, later),
+            366,
+            "the line this pass wrote counts at once"
+        );
+        assert_eq!(recorded_out(&root, SESSION), 366, "each line once");
+        assert_eq!(
+            pass(&mut state, &mut memory, later + ChronoDuration::seconds(1)),
+            366,
+            "nothing new, nothing added"
+        );
+        let row = harness_row(&memory, SESSION);
+        assert!(
+            row.values.api.is_some(),
+            "the lines are valued: {:?}",
+            row.values
+        );
+    }
+
+    /// A linked flash job's tokens count once in its Claude Code row: in the
+    /// pass that reads them, from the lines written after the rows, and in
+    /// every later pass from the history, never added again by the job put
+    /// under the row (fault B, question b).
+    #[test]
+    fn a_linked_jobs_tokens_count_once_in_its_running_row() {
+        let (tmp, claude, app) = fixture();
+        let root = tmp.path().join("history");
+        let recorder = Recorder::new(history(&root));
+        let now = time("2026-11-16T14:00:00Z");
+        write_session(
+            &claude,
+            400,
+            &session_json(
+                400,
+                SESSION,
+                "/home/sam/projects/atlas",
+                None,
+                "busy",
+                now.timestamp_millis(),
+            ),
+        );
+        let paths = harness_paths(&tmp);
+        write_harness(&paths, HARNESS_JOB, None, 0, 2, now, false);
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(claude.home().to_path_buf());
+        memory.harness_paths = Some(paths.clone());
+        let pass = |state: &mut ScanState, memory: &mut SessionMemory, at: DateTime<Utc>| {
+            // The session has no transcript here, so the scan forgets it each
+            // pass: put back what its transcript would give, the job's link.
+            state.sessions.insert(
+                SESSION.to_string(),
+                seen_with_jobs(
+                    SESSION,
+                    "/home/sam/projects/atlas",
+                    at,
+                    BTreeSet::from([HARNESS_JOB.to_string()]),
+                ),
+            );
+            run_pass(
+                &app,
+                &claude,
+                &probe(&[400]),
+                &NoProc,
+                Some(&recorder),
+                state,
+                memory,
+                at,
+                None,
+            );
+            let row = harness_row(memory, SESSION);
+            let job = row
+                .agents
+                .iter()
+                .find(|agent| agent.agent == HARNESS_JOB)
+                .expect("the linked job");
+            (row.tokens.out, job.tokens.out)
+        };
+
+        assert_eq!(
+            pass(&mut state, &mut memory, now),
+            (100, 100),
+            "the job's growth of this pass, once"
+        );
+        assert_eq!(recorded_out(&root, SESSION), 100, "written after the rows");
+        assert_eq!(
+            pass(&mut state, &mut memory, now + ChronoDuration::seconds(1)),
+            (100, 100),
+            "now from the history, still once"
+        );
+        write_harness(
+            &paths,
+            HARNESS_JOB,
+            None,
+            0,
+            3,
+            now + ChronoDuration::seconds(2),
+            false,
+        );
+        assert_eq!(
+            pass(&mut state, &mut memory, now + ChronoDuration::seconds(2)),
+            (150, 150)
+        );
+        assert_eq!(recorded_out(&root, SESSION), 150);
+    }
+
+    /// A flash job is named by its report's label; the label is shown live and
+    /// never reaches the report other hosts read.
+    #[test]
+    fn a_flash_jobs_label_is_its_task_and_never_written() {
+        let (tmp, claude, app) = fixture();
+        let root = tmp.path().join("history");
+        let recorder = Recorder::new(history(&root));
+        let now = time("2026-11-16T14:00:00Z");
+        write_session(
+            &claude,
+            400,
+            &session_json(
+                400,
+                SESSION,
+                "/home/sam/projects/atlas",
+                None,
+                "busy",
+                now.timestamp_millis(),
+            ),
+        );
+        let paths = harness_paths(&tmp);
+        write_harness(&paths, HARNESS_JOB, None, 0, 1, now, true);
+        let label = "Fix the invoice export";
+        let patches = paths.reports.join("8279d42859b9").join("patches");
+        fs::create_dir_all(&patches).expect("the reports folder");
+        fs::write(
+            patches.join("job-3e32c2fc.report.json"),
+            serde_json::json!({
+                "key": "8279d42859b9", "kind": "task", "sessionId": HARNESS_JOB,
+                "label": label, "status": "done", "stopReason": "end_turn",
+                "timing": {}, "createdAt": "2026-11-16T13:59:00.000Z", "report": {}
+            })
+            .to_string(),
+        )
+        .expect("the job's report");
+        let mut state = ScanState::default();
+        state.sessions.insert(
+            SESSION.to_string(),
+            seen_with_jobs(
+                SESSION,
+                "/home/sam/projects/atlas",
+                now,
+                BTreeSet::from(["job-3e32c2fc".to_string()]),
+            ),
+        );
+        let mut memory = SessionMemory::new(claude.home().to_path_buf());
+        memory.harness_paths = Some(paths);
+
+        let outcome = run_pass(
+            &app,
+            &claude,
+            &probe(&[400]),
+            &NoProc,
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            now,
+            None,
+        );
+
+        assert_eq!(outcome.summary.warning, None);
+        let job = harness_row(&memory, SESSION)
+            .agents
+            .iter()
+            .find(|agent| agent.agent == HARNESS_JOB)
+            .expect("the job, linked through its report")
+            .clone();
+        assert_eq!(job.task.as_deref(), Some(label));
+        assert_eq!(job.provider, live_sessions::HARNESS_PROVIDER);
+        let report = fs::read_to_string(history(&root).sessions_now_file("atlas"))
+            .expect("this host's report");
+        assert!(report.contains(HARNESS_JOB), "the job is in the report");
+        assert!(!report.contains(label), "the label is never written");
+    }
+
+    /// A running row whose records cannot be had (here: no history is open)
+    /// counts its transcripts as before the token records: the totals the
+    /// state holds, the answers read past it and its linked job's tokens. Its
+    /// values are unknown with the reason, and a pass that reads the same
+    /// unwritten answers again does not count them twice.
+    #[test]
+    fn a_running_row_without_records_counts_its_transcripts() {
+        let (tmp, claude, app) = fixture();
+        let recorder = Recorder::new(history(&tmp.path().join("history")));
+        write_running_answer(&claude, 404, SESSION, "claude-opus-5-5");
+        let now = time("2026-11-14T10:00:00Z");
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        let paths = harness_paths(&tmp);
+        memory.harness_paths = Some(paths.clone());
+        let pass = |recorder: Option<&Recorder>,
+                    state: &mut ScanState,
+                    memory: &mut SessionMemory,
+                    at: DateTime<Utc>| {
+            run_pass(
+                &app,
+                &claude,
+                &probe(&[404]),
+                &NoProc,
+                recorder,
+                state,
+                memory,
+                at,
+                None,
+            );
+            harness_row(memory, SESSION).clone()
+        };
+
+        assert_eq!(
+            pass(Some(&recorder), &mut state, &mut memory, now)
+                .tokens
+                .out,
+            166
+        );
+        // The history breaks; the session answers again and starts a flash job.
+        let history_error = "the history folder cannot be opened: another machine's host.json";
+        memory.history_error = Some(history_error.to_string());
+        append_transcript(
+            &claude,
+            "-home-sam-projects-atlas",
+            SESSION,
+            &transcript_line(
+                SESSION,
+                "msg_02",
+                time("2026-11-14T09:58:00Z"),
+                "/home/sam/projects/atlas",
+                "claude-opus-5-5",
+                (3, 200, 0, 0),
+            ),
+        );
+        write_harness(&paths, HARNESS_JOB, None, 0, 2, now, false);
+        state
+            .sessions
+            .get_mut(SESSION)
+            .expect("the session in the state")
+            .flash_jobs
+            .insert(HARNESS_JOB.to_string());
+
+        for second in [1, 2] {
+            let row = pass(
+                None,
+                &mut state,
+                &mut memory,
+                now + ChronoDuration::seconds(second),
+            );
+            assert_eq!(
+                row.tokens.out,
+                166 + 200 + 100,
+                "the state's totals, the unwritten answer and the job, once (pass {second})"
+            );
+            let job = row
+                .agents
+                .iter()
+                .find(|agent| agent.agent == HARNESS_JOB)
+                .expect("the linked job");
+            assert_eq!(job.tokens.out, 100);
+            assert_eq!(row.values.api, None);
+            assert_eq!(row.values.api_missing.as_deref(), Some(history_error));
+            assert_eq!(
+                row.values.subscription_missing.as_deref(),
+                Some(history_error)
+            );
+        }
+    }
+
+    /// Without a history the scan's offsets do not move, so a backlog past
+    /// the budget is read from the same place every pass: the row counts the
+    /// part read, the same each pass and never twice, and a warning says the
+    /// rest is not counted. Once the history works, every answer counts once.
+    #[test]
+    fn a_backlog_past_the_budget_without_a_history_is_counted_in_part_and_said() {
+        let (tmp, claude, app) = fixture();
+        let root = tmp.path().join("history");
+        let recorder = Recorder::new(history(&root));
+        write_running_answer(&claude, 404, SESSION, "claude-opus-5-5");
+        let now = time("2026-11-14T10:00:00Z");
+        let mut state = ScanState::default();
+        let mut memory = SessionMemory::new(tmp.path().to_path_buf());
+        let pass = |recorder: Option<&Recorder>,
+                    state: &mut ScanState,
+                    memory: &mut SessionMemory,
+                    at: DateTime<Utc>| {
+            let outcome = run_pass(
+                &app,
+                &claude,
+                &probe(&[404]),
+                &NoProc,
+                recorder,
+                state,
+                memory,
+                at,
+                None,
+            );
+            (
+                harness_row(memory, SESSION).tokens.out,
+                outcome.summary.warning.unwrap_or_default(),
+            )
+        };
+
+        assert_eq!(pass(Some(&recorder), &mut state, &mut memory, now).0, 166);
+        memory.history_error = Some("the history folder cannot be opened".to_string());
+        // One line per pass: the budget is reached after the first whole line.
+        memory.scan_budget = 1;
+        for (number, out) in [(2, 200), (3, 300), (4, 400)] {
+            append_transcript(
+                &claude,
+                "-home-sam-projects-atlas",
+                SESSION,
+                &transcript_line(
+                    SESSION,
+                    &format!("msg_0{number}"),
+                    time("2026-11-14T09:50:00Z") + ChronoDuration::minutes(number),
+                    "/home/sam/projects/atlas",
+                    "claude-opus-5-5",
+                    (3, out, 0, 0),
+                ),
+            );
+        }
+
+        for second in [1, 2] {
+            let (out, warning) = pass(
+                None,
+                &mut state,
+                &mut memory,
+                now + ChronoDuration::seconds(second),
+            );
+            assert_eq!(
+                out,
+                166 + 200,
+                "the first unread line, once (pass {second})"
+            );
+            assert!(
+                warning.contains("the running sessions count only the part read"),
+                "{warning}"
+            );
+        }
+
+        memory.history_error = None;
+        memory.scan_budget = SCAN_BUDGET;
+        let (out, warning) = pass(
+            Some(&recorder),
+            &mut state,
+            &mut memory,
+            now + ChronoDuration::seconds(3),
+        );
+        assert_eq!(out, 166 + 200 + 300 + 400);
+        assert!(!warning.contains("count only the part read"), "{warning}");
+        assert_eq!(recorded_out(&root, SESSION), 166 + 200 + 300 + 400);
+    }
+
+    /// A valuer that has to reach further back for an older running session,
+    /// and cannot be built, is tried again only after the retry time, not on
+    /// every pass; until then the values are unknown with the reason, never
+    /// valued by the valuer of the shorter range.
+    #[test]
+    fn a_pricing_that_cannot_reach_back_is_retried_after_the_retry_time() {
+        let (tmp, _claude, app) = fixture();
+        write_eur_settings(&app);
+        write_prices(&app, &["claude-opus-5-5"]);
+        write_fx(&app, 1.0);
+        let dir = history(&tmp.path().join("history"));
+        let mut context = RowsContext::default();
+        let mut summary = SessionsSummary {
+            running: 0,
+            busy: 0,
+            tied: 0,
+            tied_busy: 0,
+            waiting: Vec::new(),
+            unavailable: None,
+            warning: None,
+        };
+        let now = time("2026-11-14T10:00:00Z");
+        let older = Some(now - ChronoDuration::days(3));
+        let mut known = |context: &mut RowsContext,
+                         needed_from: Option<DateTime<Utc>>,
+                         at: DateTime<Utc>| {
+            matches!(
+                prepare_rows_context(context, &app, &dir, needed_from, at, &mut summary).pricing,
+                live_sessions::Pricing::Known { .. }
+            )
+        };
+        let tried = |context: &RowsContext| context.pricing_failure.as_ref().map(|f| f.tried);
+
+        assert!(known(&mut context, None, now), "built for the last day");
+        fs::write(app.prices_file(), "{not json").unwrap();
+        let first = now + ChronoDuration::seconds(10);
+        assert!(
+            !known(&mut context, older, first),
+            "the old valuer is too short"
+        );
+        assert_eq!(tried(&context), Some(first));
+        let soon = first + ChronoDuration::seconds(ROWS_CONTEXT_RETRY_SECS - 1);
+        assert!(!known(&mut context, older, soon));
+        assert_eq!(
+            tried(&context),
+            Some(first),
+            "not tried again before the retry time"
+        );
+        let later = first + ChronoDuration::seconds(ROWS_CONTEXT_RETRY_SECS);
+        assert!(!known(&mut context, older, later));
+        assert_eq!(tried(&context), Some(later), "tried again after it");
+
+        write_prices(&app, &["claude-opus-5-5"]);
+        let fixed = later + ChronoDuration::seconds(ROWS_CONTEXT_RETRY_SECS);
+        assert!(known(&mut context, older, fixed));
+        assert_eq!(tried(&context), None);
+        assert_eq!(
+            context.pricing.as_ref().map(|built| built.from),
+            older.map(|from| from.min(fixed - ChronoDuration::days(1)))
         );
     }
 }

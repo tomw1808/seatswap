@@ -268,8 +268,15 @@ impl Pricing<'_> {
 pub struct LiveAgent {
     pub agent: String,
     pub parent: Option<String>,
+    /// The agent's provider: [`CLAUDE_PROVIDER`] for a Claude Code subagent,
+    /// [`HARNESS_PROVIDER`] for a flash job and a Harness worker. A report of
+    /// an older seatswap has none; [`other_hosts`] gives such an agent its
+    /// session's provider, which is what it meant before the field existed.
+    pub provider: String,
     pub kind: Option<String>,
-    /// The meta's description, kept in memory only: this module never writes a file.
+    /// The task text, kept in memory only: a Claude Code subagent's meta
+    /// description, a flash job's report label, a Harness worker's title
+    /// outside a flash job. [`write_report`] clears it; no file holds it.
     pub task: Option<String>,
     pub model: Option<String>,
     pub running: bool,
@@ -381,6 +388,130 @@ pub fn switch_kind(
     SwitchKind::Resend
 }
 
+/// This host's token records of its running sessions, as the history holds
+/// them (spec §3.8): one read of this host's token files from an hour on, kept
+/// by the sessions thread, plus every line this host wrote after that read
+/// ([`RecordedTokens::add`]). A running row's tokens and values come from these
+/// records, as a closed row's come from the history, so the row does not jump
+/// when it closes. The default value holds no read: nothing is recorded.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RecordedTokens {
+    /// The hour the read starts at; `None` for the default value.
+    from: Option<DateTime<Utc>>,
+    /// The records of each session id, in the order they were read or added.
+    by_session: BTreeMap<String, Vec<TokenRecord>>,
+}
+
+impl RecordedTokens {
+    /// This host's token records from `from` on, whatever their end, with the
+    /// read's warnings. A history that cannot be read is the error.
+    pub fn read(
+        history: &HistoryDir,
+        from: DateTime<Utc>,
+    ) -> Result<(RecordedTokens, Vec<String>), HistoryError> {
+        let range = Range::between(Some(from), None)?;
+        let read = history.read::<TokenRecord>(&range, &Hosts::One(history.host().to_string()))?;
+        let mut recorded = RecordedTokens {
+            from: Some(from),
+            by_session: BTreeMap::new(),
+        };
+        for hosted in read.records {
+            recorded.push(hosted.record);
+        }
+        Ok((recorded, read.warnings))
+    }
+
+    /// Whether the read holds every record of this host from `from` on.
+    pub fn covers(&self, from: DateTime<Utc>) -> bool {
+        self.from.is_some_and(|start| start <= from)
+    }
+
+    /// Add lines this host wrote to the history after the read, so the
+    /// records stay what the history holds without reading it again. A line
+    /// before the read's start is not kept, as the read would not have it;
+    /// the default value keeps none.
+    pub fn add(&mut self, lines: &[TokenRecord]) {
+        let Some(from) = self.from else {
+            return;
+        };
+        for line in lines.iter().filter(|line| line.t >= from) {
+            self.push(line.clone());
+        }
+    }
+
+    fn push(&mut self, record: TokenRecord) {
+        self.by_session
+            .entry(record.session.clone())
+            .or_default()
+            .push(record);
+    }
+
+    /// The records of one session.
+    fn of(&self, session: &str) -> &[TokenRecord] {
+        self.by_session
+            .get(session)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+}
+
+/// The first hour of the running sessions' token records, for
+/// [`RecordedTokens::read`]: the hour of the earliest start or first answer of
+/// a running session (a closed row reads its records from its first answer's
+/// hour). `None` when no session runs.
+pub fn records_from(files: &[SessionFile], state: &ScanState) -> Option<DateTime<Utc>> {
+    files
+        .iter()
+        .flat_map(|file| {
+            let first = state.sessions.get(&file.session_id).map(|seen| seen.first);
+            [time_ms(file.started_at), first]
+        })
+        .flatten()
+        .min()
+        .map(transcripts::hour_start)
+}
+
+/// Where the running Claude Code rows take their tokens from ([`running`]).
+#[derive(Debug, Clone, Copy)]
+pub enum RowTokens<'a> {
+    /// The rows' token records ([`of_records`], the closed row's way):
+    /// `recorded` holds what this host's history has, `pending` the lines this
+    /// pass has not written yet.
+    Recorded {
+        recorded: &'a RecordedTokens,
+        pending: &'a [TokenRecord],
+    },
+    /// The records cannot be had (no history is open, or its token files
+    /// cannot be read): a row counts its transcripts' totals, the transcript
+    /// lines this pass could not write (`unwritten`) and its linked agents'
+    /// tokens, and every value is unknown with `reason`.
+    Transcripts {
+        unwritten: &'a [TokenRecord],
+        reason: &'a str,
+    },
+}
+
+/// The tokens and the two values of a session's token records (spec §3.8):
+/// each record is valued at its own hour by [`Valuer::value`], so a session
+/// that runs across days, a weekly reset or an account switch takes the
+/// share of each week and each account it used. The one way a running and a
+/// closed Claude Code row get their numbers.
+fn of_records<'r>(
+    records: impl IntoIterator<Item = &'r TokenRecord>,
+    host: &str,
+    pricing: &Pricing,
+) -> (Tokens, Values) {
+    let mut tokens = Tokens::default();
+    let mut valued = Vec::new();
+    for record in records {
+        tokens += Tokens::from(record);
+        if let Pricing::Known { valuer, .. } = pricing {
+            valued.push(valuer.value(host, record));
+        }
+    }
+    (tokens, pricing.of(&valued))
+}
+
 /// The running sessions of this host (spec §3.8). An agent is running while its
 /// meta says `finished == false` and does not say its transcript ended with the
 /// agent's final `end_turn` answer (`AgentMeta::transcript_ended`). An agent
@@ -391,17 +522,27 @@ pub fn switch_kind(
 /// one session, and `host` names the history host whose timeline values these
 /// records.
 ///
-/// The values are the live view's approximation. The Statistics area values
-/// every hourly history record exactly; the live view values each model's sum
-/// in `seen.by_model` as one record dated at the session's last answer
-/// (`seen.last`) and passes it to [`Valuer::value`]. An agent's tokens are one
-/// record with its model, dated at its last answer; an agent without a model
-/// has both values missing. An agent that has not answered has no time at all.
-/// A session without a [`SessionSeen`] is a row with zero tokens and the values
-/// of an empty list. The last hour is valued per model: each model's tokens of
-/// the 60 minutes are one record dated at the newest minute of that model in
-/// the hour, through the same [`Valuer::value`] as `values`. `agents_done_values`
-/// is [`Values::sum`] over the values of the agents counted done.
+/// A row's tokens and values are its token records' ([`RowTokens::Recorded`],
+/// [`of_records`], the closed row's way): `recorded` holds what this host's
+/// history has, `pending` the lines this pass has not written yet (a linked
+/// Harness worker's growth, written after the rows; transcript lines whose
+/// write failed). Only the lines of the row's own session id count. They hold
+/// the session's own answers, its Claude subagents' and the recorded growth of
+/// its linked flash/Harness workers, each in its own hour, so a session that
+/// runs across days, a weekly reset or an account switch is valued week by
+/// week and account by account. The row's last hour stays the minute-exact
+/// one of the transcripts: each model's tokens of the 60 minutes are one
+/// record dated at the newest minute of that model in the hour, through the
+/// same [`Valuer::value`]. Without records ([`RowTokens::Transcripts`]) the
+/// row counts its transcripts and every value is unknown with the reason.
+///
+/// `linked` holds the flash/Harness agents of each Claude Code session
+/// ([`harness_rows`]); they are put under their row by [`add_agents`].
+///
+/// An agent's tokens are one record with its model, dated at its last answer;
+/// an agent without a model has both values missing. An agent that has not
+/// answered has no time at all. `agents_done_values` is [`Values::sum`] over
+/// the values of the agents counted done.
 ///
 /// A session file whose `startedAt` or `statusUpdatedAt` is not a valid time is
 /// not a row: the reason goes into [`Rows::warnings`], never a default time.
@@ -415,12 +556,25 @@ pub fn running(
     files: &[SessionFile],
     state: &ScanState,
     metas: &dyn Fn(&str) -> Vec<AgentMeta>,
+    linked: &BTreeMap<String, Vec<LiveAgent>>,
+    row_tokens: RowTokens,
     projects: Option<&Projects>,
     pricing: &Pricing,
     host: &str,
     now: DateTime<Utc>,
     project_of: &dyn Fn(&str) -> ProjectKey,
 ) -> Rows {
+    // Without records no value is built, not even from part of a row.
+    let unrecorded;
+    let pricing = match row_tokens {
+        RowTokens::Recorded { .. } => pricing,
+        RowTokens::Transcripts { reason, .. } => {
+            unrecorded = Pricing::Unknown {
+                reason: reason.to_string(),
+            };
+            &unrecorded
+        }
+    };
     let mut sessions = Vec::with_capacity(files.len());
     let mut warnings = Vec::new();
     for file in files {
@@ -485,6 +639,7 @@ pub fn running(
             live_agents.push(LiveAgent {
                 agent,
                 parent: meta.as_ref().and_then(|meta| meta.parent.clone()),
+                provider: CLAUDE_PROVIDER.to_string(),
                 kind: meta.as_ref().and_then(|meta| meta.agent_type.clone()),
                 task: meta.as_ref().and_then(|meta| meta.description.clone()),
                 model,
@@ -499,7 +654,36 @@ pub fn running(
         let agents_done_values = Values::sum(&done_values);
 
         let model = seen.and_then(|seen| seen.last_model.clone());
-        let tokens = seen.map(|seen| seen.totals).unwrap_or_default();
+        let linked_agents = linked.get(&file.session_id).cloned().unwrap_or_default();
+        let own = |line: &&TokenRecord| line.session == file.session_id;
+        let (tokens, values) = match row_tokens {
+            RowTokens::Recorded { recorded, pending } => of_records(
+                recorded
+                    .of(&file.session_id)
+                    .iter()
+                    .chain(pending.iter().filter(own)),
+                host,
+                pricing,
+            ),
+            // The one place a running row counts its transcripts instead of its
+            // token records: without records there is nothing else to count,
+            // and the transcripts still show how far the session went. The
+            // totals hold the answers whose lines are in the state; the
+            // unwritten lines are the answers read past it (the state does not
+            // move while they cannot be written); the linked agents' tokens are
+            // not in the transcripts. Their sum is not valued: the values need
+            // the records, so they stay unknown with the reason.
+            RowTokens::Transcripts { unwritten, reason } => {
+                let mut tokens = seen.map(|seen| seen.totals).unwrap_or_default();
+                for line in unwritten.iter().filter(own) {
+                    tokens += Tokens::from(line);
+                }
+                for agent in &linked_agents {
+                    tokens += agent.tokens;
+                }
+                (tokens, Values::unknown(reason))
+            }
+        };
         let last_hour = seen
             .map(|seen| transcripts::last_hour(seen, now))
             .unwrap_or_default();
@@ -523,35 +707,11 @@ pub fn running(
             }
             Pricing::Unknown { reason } => Values::unknown(reason),
         };
-        let values = match pricing {
-            Pricing::Known { valuer, .. } => match seen {
-                None => pricing.of(&[]),
-                Some(seen) => {
-                    let valued: Vec<Valued> = seen
-                        .by_model
-                        .iter()
-                        .map(|(model, tokens)| {
-                            let record = token_record(
-                                &file.session_id,
-                                &file.cwd,
-                                &key,
-                                model,
-                                seen.last,
-                                *tokens,
-                            );
-                            valuer.value(host, &record)
-                        })
-                        .collect();
-                    pricing.of(&valued)
-                }
-            },
-            Pricing::Unknown { reason } => Values::unknown(reason),
-        };
         let label = file
             .name
             .clone()
             .unwrap_or_else(|| session_label(&project_name, &file.session_id));
-        sessions.push(LiveSession {
+        let mut row = LiveSession {
             session: file.session_id.clone(),
             host: host.to_string(),
             label,
@@ -574,7 +734,9 @@ pub fn running(
             last_hour_values,
             agents_done_values,
             values,
-        });
+        };
+        add_agents(&mut row, linked_agents);
+        sessions.push(row);
     }
     Rows { sessions, warnings }
 }
@@ -593,8 +755,9 @@ pub struct HarnessRows {
     pub recorded: BTreeMap<String, HarnessRecorded>,
 }
 
-/// The provider of a Harness session that is its own row (spec §3.8).
-const HARNESS_PROVIDER: &str = "DeepSeek Harness";
+/// The provider of a Harness session that is its own row, of a flash job and
+/// of a Harness worker (spec §3.8).
+pub const HARNESS_PROVIDER: &str = "DeepSeek Harness";
 
 /// Put the Harness sessions into the Sessions area: a job named in a Claude
 /// Code transcript becomes a `"flash"` agent of that session, with its workers
@@ -602,6 +765,10 @@ const HARNESS_PROVIDER: &str = "DeepSeek Harness";
 /// session become token lines for what grew since `recorded`; the returned
 /// `recorded` is the total after this pass, and a line is written only when a
 /// total grew (a total that went down is a warning, never a negative line).
+///
+/// A flash job's task text is its report's label (`reports`), so a running
+/// job, which has no report yet, shows none; a worker under a flash job shows
+/// none either ([`harness_task`]).
 #[allow(clippy::too_many_arguments)]
 pub fn harness_rows(
     sessions: &[HarnessSession],
@@ -609,6 +776,7 @@ pub fn harness_rows(
     claude_cwd: &BTreeMap<String, String>,
     recorded: &BTreeMap<String, HarnessRecorded>,
     locks: &BTreeSet<String>,
+    reports: &harness::JobReports,
     projects: Option<&Projects>,
     pricing: &Pricing,
     host: &str,
@@ -657,6 +825,7 @@ pub fn harness_rows(
                         "the Claude Code session {owner} of Harness job {root_id} is not known yet; its folder is not known"
                     ));
                 }
+                let flash = is_flash_tree(root);
                 for session in component {
                     let Some((cwd, project)) = harness_location(
                         session,
@@ -676,8 +845,9 @@ pub fn harness_rows(
                         (session.parent.clone(), None)
                     };
                     let running = harness::is_running(session, locks.contains(&session.id), now);
+                    let task = harness_task(session, flash, reports);
                     let agent = harness_agent(
-                        session, parent, kind, running, &cwd, &project, pricing, host,
+                        session, parent, kind, task, running, &cwd, &project, pricing, host,
                     );
                     out.agents.entry(owner.clone()).or_default().push(agent);
                     harness_token_line(
@@ -702,7 +872,8 @@ pub fn harness_rows(
                 // done, not idle. Its tokens are recorded either way.
                 if harness::is_open(root, locks.contains(&root.id), now) {
                     let row = harness_row(
-                        root, &component, &cwd, &project, projects, pricing, host, locks, now,
+                        root, &component, &cwd, &project, projects, reports, pricing, host, locks,
+                        now,
                     );
                     out.rows.sessions.push(row);
                 }
@@ -726,7 +897,9 @@ pub fn harness_rows(
 }
 
 /// The row of a running Harness tree whose Claude Code session is not known:
-/// the root session with its workers as agents.
+/// the root session with its workers as agents. Its tokens and values are the
+/// root's and every worker's: a Harness row has no token records of its own
+/// to read them from.
 #[allow(clippy::too_many_arguments)]
 fn harness_row(
     root: &HarnessSession,
@@ -734,6 +907,7 @@ fn harness_row(
     cwd: &str,
     project: &ProjectKey,
     projects: Option<&Projects>,
+    reports: &harness::JobReports,
     pricing: &Pricing,
     host: &str,
     locks: &BTreeSet<String>,
@@ -741,6 +915,7 @@ fn harness_row(
 ) -> LiveSession {
     let id = ProjectId::of(project, host);
     let (project_id, project_name, org) = named_project(projects, &id);
+    let flash = is_flash_tree(root);
     let mut agents = Vec::new();
     for session in component.iter().filter(|session| session.id != root.id) {
         let is_running = harness::is_running(session, locks.contains(&session.id), now);
@@ -748,6 +923,7 @@ fn harness_row(
             session,
             session.parent.clone(),
             None,
+            harness_task(session, flash, reports),
             is_running,
             cwd,
             project,
@@ -756,7 +932,14 @@ fn harness_row(
         );
         agents.push(agent);
     }
-    let values = harness_values(root, cwd, project, pricing, host);
+    let root_values = harness_values(root, cwd, project, pricing, host);
+    let mut tokens = root.tokens;
+    let mut parts = vec![&root_values];
+    for agent in &agents {
+        tokens += agent.tokens;
+        parts.push(&agent.values);
+    }
+    let values = Values::sum(&parts);
     // The last hour of a Harness row is known from its answers'
     // times, never a silent 0 (S-3): the messages inside the window,
     // valued like the row's tokens at the newest of them, or at the
@@ -801,16 +984,38 @@ fn harness_row(
         agents_running: 0,
         agents_done: 0,
         agents: Vec::new(),
-        tokens: root.tokens,
+        tokens,
         last_hour: Some(last_hour),
         last_hour_values,
         agents_done_values: Values::sum(&[]),
         values,
     };
-    // A row of its own counts its workers too, not only the root
-    // session: the one function that adds a worker into a row.
     add_agents(&mut row, agents);
     row
+}
+
+/// Whether a Harness tree is a flash job's: its top known session, or the
+/// session that one names as its parent, is a `flash-task-…` job.
+fn is_flash_tree(root: &HarnessSession) -> bool {
+    harness::is_flash_job(&root.id) || root.parent.as_deref().is_some_and(harness::is_flash_job)
+}
+
+/// The task text a Harness session shows as an agent (spec §3.8): a flash
+/// job's is its report's label, `None` while it has no report; a worker in a
+/// flash job's tree shows none, because its title only names its folder; any
+/// other Harness session shows its title.
+fn harness_task(
+    session: &HarnessSession,
+    flash_tree: bool,
+    reports: &harness::JobReports,
+) -> Option<String> {
+    if harness::is_flash_job(&session.id) {
+        reports.label(&session.id).map(str::to_string)
+    } else if flash_tree {
+        None
+    } else {
+        session.title.clone()
+    }
 }
 
 /// The top known ancestor of a session: a parent that is not in the slice stops
@@ -866,10 +1071,12 @@ fn owner_of(
     None
 }
 
-/// Add agents to a running row and recount its done totals and their values.
-/// Add a worker's tokens and values to its row, through [`Valuer::value`]'s
-/// [`Values::sum`], so a running Claude Code row shows the same numbers a
-/// closed row reads from the history.
+/// Put agents under a running row and recount its agents and the values of
+/// the done ones. The row's tokens and values are not touched: a Claude Code
+/// row's come from its token records ([`running`]), which already hold the
+/// recorded growth of its linked flash/Harness workers, so adding a worker's
+/// tokens here would count them twice (without records [`running`] adds them
+/// itself); a Harness row of its own sums its workers itself ([`harness_row`]).
 pub fn add_agents(session: &mut LiveSession, agents: Vec<LiveAgent>) {
     for agent in agents {
         if agent.running {
@@ -877,8 +1084,6 @@ pub fn add_agents(session: &mut LiveSession, agents: Vec<LiveAgent>) {
         } else {
             session.agents_done += 1;
         }
-        session.tokens += agent.tokens;
-        session.values = Values::sum(&[&session.values, &agent.values]);
         session.agents.push(agent);
     }
     let done: Vec<&Values> = session
@@ -968,12 +1173,14 @@ fn harness_location(
     Some((cwd, project))
 }
 
-/// One Harness session as a live agent; `kind` is `"flash"` for a linked job.
+/// One Harness session as a live agent; `kind` is `"flash"` for a linked job
+/// and `task` is [`harness_task`]'s.
 #[allow(clippy::too_many_arguments)]
 fn harness_agent(
     session: &HarnessSession,
     parent: Option<String>,
     kind: Option<&str>,
+    task: Option<String>,
     running: bool,
     cwd: &str,
     project: &ProjectKey,
@@ -983,8 +1190,9 @@ fn harness_agent(
     LiveAgent {
         agent: session.id.clone(),
         parent,
+        provider: HARNESS_PROVIDER.to_string(),
         kind: kind.map(str::to_string),
-        task: session.title.clone(),
+        task,
         model: session.model.clone(),
         running,
         first: Some(session.created),
@@ -1313,7 +1521,8 @@ fn codex_tokens_values(
 /// is in the range; its tokens are the sum of every `TokenRecord` of the
 /// session from the hour start of the earliest `first` of the rows (a record's
 /// `t` is the start of its hour), because one hour and model can have several
-/// lines. Its last hour sums the records whose hour `[t, t + 1 h)` overlaps
+/// lines; they are valued through [`of_records`], the running row's way. Its
+/// last hour sums the records whose hour `[t, t + 1 h)` overlaps
 /// `[now - 60 min, now)`: the history's records are hourly, so a record from
 /// the hour before the window still counts; those overlapping records are also
 /// its `last_hour_values`, each valued like `values`. Its agents list is empty,
@@ -1368,26 +1577,17 @@ pub fn closed(
             .get(&(hosted.host.clone(), record.session.clone()))
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let mut tokens = Tokens::default();
-        let mut last_hour = Tokens::default();
+        let (tokens, values) = of_records(of_session.iter().copied(), &hosted.host, pricing);
+        // The history is hourly: a record whose hour overlaps the window
+        // counts, even when its start is before the window.
         let hour_ago = now - Duration::minutes(60);
-        let mut valued = Vec::with_capacity(of_session.len());
-        let mut last_hour_valued: Vec<Valued> = Vec::new();
-        for token in of_session {
-            let of_record = Tokens::from(*token);
-            tokens += of_record;
-            // The history is hourly: a record whose hour overlaps the window
-            // counts, even when its start is before the window.
-            if token.t < now && transcripts::hour_start(token.t) + Duration::hours(1) > hour_ago {
-                last_hour += of_record;
-                if let Pricing::Known { valuer, .. } = pricing {
-                    last_hour_valued.push(valuer.value(&hosted.host, token));
-                }
-            }
-            if let Pricing::Known { valuer, .. } = pricing {
-                valued.push(valuer.value(&hosted.host, token));
-            }
-        }
+        let (last_hour, last_hour_values) = of_records(
+            of_session.iter().copied().filter(|token| {
+                token.t < now && transcripts::hour_start(token.t) + Duration::hours(1) > hour_ago
+            }),
+            &hosted.host,
+            pricing,
+        );
         // The Claude Code row keeps the Claude model of its newest plan-model
         // record; a linked worker's model never becomes the row's model.
         let model = of_session
@@ -1418,9 +1618,9 @@ pub fn closed(
             agents: Vec::new(),
             tokens,
             last_hour: Some(last_hour),
-            last_hour_values: pricing.of(&last_hour_valued),
+            last_hour_values,
             agents_done_values: Values::sum(&[]),
-            values: pricing.of(&valued),
+            values,
         });
     }
     Ok(Rows { sessions, warnings })
@@ -1528,7 +1728,10 @@ pub fn other_hosts(history: &HistoryDir, now: DateTime<Utc>) -> Result<OtherHost
                 continue;
             }
         };
-        let report: HostReport = match serde_json::from_str(&text) {
+        let report = match serde_json::from_str::<serde_json::Value>(&text).and_then(|mut value| {
+            older_agents_take_their_sessions_provider(&mut value);
+            serde_json::from_value::<HostReport>(value)
+        }) {
             Ok(report) => report,
             Err(source) => {
                 warnings.push(format!("{}: {source}", path.display()));
@@ -1551,6 +1754,43 @@ pub fn other_hosts(history: &HistoryDir, now: DateTime<Utc>) -> Result<OtherHost
     }
     hosts.sort_by(|a, b| a.host.cmp(&b.host));
     Ok(OtherHosts { hosts, warnings })
+}
+
+/// A report written by a seatswap before agents had a `provider` has none on
+/// its agents: each such agent gets its session's `provider`, which is what it
+/// meant then (a Claude Code row's agents were Claude Code's, a Harness row's
+/// workers Harness's). Only the report read does this; everywhere else a
+/// missing `provider` is the parse error it is. A session without a
+/// `provider` text is left as it is, so its own missing field stays an error.
+fn older_agents_take_their_sessions_provider(report: &mut serde_json::Value) {
+    let Some(sessions) = report
+        .get_mut("sessions")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for session in sessions {
+        let Some(provider) = session
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Some(agents) = session
+            .get_mut("agents")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        for agent in agents {
+            if let Some(agent) = agent.as_object_mut() {
+                agent
+                    .entry("provider")
+                    .or_insert_with(|| serde_json::Value::String(provider.clone()));
+            }
+        }
+    }
 }
 
 /// The key with the most output tokens; on a tie, the first in key order.
@@ -1935,6 +2175,18 @@ mod tests {
             &[session_file()],
             &state,
             &|_: &str| Vec::new(),
+            &BTreeMap::new(),
+            RowTokens::Recorded {
+                recorded: &RecordedTokens::default(),
+                // The session's one token line, not written yet.
+                pending: &[token(
+                    SESSION,
+                    utc("2026-11-14T18:00:00Z"),
+                    "claude-opus-5-5",
+                    2_000_000,
+                    12_400_000,
+                )],
+            },
             Some(&projects()),
             &known_pricing(&valuer, &settings),
             "atlas",
@@ -1969,6 +2221,11 @@ mod tests {
             &[session_file()],
             &state,
             &|_: &str| Vec::new(),
+            &BTreeMap::new(),
+            RowTokens::Recorded {
+                recorded: &RecordedTokens::default(),
+                pending: &[],
+            },
             Some(&projects()),
             &known_pricing(&valuer, &settings),
             "atlas",
@@ -1992,6 +2249,11 @@ mod tests {
             &[session_file()],
             &state,
             &|_: &str| Vec::new(),
+            &BTreeMap::new(),
+            RowTokens::Recorded {
+                recorded: &RecordedTokens::default(),
+                pending: &[],
+            },
             Some(&projects()),
             &known_pricing(&valuer, &settings),
             "atlas",
@@ -2029,6 +2291,11 @@ mod tests {
             &[session_file()],
             &state,
             &metas_of,
+            &BTreeMap::new(),
+            RowTokens::Recorded {
+                recorded: &RecordedTokens::default(),
+                pending: &[],
+            },
             Some(&projects()),
             &known_pricing(&valuer, &settings),
             "atlas",
@@ -2128,6 +2395,11 @@ mod tests {
             &[session_file()],
             &state_with(seen),
             &|_: &str| Vec::new(),
+            &BTreeMap::new(),
+            RowTokens::Recorded {
+                recorded: &RecordedTokens::default(),
+                pending: &[],
+            },
             Some(&projects()),
             &known_pricing(&valuer, &settings),
             "atlas",
@@ -2208,6 +2480,11 @@ mod tests {
             &[session_file()],
             &state_with(seen),
             &metas_of,
+            &BTreeMap::new(),
+            RowTokens::Recorded {
+                recorded: &RecordedTokens::default(),
+                pending: &[],
+            },
             Some(&projects()),
             &known_pricing(&valuer, &settings),
             "atlas",
@@ -2251,6 +2528,11 @@ mod tests {
             &[session_file()],
             &state_with(seen("claude-opus-5-5", 1_000_000)),
             &metas_of,
+            &BTreeMap::new(),
+            RowTokens::Recorded {
+                recorded: &RecordedTokens::default(),
+                pending: &[],
+            },
             Some(&projects()),
             &known_pricing(&valuer, &settings),
             "atlas",
@@ -2325,6 +2607,11 @@ mod tests {
             &[session_file()],
             &state_with(seen("claude-opus-5-5", 1_000_000)),
             &|_: &str| metas.clone(),
+            &BTreeMap::new(),
+            RowTokens::Recorded {
+                recorded: &RecordedTokens::default(),
+                pending: &[],
+            },
             Some(&projects()),
             &known_pricing(&valuer, &settings),
             "atlas",
@@ -2364,6 +2651,11 @@ mod tests {
             &[session_file()],
             &state_with(seen("claude-opus-5-5", 1_000_000)),
             &|_: &str| metas.clone(),
+            &BTreeMap::new(),
+            RowTokens::Recorded {
+                recorded: &RecordedTokens::default(),
+                pending: &[],
+            },
             Some(&projects()),
             &known_pricing(&valuer, &settings),
             "atlas",
@@ -2425,6 +2717,11 @@ mod tests {
             &[session_file()],
             &state_with(seen("claude-opus-5-5", 1_000_000)),
             &|_: &str| metas.clone(),
+            &BTreeMap::new(),
+            RowTokens::Recorded {
+                recorded: &RecordedTokens::default(),
+                pending: &[],
+            },
             Some(&projects()),
             &known_pricing(&valuer, &settings),
             "atlas",
@@ -2448,6 +2745,11 @@ mod tests {
             &[session_file()],
             &state,
             &|_: &str| Vec::new(),
+            &BTreeMap::new(),
+            RowTokens::Recorded {
+                recorded: &RecordedTokens::default(),
+                pending: &[],
+            },
             Some(&projects()),
             &known_pricing(&valuer, &settings),
             "atlas",
@@ -2789,6 +3091,11 @@ mod tests {
             &[session_file()],
             &state,
             &metas_of,
+            &BTreeMap::new(),
+            RowTokens::Recorded {
+                recorded: &RecordedTokens::default(),
+                pending: &[],
+            },
             Some(&projects()),
             &known_pricing(&valuer, &settings),
             "atlas",
@@ -2951,8 +3258,53 @@ mod tests {
         );
     }
 
+    /// [`prices`] with the flash workers' model priced under models.dev's
+    /// `ollama-cloud` list, where [`money::model_price_key`] looks it up.
+    fn prices_with_flash() -> Prices {
+        let mut prices = prices();
+        prices.take(
+            BTreeMap::from([
+                (
+                    "anthropic/claude-opus-5-5".to_string(),
+                    ModelPrice {
+                        input: 4.0,
+                        output: 20.0,
+                        cache_write: 5.0,
+                        cache_read: 0.2,
+                        tiered: false,
+                    },
+                ),
+                (
+                    "anthropic/claude-fable-5-2".to_string(),
+                    ModelPrice {
+                        input: 4.0,
+                        output: 20.0,
+                        cache_write: 5.0,
+                        cache_read: 0.2,
+                        tiered: false,
+                    },
+                ),
+                (
+                    money::model_price_key(FLASH_MODEL),
+                    ModelPrice {
+                        input: 0.3,
+                        output: 1.2,
+                        cache_write: 0.0,
+                        cache_read: 0.0,
+                        tiered: false,
+                    },
+                ),
+            ]),
+            utc("2026-01-02T00:00:00Z"),
+        );
+        prices
+    }
+
     /// A running Claude Code row and the same closed row with a linked worker
-    /// show the same tokens and values: they do not jump when the session closes.
+    /// show the same tokens and values: they do not jump when the session
+    /// closes. The running row reads the session's records (its own answers
+    /// and the worker's recorded growth) plus this pass's worker growth that is
+    /// written only after the rows; the worker put under it is not added again.
     #[test]
     fn a_running_and_closed_row_with_a_worker_have_the_same_numbers() {
         let dir = tempdir().expect("tempdir");
@@ -2973,59 +3325,67 @@ mod tests {
         window.end = utc("2026-11-21T00:00:00Z");
         window.last_sample = utc("2026-11-20T00:00:00Z");
         history.append(&window).expect("a finished window");
-        let claude_tokens = Tokens {
+        let claude = TokenRecord {
+            t: utc("2026-11-14T18:00:00Z"),
+            session: SESSION.to_string(),
+            cwd: ATLAS_CWD.to_string(),
+            project: project_key(),
+            model: "claude-opus-5-5".to_string(),
             input: 2_000_000,
             out: 12_400_000,
             cw: 26_173,
             cr: 28_126,
+            answers: 41,
+            agent_answers: 0,
         };
-        let worker_tokens = Tokens {
-            input: 2_200,
-            out: 1_100,
-            cw: 0,
-            cr: 0,
-        };
+        history.append(&claude).expect("the Claude record");
+        let mut recorded_worker = token(
+            SESSION,
+            utc("2026-11-14T18:00:00Z"),
+            FLASH_MODEL,
+            2_200,
+            1_100,
+        );
+        recorded_worker.answers = 0;
+        recorded_worker.agent_answers = 4;
         history
-            .append(&TokenRecord {
-                t: utc("2026-11-14T18:30:00Z"),
-                session: SESSION.to_string(),
-                cwd: ATLAS_CWD.to_string(),
-                project: project_key(),
-                model: "claude-opus-5-5".to_string(),
-                input: claude_tokens.input,
-                out: claude_tokens.out,
-                cw: claude_tokens.cw,
-                cr: claude_tokens.cr,
-                answers: 1,
-                agent_answers: 0,
-            })
-            .expect("the Claude record");
-        history
-            .append(&token(
-                SESSION,
-                utc("2026-11-14T18:35:00Z"),
-                "deepseek-v4.1-flash:cloud",
-                worker_tokens.input,
-                worker_tokens.out,
-            ))
-            .expect("the worker's record");
-        history
-            .append(&session_record(
-                SESSION,
-                utc("2026-11-14T18:40:00Z"),
-                utc("2026-11-13T23:40:00Z"),
-                utc("2026-11-14T18:40:00Z"),
-                true,
-                0,
-            ))
-            .expect("the closed session");
-        let valuer = valuer(&history, &settings, &[]);
+            .append(&recorded_worker)
+            .expect("the worker's recorded line");
+        // This pass's growth of the worker, written after the rows are built,
+        // and another session's line that is not this row's.
+        let mut growth = token(
+            SESSION,
+            utc("2026-11-14T18:00:00Z"),
+            FLASH_MODEL,
+            1_000,
+            500,
+        );
+        growth.answers = 0;
+        growth.agent_answers = 2;
+        let elsewhere = token(
+            OWN_SESSION,
+            utc("2026-11-14T18:00:00Z"),
+            FLASH_MODEL,
+            9_000,
+            9_000,
+        );
+        let valuer = valuer_with(&history, &settings, &[], &prices_with_flash());
         let pricing = known_pricing(&valuer, &settings);
+        let state = state_with(seen("claude-opus-5-5", claude.out));
+        let from = records_from(&[session_file()], &state).expect("a running session");
+        assert_eq!(from, utc("2026-11-13T23:00:00Z"), "the hour of its start");
+        let (recorded, warnings) = RecordedTokens::read(&history, from).expect("the records");
+        assert!(warnings.is_empty(), "{warnings:?}");
 
         let rows = running(
             &[session_file()],
-            &state_with(seen("claude-opus-5-5", claude_tokens.out)),
+            &state,
             &|_| Vec::new(),
+            &BTreeMap::new(),
+            RowTokens::Recorded {
+                recorded: &recorded,
+                pending: &[growth.clone(), elsewhere],
+            },
             Some(&projects()),
             &pricing,
             "atlas",
@@ -3035,27 +3395,51 @@ mod tests {
         let mut running_row = rows.sessions[0].clone();
         let worker_record = token(
             SESSION,
-            utc("2026-11-14T18:35:00Z"),
-            "deepseek-v4.1-flash:cloud",
-            worker_tokens.input,
-            worker_tokens.out,
+            utc("2026-11-14T18:00:00Z"),
+            FLASH_MODEL,
+            3_200,
+            1_600,
         );
         add_agents(
             &mut running_row,
             vec![LiveAgent {
                 agent: WORKER_A.to_string(),
                 parent: None,
+                provider: HARNESS_PROVIDER.to_string(),
                 kind: Some("flash".to_string()),
                 task: None,
-                model: Some("deepseek-v4.1-flash:cloud".to_string()),
+                model: Some(FLASH_MODEL.to_string()),
                 running: true,
                 first: Some(utc("2026-11-14T18:30:00Z")),
                 last: Some(utc("2026-11-14T18:35:00Z")),
-                tokens: worker_tokens,
+                tokens: Tokens {
+                    input: 3_200,
+                    out: 1_600,
+                    cw: 0,
+                    cr: 0,
+                },
                 values: pricing.of(&[valuer.value("atlas", &worker_record)]),
             }],
         );
+        assert_eq!(
+            running_row.tokens.out,
+            12_400_000 + 1_100 + 500,
+            "the Claude answers, the worker's recorded line and its growth, once"
+        );
+        assert_eq!(running_row.agents_running, 1);
 
+        // The pass writes the growth; the session then closes.
+        history.append(&growth).expect("the growth is written");
+        history
+            .append(&session_record(
+                SESSION,
+                utc("2026-11-14T18:40:00Z"),
+                utc("2026-11-13T23:40:00Z"),
+                utc("2026-11-14T18:40:00Z"),
+                true,
+                1,
+            ))
+            .expect("the closed session");
         let closed_rows = closed(
             &history,
             utc("2026-11-14T09:00:00Z"),
@@ -3068,6 +3452,162 @@ mod tests {
 
         assert_eq!(running_row.tokens, closed_row.tokens);
         assert_eq!(running_row.values, closed_row.values);
+        assert!(
+            running_row.values.api.is_some() && running_row.values.subscription.is_some(),
+            "both values are known: {:?}",
+            running_row.values
+        );
+    }
+
+    /// Fault B: a running session whose answers lie in two weekly windows is
+    /// valued record by record, each in its own week, exactly as the closed
+    /// row will be; not as one record dated at its last answer, which put the
+    /// first week's tokens into the second week's share.
+    #[test]
+    fn a_running_session_is_valued_hour_by_hour() {
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let settings = settings_eur();
+        history
+            .append(&live_event(utc("2026-11-06T00:00:00Z"), Some(ac())))
+            .expect("a live event");
+        history
+            .append(&price_changed_event(
+                utc("2026-11-01T00:00:00Z"),
+                Some(140.0),
+                Some("EUR"),
+            ))
+            .expect("the account's price");
+        // The week up to the reset at 11-14 used 80 %, the next one 40 %.
+        history.append(&weekly_window()).expect("the first week");
+        let mut second = weekly_window();
+        second.start = Some(utc("2026-11-14T00:00:00Z"));
+        second.end = utc("2026-11-21T00:00:00Z");
+        second.final_percent = 40.0;
+        second.last_sample = utc("2026-11-20T00:00:00Z");
+        history.append(&second).expect("the second week");
+        let before = token(
+            SESSION,
+            utc("2026-11-13T10:00:00Z"),
+            "claude-opus-5-5",
+            0,
+            1_000_000,
+        );
+        let after = token(
+            SESSION,
+            utc("2026-11-14T18:00:00Z"),
+            "claude-opus-5-5",
+            0,
+            1_000_000,
+        );
+        history.append(&before).expect("before the reset");
+        history.append(&after).expect("after the reset");
+        let accounts = [account(Some(140.0))];
+        let valuer = valuer(&history, &settings, &accounts);
+        let pricing = known_pricing(&valuer, &settings);
+        let mut seen = seen("claude-opus-5-5", 2_000_000);
+        seen.first = utc("2026-11-13T09:50:00Z");
+        let state = state_with(seen);
+        let from = records_from(&[session_file()], &state).expect("a running session");
+        let (recorded, _) = RecordedTokens::read(&history, from).expect("the records");
+
+        let rows = running(
+            &[session_file()],
+            &state,
+            &|_| Vec::new(),
+            &BTreeMap::new(),
+            RowTokens::Recorded {
+                recorded: &recorded,
+                pending: &[],
+            },
+            Some(&projects()),
+            &pricing,
+            "atlas",
+            utc("2026-11-14T19:00:00Z"),
+            &|_| project_key(),
+        );
+
+        let row = &rows.sessions[0];
+        assert_eq!(row.tokens.out, 2_000_000);
+        assert_eq!(row.values.api, Some(40.0), "20 EUR in each hour");
+        // Each record is the whole API value of its week, so it takes the
+        // week's whole used money: 80 % of the first week and 40 % of the
+        // second, at 140 EUR a month.
+        let expected = money::percent_value(140.0) * (80.0 + 40.0);
+        let subscription = row.values.subscription.expect("a subscription value");
+        assert!(
+            (subscription - expected).abs() < 1e-9,
+            "{subscription} is not {expected}"
+        );
+        let per_record = Values::of(
+            &[
+                valuer.value("atlas", &before),
+                valuer.value("atlas", &after),
+            ],
+            &settings,
+            valuer.fx(),
+            Utc::now(),
+        );
+        assert_eq!(row.values, per_record, "the closed row's way");
+    }
+
+    #[test]
+    fn recorded_tokens_keep_the_lines_written_after_the_read() {
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let vega = HistoryDir::at(dir.path(), "vega");
+        let early = token(
+            SESSION,
+            utc("2026-11-14T07:00:00Z"),
+            "claude-opus-5-5",
+            0,
+            100,
+        );
+        let read_line = token(
+            SESSION,
+            utc("2026-11-14T08:00:00Z"),
+            "claude-opus-5-5",
+            0,
+            200,
+        );
+        history.append(&early).expect("an earlier line");
+        history.append(&read_line).expect("a line of the read");
+        vega.append(&token(
+            SESSION,
+            utc("2026-11-14T08:00:00Z"),
+            "claude-opus-5-5",
+            0,
+            9_000,
+        ))
+        .expect("another host's line of the same id");
+
+        assert!(!RecordedTokens::default().covers(utc("2026-11-14T08:00:00Z")));
+        let (mut recorded, _) =
+            RecordedTokens::read(&history, utc("2026-11-14T08:00:00Z")).expect("the records");
+        assert!(recorded.covers(utc("2026-11-14T09:00:00Z")));
+        assert!(!recorded.covers(utc("2026-11-14T07:00:00Z")));
+        assert_eq!(
+            recorded.of(SESSION),
+            std::slice::from_ref(&read_line),
+            "only this host's lines from the read's start"
+        );
+
+        let written = token(
+            SESSION,
+            utc("2026-11-14T09:00:00Z"),
+            "claude-opus-5-5",
+            0,
+            300,
+        );
+        recorded.add(&[early, written.clone()]);
+        assert_eq!(
+            recorded.of(SESSION),
+            [read_line, written.clone()],
+            "a line before the start is not kept"
+        );
+        let mut nothing = RecordedTokens::default();
+        nothing.add(std::slice::from_ref(&written));
+        assert!(nothing.of(SESSION).is_empty(), "no read, nothing kept");
     }
 
     /// A Codex row's subscription is a known 0, so it never blanks the Claude
@@ -3198,6 +3738,11 @@ mod tests {
             &[file],
             &ScanState::default(),
             &|_: &str| Vec::new(),
+            &BTreeMap::new(),
+            RowTokens::Recorded {
+                recorded: &RecordedTokens::default(),
+                pending: &[],
+            },
             Some(&projects()),
             &known_pricing(&valuer, &settings),
             "atlas",
@@ -3406,6 +3951,11 @@ mod tests {
             &[session_file()],
             &state_with(seen),
             &|_: &str| Vec::new(),
+            &BTreeMap::new(),
+            RowTokens::Recorded {
+                recorded: &RecordedTokens::default(),
+                pending: &[],
+            },
             Some(&projects()),
             &known_pricing(&valuer, &settings),
             "atlas",
@@ -3447,6 +3997,11 @@ mod tests {
             &[session_file()],
             &state_with(seen("claude-opus-5-5", 1_000_000)),
             &metas_of,
+            &BTreeMap::new(),
+            RowTokens::Recorded {
+                recorded: &RecordedTokens::default(),
+                pending: &[],
+            },
             Some(&projects()),
             &known_pricing(&valuer, &settings),
             "atlas",
@@ -3471,6 +4026,11 @@ mod tests {
             &[session_file()],
             &ScanState::default(),
             &|_: &str| Vec::new(),
+            &BTreeMap::new(),
+            RowTokens::Recorded {
+                recorded: &RecordedTokens::default(),
+                pending: &[],
+            },
             Some(&projects()),
             &known_pricing(&valuer, &settings),
             "atlas",
@@ -3525,6 +4085,11 @@ mod tests {
             &[file],
             &state_with(seen("claude-opus-5-5", 1_000_000)),
             &|_: &str| Vec::new(),
+            &BTreeMap::new(),
+            RowTokens::Recorded {
+                recorded: &RecordedTokens::default(),
+                pending: &[],
+            },
             Some(&projects),
             &known_pricing(&valuer, &settings),
             "atlas",
@@ -3677,6 +4242,11 @@ mod tests {
             &[session_file()],
             &state,
             &metas_of,
+            &BTreeMap::new(),
+            RowTokens::Recorded {
+                recorded: &RecordedTokens::default(),
+                pending: &[],
+            },
             Some(&projects()),
             &known_pricing(&valuer, &settings),
             "atlas",
@@ -3891,6 +4461,11 @@ mod tests {
             &[session_file(), second],
             &state_with(seen("claude-opus-5-5", 1_000_000)),
             &metas_of,
+            &BTreeMap::new(),
+            RowTokens::Recorded {
+                recorded: &RecordedTokens::default(),
+                pending: &[],
+            },
             Some(&projects()),
             &known_pricing(&valuer, &settings),
             "atlas",
@@ -3919,6 +4494,7 @@ mod tests {
         session.agents.push(LiveAgent {
             agent: "a8751b20660a1de6b".to_string(),
             parent: None,
+            provider: CLAUDE_PROVIDER.to_string(),
             kind: Some("general-purpose".to_string()),
             task: Some("fix the failing tests".to_string()),
             model: Some("claude-opus-5-5".to_string()),
@@ -4202,7 +4778,10 @@ mod tests {
         paths: &crate::harness::HarnessPaths,
         state: &ScanState,
     ) -> BTreeMap<String, String> {
-        crate::harness::links(paths, &state.sessions, &state.closed_flash_jobs).owners
+        let mut reports = crate::harness::JobReports::default();
+        let warnings = reports.refresh(paths);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        crate::harness::links(&reports, &state.sessions, &state.closed_flash_jobs).owners
     }
 
     #[test]
@@ -4235,6 +4814,11 @@ mod tests {
             &[session_file()],
             &state,
             &|_| Vec::new(),
+            &BTreeMap::new(),
+            RowTokens::Recorded {
+                recorded: &RecordedTokens::default(),
+                pending: &[],
+            },
             Some(&projects()),
             &unknown_pricing(),
             "atlas",
@@ -4247,6 +4831,7 @@ mod tests {
             &claude_cwd,
             &BTreeMap::new(),
             &BTreeSet::new(),
+            &crate::harness::JobReports::default(),
             None,
             &unknown_pricing(),
             "atlas",
@@ -4311,6 +4896,11 @@ mod tests {
             &[session_file(), other_file],
             &state,
             &|_| Vec::new(),
+            &BTreeMap::new(),
+            RowTokens::Recorded {
+                recorded: &RecordedTokens::default(),
+                pending: &[],
+            },
             Some(&projects()),
             &unknown_pricing(),
             "atlas",
@@ -4324,6 +4914,7 @@ mod tests {
             &claude_cwd,
             &BTreeMap::new(),
             &BTreeSet::new(),
+            &crate::harness::JobReports::default(),
             None,
             &unknown_pricing(),
             "atlas",
@@ -4391,6 +4982,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeSet::new(),
+            &crate::harness::JobReports::default(),
             None,
             &unknown_pricing(),
             "atlas",
@@ -4499,7 +5091,7 @@ mod tests {
         let mut prices = Prices::default();
         prices.take(
             BTreeMap::from([(
-                crate::money::price_key("anthropic", "gpt-6.1-sol"),
+                crate::money::price_key("openai", "gpt-6.1-sol"),
                 ModelPrice {
                     input: 1.0,
                     output: 2.0,
@@ -4582,11 +5174,13 @@ mod tests {
     fn no_title_reaches_the_history() {
         let (dir, paths) = harness_store();
         let title = "atlas link test";
-        write_harness_session(&paths, JOB_A, None, 0, false, 10516, 3585, None);
+        // A DeepSeek Harness session of its own, not a flash job: its worker
+        // shows its title as its task.
+        write_harness_session(&paths, OWN_SESSION, None, 0, false, 10516, 3585, None);
         write_harness_session(
             &paths,
             WORKER_A,
-            Some(JOB_A),
+            Some(OWN_SESSION),
             1,
             false,
             2200,
@@ -4600,7 +5194,8 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
-            &BTreeSet::from([JOB_A.to_string()]),
+            &BTreeSet::from([OWN_SESSION.to_string()]),
+            &crate::harness::JobReports::default(),
             None,
             &unknown_pricing(),
             "atlas",
@@ -4664,6 +5259,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeSet::from([own.to_string(), blank.to_string(), JOB_A.to_string()]),
+            &crate::harness::JobReports::default(),
             None,
             &unknown_pricing(),
             "atlas",
@@ -4704,6 +5300,232 @@ mod tests {
         );
     }
 
+    /// One finished agent of `provider` with no tokens, for the report tests.
+    fn report_agent(agent: &str, provider: &str, at: DateTime<Utc>) -> LiveAgent {
+        LiveAgent {
+            agent: agent.to_string(),
+            parent: None,
+            provider: provider.to_string(),
+            kind: None,
+            task: None,
+            model: Some(FLASH_MODEL.to_string()),
+            running: false,
+            first: Some(at),
+            last: Some(at),
+            tokens: Tokens::default(),
+            values: Values::sum(&[]),
+        }
+    }
+
+    /// A flash job is named by its report's label, and nothing else: while it
+    /// runs it has no report and no task text, its own title (flash-agents'
+    /// dispatcher prompt) is never shown, and a worker under it shows no task
+    /// (its title names its folder). The label never reaches a file.
+    #[test]
+    fn a_flash_job_is_named_by_its_report_label() {
+        let (dir, paths) = harness_store();
+        let dispatcher = "You are a dispatcher. Do the task below and report what changed.";
+        let folder = "Working directory: /home/sam/fm/8279d42859b9/slots/3";
+        let label = "Fix the invoice export";
+        write_harness_session(&paths, JOB_A, None, 0, false, 10516, 3585, Some(dispatcher));
+        write_harness_session(
+            &paths,
+            WORKER_A,
+            Some(JOB_A),
+            1,
+            false,
+            2200,
+            1100,
+            Some(folder),
+        );
+        let now = utc("2026-11-14T19:00:00Z");
+        let owners = BTreeMap::from([(JOB_A.to_string(), SESSION.to_string())]);
+        let claude_cwd = BTreeMap::from([(SESSION.to_string(), ATLAS_CWD.to_string())]);
+        let mut reports = crate::harness::JobReports::default();
+        assert!(reports.refresh(&paths).is_empty());
+        let rows_of = |owners: &BTreeMap<String, String>,
+                       locks: &BTreeSet<String>,
+                       reports: &crate::harness::JobReports| {
+            let harness = crate::harness::sessions(&paths, utc("2026-11-01T00:00:00Z"));
+            harness_rows(
+                &harness.sessions,
+                owners,
+                &claude_cwd,
+                &BTreeMap::new(),
+                locks,
+                reports,
+                None,
+                &unknown_pricing(),
+                "atlas",
+                now,
+                &|_| project_key(),
+            )
+        };
+        let task_of = |out: &HarnessRows, id: &str| {
+            out.agents[SESSION]
+                .iter()
+                .find(|agent| agent.agent == id)
+                .expect("the agent")
+                .task
+                .clone()
+        };
+
+        let running_job = rows_of(&owners, &BTreeSet::new(), &reports);
+        assert_eq!(task_of(&running_job, JOB_A), None, "no report yet");
+        assert_eq!(task_of(&running_job, WORKER_A), None);
+        for agent in &running_job.agents[SESSION] {
+            assert_eq!(agent.provider, HARNESS_PROVIDER);
+        }
+        // Not linked yet, the running job is its own row: its worker shows no
+        // task either, and the row is not named by the dispatcher prompt.
+        let own = rows_of(
+            &BTreeMap::new(),
+            &BTreeSet::from([JOB_A.to_string()]),
+            &reports,
+        );
+        assert_eq!(own.rows.sessions.len(), 1);
+        assert_eq!(own.rows.sessions[0].title, None);
+        assert_eq!(own.rows.sessions[0].agents[0].task, None);
+        assert_eq!(own.rows.sessions[0].agents[0].provider, HARNESS_PROVIDER);
+
+        // The job ends and flash-agents writes its report (a background call).
+        write_harness_session(&paths, JOB_A, None, 0, true, 10516, 3585, Some(dispatcher));
+        let patches = paths.reports.join("8279d42859b9").join("patches");
+        std::fs::create_dir_all(&patches).expect("the reports folder");
+        std::fs::write(
+            patches.join("job-3e32c2fc.report.json"),
+            serde_json::json!({
+                "key": "8279d42859b9",
+                "kind": "task",
+                "sessionId": JOB_A,
+                "label": label,
+                "status": "done",
+                "stopReason": "end_turn",
+                "timing": {"startedAt": "2026-11-14T09:40:00.000Z"},
+                "createdAt": "2026-11-14T09:40:00.000Z",
+                "report": {"text": "Done."}
+            })
+            .to_string(),
+        )
+        .expect("the job's report");
+        assert!(reports.refresh(&paths).is_empty());
+        let done = rows_of(&owners, &BTreeSet::new(), &reports);
+        assert_eq!(task_of(&done, JOB_A).as_deref(), Some(label));
+        assert_eq!(task_of(&done, WORKER_A), None);
+
+        let mut claude = row(LiveStatus::Busy, Some("claude-opus-5-5"), now);
+        add_agents(&mut claude, done.agents[SESSION].clone());
+        let history = HistoryDir::at(&dir.path().join("history"), "atlas");
+        write_report(&history, &[claude], now).expect("the sessions report");
+        crate::history::Recorder::new(HistoryDir::at(&dir.path().join("history"), "atlas"))
+            .tokens(&done.tokens)
+            .expect("the token lines");
+        let mut found = String::new();
+        let mut files = 0;
+        collect_text(&dir.path().join("history"), &mut found, &mut files);
+        assert!(files > 1, "the report and a token line were written");
+        for text in [label, dispatcher, folder] {
+            assert!(!found.contains(text), "{text} reached a file");
+        }
+    }
+
+    /// A report of an older seatswap has no `provider` on its agents: each
+    /// takes its session's provider when the report is read. An agent that
+    /// has its own keeps it.
+    #[test]
+    fn an_older_reports_agents_take_their_sessions_provider() {
+        let dir = tempdir().expect("tempdir");
+        let now = utc("2026-11-14T19:00:00Z");
+        let atlas = HistoryDir::at(dir.path(), "atlas");
+        let vega = HistoryDir::at(dir.path(), "vega");
+        let ledger = HistoryDir::at(dir.path(), "ledger");
+        host_marker(dir.path(), "vega");
+        host_marker(dir.path(), "ledger");
+        let at = now - Duration::minutes(2);
+
+        let mut claude = report_session("vega", LiveStatus::Busy, at);
+        claude.agents.push(report_agent(AGENT, CLAUDE_PROVIDER, at));
+        let mut own = report_session("vega", LiveStatus::Busy, at);
+        own.session = OWN_SESSION.to_string();
+        own.provider = HARNESS_PROVIDER.to_string();
+        own.agents
+            .push(report_agent(WORKER_A, HARNESS_PROVIDER, at));
+        let mut older = serde_json::to_value(HostReport {
+            at,
+            sessions: vec![claude, own],
+        })
+        .expect("a report");
+        for session in older["sessions"].as_array_mut().expect("sessions") {
+            for agent in session["agents"].as_array_mut().expect("agents") {
+                agent
+                    .as_object_mut()
+                    .expect("an agent")
+                    .remove("provider")
+                    .expect("the field the older report lacks");
+            }
+        }
+        std::fs::write(vega.sessions_now_file("vega"), older.to_string())
+            .expect("vega's older report");
+
+        // A current report: a flash job under a Claude Code row keeps its own.
+        let mut current = report_session("ledger", LiveStatus::Busy, at);
+        current
+            .agents
+            .push(report_agent(JOB_A, HARNESS_PROVIDER, at));
+        write_report(&ledger, &[current], at).expect("ledger's report");
+
+        let other = other_hosts(&atlas, now).expect("the other hosts");
+        assert!(other.warnings.is_empty(), "{:?}", other.warnings);
+        let host = |name: &str| {
+            other
+                .hosts
+                .iter()
+                .find(|host| host.host == name)
+                .expect("the host")
+        };
+        let vega = host("vega");
+        assert_eq!(vega.sessions[0].agents[0].provider, CLAUDE_PROVIDER);
+        assert_eq!(vega.sessions[1].agents[0].provider, HARNESS_PROVIDER);
+        assert_eq!(
+            host("ledger").sessions[0].agents[0].provider,
+            HARNESS_PROVIDER
+        );
+    }
+
+    /// Every agent names its provider: a Claude Code subagent Claude Code's.
+    #[test]
+    fn a_claude_subagent_names_its_provider() {
+        let meta = AgentMeta {
+            session: SESSION.to_string(),
+            agent: AGENT.to_string(),
+            agent_type: Some("general-purpose".to_string()),
+            description: Some("fix the failing tests".to_string()),
+            finished: false,
+            spawn_depth: Some(1),
+            tool_use_id: Some("toolu_01Nkn4".to_string()),
+            parent: None,
+            transcript_ended: false,
+        };
+        let rows = running(
+            &[session_file()],
+            &state_with(seen("claude-opus-5-5", 1_000_000)),
+            &|_: &str| vec![meta.clone()],
+            &BTreeMap::new(),
+            RowTokens::Recorded {
+                recorded: &RecordedTokens::default(),
+                pending: &[],
+            },
+            Some(&projects()),
+            &unknown_pricing(),
+            "atlas",
+            utc("2026-11-14T19:00:00Z"),
+            &|_: &str| project_key(),
+        );
+        assert_eq!(rows.sessions[0].agents[0].provider, CLAUDE_PROVIDER);
+        let json = serde_json::to_value(&rows.sessions[0].agents[0]).expect("an agent");
+        assert_eq!(json["provider"], CLAUDE_PROVIDER, "camelCase `provider`");
+    }
+
     fn collect_text(dir: &std::path::Path, text: &mut String, files: &mut usize) {
         for entry in std::fs::read_dir(dir).expect("a folder") {
             let path = entry.expect("an entry").path();
@@ -4731,6 +5553,7 @@ mod tests {
             &claude_cwd,
             &BTreeMap::new(),
             &BTreeSet::new(),
+            &crate::harness::JobReports::default(),
             None,
             &unknown_pricing(),
             "atlas",
@@ -4760,6 +5583,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeSet::new(),
+            &crate::harness::JobReports::default(),
             None,
             &unknown_pricing(),
             "atlas",
@@ -4810,6 +5634,7 @@ mod tests {
             &claude_cwd,
             &BTreeMap::new(),
             &BTreeSet::from([JOB_B.to_string()]),
+            &crate::harness::JobReports::default(),
             None,
             &unknown_pricing(),
             "atlas",
@@ -4837,6 +5662,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeSet::from([WORKER_A.to_string()]),
+            &crate::harness::JobReports::default(),
             None,
             &unknown_pricing(),
             "atlas",
@@ -4931,6 +5757,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeSet::new(),
+            &crate::harness::JobReports::default(),
             None,
             &unknown_pricing(),
             "atlas",
@@ -4985,6 +5812,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeSet::new(),
+            &crate::harness::JobReports::default(),
             None,
             &unknown_pricing(),
             "atlas",
@@ -5015,6 +5843,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeSet::new(),
+            &crate::harness::JobReports::default(),
             None,
             &unknown_pricing(),
             "atlas",
@@ -5044,6 +5873,7 @@ mod tests {
             &BTreeMap::new(),
             &first.recorded,
             &BTreeSet::new(),
+            &crate::harness::JobReports::default(),
             None,
             &unknown_pricing(),
             "atlas",
@@ -5084,7 +5914,7 @@ mod tests {
         let mut priced = prices();
         priced.take(
             std::collections::BTreeMap::from([(
-                format!("anthropic/{FLASH_MODEL}"),
+                money::model_price_key(FLASH_MODEL),
                 ModelPrice {
                     input: 4.0,
                     output: 20.0,
@@ -5104,6 +5934,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeSet::from([OWN_SESSION.to_string()]),
+            &crate::harness::JobReports::default(),
             None,
             &known_pricing(&valuer, &settings),
             "atlas",
@@ -5150,7 +5981,7 @@ mod tests {
         let mut priced = prices();
         priced.take(
             std::collections::BTreeMap::from([(
-                format!("anthropic/{FLASH_MODEL}"),
+                money::model_price_key(FLASH_MODEL),
                 ModelPrice {
                     input: 4.0,
                     output: 20.0,
@@ -5170,6 +6001,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeSet::from([OWN_SESSION.to_string()]),
+            &crate::harness::JobReports::default(),
             None,
             &known_pricing(&valuer, &settings),
             "atlas",

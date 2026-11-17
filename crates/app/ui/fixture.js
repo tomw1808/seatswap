@@ -1405,7 +1405,7 @@ export async function fixtureInvoke(command, args) {
         copied.push(name);
       }
       fixture.history.hosts.sort((one, other) => (one.host < other.host ? -1 : 1));
-      return { copied, conflicts: [], view: fixtureHistoryView(fixture) };
+      return { copied, conflicts: [], warnings: [], view: fixtureHistoryView(fixture) };
     }
 
     case "history_export": {

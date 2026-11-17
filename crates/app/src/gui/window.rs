@@ -164,9 +164,38 @@ fn is_slug(value: &str) -> bool {
 /// shown, un-minimized, focused and sent `open-area`. The two windows each have
 /// their own event name, because `emit` reaches every window: the pop-up keeps
 /// `navigate` (decision 3 of the plan's lead).
+///
+/// Every caller is on the main thread or in a synchronous command: the tray
+/// menu's handler, the socket's `run_on_main_thread` and `open_window`. On
+/// Windows, building a web view there deadlocks (Tauri's
+/// `WebviewWindowBuilder::new`, "Known issues"): the build waits for the main
+/// thread it is blocking, and the window stays white. So the work runs on a
+/// thread of its own; only a bad target is returned at once. An error from the
+/// thread is reported like the app's other errors (printed and notified once).
 #[cfg(feature = "gui")]
 pub(crate) fn show(app: &AppHandle, target: &str) -> Result<(), String> {
     parse_target(target)?;
+    let app = app.clone();
+    let target = target.to_string();
+    std::thread::Builder::new()
+        .name("seatswap-window".to_string())
+        .spawn(move || {
+            if let Err(error) = show_or_create(&app, &target) {
+                super::report_error(&app, &format!("window: {error}"));
+            }
+        })
+        .map(|_| ())
+        .map_err(|error| format!("cannot start the window's thread: {error}"))
+}
+
+/// Focus the open window on `target`, or build it. One at a time, so two quick
+/// clicks build one window and the second focuses it.
+#[cfg(feature = "gui")]
+fn show_or_create(app: &AppHandle, target: &str) -> Result<(), String> {
+    static OPENING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = OPENING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(window) = app.get_webview_window(WINDOW_LABEL) {
         window.show().map_err(|error| error.to_string())?;
         window.unminimize().map_err(|error| error.to_string())?;

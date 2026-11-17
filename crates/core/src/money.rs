@@ -194,10 +194,11 @@ impl Prices {
         save_json(app, &path, self.version, self)
     }
 
-    /// The price of a model as the valuer looks it up: every model is keyed
-    /// under models.dev's `anthropic` list, whoever runs it.
+    /// The price of a model as the valuer looks it up: under the key
+    /// [`model_price_key`] gives its id, at `at`. `None` when that key has no
+    /// price; it is never looked up under another provider.
     pub fn of_model(&self, model: &str, at: DateTime<Utc>) -> Option<&ModelPrice> {
-        self.at(&price_key("anthropic", model), at)
+        self.at(&model_price_key(model), at)
     }
 
     /// The price of `key` at `at`: the last point at or before `at`, else the
@@ -520,6 +521,38 @@ pub fn price_key(provider: &str, model_id: &str) -> String {
     format!("{provider}/{model_id}")
 }
 
+/// The key a model id is priced under (spec §11.5): the one rule every price
+/// look-up of a token record goes through.
+///
+/// - A Claude plan model ([`is_plan_model`]) is `anthropic/<id>`.
+/// - An Ollama cloud model, as DeepSeek Harness and flash name it, is in
+///   models.dev's `ollama-cloud` list without Ollama's `-cloud` marker:
+///   `<name>:cloud` is `ollama-cloud/<name>`, and `<name>:<tag>-cloud` is
+///   `ollama-cloud/<name>:<tag>` (`deepseek-v4.1-flash:1017-cloud` is
+///   `ollama-cloud/deepseek-v4.1-flash:1017`).
+/// - Any other id is `openai/<id>`: Codex is the only other source of model
+///   ids.
+///
+/// A key without a price stays a missing price; no other provider is tried.
+pub fn model_price_key(model: &str) -> String {
+    if is_plan_model(model) {
+        return price_key("anthropic", model);
+    }
+    if let Some(name) = model.strip_suffix(":cloud") {
+        if !name.is_empty() {
+            return price_key("ollama-cloud", name);
+        }
+    }
+    if let Some(tagged) = model.strip_suffix("-cloud") {
+        if let Some((name, tag)) = tagged.rsplit_once(':') {
+            if !name.is_empty() && !tag.is_empty() {
+                return price_key("ollama-cloud", tagged);
+            }
+        }
+    }
+    price_key("openai", model)
+}
+
 /// Whether `model` is a Claude Code model, so its tokens use the Claude plan
 /// (spec §1.4, §3.8): the one rule. Claude Code's own model ids start with
 /// `claude-`; a DeepSeek Harness or flash worker (`deepseek-v4.1-flash:cloud`),
@@ -740,9 +773,9 @@ pub fn look_up_rate(
 /// What one token record costs at API prices, in USD. `None` when the record's
 /// model has no price. A record whose four token counts are all 0 costs nothing,
 /// so it has the value 0 even when its model has no price (Claude Code writes
-/// such records with model `<synthetic>`). The record's model is priced as an
-/// Anthropic model (`anthropic/<model>`), the provider Claude Code's transcripts
-/// come from.
+/// such records with model `<synthetic>`). The record's model is priced under
+/// the key [`model_price_key`] gives it: a Claude model as `anthropic`, an
+/// Ollama cloud model as `ollama-cloud`, any other (Codex) as `openai`.
 pub fn api_usd(record: &TokenRecord, prices: &Prices) -> Option<f64> {
     if record.input == 0 && record.out == 0 && record.cw == 0 && record.cr == 0 {
         return Some(0.0);
@@ -1507,6 +1540,115 @@ mod tests {
         assert_eq!((ollama.input, ollama.output), (0.3, 1.2));
         assert_eq!(ollama.cache_read, 0.0);
         assert_eq!(ollama.cache_write, 0.0);
+    }
+
+    #[test]
+    fn a_model_id_has_one_price_key() {
+        for (model, key) in [
+            ("claude-opus-5-5", "anthropic/claude-opus-5-5"),
+            ("claude-haiku-5-5", "anthropic/claude-haiku-5-5"),
+            (
+                "deepseek-v4.1-flash:cloud",
+                "ollama-cloud/deepseek-v4.1-flash",
+            ),
+            (
+                "deepseek-v4.1-flash:1017-cloud",
+                "ollama-cloud/deepseek-v4.1-flash:1017",
+            ),
+            (
+                "minimax-m3.1-flash:cloud",
+                "ollama-cloud/minimax-m3.1-flash",
+            ),
+            ("gpt-6.1-sol", "openai/gpt-6.1-sol"),
+            // Neither Ollama form: an id that only ends in `-cloud` or has an
+            // empty name or tag is another provider's id, priced as `openai`.
+            ("gpt-6.1-cloud", "openai/gpt-6.1-cloud"),
+            (":cloud", "openai/:cloud"),
+            (
+                "deepseek-v4.1-flash:-cloud",
+                "openai/deepseek-v4.1-flash:-cloud",
+            ),
+        ] {
+            assert_eq!(model_price_key(model), key, "{model}");
+        }
+    }
+
+    /// Every model is priced under its own provider's list (fault A): a
+    /// Harness, flash, Ollama or Codex record gets its API value, and a key
+    /// without a price stays missing with the model named, never a price of
+    /// another provider.
+    #[test]
+    fn every_provider_is_priced_by_its_own_key() {
+        let at = utc("2026-11-14T09:00:00Z");
+        let price = |output: f64| ModelPrice {
+            input: 1.0,
+            output,
+            cache_write: 0.0,
+            cache_read: 0.0,
+            tiered: false,
+        };
+        let mut prices = Prices::default();
+        prices.take(
+            BTreeMap::from([
+                ("anthropic/claude-opus-5-5".to_string(), price(20.0)),
+                ("ollama-cloud/deepseek-v4.1-flash".to_string(), price(2.0)),
+                (
+                    "ollama-cloud/deepseek-v4.1-flash:1017".to_string(),
+                    price(3.0),
+                ),
+                ("ollama-cloud/minimax-m3.1-flash".to_string(), price(4.0)),
+                ("openai/gpt-6.1-sol".to_string(), price(10.0)),
+                // A price stored under the wrong provider is never used.
+                ("anthropic/glm-5".to_string(), price(99.0)),
+            ]),
+            utc("2026-01-01T00:00:00Z"),
+        );
+        for (model, usd) in [
+            ("claude-opus-5-5", 20.0),
+            ("deepseek-v4.1-flash:cloud", 2.0),
+            ("deepseek-v4.1-flash:1017-cloud", 3.0),
+            ("minimax-m3.1-flash:cloud", 4.0),
+            ("gpt-6.1-sol", 10.0),
+        ] {
+            assert_eq!(
+                api_usd(&token(at, model, 0, 1_000_000, 0, 0), &prices),
+                Some(usd),
+                "{model}"
+            );
+        }
+        assert_eq!(
+            api_usd(&token(at, "glm-5:cloud", 0, 1_000_000, 0, 0), &prices),
+            None,
+            "ollama-cloud/glm-5 has no price; anthropic/glm-5 is not tried"
+        );
+
+        let settings = settings_eur();
+        let history = HistoryDir::at(tempdir().expect("tempdir").path(), "atlas");
+        let valuer = Valuer::build(
+            &history,
+            &range("2026-11-10T00:00:00Z", "2026-11-15T00:00:00Z"),
+            &prices,
+            &fx_eur(),
+            &settings,
+            &[],
+            &RefCell::new(Vec::new()),
+        )
+        .expect("a valuer");
+        let flash = valuer.value(
+            "atlas",
+            &token(at, "deepseek-v4.1-flash:cloud", 0, 1_000_000, 0, 0),
+        );
+        assert_eq!(flash.api, Some(2.0));
+        assert_eq!(flash.subscription, Some(0.0), "outside the Claude plan");
+        let unpriced = valuer.value("atlas", &token(at, "glm-5:cloud", 0, 1_000_000, 0, 0));
+        assert_eq!(unpriced.api, None);
+        assert_eq!(
+            unpriced.api_missing,
+            Some(Missing::NoPrice {
+                model: "glm-5:cloud".to_string()
+            }),
+            "the reason names the model"
+        );
     }
 
     #[test]

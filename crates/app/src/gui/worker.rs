@@ -418,8 +418,22 @@ pub(crate) fn spawn(
     // The one history folder this run uses: the recorder's and every read's.
     // Opening it here means a changed `hostName` or `historyDir` is not read
     // from a newer snapshot while the recorder still writes the old folder.
+    // A changed history folder first gets this host's history. `gui::run` took
+    // `gui.lock` before this, and no thread of this run writes the history
+    // yet, so nothing writes the old folder while it is copied. A failed move
+    // is reported and the folder opens anyway; the next start tries again.
     let history = match settings.as_ref() {
-        Some(settings) => ops::open_history(&app, settings).map(|recorder| recorder.dir().clone()),
+        Some(settings) => {
+            match ops::bring_history_along(&app, settings, ops::Bringer::TrayApp) {
+                Ok(warnings) => {
+                    for warning in &warnings {
+                        reported_errors.report(warning);
+                    }
+                }
+                Err(error) => reported_errors.report(&error),
+            }
+            ops::open_history(&app, settings).map(|recorder| recorder.dir().clone())
+        }
         None => Err(ops::history_unwritable(&"the settings are not loaded")),
     };
     let forecast = Arc::new(Mutex::new(None));

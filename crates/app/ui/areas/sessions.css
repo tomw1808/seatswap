@@ -313,7 +313,8 @@
 
 /* A sub-row that names an error of the view (a session without a provider):
    the error's colour, never a silently made-up provider. */
-.sess-subrow-error {
+.sess-subrow-error,
+.sess-subrow-error > .mf {
   color: var(--danger);
 }
 

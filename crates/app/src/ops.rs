@@ -5,7 +5,7 @@
 use chrono::{DateTime, Utc};
 
 use seatswap_core::history::{
-    AccountRef, By, EventKind, HistoryDir, HistoryError, Recorder, SessionCounts,
+    self, AccountRef, By, EventKind, HistoryDir, HistoryError, Recorder, SessionCounts,
 };
 use seatswap_core::paths::{AppPaths, ClaudePaths};
 use seatswap_core::shared;
@@ -13,6 +13,8 @@ use seatswap_core::shared;
 use seatswap_core::store::AccountsFile;
 use seatswap_core::store::{Account, Settings, Store};
 use seatswap_core::switcher::{self, LiveState, Synced};
+
+use crate::gui::ipc::{self, IpcError};
 
 /// The one place a switch is written to the history, for the CLI and the GUI.
 /// A switch that saved the unsaved login writes that account's `accountAdded`
@@ -125,6 +127,74 @@ pub(crate) fn record_plan_change(
 /// The one sentence the app uses when the history cannot be written.
 pub(crate) fn history_unwritable(error: &dyn std::fmt::Display) -> String {
     format!("the history cannot be written: {error}")
+}
+
+/// Who brings this host's history along to a changed history folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Bringer {
+    /// The tray app at its start: it holds `gui.lock` for its whole run, so
+    /// no other tray app writes the history, and none of its own threads
+    /// writes it yet.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    TrayApp,
+    /// A command: only while no tray app runs. A running tray app may still be
+    /// writing the old folder; it brings the history along at its next start.
+    Command,
+}
+
+/// Bring this host's history folder to the history folder the settings name
+/// now (`history::bring_along`), when the folder changed since the last run.
+/// The warnings are `history::bring_along`'s; the error is the one every
+/// front end shows when the move failed. A failed move does not keep the
+/// history from opening: the move is tried again at the next start, and lines
+/// written to the new folder meanwhile are kept.
+pub(crate) fn bring_history_along(
+    app: &AppPaths,
+    settings: &Settings,
+    by: Bringer,
+) -> Result<Vec<String>, String> {
+    // `feed` asks a running tray app to take the status line's numbers, which
+    // the status line does every few seconds anyway; nothing else changes.
+    bring_unless_a_tray_app_runs(app, settings, by, || ipc::send_line(app, "feed"))
+}
+
+/// [`bring_history_along`] with the question to the tray app passed in, so a
+/// test never reaches a real tray app's socket.
+fn bring_unless_a_tray_app_runs(
+    app: &AppPaths,
+    settings: &Settings,
+    by: Bringer,
+    ask_tray_app: impl FnOnce() -> Result<(), IpcError>,
+) -> Result<Vec<String>, String> {
+    let due = history::bring_along_due(app, settings).map_err(|error| not_brought(&error))?;
+    if !due {
+        return Ok(Vec::new());
+    }
+    // A command asks the tray app's socket, the way `seatswap panel` reaches
+    // it, and never takes `gui.lock`: a tray app starting in that instant
+    // would find the lock taken, believe another one runs, and exit. A tray
+    // app that runs binds its socket before it opens the history, so one that
+    // may be writing the old folder answers, and the command leaves the move
+    // to that tray app's next start. One that starts after this question reads
+    // the settings that name the new folder, never writes the old one, and
+    // does its own move first, on the app lock, after this one.
+    if by == Bringer::Command && tray_app_may_run(ask_tray_app()) {
+        return Ok(Vec::new());
+    }
+    history::bring_along(app, settings).map_err(|error| not_brought(&error))
+}
+
+/// Whether a tray app may be running, from what its socket answered. Only a
+/// socket nobody listens on says none runs; any answer (an older tray app's
+/// "unknown command" too) and any other failure (a socket that does not
+/// answer in time) may be a running tray app.
+fn tray_app_may_run(answer: Result<(), IpcError>) -> bool {
+    !matches!(answer, Err(IpcError::NotRunning))
+}
+
+/// The one sentence for a move of the history that failed.
+fn not_brought(error: &dyn std::fmt::Display) -> String {
+    format!("this host's history was not brought to the new history folder: {error}")
 }
 
 /// Open the history folder with the same rule everywhere. The text is the one
@@ -654,5 +724,94 @@ mod tests {
         let events = event_values(history.path());
         assert_eq!(events.len(), 1, "{events:?}");
         assert_eq!(events[0]["type"], "switch");
+    }
+
+    /// A command brings the history along only while no tray app answers on
+    /// its socket: a running tray app may still write the old folder.
+    #[test]
+    fn a_command_brings_the_history_along_only_while_no_tray_app_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = AppPaths::at(&tmp.path().join("data"));
+        fs::create_dir_all(&app.data_dir).unwrap();
+        let machine_id = "0b4e7c22-6a1d-4e3f-8c59-2d7a9e1b4f60";
+        fs::write(app.machine_id_file(), machine_id).unwrap();
+        // This host's history in the data folder, as every earlier version kept it.
+        let old = app.history_dir().join("atlas");
+        fs::create_dir_all(&old).unwrap();
+        fs::write(
+            old.join("host.json"),
+            format!("{{\"machineId\":\"{machine_id}\"}}"),
+        )
+        .unwrap();
+        fs::write(
+            old.join("up-2026-11.jsonl"),
+            "{\"t\":\"2026-11-14T09:00:00Z\"}\n",
+        )
+        .unwrap();
+        let new = tmp.path().join("Dropbox").join("seatswap");
+        let settings = Settings {
+            host_name: Some("atlas".to_string()),
+            history_dir: Some(new.clone()),
+            ..Settings::default()
+        };
+
+        // A tray app answers: it may be writing the old folder, so nothing
+        // moves, and gui.lock is never taken.
+        let answers = || Ok(());
+        assert_eq!(
+            bring_unless_a_tray_app_runs(&app, &settings, Bringer::Command, answers),
+            Ok(Vec::new())
+        );
+        assert!(!new.exists(), "nothing moves while the tray app runs");
+        assert!(!app.history_root_file().exists());
+        assert!(!app.gui_lock().exists(), "gui.lock is never taken");
+
+        // The tray app itself moves at its start without asking anyone.
+        let asked = std::cell::Cell::new(false);
+        let tray_start = Settings {
+            history_dir: Some(tmp.path().join("elsewhere")),
+            ..settings.clone()
+        };
+        let ask = || {
+            asked.set(true);
+            Ok(())
+        };
+        assert_eq!(
+            bring_unless_a_tray_app_runs(&app, &tray_start, Bringer::TrayApp, ask),
+            Ok(Vec::new())
+        );
+        assert!(!asked.get());
+        assert!(tmp
+            .path()
+            .join("elsewhere/atlas/up-2026-11.jsonl")
+            .is_file());
+        fs::remove_file(app.history_root_file()).unwrap();
+
+        // Nobody listens on the socket: no tray app runs, the command moves.
+        let nobody = || Err(IpcError::NotRunning);
+        assert_eq!(
+            bring_unless_a_tray_app_runs(&app, &settings, Bringer::Command, nobody),
+            Ok(Vec::new())
+        );
+        assert!(new.join("atlas/up-2026-11.jsonl").is_file());
+        assert!(app.history_root_file().is_file());
+        assert!(
+            old.join("up-2026-11.jsonl").is_file(),
+            "the old folder stays"
+        );
+    }
+
+    /// Only a socket nobody listens on means no tray app runs.
+    #[test]
+    fn only_a_silent_socket_means_no_tray_app_runs() {
+        assert!(!tray_app_may_run(Err(IpcError::NotRunning)));
+        assert!(tray_app_may_run(Ok(())));
+        assert!(tray_app_may_run(Err(IpcError::Reply(
+            "error unknown command".to_string()
+        ))));
+        assert!(tray_app_may_run(Err(IpcError::Io {
+            path: std::path::PathBuf::from("/run/user/1000/seatswap-0f3a9c21d4e6b781.sock"),
+            source: std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out"),
+        })));
     }
 }

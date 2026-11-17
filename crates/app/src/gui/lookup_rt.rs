@@ -625,6 +625,12 @@ mod tests {
 
     /// The request line and the headers, read from the local test connection.
     fn read_request(stream: &std::net::TcpStream) -> Captured {
+        // On Windows an accepted stream inherits the listener's non-blocking
+        // mode (two servers here poll their listener); a read would then fail
+        // with WouldBlock while the client is still sending.
+        stream
+            .set_nonblocking(false)
+            .expect("the accepted stream blocks");
         let mut reader = BufReader::new(stream.try_clone().expect("a stream clone"));
         let mut line = String::new();
         reader.read_line(&mut line).expect("the request line");

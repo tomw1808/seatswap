@@ -956,6 +956,16 @@ fn open_context(cli: &Cli) -> Result<Context, CliError> {
         file.settings.claude_config_dir.as_deref(),
     )?;
     let (_, claude) = paths.into_parts();
+    // Before any command reads or writes the history: a changed history folder
+    // gets this host's history first. The command runs either way.
+    match ops::bring_history_along(store.app_paths(), &file.settings, ops::Bringer::Command) {
+        Ok(warnings) => {
+            for warning in &warnings {
+                warn(warning);
+            }
+        }
+        Err(error) => warn(&error),
+    }
     Ok(Context {
         store,
         claude,
@@ -1503,6 +1513,9 @@ fn utc_midnight(date: NaiveDate) -> Result<DateTime<Utc>, CliError> {
 /// error after everything that was copied.
 fn history_import(context: &Context, folder: &str) -> Result<(), CliError> {
     let imported = import_history(context, folder)?;
+    for warning in &imported.warnings {
+        warn(warning);
+    }
     if imported.copied.is_empty() {
         println!("nothing new");
     } else {

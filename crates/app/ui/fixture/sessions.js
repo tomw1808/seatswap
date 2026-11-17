@@ -94,12 +94,15 @@ function fixtureDaysAgoAt(days, hours, minutes) {
   return date.toISOString();
 }
 
-function fixtureAgent(session, key, parent, kind, task, model, running, first, last, million) {
+// `provider` is the agent's own: a flash job and its workers under a Claude
+// Code session are DeepSeek Harness agents.
+function fixtureAgent(session, key, parent, kind, task, model, running, first, last, million, provider = "Claude Code") {
   return {
     agent: `${session}-${key}`,
     parent: parent ? `${session}-${parent}` : null,
     kind,
     task,
+    provider,
     model,
     running,
     first,
@@ -144,7 +147,8 @@ function fixtureWantsAgents400() {
 }
 
 // `?fixture=noprovider` takes the provider away from the session with the flash
-// job, so the page's "a missing provider is an error on the row" can be seen.
+// job and from its agents, so the page's "a missing provider is an error on the
+// row" can be seen.
 function fixtureWantsNoProvider() {
   if (typeof location === "undefined" || typeof URLSearchParams !== "function") return false;
   try {
@@ -292,6 +296,22 @@ function fixtureSessionRows() {
       null,
       0.4
     ),
+    // A flash job that has not answered yet: no model and, while it runs, no
+    // label, so its row is the flash tag alone under "DeepSeek Harness · no
+    // answers yet".
+    fixtureAgent(
+      "atlas-a6",
+      "flash-new",
+      null,
+      "flash",
+      null,
+      null,
+      true,
+      isoIn(-30 * 1000),
+      null,
+      0,
+      "DeepSeek Harness"
+    ),
     ...a6Children,
     ...atlasDone,
   ];
@@ -337,43 +357,48 @@ function fixtureSessionRows() {
   s47Agents[1].task = "research a second provider";
 
   // A Claude session with a flash job (kind "flash") and its two workers: the
-  // job is one agent of the session and the workers hang under it (S-3).
+  // job is one agent of the session and the workers hang under it (S-3). The
+  // job's task is its label; its workers have no task. All three are DeepSeek
+  // Harness agents under a Claude Code session.
   const flashAgents = [
     fixtureAgent(
       "notes-62",
       "flash",
       null,
       "flash",
-      "patch the release notes",
+      "seatswap link test: direct job",
       "deepseek-v4.1-flash:cloud",
       true,
       isoIn(-9 * 60000),
       null,
-      0.3
+      0.3,
+      "DeepSeek Harness"
     ),
     fixtureAgent(
       "notes-62",
       "flash-worker-1",
       "flash",
       null,
-      "collect the changed pages",
+      null,
       "deepseek-v4.1-flash:cloud",
       true,
       isoIn(-7 * 60000),
       null,
-      0.2
+      0.2,
+      "DeepSeek Harness"
     ),
     fixtureAgent(
       "notes-62",
       "flash-worker-2",
       "flash",
       null,
-      "write the summary",
+      null,
       "deepseek-v4.1-flash:cloud",
       true,
       isoIn(-8 * 60000),
       null,
-      0.1
+      0.1,
+      "DeepSeek Harness"
     ),
   ];
   // A Harness session of its own (no Claude session owns it): its agents are
@@ -389,7 +414,8 @@ function fixtureSessionRows() {
       true,
       isoIn(-11 * 60000),
       null,
-      0.4
+      0.4,
+      "DeepSeek Harness"
     ),
     fixtureAgent(
       "dsh-b7",
@@ -401,7 +427,8 @@ function fixtureSessionRows() {
       true,
       isoIn(-6 * 60000),
       null,
-      0.2
+      0.2,
+      "DeepSeek Harness"
     ),
     fixtureAgent(
       "dsh-b7",
@@ -413,7 +440,8 @@ function fixtureSessionRows() {
       false,
       isoIn(-20 * 60000),
       isoIn(-12 * 60000),
-      0.1
+      0.1,
+      "DeepSeek Harness"
     ),
   ];
 
@@ -445,7 +473,7 @@ function fixtureSessionRows() {
   });
 
   const rows = [
-    make("atlas-a6", "atlas", "atlas", "busy", "claude-opus-5-5", isoIn(-(2 * 60 + 31) * 60000), 12.4, 1.9, 3, 38, a6Agents, {
+    make("atlas-a6", "atlas", "atlas", "busy", "claude-opus-5-5", isoIn(-(2 * 60 + 31) * 60000), 12.4, 1.9, 4, 38, a6Agents, {
       title: "Fix the invoice export",
     }),
     make("atlas-56", "atlas", "atlas", "idle", "claude-opus-5-5", isoIn(-6 * 3600000), 8.1, 0, 0, 12, s56Agents, {
@@ -613,6 +641,7 @@ export function fixtureSessionsView(args) {
     const row = rows.find((candidate) => candidate.session === "notes-62");
     if (!row) throw new Error("the no-provider fixture row is missing");
     row.provider = null;
+    for (const agent of row.agents) agent.provider = null;
   }
   if (closed === "none") {
     rows = rows.filter((row) => row.status !== "closed");

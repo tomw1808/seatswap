@@ -293,7 +293,9 @@ pub fn line(
     now: DateTime<Utc>,
 ) -> Result<Option<Vec<BurnPart>>, TextError> {
     if !learning.is_empty() {
-        let mut parts = vec![BurnPart::Text("Learning how fast ".to_string())];
+        let mut parts = vec![BurnPart::Text(
+            "Measuring how much work fits in ".to_string(),
+        )];
         for (index, id) in learning.iter().enumerate() {
             if index > 0 {
                 parts.push(BurnPart::Text(", ".to_string()));
@@ -301,7 +303,7 @@ pub fn line(
             parts.push(account_part(views, id)?);
         }
         parts.push(BurnPart::Text(
-            " are used. Until then: switch only when full.".to_string(),
+            ". Until then: switch only when full.".to_string(),
         ));
         return Ok(Some(parts));
     }
@@ -807,7 +809,7 @@ mod tests {
         assert_eq!(accounts(&learning), vec![("lb", "LB"), ("ac", "AC")]);
         assert_eq!(
             plain(&learning),
-            "Learning how fast LB, AC are used. Until then: switch only when full."
+            "Measuring how much work fits in LB, AC. Until then: switch only when full."
         );
 
         let unread = unread_line(&views, &["ac".to_string(), "lb".to_string()])

@@ -21,6 +21,7 @@ import {
   percentText,
   shortDate,
   shortPercent,
+  showTokens,
   switchText,
   tokens,
   valueTip,
@@ -167,7 +168,8 @@ export async function show(container, env) {
     apiValue.title = valueTip(summary.values, "api", "in this week");
     const beforeTitle = missingTitle || undefined;
     const tokenLine = h("span", {}, [
-      `${tokens(summary.tokens.out)} · worth `,
+      showTokens(h("span"), summary.tokens.out),
+      " · worth ",
       apiValue,
       " at API prices",
     ]);

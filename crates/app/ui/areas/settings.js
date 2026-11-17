@@ -2764,7 +2764,7 @@ function historyCard() {
   body.appendChild(
     textField("historyDir", "History folder", {
       placeholder: view && typeof view.dir === "string" ? view.dir : "",
-      note: "a synced folder shares it with your other hosts",
+      note: "a synced folder shares it with your other hosts · takes effect after restarting seatswap, which brings this host's history along",
       restart: Boolean(view && typeof view.savedDir === "string"),
       width: 280,
     })
@@ -3029,6 +3029,8 @@ function importRow() {
         !isObject(reply) ||
         !Array.isArray(reply.copied) ||
         !Array.isArray(reply.conflicts) ||
+        !Array.isArray(reply.warnings) ||
+        reply.warnings.some((warning) => typeof warning !== "string") ||
         !isObject(reply.view)
       ) {
         throw new Error("history_import returned an unexpected reply");
@@ -3045,9 +3047,10 @@ function importRow() {
       state.history = reply.view;
       state.importResult =
         reply.copied.length === 0 ? "nothing new" : `copied: ${reply.copied.join(", ")}`;
-      state.importConflicts = reply.conflicts.map(
-        (conflict) => `conflict ${conflict.host}: ${conflict.reason}`
-      );
+      state.importConflicts = [
+        ...reply.conflicts.map((conflict) => `conflict ${conflict.host}: ${conflict.reason}`),
+        ...reply.warnings,
+      ];
     } catch (error) {
       state.importResult = "";
       state.importConflicts = [];

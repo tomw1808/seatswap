@@ -22,6 +22,7 @@ import {
   readChoice,
   sessionName,
   shortDate,
+  showTokens,
   tokens,
   valueTip,
   valueText,
@@ -87,9 +88,20 @@ function dayLabel(value) {
   return date.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
 }
 
-function tokenText(counts) {
+function outputOf(counts) {
   if (!isObject(counts)) throw new Error("a token count is missing");
-  return tokens(counts.out);
+  return counts.out;
+}
+
+// The output tokens of a count in a sentence or a hover text.
+function tokenText(counts) {
+  return tokens(outputOf(counts));
+}
+
+// The output tokens of a count as a KPI's value or a table cell (common.js
+// showTokens: the thousands in the lighter colour).
+function tokenCell(counts, props) {
+  return showTokens(h("span", props || {}), outputOf(counts));
 }
 
 function tokensTip(counts) {
@@ -220,7 +232,7 @@ export async function show(container, env) {
   kpis.appendChild(
     kpi(
       "Tokens",
-      tokenText(data.totalTokens),
+      tokenCell(data.totalTokens),
       perHostTokens.join(" · "),
       `Tokens in the range, summed over hosts | ${tokensTip(
         data.totalTokens
@@ -262,7 +274,7 @@ export async function show(container, env) {
       "Per working hour",
       data.perWorkingHour === null || data.perWorkingHour === undefined
         ? "—"
-        : tokens(data.perWorkingHour),
+        : showTokens(h("span"), data.perWorkingHour),
       `highest hour ${tokenText(data.peakHour)}`,
       `Per working hour · last 7 days | all hosts' output tokens of the last 7 days over their working hours of those days | highest hour | ${tokensTip(
         data.peakHour
@@ -302,7 +314,7 @@ export async function show(container, env) {
     kpis.appendChild(
       kpi(
         "Other Ollama use",
-        `${tokens(ollama.otherTokens)} tokens`,
+        [showTokens(h("span"), ollama.otherTokens), " tokens"],
         ollamaNotes.join(" · ") || null,
         ollamaTipParts.join(" | ")
       )
@@ -683,7 +695,7 @@ export async function show(container, env) {
         );
       }
       row.appendChild(
-        h("span", { class: "n", text: tokenText(week.tokens), title: tokensTip(week.tokens) })
+        tokenCell(week.tokens, { class: "n", title: tokensTip(week.tokens) })
       );
       row.appendChild(
         h("span", { class: "n", title: valueTip(week.values, "subscription") }, [
@@ -760,7 +772,7 @@ export async function show(container, env) {
         })
       );
       row.appendChild(
-        h("span", { class: "n", text: tokenText(session.tokens), title: tokensTip(session.tokens) })
+        tokenCell(session.tokens, { class: "n", title: tokensTip(session.tokens) })
       );
       row.appendChild(
         h("span", { class: "n", title: valueTip(session.values, "subscription") }, [

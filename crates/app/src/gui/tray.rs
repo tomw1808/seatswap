@@ -279,7 +279,8 @@ const STATUS_NOTIFIER_WATCHER: &str = "org.kde.StatusNotifierWatcher";
 const TRAY_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn build(app: &AppHandle, snapshot: &Snapshot) -> tauri::Result<TrayIcon> {
-    let menu = build_menu(app, snapshot)?;
+    let entries = menu_entries(snapshot, Utc::now());
+    let menu = build_menu(app, &entries)?;
     let spec = icon_spec(&snapshot.views, snapshot.settings.as_ref());
     let image = Image::new_owned(icon::render(&spec, ICON_SIZE), ICON_SIZE, ICON_SIZE);
     TrayIconBuilder::with_id(TRAY_ID)
@@ -306,6 +307,7 @@ fn build(app: &AppHandle, snapshot: &Snapshot) -> tauri::Result<TrayIcon> {
             }
         })
         .build(app)
+        .inspect(|_| *applied_menu() = Some(AppliedMenu { entries, menu }))
 }
 
 /// Update icon, tooltip, title and menu from a new snapshot.
@@ -324,44 +326,55 @@ pub(crate) fn update(tray: &TrayIcon, snapshot: &Snapshot) {
     if let Err(error) = tray.set_title(if empty { None::<String> } else { Some(title) }) {
         eprintln!("seatswap: tray title: {error}");
     }
-    match build_menu(tray.app_handle(), snapshot) {
-        Ok(menu) => {
-            if let Err(error) = tray.set_menu(Some(menu)) {
-                eprintln!("seatswap: tray menu: {error}");
-            }
-        }
-        Err(error) => eprintln!("seatswap: tray menu: {error}"),
+    if let Err(error) = apply_menu(tray, menu_entries(snapshot, now)) {
+        eprintln!("seatswap: tray menu: {error}");
     }
 }
 
-fn build_menu(app: &AppHandle, snapshot: &Snapshot) -> tauri::Result<Menu<tauri::Wry>> {
-    let now = Utc::now();
-    let menu = Menu::new(app)?;
-    for view in &snapshot.views {
-        let item = MenuItem::with_id(
-            app,
-            format!("account:{}", view.id),
-            menu_text(view, now),
-            true,
-            None::<&str>,
-        )?;
-        menu.append(&item)?;
+/// One line of the tray menu: an item with its id and text, or a separator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MenuEntry {
+    Item { id: String, text: String },
+    Separator,
+}
+
+impl MenuEntry {
+    fn item(id: impl Into<String>, text: impl Into<String>) -> MenuEntry {
+        MenuEntry::Item {
+            id: id.into(),
+            text: text.into(),
+        }
     }
+
+    /// The entry without its text: two menus with the same layout differ only
+    /// in texts, which an open menu can take in place.
+    fn layout(&self) -> Option<&str> {
+        match self {
+            MenuEntry::Item { id, .. } => Some(id),
+            MenuEntry::Separator => None,
+        }
+    }
+}
+
+/// The menu a snapshot asks for: one item per account, *Save current login*
+/// for an unknown login, the windows, and *Quit*.
+fn menu_entries(snapshot: &Snapshot, now: DateTime<Utc>) -> Vec<MenuEntry> {
+    let mut entries: Vec<MenuEntry> = snapshot
+        .views
+        .iter()
+        .map(|view| MenuEntry::item(format!("account:{}", view.id), menu_text(view, now)))
+        .collect();
     if let LiveView::Unknown { email, org_name } = &snapshot.live {
         let who = email
             .as_deref()
             .or(org_name.as_deref())
             .unwrap_or("new login");
-        let item = MenuItem::with_id(
-            app,
+        entries.push(MenuEntry::item(
             "save-current",
             format!("Save current login ({who})…"),
-            true,
-            None::<&str>,
-        )?;
-        menu.append(&item)?;
+        ));
     }
-    menu.append(&PredefinedMenuItem::separator(app)?)?;
+    entries.push(MenuEntry::Separator);
     for (id, text) in [
         ("open-panel", "Open panel…"),
         ("add-account", "Add account…"),
@@ -369,13 +382,120 @@ fn build_menu(app: &AppHandle, snapshot: &Snapshot) -> tauri::Result<Menu<tauri:
         ("statistics", "Statistics…"),
         ("settings", "Settings…"),
     ] {
-        let item = MenuItem::with_id(app, id, text, true, None::<&str>)?;
-        menu.append(&item)?;
+        entries.push(MenuEntry::item(id, text));
     }
-    menu.append(&PredefinedMenuItem::separator(app)?)?;
-    let quit = MenuItem::with_id(app, "quit", "Quit seatswap", true, None::<&str>)?;
-    menu.append(&quit)?;
+    entries.push(MenuEntry::Separator);
+    entries.push(MenuEntry::item("quit", "Quit seatswap"));
+    entries
+}
+
+fn build_menu(app: &AppHandle, entries: &[MenuEntry]) -> tauri::Result<Menu<tauri::Wry>> {
+    let menu = Menu::new(app)?;
+    for entry in entries {
+        match entry {
+            MenuEntry::Item { id, text } => {
+                let item = MenuItem::with_id(app, id.as_str(), text, true, None::<&str>)?;
+                menu.append(&item)?;
+            }
+            MenuEntry::Separator => menu.append(&PredefinedMenuItem::separator(app)?)?,
+        }
+    }
     Ok(menu)
+}
+
+/// The menu the tray shows now, with the entries it was built from.
+struct AppliedMenu {
+    entries: Vec<MenuEntry>,
+    menu: Menu<tauri::Wry>,
+}
+
+/// The tray has one menu; this module alone keeps it.
+fn applied_menu() -> std::sync::MutexGuard<'static, Option<AppliedMenu>> {
+    static APPLIED: std::sync::Mutex<Option<AppliedMenu>> = std::sync::Mutex::new(None);
+    APPLIED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// What a new list of entries needs from the menu the tray shows.
+#[derive(Debug, PartialEq, Eq)]
+enum MenuChange {
+    /// The same entries: nothing to do.
+    None,
+    /// The same items in the same order; these items' texts changed.
+    Texts(Vec<(String, String)>),
+    /// Items came, went or moved: a new menu.
+    Rebuild,
+}
+
+fn menu_change(applied: Option<&[MenuEntry]>, entries: &[MenuEntry]) -> MenuChange {
+    let Some(applied) = applied else {
+        return MenuChange::Rebuild;
+    };
+    if applied == entries {
+        return MenuChange::None;
+    }
+    let same_layout = applied.len() == entries.len()
+        && applied
+            .iter()
+            .zip(entries)
+            .all(|(old, new)| old.layout() == new.layout());
+    if !same_layout {
+        return MenuChange::Rebuild;
+    }
+    MenuChange::Texts(
+        applied
+            .iter()
+            .zip(entries)
+            .filter_map(|(old, new)| match (old, new) {
+                (MenuEntry::Item { text: old, .. }, MenuEntry::Item { id, text })
+                    if old != text =>
+                {
+                    Some((id.clone(), text.clone()))
+                }
+                _ => None,
+            })
+            .collect(),
+    )
+}
+
+/// Show `entries` in the tray's menu. Replacing the menu closes it while it is
+/// open on Windows, and a snapshot comes with every sessions pass (about once a
+/// second while a session works), so the menu is replaced only when its items
+/// change; a changed text is set on the item in place, which an open menu
+/// keeps.
+fn apply_menu(tray: &TrayIcon, entries: Vec<MenuEntry>) -> Result<(), String> {
+    let mut applied = applied_menu();
+    match menu_change(
+        applied.as_ref().map(|menu| menu.entries.as_slice()),
+        &entries,
+    ) {
+        MenuChange::None => Ok(()),
+        MenuChange::Texts(texts) => {
+            let Some(current) = applied.as_mut() else {
+                return Err("the tray menu is not built".to_string());
+            };
+            for (id, text) in &texts {
+                let Some(item) = current.menu.get(id.as_str()) else {
+                    return Err(format!("the tray menu has no item {id}"));
+                };
+                let Some(item) = item.as_menuitem() else {
+                    return Err(format!("the tray menu's {id} is not a plain item"));
+                };
+                item.set_text(text).map_err(|error| error.to_string())?;
+            }
+            current.entries = entries;
+            Ok(())
+        }
+        MenuChange::Rebuild => {
+            let menu =
+                build_menu(tray.app_handle(), &entries).map_err(|error| error.to_string())?;
+            tray.set_menu(Some(menu.clone()))
+                .map_err(|error| error.to_string())?;
+            *applied = Some(AppliedMenu { entries, menu });
+            Ok(())
+        }
+    }
 }
 
 fn menu_event(app: &AppHandle, id: &str) {
@@ -407,6 +527,46 @@ mod tests {
     use seatswap_core::store::Settings;
 
     use chrono::Duration;
+
+    const ACCOUNT: &str = "account:5f0c2a7e-3b1d-4c8e-9a6f-2d7b8e1c4f30";
+
+    fn entries(account_text: &str, save_current: bool) -> Vec<MenuEntry> {
+        let mut entries = vec![MenuEntry::item(ACCOUNT, account_text)];
+        if save_current {
+            entries.push(MenuEntry::item("save-current", "Save current login (sam)…"));
+        }
+        entries.push(MenuEntry::Separator);
+        entries.push(MenuEntry::item("quit", "Quit seatswap"));
+        entries
+    }
+
+    #[test]
+    fn the_same_menu_is_left_alone() {
+        let menu = entries("LB · 41 % · resets in 2h", false);
+        assert_eq!(menu_change(Some(&menu), &menu), MenuChange::None);
+    }
+
+    #[test]
+    fn a_changed_text_is_set_in_place() {
+        let old = entries("LB · 41 % · resets in 2h", false);
+        let new = entries("LB · 42 % · resets in 2h", false);
+        assert_eq!(
+            menu_change(Some(&old), &new),
+            MenuChange::Texts(vec![(
+                ACCOUNT.to_string(),
+                "LB · 42 % · resets in 2h".to_string()
+            )])
+        );
+    }
+
+    #[test]
+    fn a_new_item_or_no_menu_yet_builds_the_menu_again() {
+        let old = entries("LB · 41 %", false);
+        let new = entries("LB · 41 %", true);
+        assert_eq!(menu_change(Some(&old), &new), MenuChange::Rebuild);
+        assert_eq!(menu_change(Some(&new), &old), MenuChange::Rebuild);
+        assert_eq!(menu_change(None, &new), MenuChange::Rebuild);
+    }
 
     fn usage(limits: Vec<Limit>) -> Usage {
         Usage {

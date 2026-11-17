@@ -2068,8 +2068,12 @@ On/Off word (or `{ words: false }` without it) and, with `{ popup: true }`, the 
 the caller saves and reverts it through `set`. `followTheme(getSetting)` is the one system light/dark follower both pages call; it
 applies `applyTheme("system")` on a change while `getSetting()` is "system". `money(amount, currency)` gives `"1,234 EUR"` for `(1234, "EUR")` and two decimals
 below 10, `"6.47 EUR"`, and throws on a negative or non-finite amount or a currency that is not
-three capital letters; `tokens(n)` returns `"12.4 M"`, `"845 k"` or `"0"` and throws on an invalid
-count. `window.html`, `window.css` and `window.js` are the second page; `window.js` reads the area
+three capital letters; `tokens(n)` returns `"1.54M"`, `"683K"`, `"845"` or `"0"` (three significant
+digits, units K/M/B, a rounding carry moves to the next unit) and throws on an invalid count;
+`showTokens(node, n)` writes that text into a cell and sets `tokens-small` (common.css
+`--tokens-small`, `--tokens-small-accent`) below a million; `modelName(null)` is "no answers yet" and
+any other value that is not a model id throws; `plural(count, one, many)` is the one "1 host / 2
+hosts". `window.html`, `window.css` and `window.js` are the second page; `window.js` reads the area
 from `location.hash`, draws the tabs, imports `./areas/<area>.js` on demand and calls its
 `render(container, { sub, snapshot, invoke, listen, fromOpen })`. A module that fails to import
 shows "This page could not be loaded: <the error's message>" in the area and keeps the reason in
@@ -4802,3 +4806,66 @@ Known limits: an edit made with the CLI at the very moment the tray app applies 
 the next round (at most 5 minutes later), because the CLI writes its event after its app lock. A
 host that adds an account before another host's events reached it through the sync seeds its own
 look; the newer one wins everywhere.
+
+## 1.2.0 release-candidate fixes (2026-11-17)
+
+**money.** `pub fn model_price_key(model: &str) -> String` is the one map from a model id to its
+price key (spec §11.5): `claude-*` → `anthropic/<id>`, `<name>:cloud` → `ollama-cloud/<name>`,
+`<name>:<tag>-cloud` → `ollama-cloud/<name>:<tag>`, else `openai/<id>`. `Prices::of_model` uses it.
+
+**harness.** `pub struct JobReports` caches flash-agents' job reports by file name:
+`refresh(&HarnessPaths) -> Vec<String>` parses only reports it has not read (a broken one is a warning
+and is tried again), `label(id) -> Option<&str>` by the job's `sessionId` (a blank label is none).
+`links(reports: &JobReports, seen, closed)`. `copy_source` knows the three worker-copy layouts and
+slot names of spec §3.8 and matches a root as recorded and with either case of its drive letter. An
+empty or all-space Harness model is no model.
+
+**live_sessions.** `LiveAgent.provider: String` (`CLAUDE_PROVIDER` or `pub const HARNESS_PROVIDER`);
+an older host report's agents take their session's provider while the report is read.
+`pub struct RecordedTokens` holds this host's TokenRecords from an hour on, by session:
+`read(history, from) -> Result<(RecordedTokens, Vec<String>), HistoryError>`, `covers(from) -> bool`,
+`add(&[TokenRecord])`; `pub fn records_from(files, state) -> Option<DateTime<Utc>>`.
+`running(files, state, metas, linked: &BTreeMap<String, Vec<LiveAgent>>, row_tokens: RowTokens,
+projects, pricing, host, now, project_of)`: with `RowTokens::Recorded { recorded, pending }` a row is
+valued from its recorded lines plus the pending ones through the same private `of_records` as
+`closed`; with `RowTokens::Transcripts { unwritten, reason }` (no history, or the records cannot be
+read) its tokens are `seen.totals` + its unwritten lines + its linked agents', and every value is
+unknown with the reason. `running` attaches the linked agents itself (`add_agents`, which adds no
+tokens or values). A scan that hits its budget while nothing can be recorded is a warning.
+`harness_rows(…, reports: &harness::JobReports, …)`: a flash job's task is its label, a worker inside
+a flash tree has none.
+
+**The sessions thread.** `RowsContext.recorded` is rebuilt every 300 s (retry after 60 s), or when it
+does not reach back to `records_from`; lines written in a pass are added in memory, `unwritten` and
+the Harness lines are passed as pending. The pricing rebuild for an earlier `from` has the same retry
+guard. `SessionMemory.job_reports` is refreshed every pass before `links`.
+
+**history.** New `history/carry.rs`: `pub fn bring_along_due(app, settings) -> Result<bool,
+HistoryError>` (no lock, no write), `pub fn bring_along(app, settings) -> Result<Vec<String>,
+HistoryError>` under the app lock (`BRING_ALONG_LOCK_TIMEOUT` 120 s), and `pub(super) fn
+merge_folder(from_dir, to_dir) -> Result<Merged, HistoryError>`, used by the move and the import.
+Lines are only appended: every reader sorts by `Record::at` (stable), so file order does not matter
+and a concurrent append is never lost. A prefix keeps the longer file (a file torn inside a line that
+the other completes is replaced through `write_atomic`); otherwise a multiset: a line k times in the
+source and j < k times in the target is appended k − j times. Not-`.jsonl` files are copied only when
+missing; `sessions-now.json` never. The root is remembered in `AppPaths::history_root_file()`
+(`<data_dir>/history-root.json`, `{"historyRoot": …}`) only after a complete move. `Imported` gains
+`warnings`, which the Settings page shows. `HistoryError::Lock(LockError)`.
+
+**ops.** `pub(crate) enum Bringer { TrayApp, Command }`, `pub(crate) fn bring_history_along(app,
+settings, by) -> Result<Vec<String>, String>`. `worker::spawn` calls it (TrayApp) before
+`open_history`, its warnings and errors through `ReportedErrors`; `cli::open_context` (Command), through
+`warn()`. `Command` asks the tray app's socket (`ipc::send_line(app, "feed")`); only `NotRunning` lets
+it move, and it never takes `gui.lock`.
+
+**gui/window.rs.** `show` validates the target and does the rest on a thread of its own
+(`show_or_create`, one at a time): building a web view on the main thread or in a synchronous
+command deadlocks on Windows (Tauri's `WebviewWindowBuilder::new`, "Known issues"). An error from
+that thread goes through `gui::report_error` (the one `ReportedErrors`; printed only before it is
+managed).
+
+**gui/tray.rs.** The menu is a list of `MenuEntry` (`menu_entries(snapshot, now)`); `apply_menu`
+replaces the tray's menu only when items come, go or move (`menu_change`) and otherwise sets changed
+texts on the open menu's items, because replacing the menu closes it on Windows and a snapshot comes
+with every sessions pass.
+

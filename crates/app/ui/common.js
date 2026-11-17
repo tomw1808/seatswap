@@ -53,7 +53,14 @@ function modelColor(model) {
 
 // The model's name from the one table; a model the table does not know keeps
 // its id as the name (its colour is the neutral token, as `modelColor` says).
+// A model of null is one that has not answered yet: "no answers yet", the one
+// text every row, heading and card shows for it. Anything else that is not a
+// model id is an error, never printed as "undefined".
 function modelName(model) {
+  if (model === null) return "no answers yet";
+  if (typeof model !== "string" || model === "") {
+    throw new Error(`invalid model ${JSON.stringify(model)}: a model id or null`);
+  }
   return MODEL_NAMES[model] !== undefined ? MODEL_NAMES[model] : model;
 }
 
@@ -1045,14 +1052,49 @@ function money(amount, currency) {
   return `${number} ${currency}`;
 }
 
-// "12.4 M" and "0.4 M" for every count of tokens, and "0 M" for none: the
-// Sessions page writes every token cell and total in millions, one decimal.
-function tokens(n) {
+const TOKEN_UNITS = [
+  { unit: "K", scale: 1e3 },
+  { unit: "M", scale: 1e6 },
+  { unit: "B", scale: 1e9 },
+];
+
+// The one spelling of a token count, as its text and its unit: three
+// significant digits with the unit and no space ("1.54M", "23.4K", "683K",
+// "1.20K", "1.23B"); below 1,000 the plain number ("845", "7"; "0" for none).
+// Rounding that carries over moves to the next unit: 999,600 is "1.00M", never
+// "1000K". Above 999B the billions keep their whole digits ("1234B").
+function tokenParts(n) {
   if (typeof n !== "number" || !Number.isFinite(n) || n < 0) {
     throw new Error(`invalid token count ${String(n)}: use a finite number of 0 or more`);
   }
-  if (n === 0) return "0 M";
-  return `${(n / 1000000).toFixed(1)} M`;
+  const whole = Math.round(n);
+  if (whole < 1000) return { text: String(whole), unit: "" };
+  for (const [index, { unit, scale }] of TOKEN_UNITS.entries()) {
+    const value = n / scale;
+    for (const decimals of [2, 1, 0]) {
+      const factor = 10 ** decimals;
+      const rounded = Math.round(value * factor) / factor;
+      if (rounded < 10 ** (3 - decimals)) return { text: `${rounded.toFixed(decimals)}${unit}`, unit };
+    }
+    if (index === TOKEN_UNITS.length - 1) return { text: `${Math.round(value)}${unit}`, unit };
+  }
+  throw new Error(`token count ${String(n)} has no unit`);
+}
+
+// A token count's text, for sentences, hover texts and chart axes.
+function tokens(n) {
+  return tokenParts(n).text;
+}
+
+// The one way a token count is put into a cell or a KPI: the text of `tokens`,
+// and the class `tokens-small` (common.css, a lighter colour) for thousands and
+// plain numbers, so the millions and billions stand out. A bold cell stays bold.
+// Returns the node.
+function showTokens(node, n) {
+  const parts = tokenParts(n);
+  if (node.textContent !== parts.text) node.textContent = parts.text;
+  node.classList.toggle("tokens-small", parts.unit !== "M" && parts.unit !== "B");
+  return node;
 }
 
 // The one way a session is named on a page (the Sessions rows, Activity's
@@ -1075,7 +1117,13 @@ function sessionName(item) {
   ];
 }
 
+// "1 host", "2 hosts": a count with its noun in the right number.
+function plural(count, one, many) {
+  return `${count} ${count === 1 ? one : many}`;
+}
+
 export {
+  plural,
   PALETTE,
   TRAY_GREY,
   LEVEL_COLORS,
@@ -1122,6 +1170,7 @@ export {
   listen,
   money,
   tokens,
+  showTokens,
   readChoice,
   writeChoice,
   dateText,

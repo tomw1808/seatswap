@@ -18,9 +18,11 @@ use crate::paths::{self, AppPaths, PathsError};
 use crate::project::ProjectKey;
 use crate::store::{Account, Settings};
 
+mod carry;
 mod read;
 mod write;
 
+pub use carry::{bring_along, bring_along_due, BRING_ALONG_LOCK_TIMEOUT};
 pub use read::{
     export_csv, export_json, HostConflict, HostInfo, Hosted, Hosts, Imported, Range, Read,
 };
@@ -64,6 +66,8 @@ pub enum HistoryError {
     },
     #[error(transparent)]
     Paths(#[from] PathsError),
+    #[error(transparent)]
+    Lock(#[from] crate::locks::LockError),
     #[error("{} does not exist", path.display())]
     NoFolder { path: PathBuf },
     #[error("from {} is not before until {}", from.to_rfc3339(), to.to_rfc3339())]

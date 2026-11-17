@@ -21,6 +21,7 @@ import {
   modelName,
   percentText,
   shortDate,
+  showTokens,
   tokens,
   valueTip,
 } from "../../common.js";
@@ -219,7 +220,7 @@ export async function show(container, env) {
       }
       row.appendChild(nameCell);
 
-      row.appendChild(h("span", { class: "n", text: tokens(node.tokens.out) }));
+      row.appendChild(showTokens(h("span", { class: "n" }), node.tokens.out));
       const share = shareText(node.share);
       row.appendChild(
         h("span", { class: "n mf", text: share.text, title: share.title || undefined })
@@ -418,7 +419,7 @@ export async function show(container, env) {
     kpis.appendChild(
       h("div", { class: "stats-mini-kpi" }, [
         h("span", { class: "stats-kpi-label", text: "Output" }),
-        h("span", { class: "stats-kpi-value", text: tokens(detail.tokens.out) }),
+        showTokens(h("span", { class: "stats-kpi-value" }), detail.tokens.out),
         h("span", {
           class: "stats-kpi-sub",
           text: `${percentText(detail.agentShare)} from agents`,
@@ -428,7 +429,7 @@ export async function show(container, env) {
     kpis.appendChild(
       h("div", { class: "stats-mini-kpi" }, [
         h("span", { class: "stats-kpi-label", text: "Cache read" }),
-        h("span", { class: "stats-kpi-value", text: tokens(detail.tokens.cr) }),
+        showTokens(h("span", { class: "stats-kpi-value" }), detail.tokens.cr),
         h("span", { class: "stats-kpi-sub", text: `written ${tokens(detail.tokens.cw)}` }),
       ])
     );

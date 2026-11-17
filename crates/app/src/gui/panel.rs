@@ -951,6 +951,7 @@ pub(crate) struct HistoryView {
 pub(crate) struct ImportResult {
     copied: Vec<String>,
     conflicts: Vec<HostConflict>,
+    warnings: Vec<String>,
     view: HistoryView,
 }
 
@@ -1072,6 +1073,7 @@ pub(crate) async fn history_import(
     Ok(ImportResult {
         copied: imported.copied,
         conflicts: imported.conflicts,
+        warnings: imported.warnings,
         view,
     })
 }

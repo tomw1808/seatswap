@@ -16,9 +16,10 @@ import {
   isObject,
   kpi,
   modelName,
+  plural,
   readChoice,
   sessionName,
-  tokens,
+  showTokens,
   valueSummary,
   valueText,
   writeChoice,
@@ -134,10 +135,6 @@ function options() {
 // ---------------------------------------------------------------------------
 // small shared helpers (all presentation, never a rule of the view)
 // ---------------------------------------------------------------------------
-
-function plural(count, one, many) {
-  return `${count} ${count === 1 ? one : many}`;
-}
 
 // "A and B"; three or more: "A, B and C".
 function nameList(names) {
@@ -289,7 +286,7 @@ function tokenNode(count, className) {
   if (count === null || count === undefined) {
     return h("span", { class: className || "n" }, "");
   }
-  return h("span", { class: className || "n" }, tokens(count));
+  return showTokens(h("span", { class: className || "n" }), count);
 }
 
 // The reason a last hour is not known, or null when it is known. The view says
@@ -334,7 +331,7 @@ function fillLastHour(node, lastHour, lastHourValues) {
     return;
   }
   node.className = "n pri";
-  node.appendChild(document.createTextNode(tokens(lastHour.out)));
+  showTokens(node, lastHour.out);
 }
 
 function lastHourCell(row) {
@@ -344,11 +341,11 @@ function lastHourCell(row) {
 }
 
 // The same hour as the KPI and the cards show it: a number, even a known 0, or
-// "—" with the view's reason.
+// "—" with the view's reason as its hover text. `title` is that reason or "".
 function lastHourSummary(sum) {
   const reason = lastHourReason(sum.lastHour, sum.lastHourValues);
-  if (reason) return { text: "—", title: reason };
-  return { text: tokens(sum.lastHour.out), title: "" };
+  if (reason) return { node: h("span", { title: reason }, "—"), title: reason };
+  return { node: showTokens(h("span"), sum.lastHour.out), title: "" };
 }
 
 // A session's or an agent's elapsed time: the seconds since `since` in the one
@@ -1094,7 +1091,7 @@ function renderKpis() {
   kpis[2].update("Agents", `${agentsRunning} running`, `${completedToday} completed today`);
   kpis[3].update(
     `${view.sessions.length === 1 ? "Total of the 1 session" : `Total of the ${view.sessions.length} sessions`}${closedCount ? ` · ${closedCount} closed` : ""}`,
-    all ? `${tokens(all.tokens.out)} tokens` : "no sum in the view",
+    all ? [showTokens(h("span"), all.tokens.out), " tokens"] : "no sum in the view",
     all ? valueSummary(all.values) : ""
   );
   // The last hour's two values come from the same `sums` the tree reads, summed
@@ -1103,9 +1100,7 @@ function renderKpis() {
   // 11).
   const lastHourValues = all ? all.lastHourValues : null;
   const lastHour = all ? lastHourSummary(all) : null;
-  const lastHourValue = lastHour
-    ? h("span", { title: lastHour.title || null }, lastHour.text)
-    : "no sum in the view";
+  const lastHourValue = lastHour ? lastHour.node : "no sum in the view";
   kpis[4].update(
     "Last hour",
     lastHourValue,
@@ -1281,8 +1276,7 @@ function updateGroupItem(entry, item) {
   fillAgents(entry.agentsNode, sum.agentsRunning, sum.agentsDone, agentData);
   entry.tokensNode.className = "n b6";
   entry.tokensNode.removeAttribute("title");
-  const tokenText = tokens(sum.tokens.out);
-  if (entry.tokensNode.textContent !== tokenText) entry.tokensNode.textContent = tokenText;
+  showTokens(entry.tokensNode, sum.tokens.out);
   fillLastHour(entry.lastNode, sum.lastHour, sum.lastHourValues);
   setValueText(entry.valueNodes[0], sum.values, "subscription", state.view.currency, "n b6");
   setValueText(entry.valueNodes[1], sum.values, "api", state.view.currency, "n b6");
@@ -1426,7 +1420,7 @@ function sessionCells(row, options, now) {
   const model = options.wide
     ? h("span", { class: "sess-model" }, [tiedNode(row)])
     : h("span", { class: "sess-model" }, [
-        row.model ? modelName(row.model) : "—",
+        modelName(row.model),
         tiedNode(row),
       ]);
   const lastHour = lastHourCell(row);
@@ -1508,6 +1502,7 @@ function agentSignature(row, now) {
         agent.parent,
         agent.kind,
         agent.task,
+        agent.provider,
         agent.model,
         agent.running === true,
         agent.running === true ? sinceText(agent.first || agent.last, now) : "",
@@ -1610,8 +1605,9 @@ function agentStatus(agent, now) {
   return span;
 }
 
-// An agent's kind: a flash job's is the small "flash" tag (S-3), every other
-// kind is the bold word it always was.
+// An agent's kind: a flash job's is the small "flash" tag (S-3), Claude Code's
+// default `general-purpose` and an agent without a kind show none, every other
+// kind is the bold word it always was. Null when the row shows no kind.
 function agentKindNode(agent) {
   if (agent.kind === "flash") {
     return h(
@@ -1620,16 +1616,32 @@ function agentKindNode(agent) {
       "flash"
     );
   }
-  return h("b", {}, agent.kind || "agent");
+  if (typeof agent.kind !== "string" || agent.kind === "" || agent.kind === "general-purpose") {
+    return null;
+  }
+  return h("b", {}, agent.kind);
+}
+
+// The agent's name cell: its kind, then its task in grey; without a kind the
+// task alone in the normal colour; with neither the word "agent", so the row
+// is never empty. A task cut by the column is whole in the hover text.
+function agentNameNode(agent) {
+  const kind = agentKindNode(agent);
+  const task = typeof agent.task === "string" && agent.task !== "" ? agent.task : null;
+  const name = h("span", { class: "sess-agent-name", title: task });
+  if (kind) {
+    name.appendChild(kind);
+    if (task) name.appendChild(h("span", { class: "mf" }, ` ${task}`));
+  } else {
+    name.appendChild(task ? h("span", {}, task) : h("b", {}, "agent"));
+  }
+  return name;
 }
 
 function agentCells(agent, children, depth) {
   const now = Date.now();
   const view = state.view;
-  const name = h("span", { class: "sess-agent-name" }, [agentKindNode(agent)]);
-  if (typeof agent.task === "string" && agent.task !== "") {
-    name.appendChild(h("span", { class: "mf" }, ` ${agent.task}`));
-  }
+  const name = agentNameNode(agent);
   const running = children.filter((child) => child.running).length;
   const done = children.length - running;
   return [
@@ -1638,7 +1650,7 @@ function agentCells(agent, children, depth) {
       { class: "sess-name", style: { paddingLeft: `${depth * 14}px` } },
       [h("span", { class: children.length ? "sess-car" : "sess-car0" }), name]
     ),
-    h("span", { class: "sess-model" }, agent.model ? modelName(agent.model) : "—"),
+    h("span", { class: "sess-model" }, modelName(agent.model)),
     agentStatus(agent, now),
     children.length ? agentsCell(running, done, true) : h("span", {}, ""),
     tokenNode(agent.tokens ? agent.tokens.out : 0),
@@ -1739,6 +1751,12 @@ function childAgents(session, parentId) {
   return session.agents.filter((agent) => agent.parent === parentId);
 }
 
+// The agent's own provider (`Claude Code`, `DeepSeek Harness`, …), or null when
+// the view gave it none.
+function agentProvider(agent) {
+  return typeof agent.provider === "string" && agent.provider !== "" ? agent.provider : null;
+}
+
 function renderAgentList(container, session, parentId, depth, parentKey) {
   const agents = Array.isArray(session.agents) ? session.agents : [];
   const ids = new Set(agents.map((agent) => agent.agent));
@@ -1749,16 +1767,21 @@ function renderAgentList(container, session, parentId, depth, parentKey) {
   );
   const running = children.filter((agent) => agent.running);
   const done = children.filter((agent) => !agent.running);
-  const provider =
-    typeof session.provider === "string" && session.provider !== "" ? session.provider : null;
-  for (const group of groupsOf(running, (agent) => modelKey(agent.model))) {
-    const model = group[0].model;
+  // Running agents are grouped by their own provider and model: a flash job
+  // under a Claude Code session is a DeepSeek Harness agent. An agent without a
+  // provider is an error line naming the session, never a guessed provider.
+  for (const group of groupsOf(
+    running,
+    (agent) => `${agentProvider(agent) || ""}\u0000${modelKey(agent.model)}`
+  )) {
+    const provider = agentProvider(group[0]);
+    const model = modelName(group[0].model);
     const count = plural(group.length, "agent", "agents");
     container.appendChild(
       createSubItem({
         text: provider
-          ? `${provider} · ${modelName(model)} · ${count}`
-          : `error: the session ${session.session} has no provider · ${modelName(model)} · ${count}`,
+          ? `${provider} · ${model} · ${count}`
+          : `error: an agent of the session ${session.session} has no provider · ${model} · ${count}`,
         depth,
         error: provider === null,
       }).node
@@ -1903,7 +1926,7 @@ function projectTreeItems() {
         items.push({
           type: "group",
           key: `projectModel\u0000${group.key}\u0000${provider}\u0000${modelKey(model)}`,
-          name: model === null ? "no answers yet" : `${provider} · ${modelName(model)}`,
+          name: model === null ? modelName(model) : `${provider} · ${modelName(model)}`,
           sub: modelSubDetail(viewLeafRows, model, sampleLeafRows),
           sum: sumFor("projectModel", {
             project: group.projectId,
@@ -1978,7 +2001,7 @@ function modelTreeItems() {
       items.push({
         type: "group",
         key: `model\u0000${group.provider}\u0000${modelKey(model)}`,
-        name: model === null ? "no answers yet" : modelName(model),
+        name: modelName(model),
         sub: modelSubDetail(viewLeafRows, model, sampleLeafRows),
         sum: sumFor("providerModel", { provider: group.provider, model }),
         rows: viewLeafRows.length ? viewLeafRows : sampleLeafRows,
@@ -2137,17 +2160,18 @@ function modelCard() {
     const running = group.filter(isRunning);
     const busy = running.filter((row) => statusName(row) === "busy").length;
     const sum = sumFor("model", model);
-    const last = sum ? lastHourSummary(sum) : { text: "", title: "" };
+    const last = sum ? lastHourSummary(sum).node : h("span", { title: "this model has no sum in the view" }, "");
+    last.classList.add("n");
     const tied = group.some((row) => isReported(row) && row.tied === true);
     body.appendChild(
       h("div", { class: "sess-mini-row" }, [
         h("span", { class: "sess-mini-name" }, [
-          model === null ? "none yet" : modelName(model),
+          modelName(model),
           tied ? tiedNode({ tied: true }) : null,
         ]),
         h("span", { class: "n" }, String(running.length)),
         h("span", { class: "n" }, String(busy)),
-        h("span", { class: "n", title: last.title || null }, last.text),
+        last,
       ])
     );
   }
@@ -2272,9 +2296,10 @@ function lastHourCard() {
     const value = bar.values ? valueText(bar.values, "subscription", null) : null;
     const summary = bar.hasSum
       ? lastHourSummary({ lastHour: bar.lastHour, lastHourValues: bar.values })
-      : { text: "", title: "" };
+      : { node: null, title: "" };
     const title = summary.title || (value && value.title ? value.title : "");
-    const text = summary.title || !value ? summary.text : `${summary.text} · ${value.text}`;
+    const text =
+      summary.title || !value ? [summary.node] : [summary.node, ` · ${value.text}`];
     body.appendChild(
       h("div", { class: "sess-bar-row" }, [
         h("span", { class: "sess-bar-name" }, bar.name),

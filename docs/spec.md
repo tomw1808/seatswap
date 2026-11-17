@@ -246,9 +246,25 @@ They use the `keyring` crate, with service `seatswap` and the account `id` as th
 
 **Money.** `prices.json` holds the API prices with their dates; `fx.json` the dollar rate with its dates. Both are written under the app lock, atomically and with mode 0600; their shapes are in §11.5.
 
-**The app's own files.** Besides `accounts.json`, the secrets, `usage-cache.json`, `prices.json` and `fx.json`, the data folder holds the status line's `feed.json` and `burn-next.json`, `machine-id`, the transcript state under `transcripts-state/`, `statusline-keys.json` while a recording runs, and `<data folder>/notification-icon.png`: the picture a notification shows, written when it is missing or holds another picture (a new data folder, one a cleaner emptied, or the icon of an older seatswap). A failed icon write is printed and the notification still goes out without an image.
+**The app's own files.** Besides `accounts.json`, the secrets, `usage-cache.json`, `prices.json` and `fx.json`, the data folder holds the status line's `feed.json` and `burn-next.json`, `machine-id`, `history-root.json` (the history folder this host last wrote, below), the transcript state under `transcripts-state/`, `statusline-keys.json` while a recording runs, and `<data folder>/notification-icon.png`: the picture a notification shows, written when it is missing or holds another picture (a new data folder, one a cleaner emptied, or the icon of an older seatswap). A failed icon write is printed and the notification still goes out without an image.
 
 **History.** seatswap keeps what it saw and did in a folder of its own: `<data folder>/history` (`historyDir` names another one). Every host writes only into its own subfolder `<host>/`, and only appends, so several hosts can share one synced folder without producing a conflict. `<host>/host.json` holds the id of the machine that writes there; when it names another machine, seatswap refuses to write into that subfolder and says why.
+
+**A new history folder.** When `historyDir` names another folder, this host's history comes along at
+the next start. `<data folder>/history-root.json` (`{"historyRoot":"…"}`) remembers the folder this
+host's history was last in; without that file it is `<data folder>/history`, where earlier versions
+kept it. The tray app does this at its start; a command does it only while no tray app answers on its
+socket, since a running tray app may still be writing the old folder, and leaves it to that tray app's
+next start.
+When `<new>/<host>/` is missing, `<old>/<host>/` is copied there. When it is this machine's (its
+host.json names this machine's id) or has no host.json (which seatswap claims for this machine
+anyway), the two folders are merged file by file: a month file gets the lines it is missing, counted
+with their repeats, and no line is ever removed. A copied line that is not valid JSON is kept and
+named in a warning. The old folder is never changed. A `<new>/<host>/` folder of another machine is
+not touched, and the start says so as before; an old folder whose host.json names another machine is
+not brought along; a warning says so once, with both ids and the steps that bring it if it is this
+machine's (its id was made anew). A move that fails is notified and tried again at the next
+start; the history opens in the new folder either way.
 
 The history has eight kinds of file, one JSON object per line, one file per month and kind: `samples-YYYY-MM.jsonl` (one line per usage answer the tray app receives, per account, when a number or a reset time changed, and at least once an hour while the app runs), `windows-YYYY-MM.jsonl` (a window that ended), `events-YYYY-MM.jsonl` (a switch; a limit crossing 100 %, as `blocked`, `unblocked`, `allBlocked` or `anyUsable`; an `accountAdded` or `accountRemoved` when the CLI or the tray app creates or removes an account; a `loginEnded` or `loginRenewed` when the tray app's poll sees an account's login end or work again; a `planChanged` when the plan label changes; a `priceChanged` when an account's monthly price changes; an `accountLook` when an account's label, abbreviation, colour or "Auto-burn may use it" is edited; a `settingSet` when a shared setting is saved; `live`; an `agentCall`; a wait), `tokens-YYYY-MM.jsonl` (what the sessions used, one line per session, hour and model), `sessions-YYYY-MM.jsonl` (a session's summary when it changes and when it closes, also for a session that is seen in a transcript but no longer runs), `projects-YYYY-MM.jsonl` (the project log: one line per rename, join, unjoin, organization assignment or organization edit, §11.6), `ollama-YYYY-MM.jsonl` (one line per hour of Ollama's own usage, from a successful `/api/usage?range=24h` answer, §7.9), and `up-YYYY-MM.jsonl` (at most one line per 5 minutes while seatswap runs on this host). The CLI writes the account events (`accountAdded`, `accountRemoved`); the tray app's engine writes the login events (`loginEnded`, `loginRenewed`) with the poll's time, and the app writes `planChanged` and `priceChanged` when it stores a login or a price edit changes them. The tray app and `seatswap edit` write `accountLook`, and a settings save `settingSet` (below).
 
@@ -570,7 +586,7 @@ minutes are not shown (`3d 4h`); `about 2h` keeps its word.
 - **The line under the switch:** `On PR until its week is full, about 2h. Then AC.`, `On AC until
   its 5h window is full, about 1h 30min. Then LB.`, `On PR for about 2h. Then AC, before PR is full.`
   (the plan leaves PR before it fills), `On PR. No switch planned this week.` While rates are
-  missing: `Learning how fast AC, LB are used. Until then: switch only when full.`
+  missing: `Measuring how much work fits in AC, LB. Until then: switch only when full.`
 - **An automatic switch** (when `notifyOnSwitch` is on): `Auto-burn: now on PR. AC is full until
   14:40.` or `Auto-burn: now on PR: its week resets on Mon 02:00.`
 - **A suggestion** (auto-burn off): `Switch to AC now: its 5h window is open and its week resets
@@ -1195,7 +1211,10 @@ a snapshot ticks.
   effect after a restart, and the row says so when the saved value differs from the one in effect.
   Export writes CSV or JSON to a file the person names (an existing file is refused); import copies
   another history folder's host folders in by hand and never writes this host's own folder or a
-  same-named folder of another machine. While the saved settings name no history folder, the section
+  same-named folder of another machine. A host folder that is already here is merged the same way as
+  a new history folder (§5): a missing file is copied, a month file gets its missing lines, and nothing
+  is removed, so two copies that both changed keep every line; a copied line that is not valid JSON is
+  named. While the saved settings name no history folder, the section
   reads Dropbox's own `info.json` (macOS and Linux `~/.dropbox/info.json`; Windows
   `%APPDATA%\Dropbox\info.json`, then `%LOCALAPPDATA%\Dropbox\info.json`: `personal.path`, else
   `business.path`) and suggests `Dropbox found: <Dropbox folder>/seatswap` with a Use button that
@@ -1236,8 +1255,8 @@ provider do not repeat it; a model total row carries the `tied` bubble, and a to
 
 | Column | Content |
 |---|---|
-| Name | Claude Code's own title of the session (the one VS Code and `/resume` show), with the session's label (`atlas-a6`) as a small grey tag after it; a DeepSeek Harness row likewise by the title of its last `session/title` event, except a flash job's row, whose title is a worker's task text; a Codex row by its thread name, the newest line for its id in Codex's `session_index.jsonl`; the label alone when the session has no title. A long title is cut with `…` and its whole text is the hover text. Opens to its agents |
-| Model | the model of its last answer, with the `tied` bubble when its thinking is tied to the account |
+| Name | Claude Code's own title of the session (the one VS Code and `/resume` show), with the session's label (`atlas-a6`) as a small grey tag after it; a DeepSeek Harness row likewise by the title of its last `session/title` event, except a flash job's row, whose title is the job's label (below); a Codex row by its thread name, the newest line for its id in Codex's `session_index.jsonl`; the label alone when the session has no title. A long title is cut with `…` and its whole text is the hover text. Opens to its agents |
+| Model | the model of its last answer, or `no answers yet`, with the `tied` bubble when its thinking is tied to the account |
 | Status | busy · idle · waiting for you, with how long; for a closed session, when it closed |
 | Agents | running · completed, the running number in the busy colour (grey at zero), completed always grey; `—` when a session has no agent data |
 | Tokens | output tokens of the session and its agents since it started |
@@ -1250,8 +1269,33 @@ A total's last hour is `—` when any row it sums has an unknown one. The last h
 and model, so its tokens are priced like the rest, and a closed session's hourly token records are
 priced with it.
 
-A session opens to its agents, grouped by provider and model. One row per agent has kind, task,
-the model of its last answer (`—` before its first), running or completed with when it finished, tokens and both values, and its own agents as "1 running ·
+A running session is valued exactly like a closed one: from its token lines in the history, one per
+hour and model, each priced at its hour with the account that was live then and that week's share
+(§11.5). Lines this pass could not write, and the DeepSeek Harness lines written after the rows, count
+once as pending until they are recorded. A linked flash job's and its workers' tokens are recorded
+under the Claude Code session, so they count once in its row; the job and its workers shown under the
+row carry their own numbers and add nothing more. While the history cannot be read, a running row's
+tokens are its transcript totals and its values are unknown with the reason.
+
+**Token counts.** Every token count in the window is written the same way: three significant digits
+with the unit and no space — 1.54M, 23.4M, 683K, 1.20K, 1.23B — and below 1,000 the plain number (845,
+7; 0 for none). Rounding that carries over moves to the next unit (999,600 is 1.00M, not 1000K).
+Thousands and plain numbers are drawn in a lighter colour than millions and billions, so the large
+numbers stand out; a bold total stays bold. A count inside a sentence or a hover text uses the same
+spelling.
+
+A session opens to its agents. Its running agents are grouped by each agent's own provider and
+model under a line "<provider> · <model> · N agents", so a flash job under a Claude Code session reads
+"DeepSeek Harness · deepseek-v4.1-flash:cloud · 1 agent"; an agent that has not answered yet reads
+`no answers yet` in place of the model, and an agent without a provider is an error line naming the
+session. An agent in a report from an older seatswap, which has no provider, takes its session's. A
+row's kind is left out for Claude Code's default `general-purpose` and for an agent without a kind:
+the row then shows only the task, in the normal text colour; every other kind (`Explore`, `Plan`, a
+custom agent) is shown in bold before the task in grey, a flash job has the tag `flash`, and an agent
+with neither kind nor task reads "agent". A flash job's task is the `label` of its flash-agents report
+(`<flash-agents state>/<key>/patches/<id>.report.json`), absent while it runs without a report; its
+workers have no task. The label is shown live only and never written to any file. One row per agent
+has kind, task, the model of its last answer (`no answers yet` before its first), running or completed with when it finished, tokens and both values, and its own agents as "1 running ·
 2 done". An agent that started agents opens the same way, to any depth. A flash job is an agent with
 the tag `flash`, its workers below it. Completed agents are folded into one "38 completed" row that opens and that
 carries the subscription and API value of their tokens — one sum for the session, shown only when the
@@ -1278,10 +1322,12 @@ nothing jumps when it closes.
   younger than 30 minutes. Only a running rollout becomes a row. A `token_count` line without an
   `info` key is a warning; `info: null` is Codex's normal early line.
 - **DeepSeek Harness.** A job first seen unlinked is its own `DeepSeek Harness` session under its
-  Harness id and folder. A flash worker's folder is a copy, `<base>/<key>/slots/<n>`, which
-  flash-agents names by the first 12 hex digits of the SHA-256 of the folder it copied: an unlinked
-  job takes the folder of a known Claude Code session whose key matches (with the copy's subfolder),
-  else the copy's own folder. An unlinked session is a row while it is open — a process holds its
+  Harness id and folder. A flash worker's folder is a copy, which flash-agents names by the first 12
+  hex digits of the SHA-256 of the folder it copied, in one of its layouts: `<base>/<key>/slots/<n>`,
+  `<tmp>/flash-mcp/<key>/<pid>/<instance>/slots/<slot>` or the older `<key>/<pid>/slots/<slot>`, a
+  slot being `<n>`, `slot-<n>` or `slot-<n>-<m>`. An unlinked job takes the folder of a known Claude
+  Code session whose key matches (with the copy's subfolder), else the copy's own folder; a folder is
+  matched as recorded and, for a Windows path, with either case of the drive letter. An unlinked session is a row while it is open — a process holds its
   lock or its last event is younger than 30 minutes — Busy during a turn, Idle between turns; a
   flash job does one task, so it is done once its turn ended and leaves the list (its tokens stay
   in the history). Once it is linked to a Claude Code session — through the running process
@@ -1877,8 +1923,10 @@ the account has no price, or when the week's used part or its API value is unkno
 **How a value is computed.**
 - One token record's API value in USD is
   `(input × input price + output × output price + cache write × cacheWrite price + cache read ×
-  cacheRead price) / 1,000,000`, at the price of the record's day. A token record's model is priced
-  as an Anthropic model (`anthropic/<model>`), the provider Claude Code's transcripts come from.
+  cacheRead price) / 1,000,000`, at the price of the record's day. A model's price key names its
+  provider: `claude-*` → `anthropic/<id>`, `<name>:cloud` → `ollama-cloud/<name>`,
+  `<name>:<tag>-cloud` → `ollama-cloud/<name>:<tag>`, any other id (Codex's) → `openai/<id>`. A model
+  with no price stays unpriced, with the model named.
   The value in the currency is that USD amount times the rate of the record's day.
 - A token record belongs to the account that the history's live and switch events say was in use on
   its host at its time.

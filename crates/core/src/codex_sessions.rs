@@ -428,7 +428,8 @@ fn read_one(file: &Path, warnings: &mut Vec<String>) -> Option<Rollout> {
             }
             "turn_context" => {
                 if let Some(value) = line.payload.and_then(|payload| payload.model) {
-                    if !value.is_empty() {
+                    // An empty or all-space model names nothing, as in harness.rs.
+                    if !value.trim().is_empty() {
                         model = Some(value);
                     }
                 }

@@ -4,10 +4,13 @@
 //! A Harness session is one folder below `<sessions>/<cwd-key>/<id>` with a
 //! zstd-compressed JSON-lines file and an empty `session.lock` beside it. The
 //! header names the session, its parent and its delegation depth; the events
-//! give its turns, tokens, model and title. Only numbers, names and a title
-//! leave this module. A Harness session that is its own row is named by its
-//! title, which the live report keeps; a flash job's or worker's title is a
-//! task text, shown live and never written. No title reaches a history record.
+//! give its turns, tokens, model and title. Only numbers, names, a title and a
+//! job's label leave this module. A Harness session that is its own row is
+//! named by its title, which the live report keeps. A flash job's task text is
+//! the `label` of its flash-agents report ([`JobReports`]); a flash job's own
+//! title is flash-agents' dispatcher prompt and a flash worker's names its
+//! folder, so neither is shown. A label and a worker's title are task texts,
+//! shown live and never written. No title or label reaches a history record.
 //!
 //! A job started by a flash tool is linked to the Claude Code session whose
 //! transcript names it. On Linux a running job that no transcript names yet is
@@ -31,35 +34,96 @@ use crate::transcripts::{ClosedJob, SessionSeen, Tokens};
 /// The folder a flash worker's copy was made from, for a session whose
 /// Claude Code session is not known.
 ///
-/// flash-agents (seen with 0.1.13) keeps a repository's worker copies under
-/// `<base>/<key>/slots/<n>`, where `<key>` is the first 12 hex digits of the
-/// SHA-256 of the folder its server was started in. `roots` are the folders
-/// that may have been copied (the known Claude Code sessions' folders); the
-/// one whose key matches is the source, with the copy's own subfolder kept.
+/// flash-agents keeps a repository's worker copies in one of three layouts:
+/// `<base>/<key>/slots/<n>`, `<tmp>/flash-mcp/<key>/<pid>/<instance>/slots/<slot>`
+/// and the older `<key>/<pid>/slots/<slot>`, where `<key>` is the first 12
+/// hex digits of the SHA-256 of the folder its server was started in, `<pid>`
+/// is digits, `<instance>` hex, and a slot is `<digits>`, `slot-<digits>` or
+/// `slot-<digits>-<digits>` (seen on Windows:
+/// `%TEMP%\flash-mcp\67cebb192d26\8308\8aef170c\slots\slot-0`). The key is
+/// the nearest 12-hex component before `slots` that only a pid and an
+/// instance stand between. `roots` are the folders that may have been copied
+/// (the known Claude Code sessions' folders); the one whose key matches is
+/// the source, in its recorded spelling, with the copy's own subfolder (all
+/// after the slot) kept. A Windows root is also matched with its drive letter
+/// upper- and lower-cased, as its server may have been started with either.
 /// `None` when `cwd` lies in no such copy or no root matches: the caller then
 /// keeps the copy's folder, never a guessed one.
 pub fn copy_source(cwd: &Path, roots: &[&str]) -> Option<String> {
-    let parts: Vec<&std::ffi::OsStr> = cwd
+    let parts: Vec<&str> = cwd
         .components()
-        .map(|component| component.as_os_str())
-        .collect();
-    let at = parts.windows(3).position(|window| {
-        let (key, slots, slot) = (window[0].to_str(), window[1], window[2].to_str());
-        key.is_some_and(|key| {
-            key.len() == 12
-                && key
-                    .bytes()
-                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-        }) && slots == "slots"
-            && slot.is_some_and(|slot| !slot.is_empty() && slot.bytes().all(|b| b.is_ascii_digit()))
+        .map(|component| component.as_os_str().to_str())
+        .collect::<Option<_>>()?;
+    let (key, rest) = (1..parts.len()).find_map(|at| {
+        if parts[at] != "slots" || !parts.get(at + 1).is_some_and(|slot| is_slot(slot)) {
+            return None;
+        }
+        copy_key_before(&parts[..at]).map(|key| (key, &parts[at + 2..]))
     })?;
-    let key = parts[at].to_str()?;
-    let root = roots.iter().find(|root| copy_key(root) == key)?;
+    let root = roots.iter().find(|root| {
+        drive_spellings(root)
+            .iter()
+            .any(|spelling| copy_key(spelling) == key)
+    })?;
     let mut source = PathBuf::from(root);
-    for part in &parts[at + 3..] {
+    for part in rest {
         source.push(part);
     }
     source.into_os_string().into_string().ok()
+}
+
+/// The key of a copy whose `slots` folder follows `before`: the nearest
+/// 12-hex component with at most a pid and an instance after it.
+fn copy_key_before<'p>(before: &[&'p str]) -> Option<&'p str> {
+    let key = |part: &str| part.len() == 12 && is_hex(part);
+    match before {
+        [.., last] if key(last) => Some(last),
+        [.., found, pid] if key(found) && is_digits(pid) => Some(found),
+        [.., found, pid, instance] if key(found) && is_digits(pid) && is_hex(instance) => {
+            Some(found)
+        }
+        _ => None,
+    }
+}
+
+/// A slot folder's name: `<digits>`, `slot-<digits>` or `slot-<digits>-<digits>`.
+fn is_slot(name: &str) -> bool {
+    match name.strip_prefix("slot-") {
+        None => is_digits(name),
+        Some(numbers) => match numbers.split_once('-') {
+            None => is_digits(numbers),
+            Some((first, second)) => is_digits(first) && is_digits(second),
+        },
+    }
+}
+
+fn is_digits(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_hex(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// `root` as recorded and, for a Windows root (`<letter>:…`), with only its
+/// drive letter upper- and lower-cased: the spellings its server may have
+/// hashed.
+fn drive_spellings(root: &str) -> Vec<String> {
+    let mut spellings = vec![root.to_string()];
+    let bytes = root.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        let rest = &root[1..];
+        for letter in [bytes[0].to_ascii_uppercase(), bytes[0].to_ascii_lowercase()] {
+            let spelling = format!("{}{rest}", char::from(letter));
+            if !spellings.contains(&spelling) {
+                spellings.push(spelling);
+            }
+        }
+    }
+    spellings
 }
 
 /// The key flash-agents names a folder's worker copies by: the first 12 hex
@@ -165,7 +229,7 @@ pub struct HarnessSession {
     pub finished: bool,
     /// The `title` of the last `session/title` event, as written; an empty or
     /// all-space title, or a last event without one, is no title. A Harness row is named by it, like a
-    /// Claude Code row by its `ai-title`; a linked worker shows it as its task.
+    /// Claude Code row by its `ai-title`; a worker outside a flash job shows it as its task.
     pub title: Option<String>,
 }
 
@@ -402,7 +466,10 @@ fn read_one(file: &Path) -> Result<Option<HarnessSession>, String> {
                     .message
                     .as_ref()
                     .and_then(|message| message.source.as_ref())
-                    .and_then(|source| source.model.clone());
+                    .and_then(|source| source.model.clone())
+                    // An empty or all-space model names none, as in Codex's
+                    // sessions: the session keeps its last named model.
+                    .filter(|model| !model.trim().is_empty());
                 if let Some(model) = &model {
                     session.model = Some(model.clone());
                 }
@@ -520,19 +587,199 @@ struct Usage {
     cache_read_tokens: Option<u64>,
 }
 
-/// The `sessionId` of one job report.
+/// What seatswap reads of one job report: its `sessionId` and its `label`.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Report {
     session_id: Option<String>,
+    label: Option<String>,
+}
+
+/// One job report as it was read: the file's job id (`job-<8 hex>` or
+/// `flash-task-<uuid>`, the name before `.report.json`), its Harness id and its
+/// label. The label is a task text: it is kept in memory only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JobReport {
+    job: String,
+    session_id: Option<String>,
+    label: Option<String>,
+}
+
+/// flash-agents' job reports, `<reports>/<key>/patches/<job>.report.json`,
+/// each read once (spec §3.8). flash-agents writes a job's report once, when
+/// the job ends, so a file already read is not read again; the folders are
+/// listed on every [`refresh`](Self::refresh) to find the new ones, and a file
+/// that left them is forgotten. A file that cannot be read or parsed is a
+/// warning naming it on every refresh while it lasts, and it is read again on
+/// the next one; it never gives a label or an id.
+///
+/// The labels are task texts: they live in this value only and are never
+/// written to the history or to any file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JobReports {
+    /// Every report read, by its file.
+    read: BTreeMap<PathBuf, JobReport>,
+    /// The first report, in file order, of each job id.
+    by_job: BTreeMap<String, PathBuf>,
+    /// Each Harness id's label, from the first report in file order that
+    /// names it and has a label.
+    labels: BTreeMap<String, String>,
+}
+
+impl JobReports {
+    /// List every report file and read the ones not read before. Returns the
+    /// warnings of this refresh: a folder that cannot be listed, a report that
+    /// cannot be read or parsed. A missing reports folder is no report and no
+    /// warning.
+    pub fn refresh(&mut self, paths: &HarnessPaths) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let mut listed: BTreeSet<PathBuf> = BTreeSet::new();
+        let keys = match fs::read_dir(&paths.reports) {
+            Ok(keys) => keys,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                self.read.clear();
+                self.index();
+                return warnings;
+            }
+            Err(source) => {
+                // Nothing can be listed: keep what was read, so a passing
+                // error does not drop every label.
+                warnings.push(format!("{}: {source}", paths.reports.display()));
+                return warnings;
+            }
+        };
+        let mut complete = true;
+        for key in keys {
+            let key = match key {
+                Ok(key) => key,
+                Err(source) => {
+                    warnings.push(format!("{}: {source}", paths.reports.display()));
+                    complete = false;
+                    continue;
+                }
+            };
+            if !entry_is_dir(key.file_type(), &key.path(), &mut warnings) {
+                continue;
+            }
+            let patches = key.path().join("patches");
+            let entries = match fs::read_dir(&patches) {
+                Ok(entries) => entries,
+                Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    warnings.push(format!("{}: {source}", patches.display()));
+                    complete = false;
+                    continue;
+                }
+            };
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(source) => {
+                        warnings.push(format!("{}: {source}", patches.display()));
+                        complete = false;
+                        continue;
+                    }
+                };
+                let path = entry.path();
+                let Some(job) = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_suffix(REPORT_SUFFIX))
+                    .map(str::to_string)
+                else {
+                    continue;
+                };
+                listed.insert(path.clone());
+                if self.read.contains_key(&path) {
+                    continue;
+                }
+                if let Some(report) = read_report(&path, job, &mut warnings) {
+                    self.read.insert(path, report);
+                }
+            }
+        }
+        // A folder that could not be listed may still hold its reports.
+        if complete {
+            self.read.retain(|path, _| listed.contains(path));
+        }
+        self.index();
+        warnings
+    }
+
+    /// Rebuild the look-ups from the reports read, in file order.
+    fn index(&mut self) {
+        self.by_job.clear();
+        self.labels.clear();
+        for (path, report) in &self.read {
+            self.by_job
+                .entry(report.job.clone())
+                .or_insert_with(|| path.clone());
+            if let (Some(session), Some(label)) = (&report.session_id, &report.label) {
+                self.labels
+                    .entry(session.clone())
+                    .or_insert_with(|| label.clone());
+            }
+        }
+    }
+
+    /// The label of the job whose Harness id is `id`, from the report that
+    /// names it in its `sessionId`; `None` while no such report exists (a
+    /// running job) or when it has no label. An empty or all-space label is
+    /// no label.
+    pub fn label(&self, id: &str) -> Option<&str> {
+        self.labels.get(id).map(String::as_str)
+    }
+
+    /// The `sessionId` of job `job`'s report; a report without one is a
+    /// warning naming the file. `None` when no report of that job was read.
+    fn session_of(&self, job: &str, warnings: &mut Vec<String>) -> Option<String> {
+        let path = self.by_job.get(job)?;
+        let report = self.read.get(path)?;
+        match &report.session_id {
+            Some(session) => Some(session.clone()),
+            None => {
+                warnings.push(format!("{}: no sessionId", path.display()));
+                None
+            }
+        }
+    }
+}
+
+/// Read one report file. A file that cannot be read or is not the report's
+/// JSON is a warning naming it, and `None`.
+fn read_report(path: &Path, job: String, warnings: &mut Vec<String>) -> Option<JobReport> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(source) => {
+            warnings.push(format!("{}: {source}", path.display()));
+            return None;
+        }
+    };
+    match serde_json::from_slice::<Report>(&bytes) {
+        Ok(report) => Some(JobReport {
+            job,
+            session_id: report.session_id,
+            label: report.label.filter(|label| !label.trim().is_empty()),
+        }),
+        Err(error) => {
+            warnings.push(format!(
+                "{}: not valid JSON at line {} column {}",
+                path.display(),
+                error.line(),
+                error.column()
+            ));
+            None
+        }
+    }
 }
 
 /// The Claude Code sessions whose transcripts named a Harness job, and the jobs
 /// of Claude Code sessions that have left the scan state. Every
 /// `flash-task-<uuid>` is taken as it is; every `job-<8 hex>` id is turned into
-/// its `flash-task-…` id through `<reports>/<key>/patches/job-…report.json`.
+/// its `flash-task-…` id through its report (`reports`, read with
+/// [`JobReports::refresh`]).
 pub fn links(
-    paths: &HarnessPaths,
+    reports: &JobReports,
     seen: &BTreeMap<String, SessionSeen>,
     closed: &BTreeMap<String, ClosedJob>,
 ) -> HarnessLinks {
@@ -542,12 +789,12 @@ pub fn links(
     let mut owner_at: BTreeMap<String, DateTime<Utc>> = BTreeMap::new();
     for (session, seen) in seen {
         for id in &seen.flash_jobs {
-            name_job(paths, id, session, seen.last, &mut links, &mut owner_at);
+            name_job(reports, id, session, seen.last, &mut links, &mut owner_at);
         }
     }
     for (id, link) in closed {
         name_job(
-            paths,
+            reports,
             id,
             &link.session,
             link.last,
@@ -561,7 +808,7 @@ pub fn links(
 /// Put one job id under the Claude Code session that named it, unless an owner
 /// with a later `last` is already known.
 fn name_job(
-    paths: &HarnessPaths,
+    reports: &JobReports,
     id: &str,
     session: &str,
     last: DateTime<Utc>,
@@ -571,7 +818,7 @@ fn name_job(
     let job = if is_flash_job(id) {
         Some(id.to_string())
     } else if id.starts_with("job-") {
-        report_session(paths, id, &mut links.warnings)
+        reports.session_of(id, &mut links.warnings)
     } else {
         None
     };
@@ -585,62 +832,6 @@ fn name_job(
             links.owners.insert(job, session.to_string());
         }
     }
-}
-
-/// The `sessionId` of `job-<8 hex>` in any `<reports>/<key>/patches/` folder.
-fn report_session(paths: &HarnessPaths, job: &str, warnings: &mut Vec<String>) -> Option<String> {
-    let keys = match fs::read_dir(&paths.reports) {
-        Ok(keys) => keys,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return None,
-        Err(source) => {
-            warnings.push(format!("{}: {source}", paths.reports.display()));
-            return None;
-        }
-    };
-    for key in keys {
-        let key = match key {
-            Ok(key) => key,
-            Err(source) => {
-                warnings.push(format!("{}: {source}", paths.reports.display()));
-                continue;
-            }
-        };
-        if !entry_is_dir(key.file_type(), &key.path(), warnings) {
-            continue;
-        }
-        let path = key
-            .path()
-            .join("patches")
-            .join(format!("{job}{REPORT_SUFFIX}"));
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
-            Err(source) => {
-                warnings.push(format!("{}: {source}", path.display()));
-                continue;
-            }
-        };
-        let report: Report = match serde_json::from_slice(&bytes) {
-            Ok(report) => report,
-            Err(error) => {
-                warnings.push(format!(
-                    "{}: not valid JSON at line {} column {}",
-                    path.display(),
-                    error.line(),
-                    error.column()
-                ));
-                return None;
-            }
-        };
-        match report.session_id {
-            Some(session) => return Some(session),
-            None => {
-                warnings.push(format!("{}: no sessionId", path.display()));
-                return None;
-            }
-        }
-    }
-    None
 }
 
 /// The processes a [`proc_links`] walk can read. The app uses [`RealProc`]; a
@@ -929,6 +1120,85 @@ mod tests {
         );
     }
 
+    /// Every layout flash-agents keeps its worker copies in, with every slot
+    /// name: `<base>/<key>/slots/<n>`, the older `<key>/<pid>/slots/<slot>`
+    /// and `<tmp>/flash-mcp/<key>/<pid>/<instance>/slots/<slot>`. Anything
+    /// between the key and `slots` other than a pid and an instance, or a
+    /// slot of another shape, is no copy.
+    #[test]
+    fn every_worker_copy_layout_and_slot_name_names_its_source() {
+        let roots = ["/home/sam/projects/ledger", "/home/sam/projects/atlas"];
+        let atlas = Some("/home/sam/projects/atlas");
+        for slot in ["10", "slot-0", "slot-3-12"] {
+            for copy in [
+                format!("/home/sam/fm/8279d42859b9/slots/{slot}"),
+                format!("/home/sam/fm/8279d42859b9/8308/slots/{slot}"),
+                format!("/tmp/flash-mcp/8279d42859b9/8308/8aef170c/slots/{slot}"),
+            ] {
+                assert_eq!(
+                    copy_source(Path::new(&copy), &roots).as_deref(),
+                    atlas,
+                    "{copy}"
+                );
+            }
+        }
+        assert_eq!(
+            copy_source(
+                Path::new("/tmp/flash-mcp/8279d42859b9/8308/8aef170c/slots/slot-0/crates/core"),
+                &roots
+            )
+            .map(PathBuf::from),
+            Some(
+                PathBuf::from("/home/sam/projects/atlas")
+                    .join("crates")
+                    .join("core")
+            ),
+            "everything after the slot is the copy's subfolder"
+        );
+        for copy in [
+            "/home/sam/fm/8279d42859b9/slots/slot-",
+            "/home/sam/fm/8279d42859b9/slots/slot-1-2-3",
+            "/home/sam/fm/8279d42859b9/slots/slot-a",
+            "/home/sam/fm/8279d42859b9/slots/s1",
+            "/home/sam/fm/8279d42859b9/slots",
+            "/home/sam/fm/8279d42859b9/work/slots/1",
+            "/home/sam/fm/8279d42859b9/8308/work/slots/1",
+            "/home/sam/fm/8279d42859b9/8308/8aef170c/77/slots/1",
+            "/home/sam/fm/8279D42859B9/slots/1",
+        ] {
+            assert_eq!(copy_source(Path::new(copy), &roots), None, "{copy}");
+        }
+    }
+
+    /// On Windows a folder may be recorded with either case of its drive
+    /// letter and hashed by flash-agents with the other (`c:\projects\seatswap`
+    /// → `80577963972b`, `C:\projects\seatswap` → `eae022a91fde`): both
+    /// match, and the source keeps the spelling the root was recorded with.
+    /// The paths are written with `/`, so the test runs on every system.
+    #[test]
+    fn a_windows_root_matches_with_either_drive_letter() {
+        assert_eq!(copy_key(r"c:\projects\seatswap"), "80577963972b");
+        assert_eq!(copy_key(r"C:\projects\seatswap"), "eae022a91fde");
+        for key in ["80577963972b", "eae022a91fde"] {
+            let copy = format!("/Temp/flash-mcp/{key}/8308/8aef170c/slots/slot-0");
+            for root in [r"C:\projects\seatswap", r"c:\projects\seatswap"] {
+                assert_eq!(
+                    copy_source(Path::new(&copy), &[root]).as_deref(),
+                    Some(root),
+                    "{copy} from {root}"
+                );
+            }
+        }
+        assert_eq!(
+            copy_source(
+                Path::new("/Temp/flash-mcp/80577963972b/8308/8aef170c/slots/slot-0"),
+                &[r"C:\projects\other"]
+            ),
+            None,
+            "another folder on the same drive"
+        );
+    }
+
     fn store() -> (TempDir, HarnessPaths) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = HarnessPaths::at(tmp.path().join("sessions"), tmp.path().join("flash-agents"));
@@ -1115,6 +1385,14 @@ mod tests {
         fs::write(dir.join(format!("{job}.report.json")), report.to_string()).expect("a report");
     }
 
+    /// The job reports of the store, read once as the sessions thread does.
+    fn reports_of(paths: &HarnessPaths) -> JobReports {
+        let mut reports = JobReports::default();
+        let warnings = reports.refresh(paths);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        reports
+    }
+
     fn since() -> DateTime<Utc> {
         "2026-11-01T00:00:00Z".parse().expect("a time")
     }
@@ -1157,6 +1435,46 @@ mod tests {
         assert_eq!(worker.tokens.input, 2200);
         assert_eq!(worker.tokens.out, 1100);
         assert!(!worker.finished);
+    }
+
+    /// An answer whose model is empty or all spaces names no model: the
+    /// session keeps the last one named, and a session that never named one
+    /// has none, so no blank model reaches the window.
+    #[test]
+    fn an_empty_or_blank_model_is_no_model() {
+        let (_tmp, paths) = store();
+        let mut lines = job_lines();
+        lines.push(assistant(1794696063000, "", 100, 50));
+        lines.push(assistant(1794696064000, "   ", 100, 50));
+        write_lines(&paths, JOB, &lines);
+        write_lines(
+            &paths,
+            WORKER,
+            &[
+                header(WORKER, Some(JOB), 1, 1794696055000),
+                assistant(1794696056000, " ", 2200, 1100),
+            ],
+        );
+
+        let read = sessions(&paths, since());
+
+        assert!(read.warnings.is_empty(), "{:?}", read.warnings);
+        let job = read.sessions.iter().find(|s| s.id == JOB).expect("the job");
+        assert_eq!(job.model.as_deref(), Some(MODEL), "the last named model");
+        assert_eq!(job.tokens.out, 3585 + 100, "the answers still count");
+        let blank: Vec<_> = job
+            .messages_detail
+            .iter()
+            .map(|m| m.model.clone())
+            .collect();
+        assert_eq!(blank[blank.len() - 2..], [None, None]);
+        let worker = read
+            .sessions
+            .iter()
+            .find(|s| s.id == WORKER)
+            .expect("the worker");
+        assert_eq!(worker.model, None);
+        assert!(worker.messages_detail.iter().all(|m| m.model.is_none()));
     }
 
     #[test]
@@ -1409,10 +1727,70 @@ mod tests {
         session.flash_jobs = BTreeSet::from(["job-3e32c2fc".to_string()]);
         seen.insert(SESSION.to_string(), session);
 
-        let links = links(&paths, &seen, &BTreeMap::new());
+        let links = links(&reports_of(&paths), &seen, &BTreeMap::new());
 
         assert!(links.warnings.is_empty(), "{:?}", links.warnings);
         assert_eq!(links.owners.get(JOB).map(String::as_str), Some(SESSION));
+    }
+
+    /// A flash job's label comes from its report, found by the report's
+    /// `sessionId` for a background (`job-…`) and a direct (`flash-task-…`)
+    /// call alike; a report is parsed once, a broken one is a warning naming
+    /// it and gives no label, and a report that left the folder is forgotten.
+    #[test]
+    fn a_job_report_gives_its_label_and_is_read_once() {
+        let (_tmp, paths) = store();
+        let direct = "flash-task-8d2f0e7c-6b1a-4c3d-9e0f-1a2b3c4d5e6f";
+        write_report(&paths, "job-3e32c2fc", JOB);
+        let dir = paths.reports.join("acme").join("patches");
+        fs::write(
+            dir.join(format!("{direct}.report.json")),
+            serde_json::json!({
+                "key": "acme", "kind": "task", "sessionId": direct,
+                "label": "Fix the invoice export", "status": "done",
+                "stopReason": null, "timing": {}, "createdAt": "2026-11-14T09:41:00.000Z",
+                "report": {}
+            })
+            .to_string(),
+        )
+        .expect("a direct call's report");
+        // Not a report: a patch beside it is never read.
+        fs::write(dir.join("job-3e32c2fc.patch"), "diff --git").expect("a patch");
+        let mut reports = JobReports::default();
+
+        assert!(reports.refresh(&paths).is_empty());
+        assert_eq!(reports.label(JOB), Some("atlas link test"));
+        assert_eq!(reports.label(direct), Some("Fix the invoice export"));
+        assert_eq!(reports.label(WORKER), None, "no report names a worker");
+
+        // A report is written once: a file already read is not parsed again.
+        fs::write(dir.join("job-3e32c2fc.report.json"), "{not json").expect("rewritten");
+        assert!(reports.refresh(&paths).is_empty());
+        assert_eq!(reports.label(JOB), Some("atlas link test"));
+
+        // A new report that cannot be parsed names its file, on every refresh.
+        let broken = dir.join("job-0a1b2c3d.report.json");
+        fs::write(&broken, "{\"sessionId\": ").expect("a broken report");
+        for _ in 0..2 {
+            let warnings = reports.refresh(&paths);
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(
+                warnings[0].contains(broken.to_str().expect("a text path")),
+                "{warnings:?}"
+            );
+        }
+
+        fs::remove_file(dir.join(format!("{direct}.report.json"))).expect("removed");
+        fs::remove_file(&broken).expect("removed");
+        assert!(reports.refresh(&paths).is_empty());
+        assert_eq!(reports.label(direct), None, "a removed report is forgotten");
+
+        let (_none, missing) = store();
+        let mut empty = JobReports::default();
+        assert!(
+            empty.refresh(&missing).is_empty(),
+            "a store without reports is no warning"
+        );
     }
 
     fn test_seen() -> SessionSeen {
@@ -1493,7 +1871,7 @@ mod tests {
             ("ffffffff-0000-4000-8000-000000000002".to_string(), newer),
         ]);
 
-        let links = links(&paths, &seen, &BTreeMap::new());
+        let links = links(&reports_of(&paths), &seen, &BTreeMap::new());
 
         assert_eq!(
             links.owners.get(JOB).map(String::as_str),
@@ -1512,14 +1890,14 @@ mod tests {
             },
         )]);
 
-        let found = links(&paths, &BTreeMap::new(), &closed);
+        let found = links(&reports_of(&paths), &BTreeMap::new(), &closed);
         assert_eq!(found.owners.get(JOB).map(String::as_str), Some(SESSION));
 
         let mut newer = test_seen();
         newer.flash_jobs = BTreeSet::from([JOB.to_string()]);
         newer.last = "2026-11-14T11:00:00Z".parse().expect("a time");
         let seen = BTreeMap::from([("ffffffff-0000-4000-8000-000000000002".to_string(), newer)]);
-        let found = links(&paths, &seen, &closed);
+        let found = links(&reports_of(&paths), &seen, &closed);
         assert_eq!(
             found.owners.get(JOB).map(String::as_str),
             Some("ffffffff-0000-4000-8000-000000000002"),

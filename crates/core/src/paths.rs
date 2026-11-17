@@ -364,6 +364,11 @@ impl AppPaths {
     pub fn history_dir(&self) -> PathBuf {
         self.data_dir.join("history")
     }
+    /// The history root this host's folder was last brought to or opened in:
+    /// `<data_dir>/history-root.json` (spec §1.5).
+    pub fn history_root_file(&self) -> PathBuf {
+        self.data_dir.join("history-root.json")
+    }
     /// The id that tells this machine apart from another host writing the same history.
     pub fn machine_id_file(&self) -> PathBuf {
         self.data_dir.join("machine-id")

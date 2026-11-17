@@ -16,11 +16,11 @@ use std::path::Path;
 use chrono::{DateTime, NaiveDate, SecondsFormat, TimeZone, Utc};
 use serde::Serialize;
 
+use super::carry::merge_folder;
 use super::{
     read_marker, same_reset, Event, HistoryDir, HistoryError, Kind, Record, Sample, SessionRecord,
     TokenRecord, UpRecord, WindowRecord, SESSIONS_NOW_FILE,
 };
-use crate::atomic::{self, Access};
 use crate::paths;
 use crate::project::ProjectKey;
 use crate::projects::ProjectsLogRecord;
@@ -70,13 +70,16 @@ pub struct Hosted<R> {
     pub record: R,
 }
 
-/// What an import did: the hosts at least one file was copied for, and the
-/// hosts it refused, each with the reason. Both are sorted by host.
+/// What an import did: the hosts at least one file or line was copied for, and
+/// the hosts it refused, each with the reason. Both are sorted by host.
+/// `warnings` names every copied line that is not valid JSON (it was kept as
+/// it is).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Imported {
     pub copied: Vec<String>,
     pub conflicts: Vec<HostConflict>,
+    pub warnings: Vec<String>,
 }
 
 /// A host folder the import did not copy, and why.
@@ -383,7 +386,7 @@ pub(super) fn month_start(year: i32, month: u32) -> Option<DateTime<Utc>> {
 
 /// A history file's bytes, or `None` when it is not there (another host may
 /// have removed it). Every history read gets its bytes here.
-fn read_bytes(path: &Path) -> Result<Option<Vec<u8>>, HistoryError> {
+pub(super) fn read_bytes(path: &Path) -> Result<Option<Vec<u8>>, HistoryError> {
     match fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -396,7 +399,7 @@ fn read_bytes(path: &Path) -> Result<Option<Vec<u8>>, HistoryError> {
 
 /// The lines of a history file: split on `\n`, the empty piece after a final
 /// newline dropped. One torn line must not lose the complete ones around it.
-fn file_lines(bytes: &[u8]) -> Vec<&[u8]> {
+pub(super) fn file_lines(bytes: &[u8]) -> Vec<&[u8]> {
     let mut lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
     if bytes.last() == Some(&b'\n') {
         lines.pop();
@@ -612,13 +615,14 @@ impl HistoryDir {
         Ok(newest)
     }
 
-    /// Copy every file of another history folder's host folders that is missing
-    /// here or longer there; a file that is longer here is kept. This host's own
-    /// folder is never read or written: a host only ever writes its own folder.
-    /// A host folder that is not here yet is copied as it is; one that is here
-    /// only when both folders' `host.json` name this machine (otherwise it is a
-    /// conflict, never a merge). A read or write error stops the whole import;
-    /// a conflict does not.
+    /// Bring in another history folder's host folders with
+    /// [`merge_folder`]: a missing file is copied, a month file's missing lines
+    /// are added, and no line is ever removed. This host's own folder is never
+    /// read or written: a host only ever writes its own folder. A host folder
+    /// that is not here yet is copied as it is; one that is here only when both
+    /// folders' `host.json` name the same machine (otherwise it is a conflict,
+    /// never a merge). A read or write error stops the whole import; a conflict
+    /// does not.
     pub fn import(&self, from: &Path) -> Result<Imported, HistoryError> {
         match fs::metadata(from) {
             Ok(_) => {}
@@ -653,12 +657,13 @@ impl HistoryDir {
         let mut imported = Imported {
             copied: Vec::new(),
             conflicts: Vec::new(),
+            warnings: Vec::new(),
         };
         for host in hosts {
             if host == self.host() {
                 continue;
             }
-            match self.copy_host(from, &host)? {
+            match self.copy_host(from, &host, &mut imported.warnings)? {
                 HostImport::Copied => imported.copied.push(host),
                 HostImport::Unchanged => {}
                 HostImport::Conflict(conflict) => imported.conflicts.push(conflict),
@@ -670,7 +675,12 @@ impl HistoryDir {
     }
 
     /// Copy the files of one other host's folder in.
-    fn copy_host(&self, from: &Path, host: &str) -> Result<HostImport, HistoryError> {
+    fn copy_host(
+        &self,
+        from: &Path,
+        host: &str,
+        warnings: &mut Vec<String>,
+    ) -> Result<HostImport, HistoryError> {
         let from_dir = from.join(host);
         let to_dir = self.root().join(host);
         // A marker without a machine id proves nothing, like no marker.
@@ -717,84 +727,9 @@ impl HistoryDir {
                 ),
             }));
         }
-        let entries = fs::read_dir(&from_dir).map_err(|source| HistoryError::Io {
-            path: from_dir.clone(),
-            source,
-        })?;
-        let mut files = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|source| HistoryError::Io {
-                path: from_dir.clone(),
-                source,
-            })?;
-            match entry.metadata() {
-                Ok(metadata) if metadata.is_file() => files.push(entry.path()),
-                Ok(_) => continue,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(source) => {
-                    return Err(HistoryError::Io {
-                        path: entry.path(),
-                        source,
-                    })
-                }
-            }
-        }
-        // By name, so a copy is the same whatever order the file system lists in.
-        files.sort();
-        let mut copied = false;
-        for file in files {
-            let Some(name) = file.file_name() else {
-                continue;
-            };
-            // `sessions-now.json` is one host's live state, not a history
-            // record: it is never copied (spec §3.8).
-            if name.to_str() == Some(SESSIONS_NOW_FILE) {
-                continue;
-            }
-            let target = to_dir.join(name);
-            let there = fs::metadata(&file)
-                .map_err(|source| HistoryError::Io {
-                    path: file.clone(),
-                    source,
-                })?
-                .len();
-            let here = match fs::metadata(&target) {
-                Ok(metadata) if metadata.is_file() => Some(metadata.len()),
-                Ok(_) => {
-                    return Err(failed(
-                        &target,
-                        io::ErrorKind::AlreadyExists,
-                        "exists but is not a file",
-                    ))
-                }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-                Err(source) => {
-                    return Err(HistoryError::Io {
-                        path: target,
-                        source,
-                    })
-                }
-            };
-            if here.is_some_and(|length| length >= there) {
-                continue;
-            }
-            let bytes = fs::read(&file).map_err(|source| HistoryError::Io {
-                path: file.clone(),
-                source,
-            })?;
-            atomic::ensure_private_dir(&to_dir).map_err(|source| HistoryError::Io {
-                path: to_dir.clone(),
-                source,
-            })?;
-            atomic::write_atomic(&target, &bytes, Access::Private).map_err(|source| {
-                HistoryError::Io {
-                    path: target.clone(),
-                    source,
-                }
-            })?;
-            copied = true;
-        }
-        Ok(if copied {
+        let merged = merge_folder(&from_dir, &to_dir)?;
+        warnings.extend(merged.warnings);
+        Ok(if merged.changed {
             HostImport::Copied
         } else {
             HostImport::Unchanged
@@ -811,7 +746,7 @@ enum HostImport {
 
 /// Whether a host folder is there, as a folder. A path that is there but is not
 /// a folder cannot hold a host's files.
-fn folder_exists(dir: &Path) -> Result<bool, HistoryError> {
+pub(super) fn folder_exists(dir: &Path) -> Result<bool, HistoryError> {
     match fs::metadata(dir) {
         Ok(metadata) if metadata.is_dir() => Ok(true),
         Ok(_) => Err(failed(
@@ -887,7 +822,7 @@ fn folder_bytes(dir: &Path) -> Result<u64, HistoryError> {
 
 /// Whether two paths name the same folder. Both are canonicalized when they
 /// exist, so a trailing slash, `..` or a link does not hide the same folder.
-fn same_folder(first: &Path, second: &Path) -> bool {
+pub(super) fn same_folder(first: &Path, second: &Path) -> bool {
     match (fs::canonicalize(first), fs::canonicalize(second)) {
         (Ok(first), Ok(second)) => first == second,
         _ => first == second,
@@ -896,7 +831,7 @@ fn same_folder(first: &Path, second: &Path) -> bool {
 
 /// An error about one path with our own text, in the shape the history's other
 /// errors have.
-fn failed(path: &Path, kind: io::ErrorKind, text: impl Into<String>) -> HistoryError {
+pub(super) fn failed(path: &Path, kind: io::ErrorKind, text: impl Into<String>) -> HistoryError {
     HistoryError::Io {
         path: path.to_path_buf(),
         source: io::Error::new(kind, text.into()),

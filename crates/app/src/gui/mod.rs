@@ -819,7 +819,17 @@ pub(crate) fn show_panel(app: &AppHandle, view: &str) {
 #[cfg(feature = "gui")]
 pub(crate) fn show_window(app: &AppHandle, target: &str) {
     if let Err(error) = window::show(app, target) {
-        eprintln!("seatswap: window: {error}");
+        report_error(app, &format!("window: {error}"));
+    }
+}
+
+/// Report an error through the app's one reporter (printed and notified once
+/// per text); before the reporter is managed, printed only.
+#[cfg(feature = "gui")]
+pub(crate) fn report_error(app: &AppHandle, text: &str) {
+    match app.try_state::<GuiState>() {
+        Some(state) => state.reported_errors.report(text),
+        None => eprintln!("seatswap: {text}"),
     }
 }
 

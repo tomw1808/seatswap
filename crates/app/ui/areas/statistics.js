@@ -13,6 +13,7 @@ import {
   h,
   isColor,
   isObject,
+  plural,
   readChoice,
   writeChoice,
 } from "../common.js";
@@ -265,8 +266,10 @@ function renderFrame() {
   clear(state.tabrow);
 
   const accounts = state.accounts.length;
-  const hosts = Array.isArray(state.hosts) ? String(state.hosts.length) : "—";
-  const meta = [`${accounts} accounts`, `${hosts} hosts`];
+  const meta = [
+    plural(accounts, "account", "accounts"),
+    Array.isArray(state.hosts) ? plural(state.hosts.length, "host", "hosts") : "— hosts",
+  ];
   if (typeof state.historyStart === "string") {
     meta.push(`since ${dateText(state.historyStart)} · now`);
   }

@@ -150,6 +150,8 @@ All notable changes to this project are documented here. The format follows
   unknown only when a part is unknown, and a missing value shows "—" with its reason as a tooltip.
 
 ### Changed
+- Token counts read 1.54M, 683K, 845 everywhere in the window, with thousands in a lighter colour so
+  the millions stand out.
 - With *Look up prices and the dollar rate* off, API values stay in US dollars and the column header
   says so.
 - A status line saved by 1.1.0 with a separator that had no character now prints `│` where 1.1.0
@@ -195,6 +197,33 @@ All notable changes to this project are documented here. The format follows
 - The large window uses half the margin around its content (12 px instead of 24 px).
 - Sessions: an agent's row shows its model, also once it is folded into "N completed"; it was
   always empty.
+- API values of DeepSeek Harness, flash, Ollama and Codex models: prices are looked up under the
+  model's own provider (`ollama-cloud/…`, `openai/…`), not as Anthropic models, so these rows and every
+  total above them are no longer "—".
+- A running session is valued hour by hour from its token lines, like a closed one, so a session that
+  runs across days, a weekly reset or a switch gets each hour's account and week; a linked flash job's
+  tokens count once.
+- Sessions: the running agents' heading names each agent's own provider ("DeepSeek Harness · …" for a
+  flash job under a Claude Code session) and says "no answers yet" instead of "null".
+- Sessions: a flash job is named by its label from flash-agents' report instead of flash-agents'
+  internal prompt, and its workers show no task; agent rows leave out Claude Code's default kind
+  `general-purpose` and show just the task.
+- A flash worker's copy is traced back to its project in every flash-agents folder layout, and on
+  Windows with either case of the drive letter.
+- After changing the history folder (Settings → History and hosts, e.g. to Dropbox) this host's
+  history stayed behind in the old folder; at the next start it now comes along, merged line by line
+  when this host already wrote into the new folder, and the old folder stays as it was. The import
+  merges two copies of a host's file that both changed instead of keeping only the longer one.
+- Windows: the large window opened plain white (it was built inside the tray menu's handler, which
+  deadlocks there); it is now built on a thread of its own. The tray's right-click menu closed by
+  itself about once a second; it is now replaced only when its items change.
+- Statistics says "1 host", not "1 hosts".
+- A running session whose token records cannot be read (no history, an offline Dropbox) shows its
+  transcripts' tokens, with the reason its values are missing; the prices for an older session are
+  retried every minute, not every pass; a DeepSeek Harness or Codex answer with an empty model no
+  longer breaks the Sessions page.
+- The pop-up's learning line says what is measured: "Measuring how much work fits in AS, A1. Until
+  then: switch only when full."
 
 ### Removed
 - *Use my own rate* (`usdRate`) and the own prices in Settings. With the look-ups off, money is
