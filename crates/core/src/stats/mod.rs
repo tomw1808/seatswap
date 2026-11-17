@@ -28,6 +28,7 @@ pub mod activity;
 pub mod fixture;
 pub mod forecast;
 pub mod overview;
+pub mod plans;
 pub mod projects;
 pub mod subscriptions;
 pub mod weeks;

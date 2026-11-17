@@ -7,6 +7,7 @@ use chrono::{DateTime, FixedOffset, Utc};
 pub mod burn_next;
 pub mod cost;
 pub mod decide;
+pub mod fit;
 pub mod live;
 pub mod plan;
 pub mod rates;
