@@ -1060,7 +1060,12 @@ async function listen(eventName, handler) {
     });
     return unlisten;
   }
-  return () => {};
+  // A browser without the tray app has no Tauri event bus: a fixture pushes an
+  // event of the same name as a browser `CustomEvent` on `window`, with the
+  // live payload in its `detail`. The returned function removes it again.
+  const onEvent = (event) => handler(event.detail);
+  window.addEventListener(eventName, onEvent);
+  return () => window.removeEventListener(eventName, onEvent);
 }
 
 // ---------------------------------------------------------------------------

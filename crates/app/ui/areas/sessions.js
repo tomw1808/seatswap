@@ -85,7 +85,9 @@ const state = {
   subscribeError: null,
   error: null,
   linkMessage: null,
-  openSessions: new Set(),
+  // The user's own folds by session: kept while the window's page is open
+  // (rule R7). Neither a render nor a leave of the Sessions area clears it.
+  userFolds: new Map(),
   openAgents: new Set(),
   departed: new Map(),
   marked: null,
@@ -418,7 +420,6 @@ export async function render(container, context) {
   state.linkMessage = null;
   state.sub = typeof context.sub === "string" ? context.sub : null;
   state.pendingLink = state.sub;
-  state.openSessions.clear();
   state.openAgents.clear();
   state.departed.clear();
   state.treeNodes = new Map();
@@ -428,14 +429,15 @@ export async function render(container, context) {
   readChoices();
   buildShell(container);
 
-  const unlisten = await context.listen("sessions-view", (payload) => {
+  const onView = (payload) => {
     if (!isObject(payload) || start !== state.startToken) return;
     try {
       applyView(payload);
     } catch (error) {
       setError(`sessions-view: ${errorMessage(error)}`);
     }
-  });
+  };
+  const unlisten = await context.listen("sessions-view", onView);
   // The area may have been left while the listener was being set up. Nothing
   // of this start may survive a leave: the listener goes, the start stops.
   // It is kept in a local until then, so a later start's listener is never
@@ -509,7 +511,8 @@ export function unmount() {
   state.apiHead = null;
   state.rowNodes = new Map();
   state.sums = new Map();
-  state.openSessions.clear();
+  // `state.userFolds` stays: the user's fold lasts while the window's page is
+  // open (rule R7), not only while the Sessions area is shown.
   state.openAgents.clear();
   state.departed.clear();
   state.sub = null;
@@ -695,7 +698,7 @@ function applyLink(id) {
     return;
   }
   state.linkMessage = null;
-  state.openSessions.add(id);
+  state.userFolds.set(id, true);
   if (state.marked && state.marked.id === id) {
     const old = state.rowNodes.get(id);
     if (old) old.classList.remove("sess-marked");
@@ -1515,9 +1518,31 @@ function agentSignature(row, now) {
     .join("\u0001");
 }
 
+// Rule R7: a session is open while it has agents running, and a fold the user
+// set by hand keeps that session's choice while the window is open. The map is
+// the only record of the user's choice; there is no second set of open rows.
+function sessionOpen(row) {
+  return state.userFolds.has(row.session)
+    ? state.userFolds.get(row.session)
+    : row.agentsRunning > 0;
+}
+
+// The user's fold, if the row shows one: a click changes `details.open` at
+// once, while its `toggle` event comes later as a task. Any open state that
+// differs from what this code last wrote (`entry.shownOpen`) is therefore the
+// user's, whether a `toggle` reports it or a view lands before that task. Both
+// the listener and `updateSessionItem` call this before they touch `.open`, so
+// a view can never overwrite a click it has not recorded yet.
+function noteUserFold(entry) {
+  const open = entry.node.open;
+  if (open === entry.shownOpen) return;
+  state.userFolds.set(entry.row.session, open);
+  entry.shownOpen = open;
+}
+
 function createSessionItem(row, options) {
   const details = sessionHasAgents(row);
-  const open = state.openSessions.has(row.session);
+  const open = sessionOpen(row);
   const rowNode = h(details ? "summary" : "div", { class: sessionClasses(row, options) });
   for (const cell of sessionCells(row, { ...options, details }, Date.now())) {
     rowNode.appendChild(cell);
@@ -1535,6 +1560,8 @@ function createSessionItem(row, options) {
     node: rowNode,
     rowNode,
     children: null,
+    // The open state this code last wrote. `null` for a row without details.
+    shownOpen: null,
     build: null,
   };
   if (!details) {
@@ -1548,6 +1575,7 @@ function createSessionItem(row, options) {
   container.appendChild(children);
   entry.node = container;
   entry.children = children;
+  entry.shownOpen = open;
   const build = () => {
     if (children.dataset.built === "1") return;
     renderAgentList(children, entry.row, null, 4, entry.row.session);
@@ -1557,12 +1585,10 @@ function createSessionItem(row, options) {
   entry.build = build;
   if (open) build();
   container.addEventListener("toggle", () => {
-    if (container.open) {
-      state.openSessions.add(entry.row.session);
-      build();
-    } else {
-      state.openSessions.delete(entry.row.session);
-    }
+    // Code sets `open` too (creation and `updateSessionItem`); `shownOpen` says
+    // what it last wrote, so only a different value here is the user's click.
+    noteUserFold(entry);
+    if (container.open) build();
   });
   return entry;
 }
@@ -1582,12 +1608,24 @@ function updateSessionItem(entry, row, options) {
       entry.rowNode.appendChild(cell);
     }
   }
-  if (entry.children && entry.children.dataset.built === "1") {
-    const signatureOfAgents = agentSignature(row, now);
-    if (signatureOfAgents !== entry.agentsSignature) {
-      entry.agentsSignature = signatureOfAgents;
-      clear(entry.children);
-      delete entry.children.dataset.built;
+  if (entry.children) {
+    // An existing row follows the running agents: it opens when the answer
+    // becomes true and closes when it becomes false, unless the user folded
+    // it by hand. A click whose `toggle` task has not run yet is recorded
+    // first, so this write cannot swallow it.
+    noteUserFold(entry);
+    const open = sessionOpen(row);
+    if (entry.node.open !== open) entry.node.open = open;
+    entry.shownOpen = open;
+    if (entry.children.dataset.built === "1") {
+      const signatureOfAgents = agentSignature(row, now);
+      if (signatureOfAgents !== entry.agentsSignature) {
+        entry.agentsSignature = signatureOfAgents;
+        clear(entry.children);
+        delete entry.children.dataset.built;
+        entry.build();
+      }
+    } else if (open) {
       entry.build();
     }
   }

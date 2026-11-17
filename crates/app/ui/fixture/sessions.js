@@ -25,6 +25,15 @@ const SESSION_PROJECTS = {
   notes: "github.com/sam/notes",
 };
 
+// The page-shot hook below marks both running agents of the one session that
+// has exactly two of them as done; every view built afterwards carries them
+// done.
+let agentsFinished = false;
+let lastFinishedSession = null;
+// The options of the last `sessions_view`, so a pushed view lists what the page
+// asked for.
+let lastOptions = { closed: "none", host: null };
+
 function fixtureTokenCounts(million) {
   return { input: 0, out: Math.round(million * 1000000), cw: 0, cr: 0 };
 }
@@ -338,7 +347,7 @@ function fixtureSessionRows() {
   const b3Agents = fixtureFinishedAgents("atlas-b3", "vega", 4, () => 0.1);
   b3Agents[0].task = null;
   const staleFableAgents = fixtureFinishedAgents("acme-kb-91", "ledger", 5, () => 0.1);
-  for (const agent of staleFableAgents.slice(0, 2)) {
+  for (const agent of staleFableAgents.slice(0, 3)) {
     agent.running = true;
     agent.last = null;
   }
@@ -501,7 +510,7 @@ function fixtureSessionRows() {
       title: "Map the order engine",
       tied: true,
     }),
-    make("acme-kb-91", "acme-kb", "ledger", { other: "no report" }, "claude-fable-5-2", isoIn(-3 * 3600000), 1.2, 0, 2, 3, staleFableAgents, {
+    make("acme-kb-91", "acme-kb", "ledger", { other: "no report" }, "claude-fable-5-2", isoIn(-3 * 3600000), 1.2, 0, 3, 2, staleFableAgents, {
       title: "Check the stale report",
       tied: true,
     }),
@@ -547,7 +556,37 @@ function fixtureSessionRows() {
       )
     );
   }
+  if (agentsFinished) fixtureFinishTwoAgents(rows);
   return rows;
+}
+
+// The fixture hook's change, made on every view built after it was called: the
+// one session with exactly two running agents gets them done, so the page sees
+// `agentsRunning` drop from 2 to 0 as a live view would show it.
+function fixtureFinishTwoAgents(rows) {
+  const sessions = rows.filter((row) => row.agentsRunning === 2);
+  if (sessions.length !== 1) {
+    throw new Error(
+      `the fixture needs one session with 2 running agents, got ${sessions.length}`
+    );
+  }
+  const session = sessions[0];
+  const agents = Array.isArray(session.agents) ? session.agents : [];
+  const running = agents.filter((agent) => agent.running === true);
+  if (running.length !== 2) {
+    throw new Error(
+      `the fixture session ${session.session} has ${running.length} running agents, not 2`
+    );
+  }
+  const at = new Date().toISOString();
+  for (const agent of running) {
+    agent.running = false;
+    agent.last = at;
+  }
+  session.agentsRunning = 0;
+  session.agentsDone = agents.filter((agent) => agent.running !== true).length;
+  session.agentsDoneValues = fixtureAgentsDoneValues(agents);
+  lastFinishedSession = session.session;
 }
 
 function fixtureAddTokens(one, other) {
@@ -634,6 +673,7 @@ export function fixtureSessionsView(args) {
     throw new Error(`unknown closed filter ${JSON.stringify(options.closed)}`);
   }
   const host = typeof options.host === "string" && options.host !== "" ? options.host : null;
+  lastOptions = { closed, host };
   const now = Date.now();
   const days = closed === "day" ? 1 : closed === "week" ? 7 : closed === "month" ? 30 : 0;
   let rows = fixtureSessionRows();
@@ -675,5 +715,26 @@ export function fixtureSessionsView(args) {
     },
     currency: "EUR",
     unavailable: null,
+  };
+}
+
+// The page-shot step calls `window.__sessionsFixture.finishAgents()`. The new
+// view goes over a browser event of the same name the live app uses; the
+// page's listener hands it to `applyView`, the path a live view takes.
+function fixturePushSessionsView() {
+  const view = fixtureSessionsView({ options: { ...lastOptions } });
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new CustomEvent("sessions-view", { detail: view }));
+  }
+  return view;
+}
+
+if (typeof window !== "undefined") {
+  window.__sessionsFixture = {
+    finishAgents() {
+      agentsFinished = true;
+      fixturePushSessionsView();
+      return lastFinishedSession;
+    },
   };
 }
