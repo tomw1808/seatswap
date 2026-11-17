@@ -6,6 +6,18 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-11-17
+
+1.2.1 was tagged but not released: its Windows check failed. 1.2.2 holds every change of 1.2.1
+(below) and this fix.
+
+### Fixed
+
+- Windows: when the Claude Code folder is removed while seatswap runs, the pop-up now says Claude
+  Code is not set up and notices the folder when it comes back. Before, the removal went unnoticed
+  (only with `CLAUDE_CONFIG_DIR` set; the default `~/.claude` was already followed). A file named
+  `.claude.json` next to a `CLAUDE_CONFIG_DIR` folder is no longer taken for its login.
+
 ## [1.2.1] - 2026-11-17
 
 ### Changed
@@ -466,7 +478,8 @@ All notable changes to this project are documented here. The format follows
   starts later): it says so and shows the icon as soon as a tray appears; `seatswap panel` opens
   the pop-up meanwhile.
 
-[Unreleased]: https://github.com/ymihere/seatswap/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/ymihere/seatswap/compare/v1.2.2...HEAD
+[1.2.2]: https://github.com/ymihere/seatswap/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/ymihere/seatswap/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/ymihere/seatswap/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/ymihere/seatswap/releases/tag/v1.1.0
