@@ -68,6 +68,26 @@ pub(crate) fn record_switch(
     }
 }
 
+/// The one place a Codex login switch is written to the history, for the GUI's
+/// switch action and for the poll that sees Codex's login changed outside
+/// seatswap (R8, spec §5). The caller decides whether the live login changed;
+/// this writes the one event.
+pub(crate) fn record_provider_switch(
+    recorder: &Recorder,
+    from: Option<AccountRef>,
+    to: AccountRef,
+    at: DateTime<Utc>,
+) -> Result<(), HistoryError> {
+    recorder.event(
+        at,
+        EventKind::ProviderSwitch {
+            from,
+            to,
+            by: By::User,
+        },
+    )
+}
+
 /// The one place an account is removed, for the CLI and the GUI. The remove
 /// happens first; a history that cannot be written is returned beside the
 /// removed account and never fails the remove.
@@ -108,11 +128,7 @@ pub(crate) fn ensure_provider_subscription(
     let ensured = match switcher::ensure_provider_subscription(app, account, plan) {
         Ok(ensured) => ensured,
         Err(error) => {
-            let label = match account.org.as_str() {
-                CODEX_ORG => "OpenAI (Codex)",
-                seatswap_core::providers::OLLAMA_ORG => "Ollama",
-                _ => account.org.as_str(),
-            };
+            let label = seatswap_core::money::Company::of_account(account).name();
             return vec![format!("the {label} subscription is not saved: {error}")];
         }
     };
@@ -183,14 +199,9 @@ pub(crate) fn switch_codex(
     let changed = switched.from.as_ref() != Some(to);
     if changed {
         if let Some(recorder) = recorder {
-            if let Err(error) = recorder.event(
-                now,
-                EventKind::ProviderSwitch {
-                    from: switched.from.clone(),
-                    to: switched.to.clone(),
-                    by: By::User,
-                },
-            ) {
+            if let Err(error) =
+                record_provider_switch(recorder, switched.from.clone(), switched.to.clone(), now)
+            {
                 warnings.push(history_unwritable(&error));
             }
         }
@@ -777,6 +788,39 @@ mod tests {
         assert_eq!(events[0]["account"]["org"], CODEX_ORG);
         assert_eq!(events[1]["type"], "providerSwitch");
         assert_eq!(events[1]["to"]["acc"], CODEX_OTHER_ID);
+    }
+
+    /// The provider error names the company through `Company::of_account`:
+    /// OpenAI and Ollama by their names, a Claude organization as Anthropic,
+    /// never a raw organization id and never "OpenAI (Codex)".
+    #[test]
+    fn a_failed_subscription_names_the_company_from_its_owner() {
+        let fixture = Fixture::new();
+        fs::write(fixture.app.accounts_file(), b"{ not json").expect("corrupt accounts");
+        let codex = AccountRef {
+            acc: CODEX_LIVE_ID.to_string(),
+            org: CODEX_ORG.to_string(),
+        };
+        let claude = AccountRef {
+            acc: ACCOUNT_UUID.to_string(),
+            org: ORG_UUID.to_string(),
+        };
+
+        let openai = ensure_provider_subscription(&fixture.app, None, &codex, None, Utc::now());
+        assert_eq!(openai.len(), 1, "{openai:?}");
+        assert!(
+            openai[0].starts_with("the OpenAI subscription is not saved: "),
+            "{openai:?}"
+        );
+        assert!(!openai[0].contains("OpenAI (Codex)"), "{openai:?}");
+
+        let anthropic = ensure_provider_subscription(&fixture.app, None, &claude, None, Utc::now());
+        assert_eq!(anthropic.len(), 1, "{anthropic:?}");
+        assert!(
+            anthropic[0].starts_with("the Anthropic subscription is not saved: "),
+            "{anthropic:?}"
+        );
+        assert!(!anthropic[0].contains(ORG_UUID), "{anthropic:?}");
     }
 
     #[test]

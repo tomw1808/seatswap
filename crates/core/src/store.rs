@@ -1463,9 +1463,10 @@ impl AccountsFile {
             return Ok(false);
         }
         let company = crate::money::Company::of_account(account);
-        let (label, base_abbr, color) = match company {
-            crate::money::Company::OpenAI => ("OpenAI", "OA", "#db2777"),
-            crate::money::Company::Ollama => ("Ollama", "OL", "#ea580c"),
+        let label = company.name();
+        let (base_abbr, color) = match company {
+            crate::money::Company::OpenAI => ("OA", "#db2777"),
+            crate::money::Company::Ollama => ("OL", "#ea580c"),
             crate::money::Company::Anthropic => {
                 return Err(StoreError::NotProvider(account.acc.clone()))
             }
@@ -1495,13 +1496,8 @@ impl AccountsFile {
         let Some(first) = base.chars().next() else {
             return Err(StoreError::DuplicateAbbr(base.to_string()));
         };
-        for number in 2..=9 {
-            let candidate = format!("{first}{number}");
-            if !taken.contains(&candidate) {
-                return Ok(candidate);
-            }
-        }
-        Err(StoreError::DuplicateAbbr(base.to_string()))
+        first_free_digit_abbr(first, &taken)
+            .ok_or_else(|| StoreError::DuplicateAbbr(base.to_string()))
     }
 }
 
@@ -2142,13 +2138,21 @@ fn unique_abbr(label: &str, taken: &HashSet<String>) -> Result<String, StoreErro
             return Ok(candidate);
         }
     }
+    first_free_digit_abbr(first, taken).ok_or(StoreError::DuplicateAbbr(default))
+}
+
+/// The last step of an abbreviation search: `first` with the first free digit
+/// 2-9 appended, or `None` when all of them are taken. [`unique_abbr`] and
+/// [`AccountsFile::unique_subscription_abbr`] share it; each keeps its own
+/// candidates before this step.
+fn first_free_digit_abbr(first: char, taken: &HashSet<String>) -> Option<String> {
     for digit in '2'..='9' {
         let candidate = format!("{first}{digit}");
-        if !taken.contains(&candidate) && tried.insert(candidate.clone()) {
-            return Ok(candidate);
+        if !taken.contains(&candidate) {
+            return Some(candidate);
         }
     }
-    Err(StoreError::DuplicateAbbr(default))
+    None
 }
 
 fn pick_color(file: &AccountsFile) -> String {

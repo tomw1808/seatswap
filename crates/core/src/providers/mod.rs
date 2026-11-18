@@ -40,6 +40,10 @@ pub enum ProviderError {
     /// A stored Codex login could not be renewed (R8).
     #[error("{0}")]
     RenewFailed(String),
+    /// A saved login became Codex's live login while a poll asked for it; it is
+    /// not renewed, because Codex renews the live login itself (R8).
+    #[error("this saved login became Codex's live login during the poll; seatswap does not renew the live login")]
+    BecameLive,
     /// A file lock could not be taken — seatswap's own app lock, or Codex's
     /// `auth.lock` or `auth.json.lock` during a switch (R8); the text names the
     /// file.

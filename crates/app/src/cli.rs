@@ -1552,6 +1552,11 @@ fn status(
             now,
             offset,
         );
+        // `status --json` has no warnings field: the history read's warnings go
+        // to stderr, through the one warning line, and nowhere else.
+        for warning in &burn.warnings {
+            warn(warning);
+        }
         let output = StatusJson::new(&views, active, &burn);
         println!("{}", serde_json::to_string(&output)?);
     } else {
@@ -1771,7 +1776,8 @@ fn history_dir(app: &AppPaths, settings: &Settings) -> Result<HistoryDir, CliErr
 
 /// What `status` shows of auto-burn, derived from one history read. A history
 /// read or planner error is kept in `error` so `status` can answer anyway;
-/// `next` and `slack_hours` are then absent.
+/// `next` and `slack_hours` are then absent. `warnings` are the history read's
+/// own warnings, printed once by `status`.
 #[derive(Debug, Default)]
 struct BurnStatus {
     on: bool,
@@ -1780,6 +1786,7 @@ struct BurnStatus {
     suggestion: Option<SuggestionJson>,
     slack_hours: BTreeMap<String, f64>,
     error: Option<String>,
+    warnings: Vec<String>,
 }
 
 /// Read the history once and give the auto-burn facts `status` prints. It never
@@ -1827,6 +1834,7 @@ fn burn_status(
             return status;
         }
     };
+    status.warnings = learned.warnings.clone();
     let active = active.filter(|id| accounts.iter().any(|account| account.id == *id));
     let readiness = match live::situation(&learned, views, accounts, active, now, offset, 0, &[]) {
         Ok(readiness) => readiness,
@@ -1958,6 +1966,9 @@ fn burn_plan(context: Context, json: bool) -> Result<String, CliError> {
         &prices,
     )
     .map_err(|error| CliError::Message(format!("cannot read the history: {error}")))?;
+    for warning in &learned.warnings {
+        warn(warning);
+    }
     let readiness = live::situation(&learned, &views, &accounts, active, now, offset, 0, &[])
         .map_err(|error| CliError::Message(error.to_string()))?;
     let situation = match readiness {
@@ -2056,8 +2067,15 @@ fn burn_simulate(
         &prices,
     )
     .map_err(|error| CliError::Message(format!("cannot read the history: {error}")))?;
-    let mut lines = Vec::new();
+    // The history read's warnings come once, before either replay's own: a
+    // warning the replay repeats is not printed again.
     let mut printed = BTreeSet::new();
+    for warning in &learned.warnings {
+        if printed.insert(warning.clone()) {
+            warn(warning);
+        }
+    }
+    let mut lines = Vec::new();
     for policy in [Policy::Lazy, Policy::Eager] {
         let result = replay(&history, &range, &learned.rates, &excluded, policy, &prices)
             .map_err(|error| CliError::Message(error.to_string()))?;
@@ -2741,6 +2759,27 @@ pub(crate) mod tests {
                     agent_answers: 0,
                 })
                 .expect("the token record is written");
+        }
+
+        /// One hour of `claude-new-9`, a model `prices.json` does not list:
+        /// `live::learn` names it once in its warnings.
+        fn write_unpriced_work(&self, at: DateTime<Utc>) {
+            self.history()
+                .append(&TokenRecord {
+                    t: at,
+                    minutes: 60,
+                    session: "b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e".to_string(),
+                    cwd: "/home/sam/projects/atlas".to_string(),
+                    project: ProjectKey::Repo("github.com/sam/atlas".to_string()),
+                    model: "claude-new-9".to_string(),
+                    input: 30_000_000,
+                    out: 0,
+                    cw: 0,
+                    cr: 0,
+                    answers: 1,
+                    agent_answers: 0,
+                })
+                .expect("the unpriced token record is written");
         }
     }
 
@@ -4563,6 +4602,132 @@ pub(crate) mod tests {
             }
             other => panic!("expected a usage error, got {other:?}"),
         }
+    }
+
+    /// A fixture with one reading and two token lines: one priced, one of
+    /// `claude-new-9`, which `prices.json` does not list.
+    fn warning_fixture() -> Fixture {
+        let fixture = Fixture::new();
+        fixture.add_account(0);
+        let account = fixture.account(0);
+        fixture.set_reading(&account, 10.0, false);
+        let now = Utc::now();
+        fixture.write_work(now - Duration::minutes(20), 1.0);
+        fixture.write_unpriced_work(now - Duration::minutes(10));
+        fixture
+    }
+
+    fn burn_plan_warning_child() {
+        let fixture = warning_fixture();
+        let context = open_context(&fixture.cli(Command::Burn {
+            action: BurnAction::Plan { json: false },
+        }))
+        .expect("the context opens");
+        let text = burn_plan(context, false).expect("the plan is written");
+        println!("SEATSWAP-WARN-PLAN-CHILD-RAN\n{text}");
+    }
+
+    fn status_warning_child() {
+        let fixture = warning_fixture();
+        let context = open_context(&fixture.cli(Command::Status {
+            json: true,
+            waybar: false,
+            i3blocks: false,
+            refresh: false,
+        }))
+        .expect("the context opens");
+        status(context, true, false, false, false).expect("the status is written");
+        println!("SEATSWAP-WARN-STATUS-CHILD-RAN");
+    }
+
+    fn simulate_warning_child() {
+        let fixture = warning_fixture();
+        let day = Local::now().date_naive().format("%Y-%m-%d").to_string();
+        let context = open_context(&fixture.cli(Command::Burn {
+            action: BurnAction::Simulate {
+                from: day.clone(),
+                to: day.clone(),
+                without: Vec::new(),
+            },
+        }))
+        .expect("the context opens");
+        let text = burn_simulate(context, &day, &day, &[]).expect("the replay is written");
+        println!("SEATSWAP-WARN-SIMULATE-CHILD-RAN\n{text}");
+    }
+
+    /// Run one test function in a child with `--nocapture` and give its stderr,
+    /// where `warn` writes.
+    fn warning_child(test_name: &str, variable: &str) -> String {
+        let exe = std::env::current_exe().expect("the test binary");
+        let output = std::process::Command::new(exe)
+            .args([test_name, "--nocapture", "--test-threads=1"])
+            .env(variable, "1")
+            .output()
+            .expect("the child runs");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "the child failed:\n{stdout}\n{stderr}"
+        );
+        stderr.into_owned()
+    }
+
+    /// `burn plan` prints the history read's warnings once: "no price for …"
+    /// must not stay inside `learned.warnings` (review, 1.3.0).
+    #[test]
+    fn burn_plan_prints_the_historys_warnings_once() {
+        if std::env::var_os("SEATSWAP_WARN_PLAN_CHILD").is_some() {
+            burn_plan_warning_child();
+            return;
+        }
+        let stderr = warning_child(
+            "burn_plan_prints_the_historys_warnings_once",
+            "SEATSWAP_WARN_PLAN_CHILD",
+        );
+        assert_eq!(
+            stderr.matches("no price for claude-new-9").count(),
+            1,
+            "one warning for the model: {stderr}"
+        );
+    }
+
+    /// `status --json` has no warnings field, so the history read's warnings go
+    /// to stderr once (review, 1.3.0).
+    #[test]
+    fn status_json_prints_the_historys_warnings_once() {
+        if std::env::var_os("SEATSWAP_WARN_STATUS_CHILD").is_some() {
+            status_warning_child();
+            return;
+        }
+        let stderr = warning_child(
+            "status_json_prints_the_historys_warnings_once",
+            "SEATSWAP_WARN_STATUS_CHILD",
+        );
+        assert_eq!(
+            stderr.matches("no price for claude-new-9").count(),
+            1,
+            "one warning for the model: {stderr}"
+        );
+    }
+
+    /// `burn simulate` prints the history read's warnings once, before the
+    /// replays' own warnings (review, 1.3.0).
+    #[test]
+    fn burn_simulate_prints_the_historys_warnings_once() {
+        if std::env::var_os("SEATSWAP_WARN_SIMULATE_CHILD").is_some() {
+            simulate_warning_child();
+            return;
+        }
+        let stderr = warning_child(
+            "burn_simulate_prints_the_historys_warnings_once",
+            "SEATSWAP_WARN_SIMULATE_CHILD",
+        );
+        assert_eq!(
+            stderr.matches("no price for claude-new-9").count(),
+            1,
+            "one warning for the model: {stderr}"
+        );
     }
 
     #[test]

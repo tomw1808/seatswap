@@ -37,6 +37,12 @@ const CODEX_ISSUER: &str = "https://auth.openai.com";
 /// What a renewal failure tells the user to do.
 const SIGN_IN_AGAIN: &str = "Sign in again with codex login.";
 
+/// The refusal a Remove of the live Codex login gets (R8). The worker uses it as
+/// the action's error and the provider snapshot sends it to Settings, so the
+/// sentence has one home.
+pub const LIVE_LOGIN_REMOVE: &str =
+    "the live login: switch Codex to another login first to remove it";
+
 /// The stored copy's id: the first 32 hex digits of SHA-256 of `codex:<acc>`
 /// (R8). 32 lower-case hex characters, which is the id shape
 /// [`crate::store::FileSecrets`] accepts.
@@ -122,23 +128,40 @@ pub fn live_account(paths: &CodexPaths) -> Result<Option<AccountRef>, ProviderEr
     }))
 }
 
+/// Whether a saved login may still be renewed: the live login is not, and the
+/// live file is read again here, under the caller's app lock, so a login that
+/// became live after the round began is refused ([`ProviderError::BecameLive`]). No file, a
+/// keyring login and an API-key login mean no saved login is live; a file that
+/// does not read is its own error, never a guess.
+fn ensure_not_live(paths: &CodexPaths, account: &AccountRef) -> Result<(), ProviderError> {
+    match live_account(paths) {
+        Ok(Some(live)) if &live == account => Err(ProviderError::BecameLive),
+        Ok(_) => Ok(()),
+        Err(ProviderError::KeyringLogin) | Err(ProviderError::ApiKeyLogin) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// A saved Codex login that is not live: its usage, asked with the stored access
-/// token (R8). The first usage ask and the renewal call are network calls and
-/// run without a lock. A 401 renews the login once at Codex's own issuer and
-/// asks again; a renewal that fails, or a second 401, is
-/// [`ProviderError::RenewFailed`] and the copy stays, so the user can sign in
-/// again with `codex login`.
+/// token (R8). The first usage ask is a network call without a lock. A 401
+/// renews the login once at Codex's own issuer and asks again; a renewal that
+/// fails, or a second 401, is [`ProviderError::RenewFailed`] and the copy stays,
+/// so the user can sign in again with `codex login`.
 ///
-/// A successful renewal is stored under seatswap's own app lock, which re-reads
-/// the stored copy first: the renewed copy replaces it only when it still holds
-/// the tokens the renewal started from ([`CodexLogin::same_tokens`]); a newer
-/// copy someone saved meanwhile stays, and the second usage ask uses that one.
-/// There is no second renewal.
+/// The renewal — the token POST and storing its answer — runs under seatswap's
+/// own app lock, after the live file has been read under that lock: a login that
+/// became live during the poll is not renewed ([`ProviderError::BecameLive`]), because Codex
+/// renews the live login itself. Under the same lock the stored copy is re-read:
+/// the renewed copy replaces it only when it still holds the tokens the renewal
+/// started from ([`CodexLogin::same_tokens`]); a newer copy someone saved
+/// meanwhile stays, and the second usage ask uses that one. There is no second
+/// renewal.
 ///
 /// Never used for the live login: Codex renews that one itself, and the caller
 /// reads it with [`read`].
 pub fn read_saved(
     app: &AppPaths,
+    paths: &CodexPaths,
     secrets: &dyn SecretStore,
     account: &AccountRef,
     api: &Api,
@@ -156,8 +179,27 @@ pub fn read_saved(
     match api.codex_usage(access_token, login_account) {
         Ok(answer) => reading_from(&answer, login_account),
         Err(ApiError::Unauthorized) => {
-            let renewed = renew(&login, api)?;
-            let login = store_renewed(app, secrets, &id, &login, renewed, account)?;
+            // The lock covers the live check, the token POST and the store, and
+            // nothing else: the second usage ask runs without it.
+            let login = {
+                let _app_lock = acquire_app_lock(app, APP_LOCK_TIMEOUT)?;
+                ensure_not_live(paths, account)?;
+                // The copy is read again under the lock: one someone renewed
+                // while this round waited is asked with as it is, so a spent
+                // refresh token is never sent.
+                let current = secrets
+                    .get_codex(&id)
+                    .map_err(ProviderError::Store)?
+                    .ok_or_else(|| ProviderError::NotSaved {
+                        acc: account.acc.clone(),
+                    })?;
+                if current.same_tokens(&login) {
+                    let renewed = renew(&current, api)?;
+                    store_renewed(secrets, &id, &current, renewed, account)?
+                } else {
+                    current
+                }
+            };
             let tokens = saved_tokens(&login)?;
             let access_token = string_field(tokens, "access_token")?;
             match api.codex_usage(access_token, login_account) {
@@ -378,21 +420,20 @@ fn save_copy(
     Ok(true)
 }
 
-/// Store a renewed copy after the renewal's network calls, under seatswap's own
-/// app lock. The stored copy is re-read there: when it still holds the tokens
-/// the renewal started from ([`CodexLogin::same_tokens`]) the renewed copy
-/// replaces it; otherwise a newer copy someone saved meanwhile stays untouched.
-/// The login to ask usage with next is returned: the renewed one, or the newer
-/// stored one. A copy removed meanwhile is [`ProviderError::NotSaved`].
+/// Store a renewed copy after the renewal's network calls; [`read_saved`] holds
+/// seatswap's own app lock around this call and the token POST. The stored copy
+/// is re-read here: when it still holds the tokens the renewal started from
+/// ([`CodexLogin::same_tokens`]) the renewed copy replaces it; otherwise a newer
+/// copy someone saved meanwhile stays untouched. The login to ask usage with
+/// next is returned: the renewed one, or the newer stored one. A copy removed
+/// meanwhile is [`ProviderError::NotSaved`].
 fn store_renewed(
-    app: &AppPaths,
     secrets: &dyn SecretStore,
     id: &str,
     started_from: &CodexLogin,
     renewed: CodexLogin,
     account: &AccountRef,
 ) -> Result<CodexLogin, ProviderError> {
-    let _app_lock = acquire_app_lock(app, APP_LOCK_TIMEOUT)?;
     let stored = secrets
         .get_codex(id)
         .map_err(ProviderError::Store)?
@@ -2018,7 +2059,14 @@ mod tests {
             Reply::ok(token_answer(&fresh)),
             Reply::ok(usage_answer(OA)),
         ]);
-        let reading = read_saved(&fake.app(), &fake.secrets, &oa, &api_at(&base)).unwrap();
+        let reading = read_saved(
+            &fake.app(),
+            &fake.paths(),
+            &fake.secrets,
+            &oa,
+            &api_at(&base),
+        )
+        .unwrap();
         let first = received(&receiver);
         let second = received(&receiver);
         let third = received(&receiver);
@@ -2108,7 +2156,14 @@ mod tests {
             (first, second, third)
         });
 
-        let reading = read_saved(&fake.app(), &fake.secrets, &oa, &api_at(&base)).unwrap();
+        let reading = read_saved(
+            &fake.app(),
+            &fake.paths(),
+            &fake.secrets,
+            &oa,
+            &api_at(&base),
+        )
+        .unwrap();
         let (first, second, third) = handle.join().unwrap();
 
         assert_eq!(reading.account, oa);
@@ -2161,7 +2216,14 @@ mod tests {
                 .to_string(),
             ),
         ]);
-        let error = read_saved(&fake.app(), &fake.secrets, &oa, &api_at(&base)).unwrap_err();
+        let error = read_saved(
+            &fake.app(),
+            &fake.paths(),
+            &fake.secrets,
+            &oa,
+            &api_at(&base),
+        )
+        .unwrap_err();
         let _ = received(&receiver);
         let _ = received(&receiver);
         handle.join().unwrap();
@@ -2195,7 +2257,14 @@ mod tests {
             Reply::ok(token_answer(&fresh)),
             Reply::status(401, "unauthorized"),
         ]);
-        let error = read_saved(&fake.app(), &fake.secrets, &oa, &api_at(&base)).unwrap_err();
+        let error = read_saved(
+            &fake.app(),
+            &fake.paths(),
+            &fake.secrets,
+            &oa,
+            &api_at(&base),
+        )
+        .unwrap_err();
         let _ = received(&receiver);
         let _ = received(&receiver);
         let _ = received(&receiver);
@@ -2220,6 +2289,39 @@ mod tests {
         );
     }
 
+    /// R8: a poll reads which login is live at its start; a switch during the
+    /// round must not let a 401 renew the login that is live by then. The live
+    /// file is read again under the app lock, before the token POST.
+    #[test]
+    fn a_login_that_became_live_is_not_renewed() {
+        let fake = Fake::new();
+        let oa = account(OA);
+        let login = login_value(OA);
+        fake.store(&oa, &login);
+        // The login became Codex's live login while the round ran.
+        fake.write_live(&login);
+        let id = secret_id(&oa);
+        let stored_before = std::fs::read(fake.secret_file(&id)).unwrap();
+
+        let (base, receiver, handle) = start_script(vec![Reply::status(401, "unauthorized")]);
+        let (token_base, token_receiver, token_handle) = no_request_server();
+        let api = Api::new()
+            .with_codex_url(&format!("{base}/backend-api/wham/usage"))
+            .with_codex_token_url(&format!("{token_base}/oauth/token"));
+
+        let error = read_saved(&fake.app(), &fake.paths(), &fake.secrets, &oa, &api).unwrap_err();
+        let _ = received(&receiver);
+        handle.join().unwrap();
+        saw_no_request(&token_receiver, token_handle);
+
+        assert!(matches!(&error, ProviderError::BecameLive), "{error:?}");
+        assert_eq!(
+            std::fs::read(fake.secret_file(&id)).unwrap(),
+            stored_before,
+            "the copy that became live is not renewed and not stored again"
+        );
+    }
+
     #[test]
     fn an_empty_renewal_answer_is_a_failed_renewal() {
         let fake = Fake::new();
@@ -2235,7 +2337,14 @@ mod tests {
             Reply::status(401, "unauthorized"),
             Reply::ok(answer.to_string()),
         ]);
-        let error = read_saved(&fake.app(), &fake.secrets, &oa, &api_at(&base)).unwrap_err();
+        let error = read_saved(
+            &fake.app(),
+            &fake.paths(),
+            &fake.secrets,
+            &oa,
+            &api_at(&base),
+        )
+        .unwrap_err();
         let _ = received(&receiver);
         let _ = received(&receiver);
         handle.join().unwrap();
@@ -2264,7 +2373,14 @@ mod tests {
             Reply::status(401, "unauthorized"),
             Reply::status(500, "down"),
         ]);
-        let error = read_saved(&fake.app(), &fake.secrets, &oa, &api_at(&base)).unwrap_err();
+        let error = read_saved(
+            &fake.app(),
+            &fake.paths(),
+            &fake.secrets,
+            &oa,
+            &api_at(&base),
+        )
+        .unwrap_err();
         let _ = received(&receiver);
         let _ = received(&receiver);
         handle.join().unwrap();
@@ -2297,7 +2413,7 @@ mod tests {
             .with_codex_url(&format!("{usage_base}/backend-api/wham/usage"))
             .with_codex_token_url(&format!("{token_base}/oauth/token"));
 
-        let error = read_saved(&fake.app(), &fake.secrets, &oa, &api).unwrap_err();
+        let error = read_saved(&fake.app(), &fake.paths(), &fake.secrets, &oa, &api).unwrap_err();
         let _ = received(&usage_receiver);
         usage_handle.join().unwrap();
         saw_no_request(&token_receiver, token_handle);

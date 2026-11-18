@@ -123,18 +123,11 @@ function amountCell(value, currency, reason) {
   return node;
 }
 
-// A used share in whole percent, as the mock-up and the rest of the page write
-// it ("91 %").
-function shareText(value) {
-  const share = requireNumber(value, "a used share");
-  return `${Math.round(share)} %`;
-}
-
 function shareCell(value, reason) {
   if (value === null || value === undefined) {
     return h("span", { class: "n mf", text: "—", title: reason });
   }
-  return h("span", { class: "n", text: shareText(value) });
+  return h("span", { class: "n", text: percentText(requireNumber(value, "a used share")) });
 }
 
 // A subscribed price in the display currency; the price the user entered stays
@@ -611,7 +604,7 @@ function usageCells(row, currency, env) {
             : plan === null
               ? accountNameText(env.accounts, row.id)
               : plan
-        } · used ${shareText(used)}`;
+        } · used ${percentText(used)}`;
   cells.push(barNode(used, color, barTitle, false));
   cells.push(shareCell(used, usedReason));
   cells.push(amountCell(expired, currency, expiredReason));
@@ -1004,8 +997,22 @@ function onePercentCard(perPercent, env) {
 // ---------------------------------------------------------------------------
 
 function parseTokenCell(cell, model, index) {
-  if (cell === null) return null;
   requireObject(cell, "a tokens-week cell");
+  const has = (field) => Object.prototype.hasOwnProperty.call(cell, field);
+  const figureFields = ["tokens", "low", "high", "estimated", "thin"];
+  if (has("missing")) {
+    if (figureFields.some(has)) {
+      throw new Error(
+        `a tokens-week cell is both a figure and missing: ${JSON.stringify(cell)}`
+      );
+    }
+    return { missing: requireString(cell.missing, "a tokens-week cell's missing reason") };
+  }
+  if (!has("tokens")) {
+    throw new Error(
+      `a tokens-week cell must be a figure or { missing }: ${JSON.stringify(cell)}`
+    );
+  }
   const value = requireNumber(cell.tokens, "a tokens-week cell's tokens");
   const low = requireNumber(cell.low, "a tokens-week cell's low");
   const high = optionalNumber(cell.high, "a tokens-week cell's high");
@@ -1022,11 +1029,11 @@ function parseTokenCell(cell, model, index) {
 }
 
 function tokenCell(parsed, model, max, color, env, id) {
-  if (parsed === null) {
+  if (parsed.missing !== undefined) {
     return h("span", {
       class: "mf stats-sub-token-null",
       text: "—",
-      title: `not offered by ${companyText(model.company)}`,
+      title: parsed.missing,
     });
   }
   const cell = h("span", { class: "stats-sub-token-cell" });
@@ -1104,7 +1111,7 @@ function tokensWeekCard(tokensWeek, plans, env) {
     for (const row of parsedRows) {
       if (row.missing !== null) continue;
       const cell = row.cells[index];
-      if (cell !== null && cell.value > max) max = cell.value;
+      if (cell.missing === undefined && cell.value > max) max = cell.value;
     }
     return max;
   });
@@ -1115,7 +1122,7 @@ function tokensWeekCard(tokensWeek, plans, env) {
     for (const row of parsedRows) {
       if (row.missing !== null) continue;
       const cell = row.cells[index];
-      if (cell === null) continue;
+      if (cell.missing !== undefined) continue;
       any = true;
       if (!cell.estimated) allEstimated = false;
     }

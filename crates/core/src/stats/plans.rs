@@ -15,7 +15,8 @@ use crate::burn::rates::{self, main_limit, rhythm_of_company, PairLimit, RateAcc
 use crate::burn::{usd_hours, Rates, RHYTHM_WEEKS};
 use crate::history::{AccountRef, Event, Hosted, Hosts, Range, Sample, TokenRecord, WindowRecord};
 use crate::live_sessions::Values;
-use crate::money::{api_usd, work_usd, Company, Valuer};
+use crate::money::{api_usd, model_price_key, price_key, work_usd, Company, Valuer};
+use crate::transcripts::Tokens;
 
 use super::subscriptions::{self, HistoryReads, Period, UsageInput};
 use super::{
@@ -224,20 +225,30 @@ pub struct TokenModel {
 #[serde(rename_all = "camelCase")]
 pub struct TokensWeekRow {
     pub id: String,
-    pub cells: Vec<Option<TokensWeekCell>>,
+    /// One cell per model column: the figure, or why the cell has none.
+    pub cells: Vec<TokensWeekCell>,
     /// Why the row has no cells; `None` when it has them (decision 12 of
     /// M-2's fix).
     pub missing: Option<String>,
 }
 
+/// One cell of the tokens-a-week table: a figure for a model the subscription
+/// can use, or the reason the cell is empty. Serialized untagged, a missing
+/// cell is `{ "missing": "<reason>" }`; a figure carries `tokens`, `low`,
+/// `high`, `estimated` and `thin`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TokensWeekCell {
-    pub tokens: f64,
-    pub low: f64,
-    pub high: Option<f64>,
-    pub estimated: bool,
-    pub thin: bool,
+#[serde(untagged)]
+pub enum TokensWeekCell {
+    Figure {
+        tokens: f64,
+        low: f64,
+        high: Option<f64>,
+        estimated: bool,
+        thin: bool,
+    },
+    Missing {
+        missing: String,
+    },
 }
 
 /// The page's entry point, for the window command.
@@ -266,11 +277,12 @@ struct ModelStat {
 
 impl ModelStat {
     fn add(&mut self, record: &TokenRecord, usd: Option<f64>) {
-        self.tokens += token_count(record);
-        self.mix[0] += record.input;
-        self.mix[1] += record.out;
-        self.mix[2] += record.cw;
-        self.mix[3] += record.cr;
+        let tokens = Tokens::from(record);
+        self.tokens += tokens.input + tokens.out + tokens.cw + tokens.cr;
+        self.mix[0] += tokens.input;
+        self.mix[1] += tokens.out;
+        self.mix[2] += tokens.cw;
+        self.mix[3] += tokens.cr;
         match usd {
             Some(usd) => self.usd += usd,
             None => self.unpriced = true,
@@ -434,11 +446,13 @@ pub(crate) fn subscriptions_in<Tz: TimeZone + Copy>(
             .is_err()
         {
             warned_unknown_openai = true;
-            ctx.warnings.borrow_mut().push(format!(
-                "the OpenAI record of {} on {} at {} belongs to no stored OpenAI login \
-                 (several logins and no providerSwitch); its work is left out of every plan",
-                record.model, hosted.host, record.t
-            ));
+            ctx.warnings
+                .borrow_mut()
+                .push(crate::money::no_openai_login_warning(
+                    &format!("record of {}", record.model),
+                    &hosted.host,
+                    record.t,
+                ));
         }
         company_models
             .entry(company)
@@ -854,7 +868,8 @@ fn stored_price<Tz: TimeZone + Copy>(
 }
 
 fn token_count(record: &TokenRecord) -> u64 {
-    record.input + record.out + record.cw + record.cr
+    let tokens = Tokens::from(record);
+    tokens.input + tokens.out + tokens.cw + tokens.cr
 }
 
 fn is_thin(factor: &Factor) -> bool {
@@ -1067,6 +1082,18 @@ fn change_of(points: &[ChangePoint], model: &str, upt: Option<f64>) -> Option<Ch
             .fold(f64::NEG_INFINITY, f64::max);
         let a = points[k].value;
         let b = points[k + 1].value;
+        // Two consecutive points are only two consecutive weeks when their
+        // calendar dates are one week apart: a week without a point breaks the
+        // run (fix 4 of the final review).
+        if points[k]
+            .point
+            .week
+            .date_naive()
+            .checked_add_signed(Duration::days(7))
+            != Some(points[k + 1].point.week.date_naive())
+        {
+            continue;
+        }
         if !((a > high && b > high) || (a < low && b < low)) {
             continue;
         }
@@ -1479,13 +1506,23 @@ fn tokens_week_of<Tz: TimeZone + Copy>(
     priced_main: &BTreeSet<AccountRef>,
     company_models: &BTreeMap<Company, BTreeMap<String, ModelStat>>,
 ) -> TokensWeek {
+    // Only a company with a row has columns. Ollama has a month line, not a
+    // week row, so its models get no column (fix 3 of the final review).
+    let row_companies: BTreeSet<Company> = subjects
+        .iter()
+        .filter(|subject| subject.company != Company::Ollama)
+        .map(|subject| subject.company)
+        .collect();
     let mut models: Vec<TokenModel> = Vec::new();
     for company in [Company::Anthropic, Company::OpenAI, Company::Ollama] {
+        if !row_companies.contains(&company) {
+            continue;
+        }
         let stats = company_models.get(&company);
         let mut seen: Vec<(String, u64)> = stats
             .into_iter()
             .flat_map(|stats| stats.iter())
-            .filter(|(_, stat)| stat.usd_per_token().is_some() && stat.tokens > 0)
+            .filter(|(_, stat)| stat.tokens > 0)
             .map(|(model, stat)| (model.clone(), stat.tokens))
             .collect();
         seen.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -1505,7 +1542,13 @@ fn tokens_week_of<Tz: TimeZone + Copy>(
             }
         }
     }
-    let no_cells = || vec![None; models.len()];
+    let missing_cells = |reason: &str| -> Vec<TokensWeekCell> {
+        (0..models.len())
+            .map(|_| TokensWeekCell::Missing {
+                missing: reason.to_string(),
+            })
+            .collect()
+    };
     let mut rows = Vec::new();
     for subject in subjects {
         if subject.company == Company::Ollama {
@@ -1515,7 +1558,7 @@ fn tokens_week_of<Tz: TimeZone + Copy>(
         let Some(rates) = weekly.get(&subject.account) else {
             rows.push(TokensWeekRow {
                 id,
-                cells: no_cells(),
+                cells: missing_cells(NO_FACTOR_REASON),
                 missing: Some(NO_FACTOR_REASON.to_string()),
             });
             continue;
@@ -1523,49 +1566,47 @@ fn tokens_week_of<Tz: TimeZone + Copy>(
         if !priced_main.contains(&subject.account) {
             rows.push(TokensWeekRow {
                 id,
-                cells: no_cells(),
+                cells: missing_cells(NO_PRICED_MODEL_REASON),
                 missing: Some(NO_PRICED_MODEL_REASON.to_string()),
             });
             continue;
         }
+        let figure = |upt: f64, estimated: bool| TokensWeekCell::Figure {
+            tokens: 100.0 / (rates.c.value * upt),
+            low: 100.0 / (rates.c.high * upt),
+            high: (rates.c.low > 0.0).then(|| 100.0 / (rates.c.low * upt)),
+            estimated,
+            thin: is_thin(&rates.c),
+        };
         let mut cells = Vec::new();
         for model_entry in &models {
             let model_company = Company::of_model(&model_entry.model);
             if model_company != subject.company {
-                cells.push(None);
+                cells.push(TokensWeekCell::Missing {
+                    missing: format!("not offered by {}", subject.company.name()),
+                });
                 continue;
             }
             let seen = company_models
                 .get(&subject.company)
                 .and_then(|stats| stats.get(&model_entry.model))
                 .is_some_and(|stat| stat.tokens > 0);
-            let (upt, estimated) = if seen {
+            let cell = if seen {
                 // A model somebody ran is never estimated: its owner's mix
                 // gives its price, or it has none (decision 8).
-                (
-                    model_upt(company_models, subject.company, &model_entry.model),
-                    false,
-                )
+                match model_upt(company_models, subject.company, &model_entry.model) {
+                    Some(upt) => figure(upt, false),
+                    None => TokensWeekCell::Missing {
+                        missing: format!("no price for {}", model_entry.model),
+                    },
+                }
             } else {
-                (
-                    estimated_upt(ctx, &model_entry.model, subject.company, company_models),
-                    true,
-                )
+                match estimated_upt(ctx, &model_entry.model, subject.company, company_models) {
+                    Ok(upt) => figure(upt, true),
+                    Err(missing) => TokensWeekCell::Missing { missing },
+                }
             };
-            let Some(upt) = upt else {
-                cells.push(None);
-                continue;
-            };
-            let tokens = 100.0 / (rates.c.value * upt);
-            let low = 100.0 / (rates.c.high * upt);
-            let high = (rates.c.low > 0.0).then(|| 100.0 / (rates.c.low * upt));
-            cells.push(Some(TokensWeekCell {
-                tokens,
-                low,
-                high,
-                estimated,
-                thin: is_thin(&rates.c),
-            }));
+            cells.push(cell);
         }
         rows.push(TokensWeekRow {
             id,
@@ -1581,7 +1622,10 @@ fn tokens_week_of<Tz: TimeZone + Copy>(
 /// same version are one model, and the alias is the one kept (decision 15 of
 /// M-2's fix).
 fn lineup_model<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, family: &str) -> Option<String> {
-    let prefix = format!("anthropic/claude-{family}-");
+    let provider = Company::Anthropic.price_list();
+    let family_prefix = format!("claude-{family}-");
+    let prefix = price_key(provider, &family_prefix);
+    let provider_prefix = price_key(provider, "");
     let mut best: Option<(Vec<u64>, bool, String)> = None;
     for key in ctx
         .prices
@@ -1589,7 +1633,15 @@ fn lineup_model<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, family: &str) -> Option<Stri
         .keys()
         .filter(|key| key.starts_with(&prefix))
     {
-        let Some(rest) = key.strip_prefix(&prefix) else {
+        let Some(model) = key.strip_prefix(&provider_prefix) else {
+            continue;
+        };
+        // A key that is not the one `model_price_key` gives its model is not
+        // that model's price.
+        if model_price_key(model) != *key {
+            continue;
+        }
+        let Some(rest) = model.strip_prefix(&family_prefix) else {
             continue;
         };
         let (version, dated) = match rest.rsplit_once('-') {
@@ -1607,37 +1659,46 @@ fn lineup_model<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, family: &str) -> Option<Stri
         else {
             continue;
         };
-        let candidate = (parts, dated, key.clone());
+        let candidate = (parts, dated, model.to_string());
         best = match best {
             None => Some(candidate),
-            Some((best_parts, best_dated, best_key)) => {
+            Some((best_parts, best_dated, best_model)) => {
                 if candidate.0 > best_parts
                     || (candidate.0 == best_parts && best_dated && !candidate.1)
                 {
                     Some(candidate)
                 } else {
-                    Some((best_parts, best_dated, best_key))
+                    Some((best_parts, best_dated, best_model))
                 }
             }
         };
     }
-    best.map(|(_, _, key)| key.trim_start_matches("anthropic/").to_string())
+    best.map(|(_, _, model)| model)
 }
 
+/// The owner's estimate of `model`'s dollars per token from the company's most
+/// used model's token mix, at `model`'s own price. The main model needs a mix,
+/// not a price of its own: a new model before models.dev lists it still gives
+/// the mix (fix 2 of the final review). `Err` carries the reason a cell has no
+/// estimate.
 fn estimated_upt<Tz: TimeZone + Copy>(
     ctx: &Ctx<Tz>,
     model: &str,
     company: Company,
     company_models: &BTreeMap<Company, BTreeMap<String, ModelStat>>,
-) -> Option<f64> {
-    let stats = company_models.get(&company)?;
+) -> Result<f64, String> {
+    let no_mix = || format!("no token mix of {} in this range", company.name());
+    let stats = company_models.get(&company).ok_or_else(no_mix)?;
     let (_, main_stat) = stats
         .iter()
-        .max_by(|a, b| a.1.tokens.cmp(&b.1.tokens).then_with(|| b.0.cmp(a.0)))?;
-    main_stat.usd_per_token()?;
+        .max_by(|a, b| a.1.tokens.cmp(&b.1.tokens).then_with(|| b.0.cmp(a.0)))
+        .ok_or_else(no_mix)?;
     let tokens: u64 = main_stat.mix.iter().sum();
     if tokens == 0 {
-        return None;
+        return Err(format!(
+            "the token mix of {}'s main model is empty",
+            company.name()
+        ));
     }
     let estimated = work_usd(
         model,
@@ -1647,8 +1708,12 @@ fn estimated_upt<Tz: TimeZone + Copy>(
         main_stat.mix[3],
         ctx.prices,
         ctx.now,
-    )?;
-    (estimated > 0.0).then(|| estimated / tokens as f64)
+    )
+    .ok_or_else(|| format!("no price for {model}"))?;
+    if estimated <= 0.0 {
+        return Err(format!("{model}'s price gives no estimate"));
+    }
+    Ok(estimated / tokens as f64)
 }
 
 #[cfg(test)]
@@ -1863,6 +1928,223 @@ mod tests {
         points.push(point(start + Duration::weeks(8), 2.0, 2.0));
         points.push(point(start + Duration::weeks(9), 1.0, 1.0));
         assert!(change_of(&points, "claude-opus-5-5", Some(1.0)).is_none());
+    }
+
+    #[test]
+    fn a_gap_between_two_weeks_is_no_change() {
+        let start = utc("2026-09-07T00:00:00Z");
+        let mut points: Vec<ChangePoint> = (0..8)
+            .map(|index| point(start + Duration::weeks(index), 1.0, 1.0))
+            .collect();
+        points.push(point(start + Duration::weeks(8), 2.0, 2.0));
+        // Week 9 has no point, so weeks 8 and 10 are not consecutive.
+        points.push(point(start + Duration::weeks(10), 2.0, 2.0));
+        assert!(change_of(&points, "claude-opus-5-5", Some(1.0)).is_none());
+    }
+
+    #[test]
+    fn an_unpriced_new_model_does_not_make_the_lineup_not_offered() {
+        let mut tiny = tiny();
+        tiny.prices.take(
+            BTreeMap::from([(
+                price_key("anthropic", "claude-sonnet-5-5"),
+                ModelPrice {
+                    input: 3.0,
+                    output: 15.0,
+                    cache_write: 3.75,
+                    cache_read: 0.3,
+                    tiered: false,
+                },
+            )]),
+            utc("2026-01-01T00:00:00Z"),
+        );
+        let ctx = tiny.ctx();
+        let lb = RateAccount::of(tiny.lb());
+        let rates = Rates::given(0.5, None);
+        let weekly = BTreeMap::from([(lb.account.clone(), rates)]);
+        let priced_main = BTreeSet::from([lb.account.clone()]);
+        // The company's most used model is new and has no price; the older
+        // opus is priced. The estimate for sonnet still uses the new model's
+        // token mix and sonnet's own price.
+        let company = BTreeMap::from([(
+            Company::Anthropic,
+            BTreeMap::from([
+                (
+                    "claude-opus-6-0".to_string(),
+                    ModelStat {
+                        tokens: 2_000_000,
+                        usd: 0.0,
+                        unpriced: true,
+                        mix: [2_000_000, 0, 0, 0],
+                    },
+                ),
+                (
+                    "claude-opus-5-5".to_string(),
+                    ModelStat {
+                        tokens: 100_000,
+                        usd: 2.0,
+                        unpriced: false,
+                        mix: [0, 100_000, 0, 0],
+                    },
+                ),
+            ]),
+        )]);
+        let week = tokens_week_of(
+            &ctx,
+            std::slice::from_ref(&lb),
+            &weekly,
+            &priced_main,
+            &company,
+        );
+        let row = week
+            .rows
+            .iter()
+            .find(|row| row.id == account_id(&ctx, &lb.account))
+            .expect("LB's week row");
+        let index = week
+            .models
+            .iter()
+            .position(|model| model.model == "claude-sonnet-5-5")
+            .expect("sonnet's line-up column");
+        match &row.cells[index] {
+            TokensWeekCell::Figure { estimated, .. } => assert!(*estimated),
+            TokensWeekCell::Missing { missing } => {
+                panic!("sonnet is offered but its cell says {missing}")
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_cell_says_why_and_a_company_without_a_row_has_no_column() {
+        let tiny = tiny();
+        let ctx = tiny.ctx();
+        let lb = RateAccount::of(tiny.lb());
+        let codex = RateAccount {
+            account: crate::stats::tests::codex_ref(),
+            company: Company::OpenAI,
+            capacity: Some(1.0),
+            plan: Some("Plus".to_string()),
+        };
+        let ollama = RateAccount {
+            account: crate::money::ollama_subscription(),
+            company: Company::Ollama,
+            capacity: Some(1.0),
+            plan: Some("Plus".to_string()),
+        };
+        let rates = Rates::given(0.5, None);
+        let weekly = BTreeMap::from([
+            (lb.account.clone(), rates),
+            (codex.account.clone(), rates),
+            (ollama.account.clone(), rates),
+        ]);
+        let priced_main = BTreeSet::from([
+            lb.account.clone(),
+            codex.account.clone(),
+            ollama.account.clone(),
+        ]);
+        let company = BTreeMap::from([
+            (
+                Company::Anthropic,
+                BTreeMap::from([
+                    (
+                        "claude-opus-5-5".to_string(),
+                        ModelStat {
+                            tokens: 1_000_000,
+                            usd: 2.0,
+                            unpriced: false,
+                            mix: [0, 1_000_000, 0, 0],
+                        },
+                    ),
+                    (
+                        "claude-opus-6-0".to_string(),
+                        ModelStat {
+                            tokens: 500_000,
+                            usd: 0.0,
+                            unpriced: true,
+                            mix: [500_000, 0, 0, 0],
+                        },
+                    ),
+                ]),
+            ),
+            (
+                Company::OpenAI,
+                BTreeMap::from([(
+                    "gpt-6.2-codex".to_string(),
+                    ModelStat {
+                        tokens: 1_000_000,
+                        usd: 5.0,
+                        unpriced: false,
+                        mix: [1_000_000, 0, 0, 0],
+                    },
+                )]),
+            ),
+            (
+                Company::Ollama,
+                BTreeMap::from([(
+                    "llama-4:cloud".to_string(),
+                    ModelStat {
+                        tokens: 1_000_000,
+                        usd: 5.0,
+                        unpriced: false,
+                        mix: [1_000_000, 0, 0, 0],
+                    },
+                )]),
+            ),
+        ]);
+        let week = tokens_week_of(
+            &ctx,
+            &[lb.clone(), codex.clone(), ollama],
+            &weekly,
+            &priced_main,
+            &company,
+        );
+        assert!(
+            !week
+                .models
+                .iter()
+                .any(|model| model.company == Company::Ollama),
+            "Ollama has no week row, so no Ollama column: {:?}",
+            week.models
+        );
+        let index = |model: &str| {
+            week.models
+                .iter()
+                .position(|entry| entry.model == model)
+                .unwrap_or_else(|| panic!("{model}'s column"))
+        };
+        let lb_row = week
+            .rows
+            .iter()
+            .find(|row| row.id == account_id(&ctx, &lb.account))
+            .expect("LB's week row");
+        assert_eq!(
+            lb_row.cells[index("gpt-6.2-codex")],
+            TokensWeekCell::Missing {
+                missing: "not offered by Anthropic".to_string()
+            }
+        );
+        assert_eq!(
+            lb_row.cells[index("claude-opus-6-0")],
+            TokensWeekCell::Missing {
+                missing: "no price for claude-opus-6-0".to_string()
+            }
+        );
+        let codex_row = week
+            .rows
+            .iter()
+            .find(|row| row.id == account_id(&ctx, &codex.account))
+            .expect("the OpenAI week row");
+        assert_eq!(
+            codex_row.cells[index("claude-opus-5-5")],
+            TokensWeekCell::Missing {
+                missing: "not offered by OpenAI".to_string()
+            }
+        );
+        let json = serde_json::to_value(&week).expect("the week's JSON");
+        assert_eq!(
+            json["rows"][0]["cells"][index("claude-opus-6-0")]["missing"],
+            "no price for claude-opus-6-0"
+        );
     }
 
     #[test]
@@ -2122,7 +2404,10 @@ mod tests {
             .find(|row| row.id == ac_id)
             .expect("AC's week row");
         assert_eq!(week_row.missing.as_deref(), Some(NO_FACTOR_REASON));
-        assert!(week_row.cells.iter().all(Option::is_none));
+        assert!(week_row.cells.iter().all(|cell| matches!(
+            cell,
+            TokensWeekCell::Missing { missing } if missing == NO_FACTOR_REASON
+        )));
         assert!(!page.per_percent.iter().any(|line| line.id == ac_id));
     }
 
@@ -2615,6 +2900,71 @@ mod tests {
                 .expect("the Ollama sample");
         }
         tiny
+    }
+
+    /// The fixture plus one Ollama subscription with a finished October month at
+    /// 50 % and a running November month at 21.09 %; "now" is 19 Nov.
+    fn tiny_with_a_finished_and_a_running_ollama_month() -> crate::stats::fixture::Tiny {
+        let mut tiny = tiny();
+        let ollama = crate::money::ollama_subscription();
+        tiny.provider_subscriptions
+            .push(provider_subscription(&ollama, "OL", Some(20.0)));
+        let month = LimitKind::Other("monthly_credits".to_string());
+        for (at, percent, reset) in [
+            ("2026-10-01T00:00:00Z", 0.0, "2026-11-01T00:00:00Z"),
+            ("2026-10-01T05:00:00Z", 50.0, "2026-11-01T00:00:00Z"),
+            ("2026-11-01T00:00:00Z", 0.0, "2026-12-01T00:00:00Z"),
+            ("2026-11-15T05:00:00Z", 21.09, "2026-12-01T00:00:00Z"),
+        ] {
+            tiny.history
+                .append(&Sample {
+                    t: utc(at),
+                    account: ollama.clone(),
+                    src: Source::Poll,
+                    l: vec![LimitSample {
+                        k: month.clone(),
+                        m: None,
+                        p: percent,
+                        r: Some(utc(reset)),
+                        b: false,
+                    }],
+                })
+                .expect("the Ollama sample");
+        }
+        tiny.history
+            .append(&WindowRecord {
+                account: ollama,
+                k: month,
+                m: None,
+                start: Some(utc("2026-10-01T00:00:00Z")),
+                end: utc("2026-11-01T00:00:00Z"),
+                final_percent: 50.0,
+                lost: Some(50.0),
+                last_sample: utc("2026-10-01T05:00:00Z"),
+                plan: Some("Plus".to_string()),
+                uncertain: false,
+                reset: false,
+                from: None,
+            })
+            .expect("the Ollama month");
+        tiny
+    }
+
+    #[test]
+    fn ollama_used_share_counts_finished_months_only() {
+        let tiny = tiny_with_a_finished_and_a_running_ollama_month();
+        let range = Range {
+            from: utc("2026-10-01T00:00:00Z"),
+            to: tiny.now,
+        };
+        let page = subscriptions_in(&tiny.ctx(), &range, &all()).expect("the page");
+        let group = page
+            .usage
+            .iter()
+            .find(|group| group.company == Company::Ollama)
+            .expect("Ollama's group");
+        let row = group.rows.first().expect("Ollama's row");
+        assert_eq!(row.used_percent, Some(50.0), "{row:?}");
     }
 
     /// The range the lead's app used: the last 30 days.

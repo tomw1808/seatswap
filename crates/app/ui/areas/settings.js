@@ -23,6 +23,7 @@ import {
   loginDaysLeft,
   message,
   panel,
+  providerName,
   selectInput,
   shortPercent,
   switchControl,
@@ -1566,15 +1567,6 @@ function accountRow(row) {
   return wrap;
 }
 
-// The company a subscription's `company` JSON names; the page never guesses
-// one it does not know.
-function companyName(company) {
-  if (company === "openai") return "OpenAI";
-  if (company === "ollama") return "Ollama";
-  if (company === "anthropic") return "Anthropic";
-  return "—";
-}
-
 function subscriptionPlan(subscription) {
   if (typeof subscription.plan === "string" && subscription.plan !== "") {
     return subscription.plan;
@@ -1720,15 +1712,16 @@ function subscriptionRow(subscription) {
     });
   }
 
+  // The one company-name map lives in common.js; `providerName` throws on a
+  // company key it does not know instead of quietly writing "—".
+  const company = providerName(subscription.company, undefined);
+  company.className = "acc-text acc-company";
+  company.title = company.textContent;
   wrap.appendChild(
     h("div", { class: "lr acc-grid" }, [
       chip,
       labelInput,
-      h("span", {
-        class: "acc-text acc-company",
-        title: companyName(subscription.company),
-        text: companyName(subscription.company),
-      }),
+      company,
       planControl,
       h("div", { class: "price-cell" }, [priceInput, currencyLabel]),
       h("span", { class: "acc-text", text: "—" }),
@@ -1754,39 +1747,42 @@ function subscriptionRow(subscription) {
     // the one action that deletes that copy; the row, its plan, price and
     // history stay, and Codex's own login file is never touched. The live login
     // is not offered: the next poll would save its copy again.
-    const loginState = codexLoginState(subscription.account);
-    if (loginState === "saved") {
-      editor.appendChild(removeSavedLogin(subscription, field));
-    } else if (loginState === "live") {
-      editor.appendChild(liveLoginNote());
+    const login = codexLogin(subscription.account);
+    if (login) {
+      if (login.live === true) editor.appendChild(liveLoginNote(login));
+      else editor.appendChild(removeSavedLogin(subscription, field));
     }
     wrap.appendChild(editor);
   }
   return wrap;
 }
 
-// What Settings knows about a Codex login from the snapshot: the live one, a
-// saved one, or nothing (the OpenAI card is off, or its copy is gone). Only a
-// saved, non-live login may be removed.
-function codexLoginState(account) {
-  if (!isObject(account) || account.org !== "codex") return "unknown";
+// The Codex login the snapshot knows for an account, or null (the OpenAI card
+// is off, or its copy is gone). Only a saved, non-live login may be removed.
+function codexLogin(account) {
+  if (!isObject(account) || account.org !== "codex") return null;
   const snapshot = state.snapshot || {};
   const logins = Array.isArray(snapshot.codexLogins) ? snapshot.codexLogins : [];
-  const login = logins.find(
-    (entry) => isObject(entry.account) && sameRef(entry.account, account)
+  return (
+    logins.find((entry) => isObject(entry.account) && sameRef(entry.account, account)) ||
+    null
   );
-  if (!login) return "unknown";
-  return login.live === true ? "live" : "saved";
 }
 
-// The sentence that takes the place of Remove on the live login, muted: the
-// worker refuses the same remove with the same words.
-const LIVE_LOGIN_REMOVE =
-  "the live login: switch Codex to another login first to remove it";
-
-function liveLoginNote() {
+// The sentence that takes the place of Remove on the live login, muted. It
+// comes from the snapshot (the worker's own refusal), never from a second copy
+// in this page.
+function liveLoginNote(login) {
+  const note =
+    typeof login.removeNote === "string" && login.removeNote !== ""
+      ? login.removeNote
+      : null;
   return h("div", { class: "editor-actions" }, [
-    h("span", { class: "mf x11", text: LIVE_LOGIN_REMOVE }),
+    h("span", {
+      class: "mf x11",
+      text: note || "—",
+      title: note || "the snapshot carries no removal note for this login",
+    }),
   ]);
 }
 

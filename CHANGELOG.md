@@ -44,6 +44,14 @@ All notable changes to this project are documented here. The format follows
   longer makes a minutes-long period at the new price.
 - Codex token growth is counted once: a repeated total records nothing, a total below the highest
   one is a warning, and a missing `cache_write_input_tokens` counts as 0.
+- The OpenAI card keeps showing the live login's usage when seatswap cannot save that login (for
+  example a keyring that refuses it); the pop-up row says why it is not saved.
+- A Codex login changed outside seatswap (`codex login`, or a switch from another seatswap process)
+  is recorded as a switch, so OpenAI work is booked to the right subscription.
+- `seatswap status`, `burn plan` and `burn simulate` print the history's warnings, such as a model
+  without a price.
+- The Forecast shows `—` with its reason instead of `0h` blocked when no typical working hour is
+  known yet.
 
 ### Removed
 

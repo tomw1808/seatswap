@@ -23,6 +23,7 @@ const MODELS = {
   haiku: "claude-haiku-5-5",
   gpt: "gpt-5.5-codex",
   deepseek: "deepseek-v4.1-flash",
+  astra: "gpt-6-astra",
 };
 
 // M-2's reason for a subscription with no pair of priced work in the range.
@@ -426,7 +427,7 @@ function tokensWeek() {
     { model: MODELS.sonnet, company: "anthropic" },
     { model: MODELS.haiku, company: "anthropic" },
     { model: MODELS.gpt, company: "openai" },
-    { model: MODELS.deepseek, company: "ollama" },
+    { model: MODELS.astra, company: "openai" },
   ];
   const cell = (tokens, low, high, estimated = false, thin = false) => ({
     tokens: Math.round(tokens * 1e6),
@@ -436,6 +437,8 @@ function tokensWeek() {
     thin,
   });
   const estimated = (tokens) => cell(tokens, tokens, tokens, true, false);
+  const missing = (reason) => ({ missing: reason });
+  const notOffered = (company) => missing(`not offered by ${company}`);
   const rows = [
     {
       id: accountId("LB"),
@@ -443,8 +446,8 @@ function tokensWeek() {
         cell(160, 156, 164),
         cell(270, 262, 278),
         estimated(810),
-        null,
-        null,
+        notOffered("Anthropic"),
+        notOffered("Anthropic"),
       ],
       missing: null,
     },
@@ -454,8 +457,8 @@ function tokensWeek() {
         cell(102, 95, 109),
         cell(216, 209, 223),
         estimated(648),
-        null,
-        null,
+        notOffered("Anthropic"),
+        notOffered("Anthropic"),
       ],
       missing: null,
     },
@@ -465,37 +468,26 @@ function tokensWeek() {
         cell(320, 308, 332),
         cell(540, 520, 560),
         estimated(1620),
-        null,
-        null,
+        notOffered("Anthropic"),
+        notOffered("Anthropic"),
       ],
       missing: null,
     },
     {
       id: subscriptionId("OA"),
       cells: [
-        null,
-        null,
-        null,
+        notOffered("OpenAI"),
+        notOffered("OpenAI"),
+        notOffered("OpenAI"),
         cell(42, 40, 44),
-        null,
+        missing(`no price for ${MODELS.astra}`),
       ],
       missing: null,
     },
     {
       id: subscriptionId("O2"),
-      cells: Array(models.length).fill(null),
+      cells: models.map(() => missing(NOT_MEASURED)),
       missing: NOT_MEASURED,
-    },
-    {
-      id: subscriptionId("OL"),
-      cells: [
-        null,
-        null,
-        null,
-        null,
-        cell(55, 53, 57, false, true),
-      ],
-      missing: null,
     },
   ];
   return { models, rows };

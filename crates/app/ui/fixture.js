@@ -603,6 +603,7 @@ function makeFixture() {
         usage: null,
         state: "ok",
         message: null,
+        removeNote: "the live login: switch Codex to another login first to remove it",
       },
       {
         account: { acc: codexSavedId, org: "codex" },

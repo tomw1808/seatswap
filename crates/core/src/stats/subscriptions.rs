@@ -199,7 +199,16 @@ pub(crate) fn usage_row(input: UsageInput<'_>) -> Result<(UsageRow, Option<f64>)
     }
 
     let used_percent = if input.ollama {
-        mean(input.months.iter().map(|month| month.used_percent))
+        // A running month's share is not a figure of the range: the row's use
+        // counts its finished months only, as its money and API value do
+        // (fix 1 of the final review).
+        mean(
+            input
+                .months
+                .iter()
+                .filter(|month| month.end <= input.now)
+                .map(|month| month.used_percent),
+        )
     } else {
         mean(input.weeks.iter().map(|week| week.used))
     };

@@ -293,14 +293,17 @@ left out of the learned rates, because the drop is not use.
 **A token line's `min`.** Since 1.3 every new token line carries `"min": 5` and covers the 5-minute
 bucket it starts in. A line without `min` is an hour, which is what every version before 1.3 wrote.
 `TokenRecord::span()` is the one place that says how long a line lasts; every reader that spreads a
-line over time or windows one uses it. An older seatswap reads a 5-minute line as an hour: it shows
+line over time uses it (the rates, the rhythm, the replay). The money readers (the Valuer behind
+Overview, Projects, Subscriptions and Sessions) place a line at its start: a 5-minute line can fall
+at most 5 minutes on the wrong side of a switch or a reset, an older hourly line up to an hour. An older seatswap reads a 5-minute line as an hour: it shows
 no error, but spreads that line's work over too long a time, so every machine should be updated
 together.
 
-**`codex.json`.** The Codex scan state in `transcripts-state/codex.json` keeps, per rollout file, the
-token total it last recorded, the time of that line and the file's path. It is written before the
-token lines it covers, so a crash records nothing twice. A file that is gone has its entry pruned
-unless the scan still sees it.
+**`codex.json`.** The Codex scan state in `transcripts-state/codex.json` keeps, per Codex session id,
+the token total it last recorded, the time of that line and the path of its newest rollout file (a
+resumed session's files share one entry). It is written before the
+token lines it covers, so a crash records nothing twice. An entry is pruned when its
+newest file is gone and the scan no longer sees the session.
 
 Next to the history files, each host writes one live report into its own host folder, `<host>/sessions-now.json` (§11.4): what is running on that host, for the other hosts' Sessions area. It is not history: the import never copies it and a host folder's size leaves it out.
 
@@ -574,8 +577,9 @@ union over hosts, documented rule): a rise outside that time comes from use seat
 (claude.ai, the phone, a machine without seatswap). The pairs inside one 5 h window give `s` the
 same way.
 
-A factor's estimate is `(Σ gain + prior × 100 USD) / (Σ usd + 100 USD)` while it leans on a prior,
-and `Σ gain / Σ usd` once 100 USD of its own work was measured. Its 80 % range is 1.2816 standard
+A factor's estimate is `(Σ gain + prior × 100 USD) / (Σ usd + 100 USD)` whenever the account has a
+prior, measured or not, so the prior's weight fades as the account's own dollars grow; without a prior
+it is `Σ gain / Σ usd`. Its 80 % range is 1.2816 standard
 errors of all pairs around that line, with the prior counted as one more pair of 100 USD (documented
 rule); without pairs the range is the prior itself. A factor that is not above 0 is unknown, never a
 number. A factor is measured at 100 USD of the account's own pairs; below that it leans on its prior.
@@ -857,7 +861,8 @@ Their readings go into the history like a Claude account's, under an organizatio
 
 **Codex.** The card reads `<codex folder>/auth.json`: the `codexHome` setting when set, else
 `$CODEX_HOME`, else `~/.codex/auth.json`. The file is read at every provider poll; seatswap writes
-it only when switching a saved login, and then through its atomic write with mode `0600`. Of it
+it only when switching a saved login, and then through its atomic write, which keeps the file's mode
+(Codex writes it `0600`; a file seatswap creates gets `0600`). Of it
 seatswap uses `tokens.access_token`, `tokens.account_id` and, for a saved login, the whole JSON
 object with every key in its order. `auth_mode` is looked at only to tell a login kept in the OS
 keyring or an API key from a ChatGPT login. A missing file says so, and names the keyring too: `No
@@ -892,8 +897,15 @@ The answer becomes the same limits a Claude account has:
 under the first 32 hex digits of SHA-256 of `codex:<account id>`. When the live tokens differ from
 the stored copy (Codex renewed them, or the person signed in with `codex login`), the stored copy is
 replaced; a poll that changed nothing writes nothing. A new `account_id` gets a provider
-subscription, so one ChatGPT account is one subscription (`OA`, then the next free abbreviation).
-A login kept in the keyring and an API-key login are not saved, with the two messages above.
+subscription as soon as its copy is saved, so one ChatGPT account is one subscription (`OA`, then the
+next free abbreviation). A login kept in the keyring and an API-key login are not saved, with the two
+messages above. A save that fails (the secrets store refuses the login, the app lock times out, the
+login has no refresh token) never hides the card: the live login's usage is still read and shown,
+and its row in the pop-up says `This login is not saved: {error}`; a switch away from it then fails,
+because a switch saves the live login first. When the live login changes outside seatswap (`codex
+login` with another account, or a switch by another seatswap process), the next poll writes one
+`providerSwitch` from the login it saw before, unless this host's last `providerSwitch` already
+names the new login.
 
 A switch to a saved login takes seatswap's own app lock first, then Codex's two locks in Codex's
 order (`<codex folder>/auth.lock`, then `auth.json.lock`), with one 10 s deadline for both; it reads
@@ -913,21 +925,24 @@ the login once at its issuer (`POST https://auth.openai.com/oauth/token` with th
 `access_token`, `refresh_token` and `last_refresh`, and asks once more. A stored login whose issuer
 is not `https://auth.openai.com` is not renewed: the token is never sent to another issuer. A failed
 renewal marks the login `expired` with `Sign in again with codex login.` and keeps the copy.
-seatswap never renews the live login; Codex does.
+seatswap never renews the live login; Codex does. The renewal runs under seatswap's app lock, after
+reading the live file again under it, so a login that became live during the round is not renewed.
 
 Settings → Accounts' *Remove saved login* on a saved Codex login that is not live deletes seatswap's
-stored copy only; Codex's `auth.json` and the subscription stay. Sign-in and sign-out stay Codex's
+stored copy only; Codex's `auth.json` and the subscription stay. While Codex runs on an API key or a
+keyring login, no saved login is live, so every saved copy can be removed. Sign-in and sign-out stay Codex's
 (`codex login`).
 
 **Codex token lines.** With *Read sessions* on, seatswap writes `TokenRecord` lines for Codex
 sessions from Codex's rollout files: the growth of `info.total_token_usage` between `token_count`
 lines, per 5-minute bucket and the model of the turn (`turn_context.payload.model` in force at that
-line). `input = input_tokens − cached_input_tokens`, `cr = cached_input_tokens`, `out =
+line; growth before the session's first `turn_context` belongs to the first one after it, and waits
+until that one is written). `input = input_tokens − cached_input_tokens`, `cr = cached_input_tokens`, `out =
 output_tokens` (reasoning included) and `cw = 0`, because OpenAI bills no cache write and Codex's
 real lines do not carry the field (documented rule); `answers` is the number of `token_count` lines
-that grew. What was recorded per rollout file is kept in the scan state (`codex.json`): its total,
+that grew. What was recorded per Codex session is kept in the scan state (`codex.json`): its total,
 its last time and its file. A total equal to the recorded one records nothing; a resumed session
-records only its growth; an entry is never pruned while its file still exists. A session not seen
+records only its growth; an entry is pruned only when its newest file is gone and the scan no longer sees the session. A session not seen
 within 24 h of its end is not recorded (documented rule). The Sessions area's Codex row keeps the
 live total from the rollout file; closed Codex sessions are not rows of their own yet.
 
@@ -948,7 +963,9 @@ is asked there.
   cannot be read keeps its row as `not read: {reason}`; the balance still counts.
 - An **old plan** (session and weekly limits) has `included.session` and `included.weekly`, each with
   `remaining_percent` and `resets_at`. They become a session and a week limit with
-  `percent = 100 − remaining_percent`, like a Claude account; the card has no credits.
+  `percent = 100 − remaining_percent`, like a Claude account; the card has no credits. Such a
+  subscription has no month to value its price over, so its subscription value is unknown with the
+  reason `no monthly allowance in Ollama's reading`, as for a new plan without an allowance.
 - The account is named `ollama` under the organization `ollama`; the plan is empty.
 - Every successful `/api/usage?range=24h` answer's `buckets` also become the history's Ollama hours (§5); the Activity page names in one note how much they counted beyond the known sessions (§11.4).
 
@@ -1415,7 +1432,7 @@ provider do not repeat it; a model total row carries the `tied` bubble, and a to
 | Host | where it runs; for another host, the age of its last report |
 
 A total's last hour is `—` when any row it sums has an unknown one. The last hour is kept per minute
-and model, so its tokens are priced like the rest, and a closed session's hourly token records are
+and model, so its tokens are priced like the rest, and a closed session's token records are
 priced with it.
 
 A running session is valued exactly like a closed one: from its token lines in the history, one per
@@ -1821,8 +1838,8 @@ The four cards:
   of typical work a full limit holds**: `100 / factor` API dollars divided by the typical-hour dollars
   of the owner's work with that model (the mean API dollars per working hour with it over the last 4
   weeks). **Over the weeks** says `steady`, or names a change (`gpt-6-astra 24h → 19h since 19 Oct`)
-  when two consecutive finished weeks lie on the same side outside the range of the 8 weeks before
-  (documented rule). **Based on** shows the factor's `basis_usd` as typical hours; the figure is
+  when two consecutive finished weeks (one calendar week apart; a week without a point breaks the
+  run) lie on the same side outside the range of the 8 weeks before (documented rule). **Based on** shows the factor's `basis_usd` as typical hours; the figure is
   marked `thin` when half its range's width is more than 20 % of its value (documented rule). Below
   it, **Plan sizes, measured**: each plan's week factor against the reference plan — the measured
   Anthropic plan with the largest `basis_usd`, or no reference when none is measured — as
@@ -1831,7 +1848,8 @@ The four cards:
   prior is not a measured size and shows no ratio.
 - **Am I using what I pay for?** Grouped by company with a subtotal line, one row per subscription:
   the price a month (the entered price and currency in the tooltip when converted), the use (its
-  average share of the limit; Ollama: of the monthly credits), the money expired, the value at API
+  average share of the limit over its finished weeks; Ollama: of the monthly credits over its finished
+  months), the money expired, the value at API
   prices and `× paid`. A total row sums them.
 - **What 1 % of a limit buys, over the weeks.** Tabs per subscription, then per limit: Week, 5h, and
   Month for Ollama. One point per finished week: the tokens per 1 % of the main model (the model
@@ -1841,13 +1859,14 @@ The four cards:
   shows the week; otherwise it says `Steady. No week left its usual range.` Under it stand the
   current figures per model as tokens and typical-work minutes; for 5h also how much work a full
   window holds.
-- **Tokens a week, per subscription and model.** Rows are the subscriptions; columns are the models
-  seen in the range plus each company's other priced models of the same line-up (Opus, Sonnet,
-  Haiku, Fable for Anthropic). A cell is the tokens a full weekly limit holds: `100 / factor` API
+- **Tokens a week, per subscription and model.** Rows are the subscriptions with a week (Ollama has
+  none); columns are the models of those rows' companies seen in the range, priced or not, plus each
+  company's other priced models of the same line-up (Opus, Sonnet, Haiku, Fable for Anthropic). A cell is the tokens a full weekly limit holds: `100 / factor` API
   dollars divided by the model's dollars per token at the owner's token mix for it. A model the owner
   never used is priced with the token mix of the same company's most used model and marked
-  `estimated` (a striped bar). Bars compare within a column; `—` means the company does not offer the
-  model. The note reads `Refit every week as new work comes in; the range is how far a figure may
+  `estimated` (a striped bar); the main model needs a token mix, not a price of its own. Bars
+  compare within a column. An empty cell is `—` titled with its reason: `not offered by {company}`,
+  `no price for {model}`, or why the estimate could not be made. The note reads `Refit every week as new work comes in; the range is how far a figure may
   still be off.`
 
 The what-if replay is gone: no page replays a week without a subscription, and there is no

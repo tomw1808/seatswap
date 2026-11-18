@@ -11,8 +11,8 @@ use crate::history::{
     is_early_reset, same_reset, AccountRef, Event, EventKind, Hosted, Sample, TokenRecord,
 };
 use crate::money::{
-    api_usd, is_plan_model, ollama_subscription, openai_subscription_at, openai_subscriptions,
-    provider_switch_timelines, Company, Prices,
+    api_usd, is_plan_model, no_openai_login_warning, ollama_subscription, openai_subscription_at,
+    openai_subscriptions, provider_switch_timelines, Company, Prices,
 };
 use crate::store::{Account, ProviderSubscription};
 
@@ -188,15 +188,21 @@ pub(crate) fn main_limit(company: Company) -> LimitKind {
 pub struct LearnedRates {
     pub rates: BTreeMap<AccountRef, Rates>,
     pub unpriced: BTreeSet<String>,
+    /// One sentence per host on which an OpenAI record could belong to no
+    /// stored login (several logins and no `providerSwitch`): its work is left
+    /// out of every subscription's pairs, and the caller says so once per host.
+    pub openai_without_login: BTreeMap<String, String>,
 }
 
 impl LearnedRates {
     /// One warning per Claude model without a price, not one per record: the
-    /// words [`super::live::learn`] adds to its warnings.
+    /// words [`super::live::learn`] adds to its warnings. Then one per host
+    /// whose OpenAI records belong to no stored login.
     pub fn warnings(&self) -> Vec<String> {
         self.unpriced
             .iter()
             .map(|model| unpriced_warning(model))
+            .chain(self.openai_without_login.values().cloned())
             .collect()
     }
 }
@@ -378,6 +384,10 @@ pub(crate) fn rates_in_with(
         })
         .collect();
 
+    let mut openai_without_login = BTreeMap::new();
+    for (_, own) in &measured {
+        openai_without_login.extend(own.openai_without_login.clone());
+    }
     let mut learned = BTreeMap::new();
     for (entry, own) in &measured {
         let week_prior = prior(
@@ -399,6 +409,7 @@ pub(crate) fn rates_in_with(
     LearnedRates {
         rates: learned,
         unpriced: unpriced_models(tokens, prices),
+        openai_without_login,
     }
 }
 
@@ -485,6 +496,9 @@ struct Measured {
     session: Vec<fit::Pair>,
     /// The subscription's latest sample in `[from, to]` has a session limit.
     has_session: bool,
+    /// One sentence per host whose OpenAI records no stored login can be named
+    /// for: see [`LearnedRates::openai_without_login`].
+    openai_without_login: BTreeMap<String, String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -498,7 +512,8 @@ fn measure(
     to: DateTime<Utc>,
     has_session: bool,
 ) -> Measured {
-    let owned = owned_pairs(subject, lines, tokens, pools, prices, from, to);
+    let (owned, openai_without_login) =
+        owned_pairs(subject, lines, tokens, pools, prices, from, to);
     let mut week = Vec::new();
     let mut session = Vec::new();
     for (pair, work) in owned {
@@ -520,6 +535,7 @@ fn measure(
         week,
         session,
         has_session,
+        openai_without_login,
     }
 }
 
@@ -548,7 +564,8 @@ pub(crate) fn window_pairs(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
 ) -> Vec<fit::Pair> {
-    owned_pairs(subject, lines, tokens, pools, prices, from, to)
+    let (owned, _) = owned_pairs(subject, lines, tokens, pools, prices, from, to);
+    owned
         .into_iter()
         .filter_map(|(pair, work)| {
             if work.unpriced {
@@ -581,7 +598,7 @@ fn owned_pairs(
     prices: &Prices,
     from: DateTime<Utc>,
     to: DateTime<Utc>,
-) -> Vec<(SamplePair, SpanWork)> {
+) -> (Vec<(SamplePair, SpanWork)>, BTreeMap<String, String>) {
     let raw = pairs(lines, from, to, &main_limit(subject.company));
     let spans: Vec<(DateTime<Utc>, DateTime<Utc>)> =
         raw.iter().map(|pair| (pair.from, pair.to)).collect();
@@ -599,8 +616,17 @@ fn owned_pairs(
         Company::Anthropic => Ownership::Claude(&subject.account),
         Company::OpenAI | Company::Ollama => Ownership::Provider(&provider),
     };
-    let work = work_for(&pools.timelines, tokens, owner, &spans, prices);
-    raw.into_iter()
+    let mut openai_without_login = BTreeMap::new();
+    let work = work_for(
+        &pools.timelines,
+        tokens,
+        owner,
+        &spans,
+        prices,
+        &mut openai_without_login,
+    );
+    let owned = raw
+        .into_iter()
         .zip(work)
         .filter(|(pair, work)| {
             if work.foreign {
@@ -614,7 +640,8 @@ fn owned_pairs(
                 Company::OpenAI | Company::Ollama => work.own,
             }
         })
-        .collect()
+        .collect();
+    (owned, openai_without_login)
 }
 
 /// The timeline of every host that has an event. `pub(crate)` so `money` reads
@@ -923,15 +950,18 @@ struct ProviderWork<'a> {
 /// its company is the subscription's and it belongs to it, spread the same way
 /// and without a live rule; a record of that company inside the span that
 /// belongs elsewhere marks the span `foreign`. A record without a price is not
-/// valued: it marks the spans it counts for as `unpriced`. `tokens` are sorted
-/// by time, as a history read returns them, so only the records whose longest
-/// possible span reaches into the spans are looked at.
+/// valued: it marks the spans it counts for as `unpriced`. An OpenAI record the
+/// stored logins cannot be named for marks its host in `openai_without_login`,
+/// once per host, and counts as foreign. `tokens` are sorted by time, as a
+/// history read returns them, so only the records whose longest possible span
+/// reaches into the spans are looked at.
 fn work_for(
     timelines: &HashMap<String, Timeline>,
     tokens: &[Hosted<TokenRecord>],
     owner: Ownership<'_>,
     spans: &[(DateTime<Utc>, DateTime<Utc>)],
     prices: &Prices,
+    openai_without_login: &mut BTreeMap<String, String>,
 ) -> Vec<SpanWork> {
     let mut work = vec![SpanWork::default(); spans.len()];
     let (Some(first_span), Some(last_span)) = (spans.first(), spans.last()) else {
@@ -995,15 +1025,26 @@ fn work_for(
                 let belongs = match company {
                     Company::Ollama => provider.subscription == &ollama_subscription(),
                     Company::Anthropic | Company::OpenAI => {
-                        openai_subscription_at(
+                        match openai_subscription_at(
                             provider.timelines,
                             provider.openai,
                             &hosted.host,
                             record.t,
-                        )
-                        .ok()
-                        .as_ref()
-                            == Some(provider.subscription)
+                        ) {
+                            Ok(account) => &account == provider.subscription,
+                            Err(_) => {
+                                openai_without_login
+                                    .entry(hosted.host.clone())
+                                    .or_insert_with(|| {
+                                        no_openai_login_warning(
+                                            &format!("record of {}", record.model),
+                                            &hosted.host,
+                                            record.t,
+                                        )
+                                    });
+                                false
+                            }
+                        }
                     }
                 };
                 let first = spans.partition_point(|span| span.1 <= start);
@@ -1042,7 +1083,17 @@ pub(super) fn work_in(
     spans: &[(DateTime<Utc>, DateTime<Utc>)],
     prices: &Prices,
 ) -> Vec<SpanWork> {
-    work_for(timelines, tokens, Ownership::Claude(account), spans, prices)
+    // A Claude account reads no OpenAI record as work: there is no OpenAI
+    // subscription in its owner to warn about.
+    let mut openai_without_login = BTreeMap::new();
+    work_for(
+        timelines,
+        tokens,
+        Ownership::Claude(account),
+        spans,
+        prices,
+        &mut openai_without_login,
+    )
 }
 
 #[cfg(test)]
@@ -2087,6 +2138,88 @@ mod tests {
         assert_eq!(pairs.len(), 1, "{pairs:?}");
         assert_eq!(pairs[0].gain, 10.0);
         assert!((pairs[0].usd - 100.0).abs() < 0.001, "{}", pairs[0].usd);
+    }
+
+    /// Two stored OpenAI logins and no `providerSwitch` on the host: the pair
+    /// belongs to neither subscription, so it is not booked, but the rates
+    /// reader says so once for the host (review, 1.3.0).
+    #[test]
+    fn two_openai_logins_without_a_switch_are_named_once() {
+        let first = AccountRef {
+            acc: "3c1e7a94-6d2b-4f08-9a51-2e7c4b6d8f10".to_string(),
+            org: crate::providers::CODEX_ORG.to_string(),
+        };
+        let second = AccountRef {
+            acc: "9b4d2e61-7c3a-4f85-8d09-1a6e5c3b7f24".to_string(),
+            org: crate::providers::CODEX_ORG.to_string(),
+        };
+        let subscriptions = [
+            crate::stats::tests::provider_subscription(&first, "OA", None),
+            crate::stats::tests::provider_subscription(&second, "OB", None),
+        ];
+        let samples = vec![
+            sample(
+                "atlas",
+                "2026-11-10T08:00:00Z",
+                first.clone(),
+                vec![weekly(0.0, "2026-11-16T00:00:00Z")],
+            ),
+            sample(
+                "atlas",
+                "2026-11-10T09:00:00Z",
+                first.clone(),
+                vec![weekly(10.0, "2026-11-16T00:00:00Z")],
+            ),
+        ];
+        let mut prices = prices();
+        crate::stats::tests::codex_prices(&mut prices);
+        let tokens = vec![
+            Hosted {
+                host: "atlas".to_string(),
+                record: crate::stats::tests::codex_token(
+                    "2026-11-10T08:10:00Z",
+                    "gpt-6.2-codex",
+                    12_000_000,
+                ),
+            },
+            Hosted {
+                host: "atlas".to_string(),
+                record: crate::stats::tests::codex_token(
+                    "2026-11-10T08:20:00Z",
+                    "gpt-6.2-codex",
+                    12_000_000,
+                ),
+            },
+        ];
+        let subject = RateAccount::of_provider(&subscriptions[0]);
+
+        let learned = rates_in(
+            std::slice::from_ref(&subject),
+            &samples,
+            &tokens,
+            &[],
+            &subscriptions,
+            &prices,
+            utc("2026-11-10T08:00:00Z"),
+            utc("2026-11-10T10:00:00Z"),
+        );
+        assert!(
+            learned.rates.is_empty(),
+            "no pair can be booked for either login: {:?}",
+            learned.rates
+        );
+        let warnings = learned.warnings();
+        assert_eq!(warnings.len(), 1, "one warning per host: {warnings:?}");
+        assert!(
+            warnings[0].starts_with("the OpenAI record of gpt-6.2-codex on atlas at "),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[0].contains(
+                "belongs to no stored OpenAI login (several logins and no providerSwitch)"
+            ),
+            "{warnings:?}"
+        );
     }
 
     #[test]

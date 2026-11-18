@@ -750,10 +750,7 @@ fn provider_row(
 ) {
     let Some(run) = run else {
         let missing = match company {
-            Company::Ollama if valuer.month_windows(account).is_empty() => {
-                crate::money::Missing::NoMonthlyAllowance
-            }
-            Company::Ollama => crate::money::Missing::NoMonthReading,
+            Company::OpenAI | Company::Ollama => valuer.no_reading(account),
             _ => crate::money::Missing::NoWeekReading,
         };
         return (None, None, Some(missing.to_string()), None);
@@ -989,12 +986,13 @@ fn finding_expired<Tz: TimeZone + Copy>(
 /// speaks of Claude's accounts alone: auto-burn and the finding are
 /// Anthropic's, and no company's hours are added to another's (decision P-2 5).
 fn finding_blocked(kpis: &Kpis, weeks: &[OverviewWeek]) -> Option<String> {
+    // No Anthropic entry means no Anthropic blocked hours in the range: there
+    // is no finding, not a finding of 0 h.
     let blocked = kpis
         .blocked_by_company
         .iter()
         .find(|entry| entry.company == Company::Anthropic)
-        .map(|entry| entry.hours)
-        .unwrap_or(0.0);
+        .map(|entry| entry.hours)?;
     if blocked <= 0.0 || weeks.is_empty() {
         return None;
     }
@@ -2332,6 +2330,27 @@ mod tests {
         );
     }
 
+    /// No Anthropic entry in `blocked_by_company` means there is no blocked
+    /// finding to show, not a finding of 0 h (review, 1.3.0).
+    #[test]
+    fn a_missing_anthropic_blocked_entry_has_no_finding() {
+        let tiny = tiny();
+        let october = Range {
+            from: utc("2026-10-01T00:00:00Z"),
+            to: utc("2026-11-01T00:00:00Z"),
+        };
+        let page = overview_in(&tiny.ctx(), &october, &all()).unwrap();
+        assert!(
+            page.kpis
+                .blocked_by_company
+                .iter()
+                .all(|entry| entry.company != Company::Anthropic),
+            "the range has no Anthropic blocked hours: {:?}",
+            page.kpis.blocked_by_company
+        );
+        assert_eq!(finding_blocked(&page.kpis, &page.weeks), None);
+    }
+
     /// P-2 counts an OpenAI subscription's finished week as an account week, so
     /// the Codex week joins the page as a row without a price; every Claude
     /// figure stays what it was.
@@ -2541,6 +2560,50 @@ mod tests {
         assert_eq!(ollama_row.used, None);
         assert_eq!(
             ollama_row.money_missing.as_deref(),
+            Some("no monthly allowance in Ollama's reading")
+        );
+    }
+
+    /// RF5: Ollama's missing month has one reason, decided by the Valuer. A
+    /// subscription with a price and no `monthly_credits` reading says "no
+    /// monthly allowance" on the Overview and through `Valuer::subscription`.
+    #[test]
+    fn ollama_without_a_month_says_the_same_reason_everywhere() {
+        let mut tiny = tiny();
+        let ollama = crate::money::ollama_subscription();
+        tiny.provider_subscriptions = vec![provider_subscription(&ollama, "OL", Some(20.0))];
+
+        let card = this_week_card(&tiny.ctx(), &all()).expect("the This-week card");
+        let row = card
+            .providers
+            .iter()
+            .find(|row| row.name == "OL")
+            .expect("the OL row");
+        let valuer = Valuer::build(
+            &tiny.history,
+            &Range {
+                from: tiny.now - Duration::days(7),
+                to: tiny.now,
+            },
+            &tiny.prices,
+            &tiny.fx,
+            &tiny.settings,
+            &tiny.accounts,
+            &tiny.provider_subscriptions,
+            &tiny.warnings,
+        )
+        .expect("a valuer");
+        let from_valuer = valuer
+            .subscription(
+                &ollama,
+                &LimitKind::Other("monthly_credits".to_string()),
+                tiny.now,
+                1.0,
+            )
+            .expect_err("no month window");
+        assert_eq!(row.money_missing, Some(from_valuer.to_string()));
+        assert_eq!(
+            row.money_missing.as_deref(),
             Some("no monthly allowance in Ollama's reading")
         );
     }

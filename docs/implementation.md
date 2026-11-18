@@ -1982,8 +1982,8 @@ pub fn policy_name(policy: Policy) -> &'static str; // "Lazy" | "Eager"
 pub fn replay_report(result: &ReplayResult, accounts: &[Account]) -> Result<String, TextError>;
 pub fn reason(reason: &Reason, target: &str, active: Option<&str>, views: &[AccountView],
               now: DateTime<Utc>, offset: FixedOffset) -> Result<String, TextError>;
-pub fn line(plan: &Plan, active: Option<&str>, views: &[AccountView], learning: &[String],
-            now: DateTime<Utc>) -> Result<Option<String>, TextError>;        // feature "gui"
+pub fn line(plan: &Plan, active: Option<&str>, views: &[AccountView],
+            now: DateTime<Utc>) -> Result<Option<Vec<BurnPart>>, TextError>; // feature "gui"
 pub fn planned(plan: &Plan, active: Option<&str>) -> BTreeMap<String, DateTime<Utc>>; // feature "gui"
 pub fn switch_notification(decision: &Decision, active: Option<&str>, views: &[AccountView],
     now: DateTime<Utc>, offset: FixedOffset) -> Result<Option<String>, TextError>; // feature "gui"
@@ -2008,7 +2008,7 @@ that plan leaves more than 1 % of the target's week at its reset.
 pub(crate) struct WaitingSwitch { pub to: String, pub latest: DateTime<Utc>, pub tied_busy: u32 }
 #[derive(Debug, Clone, Default, Serialize)] #[serde(rename_all = "camelCase")]
 pub(crate) struct BurnView { pub on: bool, pub paused_until: Option<DateTime<Utc>>,
-    pub early: bool, pub why: String, pub learning: Vec<String>, pub line: Option<String>,
+    pub early: bool, pub why: String, pub line: Option<Vec<BurnPart>>,
     pub planned: BTreeMap<String, DateTime<Utc>>, pub waiting: Option<WaitingSwitch>,
     pub suggestion: Option<SwitchSuggestion>, pub measured: Option<Measured>,
     pub manual_hold_h: i64 } // burn::MANUAL_HOLD_H: the page's "it waits {n} hours"
@@ -2969,11 +2969,11 @@ missing. `switch_kind` answers what a switch costs a row in the "If you switched
 for a closed one, one without a model, or an idle or waiting one older than `CACHE_LIFE_MIN`; else
 `LosesThinking` when the row is tied and `thinking_since_user > 0`; else `Resend`. `closed` reads
 the last `SessionRecord` of each session and keeps the closed ones whose `last` is in `[since, now)`,
-sums every `TokenRecord` of the session (several lines for one hour and model) from the hour start
-of the earliest `first` — a record's `t` is its hour's start — and gives the row the
+sums every `TokenRecord` of the session (several lines for one bucket and model) from the hour start
+of the earliest `first` — a record's `t` is its bucket's start — and gives the row the
 label `<project>-<first two characters of the session id>` and no agents. A closed row's last hour
-sums the records whose hour `[t, t + 1 h)` overlaps `[now - 60 min, now)`, because the history is
-hourly, so a record from the hour before the window still counts.
+sums the records whose span `[t, t + span())` overlaps `[now - 60 min, now)`: a 5-minute line, or an
+older hourly line from the hour before the window, counts when it reaches into it.
 
 `live_sessions::Values::sum(parts: &[&Values]) -> Values` is the one sum rule: each half is added
 only when every part has it, a missing part makes the sum unknown with the first part's reason, and
@@ -3587,10 +3587,12 @@ pub struct Change { pub model: String, pub since: DateTime<Utc>, pub percent: f6
     pub before: f64, pub after: f64 }
 pub struct TokensWeek { pub models: Vec<TokenModel>, pub rows: Vec<TokensWeekRow> }
 pub struct TokenModel { pub model: String, pub company: Company }
-pub struct TokensWeekRow { pub id: String, pub cells: Vec<Option<TokensWeekCell>>,
+pub struct TokensWeekRow { pub id: String, pub cells: Vec<TokensWeekCell>,
     pub missing: Option<String> }
-pub struct TokensWeekCell { pub tokens: f64, pub low: f64, pub high: Option<f64>,
-    pub estimated: bool, pub thin: bool }
+#[serde(untagged)] // a figure, or {"missing": "<reason>"}: "not offered by {Company}",
+pub enum TokensWeekCell {  // "no price for {model}", or why the estimate failed
+    Figure { tokens: f64, low: f64, high: Option<f64>, estimated: bool, thin: bool },
+    Missing { missing: String } }
 const THIN_SHARE: f64 = 0.2;          // a thin figure: half its range over 20 % of its value
 const POINTS_BEFORE_CHANGE: usize = 8; // the weeks before a change that set its range
 const NO_FACTOR_REASON: &str = "not measured yet: no pair with priced work in this range";
@@ -4599,8 +4601,9 @@ pub fn sync_live(app: &AppPaths, paths: &CodexPaths, secrets: &dyn SecretStore)
     -> Result<LiveCodex, ProviderError>;
 pub fn read(paths: &CodexPaths, api: &Api) -> Result<ProviderReading, ProviderError>;
 pub fn live_account(paths: &CodexPaths) -> Result<Option<AccountRef>, ProviderError>;
-pub fn read_saved(app: &AppPaths, secrets: &dyn SecretStore, account: &AccountRef, api: &Api)
-    -> Result<ProviderReading, ProviderError>;
+pub fn read_saved(app: &AppPaths, paths: &CodexPaths, secrets: &dyn SecretStore,
+                  account: &AccountRef, api: &Api) -> Result<ProviderReading, ProviderError>;
+pub const LIVE_LOGIN_REMOVE: &str; // the one refusal sentence for removing the live login
 pub fn forget(app: &AppPaths, secrets: &dyn SecretStore, account: &AccountRef)
     -> Result<(), ProviderError>;
 pub struct CodexSwitched { pub from: Option<AccountRef>, pub to: AccountRef }
@@ -4629,7 +4632,12 @@ which saved login is live (`codex list`, and the guard against removing the live
 `read_saved` asks the stored copy's usage. A 401 renews it once at `CODEX_TOKEN_URL`, its own
 issuer only (`api.codex_refresh`, through the no-redirect agent), then asks again; a failed renewal
 or a second 401 is `RenewFailed(SIGN_IN_AGAIN)`, and the copy stays, so `codex login` is the next
-step. A successful renewal is written under the app lock, which re-reads the copy first: it replaces
+step. The renewal (the token POST and storing its answer) runs under the app lock, after the live
+file was read again under it: a login that became live during the round is not renewed
+(`BecameLive`, an `error` row for that round), because Codex renews the live login itself. Under the
+same lock the stored copy is read again: a copy someone renewed meanwhile is asked with as it is
+(no second POST with a spent refresh token); the second usage ask runs after the lock is released.
+`store_renewed` re-reads the copy too: the renewal replaces
 the copy only when the copy still holds the tokens the renewal started from
 (`CodexLogin::same_tokens`), and the second ask uses the newer copy. There is no second renewal. A
 login whose stored `tokens.oauth_provenance.issuer` is not `CODEX_ISSUER` is not renewed at all (`RenewFailed`, same sentence:
@@ -4829,7 +4837,8 @@ pub(crate) struct ProviderView {
 pub(crate) struct CodexLoginView {
     pub account: AccountRef, pub abbr: String, pub label: String, pub color: String,
     pub plan: Option<String>, pub live: bool, pub usage: Option<Usage>,
-    pub state: CodexLoginState, pub message: Option<String> }
+    pub state: CodexLoginState, pub message: Option<String>,
+    pub remove_note: Option<String> } // codex::LIVE_LOGIN_REMOVE on the live row, else None
 #[derive(Serialize)] #[serde(rename_all = "lowercase")]
 pub(crate) enum CodexLoginState { Ok, Expired, Error }
 /// The cards and the saved logins, handed to the UI in one event.
@@ -4898,9 +4907,16 @@ on, or whose `codexHome`/`ollamaUrl` changed; a card that is now off is dropped 
 other save does not poll. `codex_changed` polls Codex at once after a switch or a removal, so the
 live mark and the rows follow it before the next round.
 
-`poll` marks the attempt time before the reading. Codex runs one round: `sync_live`, then the live
-`read`, then `read_saved` for each stored login in `accounts.json`, and
-`ops::ensure_provider_subscription` for each answer's account so an OpenAI plan stays current; a
+`poll` marks the attempt time before the reading. Codex runs one round: `live_account` (a live
+login that cannot be read fails the card), the live `read`, then `sync_live` as a separate step (a
+failed save is reported and the live row's message says `This login is not saved: {error}`; the card
+keeps its reading; a copy the save created or replaced gets its subscription at once, plan `None`),
+then `read_saved` for each stored login in `accounts.json`, and
+`ops::ensure_provider_subscription` for each answer's account so an OpenAI plan stays current. The
+round remembers the live account; when it changes and this host's last `providerSwitch` does not
+already name it as `to`, the poll writes one `providerSwitch {from: the last round's account, to,
+by: "user"}` through `ops::record_provider_switch`, the one writer `switch_codex` uses too (at the
+app's first round the last round's account is that event's `to`; with no event, nothing is written); a
 failed renewal keeps its copy and is listed as `expired` with `SIGN_IN_AGAIN`, and any other failure
 as `error`. Ollama runs `providers::ollama::read`. It then reads the settings again through the
 `SettingsLookup`:
@@ -4928,7 +4944,7 @@ so the pop-up and the large window see the same lists. The JSON is camelCase:
 `Usage` is `{limits: [{kind, percent, severity, resetsAt, model, isActive}], extraUsageEnabled}`; a
 `LimitKind::Other("monthly_credits")` is `{"other":"monthly_credits"}`; `Credits` is
 `{left, allowance, until, purchased}`. A `CodexLoginView` is
-`{account, abbr, label, color, plan, live, usage, state, message}`, with `state` one of `ok`,
+`{account, abbr, label, color, plan, live, usage, state, message, removeNote}`, with `state` one of `ok`,
 `expired`, `error`. Example:
 
 ```json

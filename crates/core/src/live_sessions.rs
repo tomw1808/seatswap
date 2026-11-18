@@ -327,7 +327,8 @@ pub struct LiveSession {
     /// (a Codex total that went down), so a sum over it is unknown too.
     pub last_hour: Option<Tokens>,
     /// The last hour's tokens valued per model, like `values` (spec §3.8).
-    /// Closed rows value the hourly records that overlap the last hour.
+    /// Closed rows value the token lines that overlap the last hour: each line
+    /// is a 5-minute bucket, and an old line without `min` is an hour.
     #[serde(default = "no_values")]
     pub last_hour_values: Values,
     /// [`Values::sum`] of the values of the agents counted done; the sum of an
@@ -3561,11 +3562,11 @@ mod tests {
         );
         assert_eq!(
             running_row.values.subscription, None,
-            "the worker's Ollama month has no reading here, so its share is unknown"
+            "the worker's Ollama history names no month window here, so its share is unknown"
         );
         assert_eq!(
             running_row.values.subscription_missing.as_deref(),
-            Some("no reading of this month's usage")
+            Some("no monthly allowance in Ollama's reading")
         );
     }
 

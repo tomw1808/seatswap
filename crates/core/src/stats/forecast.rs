@@ -59,7 +59,7 @@ pub struct Forecast {
 }
 
 /// The four numbers on top of the page (spec §3.4).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ForecastKpis {
     /// The money of the percent each account is planned to leave unused at its
@@ -68,8 +68,11 @@ pub struct ForecastKpis {
     /// The same when switching only when an account is full.
     pub expire_only_when_full: Option<f64>,
     /// The hours the plan has no usable account, in the working hours of the
-    /// regime's plan; never converted a second time.
-    pub blocked_hours: f64,
+    /// regime's plan; never converted a second time. `None` when the rhythm has
+    /// no typical working hour yet, with `blocked_hours_missing` saying so.
+    pub blocked_hours: Option<f64>,
+    /// Why [`ForecastKpis::blocked_hours`] is `None`; `None` when it has a value.
+    pub blocked_hours_missing: Option<String>,
     pub switches: u32,
     /// The planned plan's switches per day of the forecast's [`HORIZON_H`]
     /// hours: the "about N a day" under the switch count.
@@ -286,14 +289,19 @@ pub fn forecast<Tz: TimeZone + Copy>(
 
     let planned_money = expire_money(&inputs.accounts, &prices, &planned.left_at_reset);
     let lazy_money = expire_money(&inputs.accounts, &prices, &lazy.left_at_reset);
+    // The plan on the page: its blocked work in the hours the rhythm makes of
+    // it, with the one dollars-to-hours function. A typical hour of 0.0 means
+    // no hours can be computed: the page shows "—" with the reason, never 0.
+    let (blocked_hours, blocked_hours_missing) =
+        match usd_hours(planned.blocked_usd, inputs.rhythm.typical_hour()) {
+            Some(hours) => (Some(hours), None),
+            None => (None, Some("no typical working hour yet".to_string())),
+        };
     let kpis = ForecastKpis {
         expire_planned: planned_money,
         expire_only_when_full: lazy_money,
-        // The plan on the page: its blocked work in the hours the rhythm makes
-        // of it, with the one dollars-to-hours function. A typical hour of
-        // 0.0 means no hours can be computed; the regime's rule then says 0.0
-        // (see `burn::decide::regime`).
-        blocked_hours: usd_hours(planned.blocked_usd, inputs.rhythm.typical_hour()).unwrap_or(0.0),
+        blocked_hours,
+        blocked_hours_missing,
         switches: planned.switches,
         switches_per_day: crate::burn::switches_per_day(planned.switches),
         switches_only_when_full: lazy.switches,
@@ -728,7 +736,8 @@ mod tests {
         assert_eq!(forecast.to, inputs.now + Duration::hours(HORIZON_H));
         let blocked_hours = usd_hours(planned.blocked_usd, inputs.rhythm.typical_hour())
             .expect("the test rhythm has working hours");
-        assert_eq!(forecast.kpis.blocked_hours, blocked_hours);
+        assert_eq!(forecast.kpis.blocked_hours, Some(blocked_hours));
+        assert_eq!(forecast.kpis.blocked_hours_missing, None);
         assert_eq!(forecast.kpis.switches, planned.switches);
         assert_eq!(forecast.kpis.switches_only_when_full, lazy.switches);
     }
@@ -1269,11 +1278,34 @@ mod tests {
         assert!(planned.blocked_usd > 0.0, "the plan must have blocked work");
 
         let page = forecast(&ctx, &inputs, &regime(false)).expect("the forecast");
+        let shown = page
+            .kpis
+            .blocked_hours
+            .expect("the test rhythm has working hours");
         assert!(
-            close(page.kpis.blocked_hours, expected),
+            close(shown, expected),
             "the page says {} blocked hours, the plan {}",
-            page.kpis.blocked_hours,
+            shown,
             expected
+        );
+        assert_eq!(page.kpis.blocked_hours_missing, None);
+    }
+
+    /// No typical working hour yet: the planned blocked work has no hours, so
+    /// the page says so instead of showing 0 h (review, 1.3.0).
+    #[test]
+    fn blocked_hours_are_missing_without_a_typical_hour() {
+        let tiny = tiny();
+        let accounts = stored_accounts(&tiny);
+        let ctx = context(&tiny, &accounts);
+        let mut inputs = inputs();
+        inputs.rhythm = week(0);
+
+        let page = forecast(&ctx, &inputs, &regime(false)).expect("the forecast");
+        assert_eq!(page.kpis.blocked_hours, None);
+        assert_eq!(
+            page.kpis.blocked_hours_missing.as_deref(),
+            Some("no typical working hour yet")
         );
     }
 
@@ -1482,7 +1514,8 @@ mod tests {
         assert_eq!(page.kpis.switches_only_when_full, lazy.switches);
         let blocked_hours = usd_hours(eager.blocked_usd, inputs.rhythm.typical_hour())
             .expect("the test rhythm has working hours");
-        assert_eq!(page.kpis.blocked_hours, blocked_hours);
+        assert_eq!(page.kpis.blocked_hours, Some(blocked_hours));
+        assert_eq!(page.kpis.blocked_hours_missing, None);
     }
 
     // ---- proof tests of the review ----

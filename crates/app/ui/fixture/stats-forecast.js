@@ -93,8 +93,12 @@ const FORECAST_RUNS = [
 
 // `?fixture=forecast-learning`: AC's rates are not known yet, and LB's are
 // assumed from its plan. AC's row has no expected percent and no money; LB's
-// expected percent is there. `?fixture=forecast-unread`: no plan yet, AC still
-// waits for its first reading (`window.rs`'s `no_plan_text`).
+// expected percent is there. `?fixture=forecast-no-hours`: the rhythm has no
+// typical working hour yet, so the blocked-hours KPI is null with its reason.
+// `?fixture=forecast-unread`: no plan yet, AC still waits for its first reading
+// (`window.rs`'s `no_plan_text`).
+const FORECAST_NO_TYPICAL_HOUR = "no typical working hour yet";
+
 function forecastVariant() {
   if (typeof location === "undefined" || typeof URLSearchParams !== "function") return null;
   return new URLSearchParams(location.search).get("fixture");
@@ -105,6 +109,7 @@ export function forecastPage() {
   if (variant === "forecast-unread") {
     throw new Error(`${FORECAST_NO_PLAN}: AC has none yet; it comes with the next usage poll`);
   }
+  const noTypicalHour = variant === "forecast-no-hours";
   const unknownRate = (abbr) => variant === "forecast-learning" && abbr === "AC";
   const assumedRate = (abbr) => variant === "forecast-learning" && abbr === "LB";
   const unknown = viewOrder().filter((id) => unknownRate(accountById(id).abbr));
@@ -160,7 +165,8 @@ export function forecastPage() {
     kpis: {
       expirePlanned: expire(FORECAST_PLANNED_AT_RESET),
       expireOnlyWhenFull: expire(FORECAST_LAZY_AT_RESET),
-      blockedHours: 0,
+      blockedHours: noTypicalHour ? null : 0,
+      blockedHoursMissing: noTypicalHour ? FORECAST_NO_TYPICAL_HOUR : null,
       switches: FORECAST_SWITCHES,
       switchesPerDay: FORECAST_SWITCHES / 7,
       switchesOnlyWhenFull: FORECAST_SWITCHES_ONLY_WHEN_FULL,

@@ -2,10 +2,11 @@
 //! every five minutes while their switch is on, and Codex's saved logins (R8).
 //!
 //! The thread opens the store once at spawn ([`store::open_store`]) and keeps
-//! it. A Codex round saves the live login, asks every other saved login with its
-//! own token, and keeps the logins that expired on a failed renewal out of the
-//! requests until their stored copy changes. Only Codex's stored copies and its
-//! live `auth.json` are touched; no Claude login is read or written.
+//! it. A Codex round reads the live login and its usage, saves the live copy
+//! separately, asks every other saved login with its own token, and keeps the
+//! logins that expired on a failed renewal out of the requests until their
+//! stored copy changes. Only Codex's stored copies and its live `auth.json` are
+//! touched; no Claude login is read or written.
 //!
 //! The thread reads `accounts.json` at every round, so a switch, a Codex folder
 //! or an Ollama URL counts without a restart. A card that is off is never read
@@ -25,7 +26,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use seatswap_core::api::{Api, Usage};
-use seatswap_core::history::{AccountRef, HistoryDir, Recorder, Source};
+use seatswap_core::history::{AccountRef, Event, HistoryDir, Hosts, Range, Recorder, Source};
 use seatswap_core::paths::{AppPaths, CodexPaths, PathsError};
 use seatswap_core::providers::{self, Credits, ProviderReading, CODEX_ORG, OLLAMA_ORG};
 use seatswap_core::store::{self, ProviderSubscription, Settings, Store};
@@ -72,6 +73,9 @@ pub(crate) struct ProviderView {
 /// and plan, the last reading's usage, and whether the login is the live one.
 /// `state` is `"ok"`, `"expired"` after a failed renewal, or `"error"` for any
 /// other failed reading; `message` says why and is `None` when ok.
+/// `removeNote` is the sentence Settings shows in place of Remove on the live
+/// row; it comes from [`providers::codex::LIVE_LOGIN_REMOVE`] so the page does
+/// not keep a second copy of it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CodexLoginView {
@@ -84,6 +88,7 @@ pub(crate) struct CodexLoginView {
     pub usage: Option<Usage>,
     pub state: CodexLoginState,
     pub message: Option<String>,
+    pub remove_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -405,6 +410,12 @@ pub(crate) struct ProvidersRuntime {
     codex_failed: Vec<FailedCodex>,
     codex_tried: Option<DateTime<Utc>>,
     ollama_tried: Option<DateTime<Utc>>,
+    /// Whether a round has already established the live login it compares
+    /// against; at the app's first round it comes from the history (R8).
+    live_seen: bool,
+    /// The live Codex login the last round saw, for the `providerSwitch` a
+    /// change outside seatswap writes (spec §5).
+    last_live: Option<AccountRef>,
     /// The lists the UI received last; a send happens only when they change.
     published: (Vec<ProviderView>, Vec<CodexLoginView>),
 }
@@ -423,11 +434,18 @@ struct FailedCodex {
 /// of saved logins could be read at all.
 struct CodexRound {
     card: CodexCard,
-    /// The account `sync_live` saw in `auth.json`, when it saved one.
+    /// The account `live_account` read from `auth.json`, when there is one: the
+    /// card and the saved logins no longer depend on the copy being saved.
     live: Option<AccountRef>,
     answers: Vec<CodexAnswer>,
     /// The saved logins could not be read: the pop-up keeps the ones it had.
     keep_logins: bool,
+    /// Why `sync_live` could not save this round's live login, shown on the live
+    /// row and reported once.
+    save_error: Option<String>,
+    /// The live login whose stored copy the save created or replaced, for the
+    /// subscription it must get at once.
+    saved_live: Option<AccountRef>,
 }
 
 impl CodexRound {
@@ -439,6 +457,8 @@ impl CodexRound {
             live: None,
             answers: Vec::new(),
             keep_logins: true,
+            save_error: None,
+            saved_live: None,
         }
     }
 }
@@ -515,6 +535,8 @@ impl ProvidersRuntime {
             codex_failed: Vec::new(),
             codex_tried: None,
             ollama_tried: None,
+            live_seen: false,
+            last_live: None,
             published: (Vec::new(), Vec::new()),
         }
     }
@@ -706,7 +728,7 @@ impl ProvidersRuntime {
         let view = match result {
             Ok(reading) => {
                 self.record(&reading, now);
-                self.ensure_subscription(&reading, now);
+                self.ensure_subscription(&reading.account, reading.plan.as_deref(), now);
                 on.then(|| success(Provider::Ollama, reading, now))
             }
             Err(error) => {
@@ -731,6 +753,25 @@ impl ProvidersRuntime {
     fn poll_codex(&mut self, settings: &Settings, now: DateTime<Utc>) {
         let round = self.read_codex_round(settings);
         self.codex_tried = Some(now);
+        // A failed save is shown on the live row and reported once; it never
+        // blanks the card or hides the reading.
+        if let Some(error) = &round.save_error {
+            self.report_error(error);
+        }
+        // A copy the save created or replaced gets its subscription at once
+        // (R8), with the plan of this round's reading of it when there is one,
+        // so a new login writes one `accountAdded` with its plan and no
+        // `planChanged`; without a reading the plan waits for one.
+        if let Some(account) = &round.saved_live {
+            let plan = match &round.card {
+                CodexCard::Reading(reading) if &reading.account == account => reading.plan.clone(),
+                _ => None,
+            };
+            self.ensure_subscription(account, plan.as_deref(), now);
+        }
+        // A live login that changed outside seatswap writes its one
+        // `providerSwitch` event (spec §5).
+        self.note_live_login(round.live.as_ref(), now);
         let Some(current) = self.settings_after_request(settings) else {
             return;
         };
@@ -750,7 +791,10 @@ impl ProvidersRuntime {
                         .clone()
                         .unwrap_or_else(|| reading.account.clone()),
                     state: CodexLoginState::Ok,
-                    message: None,
+                    message: round
+                        .save_error
+                        .as_ref()
+                        .map(|error| format!("This login is not saved: {error}")),
                     usage: reading.usage.clone(),
                     // The reading is recorded here; the saved logins' below.
                     reading: None,
@@ -758,15 +802,20 @@ impl ProvidersRuntime {
                     live: true,
                 });
                 self.record(&reading, now);
-                self.ensure_subscription(&reading, now);
+                self.ensure_subscription(&reading.account, reading.plan.as_deref(), now);
                 on.then(|| success(Provider::Codex, reading, now))
             }
             CodexCard::Failed(text) => {
                 if let Some(live) = &round.live {
+                    // The row keeps its state and message from the reading; a
+                    // failed save adds why the login is not stored.
                     live_answer = Some(CodexAnswer {
                         account: live.clone(),
                         state: CodexLoginState::Error,
-                        message: Some(text.clone()),
+                        message: Some(match &round.save_error {
+                            Some(error) => format!("{text} This login is not saved: {error}"),
+                            None => text.clone(),
+                        }),
                         usage: None,
                         reading: None,
                         copy: None,
@@ -791,7 +840,7 @@ impl ProvidersRuntime {
         for answer in &answers {
             if let Some(reading) = &answer.reading {
                 self.record(reading, now);
-                self.ensure_subscription(reading, now);
+                self.ensure_subscription(&reading.account, reading.plan.as_deref(), now);
             }
         }
         if !round.keep_logins {
@@ -848,27 +897,33 @@ impl ProvidersRuntime {
             None => return CodexRound::unreadable("the store is not open".to_string()),
         };
         let secrets = store.secrets();
-        let (live, card) = match providers::codex::sync_live(&self.app, &paths, secrets) {
-            Ok(live) => {
-                let reading = providers::codex::read(&paths, &self.api);
-                (Some(live.account.clone()), reading)
+        // Which login is live and its usage are read-only: neither depends on
+        // the copy being saved. A live login that cannot be read (no file, a
+        // keyring login, an API key) fails the card as before (B2).
+        let live = match providers::codex::live_account(&paths) {
+            Ok(Some(live)) => live,
+            Ok(None) => {
+                return CodexRound::unreadable(
+                    providers::ProviderError::NoLogin {
+                        path: paths.auth_file.clone(),
+                    }
+                    .to_string(),
+                )
             }
-            // Without the live login the round cannot tell which saved login is
-            // live, so it asks none of them (B2): the rows keep their last
-            // values and state until the live login can be read again.
-            Err(error) => {
-                return CodexRound {
-                    card: CodexCard::Failed(error.to_string()),
-                    live: None,
-                    answers: Vec::new(),
-                    keep_logins: true,
-                }
-            }
+            Err(error) => return CodexRound::unreadable(error.to_string()),
         };
-        let card = match card {
+        let card = match providers::codex::read(&paths, &self.api) {
             Ok(reading) => CodexCard::Reading(Box::new(reading)),
             Err(error) => CodexCard::Failed(error.to_string()),
         };
+        // The save is a separate step: a login the keyring refuses, or one
+        // without a refresh token, still shows its usage.
+        let (save_error, saved_live) = match providers::codex::sync_live(&self.app, &paths, secrets)
+        {
+            Ok(saved) => (None, saved.saved.then_some(saved.account)),
+            Err(error) => (Some(error.to_string()), None),
+        };
+        let live = Some(live);
         let subscriptions = match store::load_accounts(&self.app) {
             Ok(file) => file.provider_subscriptions,
             Err(error) => {
@@ -880,6 +935,8 @@ impl ProvidersRuntime {
                     live,
                     answers: Vec::new(),
                     keep_logins: true,
+                    save_error,
+                    saved_live,
                 };
             }
         };
@@ -920,7 +977,7 @@ impl ProvidersRuntime {
                 ));
                 continue;
             }
-            match providers::codex::read_saved(&self.app, secrets, &account, &self.api) {
+            match providers::codex::read_saved(&self.app, &paths, secrets, &account, &self.api) {
                 Ok(reading) => answers.push(CodexAnswer {
                     account,
                     state: CodexLoginState::Ok,
@@ -946,6 +1003,8 @@ impl ProvidersRuntime {
             live,
             answers,
             keep_logins: false,
+            save_error,
+            saved_live,
         }
     }
 
@@ -990,6 +1049,9 @@ impl ProvidersRuntime {
                 usage,
                 state: answer.state,
                 message: answer.message.clone(),
+                remove_note: answer
+                    .live
+                    .then(|| providers::codex::LIVE_LOGIN_REMOVE.to_string()),
             });
         }
         views
@@ -1023,23 +1085,106 @@ impl ProvidersRuntime {
             .any(|subscription| subscription.price.is_some())
     }
 
-    /// Make sure a successful reading's account has a subscription through the
-    /// one [`ops::ensure_provider_subscription`], which writes `accountAdded`
-    /// and `planChanged`. Its warnings are reported here like any provider
-    /// error and never stop the poll.
-    fn ensure_subscription(&mut self, reading: &ProviderReading, now: DateTime<Utc>) {
+    /// Make sure an account has a subscription through the one
+    /// [`ops::ensure_provider_subscription`], which writes `accountAdded` and
+    /// `planChanged`: a successful reading's account, or a saved login's copy
+    /// before any reading names its plan (`None`). Its warnings are reported
+    /// here like any provider error and never stop the poll.
+    fn ensure_subscription(
+        &mut self,
+        account: &AccountRef,
+        plan: Option<&str>,
+        now: DateTime<Utc>,
+    ) {
         let warnings = {
             let recorder = self.recorder.as_ref().ok();
-            ops::ensure_provider_subscription(
-                &self.app,
-                recorder,
-                &reading.account,
-                reading.plan.as_deref(),
-                now,
-            )
+            ops::ensure_provider_subscription(&self.app, recorder, account, plan, now)
         };
         for text in &warnings {
             self.report_error(text);
+        }
+        self.print_history_warnings();
+    }
+
+    /// Write the one `providerSwitch` for a live login that changed outside
+    /// seatswap (spec §5): `codex login` with another account, or a switch by
+    /// another seatswap process. The last round's account is remembered in
+    /// memory; at the app's first round it is the `to` of this host's last
+    /// `providerSwitch`, and with no such event the first login seen writes
+    /// nothing. A switch seatswap already wrote is recognised by that same `to`
+    /// and is not written twice.
+    fn note_live_login(&mut self, live: Option<&AccountRef>, now: DateTime<Utc>) {
+        let Some(live) = live else { return };
+        if !self.live_seen {
+            self.live_seen = true;
+            match self.last_provider_switch() {
+                Ok(Some(to)) if &to != live => {
+                    self.write_provider_switch(Some(to), live.clone(), now);
+                }
+                _ => {}
+            }
+            self.last_live = Some(live.clone());
+            return;
+        }
+        if self.last_live.as_ref() == Some(live) {
+            return;
+        }
+        match self.last_provider_switch() {
+            // A seatswap switch (this app or the CLI) already wrote the event.
+            Ok(Some(to)) if &to == live => {}
+            Ok(_) => self.write_provider_switch(self.last_live.clone(), live.clone(), now),
+            Err(()) => {}
+        }
+        self.last_live = Some(live.clone());
+    }
+
+    /// This host's last `providerSwitch` `to`, or `None` when there is none.
+    /// A history that cannot be read is reported and never guessed.
+    fn last_provider_switch(&mut self) -> Result<Option<AccountRef>, ()> {
+        let Ok(recorder) = self.recorder.as_ref() else {
+            return Ok(None);
+        };
+        let read = recorder
+            .dir()
+            .read::<Event>(&Range::ALL, &Hosts::One(recorder.dir().host().to_string()));
+        match read {
+            Ok(read) => {
+                super::lock(&self.printed_warnings).print(&read.warnings);
+                Ok(read
+                    .records
+                    .iter()
+                    .filter_map(|hosted| match &hosted.record.kind {
+                        seatswap_core::history::EventKind::ProviderSwitch { to, .. } => {
+                            Some((hosted.record.t, to.clone()))
+                        }
+                        _ => None,
+                    })
+                    .max_by_key(|(at, _)| *at)
+                    .map(|(_, to)| to))
+            }
+            Err(error) => {
+                let text = ops::history_unwritable(&error);
+                self.report_error(&text);
+                Err(())
+            }
+        }
+    }
+
+    /// The one write of a `providerSwitch` event, through [`ops`]'s writer.
+    fn write_provider_switch(
+        &mut self,
+        from: Option<AccountRef>,
+        to: AccountRef,
+        now: DateTime<Utc>,
+    ) {
+        let result = match self.recorder.as_ref() {
+            Ok(recorder) => ops::record_provider_switch(recorder, from, to, now),
+            // No history was opened at start; the snapshot already says why.
+            Err(_) => return,
+        };
+        if let Err(error) = result {
+            let text = ops::history_unwritable(&error);
+            self.report_error(&text);
         }
         self.print_history_warnings();
     }
@@ -1165,7 +1310,9 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use seatswap_core::history::{AccountRef, Hosts, OllamaHourRecord, Range, Sample};
+    use seatswap_core::history::{
+        AccountRef, By, Event, EventKind, Hosts, OllamaHourRecord, Range, Sample,
+    };
     use seatswap_core::store::{FileSecrets, Store};
 
     use crate::gui::ReportedErrors;
@@ -1379,7 +1526,10 @@ mod tests {
                                 .unwrap_or((200, String::new()));
                             served += 1;
                             write_reply(&mut stream, status, &body);
-                            deadline = Instant::now() + Duration::from_millis(300);
+                            // `finish` stops the server; the deadline only ends
+                            // a server no test finishes. It must outlast the
+                            // work between two polls on a loaded machine.
+                            deadline = Instant::now() + Duration::from_secs(10);
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             if Instant::now() >= deadline {
@@ -1550,6 +1700,284 @@ mod tests {
         let _ = server.finish();
     }
 
+    /// A save that fails (a login without `refresh_token`, a locked keyring)
+    /// must not blank the card: the live login's usage is read anyway, the live
+    /// row says the login is not saved, and the error is reported once. Saved
+    /// logins are still asked.
+    #[test]
+    fn a_login_that_cannot_be_saved_still_shows_its_usage_and_says_so() {
+        let dir = tempdir().expect("tempdir");
+        let codex_home = dir.path().join("codex");
+        std::fs::create_dir_all(&codex_home).expect("the Codex folder");
+        let mut auth: serde_json::Value = serde_json::from_str(AUTH).expect("auth.json");
+        auth["tokens"]
+            .as_object_mut()
+            .expect("tokens")
+            .remove("refresh_token");
+        std::fs::write(codex_home.join("auth.json"), auth.to_string()).expect("auth.json");
+
+        let store = test_store(dir.path());
+        let other = account(SAVED_ACCOUNT_ID);
+        store
+            .secrets()
+            .set_codex(
+                &providers::codex::secret_id(&other),
+                &codex_login(SAVED_AUTH),
+            )
+            .expect("the saved copy");
+        let mut file = store.load().expect("accounts.json");
+        file.provider_subscriptions.push(ProviderSubscription {
+            account: other.clone(),
+            label: "OpenAI".to_string(),
+            abbr: "OA2".to_string(),
+            color: "#db2777".to_string(),
+            plan: Some("Pro".to_string()),
+            price: None,
+            price_currency: None,
+        });
+        store.save(&file).expect("accounts.json");
+
+        let server = Fake::start(vec![
+            (200, PLUS_ANSWER.to_string()),
+            (200, PRO_ANSWER.to_string()),
+        ]);
+        let (reported, received) = mpsc::channel();
+        let report: ReportError = Box::new(move |text| {
+            let _ = reported.send(text.to_string());
+        });
+        let lookup_home = codex_home.clone();
+        let codex_paths: CodexPathsLookup = Box::new(move |_| Ok(CodexPaths::at(&lookup_home)));
+        let mut runtime = test_runtime_with(
+            dir.path(),
+            codex_api(&server.base),
+            codex_paths,
+            same_settings(),
+            report,
+        );
+        let view = only_view(runtime.poll_round(&codex_on(), utc("2026-11-14T09:00:00Z")));
+        let paths = server.finish();
+        assert_eq!(paths.len(), 2, "the live and the saved login are asked");
+        assert_eq!(view.error, None, "the failed save is not the card's error");
+        assert!(
+            view.usage.is_some(),
+            "the card keeps the live login's usage"
+        );
+        assert_eq!(view.plan.as_deref(), Some("Plus"));
+
+        let logins = runtime.codex_logins();
+        assert_eq!(logins.len(), 2, "the saved login is still listed");
+        let live = logins
+            .iter()
+            .find(|login| login.live)
+            .expect("the live row");
+        assert_eq!(live.state, CodexLoginState::Ok);
+        assert!(live.usage.is_some(), "the live row keeps its usage");
+        assert_eq!(
+            live.message.as_deref(),
+            Some("This login is not saved: Unexpected answer: the Codex login lacks refresh_token")
+        );
+        assert!(
+            logins
+                .iter()
+                .any(|login| !login.live && login.state == CodexLoginState::Ok),
+            "the saved login was polled as before"
+        );
+        assert_eq!(
+            received.try_iter().collect::<Vec<String>>(),
+            vec!["Unexpected answer: the Codex login lacks refresh_token".to_string()],
+            "the save error is reported once"
+        );
+    }
+
+    /// R8: a copy the save created gets its subscription at once, with no plan
+    /// until a reading names one, even when the usage read that round failed.
+    #[test]
+    fn a_saved_copy_without_a_reading_gets_its_subscription() {
+        let dir = tempdir().expect("tempdir");
+        let codex_home = dir.path().join("codex");
+        write_auth(&codex_home);
+        let server = Fake::start(vec![(500, "the usage service is unavailable".to_string())]);
+        let mut runtime = test_runtime(dir.path(), codex_api(&server.base), &codex_home);
+
+        let view = only_view(runtime.poll_round(&codex_on(), utc("2026-11-14T09:00:00Z")));
+        let _ = server.finish();
+        assert!(view.error.is_some(), "the reading itself failed");
+
+        let store = test_store(dir.path());
+        let live = account(LIVE_ACCOUNT_ID);
+        let saved = store
+            .secrets()
+            .get_codex(&providers::codex::secret_id(&live))
+            .expect("the stored copy")
+            .expect("the login was saved");
+        assert_eq!(saved, codex_login(AUTH));
+        let file = store.load().expect("accounts.json");
+        let subscription = file
+            .provider_subscription(&live)
+            .expect("a saved copy has its subscription");
+        assert_eq!(subscription.abbr, "OA");
+        assert_eq!(
+            subscription.plan, None,
+            "no reading named a plan this round"
+        );
+    }
+
+    /// Spec §5: `codex login` with another account while the app runs changes
+    /// the live login outside seatswap and writes the one `providerSwitch`. The
+    /// first live login the app ever sees writes nothing.
+    #[test]
+    fn a_live_login_change_outside_seatswap_writes_a_provider_switch() {
+        let dir = tempdir().expect("tempdir");
+        let codex_home = dir.path().join("codex");
+        write_auth(&codex_home);
+        let server = Fake::start(vec![
+            (200, PLUS_ANSWER.to_string()),
+            (200, PRO_ANSWER.to_string()),
+        ]);
+        let mut runtime = test_runtime(dir.path(), codex_api(&server.base), &codex_home);
+
+        runtime.poll_round(&codex_on(), utc("2026-11-14T09:00:00Z"));
+        assert!(
+            provider_switches(dir.path()).is_empty(),
+            "the first live login seen writes nothing"
+        );
+
+        std::fs::write(codex_home.join("auth.json"), AUTH_OTHER_ACCOUNT)
+            .expect("the other account's auth.json");
+        runtime.poll_round(&codex_on(), utc("2026-11-14T09:05:00Z"));
+        let _ = server.finish();
+
+        assert_eq!(
+            provider_switches(dir.path()),
+            vec![EventKind::ProviderSwitch {
+                from: Some(account(LIVE_ACCOUNT_ID)),
+                to: account(SAVED_ACCOUNT_ID),
+                by: By::User,
+            }]
+        );
+    }
+
+    /// Spec §5: at the app's first round the previous live login is this host's
+    /// last `providerSwitch` `to`, so a `codex login` while the app was off still
+    /// writes the switch from the login the app last knew.
+    #[test]
+    fn a_first_round_takes_the_last_provider_switch_as_its_previous_login() {
+        let dir = tempdir().expect("tempdir");
+        let codex_home = dir.path().join("codex");
+        write_auth(&codex_home);
+        let recorder = Recorder::new(history(dir.path()));
+        ops::record_provider_switch(
+            &recorder,
+            Some(account(LIVE_ACCOUNT_ID)),
+            account(SAVED_ACCOUNT_ID),
+            utc("2026-11-14T08:00:00Z"),
+        )
+        .expect("the last switch");
+
+        let server = Fake::start(vec![(200, PLUS_ANSWER.to_string())]);
+        let mut runtime = test_runtime(dir.path(), codex_api(&server.base), &codex_home);
+        runtime.poll_round(&codex_on(), utc("2026-11-14T09:00:00Z"));
+        let _ = server.finish();
+
+        let switches = provider_switches(dir.path());
+        assert_eq!(switches.len(), 2, "{switches:?}");
+        assert_eq!(
+            switches[1],
+            EventKind::ProviderSwitch {
+                from: Some(account(SAVED_ACCOUNT_ID)),
+                to: account(LIVE_ACCOUNT_ID),
+                by: By::User,
+            }
+        );
+    }
+
+    /// A switch seatswap made itself (the CLI or the window) already wrote its
+    /// `providerSwitch`; the poll that then sees the new live login writes no
+    /// second one.
+    #[test]
+    fn seatswaps_own_switch_is_not_written_again_by_the_poll() {
+        let dir = tempdir().expect("tempdir");
+        let codex_home = dir.path().join("codex");
+        write_auth(&codex_home);
+        let server = Fake::start(vec![
+            (200, PLUS_ANSWER.to_string()),
+            (200, PRO_ANSWER.to_string()),
+        ]);
+        let mut runtime = test_runtime(dir.path(), codex_api(&server.base), &codex_home);
+        runtime.poll_round(&codex_on(), utc("2026-11-14T09:00:00Z"));
+
+        // Another seatswap process switched: it wrote auth.json and its event.
+        std::fs::write(codex_home.join("auth.json"), AUTH_OTHER_ACCOUNT)
+            .expect("the other account's auth.json");
+        let recorder = Recorder::new(history(dir.path()));
+        ops::record_provider_switch(
+            &recorder,
+            Some(account(LIVE_ACCOUNT_ID)),
+            account(SAVED_ACCOUNT_ID),
+            utc("2026-11-14T09:02:00Z"),
+        )
+        .expect("the switch's own event");
+        runtime.poll_round(&codex_on(), utc("2026-11-14T09:05:00Z"));
+        let _ = server.finish();
+
+        assert_eq!(
+            provider_switches(dir.path()).len(),
+            1,
+            "only the switch's own event: {:?}",
+            provider_switches(dir.path())
+        );
+    }
+
+    /// A login seen for the first time with a reading gets one `accountAdded`
+    /// carrying the reading's plan, and no `planChanged` from no plan to it.
+    #[test]
+    fn a_new_login_with_a_reading_writes_its_plan_once() {
+        let dir = tempdir().expect("tempdir");
+        let codex_home = dir.path().join("codex");
+        write_auth(&codex_home);
+        let server = Fake::start(vec![(200, PLUS_ANSWER.to_string())]);
+        let mut runtime = test_runtime(dir.path(), codex_api(&server.base), &codex_home);
+        runtime.poll_round(&codex_on(), utc("2026-11-14T09:00:00Z"));
+        let _ = server.finish();
+
+        let history = history(dir.path());
+        let read = history
+            .read::<Event>(&Range::ALL, &Hosts::One(history.host().to_string()))
+            .expect("the events are read");
+        let kinds: Vec<EventKind> = read
+            .records
+            .into_iter()
+            .map(|hosted| hosted.record.kind)
+            .collect();
+        assert!(
+            kinds.iter().any(|kind| matches!(kind,
+                EventKind::AccountAdded { account: added, plan } if added == &account(LIVE_ACCOUNT_ID)
+                    && plan.as_deref() == Some("Plus"))),
+            "{kinds:?}"
+        );
+        assert!(
+            !kinds
+                .iter()
+                .any(|kind| matches!(kind, EventKind::PlanChanged { .. })),
+            "{kinds:?}"
+        );
+    }
+
+    /// The `providerSwitch` events this host wrote, oldest first.
+    fn provider_switches(dir: &Path) -> Vec<EventKind> {
+        let history = history(dir);
+        let read = history
+            .read::<Event>(&Range::ALL, &Hosts::One(history.host().to_string()))
+            .expect("the events are read");
+        read.records
+            .into_iter()
+            .filter_map(|hosted| match hosted.record.kind {
+                kind @ EventKind::ProviderSwitch { .. } => Some(kind),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// R8: every saved Codex login is asked with its own stored token, never
     /// with the live one's, and the pop-up lists each with its own plan.
     #[test]
@@ -1644,6 +2072,59 @@ mod tests {
             runtime.codex_logins().is_empty(),
             "the rows are gone while the card is off"
         );
+    }
+
+    /// The live row carries the worker's removal sentence in the snapshot, so
+    /// Settings shows it without a second copy; a saved row carries none.
+    #[test]
+    fn only_the_live_codex_row_carries_the_remove_sentence() {
+        let dir = tempdir().expect("tempdir");
+        let codex_home = dir.path().join("codex");
+        write_auth(&codex_home);
+        let store = test_store(dir.path());
+        let other = account(SAVED_ACCOUNT_ID);
+        store
+            .secrets()
+            .set_codex(
+                &providers::codex::secret_id(&other),
+                &codex_login(SAVED_AUTH),
+            )
+            .expect("the saved copy");
+        let mut file = store.load().expect("accounts.json");
+        file.provider_subscriptions.push(ProviderSubscription {
+            account: other.clone(),
+            label: "OpenAI".to_string(),
+            abbr: "OA2".to_string(),
+            color: "#db2777".to_string(),
+            plan: Some("Pro".to_string()),
+            price: None,
+            price_currency: None,
+        });
+        store.save(&file).expect("accounts.json");
+
+        let server = Fake::start(vec![
+            (200, PLUS_ANSWER.to_string()),
+            (200, PRO_ANSWER.to_string()),
+        ]);
+        let mut runtime = test_runtime(dir.path(), codex_api(&server.base), &codex_home);
+        runtime.poll_round(&codex_on(), utc("2026-11-14T09:00:00Z"));
+        let _ = server.finish();
+
+        let logins = runtime.codex_logins();
+        assert_eq!(logins.len(), 2, "{logins:?}");
+        let live = logins
+            .iter()
+            .find(|login| login.live)
+            .expect("the live row");
+        assert_eq!(
+            live.remove_note.as_deref(),
+            Some(providers::codex::LIVE_LOGIN_REMOVE)
+        );
+        let saved = logins
+            .iter()
+            .find(|login| !login.live)
+            .expect("the saved row");
+        assert_eq!(saved.remove_note, None);
     }
 
     /// R8: a login whose renewal failed is `expired` with the error's text and

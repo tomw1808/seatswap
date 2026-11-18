@@ -119,12 +119,25 @@ export async function show(container, env) {
       "With “only when full” | the same money when every switch waits for a full account"
     )
   );
+  const blockedHours = data.kpis.blockedHours;
+  const blockedHoursMissing = data.kpis.blockedHoursMissing;
+  if (typeof blockedHours !== "number" && typeof blockedHoursMissing !== "string") {
+    throw new Error(
+      `the forecast's blocked hours are missing without a reason: ${JSON.stringify(blockedHoursMissing)}`
+    );
+  }
+  const blockedValue =
+    typeof blockedHours === "number"
+      ? durationText(Math.round(blockedHours * 3600))
+      : h("span", { text: "—", title: blockedHoursMissing });
   kpis.appendChild(
     kpi(
       "Hours with no usable account",
-      durationText(Math.round(data.kpis.blockedHours * 3600)),
+      blockedValue,
       "working hours with no usable account in the next 7 days",
-      "Hours with no usable account | the hours the plan has no usable account, in your usual working hours"
+      typeof blockedHours === "number"
+        ? "Hours with no usable account | the hours the plan has no usable account, in your usual working hours"
+        : `Hours with no usable account | — (${blockedHoursMissing})`
     )
   );
   kpis.appendChild(

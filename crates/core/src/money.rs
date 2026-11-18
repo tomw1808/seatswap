@@ -655,6 +655,18 @@ pub(crate) fn openai_subscription_at(
     }
 }
 
+/// The one wording of work no stored OpenAI login can be named for: several
+/// logins are stored and the host has no `providerSwitch`, so
+/// [`openai_subscription_at`] cannot say which one a record or a block belongs
+/// to. `what` names the work (`record of {model}`, `block of {abbr}`); the
+/// readers leave it out and say so with this sentence.
+pub(crate) fn no_openai_login_warning(what: &str, host: &str, t: DateTime<Utc>) -> String {
+    format!(
+        "the OpenAI {what} on {host} at {t} belongs to no stored OpenAI login \
+         (several logins and no providerSwitch); its work is left out of every plan"
+    )
+}
+
 /// The limit kind of Ollama's month (R4): the credits' period.
 fn monthly_credits() -> LimitKind {
     LimitKind::Other("monthly_credits".to_string())
@@ -1737,7 +1749,23 @@ impl Valuer {
         }
     }
 
-    fn subscription(
+    /// Why a subscription has no reading for `account`, in its own words
+    /// (decision P-2 7): Ollama without a month window at all has no monthly
+    /// allowance to take a share of, while an account with month windows but
+    /// none holding the record has no reading of this month's usage. The one
+    /// rule the value and the pages use.
+    pub(crate) fn no_reading(&self, account: &AccountRef) -> Missing {
+        match Company::of_account(account) {
+            Company::Anthropic => Missing::NoReading,
+            Company::OpenAI => Missing::NoWeekReading,
+            Company::Ollama if self.month_windows(account).is_empty() => {
+                Missing::NoMonthlyAllowance
+            }
+            Company::Ollama => Missing::NoMonthReading,
+        }
+    }
+
+    pub(crate) fn subscription(
         &self,
         account: &AccountRef,
         kind: &LimitKind,
@@ -1747,11 +1775,7 @@ impl Valuer {
         // A record's missing window is worded for its subscription: Claude
         // keeps "that week", OpenAI says "this week" and Ollama "this month"
         // (decision P-2 7).
-        let no_reading = match Company::of_account(account) {
-            Company::Anthropic => Missing::NoReading,
-            Company::OpenAI => Missing::NoWeekReading,
-            Company::Ollama => Missing::NoMonthReading,
-        };
+        let no_reading = self.no_reading(account);
         let window = self
             .window_holding(account, kind, at)
             .map(|index| &self.windows[index])
@@ -2234,9 +2258,13 @@ pub(crate) mod tests {
         assert_eq!(flash.api, Some(2.0));
         assert_eq!(
             flash.subscription, None,
-            "no month reading of Ollama's credits: never a 0"
+            "no month window of Ollama's credits: never a 0"
         );
-        assert_eq!(flash.subscription_missing, Some(Missing::NoMonthReading));
+        assert_eq!(
+            flash.subscription_missing,
+            Some(Missing::NoMonthlyAllowance),
+            "no month window at all: the reading names no monthly allowance"
+        );
         let unpriced = valuer.value("atlas", &token(at, "glm-5:cloud", 0, 1_000_000, 0, 0));
         assert_eq!(unpriced.api, None);
         assert_eq!(

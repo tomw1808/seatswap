@@ -162,7 +162,8 @@ function subscriptionRow(provider, view, colours, currency, env) {
 // its API value since Monday by project, with no limit to fill, so the pieces
 // span the whole paler bar and never read as a share of a limit used.
 function companyRow(provider, colours) {
-  const tip = `${provider.company} this week: no subscription, valued at API prices`;
+  const name = providerName(provider.company).textContent;
+  const tip = `${name} this week: no subscription, valued at API prices`;
   const row = h("div", { class: "stats-tw-row stats-tw-row-api" }, [
     h("div", { class: "stats-tw-account" }, [providerName(provider.company, tip)]),
   ]);

@@ -3431,11 +3431,11 @@ mod tests {
     }
 
     /// The first start reads a projects folder it has never seen and writes one
-    /// token line per session, hour and model; a second start, from the saved
-    /// state, adds none. The data is made here: three sessions, two days, about
-    /// forty answers, two models, several answers in one hour.
+    /// token line per session, 5-minute bucket and model; a second start, from
+    /// the saved state, adds none. The data is made here: three sessions, two
+    /// days, about forty answers, two models, several answers in one bucket.
     #[test]
-    fn a_backfill_writes_each_hour_once() {
+    fn a_backfill_writes_each_bucket_once() {
         use std::collections::BTreeMap;
 
         const LEDGER: &str = "2b7d9c1e-5a4f-4c3b-9e8d-7f6a5b4c3d2e";

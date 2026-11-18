@@ -62,10 +62,6 @@ use crate::ops;
 /// How often the engine thread polls even without a command.
 const TICK: Duration = Duration::from_secs(30);
 
-/// The refusal a Remove of the live Codex login gets (R8), in the worker and in
-/// Settings alike: the UI is not the only guard.
-const LIVE_LOGIN_REMOVE: &str = "the live login: switch Codex to another login first to remove it";
-
 /// How often the engine thread asks the action thread to exchange the shared
 /// looks and settings with the other hosts (spec §5): on its poll tick, at most
 /// this often. Another host's edit arrives with the delay of the folder's sync
@@ -1825,9 +1821,14 @@ impl ActionRuntime {
         };
         match providers::codex::live_account(&paths) {
             Ok(Some(live)) if &live == account => {
-                return ActionReply::Failed(LIVE_LOGIN_REMOVE.to_string())
+                return ActionReply::Failed(providers::codex::LIVE_LOGIN_REMOVE.to_string())
             }
             Ok(_) => {}
+            // A keyring or API-key login means no saved login is live, so a
+            // stored copy can be removed. Any other error still refuses with
+            // that error: we cannot know which login is live.
+            Err(providers::ProviderError::KeyringLogin)
+            | Err(providers::ProviderError::ApiKeyLogin) => {}
             Err(error) => return ActionReply::Failed(error.to_string()),
         }
         let Some(store) = self.store.as_ref() else {
@@ -2818,6 +2819,69 @@ mod tests {
         );
     }
 
+    /// R8: a keyring or API-key login means no saved login is live, so Remove
+    /// deletes the stored copy instead of refusing with the live file's error.
+    #[test]
+    fn remove_codex_login_proceeds_on_a_keyring_or_api_key_login() {
+        let fixture = Fixture::new();
+        let codex_home = fixture._tmp.path().join("codex");
+        fs::create_dir_all(&codex_home).expect("the Codex folder");
+        let other = AccountRef {
+            acc: CODEX_OTHER_ID.to_string(),
+            org: CODEX_ORG.to_string(),
+        };
+        let store = Store::new(
+            fixture.app.clone(),
+            Box::new(FileSecrets::new(fixture.app.secrets_dir())),
+        );
+        let mut file = store.load().expect("accounts.json");
+        file.settings.codex_home = Some(codex_home.clone());
+        file.provider_subscriptions.push(ProviderSubscription {
+            account: other.clone(),
+            label: "OpenAI".to_string(),
+            abbr: "OA2".to_string(),
+            color: "#db2777".to_string(),
+            plan: Some("Pro".to_string()),
+            price: None,
+            price_currency: None,
+        });
+        store.save(&file).expect("accounts.json");
+        let login = serde_json::from_str(CODEX_OTHER_AUTH).expect("a Codex login");
+
+        let (engine, _engine_rx) = mpsc::channel();
+        let mut action = ActionRuntime::new(
+            fixture.app.clone(),
+            fixture.claude.clone(),
+            Vec::new(),
+            engine,
+            fixture.history(),
+            test_errors(),
+            test_printed_warnings(),
+        );
+        for auth in [
+            r#"{"auth_mode":"chatgpt","tokens":null}"#,
+            r#"{"OPENAI_API_KEY":"sk-made-up","auth_mode":"apikey","tokens":null}"#,
+        ] {
+            fs::write(codex_home.join("auth.json"), auth).expect("auth.json");
+            store
+                .secrets()
+                .set_codex(&providers::codex::secret_id(&other), &login)
+                .expect("the saved copy");
+            match action.remove_codex_login(&other) {
+                ActionReply::Done => {}
+                other => panic!("expected Done, got {other:?}"),
+            }
+            assert!(
+                store
+                    .secrets()
+                    .get_codex(&providers::codex::secret_id(&other))
+                    .expect("the secret store")
+                    .is_none(),
+                "the copy is gone for {auth}"
+            );
+        }
+    }
+
     /// R8: the live login's copy cannot be removed, because the next poll would
     /// save it again. The worker is a guard of its own, not only the UI.
     #[test]
@@ -2864,7 +2928,9 @@ mod tests {
         );
 
         match action.remove_codex_login(&live) {
-            ActionReply::Failed(text) => assert_eq!(text, LIVE_LOGIN_REMOVE),
+            ActionReply::Failed(text) => {
+                assert_eq!(text, providers::codex::LIVE_LOGIN_REMOVE)
+            }
             other => panic!("expected the live-login refusal, got {other:?}"),
         }
         assert!(

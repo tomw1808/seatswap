@@ -60,7 +60,8 @@ pub struct CodexSession {
     pub tokens: Tokens,
     /// Every `token_count` line in time order over all the session's files: its
     /// time, the model of the latest `turn_context` before it in time over all
-    /// those files (`None` before the first one), and its running total. This is
+    /// those files (or of the first one after it when none is before; `None`
+    /// when no `turn_context` follows either), and its running total. This is
     /// what the token lines are the growth of; a total equal to the previous one
     /// records nothing.
     pub series: Vec<CodexTokenPoint>,
@@ -571,7 +572,9 @@ struct Rollout {
 /// files, so a newer file without a total keeps the older file's total and no
 /// file ever resets it to zero; a session with no total at all has zero. The
 /// model of each point is the latest `turn_context` before it in time over all
-/// the files, so a session merged from two files keeps its model.
+/// the files, so a session merged from two files keeps its model; a point
+/// before every `turn_context` takes the first one after it, since that is the
+/// turn it grew in.
 ///
 /// Every file's totals are put in time order for the last hour, which compares
 /// two of them: the newest total minus the newest total at or before
@@ -627,7 +630,8 @@ fn merge_rollouts(
         };
         // The model of a point is the latest `turn_context` before it in time
         // over all the session's files, so a session merged from two files
-        // keeps its model.
+        // keeps its model; before the first one, the first after it is taken
+        // below.
         let mut models: Vec<(DateTime<Utc>, PathBuf, String)> = group
             .iter()
             .flat_map(|rollout| {
@@ -647,6 +651,18 @@ fn merge_rollouts(
                 next_model += 1;
             }
             series.push((at, model.clone(), total));
+        }
+        // A `token_count` before the first `turn_context` belongs to the first
+        // turn that follows it: with no model before it, take the first one
+        // after it. Without a later turn_context its model stays unknown, so
+        // the token lines wait for a later pass.
+        for (at, point_model, _) in &mut series {
+            if point_model.is_none() {
+                *point_model = models
+                    .iter()
+                    .find(|(model_at, _, _)| *model_at > *at)
+                    .map(|(_, _, model)| model.clone());
+            }
         }
         if last_hour.is_none() {
             warnings.push(format!(
@@ -2704,6 +2720,55 @@ mod tests {
         );
         assert_eq!(lines[0].input, 3000);
         assert_eq!(lines[0].answers, 2);
+    }
+
+    /// Review: a `token_count` that grew before the first `turn_context` used to
+    /// stop the pass for good, because no model was known yet. Its growth belongs
+    /// to the first turn that follows it, so one pass records all of it under
+    /// that model and the next adds nothing.
+    #[test]
+    fn growth_before_the_first_model_is_booked_to_the_first_model() {
+        let (_tmp, paths) = store();
+        write(
+            &paths,
+            ["2026", "11", "14"],
+            "2026-11-14T09-55-00",
+            ATLAS,
+            &[
+                meta("2026-11-14T09:55:00.000Z", ATLAS),
+                token_count_without_cache_write("2026-11-14T10:01:00.000Z", 1, 1000, 0, 100),
+                turn_context("2026-11-14T10:02:00.000Z", 2, MODEL),
+                token_count_without_cache_write("2026-11-14T10:03:00.000Z", 3, 3000, 0, 300),
+                token_count_without_cache_write("2026-11-14T10:08:00.000Z", 4, 5000, 0, 500),
+            ],
+            "2026-11-14T10:09:00Z",
+        );
+        let mut recorded = BTreeMap::new();
+
+        let built = read_and_record(&paths, &mut recorded);
+        let lines = built.lines;
+
+        assert_eq!(lines.len(), 2, "{lines:#?}");
+        assert!(built.warnings.is_empty(), "{:?}", built.warnings);
+        for line in &lines {
+            assert_eq!(line.model, MODEL, "the first turn owns the early growth");
+        }
+        assert_eq!(
+            lines.iter().map(|line| line.input).sum::<u64>(),
+            5000,
+            "the whole growth: 3000 in the 10:00 bucket, then 2000: {lines:#?}"
+        );
+        assert_eq!(lines.iter().map(|line| line.out).sum::<u64>(), 500);
+        let saved = recorded.get(ATLAS).expect("the session's recorded total");
+        assert_eq!(saved.total.input, 5000);
+        assert_eq!(saved.total.out, 500);
+
+        let built = read_and_record(&paths, &mut recorded);
+        assert!(
+            built.lines.is_empty(),
+            "the second pass records nothing more: {:#?}",
+            built.lines
+        );
     }
 
     /// A grown line without a model is kept back: the recorded total and time

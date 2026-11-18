@@ -18,7 +18,8 @@ use crate::history::{
 };
 use crate::live_sessions::Values;
 use crate::money::{
-    window_money, Company, Fx, Missing, MoneyError, Prices, Valued, Valuer, WindowMoney,
+    no_openai_login_warning, window_money, Company, Fx, Missing, MoneyError, Prices, Valued,
+    Valuer, WindowMoney,
 };
 use crate::projects::{Projects, ProjectsLogRecord};
 use crate::store::{Account, ProviderSubscription, Settings};
@@ -1179,6 +1180,7 @@ pub fn blocked_spans<Tz: TimeZone + Copy>(
     let openai_stored = crate::money::openai_subscriptions(ctx.provider_subscriptions);
 
     let mut spans = Vec::new();
+    let mut warned_openai_hosts: BTreeSet<String> = BTreeSet::new();
     for host in hosts_of(q, &block_events) {
         if company == Company::Anthropic && !claude_timelines.contains_key(&host) {
             continue;
@@ -1223,15 +1225,24 @@ pub fn blocked_spans<Tz: TimeZone + Copy>(
                         .get(&host)
                         .is_some_and(|timeline| timeline.at(from) == Some(account)),
                     Company::OpenAI => {
-                        crate::money::openai_subscription_at(
+                        match crate::money::openai_subscription_at(
                             &provider_timelines,
                             &openai_stored,
                             &host,
                             from,
-                        )
-                        .ok()
-                        .as_ref()
-                            == Some(account)
+                        ) {
+                            Ok(subscription) => &subscription == account,
+                            Err(_) => {
+                                if warned_openai_hosts.insert(host.clone()) {
+                                    ctx.warnings.borrow_mut().push(no_openai_login_warning(
+                                        &format!("block of {}", account_abbr(ctx, account)),
+                                        &host,
+                                        from,
+                                    ));
+                                }
+                                false
+                            }
+                        }
                     }
                     Company::Ollama => true,
                 };
@@ -3264,6 +3275,67 @@ pub(crate) mod tests {
             .expect("the OpenAI spans");
         let hours: f64 = spans.iter().map(|span| span.hours).sum();
         assert_eq!(hours, 0.0, "OA2 was in use during OA's block: {spans:?}");
+    }
+
+    /// Two stored OpenAI logins and no `providerSwitch`: the block belongs to
+    /// neither, so it is not counted, but the statistics say why once for the
+    /// host (review, 1.3.0).
+    #[test]
+    fn two_openai_logins_without_a_switch_name_the_dropped_block_once() {
+        let mut tiny = tiny();
+        let oa = codex_ref();
+        let oa2 = AccountRef {
+            acc: "5d2e7a1c-3b4f-4a6e-9c8d-1f2a3b4c5d6e".to_string(),
+            org: crate::providers::CODEX_ORG.to_string(),
+        };
+        tiny.provider_subscriptions = vec![
+            provider_subscription(&oa, "OA", Some(23.0)),
+            provider_subscription(&oa2, "OA2", Some(23.0)),
+        ];
+        for (from, to) in [
+            ("2026-11-12T13:00:00Z", "2026-11-12T16:00:00Z"),
+            ("2026-11-13T13:00:00Z", "2026-11-13T16:00:00Z"),
+        ] {
+            tiny.history
+                .append(&Event {
+                    t: utc(from),
+                    kind: EventKind::Blocked {
+                        account: oa.clone(),
+                        k: LimitKind::Session,
+                        m: None,
+                    },
+                })
+                .expect("OA's block");
+            tiny.history
+                .append(&Event {
+                    t: utc(to),
+                    kind: EventKind::Unblocked {
+                        account: oa.clone(),
+                        k: LimitKind::Session,
+                        m: None,
+                    },
+                })
+                .expect("OA's unblock");
+        }
+
+        let spans = blocked_spans(&tiny.ctx(), &two_weeks(), &all(), Company::OpenAI)
+            .expect("the OpenAI spans");
+        assert!(
+            spans.is_empty(),
+            "no stored login can be named for the block: {spans:?}"
+        );
+        let warnings = tiny.warnings.borrow();
+        let named = warnings
+            .iter()
+            .filter(|warning| warning.contains("belongs to no stored OpenAI login"))
+            .count();
+        assert_eq!(named, 1, "one warning per host: {warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("the OpenAI block of OA on atlas at ")),
+            "{warnings:?}"
+        );
     }
 
     // ---- proof tests of the review ----
