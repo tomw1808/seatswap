@@ -18,12 +18,17 @@ import {
   errorMessage,
   h,
   isColor,
+  isObject,
   kpi,
   legendItem,
   percentText,
   providerName,
+  showTokens,
   shortDate,
+  subscriptionSplit,
   switchText,
+  valueNode,
+  valueText,
   weekdayTimeText,
 } from "../../common.js";
 import { lines, stackedColumns } from "../../charts.js";
@@ -66,266 +71,409 @@ function barWidth(value) {
 
 // The subscription behind a This-week provider row: the frame's view for its
 // abbreviation, or null for a company row (work whose subscription is not
-// known), which `providerName` names.
+// known), which the subscriptions block leaves out.
 function providerSubscription(provider, env) {
   if (typeof provider.name !== "string" || provider.name === "") return null;
   return env.accounts.find((view) => view.abbr === provider.name) || null;
 }
 
-// Whether a provider row has no subscription value to fill a bar with: a
-// company row (no subscription) and a subscription whose view has no price are
-// the paler kind. The frame's view carries the snapshot's monthly price.
-function providerIsPale(view) {
-  return view === null || view.price === null;
-}
-
-// The pieces of a provider row's bar by project, as the account rows draw them.
-function providerFill(provider, used, color, colours, tip) {
-  const fill = h("div", { class: "stats-tw-fill" });
-  if (typeof used === "number") fill.style.width = barWidth(used);
-  if (provider.projects.length === 0) {
-    const reason =
-      typeof provider.apiMissing === "string" ? provider.apiMissing : "no API value this week";
-    fill.appendChild(
-      h("i", {
-        class: "stats-tw-seg",
-        style: { flexGrow: "1", background: color },
-        title: `${tip} | no project split: ${reason}`,
-      })
+// The known subscription value of a project's row: the number the bar is as
+// long as, or null when the project has no known part (its cell and its empty
+// bar carry the reason).
+function knownSubscription(project) {
+  const value = project.values.subscription;
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new Error(
+      `the subscription value of ${JSON.stringify(project.name)} is a finite number of 0 or more, not ${JSON.stringify(value)}`
     );
   }
-  for (const [project, share] of provider.projects) {
-    const amount =
-      typeof provider.api === "number"
-        ? ` = ${amountTip((provider.api * share) / 100, provider.apiCurrency)}`
-        : "";
-    fill.appendChild(
-      h("i", {
-        class: "stats-tw-seg",
-        style: { flexGrow: String(share), background: colours.get(project) || "var(--muted)" },
-        title: `${project} · ${provider.name} | ${percentText(share)} of its API value this week${amount}`,
-      })
-    );
-  }
-  return fill;
+  return value;
 }
 
-// A provider subscription's row of the This-week card: the account row's code
-// (chip, used bar, money, reset). Without a price the bar is the paler kind and
-// its money is "—" titled with the reason.
-function subscriptionRow(provider, view, colours, currency, env) {
-  const name = accountNameText(env.accounts, view.id);
-  const color = isColor(view.color) ? view.color : "var(--muted)";
-  const used = typeof provider.used === "number" ? provider.used : null;
-  const tip =
-    used === null
-      ? `${name} this week: no running window of this subscription`
-      : `${name} this week: used ${percentText(used)} so far`;
-  const pale = providerIsPale(view);
-  const row = h("div", { class: `stats-tw-row${pale ? " stats-tw-row-api" : ""}` }, [
-    h("div", { class: "stats-tw-account" }, [
-      accountName(env.accounts, view.id),
-      accountPlan(env.accounts, view.id),
+// The card's fields the page draws; a shape it does not expect is an error,
+// never a zero or a blank.
+function checkThisWeek(card) {
+  if (!isObject(card)) throw new Error("stats_this_week returned no card");
+  if (!Array.isArray(card.accounts)) throw new Error("stats_this_week returned no accounts");
+  if (!Array.isArray(card.providers)) throw new Error("stats_this_week returned no providers");
+  if (!Array.isArray(card.projects)) throw new Error("stats_this_week returned no projects");
+  const totals = card.totals;
+  if (!isObject(totals)) throw new Error("stats_this_week returned no totals");
+  if (
+    typeof totals.tokensOut !== "number" ||
+    !Number.isFinite(totals.tokensOut) ||
+    totals.tokensOut < 0
+  ) {
+    throw new Error(
+      `stats_this_week returned the token total ${JSON.stringify(totals.tokensOut)}`
+    );
+  }
+  if (!Number.isInteger(totals.projects) || totals.projects < 0) {
+    throw new Error(
+      `stats_this_week returned the project count ${JSON.stringify(totals.projects)}`
+    );
+  }
+  if (totals.projects !== card.projects.length) {
+    throw new Error(
+      `stats_this_week counts ${totals.projects} projects but lists ${card.projects.length}`
+    );
+  }
+  if (!isObject(totals.used)) throw new Error("stats_this_week returned no used values");
+  if (
+    totals.paid !== null &&
+    (typeof totals.paid !== "number" || !Number.isFinite(totals.paid))
+  ) {
+    throw new Error(`stats_this_week returned the paid sum ${JSON.stringify(totals.paid)}`);
+  }
+  if (typeof totals.paidPartial !== "boolean") {
+    throw new Error("stats_this_week did not say whether the paid sum is partial");
+  }
+  if (
+    totals.usedOfPaid !== null &&
+    (typeof totals.usedOfPaid !== "number" || !Number.isFinite(totals.usedOfPaid))
+  ) {
+    throw new Error(
+      `stats_this_week returned the used share ${JSON.stringify(totals.usedOfPaid)}`
+    );
+  }
+  if (totals.paid === null && (totals.paidPartial || totals.usedOfPaid !== null)) {
+    throw new Error("stats_this_week has no paid sum but a partial sum or a share of it");
+  }
+  for (const project of card.projects) {
+    if (!isObject(project)) throw new Error("stats_this_week returned a project that is not a row");
+    if (typeof project.name !== "string" || project.name === "") {
+      throw new Error("stats_this_week returned a project without a name");
+    }
+    if (
+      typeof project.tokensOut !== "number" ||
+      !Number.isFinite(project.tokensOut) ||
+      project.tokensOut < 0
+    ) {
+      throw new Error(
+        `the token count of ${JSON.stringify(project.name)} is a finite number of 0 or more`
+      );
+    }
+    if (!isObject(project.values)) {
+      throw new Error(`stats_this_week returned no values for ${JSON.stringify(project.name)}`);
+    }
+    if (!Array.isArray(project.bySubscription)) {
+      throw new Error(
+        `stats_this_week returned no subscription split for ${JSON.stringify(project.name)}`
+      );
+    }
+  }
+}
+
+// The amount of what the running windows' weeks cost. A partial sum is a lower
+// bound (R3): "≥" and the reason, so it never reads as the whole price.
+function paidAmount(totals, currency) {
+  const amount = amountNode(totals.paid, currency);
+  if (!totals.paidPartial) return [amount];
+  return [
+    h("span", { title: "at least: a running window has no price" }, ["≥ ", amount]),
+  ];
+}
+
+// The Used total's sub-line: the share and the paid sum, or the paid sum alone
+// while the share is not known (R3: a partial used value or a partial paid sum
+// has no share), or the reason no window has a price.
+function usedSubline(totals, currency) {
+  if (totals.paid === null) return "no price for this week's windows";
+  const parts = [];
+  if (typeof totals.usedOfPaid === "number") {
+    parts.push(`${percentText(totals.usedOfPaid)} of `);
+  } else {
+    parts.push("of ");
+  }
+  parts.push(...paidAmount(totals, currency));
+  parts.push(" paid for this week");
+  return parts;
+}
+
+// The three totals on top of the card (R5).
+function thisWeekTotals(totals, currency) {
+  const boxes = h("div", { class: "stats-tw-totals" });
+  boxes.appendChild(
+    kpi(
+      "Tokens",
+      showTokens(h("span"), totals.tokensOut),
+      `output, ${totals.projects} projects`,
+      "Tokens | output tokens of every project this week's card counts"
+    )
+  );
+  boxes.appendChild(
+    kpi(
+      "Used",
+      valueNode(totals.used, "subscription", currency),
+      usedSubline(totals, currency),
+      "Used | subscription value of the running windows, of what their weeks cost"
+    )
+  );
+  boxes.appendChild(
+    kpi(
+      "At API prices",
+      valueNode(totals.used, "api", currency),
+      "what the same work would cost without a subscription",
+      "At API prices | the same work without a subscription"
+    )
+  );
+  return boxes;
+}
+
+// One project's bar: as long as its known subscription value over the largest
+// known part of the card's projects, split by subscription (R2). A project
+// without a known part gets no length and the reason on its bar.
+function projectBar(project, maxKnown, currency, env) {
+  const length = h("span", { class: "stats-tw-length" });
+  const known = knownSubscription(project);
+  if (known === null) {
+    const missing = valueText(project.values, "subscription", currency);
+    length.style.width = "0%";
+    length.title = missing.title;
+    return h("span", { class: "stats-tw-spent", title: missing.title }, [length]);
+  }
+  const width = maxKnown > 0 ? (known / maxKnown) * 100 : 0;
+  length.style.width = barWidth(width);
+  if (project.bySubscription.length === 0) {
+    length.appendChild(
+      h("span", {
+        class: "stats-split",
+        title: "no subscription split: this project's API value is unknown",
+      })
+    );
+  } else {
+    length.appendChild(
+      subscriptionSplit(project.bySubscription, env.accounts, (name, percent) =>
+        `${name} · ${percentText(percent)} of this project's API value`
+      )
+    );
+  }
+  return h("span", { class: "stats-tw-spent" }, [length]);
+}
+
+// One project row, in the struct's order (Rust sorts it).
+function projectRow(project, maxKnown, currency, env) {
+  return h("div", { class: "stats-tw-grid stats-tw-row" }, [
+    h("span", { class: "stats-tw-name", text: project.name, title: project.name }),
+    projectBar(project, maxKnown, currency, env),
+    showTokens(h("span", { class: "stats-tw-num" }), project.tokensOut),
+    h("span", { class: "stats-tw-num stats-tw-money" }, [
+      valueNode(project.values, "subscription", currency),
+    ]),
+    h("span", { class: "stats-tw-num stats-tw-api" }, [
+      valueNode(project.values, "api", currency),
     ]),
   ]);
-  row.appendChild(
-    h("div", { class: `stats-tw-bar${pale ? " stats-tw-bar-api" : ""}` }, [
-      providerFill(provider, used, color, colours, tip),
-    ])
-  );
-  const amount = amountNode(provider.money, currency);
-  if (provider.money === null && typeof provider.moneyMissing === "string") {
-    amount.title = provider.moneyMissing;
-  }
-  const valueTitle = [tip, provider.moneyMissing].filter(Boolean).join(" | ");
-  row.appendChild(
-    h("span", { class: "stats-tw-figure", title: valueTitle }, [
-      `${used === null ? "—" : percentText(used)} · `,
-      amount,
-    ])
-  );
-  const reset =
-    typeof provider.resetsAt === "string"
-      ? {
-          text: `resets ${weekdayTimeText(provider.resetsAt)}`,
-          title: `resets ${dateTimeText(provider.resetsAt)}`,
-        }
-      : {
-          text: "resets —",
-          title: provider.moneyMissing || "no running window of this subscription",
-        };
-  row.appendChild(h("span", { class: "stats-tw-reset", text: reset.text, title: reset.title }));
-  return row;
 }
 
-// A company row of the This-week card (work whose subscription is not known):
-// its API value since Monday by project, with no limit to fill, so the pieces
-// span the whole paler bar and never read as a share of a limit used.
-function companyRow(provider, colours) {
-  const name = providerName(provider.company).textContent;
-  const tip = `${name} this week: no subscription, valued at API prices`;
-  const row = h("div", { class: "stats-tw-row stats-tw-row-api" }, [
-    h("div", { class: "stats-tw-account" }, [providerName(provider.company, tip)]),
+// The column headers of the project list.
+function projectHead() {
+  return h("div", { class: "stats-tw-grid stats-tw-head" }, [
+    h("span", { text: "Project" }),
+    h("span", { text: "Spent, by subscription" }),
+    h("span", { class: "stats-tw-num", text: "Tokens" }),
+    h("span", { class: "stats-tw-num", text: "Subscr." }),
+    h("span", { class: "stats-tw-num", text: "API value" }),
   ]);
-  row.appendChild(
-    h("div", { class: "stats-tw-bar stats-tw-bar-api" }, [
-      providerFill(provider, null, "var(--muted)", colours, tip),
-    ])
+}
+
+// The total row under the projects: the same figures over all of them.
+function totalRow(totals, currency) {
+  return h("div", { class: "stats-tw-grid stats-tw-total" }, [
+    h("span", { class: "stats-tw-name stats-tw-muted", text: `all ${totals.projects}` }),
+    h("span"),
+    showTokens(h("span", { class: "stats-tw-num" }), totals.tokensOut),
+    h("span", { class: "stats-tw-num stats-tw-money" }, [
+      valueNode(totals.used, "subscription", currency),
+    ]),
+    h("span", { class: "stats-tw-num stats-tw-api" }, [
+      valueNode(totals.used, "api", currency),
+    ]),
+  ]);
+}
+
+// The first eight projects, then the rest behind "Show all N projects ▾"; the
+// open list scrolls inside the card, at the height of those eight rows.
+function projectList(card, currency, env) {
+  const maxKnown = card.projects.reduce(
+    (largest, project) => Math.max(largest, knownSubscription(project) ?? 0),
+    0
   );
-  const amount = amountNode(provider.api, provider.apiCurrency);
-  if (provider.api === null && typeof provider.apiMissing === "string") {
-    amount.title = provider.apiMissing;
+  const rows = h("div", { class: "stats-tw-rows" });
+  const projectRows = card.projects.map((project) =>
+    projectRow(project, maxKnown, currency, env)
+  );
+  for (const [index, row] of projectRows.entries()) {
+    row.hidden = index >= 8;
+    rows.appendChild(row);
   }
-  row.appendChild(
-    h("span", { class: "stats-tw-figure", title: tip }, [amount, " at API prices"])
-  );
-  row.appendChild(
+  const main = h("div", { class: "stats-tw-main" }, [projectHead(), rows]);
+  if (card.projects.length > 8) {
+    const button = h("button", {
+      type: "button",
+      class: "stats-tw-more",
+      "aria-expanded": "false",
+    });
+    let open = false;
+    const paint = () => {
+      for (const [index, row] of projectRows.entries()) {
+        if (index >= 8) row.hidden = !open;
+      }
+      rows.classList.toggle("stats-tw-open", open);
+      button.textContent = open
+        ? "Show fewer ▴"
+        : `Show all ${card.projects.length} projects ▾`;
+      button.setAttribute("aria-expanded", String(open));
+    };
+    button.addEventListener("click", () => {
+      open = !open;
+      paint();
+    });
+    paint();
+    main.appendChild(button);
+  }
+  main.appendChild(totalRow(card.totals, currency));
+  return main;
+}
+
+// The subscription lines the card carries: every running account window, then
+// every provider subscription the chips know with a running window.
+function subscriptionEntries(card, env) {
+  const entries = [];
+  for (const account of card.accounts) {
+    if (typeof account.id !== "string" || account.id === "") {
+      throw new Error("stats_this_week returned an account row without an id");
+    }
+    if (typeof account.used !== "number" || !Number.isFinite(account.used)) {
+      throw new Error(
+        `the used percent of ${JSON.stringify(account.id)} is a finite number`
+      );
+    }
+    if (typeof account.resetsAt !== "string") {
+      throw new Error(`the running window of ${JSON.stringify(account.id)} has no reset`);
+    }
+    if (
+      account.money !== null &&
+      (typeof account.money !== "number" || !Number.isFinite(account.money))
+    ) {
+      throw new Error(`the money of ${JSON.stringify(account.id)} is a number or null`);
+    }
+    if (account.money === null && typeof account.moneyMissing !== "string") {
+      throw new Error(`the missing money of ${JSON.stringify(account.id)} has a reason`);
+    }
+    entries.push({ source: account, id: account.id, provider: false });
+  }
+  for (const provider of card.providers) {
+    if (typeof provider.name !== "string" || provider.name === "") {
+      throw new Error("stats_this_week returned a provider row without a name");
+    }
+    const view = providerSubscription(provider, env);
+    if (view === null) continue;
+    if (provider.used === null || provider.used === undefined) continue;
+    if (typeof provider.used !== "number" || !Number.isFinite(provider.used)) {
+      throw new Error(
+        `the used percent of ${JSON.stringify(provider.name)} is a finite number`
+      );
+    }
+    if (typeof provider.resetsAt !== "string") {
+      throw new Error(`the running window of ${JSON.stringify(provider.name)} has no reset`);
+    }
+    if (
+      provider.money !== null &&
+      (typeof provider.money !== "number" || !Number.isFinite(provider.money))
+    ) {
+      throw new Error(`the money of ${JSON.stringify(provider.name)} is a number or null`);
+    }
+    entries.push({ source: provider, id: view.id, provider: true });
+  }
+  return entries;
+}
+
+// One subscription line: its tag, plan, a use bar, the percent and money, and
+// the reset. A provider without a price reads "no price"; an account without
+// one keeps "—" with the reason.
+function subscriptionLine(entry, currency, env) {
+  const { source, id, provider } = entry;
+  let money;
+  if (provider && typeof source.money !== "number") {
+    money = h("span", {
+      text: "no price",
+      title:
+        typeof source.moneyMissing === "string"
+          ? source.moneyMissing
+          : "the subscription has no price",
+    });
+  } else {
+    money = amountNode(source.money, currency);
+    if (source.money === null && typeof source.moneyMissing === "string") {
+      money.title = source.moneyMissing;
+    }
+  }
+  const view = accountView(env.accounts, id);
+  const color = view && isColor(view.color) ? view.color : "var(--focus)";
+  return h("div", { class: "stats-tw-sub" }, [
+    accountName(env.accounts, id),
+    accountPlan(env.accounts, id),
+    h("span", { class: "stats-ubar" }, [
+      h("i", { style: { width: barWidth(source.used), background: color } }),
+    ]),
+    h("span", { class: "stats-tw-sub-money" }, [
+      `${percentText(source.used)} · `,
+      money,
+    ]),
     h("span", {
-      class: "stats-tw-reset",
-      text: "since Mon",
-      title: "since Monday 00:00 of this calendar week",
+      class: "stats-tw-sub-reset",
+      text: `resets ${weekdayTimeText(source.resetsAt)}`,
+      title: `resets ${dateTimeText(source.resetsAt)}`,
+    }),
+  ]);
+}
+
+// The right-hand block: one line per subscription with a running window and the
+// note that explains the percent (R5).
+function subscriptionsBlock(entries, currency, env) {
+  const block = h("div", { class: "stats-tw-subs" }, [
+    h("div", { class: "stats-tw-subs-title", text: "Subscriptions this week" }),
+  ]);
+  for (const entry of entries) block.appendChild(subscriptionLine(entry, currency, env));
+  block.appendChild(
+    h("p", {
+      class: "stats-tw-subs-note",
+      text: "Percent of each subscription's weekly limit; its window resets at the time shown.",
     })
   );
-  return row;
+  return block;
 }
 
-// One other provider's row of the This-week card: a subscription row when the
-// frame knows the subscription its name is, else the company row.
-function providerRow(provider, colours, currency, env) {
-  const view = providerSubscription(provider, env);
-  return view === null
-    ? companyRow(provider, colours)
-    : subscriptionRow(provider, view, colours, currency, env);
-}
-
-// The This-week card: each account's weekly window running now, its use so
-// far split by project, its money and its reset; then each other provider's
-// work of this calendar week at API prices. It ignores the range.
-function thisWeekCard(card, currency, colours, env) {
+// The This-week card: the three totals, the projects by subscription value, and
+// the subscriptions' running windows beside them. It ignores the range.
+function thisWeekCard(card, currency, env) {
+  checkThisWeek(card);
   const node = h("div", { class: "hcard stats-tw-card" }, [
     h("div", { class: "ch" }, [
       h("span", { class: "t", text: "This week · so far" }),
-      h("span", {
-        class: "s",
-        text: "each account's and subscription's current window, by project",
-      }),
+      h("span", { class: "s", text: "each subscription's current window" }),
     ]),
   ]);
-  if (card.accounts.length === 0) {
+  const entries = subscriptionEntries(card, env);
+  if (card.projects.length === 0 && entries.length === 0) {
     node.appendChild(
       h("p", {
         class: "stats-tw-empty",
         text: "No usage reading yet: this card fills in with the next usage poll.",
       })
     );
-    if (card.providers.length === 0) return node;
+    return node;
   }
-  const rows = h("div", { class: "stats-tw-rows" });
-  for (const account of card.accounts) {
-    const view = accountView(env.accounts, account.id);
-    const color = view && isColor(view.color) ? view.color : "var(--muted)";
-    const name = accountNameText(env.accounts, account.id);
-    const since = `${name} · since ${dateTimeText(account.startedAt)}`;
-    const row = h("div", { class: "stats-tw-row" }, [
-      h("div", { class: "stats-tw-account" }, [
-        accountName(env.accounts, account.id),
-        accountPlan(env.accounts, account.id),
-      ]),
-    ]);
-
-    const fill = h("div", { class: "stats-tw-fill", style: { width: barWidth(account.used) } });
-    if (account.projects.length === 0) {
-      // No token record of the window has a value yet: the use is one piece.
-      fill.appendChild(
-        h("i", {
-          class: "stats-tw-seg",
-          style: { flexGrow: "1", background: color },
-          title: `${since} | used ${percentText(account.used)} | no project split: no valued token record in this window yet`,
-        })
-      );
-    }
-    for (const [project, share] of account.projects) {
-      const money =
-        typeof account.money === "number"
-          ? ` = ${amountTip((account.money * share) / 100, currency)}`
-          : "";
-      fill.appendChild(
-        h("i", {
-          class: "stats-tw-seg",
-          style: { flexGrow: String(share), background: colours.get(project) || "var(--muted)" },
-          title: `${project} · ${name} | ${percentText(share)} of the window's value${money}`,
-        })
-      );
-    }
-    row.appendChild(h("div", { class: "stats-tw-bar" }, [fill]));
-
-    const amount = amountNode(account.money, currency);
-    if (account.money === null && typeof account.moneyMissing === "string") {
-      amount.title = account.moneyMissing;
-    }
-    row.appendChild(
-      h(
-        "span",
-        {
-          class: "stats-tw-figure",
-          title:
-            account.now !== account.used
-              ? `${since} | the newest reading is ${percentText(
-                  account.now
-                )}; a reset began this window at ${percentText(
-                  account.now - account.used
-                )}, so ${percentText(account.used)} is used so far`
-              : `${since} | used ${percentText(account.used)} so far`,
-        },
-        [`${percentText(account.used)} · `, amount]
-      )
-    );
-    row.appendChild(
-      h("span", {
-        class: "stats-tw-reset",
-        text: `resets ${weekdayTimeText(account.resetsAt)}`,
-        title: `resets ${dateTimeText(account.resetsAt)}`,
-      })
-    );
-    rows.appendChild(row);
-  }
-  for (const provider of card.providers) {
-    rows.appendChild(providerRow(provider, colours, currency, env));
-  }
-  node.appendChild(rows);
-
-  // The legend names every colour the bars show: the projects of all listed
-  // accounts and providers together with their share of the API value, then
-  // a project only one row's split names (all together count it in `other`).
-  const legend = h("div", { class: "stats-tw-legend" });
-  const named = new Set();
-  for (const [project, share] of card.projects) {
-    named.add(project);
-    const item = legendItem(colours.get(project) || "var(--muted)", project, false);
-    item.appendChild(h("span", { class: "stats-tw-share", text: percentText(share) }));
-    item.title = `${project} | ${percentText(share)} of the listed accounts' and providers' API value this week`;
-    legend.appendChild(item);
-  }
-  for (const part of [...card.accounts, ...card.providers]) {
-    for (const [project] of part.projects) {
-      if (named.has(project)) continue;
-      named.add(project);
-      const item = legendItem(colours.get(project) || "var(--muted)", project, false);
-      item.title = `${project} | in "other" over all listed accounts and providers`;
-      legend.appendChild(item);
-    }
-  }
-  // The paler bar means no subscription value: say so once, only when a row
-  // draws one.
-  if (card.providers.some((provider) => providerIsPale(providerSubscription(provider, env)))) {
-    legend.appendChild(
-      h("span", {
-        class: "stats-tw-paler",
-        text: "paler: valued at API prices only, no price entered",
-      })
-    );
-  }
-  if (legend.childNodes.length > 0) node.appendChild(legend);
+  node.appendChild(thisWeekTotals(card.totals, currency));
+  const main =
+    card.projects.length === 0
+      ? h("div", { class: "stats-tw-main" }, [projectHead(), emptyLine("no project in this week's windows")])
+      : projectList(card, currency, env);
+  node.appendChild(
+    h("div", { class: "stats-tw-body" }, [main, subscriptionsBlock(entries, currency, env)])
+  );
   return node;
 }
 
@@ -366,18 +514,24 @@ export async function show(container, env) {
   // The card's projects first, so the projects running now take the first
   // colours; the weekly chart uses the same colour for the same project.
   const colours = projectColours([
-    card.projects,
-    ...card.accounts.map((account) => account.projects),
-    ...card.providers.map((provider) => provider.projects),
+    card.projects.map((project) => [project.name]),
     ...(data === null ? [] : data.weeks.map((week) => week.projects)),
   ]);
 
   const root = h("div", { class: "g stats-overview" });
-  root.appendChild(thisWeekCard(card, currency, colours, env));
+  root.appendChild(thisWeekCard(card, currency, env));
   if (data === null) {
     root.appendChild(h("p", { class: "stats-empty stats-overview-empty", text: page.empty }));
     container.appendChild(root);
     return;
+  }
+  for (const week of data.weeks) {
+    if (!Array.isArray(week.accounts) || !Array.isArray(week.projects)) {
+      throw new Error("stats_overview returned a week without its accounts or projects");
+    }
+    if (typeof week.running !== "boolean") {
+      throw new Error("stats_overview returned a week without its running mark");
+    }
   }
 
   const kpis = h("div", { class: "stats-kpis" });
@@ -502,7 +656,10 @@ export async function show(container, env) {
   weeksCard.appendChild(weeksHead);
 
   const columns = data.weeks.map((week) => {
-    const label = shortDate(week.week);
+    // The history counts every weekly window of the range, the running ones
+    // included; a running week's column and tips say so.
+    const day = shortDate(week.week);
+    const label = week.running === true ? `${day} · so far` : day;
     // The expired money is carried per account, not as one week total, so each
     // account's hatched expired piece stands above the used pieces of the stack.
     const expiredStack = [];
@@ -552,12 +709,12 @@ export async function show(container, env) {
   if (data.weeks.length === 0) {
     chartBody.appendChild(emptyLine("no week in the range"));
   } else if (data.weeks.every((week) => week.accounts.length === 0)) {
-    // The history counts finished windows only; the card above shows the
-    // running ones, so the page is never empty while one runs.
+    // The history counts the running windows too, so this line only remains
+    // for a range in which no weekly window has started.
     chartBody.appendChild(
       h("p", {
         class: "stats-empty",
-        text: "No weekly window has finished in this range yet. The card above shows the running ones.",
+        text: "No weekly window in this range yet.",
       })
     );
   } else {
