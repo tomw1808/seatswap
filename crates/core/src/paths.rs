@@ -2,7 +2,7 @@
 //!
 //! Every path the program uses comes from here; no other module builds one.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 /// The `sun_path` size of a Unix socket address, including the trailing NUL.
@@ -692,6 +692,43 @@ pub fn absolute(path: &Path) -> Result<PathBuf, PathsError> {
     })
 }
 
+/// Find a program in a `PATH` value (spec R6): the first `<folder>/<name>` that
+/// is a file, and on Unix has an execute bit; on Windows the name gets `.exe`.
+/// Only the value passed in is read, never the process environment, and no
+/// shell or `which` is called.
+pub fn program_on_path(name: &str, path_var: &OsStr) -> Option<PathBuf> {
+    #[cfg(windows)]
+    let file_name = format!("{name}.exe");
+    #[cfg(not(windows))]
+    let file_name = name.to_string();
+    std::env::split_paths(path_var)
+        // An empty entry (`""`, a leading/trailing `:`, `::`) or a relative
+        // one (`"."`) would name a file in the process's current folder, which
+        // for a tray app started by a launcher is anywhere. Only folders on
+        // `PATH` are searched.
+        .filter(|folder| !folder.as_os_str().is_empty() && folder.is_absolute())
+        .map(|folder| folder.join(&file_name))
+        .find(|candidate| is_program(candidate))
+}
+
+#[cfg(windows)]
+fn is_program(path: &Path) -> bool {
+    path.is_file()
+}
+
+#[cfg(unix)]
+fn is_program(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_program(path: &Path) -> bool {
+    path.is_file()
+}
+
 /// The user's runtime folder (`$XDG_RUNTIME_DIR`), where the GUI's socket lives
 /// when it exists.
 pub fn runtime_dir() -> Option<PathBuf> {
@@ -1306,5 +1343,93 @@ mod tests {
             !files.is_empty(),
             "macOS must look for Dropbox's info.json as Linux does"
         );
+    }
+
+    #[test]
+    fn a_program_is_found_in_a_path_folder() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let name = if cfg!(windows) {
+            "ollama.exe"
+        } else {
+            "ollama"
+        };
+        let program = second.path().join(name);
+        std::fs::write(&program, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path_var = std::env::join_paths([first.path(), second.path()]).unwrap();
+        assert_eq!(program_on_path("ollama", &path_var), Some(program));
+    }
+
+    /// The path of `to` as seen from `from`, or `None` when the two have no
+    /// common root (a different drive on Windows).
+    fn relative_path(from: &Path, to: &Path) -> Option<PathBuf> {
+        let from: Vec<_> = from.components().collect();
+        let to: Vec<_> = to.components().collect();
+        if from.first() != to.first() {
+            return None;
+        }
+        let common = from
+            .iter()
+            .zip(&to)
+            .take_while(|(first, second)| first == second)
+            .count();
+        let mut relative = PathBuf::new();
+        for _ in common..from.len() {
+            relative.push("..");
+        }
+        for component in &to[common..] {
+            relative.push(component.as_os_str());
+        }
+        Some(relative)
+    }
+
+    /// R6 review: an `ollama` file in a folder is not found through a `PATH`
+    /// entry that is empty or relative. The relative entry is built from the
+    /// current folder to the temp folder, so the same file is reached without
+    /// changing the process's current folder; `""`, `"."` and `":"` are the
+    /// empty and relative entries `split_paths` makes of them.
+    #[test]
+    fn a_relative_or_empty_path_entry_is_not_searched() {
+        let folder = tempfile::tempdir().unwrap();
+        let name = if cfg!(windows) {
+            "ollama.exe"
+        } else {
+            "ollama"
+        };
+        let program = folder.path().join(name);
+        std::fs::write(&program, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let absolute = std::env::join_paths([folder.path()]).unwrap();
+        assert_eq!(program_on_path("ollama", &absolute), Some(program.clone()));
+
+        let current = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let target = folder.path().canonicalize().unwrap();
+        if let Some(relative) = relative_path(&current, &target) {
+            let path_var = std::env::join_paths([relative.as_path()]).unwrap();
+            assert_eq!(
+                program_on_path("ollama", &path_var),
+                None,
+                "a relative PATH entry was searched: {relative:?}"
+            );
+        }
+
+        for value in ["", ".", ":"] {
+            let path_var = OsString::from(value);
+            assert_eq!(
+                program_on_path("ollama", &path_var),
+                None,
+                "an empty or relative PATH entry was searched: {value:?}"
+            );
+        }
     }
 }

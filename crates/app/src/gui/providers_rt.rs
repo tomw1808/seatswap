@@ -9,12 +9,15 @@
 //! touched; no Claude login is read or written.
 //!
 //! The thread reads `accounts.json` at every round, so a switch, a Codex folder
-//! or an Ollama URL counts without a restart. A card that is off is never read
-//! and never asked, unless its subscription has a price. Every change of the
-//! lists is one [`UiEvent::Providers`] for the main thread, Codex first; the
-//! card list holds only the cards that are on, and the Codex login list is empty
-//! while the Codex card is off.
+//! or an Ollama URL counts without a restart. A provider is polled while its
+//! card is on or while it is found by itself (R6): Codex when its `auth.json`
+//! exists, Ollama when the `ollama` program is on `PATH` or a stored Ollama
+//! subscription exists. A provider that is neither on nor found is never read
+//! and never asked. Every change of the lists is one [`UiEvent::Providers`] for
+//! the main thread, Codex first; the card list holds only the cards that are on,
+//! and the Codex login list is empty while the Codex card is off.
 
+use std::ffi::OsString;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -27,7 +30,7 @@ use serde::Serialize;
 
 use seatswap_core::api::{Api, Usage};
 use seatswap_core::history::{AccountRef, Event, HistoryDir, Hosts, Range, Recorder, Source};
-use seatswap_core::paths::{AppPaths, CodexPaths, PathsError};
+use seatswap_core::paths::{self, AppPaths, CodexPaths, PathsError};
 use seatswap_core::providers::{self, Credits, ProviderReading, CODEX_ORG, OLLAMA_ORG};
 use seatswap_core::store::{self, ProviderSubscription, Settings, Store};
 use seatswap_core::types::CodexLogin;
@@ -67,6 +70,10 @@ pub(crate) struct ProviderView {
     pub spend_24h_error: Option<String>,
     pub fetched_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
+    /// The last poll of this provider found it not running (Ollama's
+    /// connection was refused): the card keeps its numbers and says so in a
+    /// quiet line, with no error banner (R6).
+    pub not_running: bool,
 }
 
 /// One saved Codex login as the pop-up lists it (R8): the subscription's look
@@ -264,6 +271,9 @@ pub(crate) fn spawn(
     let (commands, received) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
+    // The one read of `PATH` for this run: a found Ollama program is decided
+    // from this value at every round (R6).
+    let path_var = std::env::var_os("PATH");
     let thread = thread::Builder::new()
         .name("seatswap-providers".to_string())
         .spawn(move || {
@@ -276,6 +286,7 @@ pub(crate) fn spawn(
                 received,
                 reported_errors,
                 printed_warnings,
+                path_var,
             )
         })
         .map_err(|error| format!("cannot start the provider thread: {error}"))?;
@@ -296,6 +307,7 @@ fn run(
     commands: Receiver<ProvidersCommand>,
     reported_errors: Arc<ReportedErrors>,
     printed_warnings: Arc<Mutex<PrintedWarnings>>,
+    path_var: Option<OsString>,
 ) {
     let app_for_lookup = app.clone();
     // The one store this thread keeps (R8). It opens on the first Codex round;
@@ -317,6 +329,7 @@ fn run(
         api,
         Some(ui),
         app.clone(),
+        path_var,
         store_opener,
         Box::new(CodexPaths::resolve),
         Box::new(move |_| {
@@ -381,6 +394,10 @@ pub(crate) struct ProvidersRuntime {
     /// The app paths; the subscription list and its prices live in
     /// `accounts.json` there.
     app: AppPaths,
+    /// The `PATH` value `spawn` read once, or `None` when there is none: a
+    /// found Ollama program is decided from it (R6). A test passes its own
+    /// fake value.
+    path_var: Option<OsString>,
     /// The store the Codex round reads and saves in; none until an open
     /// succeeds. An open that failed is tried again at every round, and its
     /// error is the OpenAI card's error until then.
@@ -410,6 +427,9 @@ pub(crate) struct ProvidersRuntime {
     codex_failed: Vec<FailedCodex>,
     codex_tried: Option<DateTime<Utc>>,
     ollama_tried: Option<DateTime<Utc>>,
+    /// Whether the last Ollama poll of this run was `NotRunning`: the change
+    /// from running to not running is reported once (R6).
+    ollama_not_running: bool,
     /// Whether a round has already established the live login it compares
     /// against; at the app's first round it comes from the history (R8).
     live_seen: bool,
@@ -511,6 +531,7 @@ impl ProvidersRuntime {
         api: Api,
         ui: Option<Sender<UiEvent>>,
         app: AppPaths,
+        path_var: Option<OsString>,
         store_opener: StoreOpener,
         codex_paths: CodexPathsLookup,
         settings_lookup: SettingsLookup,
@@ -521,6 +542,7 @@ impl ProvidersRuntime {
             api,
             ui,
             app,
+            path_var,
             store: None,
             store_opener,
             codex_paths,
@@ -535,6 +557,7 @@ impl ProvidersRuntime {
             codex_failed: Vec::new(),
             codex_tried: None,
             ollama_tried: None,
+            ollama_not_running: false,
             live_seen: false,
             last_live: None,
             published: (Vec::new(), Vec::new()),
@@ -560,8 +583,7 @@ impl ProvidersRuntime {
     }
 
     /// The start and every five minutes: every card that is switched on, and
-    /// every provider whose subscription has a price even while its card is off
-    /// (spec R4).
+    /// every provider found by itself even while its card is off (spec R6).
     pub(crate) fn poll_round(
         &mut self,
         settings: &Settings,
@@ -571,7 +593,7 @@ impl ProvidersRuntime {
         self.settle(settings, previous.as_ref());
         let mut due = Vec::new();
         for provider in [Provider::Codex, Provider::Ollama] {
-            if provider.is_on(settings) || self.priced(provider) {
+            if provider.is_on(settings) || self.found(provider, settings) {
                 due.push(provider);
             }
         }
@@ -646,7 +668,7 @@ impl ProvidersRuntime {
         let previous = self.settings.replace(settings.clone());
         self.settle(settings, previous.as_ref());
         let mut due = Vec::new();
-        if Provider::Codex.is_on(settings) || self.priced(Provider::Codex) {
+        if Provider::Codex.is_on(settings) || self.found(Provider::Codex, settings) {
             due.push(Provider::Codex);
         }
         self.poll(&due, settings, now);
@@ -663,6 +685,17 @@ impl ProvidersRuntime {
             if !provider.is_on(settings) {
                 *provider.view_mut(&mut self.codex, &mut self.ollama) = None;
                 *provider.tried_mut(&mut self.codex_tried, &mut self.ollama_tried) = None;
+                // A card that is off is still polled while its provider is
+                // found by itself; when the URL moved or the provider is not
+                // found, the polling stops or moves and the not-running change
+                // is forgotten, so a later poll reports it again (R6).
+                if provider == Provider::Ollama {
+                    let moved = previous
+                        .is_some_and(|previous| provider.setting_changed(previous, settings));
+                    if moved || !self.found(Provider::Ollama, settings) {
+                        self.ollama_not_running = false;
+                    }
+                }
                 if provider == Provider::Codex {
                     self.codex_logins.clear();
                 }
@@ -671,6 +704,11 @@ impl ProvidersRuntime {
                 *provider.view_mut(&mut self.codex, &mut self.ollama) = None;
                 if provider == Provider::Codex {
                     self.codex_logins.clear();
+                }
+                // The new server has its own running state: a not-running one
+                // at the new URL is a new change and is reported (R6).
+                if provider == Provider::Ollama {
+                    self.ollama_not_running = false;
                 }
                 changed.push(provider);
             }
@@ -701,15 +739,15 @@ impl ProvidersRuntime {
         }
     }
 
-    /// Whether a card is still read after the request: it is on, or its
-    /// subscription has a price, and it has not moved. A card that is on and
-    /// unpriced is still shown. A card that is off but whose subscription has a
-    /// price is still recorded; it has no view (spec §7.9).
+    /// Whether a provider is still read after the request: it is on, or it is
+    /// found by itself, and it has not moved. A card that is on is still shown.
+    /// A card that is off but whose provider is found is still recorded; it has
+    /// no view (spec R6).
     fn keeps(&mut self, provider: Provider, used: &Settings, current: &Settings) -> bool {
         if provider.setting_changed(used, current) {
             return false;
         }
-        provider.is_on(current) || self.priced(provider)
+        provider.is_on(current) || self.found(provider, current)
     }
 
     /// One Ollama round: the balance and the 24 h usage, then the same checks
@@ -727,19 +765,34 @@ impl ProvidersRuntime {
         }
         let view = match result {
             Ok(reading) => {
-                self.record(&reading, now);
-                self.ensure_subscription(&reading.account, reading.plan.as_deref(), now);
+                self.ollama_not_running = false;
+                self.record(&reading, now, on);
+                self.ensure_subscription(&reading.account, reading.plan.as_deref(), now, on);
                 on.then(|| success(Provider::Ollama, reading, now))
             }
             Err(error) => {
                 let text = error.to_string();
-                if on {
-                    Some(failure(Provider::Ollama, self.ollama.as_ref(), text))
+                if matches!(&error, providers::ProviderError::NotRunning { .. }) {
+                    // A provider that is not running is reported once per
+                    // change from running to not running; no reading is
+                    // recorded, and the next answering poll resumes (R6).
+                    let changed = !self.ollama_not_running;
+                    self.ollama_not_running = true;
+                    if changed {
+                        self.report_provider_error(on, &text);
+                    }
+                    on.then(|| not_running(Provider::Ollama, self.ollama.as_ref()))
                 } else {
-                    // The card is off, so there is no view to show the error;
-                    // report it the way every provider error is.
-                    self.report_error(&text);
-                    None
+                    self.ollama_not_running = false;
+                    if on {
+                        Some(failure(Provider::Ollama, self.ollama.as_ref(), text))
+                    } else {
+                        // The card is off, so there is no view to show the error
+                        // and the user never switched it on: it is printed on
+                        // stderr once, not sent as a notification (R6 review).
+                        self.report_provider_error(false, &text);
+                        None
+                    }
                 }
             }
         };
@@ -754,9 +807,10 @@ impl ProvidersRuntime {
         let round = self.read_codex_round(settings);
         self.codex_tried = Some(now);
         // A failed save is shown on the live row and reported once; it never
-        // blanks the card or hides the reading.
+        // blanks the card or hides the reading. With the card off it is only
+        // printed, like every error of a provider the user never switched on.
         if let Some(error) = &round.save_error {
-            self.report_error(error);
+            self.report_provider_error(settings.codex_card, error);
         }
         // A copy the save created or replaced gets its subscription at once
         // (R8), with the plan of this round's reading of it when there is one,
@@ -767,7 +821,7 @@ impl ProvidersRuntime {
                 CodexCard::Reading(reading) if &reading.account == account => reading.plan.clone(),
                 _ => None,
             };
-            self.ensure_subscription(account, plan.as_deref(), now);
+            self.ensure_subscription(account, plan.as_deref(), now, settings.codex_card);
         }
         // A live login that changed outside seatswap writes its one
         // `providerSwitch` event (spec §5).
@@ -801,8 +855,8 @@ impl ProvidersRuntime {
                     copy: None,
                     live: true,
                 });
-                self.record(&reading, now);
-                self.ensure_subscription(&reading.account, reading.plan.as_deref(), now);
+                self.record(&reading, now, on);
+                self.ensure_subscription(&reading.account, reading.plan.as_deref(), now, on);
                 on.then(|| success(Provider::Codex, reading, now))
             }
             CodexCard::Failed(text) => {
@@ -825,8 +879,10 @@ impl ProvidersRuntime {
                 if on {
                     Some(failure(Provider::Codex, self.codex.as_ref(), text))
                 } else {
-                    // The card is off, so there is no view to show the error.
-                    self.report_error(&text);
+                    // The card is off, so there is no view to show the error
+                    // and the user never switched it on: it is printed on
+                    // stderr once, not sent as a notification (R6 review).
+                    self.report_provider_error(false, &text);
                     None
                 }
             }
@@ -839,8 +895,8 @@ impl ProvidersRuntime {
         }
         for answer in &answers {
             if let Some(reading) = &answer.reading {
-                self.record(reading, now);
-                self.ensure_subscription(&reading.account, reading.plan.as_deref(), now);
+                self.record(reading, now, on);
+                self.ensure_subscription(&reading.account, reading.plan.as_deref(), now, on);
             }
         }
         if !round.keep_logins {
@@ -859,8 +915,8 @@ impl ProvidersRuntime {
                         copy,
                         message,
                     }),
-                    (Some(_), None) => self.report_error(EXPIRED_WITHOUT_MESSAGE),
-                    (None, _) => self.report_error(EXPIRED_WITHOUT_COPY),
+                    (Some(_), None) => self.report_provider_error(on, EXPIRED_WITHOUT_MESSAGE),
+                    (None, _) => self.report_provider_error(on, EXPIRED_WITHOUT_COPY),
                 }
             }
             self.codex_failed = failed;
@@ -928,8 +984,8 @@ impl ProvidersRuntime {
             Ok(file) => file.provider_subscriptions,
             Err(error) => {
                 // The list of saved logins cannot be known; the pop-up keeps
-                // the one it had.
-                self.report_error(&error.to_string());
+                // the one it had. With the card off only stderr hears of it.
+                self.report_provider_error(settings.codex_card, &error.to_string());
                 return CodexRound {
                     card,
                     live,
@@ -1077,31 +1133,49 @@ impl ProvidersRuntime {
         }
     }
 
-    /// Whether any subscription of this provider has a price, so the provider is
-    /// polled even with its card off (spec R4).
-    fn priced(&mut self, provider: Provider) -> bool {
-        self.subscriptions(provider)
-            .iter()
-            .any(|subscription| subscription.price.is_some())
+    /// Whether `provider` is found by itself, whatever its card switch (R6).
+    /// Codex is found when its `auth.json` exists in the Codex folder the
+    /// runtime resolves (through [`CodexPathsLookup`], never by resolving the
+    /// real folder here); Ollama when the `ollama` program is in this run's
+    /// `PATH` or a stored Ollama subscription exists. Not found means nothing
+    /// is read and nothing is sent.
+    fn found(&mut self, provider: Provider, settings: &Settings) -> bool {
+        match provider {
+            Provider::Codex => match (self.codex_paths)(settings.codex_home.as_deref()) {
+                Ok(paths) => paths.auth_file.is_file(),
+                // A folder that cannot be resolved is not found; with the card
+                // on the same error is the card's own text.
+                Err(_) => false,
+            },
+            Provider::Ollama => {
+                let in_path = self
+                    .path_var
+                    .as_deref()
+                    .is_some_and(|path_var| paths::program_on_path("ollama", path_var).is_some());
+                in_path || !self.subscriptions(provider).is_empty()
+            }
+        }
     }
 
     /// Make sure an account has a subscription through the one
     /// [`ops::ensure_provider_subscription`], which writes `accountAdded` and
     /// `planChanged`: a successful reading's account, or a saved login's copy
     /// before any reading names its plan (`None`). Its warnings are reported
-    /// here like any provider error and never stop the poll.
+    /// here like any provider error and never stop the poll; `on` says whether
+    /// the card was on (R6 review).
     fn ensure_subscription(
         &mut self,
         account: &AccountRef,
         plan: Option<&str>,
         now: DateTime<Utc>,
+        on: bool,
     ) {
         let warnings = {
             let recorder = self.recorder.as_ref().ok();
             ops::ensure_provider_subscription(&self.app, recorder, account, plan, now)
         };
         for text in &warnings {
-            self.report_error(text);
+            self.report_provider_error(on, text);
         }
         self.print_history_warnings();
     }
@@ -1191,13 +1265,14 @@ impl ProvidersRuntime {
 
     /// Record a reading that carries a usage and Ollama's hourly buckets; one
     /// without a usage records no sample. A recording error is reported the one
-    /// way the app reports a history write, and never changes the card. An answer
+    /// way the app reports a history write, and never changes the card; with
+    /// the card off it only reaches stderr (`on`, R6 review). An answer
     /// whose buckets cannot be read is reported too, without failing the card; a
     /// usage call that itself failed has no buckets (`hours` is `None`) and is
     /// only the card's spend error, as before O-1. A history that could not be
     /// opened at start is already in the snapshot's error and was notified there,
     /// so this thread records nothing and reports nothing for it.
-    fn record(&mut self, reading: &ProviderReading, now: DateTime<Utc>) {
+    fn record(&mut self, reading: &ProviderReading, now: DateTime<Utc>, on: bool) {
         let mut failures = Vec::new();
         if let Some(usage) = &reading.usage {
             if let Ok(recorder) = &mut self.recorder {
@@ -1225,7 +1300,7 @@ impl ProvidersRuntime {
             }
         }
         for text in &failures {
-            self.report_error(text);
+            self.report_provider_error(on, text);
         }
         self.print_history_warnings();
     }
@@ -1246,6 +1321,19 @@ impl ProvidersRuntime {
     /// run. A test's reporter counts the calls.
     pub(crate) fn report_error(&mut self, text: &str) {
         (self.report)(text);
+    }
+
+    /// Report an error of a provider's poll. With the card on it goes through
+    /// [`Self::report_error`]; with the card off the user never switched that
+    /// provider on, so it is only printed on stderr, once per text, through the
+    /// runtime's one warning path ([`PrintedWarnings`]) and never notified
+    /// (R6 review).
+    fn report_provider_error(&mut self, on: bool, text: &str) {
+        if on {
+            self.report_error(text);
+        } else {
+            super::lock(&self.printed_warnings).print(&[text.to_string()]);
+        }
     }
 
     fn publish(&mut self) {
@@ -1280,12 +1368,13 @@ fn success(provider: Provider, reading: ProviderReading, now: DateTime<Utc>) -> 
         spend_24h_error,
         fetched_at: Some(now),
         error: None,
+        not_running: false,
     }
 }
 
-/// A failed reading: every number of the last one and its `fetched_at` stay,
-/// and `error` is the provider error's own text.
-fn failure(provider: Provider, last: Option<&ProviderView>, error: String) -> ProviderView {
+/// The last numbers of a provider's view, with no error and not marked as not
+/// running: the base of [`failure`] and [`not_running`].
+fn last_numbers(provider: Provider, last: Option<&ProviderView>) -> ProviderView {
     ProviderView {
         provider: provider.name().to_string(),
         title: provider.title().to_string(),
@@ -1295,8 +1384,27 @@ fn failure(provider: Provider, last: Option<&ProviderView>, error: String) -> Pr
         spend_24h: last.and_then(|view| view.spend_24h),
         spend_24h_error: last.and_then(|view| view.spend_24h_error.clone()),
         fetched_at: last.and_then(|view| view.fetched_at),
-        error: Some(error),
+        error: None,
+        not_running: false,
     }
+}
+
+/// A failed reading: every number of the last one and its `fetched_at` stay,
+/// and `error` is the provider error's own text.
+fn failure(provider: Provider, last: Option<&ProviderView>, error: String) -> ProviderView {
+    let mut view = last_numbers(provider, last);
+    view.error = Some(error);
+    view.not_running = false;
+    view
+}
+
+/// A provider that is not running: every number of the last one and its
+/// `fetched_at` stay, there is no error banner, and the card says the quiet
+/// line of R6.
+fn not_running(provider: Provider, last: Option<&ProviderView>) -> ProviderView {
+    let mut view = last_numbers(provider, last);
+    view.not_running = true;
+    view
 }
 
 #[cfg(test)]
@@ -1381,6 +1489,26 @@ mod tests {
         std::fs::write(folder.join("auth.json"), AUTH).expect("auth.json");
     }
 
+    /// A fake `ollama` program in `folder`, executable on Unix, named
+    /// `ollama.exe` on Windows as [`paths::program_on_path`] looks for it.
+    fn fake_program(folder: &Path) -> std::path::PathBuf {
+        std::fs::create_dir_all(folder).expect("the program folder");
+        let name = if cfg!(windows) {
+            "ollama.exe"
+        } else {
+            "ollama"
+        };
+        let program = folder.join(name);
+        std::fs::write(&program, b"#!/bin/sh\nexit 0\n").expect("the program");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+                .expect("the execute bit");
+        }
+        program
+    }
+
     fn history(dir: &Path) -> HistoryDir {
         HistoryDir::at(&dir.join("history"), "atlas")
     }
@@ -1429,13 +1557,34 @@ mod tests {
         settings_lookup: SettingsLookup,
         report: ReportError,
     ) -> ProvidersRuntime {
-        test_runtime_with_app(
+        test_runtime_with_path(
+            dir,
+            api,
+            codex_paths,
+            settings_lookup,
+            report,
+            OsString::new(),
+        )
+    }
+
+    /// A runtime with the `PATH` value the test gives it: an empty one means
+    /// no program is found there.
+    fn test_runtime_with_path(
+        dir: &Path,
+        api: Api,
+        codex_paths: CodexPathsLookup,
+        settings_lookup: SettingsLookup,
+        report: ReportError,
+        path_var: OsString,
+    ) -> ProvidersRuntime {
+        test_runtime_with_app_path(
             dir,
             api,
             codex_paths,
             settings_lookup,
             report,
             test_app(dir),
+            path_var,
         )
     }
 
@@ -1447,12 +1596,33 @@ mod tests {
         report: ReportError,
         app: AppPaths,
     ) -> ProvidersRuntime {
+        test_runtime_with_app_path(
+            dir,
+            api,
+            codex_paths,
+            settings_lookup,
+            report,
+            app,
+            OsString::new(),
+        )
+    }
+
+    fn test_runtime_with_app_path(
+        dir: &Path,
+        api: Api,
+        codex_paths: CodexPathsLookup,
+        settings_lookup: SettingsLookup,
+        report: ReportError,
+        app: AppPaths,
+        path_var: OsString,
+    ) -> ProvidersRuntime {
         let store_opener = test_store_opener(app.clone());
         ProvidersRuntime::new(
             Ok(history(dir)),
             api,
             None,
             app,
+            Some(path_var),
             store_opener,
             codex_paths,
             settings_lookup,
@@ -1497,7 +1667,13 @@ mod tests {
 
     impl Fake {
         fn start(replies: Vec<(u16, String)>) -> Fake {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("a local server");
+            Fake::start_on(0, replies)
+        }
+
+        /// A server on `port`, so a test can leave that port closed for a few
+        /// polls and then let the fourth one answer there.
+        fn start_on(port: u16, replies: Vec<(u16, String)>) -> Fake {
+            let listener = TcpListener::bind(("127.0.0.1", port)).expect("a local server");
             listener
                 .set_nonblocking(true)
                 .expect("a non-blocking listener");
@@ -2054,19 +2230,27 @@ mod tests {
         assert!(logins[1].usage.is_some());
         assert_eq!(logins[1].message, None);
 
-        // A card switched off keeps no rows, and a round after the switch makes
-        // no request while no price keeps the provider polled.
+        // A card switched off keeps no rows, but a login that is still found is
+        // polled whatever the card switch (R6): this round asks the live and the
+        // saved login once more.
         let mut off = codex_on();
         off.codex_card = false;
-        let server = Fake::start(vec![]);
+        let server = Fake::start(vec![
+            (200, PLUS_ANSWER.to_string()),
+            (200, PRO_ANSWER.to_string()),
+        ]);
         runtime.api = codex_api(&server.base);
         assert!(runtime
             .poll_round(&off, utc("2026-11-14T09:05:00Z"))
             .is_empty());
         let paths = server.finish();
-        assert!(
-            paths.is_empty(),
-            "a switched-off card made a request: {paths:?}"
+        assert_eq!(
+            paths,
+            vec![
+                "/backend-api/wham/usage".to_string(),
+                "/backend-api/wham/usage".to_string()
+            ],
+            "the found logins are still polled with the card off"
         );
         assert!(
             runtime.codex_logins().is_empty(),
@@ -2253,6 +2437,7 @@ mod tests {
             api,
             None,
             app,
+            Some(OsString::new()),
             opener,
             Box::new(move |_| Ok(CodexPaths::at(&folder))),
             same_settings(),
@@ -2381,6 +2566,399 @@ mod tests {
         );
     }
 
+    /// R6: Codex is found when its `auth.json` exists, whatever the card
+    /// switch. It is polled, its reading is recorded and its subscription is
+    /// created; the card stays off, so the snapshot shows no card.
+    #[test]
+    fn codex_is_polled_when_its_login_file_exists_with_the_card_off() {
+        let dir = tempdir().expect("tempdir");
+        let codex_home = dir.path().join("codex");
+        write_auth(&codex_home);
+        let server = Fake::start(vec![(200, PLUS_ANSWER.to_string())]);
+        let mut runtime = test_runtime(dir.path(), codex_api(&server.base), &codex_home);
+        let settings = Settings {
+            ollama_url: server.base.clone(),
+            ..settings()
+        };
+
+        let views = runtime.poll_round(&settings, utc("2026-11-14T09:00:00Z"));
+        let paths = server.finish();
+
+        assert!(
+            views.is_empty(),
+            "the card is off, so there is no card to show: {views:?}"
+        );
+        assert_eq!(
+            paths,
+            vec!["/backend-api/wham/usage".to_string()],
+            "the found Codex login was not polled with the card off"
+        );
+        let samples = history(dir.path())
+            .read::<Sample>(&Range::ALL, &Hosts::All)
+            .expect("the samples");
+        assert_eq!(
+            samples.records.len(),
+            1,
+            "the found login's reading was not recorded"
+        );
+        let file = test_store(dir.path()).load().expect("accounts.json");
+        assert!(
+            file.provider_subscription(&account(LIVE_ACCOUNT_ID))
+                .is_some(),
+            "the first reading did not create the subscription"
+        );
+    }
+
+    /// R6: Ollama is found when the `ollama` program is in a folder of `PATH`,
+    /// whatever the card switch. It is polled, its reading is recorded and its
+    /// subscription is created; the card stays off.
+    #[test]
+    fn ollama_is_polled_when_its_program_is_on_the_path_with_the_card_off() {
+        let dir = tempdir().expect("tempdir");
+        let bin = dir.path().join("bin");
+        fake_program(&bin);
+        let path_var = std::env::join_paths([bin.as_path()]).expect("a PATH value");
+        let server = Fake::start(vec![
+            (200, BALANCE.to_string()),
+            (200, USAGE_ANSWER.to_string()),
+        ]);
+        let mut runtime = test_runtime_with_path(
+            dir.path(),
+            codex_api(&server.base),
+            explicit_codex_paths(),
+            same_settings(),
+            Box::new(|_| {}),
+            path_var,
+        );
+        let settings = Settings {
+            ollama_url: server.base.clone(),
+            ..settings()
+        };
+
+        let views = runtime.poll_round(&settings, utc("2026-11-14T09:00:00Z"));
+        let paths = server.finish();
+
+        assert!(
+            views.is_empty(),
+            "the card is off, so there is no card to show: {views:?}"
+        );
+        assert_eq!(
+            paths,
+            vec![
+                "/api/balance".to_string(),
+                "/api/usage?range=24h".to_string()
+            ],
+            "the Ollama program on PATH was not polled with the card off"
+        );
+        let samples = history(dir.path())
+            .read::<Sample>(&Range::ALL, &Hosts::All)
+            .expect("the samples");
+        assert_eq!(samples.records.len(), 1, "the reading was not recorded");
+        assert_eq!(samples.records[0].record.account.org, "ollama");
+        let file = test_store(dir.path()).load().expect("accounts.json");
+        let ollama = AccountRef {
+            acc: providers::OLLAMA_ORG.to_string(),
+            org: providers::OLLAMA_ORG.to_string(),
+        };
+        assert!(
+            file.provider_subscription(&ollama).is_some(),
+            "the first reading did not create the subscription"
+        );
+    }
+
+    /// R6: neither provider is found, so nothing is read and no request is
+    /// sent, exactly as today with both cards off.
+    #[test]
+    fn nothing_is_read_when_neither_is_found() {
+        let dir = tempdir().expect("tempdir");
+        // A folder where auth.json is a directory: `is_file` is false, so
+        // Codex is not found.
+        let codex_home = dir.path().join("codex");
+        std::fs::create_dir_all(codex_home.join("auth.json")).expect("the folder");
+        let server = Fake::start(vec![(200, PLUS_ANSWER.to_string())]);
+        let mut runtime = test_runtime(dir.path(), codex_api(&server.base), &codex_home);
+        let settings = Settings {
+            ollama_url: server.base.clone(),
+            ..settings()
+        };
+
+        let views = runtime.poll_round(&settings, utc("2026-11-14T09:00:00Z"));
+        let paths = server.finish();
+
+        assert!(views.is_empty(), "nothing found, so there is no card");
+        assert!(
+            paths.is_empty(),
+            "nothing found, but a request was sent: {paths:?}"
+        );
+        let samples = history(dir.path())
+            .read::<Sample>(&Range::ALL, &Hosts::All)
+            .expect("the samples");
+        assert!(
+            samples.records.is_empty(),
+            "nothing found, but a reading was recorded"
+        );
+    }
+
+    /// Review Focus 5 (R6): a closed port for three polls is one report and a
+    /// quiet card line; an answer on the fourth poll records and shows as
+    /// usual.
+    #[test]
+    fn ollama_not_running_is_reported_once_and_recovers() {
+        let dir = tempdir().expect("tempdir");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a local port");
+        let port = listener.local_addr().expect("a local address").port();
+        let url = format!("http://127.0.0.1:{port}");
+        drop(listener);
+        let (sender, reports) = mpsc::channel();
+        let report: ReportError = Box::new(move |text| {
+            let _ = sender.send(text.to_string());
+        });
+        let mut runtime = test_runtime_with_path(
+            dir.path(),
+            offline_api(),
+            explicit_codex_paths(),
+            same_settings(),
+            report,
+            OsString::new(),
+        );
+        let settings = ollama_on(&url);
+
+        let first = only_view(runtime.poll_round(&settings, utc("2026-11-14T09:00:00Z")));
+        assert!(
+            first.not_running,
+            "the card line must say Ollama is not running"
+        );
+        assert_eq!(
+            first.error, None,
+            "a not-running Ollama has no error banner"
+        );
+        assert_eq!(
+            first.fetched_at, None,
+            "nothing was read, so there is no time"
+        );
+        runtime.poll_round(&settings, utc("2026-11-14T09:05:00Z"));
+        runtime.poll_round(&settings, utc("2026-11-14T09:10:00Z"));
+        let reported: Vec<String> = reports.try_iter().collect();
+        assert_eq!(
+            reported,
+            vec![format!("Ollama is not running on {url}.")],
+            "the change to not running must be reported once"
+        );
+
+        let server = Fake::start_on(
+            port,
+            vec![(200, BALANCE.to_string()), (200, USAGE_ANSWER.to_string())],
+        );
+        let fourth = only_view(runtime.poll_round(&settings, utc("2026-11-14T09:15:00Z")));
+        let paths = server.finish();
+
+        assert_eq!(
+            paths,
+            vec![
+                "/api/balance".to_string(),
+                "/api/usage?range=24h".to_string()
+            ],
+            "the answering server was not asked"
+        );
+        assert!(!fourth.not_running, "the quiet line stayed after an answer");
+        assert_eq!(fourth.error, None);
+        assert!(fourth.credits.is_some(), "the answer's numbers are shown");
+        let samples = history(dir.path())
+            .read::<Sample>(&Range::ALL, &Hosts::All)
+            .expect("the samples");
+        assert_eq!(
+            samples.records.len(),
+            1,
+            "the answering poll's reading was not recorded"
+        );
+    }
+
+    /// R6 review: a found Ollama that is not running and whose card is off is
+    /// not reported as a notification; it is printed on stderr once, and the
+    /// next poll does not print the same text again.
+    #[test]
+    fn a_found_ollama_that_is_not_running_is_printed_not_notified_with_the_card_off() {
+        let dir = tempdir().expect("tempdir");
+        let bin = dir.path().join("bin");
+        fake_program(&bin);
+        let path_var = std::env::join_paths([bin.as_path()]).expect("a PATH value");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a local port");
+        let url = format!("http://{}", listener.local_addr().expect("a local address"));
+        drop(listener);
+        let (sender, reports) = mpsc::channel();
+        let report: ReportError = Box::new(move |text| {
+            let _ = sender.send(text.to_string());
+        });
+        let mut runtime = test_runtime_with_path(
+            dir.path(),
+            offline_api(),
+            explicit_codex_paths(),
+            same_settings(),
+            report,
+            path_var,
+        );
+        let settings = Settings {
+            ollama_url: url,
+            ..Settings::default()
+        };
+
+        let first = runtime.poll_round(&settings, utc("2026-11-14T09:00:00Z"));
+        let second = runtime.poll_round(&settings, utc("2026-11-14T09:05:00Z"));
+
+        assert!(
+            first.is_empty() && second.is_empty(),
+            "a card that is off showed a view: {first:?} {second:?}"
+        );
+        let texts: Vec<String> = reports.try_iter().collect();
+        assert!(
+            texts.is_empty(),
+            "a found provider's not-running error with the card off was notified: {texts:?}"
+        );
+        assert_eq!(
+            super::super::lock(&runtime.printed_warnings).len(),
+            1,
+            "the not-running error was not printed once on stderr"
+        );
+    }
+
+    /// R6 review: a Codex login found in `auth.json` that cannot be read, with
+    /// the card off, is printed on stderr once and never notified.
+    #[test]
+    fn a_found_codex_login_that_cannot_be_read_is_printed_not_notified_with_the_card_off() {
+        let dir = tempdir().expect("tempdir");
+        let codex_home = dir.path().join("codex");
+        std::fs::create_dir_all(&codex_home).expect("the Codex folder");
+        std::fs::write(
+            codex_home.join("auth.json"),
+            r#"{"OPENAI_API_KEY":"sk-proj-made-up-not-a-real-key","auth_mode":"apikey"}"#,
+        )
+        .expect("auth.json");
+        let (sender, reports) = mpsc::channel();
+        let report: ReportError = Box::new(move |text| {
+            let _ = sender.send(text.to_string());
+        });
+        let mut runtime = test_runtime_with(
+            dir.path(),
+            offline_api(),
+            Box::new(move |_| Ok(CodexPaths::at(&codex_home))),
+            same_settings(),
+            report,
+        );
+
+        let views = runtime.poll_round(&Settings::default(), utc("2026-11-14T09:00:00Z"));
+
+        assert!(
+            views.is_empty(),
+            "the card is off, so there is no view: {views:?}"
+        );
+        let texts: Vec<String> = reports.try_iter().collect();
+        assert!(
+            texts.is_empty(),
+            "a found login's error with the card off was notified: {texts:?}"
+        );
+        assert_eq!(
+            super::super::lock(&runtime.printed_warnings).len(),
+            1,
+            "the unreadable login was not printed once on stderr"
+        );
+    }
+
+    /// R6 review: the not-running flag is reset when the Ollama URL changes, so
+    /// a not-running server at the new URL is reported again.
+    #[test]
+    fn a_not_running_ollama_at_a_changed_url_is_reported_again() {
+        let dir = tempdir().expect("tempdir");
+        let first_listener = TcpListener::bind("127.0.0.1:0").expect("a first local port");
+        let first_url = format!(
+            "http://{}",
+            first_listener.local_addr().expect("a local address")
+        );
+        drop(first_listener);
+        let second_listener = TcpListener::bind("127.0.0.1:0").expect("a second local port");
+        let second_url = format!(
+            "http://{}",
+            second_listener.local_addr().expect("a local address")
+        );
+        drop(second_listener);
+        let (sender, reports) = mpsc::channel();
+        let report: ReportError = Box::new(move |text| {
+            let _ = sender.send(text.to_string());
+        });
+        let mut runtime = test_runtime_with_path(
+            dir.path(),
+            offline_api(),
+            explicit_codex_paths(),
+            same_settings(),
+            report,
+            OsString::new(),
+        );
+
+        let first =
+            only_view(runtime.poll_round(&ollama_on(&first_url), utc("2026-11-14T09:00:00Z")));
+        assert!(first.not_running, "the first URL is not running");
+        let second =
+            only_view(runtime.poll_round(&ollama_on(&second_url), utc("2026-11-14T09:05:00Z")));
+        assert!(second.not_running, "the second URL is not running");
+
+        let texts: Vec<String> = reports.try_iter().collect();
+        assert_eq!(
+            texts,
+            vec![
+                format!("Ollama is not running on {first_url}."),
+                format!("Ollama is not running on {second_url}.")
+            ],
+            "the not-running state at the new URL was not reported again"
+        );
+    }
+
+    /// R6 review: the not-running flag is also reset when the card is off and
+    /// the provider is not found, because the polling stops; switching the
+    /// card on again reports the still not-running server again.
+    #[test]
+    fn a_not_running_ollama_is_reported_again_after_the_polling_stopped() {
+        let dir = tempdir().expect("tempdir");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a local port");
+        let url = format!("http://{}", listener.local_addr().expect("a local address"));
+        drop(listener);
+        let (sender, reports) = mpsc::channel();
+        let report: ReportError = Box::new(move |text| {
+            let _ = sender.send(text.to_string());
+        });
+        let mut runtime = test_runtime_with_path(
+            dir.path(),
+            offline_api(),
+            explicit_codex_paths(),
+            same_settings(),
+            report,
+            OsString::new(),
+        );
+        let on = ollama_on(&url);
+        // The card off and no stored subscription: Ollama is not found, so the
+        // polling stops between the two on rounds.
+        let off = Settings {
+            ollama_url: url.clone(),
+            ..Settings::default()
+        };
+
+        let first = only_view(runtime.poll_round(&on, utc("2026-11-14T09:00:00Z")));
+        assert!(first.not_running, "the server is not running");
+        assert!(
+            runtime
+                .poll_round(&off, utc("2026-11-14T09:05:00Z"))
+                .is_empty(),
+            "the card is off, so there is no view"
+        );
+        let second = only_view(runtime.poll_round(&on, utc("2026-11-14T09:10:00Z")));
+        assert!(second.not_running, "the server is still not running");
+
+        let expected = format!("Ollama is not running on {url}.");
+        assert_eq!(
+            reports.try_iter().collect::<Vec<String>>(),
+            vec![expected.clone(), expected],
+            "the not-running state was not reported again after the polling stopped"
+        );
+    }
+
     #[test]
     fn a_reading_goes_into_the_snapshot_and_the_history() {
         let dir = tempdir().expect("tempdir");
@@ -2492,15 +3070,18 @@ mod tests {
             Some("Codex's login has expired. Run codex once to renew it.")
         );
 
-        // A closed port for Ollama.
+        // A closed port for Ollama: a quiet line, not an error (R6).
         let dir = tempdir().expect("tempdir");
         let listener = TcpListener::bind("127.0.0.1:0").expect("a local port");
         let url = format!("http://{}", listener.local_addr().expect("a local address"));
         drop(listener);
         let mut runtime = test_runtime(dir.path(), offline_api(), &dir.path().join("codex"));
         let view = only_view(runtime.poll_round(&ollama_on(&url), utc("2026-11-14T09:00:00Z")));
-        let expected = format!("Ollama is not running on {url}.");
-        assert_eq!(view.error.as_deref(), Some(expected.as_str()));
+        assert_eq!(view.error, None, "a not-running Ollama has no error banner");
+        assert!(
+            view.not_running,
+            "the quiet line names Ollama as not running"
+        );
 
         // A 500: the error's own text.
         let dir = tempdir().expect("tempdir");
@@ -2667,8 +3248,70 @@ mod tests {
         assert_eq!(read.records[0].record.account.org, "ollama");
     }
 
-    /// A failed poll of a priced subscription whose card is off has no card to
-    /// show the error on; it is reported like every other provider error.
+    /// R6 review: a stored Ollama subscription alone, with no price and an
+    /// empty `PATH`, makes Ollama found and polled with the card off.
+    #[test]
+    fn ollama_with_a_stored_subscription_is_polled_with_the_card_off() {
+        let dir = tempdir().expect("tempdir");
+        let app = test_app(dir.path());
+        let store = test_store(dir.path());
+        let account = AccountRef {
+            acc: providers::OLLAMA_ORG.to_string(),
+            org: providers::OLLAMA_ORG.to_string(),
+        };
+        let mut file = store.load().expect("accounts.json");
+        file.ensure_provider_subscription(&account, None)
+            .expect("the Ollama subscription");
+        let subscription = file
+            .provider_subscription(&account)
+            .expect("the Ollama subscription");
+        assert_eq!(subscription.price, None, "the subscription has no price");
+        store.save(&file).expect("accounts.json");
+
+        let server = Fake::start(vec![
+            (200, BALANCE.to_string()),
+            (200, USAGE_ANSWER.to_string()),
+        ]);
+        // `test_runtime_with_app` gives the runtime an empty `PATH`: only the
+        // stored subscription can make Ollama found.
+        let mut runtime = test_runtime_with_app(
+            dir.path(),
+            codex_api(&server.base),
+            Box::new(|_| Ok(CodexPaths::at(Path::new("unused-codex-home")))),
+            same_settings(),
+            Box::new(|_| {}),
+            app,
+        );
+        let settings = Settings {
+            ollama_url: server.base.clone(),
+            ..Settings::default()
+        };
+
+        let views = runtime.poll_round(&settings, utc("2026-11-14T09:00:00Z"));
+        let paths = server.finish();
+
+        assert_eq!(
+            paths,
+            vec![
+                "/api/balance".to_string(),
+                "/api/usage?range=24h".to_string()
+            ],
+            "the subscription alone did not make Ollama polled with the card off"
+        );
+        assert!(
+            views.is_empty(),
+            "a card that is off showed a view: {views:?}"
+        );
+        let read = history(dir.path())
+            .read::<Sample>(&Range::ALL, &Hosts::All)
+            .expect("the samples");
+        assert_eq!(read.records.len(), 1, "the reading was recorded");
+        assert_eq!(read.records[0].record.account.org, "ollama");
+    }
+
+    /// A failed poll of a found subscription whose card is off has no card to
+    /// show the error on; it is printed once on stderr and never notified (R6
+    /// review).
     #[test]
     fn a_failed_poll_of_a_priced_card_that_is_off_shows_no_card() {
         let dir = tempdir().expect("tempdir");
@@ -2704,7 +3347,8 @@ mod tests {
             report,
             app,
         );
-        // The card stays off; only the price makes the provider polled.
+        // The card stays off; the stored subscription makes the provider
+        // polled.
         let settings = Settings {
             ollama_url: server.base.clone(),
             ..Settings::default()
@@ -2718,15 +3362,14 @@ mod tests {
             "a card that is off showed an error view: {views:?}"
         );
         let texts: Vec<String> = reports.try_iter().collect();
-        assert_eq!(
-            texts.len(),
-            1,
-            "the failure was not reported once: {texts:?}"
-        );
         assert!(
-            texts[0].contains("server error 500"),
-            "the reported text is not the provider's: {}",
-            texts[0]
+            texts.is_empty(),
+            "a found provider's error with the card off was notified: {texts:?}"
+        );
+        assert_eq!(
+            super::super::lock(&runtime.printed_warnings).len(),
+            1,
+            "the failure was not printed once on stderr"
         );
     }
 
@@ -2964,6 +3607,7 @@ mod tests {
             codex_api(&server.base),
             None,
             app.clone(),
+            Some(OsString::new()),
             test_store_opener(app),
             Box::new(move |_| Ok(CodexPaths::at(&codex_home))),
             same_settings(),
@@ -2986,15 +3630,67 @@ mod tests {
     // ---- the second review round ----
 
     /// A save is queued behind the running request: the settings read after the
-    /// request says the card is off, so that request leaves nothing behind.
+    /// request says the card is off and the provider is not found, so that
+    /// request leaves nothing behind.
     #[test]
     fn a_card_switched_off_during_its_request_leaves_no_trace() {
+        let dir = tempdir().expect("tempdir");
+        let server = Fake::start(vec![
+            (200, BALANCE.to_string()),
+            (200, USAGE_ANSWER.to_string()),
+        ]);
+        let off = Settings {
+            ollama_url: server.base.clone(),
+            ..settings()
+        };
+        let lookup: SettingsLookup = Box::new(move |_| Ok(off.clone()));
+        let mut runtime = test_runtime_with(
+            dir.path(),
+            codex_api(&server.base),
+            explicit_codex_paths(),
+            lookup,
+            Box::new(|_| {}),
+        );
+
+        let views = runtime.poll_round(&ollama_on(&server.base), utc("2026-11-14T09:00:00Z"));
+        let paths = server.finish();
+
+        assert!(
+            views.is_empty(),
+            "the dropped reading made a card: {views:?}"
+        );
+        assert_eq!(
+            paths,
+            vec![
+                "/api/balance".to_string(),
+                "/api/usage?range=24h".to_string()
+            ],
+            "the request ran before the switch"
+        );
+        let read = history(dir.path())
+            .read::<Sample>(&Range::ALL, &Hosts::All)
+            .expect("the samples");
+        assert!(
+            read.records.is_empty(),
+            "the dropped reading wrote a sample line"
+        );
+    }
+
+    /// R6 review: the Codex counterpart of the test above. `auth.json` is
+    /// removed while its request runs and the card is off, so the found login
+    /// is gone and the request leaves nothing behind.
+    #[test]
+    fn a_codex_login_removed_during_its_request_leaves_no_trace() {
         let dir = tempdir().expect("tempdir");
         let codex_home = dir.path().join("codex");
         write_auth(&codex_home);
         let server = Fake::start(vec![(200, PLUS_ANSWER.to_string())]);
         let off = settings();
-        let lookup: SettingsLookup = Box::new(move |_| Ok(off.clone()));
+        let removed = codex_home.clone();
+        let lookup: SettingsLookup = Box::new(move |_| {
+            std::fs::remove_file(removed.join("auth.json")).expect("remove auth.json");
+            Ok(off.clone())
+        });
         let folder = codex_home.clone();
         let mut runtime = test_runtime_with(
             dir.path(),
@@ -3004,7 +3700,7 @@ mod tests {
             Box::new(|_| {}),
         );
 
-        let views = runtime.poll_round(&codex_on(), utc("2026-11-14T09:00:00Z"));
+        let views = runtime.poll_round(&settings(), utc("2026-11-14T09:00:00Z"));
         let paths = server.finish();
 
         assert!(
@@ -3014,7 +3710,7 @@ mod tests {
         assert_eq!(
             paths,
             vec!["/backend-api/wham/usage".to_string()],
-            "the request ran before the switch"
+            "the request ran before the login was removed"
         );
         let read = history(dir.path())
             .read::<Sample>(&Range::ALL, &Hosts::All)
@@ -3142,8 +3838,14 @@ mod tests {
         let second = only_view(runtime.poll_round(&ollama_on(&url), utc("2026-11-14T09:10:00Z")));
         let _ = server.finish();
 
-        let expected = format!("Ollama is not running on {url}.");
-        assert_eq!(second.error.as_deref(), Some(expected.as_str()));
+        assert_eq!(
+            second.error, None,
+            "a not-running Ollama has no error banner"
+        );
+        assert!(
+            second.not_running,
+            "the changed URL's server is not running"
+        );
         assert_eq!(second.credits, None, "the old server's credits stay");
         assert_eq!(second.usage, None, "the old server's usage stays");
         assert_eq!(second.fetched_at, None, "the old reading's time stays");
@@ -3168,6 +3870,7 @@ mod tests {
             codex_api(&server.base),
             None,
             app.clone(),
+            Some(OsString::new()),
             test_store_opener(app),
             Box::new(move |_| Ok(CodexPaths::at(&folder))),
             same_settings(),

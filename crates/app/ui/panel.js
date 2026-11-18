@@ -68,6 +68,10 @@ const state = {
 // limits at all.
 const NO_LIMITS_TEXT = "No usage limits in the reply.";
 
+// The quiet line of a provider that is installed but not running (R6): no
+// error colour and no error banner.
+const NOT_RUNNING_TEXT = "Ollama is not running.";
+
 function fmtPercent(value) {
   return `${shortPercent(value)} %`;
 }
@@ -1149,7 +1153,7 @@ function renderProviderCard(view) {
   const rows = logins.length >= 2;
   const live = rows ? logins.find((login) => login.live === true) : null;
   const numbers = rows ? Boolean(live) : Boolean(credits || view.usage);
-  const stale = Boolean(view.error) && numbers && !rows;
+  const stale = (Boolean(view.error) || view.notRunning === true) && numbers && !rows;
   const ringKey = `provider:${view.provider}`;
 
   let gauge = null;
@@ -1217,10 +1221,15 @@ function renderProviderCard(view) {
 
   // A failed round with no live login has no row to carry its text, so the card
   // says it itself, as it always did; a live row that already shows the same
-  // text is not repeated.
+  // text is not repeated. A provider that is not running says so in one quiet
+  // line instead, with no error banner (R6).
   const liveMessage =
     live && typeof live.message === "string" && live.message !== "" ? live.message : null;
-  if (view.error && view.error !== liveMessage) {
+  if (view.notRunning === true) {
+    main.appendChild(
+      h("div", { class: "card-note", text: NOT_RUNNING_TEXT, title: NOT_RUNNING_TEXT })
+    );
+  } else if (view.error && view.error !== liveMessage) {
     main.appendChild(
       h("div", {
         class: "card-note error",
