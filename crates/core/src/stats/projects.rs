@@ -1,7 +1,7 @@
 //! The Projects page (spec §3.6): the tree of organizations, projects and
-//! folders, the organization × account matrix with its sentences, the tokens
-//! per percent of each account, and one project's detail. Everything here only
-//! reads.
+//! folders, the organization × subscription matrix with its sentences, the
+//! tokens per percent of each account, and one project's detail. Everything
+//! here only reads.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -53,14 +53,14 @@ pub struct Node {
     /// The two values of the node's records, built with [`Values::of`]: a
     /// missing half names its reason, and the API half names its currency.
     pub values: Values,
-    /// Each Claude account's share of this node's API value, in %, largest
-    /// first; `None` is a Claude record without a known account.
-    pub by_account: Vec<(Option<String>, f64)>,
-    /// Each other company's share of this node's API value, in %, largest
-    /// first, by the company's lowercase JSON key (`openai`, `ollama`): its
-    /// work belongs to its provider subscription, not to a Claude account. With
-    /// `by_account` it makes up the node's API value.
-    pub by_provider: Vec<(Company, f64)>,
+    /// Each subscription's share of this node's API value, in %, largest first;
+    /// ties in the chips' order ([`account_position`]). The id is a stored
+    /// Claude account's id ([`account_id`]) or a provider subscription's
+    /// `account.acc`; `None` is work without a known subscription (a Claude
+    /// record without an account, a provider record without a named
+    /// subscription). Empty when the node's API value is unknown, 0 or partial
+    /// ([`full_half`]); a part whose API half is partial or unknown is left out.
+    pub by_subscription: Vec<(Option<String>, f64)>,
     /// The distinct sessions of the node's records.
     pub sessions: u32,
 }
@@ -110,24 +110,30 @@ pub struct UsdRate {
     pub varies: bool,
 }
 
-/// The organization × account matrix.
+/// The organization × subscription matrix.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Matrix {
     /// The organizations' shown names, in the tree's order.
     pub orgs: Vec<String>,
-    /// The chosen stored accounts' ids, in [`Ctx::accounts`]' order.
-    pub accounts: Vec<String>,
-    /// The subscription value per organization and account:
-    /// `cells[org][account]`; `None` when a record has no subscription value.
+    /// The chosen Claude accounts in [`Ctx::accounts`]' order, then the chosen
+    /// provider subscriptions in the chips' order (stored order), with the ids
+    /// [`Node::by_subscription`] writes.
+    pub subscriptions: Vec<String>,
+    /// The subscription value per organization and subscription:
+    /// `cells[org][subscription]`; `None` when a record of it has no subscription
+    /// value (a provider subscription without a price), and a measured
+    /// `Some(0.0)` when it has no record there.
     pub cells: Vec<Vec<Option<f64>>>,
-    /// Each organization's cells added up over the accounts: `row_totals[org]`.
-    pub row_totals: Vec<Option<f64>>,
-    /// Each account's cells added up over the organizations:
-    /// `column_totals[account]`.
-    pub column_totals: Vec<Option<f64>>,
+    /// Each organization's cells added up over the subscriptions, as the
+    /// [`Values::sum`] of their records: `row_totals[org]`. A cell without a
+    /// value makes the sum partial (R3), never unknown.
+    pub row_totals: Vec<Values>,
+    /// Each subscription's cells added up over the organizations:
+    /// `column_totals[subscription]`.
+    pub column_totals: Vec<Values>,
     /// Every cell added up.
-    pub total: Option<f64>,
+    pub total: Values,
     pub sentences: Vec<String>,
 }
 
@@ -144,6 +150,9 @@ pub struct ProjectDetail {
     pub hosts: Vec<(String, f64)>,
     /// The two values of the project's records, built with [`Values::of`].
     pub values: Values,
+    /// Each subscription's share of the project's API value, in %, by the same
+    /// rule as [`Node::by_subscription`].
+    pub by_subscription: Vec<(Option<String>, f64)>,
     /// The project's API value as a share of the page's API value, in %; `None`
     /// when the project's own value or the page's total is missing (an unknown
     /// share is not a measured zero), or when the page's total is zero.
@@ -261,11 +270,25 @@ pub(crate) fn projects_page_in<Tz: TimeZone + Copy>(
         .iter()
         .filter(|account| account_chosen(ctx, q, Some(&AccountRef::of(account))))
         .collect();
+    // The matrix's columns: the chosen Claude accounts in the stored accounts'
+    // order, then the chosen provider subscriptions in the chips' order.
+    let mut chosen_subscriptions: Vec<AccountRef> = chosen_accounts
+        .iter()
+        .map(|account| AccountRef::of(account))
+        .collect();
+    chosen_subscriptions.extend(
+        ctx.provider_subscriptions
+            .iter()
+            .filter(|subscription| account_chosen(ctx, q, Some(&subscription.account)))
+            .map(|subscription| subscription.account.clone()),
+    );
     let currency = ctx.settings.currency.as_deref().map(str::to_string);
 
     let mut nodes = Vec::new();
     let mut matrix_orgs = Vec::new();
     let mut cells = Vec::new();
+    let mut row_totals = Vec::new();
+    let mut column_values: Vec<Option<Values>> = vec![None; chosen_subscriptions.len()];
     let mut sentences = Vec::new();
     for org in &orgs {
         let org_accounts = match &org.identity {
@@ -296,7 +319,19 @@ pub(crate) fn projects_page_in<Tz: TimeZone + Copy>(
             &page_values,
         ));
         matrix_orgs.push(org.name.clone());
-        cells.push(org_cells(org, &chosen_accounts));
+        cells.push(org_cells(org, &chosen_subscriptions));
+        // The row total is the sum of the records of its cells: every chosen
+        // subscription that has records in this organization, partial halves
+        // and their reasons kept (R3). A subscription with no record here adds
+        // nothing, the same as its measured 0 cell.
+        let mut row_parts: Vec<&Values> = Vec::new();
+        for (column, subscription) in chosen_subscriptions.iter().enumerate() {
+            if let Some(values) = org.sums.by_subscription.get(&Some(subscription.clone())) {
+                row_parts.push(values);
+                add_opt_value(&mut column_values[column], values);
+            }
+        }
+        row_totals.push(Values::sum(&row_parts));
         sentences.extend(org_sentences(ctx, org, &orgs, currency.as_deref()));
 
         let mut members = org.members.clone();
@@ -392,16 +427,15 @@ pub(crate) fn projects_page_in<Tz: TimeZone + Copy>(
     }
 
     let mut unknown_account_tokens = Tokens::default();
-    let mut providers: BTreeSet<Company> = BTreeSet::new();
+    let mut readings_tokens = Tokens::default();
+    let mut has_readings = false;
     for entry in &entries {
-        match entry.value.company {
-            Company::Anthropic if entry.value.account.is_none() => {
-                unknown_account_tokens += Tokens::from(entry.record);
-            }
-            Company::Anthropic => {}
-            other => {
-                providers.insert(other);
-            }
+        if entry.value.company == Company::Anthropic && entry.value.account.is_none() {
+            unknown_account_tokens += Tokens::from(entry.record);
+        }
+        if entry.value.account_from_readings {
+            has_readings = true;
+            readings_tokens += Tokens::from(entry.record);
         }
     }
 
@@ -423,17 +457,14 @@ pub(crate) fn projects_page_in<Tz: TimeZone + Copy>(
             thousands(unknown_total as i64)
         ));
     }
-    // A provider's work is in the tree's API value and in its own
-    // subscription's value when that has a price; it is in no Claude account's
-    // matrix cell. The page says whose work it is.
-    if !providers.is_empty() {
-        let names: Vec<String> = providers
-            .iter()
-            .map(|company| company.name().to_string())
-            .collect();
+    // R4: a record whose account came from the usage readings counts as that
+    // account everywhere on the page; only this note names the readings.
+    if has_readings {
+        let readings_total =
+            readings_tokens.input + readings_tokens.out + readings_tokens.cw + readings_tokens.cr;
         notes.push(format!(
-            "{} work belongs to its provider subscription, not to a Claude account.",
-            join_names(&names)
+            "{} tokens: account taken from the usage readings.",
+            thousands(readings_total as i64)
         ));
     }
     // A record with a known account can still have no subscription value (a
@@ -463,22 +494,25 @@ pub(crate) fn projects_page_in<Tz: TimeZone + Copy>(
         ));
     }
 
+    let column_totals: Vec<Values> = column_values
+        .into_iter()
+        .map(|values| values.unwrap_or_else(|| Values::sum(&[])))
+        .collect();
+    let total = {
+        let parts: Vec<&Values> = row_totals.iter().collect();
+        Values::sum(&parts)
+    };
     Ok(ProjectsPage {
         nodes,
         matrix: Matrix {
             orgs: matrix_orgs,
-            accounts: chosen_accounts
+            subscriptions: chosen_subscriptions
                 .iter()
-                .map(|account| account.id.clone())
+                .map(|subscription| account_id(ctx, subscription))
                 .collect(),
-            row_totals: cells
-                .iter()
-                .map(|row| sum_cells(row.iter().copied()))
-                .collect(),
-            column_totals: (0..chosen_accounts.len())
-                .map(|column| sum_cells(cells.iter().map(|row| row[column])))
-                .collect(),
-            total: sum_cells(cells.iter().flatten().copied()),
+            row_totals,
+            column_totals,
+            total,
             cells,
             sentences,
         },
@@ -488,19 +522,6 @@ pub(crate) fn projects_page_in<Tz: TimeZone + Copy>(
         notes,
         usd_rate: page_usd_rate(ctx, range),
     })
-}
-
-/// The sum of some amounts: unknown as soon as one part is unknown, because a
-/// missing subscription value must not be counted as a measured zero.
-fn sum_cells(parts: impl Iterator<Item = Option<f64>>) -> Option<f64> {
-    let mut total: Option<f64> = Some(0.0);
-    for part in parts {
-        total = match (total, part) {
-            (Some(sum), Some(value)) => Some(sum + value),
-            _ => return None,
-        };
-    }
-    total
 }
 
 /// The dollar rate the page's API values are in, at the range's end: from the
@@ -712,6 +733,7 @@ pub(crate) fn project_detail_in<Tz: TimeZone + Copy>(
         },
         hosts: host_shares,
         values: sums.values(),
+        by_subscription: by_subscription(ctx, &sums),
         share: share_of(&sums.values(), page_values.as_ref()),
         weekly_by_model,
         sessions: sums.sessions.len() as u32,
@@ -735,12 +757,10 @@ struct Entry<'a> {
 struct Sums {
     tokens: Tokens,
     values: Option<Values>,
-    /// The Claude records' API value by account; `None` is a Claude record
-    /// without a known account.
-    api_by_account: BTreeMap<Option<AccountRef>, Values>,
-    /// The API value of the records of every other company.
-    api_by_provider: BTreeMap<Company, Values>,
-    sub_by_account: BTreeMap<AccountRef, Values>,
+    /// The records' two values by subscription: a Claude account, a provider
+    /// subscription, or `None` for work without a known subscription. The API
+    /// shares and the subscription values are the same accumulation.
+    by_subscription: BTreeMap<Option<AccountRef>, Values>,
     sessions: BTreeSet<String>,
 }
 
@@ -750,17 +770,11 @@ impl Sums {
         self.tokens += Tokens::from(record);
         self.sessions.insert(record.session.clone());
         add_opt_value(&mut self.values, &entry.values);
-        match entry.value.company {
-            Company::Anthropic => add_value(
-                &mut self.api_by_account,
-                entry.value.account.clone(),
-                &entry.values,
-            ),
-            other => add_value(&mut self.api_by_provider, other, &entry.values),
-        }
-        if let Some(account) = &entry.value.account {
-            add_value(&mut self.sub_by_account, account.clone(), &entry.values);
-        }
+        add_value(
+            &mut self.by_subscription,
+            entry.value.account.clone(),
+            &entry.values,
+        );
     }
 
     fn merge(&mut self, other: &Sums) {
@@ -768,14 +782,8 @@ impl Sums {
         if let Some(values) = &other.values {
             add_opt_value(&mut self.values, values);
         }
-        for (account, values) in &other.api_by_account {
-            add_value(&mut self.api_by_account, account.clone(), values);
-        }
-        for (provider, values) in &other.api_by_provider {
-            add_value(&mut self.api_by_provider, *provider, values);
-        }
-        for (account, values) in &other.sub_by_account {
-            add_value(&mut self.sub_by_account, account.clone(), values);
+        for (subscription, values) in &other.by_subscription {
+            add_value(&mut self.by_subscription, subscription.clone(), values);
         }
         self.sessions.extend(other.sessions.iter().cloned());
     }
@@ -829,25 +837,41 @@ fn node_from<Tz: TimeZone + Copy>(
         tokens: sums.tokens,
         share: share_of(&values, Some(page)),
         values,
-        by_account: by_account(ctx, sums),
-        by_provider: by_provider(sums),
+        by_subscription: by_subscription(ctx, sums),
         sessions: sums.sessions.len() as u32,
     }
 }
 
-/// Each account's share of the node's API value, largest first; an account no
-/// longer stored sorts after the stored ones.
-fn by_account<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, sums: &Sums) -> Vec<(Option<String>, f64)> {
-    let Some(api) = sums.api().filter(|api| *api > 0.0) else {
+/// Each subscription's share of the node's API value, largest first; ties in
+/// the chips' order, an id no longer stored after the stored ones. A share is
+/// computed only from halves that are not partial (R3): an unknown or partial
+/// node value or part gives no share.
+fn by_subscription<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, sums: &Sums) -> Vec<(Option<String>, f64)> {
+    let values = sums.values();
+    let (Some(api), _) = full_half(
+        values.api,
+        values.api_partial,
+        values.api_missing.as_deref(),
+    ) else {
         return Vec::new();
     };
+    if api <= 0.0 {
+        return Vec::new();
+    }
     let mut shares: Vec<(Option<String>, f64)> = sums
-        .api_by_account
+        .by_subscription
         .iter()
-        .filter_map(|(account, values)| {
-            values.api.map(|value| {
+        .filter_map(|(subscription, values)| {
+            let (value, _) = full_half(
+                values.api,
+                values.api_partial,
+                values.api_missing.as_deref(),
+            );
+            value.map(|value| {
                 (
-                    account.as_ref().map(|account| account_id(ctx, account)),
+                    subscription
+                        .as_ref()
+                        .map(|subscription| account_id(ctx, subscription)),
                     value / api * 100.0,
                 )
             })
@@ -863,21 +887,6 @@ fn by_account<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, sums: &Sums) -> Vec<(Option<St
             (None, None) => Ordering::Equal,
         })
     });
-    shares
-}
-
-/// Each other provider's share of the node's API value, largest first, then
-/// by name; the company is serialized as its lowercase JSON key.
-fn by_provider(sums: &Sums) -> Vec<(Company, f64)> {
-    let Some(api) = sums.api().filter(|api| *api > 0.0) else {
-        return Vec::new();
-    };
-    let mut shares: Vec<(Company, f64)> = sums
-        .api_by_provider
-        .iter()
-        .filter_map(|(provider, values)| values.api.map(|value| (*provider, value / api * 100.0)))
-        .collect();
-    shares.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.name().cmp(b.0.name())));
     shares
 }
 
@@ -900,14 +909,22 @@ fn share_of(values: &Values, page: Option<&Values>) -> Option<f64> {
     }
 }
 
-/// The subscription value of the chosen accounts in one organization, in the
-/// accounts' order; an account with no record there has a measured zero.
-fn org_cells(org: &OrgRow, accounts: &[&Account]) -> Vec<Option<f64>> {
-    accounts
+/// The subscription value of the chosen subscriptions in one organization, in
+/// the subscriptions' order; `None` when a record of it has no subscription
+/// value, and a measured zero when it has no record there.
+fn org_cells(org: &OrgRow, subscriptions: &[AccountRef]) -> Vec<Option<f64>> {
+    subscriptions
         .iter()
         .map(
-            |account| match org.sums.sub_by_account.get(&AccountRef::of(account)) {
-                Some(values) => values.subscription,
+            |subscription| match org.sums.by_subscription.get(&Some(subscription.clone())) {
+                Some(values) => {
+                    full_half(
+                        values.subscription,
+                        values.subscription_partial,
+                        values.subscription_missing.as_deref(),
+                    )
+                    .0
+                }
                 None => Some(0.0),
             },
         )
@@ -945,7 +962,7 @@ fn org_sentences<Tz: TimeZone + Copy>(
     let own: BTreeSet<AccountRef> = known.accounts.iter().cloned().collect();
     let own_parts: Vec<&Values> = own
         .iter()
-        .filter_map(|account| org.sums.sub_by_account.get(account))
+        .filter_map(|account| org.sums.by_subscription.get(&Some(account.clone())))
         .collect();
     let own_sub = if own_parts.is_empty() {
         0.0
@@ -986,11 +1003,14 @@ fn org_sentences<Tz: TimeZone + Copy>(
 
     if share < 100.0 {
         if let Some(currency) = currency {
+            // The sentences speak of an organization's own Claude accounts only;
+            // provider subscriptions have their own matrix columns.
             let others: Vec<(&AccountRef, &Values)> = org
                 .sums
-                .sub_by_account
+                .by_subscription
                 .iter()
-                .filter(|(account, _)| !own.contains(*account))
+                .filter_map(|(account, values)| account.as_ref().map(|account| (account, values)))
+                .filter(|(account, _)| account.is_claude() && !own.contains(*account))
                 .collect();
             let other_parts: Vec<&Values> = others.iter().map(|(_, values)| *values).collect();
             let amount = if other_parts.is_empty() {
@@ -1038,7 +1058,7 @@ fn org_sentences<Tz: TimeZone + Copy>(
             }
             let parts: Vec<&Values> = own
                 .iter()
-                .filter_map(|account| other.sums.sub_by_account.get(account))
+                .filter_map(|account| other.sums.by_subscription.get(&Some(account.clone())))
                 .collect();
             if parts.is_empty() {
                 continue;
@@ -1170,9 +1190,11 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use crate::history::{Event, EventKind, HistoryDir, WindowRecord};
+    use crate::history::{Event, EventKind, HistoryDir, LimitSample, Sample, Source, WindowRecord};
     use crate::projects::{ProjectEdit, ProjectsLogRecord};
-    use crate::stats::tests::{all, tiny, utc};
+    use crate::stats::tests::{
+        all, append_codex_records, codex_ref, provider_subscription, tiny, utc,
+    };
     use crate::stats::Range;
 
     /// The plan's range: 2 Nov .. 16 Nov.
@@ -1281,19 +1303,19 @@ mod tests {
     }
 
     #[test]
-    fn by_account_of_atlas() {
+    fn by_subscription_of_atlas() {
         let tiny = tiny();
         let page = projects_page_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
 
         let atlas = node(&page, "atlas");
-        assert_eq!(atlas.by_account.len(), 2);
+        assert_eq!(atlas.by_subscription.len(), 2);
         let lb = atlas
-            .by_account
+            .by_subscription
             .iter()
             .find(|(account, _)| account.as_deref() == Some(&tiny.lb().id))
             .expect("LB's share");
         let ac = atlas
-            .by_account
+            .by_subscription
             .iter()
             .find(|(account, _)| account.as_deref() == Some(&tiny.ac().id))
             .expect("AC's share");
@@ -1302,7 +1324,7 @@ mod tests {
     }
 
     #[test]
-    fn the_matrix() {
+    fn the_matrix_subscription_columns() {
         let tiny = tiny();
         let projects = with_acme_account(&tiny);
         let ctx = Ctx {
@@ -1314,21 +1336,21 @@ mod tests {
         let matrix = &page.matrix;
         assert_eq!(matrix.orgs, vec!["sam", "acme"]);
         assert_eq!(
-            matrix.accounts,
+            matrix.subscriptions,
             vec![tiny.lb().id.clone(), tiny.ac().id.clone()]
         );
-        let cell = |org: &str, account: &str| -> Option<f64> {
+        let cell = |org: &str, subscription: &str| -> Option<f64> {
             let org = matrix
                 .orgs
                 .iter()
                 .position(|name| name == org)
                 .expect("the organization");
-            let account = matrix
-                .accounts
+            let subscription = matrix
+                .subscriptions
                 .iter()
-                .position(|id| id == account)
-                .expect("the account");
-            matrix.cells[org][account]
+                .position(|id| id == subscription)
+                .expect("the subscription");
+            matrix.cells[org][subscription]
         };
         assert!(close(
             cell("sam", &tiny.lb().id).expect("LB's cell"),
@@ -1356,10 +1378,11 @@ mod tests {
         let page = projects_page_in(&ctx, &two_weeks(), &all()).unwrap();
         let matrix = &page.matrix;
 
-        let total_of = |cells: &[Option<f64>]| -> Option<f64> {
+        let sum_of = |cells: &[Option<f64>]| -> f64 {
             cells
                 .iter()
-                .try_fold(0.0, |sum, cell| cell.map(|cell| sum + cell))
+                .map(|cell| cell.expect("the fixture's cells all have a value"))
+                .sum()
         };
         let org = |name: &str| {
             matrix
@@ -1368,49 +1391,63 @@ mod tests {
                 .position(|org| org == name)
                 .expect("the organization")
         };
-        let account = |id: &str| {
+        let subscription = |id: &str| {
             matrix
-                .accounts
+                .subscriptions
                 .iter()
-                .position(|account| account == id)
-                .expect("the account")
+                .position(|subscription| subscription == id)
+                .expect("the subscription")
         };
 
         for (row, total) in matrix.cells.iter().zip(&matrix.row_totals) {
-            assert!(close(total.unwrap(), total_of(row).unwrap()));
+            assert!(close(total.subscription.unwrap(), sum_of(row)));
+            assert!(
+                !total.subscription_partial,
+                "every cell of the row is known"
+            );
         }
-        for column in 0..matrix.accounts.len() {
+        for column in 0..matrix.subscriptions.len() {
             let cells: Vec<Option<f64>> = matrix.cells.iter().map(|row| row[column]).collect();
             assert!(close(
-                matrix.column_totals[column].unwrap(),
-                total_of(&cells).unwrap()
+                matrix.column_totals[column].subscription.unwrap(),
+                sum_of(&cells)
             ));
         }
         let all: Vec<Option<f64>> = matrix.cells.iter().flatten().copied().collect();
-        assert!(close(matrix.total.unwrap(), total_of(&all).unwrap()));
+        assert!(close(matrix.total.subscription.unwrap(), sum_of(&all)));
 
         // The fixture's values: sam 74.769 + 29.077, acme 16.154; LB 74.769,
         // AC 29.077 + 16.154, and every cell 120 EUR together.
         assert!(close(
-            matrix.row_totals[org("sam")].unwrap(),
+            matrix.row_totals[org("sam")].subscription.unwrap(),
             74.769 + 29.077
         ));
-        assert!(close(matrix.row_totals[org("acme")].unwrap(), 16.154));
         assert!(close(
-            matrix.column_totals[account(&tiny.lb().id)].unwrap(),
+            matrix.row_totals[org("acme")].subscription.unwrap(),
+            16.154
+        ));
+        assert!(close(
+            matrix.column_totals[subscription(&tiny.lb().id)]
+                .subscription
+                .unwrap(),
             74.769
         ));
         assert!(close(
-            matrix.column_totals[account(&tiny.ac().id)].unwrap(),
+            matrix.column_totals[subscription(&tiny.ac().id)]
+                .subscription
+                .unwrap(),
             29.077 + 16.154
         ));
-        assert!(close(matrix.total.unwrap(), 120.0));
+        assert!(close(matrix.total.subscription.unwrap(), 120.0));
 
-        // The page reads these keys: `rowTotals`, `columnTotals` and `total`.
+        // The page reads these keys: `rowTotals`, `columnTotals` and `total`,
+        // each a `Values` (J-4 draws them with `valueNode`).
         let json = serde_json::to_value(&page).expect("the page's JSON shape");
         assert!(json["matrix"]["rowTotals"].is_array());
+        assert!(json["matrix"]["rowTotals"][0].is_object());
         assert!(json["matrix"]["columnTotals"].is_array());
-        assert!(json["matrix"]["total"].is_number());
+        assert!(json["matrix"]["columnTotals"][0].is_object());
+        assert!(json["matrix"]["total"].is_object());
     }
 
     #[test]
@@ -1681,14 +1718,13 @@ mod tests {
         );
     }
 
-    /// A Codex record on atlas belongs to Codex, not to the account that was
-    /// live: it is in `by_provider`, not in `by_account`, not in the unknown
-    /// account's tokens and in no matrix cell; the page says whose work it is.
-    /// The account chips choose each provider by its subscription (decision
-    /// P-2 8): this history names no OpenAI subscription, so choosing LB alone
-    /// leaves only LB's own work.
+    /// A Codex record on atlas with no stored OpenAI subscription names no
+    /// subscription: it is the `None` part of `by_subscription`, not a Claude
+    /// account, and it is not in the unknown account's tokens or in a matrix
+    /// cell. The account chips choose each provider by its subscription
+    /// (decision P-2 8): choosing LB alone leaves only LB's own work.
     #[test]
-    fn codex_work_is_its_providers() {
+    fn codex_work_without_a_named_subscription_is_unknown() {
         let mut tiny = tiny();
         price_codex(&mut tiny);
         let before = projects_page_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
@@ -1710,29 +1746,38 @@ mod tests {
             Some(150.0),
             "120 EUR of Claude, 30 of Codex"
         );
-        assert_eq!(atlas_node.by_provider, vec![(Company::OpenAI, 20.0)]);
+        assert_eq!(
+            atlas_node.by_subscription.len(),
+            3,
+            "{:?}",
+            atlas_node.by_subscription
+        );
+        let unknown = atlas_node
+            .by_subscription
+            .iter()
+            .find(|(subscription, _)| subscription.is_none())
+            .expect("the Codex work's unknown subscription");
+        assert!(close(unknown.1, 20.0), "the unknown part {}", unknown.1);
+        assert!(atlas_node
+            .by_subscription
+            .iter()
+            .filter(|(subscription, _)| subscription.is_some())
+            .all(|(_, share)| close(*share, 40.0)));
         let json = serde_json::to_value(atlas_node).expect("the node's JSON shape");
         assert_eq!(
-            json["byProvider"],
-            serde_json::json!([["openai", 20.0]]),
-            "the company is the lowercase JSON key"
+            json["bySubscription"],
+            serde_json::json!([
+                [tiny.lb().id.clone(), 40.0],
+                [tiny.ac().id.clone(), 40.0],
+                [serde_json::Value::Null, 20.0],
+            ]),
+            "the chip ids, and null for work without a known subscription"
         );
-        assert_eq!(
-            atlas_node.by_account.len(),
-            2,
-            "{:?}",
-            atlas_node.by_account
-        );
-        assert!(atlas_node
-            .by_account
-            .iter()
-            .all(|(account, share)| account.is_some() && close(*share, 40.0)));
         assert_eq!(page.unknown_account_tokens, before.unknown_account_tokens);
         assert_eq!(page.matrix, before.matrix, "Codex is in no matrix cell");
         assert!(
-            page.notes.iter().any(|note| note
-                == "OpenAI work belongs to its provider subscription, not to a Claude account."),
-            "notes: {:#?}",
+            !page.notes.iter().any(|note| note.contains("OpenAI")),
+            "the matrix now has the provider's column: {:#?}",
             page.notes
         );
         assert!(!before.notes.iter().any(|note| note.contains("OpenAI")));
@@ -1749,9 +1794,240 @@ mod tests {
             Some(60.0),
             "only LB's own work: the Codex work's subscription is none the query names"
         );
-        assert_eq!(atlas_node.by_account.len(), 1);
+        assert_eq!(atlas_node.by_subscription.len(), 1);
         let detail = project_detail_in(&tiny.ctx(), &two_weeks(), &only_lb, &atlas()).unwrap();
         assert_eq!(detail.values.api, Some(60.0));
+    }
+
+    /// A Codex record on atlas with a stored OpenAI subscription is part of OA
+    /// everywhere: a part of the node's `by_subscription`, the matrix's OA
+    /// column and the row total over the subscriptions (R2).
+    #[test]
+    fn provider_work_is_a_part_of_its_subscription() {
+        let mut tiny = tiny();
+        price_codex(&mut tiny);
+        let oa = codex_ref();
+        tiny.provider_subscriptions = vec![provider_subscription(&oa, "OA", Some(23.0))];
+        // The OpenAI subscription's week of 7 Nov .. 14 Nov, with 12 % used.
+        append_codex_records(&tiny.history, utc("2026-11-14T09:00:00Z"));
+        tiny.history
+            .append(&record(
+                "2026-11-10T10:00:00Z",
+                "019a7c3e-4b2a-7d3f-9e6a-b8c52f0a1d7e",
+                "/home/sam/projects/atlas/engine",
+                atlas(),
+                "gpt-6.1-sol",
+                1_000_000,
+            ))
+            .expect("a Codex record");
+
+        let page = projects_page_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        let atlas_node = node(&page, "atlas");
+        assert_eq!(
+            atlas_node.values.api,
+            Some(130.0),
+            "120 EUR of Claude, 10 of Codex"
+        );
+        let oa_share = atlas_node
+            .by_subscription
+            .iter()
+            .find(|(subscription, _)| subscription.as_deref() == Some(&oa.acc))
+            .expect("OA's share of atlas");
+        assert!(close(oa_share.1, 10.0 / 130.0 * 100.0), "OA {}", oa_share.1);
+
+        let matrix = &page.matrix;
+        assert_eq!(
+            matrix.subscriptions,
+            vec![tiny.lb().id.clone(), tiny.ac().id.clone(), oa.acc.clone()],
+            "the provider subscription follows the accounts, in the chips' order"
+        );
+        let sam = matrix
+            .orgs
+            .iter()
+            .position(|org| org == "sam")
+            .expect("sam's row");
+        let oa_column = matrix
+            .subscriptions
+            .iter()
+            .position(|subscription| subscription == &oa.acc)
+            .expect("OA's column");
+        // 12 % of one week's share of the 23 EUR monthly price.
+        let oa_week = 23.0 * 12.0 / 52.0;
+        let oa_used = oa_week * 12.0 / 100.0;
+        assert!(
+            close(matrix.cells[sam][oa_column].expect("OA's cell"), oa_used),
+            "OA's cell: {:?}",
+            matrix.cells[sam][oa_column]
+        );
+        assert!(
+            close(
+                matrix.row_totals[sam].subscription.expect("the row total"),
+                74.769 + 29.077 + oa_used
+            ),
+            "the provider column counts in the row total: {:?}",
+            matrix.row_totals[sam]
+        );
+        assert!(!matrix.row_totals[sam].subscription_partial);
+
+        let detail = project_detail_in(&tiny.ctx(), &two_weeks(), &all(), &atlas()).unwrap();
+        let detail_share = detail
+            .by_subscription
+            .iter()
+            .find(|(subscription, _)| subscription.as_deref() == Some(&oa.acc))
+            .expect("OA's share of the project");
+        assert!(close(detail_share.1, oa_share.1));
+    }
+
+    /// An Ollama record whose subscription has no price makes its cell unknown,
+    /// never a measured 0; the row and the grand total keep the known part and
+    /// say why they are partial (R3).
+    #[test]
+    fn an_unpriced_provider_cell_is_none_and_the_row_total_is_partial() {
+        let mut tiny = tiny();
+        let ollama = crate::money::ollama_subscription();
+        tiny.provider_subscriptions = vec![provider_subscription(&ollama, "OL", None)];
+        tiny.prices.take(
+            BTreeMap::from([(
+                "ollama-cloud/deepseek-v4.1-flash".to_string(),
+                crate::money::ModelPrice {
+                    input: 1.0,
+                    output: 10.0,
+                    cache_write: 0.0,
+                    cache_read: 0.0,
+                    tiered: false,
+                },
+            )]),
+            utc("2026-01-01T00:00:00Z"),
+        );
+        let month = |t: &str, percent: f64| Sample {
+            t: utc(t),
+            account: ollama.clone(),
+            src: Source::Poll,
+            l: vec![LimitSample {
+                k: crate::api::LimitKind::Other("monthly_credits".to_string()),
+                m: None,
+                p: percent,
+                r: Some(utc("2026-12-01T00:00:00Z")),
+                b: false,
+            }],
+        };
+        tiny.history
+            .append(&month("2026-11-02T00:00:00Z", 10.0))
+            .expect("Ollama's first reading");
+        tiny.history
+            .append(&month("2026-11-15T00:00:00Z", 60.0))
+            .expect("Ollama's newest reading");
+        tiny.history
+            .append(&record(
+                "2026-11-10T10:00:00Z",
+                "5d3b8c2a-6e1f-4b7a-9c4d-2f8e1a3b5c70",
+                "/home/sam/projects/atlas/engine",
+                atlas(),
+                "deepseek-v4.1-flash:cloud",
+                1_000_000,
+            ))
+            .expect("an Ollama record");
+
+        let page = projects_page_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        let matrix = &page.matrix;
+        let sam = matrix
+            .orgs
+            .iter()
+            .position(|org| org == "sam")
+            .expect("sam's row");
+        let ol_column = matrix
+            .subscriptions
+            .iter()
+            .position(|subscription| subscription == &ollama.acc)
+            .expect("OL's column");
+        assert_eq!(
+            matrix.cells[sam][ol_column], None,
+            "a subscription without a price has no cell value, not 0"
+        );
+        assert!(
+            close(
+                matrix.row_totals[sam].subscription.expect("the known part"),
+                74.769 + 29.077
+            ),
+            "the row keeps its known part: {:?}",
+            matrix.row_totals[sam]
+        );
+        assert!(
+            matrix.row_totals[sam].subscription_partial,
+            "the unpriced cell makes the row total partial"
+        );
+        assert_eq!(
+            matrix.row_totals[sam].subscription_missing.as_deref(),
+            Some("the account has no monthly price")
+        );
+        assert!(
+            close(matrix.total.subscription.expect("the known part"), 120.0),
+            "the grand total keeps its known part: {:?}",
+            matrix.total
+        );
+        assert!(
+            matrix.total.subscription_partial,
+            "the unpriced cell makes the grand total partial"
+        );
+        assert_eq!(
+            matrix.total.subscription_missing.as_deref(),
+            Some("the account has no monthly price")
+        );
+    }
+
+    /// R4: the note names the work whose account was taken from the usage
+    /// readings, with the tokens written as the other notes write them.
+    #[test]
+    fn work_from_the_readings_is_named_in_the_notes() {
+        let tiny = tiny();
+        let weekly = |t: &str, account: &AccountRef, percent: f64| Sample {
+            t: utc(t),
+            account: account.clone(),
+            src: Source::Poll,
+            l: vec![LimitSample {
+                k: crate::api::LimitKind::WeeklyAll,
+                m: None,
+                p: percent,
+                r: Some(utc("2026-11-18T10:00:00Z")),
+                b: false,
+            }],
+        };
+        // AC's week rises around the record, before the first live event at
+        // 08:00; LB's does not rise.
+        tiny.history
+            .append_many(&[
+                weekly("2026-11-02T06:20:00Z", &tiny.ac_ref(), 41.0),
+                weekly("2026-11-02T06:40:00Z", &tiny.ac_ref(), 43.0),
+                weekly("2026-11-02T06:20:00Z", &tiny.lb_ref(), 10.0),
+                weekly("2026-11-02T06:40:00Z", &tiny.lb_ref(), 10.0),
+            ])
+            .expect("the readings around the record");
+        let mut work = record(
+            "2026-11-02T06:25:00Z",
+            "0c4d9e2a-8b1f-4a6c-9d3e-5f7a1b2c4d60",
+            "/home/sam/projects/atlas/engine",
+            atlas(),
+            "claude-opus-5-5",
+            1_000_000,
+        );
+        work.minutes = 5;
+        tiny.history
+            .append(&work)
+            .expect("the work of the readings");
+
+        let page = projects_page_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        assert!(
+            page.notes
+                .iter()
+                .any(|note| note == "1,000,000 tokens: account taken from the usage readings."),
+            "notes: {:#?}",
+            page.notes
+        );
+        assert_eq!(
+            page.unknown_account_tokens,
+            Tokens::default(),
+            "the record has an account, so it is not unknown work"
+        );
     }
 
     // ---- proof tests of the review ----
@@ -1950,12 +2226,12 @@ mod tests {
 
     // ---- proof tests of the review of T-5 ----
 
-    /// A total of parts where one part is missing says so: it is unknown, not
-    /// a measured zero. A record of a model without a price leaves its account's
-    /// cell without a subscription value, so the row, the column and the total
-    /// that hold it are unknown too.
+    /// A total of parts where one part is missing keeps the known part and says
+    /// so (R3): it is partial, not a measured zero and not unknown. A record of
+    /// a model without a price leaves its account's cell without a subscription
+    /// value, so the row, the column and the total that hold it are partial.
     #[test]
-    fn a_missing_cell_makes_the_totals_unknown() {
+    fn a_missing_cell_makes_the_totals_partial() {
         let tiny = tiny();
         let projects = with_acme_account(&tiny);
         let ctx = Ctx {
@@ -1983,37 +2259,72 @@ mod tests {
                 .position(|org| org == name)
                 .expect("the organization")
         };
-        let account = |id: &str| {
+        let subscription = |id: &str| {
             matrix
-                .accounts
+                .subscriptions
                 .iter()
-                .position(|account| account == id)
-                .expect("the account")
+                .position(|subscription| subscription == id)
+                .expect("the subscription")
         };
         let sam = org("sam");
         let acme = org("acme");
-        let ac = account(&tiny.ac().id);
-        let lb = account(&tiny.lb().id);
+        let ac = subscription(&tiny.ac().id);
+        let lb = subscription(&tiny.lb().id);
+        let reason = "that week also has tokens of claude-x, which has no price";
 
         assert_eq!(
             matrix.cells[sam][ac], None,
             "the cell of the account whose week has no value is unknown"
         );
-        assert_eq!(
-            matrix.row_totals[sam], None,
-            "the row total of a row with an unknown cell is unknown, not 0"
+        assert!(
+            close(
+                matrix.row_totals[sam].subscription.expect("the known part"),
+                74.769
+            ),
+            "the row keeps its known part: {:?}",
+            matrix.row_totals[sam]
+        );
+        assert!(
+            matrix.row_totals[sam].subscription_partial,
+            "a row with an unknown cell is partial, not 0 and not unknown"
         );
         assert_eq!(
-            matrix.column_totals[ac], None,
-            "the column total of a column with an unknown cell is unknown, not 0"
+            matrix.row_totals[sam].subscription_missing.as_deref(),
+            Some(reason)
         );
-        assert_eq!(
-            matrix.total, None,
-            "the total of a matrix with an unknown cell is unknown, not 0"
+        assert!(
+            close(
+                matrix.column_totals[ac]
+                    .subscription
+                    .expect("the known part"),
+                16.154
+            ),
+            "the column keeps its known part: {:?}",
+            matrix.column_totals[ac]
         );
+        assert!(
+            matrix.column_totals[ac].subscription_partial,
+            "a column with an unknown cell is partial"
+        );
+        assert!(
+            close(
+                matrix.total.subscription.expect("the known part"),
+                74.769 + 16.154
+            ),
+            "the grand total keeps its known part: {:?}",
+            matrix.total
+        );
+        assert!(
+            matrix.total.subscription_partial,
+            "the total of a matrix with an unknown cell is partial"
+        );
+        assert_eq!(matrix.total.subscription_missing.as_deref(), Some(reason));
         // The parts that are known keep their measured values.
-        assert!(close(matrix.row_totals[acme].unwrap(), 16.154));
-        assert!(close(matrix.column_totals[lb].unwrap(), 74.769));
+        assert!(close(matrix.row_totals[acme].subscription.unwrap(), 16.154));
+        assert!(close(
+            matrix.column_totals[lb].subscription.unwrap(),
+            74.769
+        ));
     }
 
     /// The matrix's row total is the organization's subscription value: the same
@@ -2032,11 +2343,14 @@ mod tests {
         for (index, org) in page.matrix.orgs.iter().enumerate() {
             let row = node(&page, org);
             assert_eq!(row.kind, NodeKind::Org, "{org} is an organization");
-            // The two are added up in another order (by account and by record),
-            // so they can differ in the last bit; the page writes the same money.
+            // The two are added up in another order (by subscription and by
+            // record), so they can differ in the last bit; the page writes the
+            // same money.
             assert!(
                 close(
-                    page.matrix.row_totals[index].unwrap(),
+                    page.matrix.row_totals[index]
+                        .subscription
+                        .expect("the fixture's row values"),
                     row.values.subscription.unwrap()
                 ),
                 "the matrix's row total of {org} is the value the tree shows for it"
@@ -2062,10 +2376,14 @@ mod tests {
             page.matrix
                 .column_totals
                 .iter()
-                .all(|total| *total == Some(0.0)),
+                .all(|total| total.subscription == Some(0.0) && !total.subscription_partial),
             "no cell, no money: a measured zero"
         );
-        assert_eq!(page.matrix.total, Some(0.0), "no cell, no money");
+        assert_eq!(
+            page.matrix.total.subscription,
+            Some(0.0),
+            "no cell, no money"
+        );
 
         let detail = project_detail_in(&tiny.ctx(), &empty, &all(), &atlas()).unwrap();
         assert_eq!(
@@ -2232,8 +2550,9 @@ mod tests {
             values: Some(full(100.0)),
             ..Sums::default()
         };
-        sums.sub_by_account.insert(tiny.ac_ref(), full(29.0));
-        sums.sub_by_account.insert(tiny.lb_ref(), partial(71.0));
+        sums.by_subscription.insert(Some(tiny.ac_ref()), full(29.0));
+        sums.by_subscription
+            .insert(Some(tiny.lb_ref()), partial(71.0));
         let acme = OrgRow {
             identity: Some("acme".to_string()),
             name: "acme".to_string(),
@@ -2241,7 +2560,9 @@ mod tests {
             sums,
         };
         let mut sam_sums = Sums::default();
-        sam_sums.sub_by_account.insert(tiny.ac_ref(), partial(71.0));
+        sam_sums
+            .by_subscription
+            .insert(Some(tiny.ac_ref()), partial(71.0));
         let sam = OrgRow {
             identity: Some("sam".to_string()),
             name: "sam".to_string(),
