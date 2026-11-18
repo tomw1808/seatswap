@@ -3169,10 +3169,11 @@ mod tests {
             stats_overview_at(&parts, &tiny.history, now, offset, &query).expect("the overview");
         match overview {
             Page::Data(overview) => {
-                // The history counts the two finished weeks' 120 EUR; the
-                // running windows (LB 30 %, AC 40 %) are on the This-week card.
+                // The history counts the two finished weeks' 120 EUR and the
+                // running windows' use so far (LB 30 %, AC 40 %, 25.38 EUR);
+                // the card still shows the two windows.
                 assert!(
-                    (overview.kpis.used - 120.0).abs() < 0.001,
+                    (overview.kpis.used - 145.3846).abs() < 0.001,
                     "used {}",
                     overview.kpis.used
                 );

@@ -1071,6 +1071,54 @@ pub(crate) fn api_shares(
     }
 }
 
+/// Each subscription's share of the API value of `total`, in percent, largest
+/// first; ties in the chips' order ([`account_position`]), an id no longer
+/// stored after the stored ones. `parts` holds each chip id's API sum: a stored
+/// Claude account's id ([`account_id`]), a provider subscription's
+/// `account.acc`, or `None` for work without a known account (Claude) or
+/// without a named subscription (provider). This is the one rule both pages
+/// use: the This-week card's project rows split their bars by it and
+/// Statistics → Projects' `Node::by_subscription` splits a project's API value
+/// by it, so both pages draw the same split. A share is computed only from
+/// halves that are not partial (R3): a partial or unknown total gives no
+/// shares, as a partial or unknown part is left out; an unknown or 0 total
+/// gives an empty list.
+pub(crate) fn subscription_shares<'a, Tz: TimeZone + Copy>(
+    ctx: &Ctx<Tz>,
+    total: &Values,
+    parts: impl IntoIterator<Item = (Option<String>, &'a Values)>,
+) -> Vec<(Option<String>, f64)> {
+    let (Some(api), _) = full_half(total.api, total.api_partial, total.api_missing.as_deref())
+    else {
+        return Vec::new();
+    };
+    if api <= 0.0 {
+        return Vec::new();
+    }
+    let mut shares: Vec<(Option<String>, f64)> = parts
+        .into_iter()
+        .filter_map(|(id, values)| {
+            let (value, _) = full_half(
+                values.api,
+                values.api_partial,
+                values.api_missing.as_deref(),
+            );
+            value.map(|value| (id, value / api * 100.0))
+        })
+        .collect();
+    shares.sort_by(|a, b| {
+        b.1.total_cmp(&a.1).then_with(|| match (&a.0, &b.0) {
+            (Some(a), Some(b)) => account_position(ctx, a)
+                .cmp(&account_position(ctx, b))
+                .then_with(|| a.cmp(b)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        })
+    });
+    shares
+}
+
 /// Money as the page writes it (`crates/app/ui/common.js`'s `money`): two
 /// decimals below 10 (`8.31 EUR`), else whole units with thousands commas
 /// (`19 EUR`, `1,204 EUR`).

@@ -18,10 +18,10 @@ use crate::store::{Account, Settings};
 use crate::transcripts::Tokens;
 
 use super::{
-    account_abbr, account_chosen, account_id, account_position, account_weeks_valued,
-    add_opt_value, add_value, full_half, join_names, keep_warnings, money_text,
-    output_by_account_week, percent_text, range_of, record_chosen, thousands, week_start,
-    windows_span, Ctx, Query, StatsError,
+    account_abbr, account_chosen, account_id, account_weeks_valued, add_opt_value, add_value,
+    full_half, join_names, keep_warnings, money_text, output_by_account_week, percent_text,
+    range_of, record_chosen, subscription_shares, thousands, week_start, windows_span, Ctx, Query,
+    StatsError,
 };
 
 /// The level of a row of the tree.
@@ -723,6 +723,19 @@ pub(crate) fn project_detail_in<Tz: TimeZone + Copy>(
         })
         .collect();
 
+    let values = sums.values();
+    let by_subscription = subscription_shares(
+        ctx,
+        &values,
+        sums.by_subscription.iter().map(|(subscription, values)| {
+            (
+                subscription
+                    .as_ref()
+                    .map(|subscription| account_id(ctx, subscription)),
+                values,
+            )
+        }),
+    );
     Ok(ProjectDetail {
         name,
         tokens: sums.tokens,
@@ -732,8 +745,8 @@ pub(crate) fn project_detail_in<Tz: TimeZone + Copy>(
             0.0
         },
         hosts: host_shares,
-        values: sums.values(),
-        by_subscription: by_subscription(ctx, &sums),
+        values,
+        by_subscription,
         share: share_of(&sums.values(), page_values.as_ref()),
         weekly_by_model,
         sessions: sums.sessions.len() as u32,
@@ -828,6 +841,18 @@ fn node_from<Tz: TimeZone + Copy>(
         NodeKind::Folder => 2,
     };
     let values = sums.values();
+    let by_subscription = subscription_shares(
+        ctx,
+        &values,
+        sums.by_subscription.iter().map(|(subscription, values)| {
+            (
+                subscription
+                    .as_ref()
+                    .map(|subscription| account_id(ctx, subscription)),
+                values,
+            )
+        }),
+    );
     Node {
         kind: label.kind,
         level,
@@ -837,57 +862,9 @@ fn node_from<Tz: TimeZone + Copy>(
         tokens: sums.tokens,
         share: share_of(&values, Some(page)),
         values,
-        by_subscription: by_subscription(ctx, sums),
+        by_subscription,
         sessions: sums.sessions.len() as u32,
     }
-}
-
-/// Each subscription's share of the node's API value, largest first; ties in
-/// the chips' order, an id no longer stored after the stored ones. A share is
-/// computed only from halves that are not partial (R3): an unknown or partial
-/// node value or part gives no share.
-fn by_subscription<Tz: TimeZone + Copy>(ctx: &Ctx<Tz>, sums: &Sums) -> Vec<(Option<String>, f64)> {
-    let values = sums.values();
-    let (Some(api), _) = full_half(
-        values.api,
-        values.api_partial,
-        values.api_missing.as_deref(),
-    ) else {
-        return Vec::new();
-    };
-    if api <= 0.0 {
-        return Vec::new();
-    }
-    let mut shares: Vec<(Option<String>, f64)> = sums
-        .by_subscription
-        .iter()
-        .filter_map(|(subscription, values)| {
-            let (value, _) = full_half(
-                values.api,
-                values.api_partial,
-                values.api_missing.as_deref(),
-            );
-            value.map(|value| {
-                (
-                    subscription
-                        .as_ref()
-                        .map(|subscription| account_id(ctx, subscription)),
-                    value / api * 100.0,
-                )
-            })
-        })
-        .collect();
-    shares.sort_by(|a, b| {
-        b.1.total_cmp(&a.1).then_with(|| match (&a.0, &b.0) {
-            (Some(a), Some(b)) => account_position(ctx, a)
-                .cmp(&account_position(ctx, b))
-                .then_with(|| a.cmp(b)),
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (None, None) => Ordering::Equal,
-        })
-    });
-    shares
 }
 
 /// A value as a share of the page's total, in %: unknown when either value is
