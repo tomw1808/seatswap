@@ -235,7 +235,9 @@ pub struct TokensWeekRow {
 /// One cell of the tokens-a-week table: a figure for a model the subscription
 /// can use, or the reason the cell is empty. Serialized untagged, a missing
 /// cell is `{ "missing": "<reason>" }`; a figure carries `tokens`, `low`,
-/// `high`, `estimated` and `thin`.
+/// `high`, `estimated`, `thin` and `measured`. `measured` is the factor's own
+/// flag: a factor that leans on its plan-size prior has no range worth showing
+/// (without pairs its range is the prior itself, so it would read `± 0`).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum TokensWeekCell {
@@ -245,6 +247,7 @@ pub enum TokensWeekCell {
         high: Option<f64>,
         estimated: bool,
         thin: bool,
+        measured: bool,
     },
     Missing {
         missing: String,
@@ -1577,6 +1580,7 @@ fn tokens_week_of<Tz: TimeZone + Copy>(
             high: (rates.c.low > 0.0).then(|| 100.0 / (rates.c.low * upt)),
             estimated,
             thin: is_thin(&rates.c),
+            measured: rates.c.measured,
         };
         let mut cells = Vec::new();
         for model_entry in &models {
@@ -2012,6 +2016,61 @@ mod tests {
                 panic!("sonnet is offered but its cell says {missing}")
             }
         }
+    }
+
+    #[test]
+    fn a_cell_on_a_factor_that_leans_on_its_prior_is_not_measured() {
+        let tiny = tiny();
+        let ctx = tiny.ctx();
+        let lb = RateAccount::of(tiny.lb());
+        // No pair yet: the factor is the plan-size prior itself, with no range.
+        let mut rates = Rates::given(0.5, None);
+        rates.c = Factor {
+            value: 0.5,
+            low: 0.5,
+            high: 0.5,
+            basis_usd: 0.0,
+            measured: false,
+        };
+        let weekly = BTreeMap::from([(lb.account.clone(), rates)]);
+        let priced_main = BTreeSet::from([lb.account.clone()]);
+        let company = BTreeMap::from([(
+            Company::Anthropic,
+            BTreeMap::from([(
+                "claude-opus-5-5".to_string(),
+                ModelStat {
+                    tokens: 100_000,
+                    usd: 2.0,
+                    unpriced: false,
+                    mix: [0, 100_000, 0, 0],
+                },
+            )]),
+        )]);
+        let week = tokens_week_of(
+            &ctx,
+            std::slice::from_ref(&lb),
+            &weekly,
+            &priced_main,
+            &company,
+        );
+        let index = week
+            .models
+            .iter()
+            .position(|model| model.model == "claude-opus-5-5")
+            .expect("opus's column");
+        match &week.rows[0].cells[index] {
+            TokensWeekCell::Figure {
+                measured,
+                estimated,
+                ..
+            } => {
+                assert!(!*measured, "a prior's factor is not measured");
+                assert!(!*estimated, "opus ran, so its cell is not estimated");
+            }
+            TokensWeekCell::Missing { missing } => panic!("opus ran but its cell says {missing}"),
+        }
+        let json = serde_json::to_value(&week.rows[0].cells[index]).expect("cell json");
+        assert_eq!(json["measured"], serde_json::json!(false));
     }
 
     #[test]

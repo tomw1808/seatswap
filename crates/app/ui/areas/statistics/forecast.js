@@ -12,7 +12,7 @@ import {
   accountView,
   amountNode,
   clear,
-  durationText,
+  hoursText,
   emptyLine,
   errorMessage,
   h,
@@ -128,7 +128,7 @@ export async function show(container, env) {
   }
   const blockedValue =
     typeof blockedHours === "number"
-      ? durationText(Math.round(blockedHours * 3600))
+      ? hoursText(blockedHours)
       : h("span", { text: "—", title: blockedHoursMissing });
   kpis.appendChild(
     kpi(
@@ -148,14 +148,9 @@ export async function show(container, env) {
       "Switches planned | the switches the plan makes in the next 7 days"
     )
   );
-  const sentence = kpi(
-    "All accounts together",
-    data.sentence,
-    null,
-    data.sentence
+  kpis.appendChild(
+    kpi("All accounts together", data.sentence, null, data.sentence, "stats-kpi-sentence-text")
   );
-  sentence.classList.add("stats-kpi-sentence");
-  kpis.appendChild(sentence);
   kpisCard.appendChild(kpis);
   root.appendChild(kpisCard);
 

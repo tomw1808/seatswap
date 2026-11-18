@@ -3597,7 +3597,8 @@ pub struct TokensWeekRow { pub id: String, pub cells: Vec<TokensWeekCell>,
     pub missing: Option<String> }
 #[serde(untagged)] // a figure, or {"missing": "<reason>"}: "not offered by {Company}",
 pub enum TokensWeekCell {  // "no price for {model}", or why the estimate failed
-    Figure { tokens: f64, low: f64, high: Option<f64>, estimated: bool, thin: bool },
+    Figure { tokens: f64, low: f64, high: Option<f64>, estimated: bool, thin: bool,
+        measured: bool },  // measured: the factor's own flag (false: leans on its prior)
     Missing { missing: String } }
 const THIN_SHARE: f64 = 0.2;          // a thin figure: half its range over 20 % of its value
 const POINTS_BEFORE_CHANGE: usize = 8; // the weeks before a change that set its range
@@ -5168,11 +5169,14 @@ are not shown. A fractional hour count (`2.5 h`) is `2h 30min`; a time that has 
 The caller rounds, the function never does: `format.rs`'s `format_age` floors an age to its largest
 unit and prints `12s ago`, `5min ago`, `2h ago`, `3d ago`; the reset text and `compact_left` round up
 to the minute (`compact_left`'s week form to the hour, so `16h` and `3d 16h`); `stats::hours_text`
-rounds to the minute; `burn_text.rs`'s hour figures and `providers/codex.rs`'s limit names go through
+rounds to the minute and writes no hours at all as `0h`, not `0s` (an hour figure such as the
+blocked hours counts hours); `burn_text.rs`'s hour figures and `providers/codex.rs`'s limit names go through
 it too. A negative or non-finite hour count keeps the old `h` text (`-2 h`); callers never pass one.
 The pages have
-`durationText(seconds)` in `common.js` with the same rule, exported; `hoursText` is gone (its callers
-pass `Math.round(hours * 3600)` seconds), `sessions.js`'s local `durationText(since, now)` becomes
+`durationText(seconds)` in `common.js` with the same rule, exported, and `hoursText(hours,
+options)` beside it for every hour figure (blocked, avoidable, working, idle hours): the seconds of
+`Math.round(hours * 3600)` through `durationText`, with none at all as `0h` like `stats::hours_text`
+(1.3.0). Subscriptions' `workHoursText` rounds its hours of work first and calls it; `sessions.js`'s local `durationText(since, now)` becomes
 `sinceText`, and the fixtures use common's function.
 
 ### the sessions thread's 1.2.0 rules

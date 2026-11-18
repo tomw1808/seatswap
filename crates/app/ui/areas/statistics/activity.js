@@ -10,7 +10,7 @@ import {
   amountNode,
   clear,
   dateText,
-  durationText,
+  hoursText,
   emptyLine,
   h,
   isObject,
@@ -145,25 +145,21 @@ export async function show(container, env) {
 
   for (const lane of lanes) {
     const parts = [
-      `on but idle ${durationText(Math.round(lane.idle * 3600))}`,
-      `off ${durationText(Math.round(lane.off * 3600))}`,
+      `on but idle ${hoursText(lane.idle)}`,
+      `off ${hoursText(lane.off)}`,
     ];
     if (lane.unknown > 0) {
-      parts.push(`not known ${durationText(Math.round(lane.unknown * 3600))}`);
+      parts.push(`not known ${hoursText(lane.unknown)}`);
     }
     parts.push(`${tokenText(lane.tokens)} tokens in the range`);
     kpis.appendChild(
       kpi(
         `${lane.host} · last 7 days`,
-        `${durationText(Math.round(lane.working * 3600))} working`,
+        `${hoursText(lane.working)} working`,
         parts.join(" · "),
-        `${lane.host} | last 7 days: working ${durationText(
-          Math.round(lane.working * 3600)
-        )} · idle ${durationText(Math.round(lane.idle * 3600))} · off ${durationText(
-          Math.round(lane.off * 3600)
-        )}${
+        `${lane.host} | last 7 days: working ${hoursText(lane.working)} · idle ${hoursText(lane.idle)} · off ${hoursText(lane.off)}${
           lane.unknown > 0
-            ? ` · not known ${durationText(Math.round(lane.unknown * 3600))}`
+            ? ` · not known ${hoursText(lane.unknown)}`
             : ""
         } | in the range: ${tokensTip(lane.tokens)} | ${valueTip(
           lane.values,
@@ -253,7 +249,7 @@ export async function show(container, env) {
     data.whatItShows,
     null,
     "What the last 7 days' lanes show",
-    "stats-act-what-text"
+    "stats-kpi-sentence-text"
   );
   whatItShows.classList.add("stats-act-what");
   kpis.appendChild(whatItShows);
@@ -569,7 +565,7 @@ export async function show(container, env) {
         row.appendChild(
           h("span", {
             class: "n",
-            text: found ? durationText(Math.round(found[1] * 3600)) : "—",
+            text: found ? hoursText(found[1]) : "—",
             title: found ? undefined : `no hour recorded on ${host} in this week`,
           })
         );
@@ -648,7 +644,7 @@ export async function show(container, env) {
       row.appendChild(
         h("span", {
           class: "n",
-          text: durationText(Math.round(session.workedHours * 3600)),
+          text: hoursText(session.workedHours),
         })
       );
       row.appendChild(

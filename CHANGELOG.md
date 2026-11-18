@@ -47,9 +47,6 @@ All notable changes to this project are documented here. The format follows
   follows flash-agents' own rule on every system, `$FLASH_DATA_DIR` included.
 - A price typed at most 15 minutes before a plan change belongs to the new plan's period, so it no
   longer makes a minutes-long period at the new price.
-- Windows: Sessions now shows a flash job's task. flash-agents keeps its job reports in
-  `%LOCALAPPDATA%\flash-agents` there, and seatswap looked in `~/.local/state/flash-agents`; it now
-  follows flash-agents' own rule on every system, `$FLASH_DATA_DIR` included.
 - Codex token growth is counted once: a repeated total records nothing, a total below the highest
   one is a warning, and a missing `cache_write_input_tokens` counts as 0.
 - The OpenAI card keeps showing the live login's usage when seatswap cannot save that login (for
@@ -60,6 +57,12 @@ All notable changes to this project are documented here. The format follows
   without a price.
 - The Forecast shows `—` with its reason instead of `0h` blocked when no typical working hour is
   known yet.
+- An hour figure with no hours reads `0h`, not `0s` (blocked, working and idle hours).
+- Settings: a block's last lines no longer run over the next section (seen with a long API prices
+  error over "Look"); the page scrolls instead.
+- Forecast: the "All accounts together" sentence wraps instead of being cut off.
+- Subscriptions → Tokens a week: a figure whose rate is still assumed from its plan says `assumed`
+  instead of `± 0`.
 
 ### Removed
 

@@ -1,7 +1,7 @@
 // The statistics Weeks page's fixture: `stats_weeks`, `stats_week_summary`
 // and `stats_window_detail`.
 
-import { durationText } from "../common.js";
+import { hoursText } from "../common.js";
 import {
   ACCOUNTS,
   API_PER_M,
@@ -200,7 +200,7 @@ export function weekSummary(query, week) {
   const conclusion = [];
   conclusion.push(
     switchesOf([index]) && BLOCKED[index] > 0
-      ? `${durationText(Math.round(BLOCKED[index] * 3600))} blocked.`
+      ? `${hoursText(BLOCKED[index])} blocked.`
       : "No hour blocked."
   );
   let closest = null;

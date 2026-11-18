@@ -169,6 +169,17 @@
   text-overflow: ellipsis;
 }
 
+/* A KPI whose value is a sentence (Activity's "What it shows", Forecast's "All
+   accounts together"): the sentence wraps instead of ending in an ellipsis. */
+.stats-kpi-value.stats-kpi-sentence-text {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  font-size: 13px;
+  line-height: 18px;
+  font-weight: 400;
+}
+
 .stats-kpi-value-bad {
   color: var(--danger);
 }

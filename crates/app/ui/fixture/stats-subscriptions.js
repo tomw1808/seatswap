@@ -429,14 +429,17 @@ function tokensWeek() {
     { model: MODELS.gpt, company: "openai" },
     { model: MODELS.astra, company: "openai" },
   ];
-  const cell = (tokens, low, high, estimated = false, thin = false) => ({
+  const cell = (tokens, low, high, estimated = false, thin = false, measured = true) => ({
     tokens: Math.round(tokens * 1e6),
     low: Math.round(low * 1e6),
     high: Math.round(high * 1e6),
     estimated,
     thin,
+    measured,
   });
   const estimated = (tokens) => cell(tokens, tokens, tokens, true, false);
+  // a factor that is still its plan-size prior: no range, not measured
+  const assumed = (tokens) => cell(tokens, tokens, tokens, false, false, false);
   const missing = (reason) => ({ missing: reason });
   const notOffered = (company) => missing(`not offered by ${company}`);
   const rows = [
@@ -479,7 +482,7 @@ function tokensWeek() {
         notOffered("OpenAI"),
         notOffered("OpenAI"),
         notOffered("OpenAI"),
-        cell(42, 40, 44),
+        assumed(42),
         missing(`no price for ${MODELS.astra}`),
       ],
       missing: null,

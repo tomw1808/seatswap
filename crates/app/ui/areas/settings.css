@@ -33,6 +33,14 @@
   flex: 1 1 auto;
 }
 
+/* The body scrolls; its blocks keep their full height. A `.col` block (the
+   money rows, the agent calls, the history hosts) has `min-height: 0`, so
+   without this the column squeezed it and its last lines ran over the next
+   section (seen 18 Nov 2026: the API prices error over "Look"). */
+.settings-body > * {
+  flex-shrink: 0;
+}
+
 /* One setting row and the error text under it; the rows keep the mock-up's
    dense 28 px height. */
 .set-row {

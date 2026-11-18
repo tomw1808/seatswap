@@ -13,7 +13,7 @@ import {
   clear,
   dateText,
   dateTimeText,
-  durationText,
+  hoursText,
   emptyLine,
   errorMessage,
   h,
@@ -418,7 +418,7 @@ export async function show(container, env) {
   const blockedBefore = data.kpis.blockedBeforeAdded;
   const blockedSub = blockedBefore
     ? [
-        durationText(Math.round(blockedBefore.hours * 3600)),
+        hoursText(blockedBefore.hours),
         " of Anthropic's before ",
         blockedBefore.name,
         " was added",
@@ -429,7 +429,7 @@ export async function show(container, env) {
   const blocked = data.kpis.blockedByCompany;
   const blockedValue =
     blocked.length === 0
-      ? durationText(0)
+      ? hoursText(0)
       : h(
           "span",
           {
@@ -441,7 +441,7 @@ export async function show(container, env) {
                 entry.company,
                 "working hours blocked at 100 % of this company's limit"
               ),
-              ` ${durationText(Math.round(entry.hours * 3600))}`,
+              ` ${hoursText(entry.hours)}`,
             ])
           )
         );
@@ -457,7 +457,7 @@ export async function show(container, env) {
   kpis.appendChild(
     kpi(
       "Avoidable",
-      durationText(Math.round(data.kpis.avoidableHours * 3600)),
+      hoursText(data.kpis.avoidableHours),
       "blocked while other quota expired",
       "Avoidable | blocked hours in a week in which another account's quota expired",
       data.kpis.avoidableHours > 0 ? "stats-kpi-value-bad" : null
@@ -538,7 +538,7 @@ export async function show(container, env) {
       color: colours.get(name) || "var(--muted)",
       tip: `${name} · week from ${label} | ${amountTip(value, currency)}`,
     }));
-    const blocked = durationText(Math.round(week.blockedHours * 3600));
+    const blocked = hoursText(week.blockedHours);
     return {
       label,
       at: week.week,

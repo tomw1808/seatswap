@@ -12,6 +12,7 @@ import {
   amountTip,
   clear,
   durationText,
+  hoursText,
   emptyLine,
   h,
   isColor,
@@ -172,12 +173,11 @@ function ratioText(value, what) {
 }
 
 // An hours figure of work: whole hours from 1h up, minutes below ("30h",
-// "40min"), in the one duration spelling, hours not rolled into days.
-function hoursText(hours) {
+// "40min"), hours not rolled into days.
+function workHoursText(hours) {
   const value = requireNumber(hours, "a number of hours");
   if (value < 0) throw new Error(`a number of hours ${String(value)} is negative`);
-  const seconds = value >= 1 ? Math.round(value) * 3600 : Math.round(value * 60) * 60;
-  return durationText(seconds, { upTo: "h" });
+  return hoursText(value >= 1 ? Math.round(value) : Math.round(value * 60) / 60, { upTo: "h" });
 }
 
 function signedPercentText(value) {
@@ -351,7 +351,7 @@ function planRowNode(row, env, unmeasured) {
           })
         );
       } else {
-        work.appendChild(h("b", { text: hoursText(entry.hours) }));
+        work.appendChild(h("b", { text: workHoursText(entry.hours) }));
       }
     }
     if (parsed.length > 2) {
@@ -364,7 +364,7 @@ function planRowNode(row, env, unmeasured) {
             .map(
               (entry) =>
                 `${modelName(entry.model)} ${
-                  entry.hours === null ? "—" : hoursText(entry.hours)
+                  entry.hours === null ? "—" : workHoursText(entry.hours)
                 }`
             )
             .join(" · "),
@@ -403,7 +403,7 @@ function planRowNode(row, env, unmeasured) {
     basisNode.appendChild(h("span", { class: "mf", text: "—", title: "no work in this range" }));
   } else {
     if (basis < 0) throw new Error(`a plan row's basisHours is negative: ${basis}`);
-    basisNode.appendChild(document.createTextNode(hoursText(basis)));
+    basisNode.appendChild(document.createTextNode(workHoursText(basis)));
     if (thin && !unmeasured.has(id)) {
       basisNode.appendChild(
         h("span", {
@@ -999,7 +999,7 @@ function onePercentCard(perPercent, env) {
 function parseTokenCell(cell, model, index) {
   requireObject(cell, "a tokens-week cell");
   const has = (field) => Object.prototype.hasOwnProperty.call(cell, field);
-  const figureFields = ["tokens", "low", "high", "estimated", "thin"];
+  const figureFields = ["tokens", "low", "high", "estimated", "thin", "measured"];
   if (has("missing")) {
     if (figureFields.some(has)) {
       throw new Error(
@@ -1018,6 +1018,7 @@ function parseTokenCell(cell, model, index) {
   const high = optionalNumber(cell.high, "a tokens-week cell's high");
   const estimated = requireBoolean(cell.estimated, "a tokens-week cell's estimated");
   const thin = requireBoolean(cell.thin, "a tokens-week cell's thin");
+  const measured = requireBoolean(cell.measured, "a tokens-week cell's measured");
   if (value < 0 || low < 0) throw new Error("a tokens-week cell has a negative token count");
   if (high !== null && high < low) {
     throw new Error(`a tokens-week cell's high ${high} is below its low ${low}`);
@@ -1025,7 +1026,7 @@ function parseTokenCell(cell, model, index) {
   if (typeof model.model !== "string") {
     throw new Error(`a tokens-week model at ${index} has no id`);
   }
-  return { value, low, high, estimated, thin };
+  return { value, low, high, estimated, thin, measured };
 }
 
 function tokenCell(parsed, model, max, color, env, id) {
@@ -1045,22 +1046,31 @@ function tokenCell(parsed, model, max, color, env, id) {
   let title = `${accountNameText(env.accounts, id)} · ${modelText} | ${tokens(
     parsed.value
   )} tokens a full weekly limit`;
-  if (parsed.estimated) {
+  // One mark after the figure, the first that applies. A factor that leans on
+  // its plan's size comes first: its range says nothing measured (with no pair
+  // it is the prior itself and would read `± 0`). "assumed" is the Forecast's
+  // word for the same factor ("measured or assumed from its plan").
+  const mark = (cls, markText) => {
     text.appendChild(document.createTextNode(" "));
-    text.appendChild(h("span", { class: "stats-plan", text: "est." }));
+    text.appendChild(h("span", { class: cls, text: markText }));
+  };
+  if (!parsed.measured) {
+    mark("stats-plan", "assumed");
+    title += " | assumed from the plan's size: too little work measured yet";
+  } else if (parsed.estimated) {
+    mark("stats-plan", "est.");
+  } else if (parsed.thin) {
+    mark("stats-warn", "thin");
+    title += " | thin: measured on only a little work in the range";
+  } else if (parsed.high !== null) {
+    const range = tokens((parsed.high - parsed.low) / 2);
+    mark("stats-plan", `± ${range}`);
+    title += ` ± ${range} (range)`;
+  }
+  if (parsed.estimated) {
     title += ` | estimated: priced at ${companyText(
       model.company
     )}'s main token mix, not measured`;
-  } else if (parsed.thin) {
-    text.appendChild(document.createTextNode(" "));
-    text.appendChild(h("span", { class: "stats-warn", text: "thin" }));
-    title += " | thin: measured on only a little work in the range";
-  } else if (parsed.high !== null) {
-    const half = (parsed.high - parsed.low) / 2;
-    const range = tokens(half);
-    text.appendChild(document.createTextNode(" "));
-    text.appendChild(h("span", { class: "stats-plan", text: `± ${range}` }));
-    title += ` ± ${range} (range)`;
   }
   cell.appendChild(text);
   cell.title = title;

@@ -721,6 +721,17 @@ function durationText(seconds, { upTo = "d" } = {}) {
   return hours === 0 ? `${days}d` : `${days}d ${hours}h`;
 }
 
+// An hours figure (blocked hours, hours of work or idle) in the one duration
+// spelling, from a number of hours. None at all reads "0h", not "0s": the
+// figure counts hours. `options` is durationText's.
+function hoursText(hours, options) {
+  if (typeof hours !== "number" || !Number.isFinite(hours) || hours < 0) {
+    throw new Error(`invalid number of hours ${String(hours)}: use a finite number of 0 or more`);
+  }
+  const seconds = Math.round(hours * 3600);
+  return seconds === 0 ? "0h" : durationText(seconds, options);
+}
+
 // The days left on an account's login, the one rule for the pop-up and Settings
 // (review finding 20): Rust's own count when the view carries it, else the end
 // time; `null` when neither is there, a negative count once it has ended.
@@ -1236,6 +1247,7 @@ export {
   dateTimeText,
   weekdayTimeText,
   durationText,
+  hoursText,
   loginDaysLeft,
   switchText,
   percentText,

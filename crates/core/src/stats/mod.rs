@@ -1085,12 +1085,17 @@ pub(crate) fn thousands(whole: i64) -> String {
 }
 
 /// An hour count as a duration, rounded to the whole minute: `2h`, `30min`,
-/// `0.5 h` becomes `30min` (review item 42). A negative or non-finite count is
-/// the callers' error, as before: it keeps the old one-decimal `h` text instead
-/// of being silently turned into a duration.
+/// `0.5 h` becomes `30min` (review item 42); none at all is `0h`, not `0s`, as
+/// the window's `hoursText` writes it. A negative or non-finite count is the
+/// callers' error, as before: it keeps the old one-decimal `h` text instead of
+/// being silently turned into a duration.
 pub(crate) fn hours_text(hours: f64) -> String {
     if hours.is_finite() && hours >= 0.0 {
-        return crate::duration::duration_text((hours * 60.0).round() as u64 * 60);
+        let minutes = (hours * 60.0).round() as u64;
+        if minutes == 0 {
+            return "0h".to_string();
+        }
+        return crate::duration::duration_text(minutes * 60);
     }
     if (hours * 10.0).round() % 10.0 == 0.0 {
         format!("{} h", hours.round() as i64)
@@ -3413,6 +3418,8 @@ pub(crate) mod tests {
     fn an_hour_count_is_the_one_duration_spelling() {
         assert_eq!(hours_text(2.0), "2h");
         assert_eq!(hours_text(0.5), "30min");
+        assert_eq!(hours_text(0.0), "0h");
+        assert_eq!(hours_text(0.004), "0h");
         assert_eq!(hours_text(2.5), "2h 30min");
         assert_eq!(hours_text(141.0), "5d 21h");
         assert_eq!(hours_text(-2.0), "-2 h");

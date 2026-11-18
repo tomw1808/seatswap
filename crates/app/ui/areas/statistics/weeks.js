@@ -14,6 +14,7 @@ import {
   dateText,
   dateTimeText,
   durationText,
+  hoursText,
   emptyLine,
   errorMessage,
   h,
@@ -159,7 +160,7 @@ export async function show(container, env) {
         h("span", { class: "stats-kpi-label", text: "Blocked" }),
         h("span", {
           class: "stats-kpi-value",
-          text: durationText(Math.round(summary.blockedHours * 3600)),
+          text: hoursText(summary.blockedHours),
         }),
         h("span", {
           class: "stats-kpi-sub",
@@ -275,9 +276,7 @@ export async function show(container, env) {
         "Reached 100 %",
         detail.reached100At === null
           ? "not reached"
-          : `${dateTimeText(detail.reached100At)} · blocked ${durationText(
-              Math.round(detail.blockedHoursAfter * 3600)
-            )} after that`,
+          : `${dateTimeText(detail.reached100At)} · blocked ${hoursText(detail.blockedHoursAfter)} after that`,
       ],
     ];
     if (detail.sessionWindowsUsed !== null) {
@@ -473,10 +472,8 @@ export async function show(container, env) {
       label: h("span", { class: "stats-row-label", text: "Blocked" }),
       // A narrow column hides the number; its tooltip always has it.
       cells: data.blocked.map((value, index) => ({
-        text: durationText(Math.round(value * 3600)),
-        tip: `Blocked · week from ${dateText(data.weekStarts[index])} | ${durationText(
-          Math.round(value * 3600)
-        )}: working hours in which the active account was full`,
+        text: hoursText(value),
+        tip: `Blocked · week from ${dateText(data.weekStarts[index])} | ${hoursText(value)}: working hours in which the active account was full`,
       })),
     };
     if (!lastIsCurrent) {

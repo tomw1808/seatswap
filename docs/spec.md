@@ -1867,7 +1867,8 @@ The four cards:
   company's other priced models of the same line-up (Opus, Sonnet, Haiku, Fable for Anthropic). A cell is the tokens a full weekly limit holds: `100 / factor` API
   dollars divided by the model's dollars per token at the owner's token mix for it. A model the owner
   never used is priced with the token mix of the same company's most used model and marked
-  `estimated` (a striped bar); the main model needs a token mix, not a price of its own. Bars
+  `estimated` (a striped bar); the main model needs a token mix, not a price of its own. A figure
+  whose factor still leans on its plan-size prior says `assumed` instead of a range. Bars
   compare within a column. An empty cell is `—` titled with its reason: `not offered by {company}`,
   `no price for {model}`, or why the estimate could not be made. The note reads `Refit every week as new work comes in; the range is how far a figure may
   still be off.`
