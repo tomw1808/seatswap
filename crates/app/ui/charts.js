@@ -722,9 +722,38 @@ export function lines({ series, yMax, marks, hlines, ySuffix, yDecimals, yFormat
 // bars — one bar per category and series
 // ---------------------------------------------------------------------------
 
-export function bars({ categories, series } = {}) {
+export function bars({ categories, series, yMax, labels, yLabel, yTicks } = {}) {
   if (!Array.isArray(categories)) throw new Error("bars needs a list of categories");
   if (!Array.isArray(series)) throw new Error("bars needs a list of series");
+  if (yMax !== undefined && !(finite(yMax) && yMax > 0)) {
+    throw new Error(`bars' yMax must be a finite number above 0, not ${JSON.stringify(yMax)}`);
+  }
+  if (labels !== undefined && typeof labels !== "function") {
+    throw new Error(`bars' labels must be a function, not ${JSON.stringify(labels)}`);
+  }
+  if (yLabel !== undefined && typeof yLabel !== "function") {
+    throw new Error(`bars' yLabel must be a function, not ${JSON.stringify(yLabel)}`);
+  }
+  if (yLabel !== undefined && yMax === undefined) {
+    throw new Error("bars' yLabel needs a yMax to place the axis labels");
+  }
+  if (yTicks !== undefined && yMax === undefined) {
+    throw new Error("bars' yTicks needs a yMax to place the axis lines");
+  }
+  if (yTicks !== undefined && !Array.isArray(yTicks)) {
+    throw new Error(`bars' yTicks must be a list, not ${JSON.stringify(yTicks)}`);
+  }
+  if (yTicks !== undefined) {
+    let previous = -Infinity;
+    for (const value of yTicks) {
+      if (!finite(value) || value < 0 || value > yMax || value <= previous) {
+        throw new Error(
+          `bars' yTicks must rise from 0 to its yMax ${yMax}, not ${JSON.stringify(yTicks)}`
+        );
+      }
+      previous = value;
+    }
+  }
   const root = h("div", { class: "chart chart-bars" });
   const legend = h("div", { class: "chart-legend" });
   for (const entry of series) {
@@ -739,45 +768,129 @@ export function bars({ categories, series } = {}) {
   }
   if (legend.childNodes.length > 0) root.appendChild(legend);
 
-  const body = h("div", { class: "chart-bars-body" });
   let max = 0;
   for (const entry of series) {
     for (const value of Array.isArray(entry.values) ? entry.values : []) {
       if (finite(value) && value > max) max = value;
     }
   }
-  const scale = max > 0 ? max : 1;
-  const labels = [];
+  const fixed = yMax === undefined ? null : yMax;
+  const scale = fixed !== null ? fixed : max > 0 ? max : 1;
+  // A fixed scale gets the lines chart's axis, but in the bars' own box: the
+  // grid lines and their labels live in `.chart-bars-body`, the box the bars
+  // grow in, so a line at value v lies at the height a bar of v reaches.
+  // Without `yTicks`, the lines sit at 0, ¼, ½, ¾ and 1 of `yMax`.
+  const ticks =
+    fixed === null
+      ? null
+      : yTicks !== undefined
+        ? yTicks
+        : [0, fixed / 4, fixed / 2, (fixed * 3) / 4, fixed];
+  const body = h("div", { class: "chart-bars-body" });
+  if (ticks !== null) {
+    for (const value of ticks) {
+      const bottom = (value / fixed) * 100;
+      body.appendChild(
+        h("div", {
+          class: "chart-gridline",
+          style: { bottom: `${clampPercent(bottom)}%` },
+        })
+      );
+      const text = typeof yLabel === "function" ? yLabel(value) : String(value);
+      if (typeof text !== "string") {
+        throw new Error(`bars' yLabel must return a string, not ${JSON.stringify(text)}`);
+      }
+      body.appendChild(
+        h("div", {
+          class: "chart-y",
+          style: { bottom: `${clampPercent(bottom)}%` },
+          text,
+        })
+      );
+    }
+  }
+  // With a fixed scale the column labels wait in a row below the bars' box,
+  // so that box is exactly the bars' height.
+  const labelsRow = ticks !== null ? h("div", { class: "chart-bar-labels" }) : null;
+  const columnLabels = [];
   for (const [index, category] of categories.entries()) {
     const group = h("div", { class: "chart-bar-group" });
     for (const entry of series) {
       const values = Array.isArray(entry.values) ? entry.values : [];
       const value = values[index];
-      if (!finite(value)) continue;
-      const bar = h("div", {
-        class: "chart-bar",
-        style: { height: `${(value / scale) * 100}%`, background: entry.color },
-      });
+      const missing = value === null;
+      if (!missing && !finite(value)) {
+        throw new Error(
+          `bars' ${String(category)} value is not a number: ${JSON.stringify(value)}`
+        );
+      }
+      if (missing && labels === undefined) continue;
+      if (!missing && fixed !== null && value > fixed) {
+        throw new Error(
+          `bars' ${String(category)} value ${value} lies above the chart's yMax ${fixed}`
+        );
+      }
       const unit = typeof entry.unit === "string" ? entry.unit : "";
       const tip =
         typeof entry.tip === "function"
-          ? entry.tip(category, value)
-          : `${category} | ${entry.name}: ${value}${unit}`;
-      attachTip(bar, tip);
-      group.appendChild(bar);
+          ? entry.tip(category, missing ? null : value)
+          : `${category} | ${entry.name}: ${missing ? null : value}${unit}`;
+      if (labels === undefined) {
+        const bar = h("div", {
+          class: "chart-bar",
+          style: { height: `${(value / scale) * 100}%`, background: entry.color },
+        });
+        attachTip(bar, tip);
+        group.appendChild(bar);
+        continue;
+      }
+      const text = labels(missing ? null : value);
+      if (typeof text !== "string") {
+        throw new Error(`bars' labels must return a string, not ${JSON.stringify(text)}`);
+      }
+      // The slot keeps the bar's height scale; the label sits above the bar,
+      // or at the foot when there is no bar (a missing value, written "—").
+      const slot = h("div", { class: "chart-bar-slot" });
+      if (!missing) {
+        const bar = h("div", {
+          class: "chart-bar",
+          style: { height: `${(value / scale) * 100}%`, background: entry.color },
+        });
+        attachTip(bar, tip);
+        slot.appendChild(bar);
+      }
+      const label = h("span", {
+        class: "chart-bar-label",
+        style: { bottom: missing ? "2px" : `calc(${(value / scale) * 100}% + 3px)` },
+        text,
+      });
+      if (missing) attachTip(label, tip);
+      slot.appendChild(label);
+      group.appendChild(slot);
     }
     // A category is a name, not a time: its labels are thinned in steps.
     const { slot, label } = columnLabel(String(category), null);
-    labels.push(label);
-    body.appendChild(h("div", { class: "chart-bar-col" }, [group, slot]));
+    columnLabels.push(label);
+    if (labelsRow !== null) {
+      body.appendChild(h("div", { class: "chart-bar-col" }, [group]));
+      labelsRow.appendChild(slot);
+    } else {
+      body.appendChild(h("div", { class: "chart-bar-col" }, [group, slot]));
+    }
   }
-  root.appendChild(body);
+  if (labelsRow !== null) {
+    root.appendChild(h("div", { class: "chart-bars-plot" }, [body]));
+    root.appendChild(labelsRow);
+  } else {
+    root.appendChild(body);
+  }
+  const labelBounds = labelsRow !== null ? labelsRow : body;
   fitOnResize(root, () => {
     root.classList.toggle(
       "chart-narrow",
       body.clientWidth / Math.max(1, categories.length) < NARROW_COLUMN
     );
-    layoutAxis(labels, body);
+    layoutAxis(columnLabels, labelBounds);
   });
   return root;
 }

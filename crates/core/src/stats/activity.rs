@@ -19,7 +19,7 @@ use super::projects::folder_name;
 use super::{
     blocked_by_weekday, blocked_spans, keep_warnings, local_date_start, local_day_start,
     local_hour_start, next_local_day_start, range_of, record_chosen, week_columns, week_start,
-    working_rhythm, Ctx, Query, StatsError,
+    working_rhythm, BlockedSpan, Ctx, Query, StatsError,
 };
 
 /// The Rhythm page: the heat map of the week and the averages per weekday.
@@ -40,12 +40,15 @@ pub struct DayRow {
     /// 0 = Monday.
     pub weekday: u8,
     /// The distinct hours with Claude tokens on that weekday, all chosen hosts
-    /// together, divided by the range's calendar weeks. A provider's hours do
-    /// not count: the blocked hours beside it are Claude's too (decision P-2 5).
-    pub working_hours: f64,
+    /// together, divided by the number of that weekday's whole local days
+    /// inside the range. A provider's hours do not count: the blocked hours
+    /// beside it are Claude's too (decision P-2 5). `None` when no whole day of
+    /// that weekday lies inside the range: it has not ended there.
+    pub working_hours: Option<f64>,
     /// The hours Claude was blocked on that weekday, inside Claude's working
-    /// hours, divided by the range's calendar weeks.
-    pub blocked_hours: f64,
+    /// hours, in the same whole days and divided by the same number; `None`
+    /// when the weekday has not ended in the range.
+    pub blocked_hours: Option<f64>,
 }
 
 /// What a host was doing in one hour (spec §3.9).
@@ -229,6 +232,30 @@ pub(crate) fn rhythm_in<Tz: TimeZone + Copy>(
             range.from, range.to
         )));
     }
+    // A weekday's divisor is the number of that weekday's whole local days
+    // inside `range`: from its 00:00 to the next 00:00, both within the range.
+    // A weekday without such a day has not ended in the range: it is `None`,
+    // not 0. The whole days found are always one contiguous run (consecutive
+    // dates, increasing starts), so `ended_from..ended_to` is their union. The
+    // numerator below counts only the hours inside these same days, so
+    // numerator and divisor cover the same days.
+    let mut whole_days = [0u32; 7];
+    let mut ended_from: Option<DateTime<Utc>> = None;
+    let mut ended_to: Option<DateTime<Utc>> = None;
+    let mut date = range.from.with_timezone(&ctx.zone).date_naive();
+    loop {
+        let start = local_date_start(date, &ctx.zone);
+        if start >= range.to {
+            break;
+        }
+        let end = next_local_day_start(start, &ctx.zone);
+        if start >= range.from && end <= range.to {
+            whole_days[date.weekday().num_days_from_monday() as usize] += 1;
+            ended_from.get_or_insert(start);
+            ended_to = Some(end);
+        }
+        date += Duration::days(1);
+    }
     let mut heat = vec![0.0; 168];
     let mut hours_by_weekday: Vec<BTreeSet<DateTime<Utc>>> =
         (0..7).map(|_| BTreeSet::new()).collect();
@@ -237,8 +264,13 @@ pub(crate) fn rhythm_in<Tz: TimeZone + Copy>(
         let local = hour.with_timezone(&ctx.zone);
         let index = local.weekday().num_days_from_monday() as usize * 24 + local.hour() as usize;
         heat[index] += entry.record.out as f64;
-        if entry.valued.company == Company::Anthropic {
-            hours_by_weekday[local.weekday().num_days_from_monday() as usize].insert(hour);
+        if let (Some(from), Some(to)) = (ended_from, ended_to) {
+            if entry.record.t >= from
+                && entry.record.t < to
+                && entry.valued.company == Company::Anthropic
+            {
+                hours_by_weekday[local.weekday().num_days_from_monday() as usize].insert(hour);
+            }
         }
     }
     for value in &mut heat {
@@ -247,14 +279,45 @@ pub(crate) fn rhythm_in<Tz: TimeZone + Copy>(
 
     let spans = blocked_spans(ctx, range, q, Company::Anthropic)?;
     let rhythm = working_rhythm(ctx, range, Company::Anthropic)?;
-    let blocked = blocked_by_weekday(&spans, &rhythm, &ctx.zone);
+    // The blocked hours use the same whole days as the working hours: a block
+    // outside them (in a day that has not ended) counts for nothing.
+    let ended_spans: Vec<BlockedSpan> = match (ended_from, ended_to) {
+        (Some(from), Some(to)) => spans
+            .iter()
+            .filter_map(|span| {
+                let start = span.from.max(from);
+                let end = span.to.min(to);
+                (start < end).then(|| BlockedSpan {
+                    host: span.host.clone(),
+                    account: span.account.clone(),
+                    from: start,
+                    to: end,
+                    // `blocked_by_weekday` recomputes the hours from `from`
+                    // and `to`; it does not read these two fields.
+                    hours: 0.0,
+                    avoidable_hours: 0.0,
+                })
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let blocked = blocked_by_weekday(&ended_spans, &rhythm, &ctx.zone);
 
     let mut per_day = Vec::with_capacity(7);
     for (weekday, hours) in hours_by_weekday.iter().enumerate() {
+        let divisor = whole_days[weekday] as f64;
+        let (working_hours, blocked_hours) = if whole_days[weekday] == 0 {
+            (None, None)
+        } else {
+            (
+                Some(hours.len() as f64 / divisor),
+                Some(blocked[weekday] / divisor),
+            )
+        };
         per_day.push(DayRow {
             weekday: weekday as u8,
-            working_hours: hours.len() as f64 / weeks as f64,
-            blocked_hours: blocked[weekday] / weeks as f64,
+            working_hours,
+            blocked_hours,
         });
     }
 
@@ -1444,12 +1507,12 @@ mod tests {
         let page = rhythm_in(&tiny.ctx(), &week, &all()).unwrap();
 
         // Tuesday holds Claude's two token hours, 09:00 and 10:00, and the
-        // Claude block in the 10:00 hour.
-        assert_eq!(page.per_day[1].working_hours, 2.0);
-        assert_eq!(page.per_day[1].blocked_hours, 1.0);
+        // Claude block in the 10:00 hour. One whole Tuesday is in the week.
+        assert_eq!(page.per_day[1].working_hours, Some(2.0));
+        assert_eq!(page.per_day[1].blocked_hours, Some(1.0));
         // Wednesday holds Codex work and a Codex block alone.
-        assert_eq!(page.per_day[2].working_hours, 0.0);
-        assert_eq!(page.per_day[2].blocked_hours, 0.0);
+        assert_eq!(page.per_day[2].working_hours, Some(0.0));
+        assert_eq!(page.per_day[2].blocked_hours, Some(0.0));
     }
 
     #[test]
@@ -1459,14 +1522,121 @@ mod tests {
         let saturday = &page.per_day[5];
         assert_eq!(saturday.weekday, 5);
         assert!(
-            close(saturday.working_hours, 1.0),
-            "working {}",
+            close(saturday.working_hours.expect("two whole Saturdays"), 1.0),
+            "working {:?}",
             saturday.working_hours
         );
         assert!(
-            close(saturday.blocked_hours, 1.0),
-            "blocked {}",
+            close(saturday.blocked_hours.expect("two whole Saturdays"), 1.0),
+            "blocked {:?}",
             saturday.blocked_hours
+        );
+    }
+
+    /// Monday and Tuesday have each fully ended inside this range, so they
+    /// divide by 1; Wednesday ends at Thursday 00:00, after the range's end,
+    /// so it has not ended and is `None`, not 0.
+    #[test]
+    fn a_weekday_counts_once_per_time_it_fully_ended_in_the_range() {
+        let tiny = tiny();
+        let range = Range {
+            from: utc("2026-11-02T00:00:00Z"),
+            to: utc("2026-11-04T12:00:00Z"),
+        };
+        let page = rhythm_in(&tiny.ctx(), &range, &all()).unwrap();
+
+        assert_eq!(page.per_day[0].working_hours, Some(0.0));
+        assert_eq!(page.per_day[1].working_hours, Some(2.0));
+        assert_eq!(page.per_day[2].working_hours, None);
+    }
+
+    /// Blocked hours divide by the same count of whole weekdays: Tuesday's
+    /// two-hour block over the one Tuesday in the range. Wednesday has work
+    /// and a block in an unfinished day; both count for nothing, so the day is
+    /// `None`, not a partial average.
+    #[test]
+    fn blocked_hours_use_the_same_divisor() {
+        let tiny = tiny();
+        tiny.history
+            .append(&record(
+                "2026-11-04T09:00:00Z",
+                "s9",
+                "/home/sam/projects/atlas/engine",
+                atlas(),
+                1_000_000,
+            ))
+            .expect("the unfinished day's record");
+        let block = |from: &str, to: &str| {
+            tiny.history
+                .append(&Event {
+                    t: utc(from),
+                    kind: EventKind::Blocked {
+                        account: tiny.lb_ref(),
+                        k: LimitKind::Session,
+                        m: None,
+                    },
+                })
+                .expect("the block");
+            tiny.history
+                .append(&Event {
+                    t: utc(to),
+                    kind: EventKind::Unblocked {
+                        account: tiny.lb_ref(),
+                        k: LimitKind::Session,
+                        m: None,
+                    },
+                })
+                .expect("the unblock");
+        };
+        block("2026-11-03T09:00:00Z", "2026-11-03T11:00:00Z");
+        block("2026-11-04T09:00:00Z", "2026-11-04T10:00:00Z");
+
+        let range = Range {
+            from: utc("2026-11-02T00:00:00Z"),
+            to: utc("2026-11-04T12:00:00Z"),
+        };
+        let page = rhythm_in(&tiny.ctx(), &range, &all()).unwrap();
+
+        assert_eq!(page.per_day[1].working_hours, Some(2.0));
+        assert_eq!(page.per_day[1].blocked_hours, Some(2.0));
+        assert_eq!(page.per_day[2].working_hours, None);
+        assert_eq!(page.per_day[2].blocked_hours, None);
+    }
+
+    /// Two lines five minutes apart lie in one local hour: the weekday counts
+    /// one working hour, not two.
+    #[test]
+    fn hours_stay_whole_hours() {
+        let tiny = tiny();
+        let mut first = record(
+            "2026-11-02T09:00:00Z",
+            "m1",
+            "/home/sam/projects/atlas/engine",
+            atlas(),
+            1_000_000,
+        );
+        first.minutes = 5;
+        let mut second = record(
+            "2026-11-02T09:05:00Z",
+            "m1",
+            "/home/sam/projects/atlas/engine",
+            atlas(),
+            1_000_000,
+        );
+        second.minutes = 5;
+        tiny.history
+            .append_many(&[first, second])
+            .expect("the two lines");
+
+        let range = Range {
+            from: utc("2026-11-02T00:00:00Z"),
+            to: utc("2026-11-04T12:00:00Z"),
+        };
+        let page = rhythm_in(&tiny.ctx(), &range, &all()).unwrap();
+        assert_eq!(
+            page.per_day[0].working_hours,
+            Some(1.0),
+            "two 5-minute lines in one hour are one working hour"
         );
     }
 
@@ -1621,15 +1791,19 @@ mod tests {
         // Tuesday: T1 is at 14:30 local, T2 (10:00 UTC) and the record of
         // 09:30 UTC are in the local hour 15, the record of 10:30 UTC in the
         // local hour 16. The range touches three local weeks with this
-        // offset.
+        // offset; only two whole Tuesdays lie inside it, so the weekday
+        // divides by 2 (the heat map keeps its three calendar weeks).
         assert!(
             close(page.heat[24 + 15], 2_000_000.0 / 3.0),
             "heat {}",
             page.heat[24 + 15]
         );
         assert!(
-            close(page.per_day[1].working_hours, 3.0 / 3.0),
-            "working {}",
+            close(
+                page.per_day[1].working_hours.expect("two whole Tuesdays"),
+                3.0 / 2.0
+            ),
+            "working {:?}",
             page.per_day[1].working_hours
         );
     }

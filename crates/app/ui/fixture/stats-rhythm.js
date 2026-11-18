@@ -1,11 +1,6 @@
 // The statistics Rhythm page's fixture: `stats_rhythm`.
 
-import {
-  chosenAccounts,
-  chosenHosts,
-  round1,
-  sum,
-} from "./stats-frame.js";
+import { chosenAccounts, chosenHosts } from "./stats-frame.js";
 
 // ---------------------------------------------------------------------------
 // Rhythm (spec §3.5; data.py's heat())
@@ -21,7 +16,11 @@ export const ACT_PATTERN = [
   [[9, 13], [15, 21]],
 ];
 
-const BLOCKED_PER_DAY = [0.4, 0.3, 0.6, 0.9, 1.1, 0.2, 1.3];
+// Average hours per whole day: Monday is 0, and Sunday has not fully ended in
+// the range, so its value is null (the page writes "—", never 0).
+const WORKING_PER_DAY = [0, 12, 7.25, 8, 6.5, 4, null];
+
+const BLOCKED_PER_DAY = [0.5, 0.25, 0.75, 1.5, 2, 0.5, null];
 
 export function rhythm(query) {
   chosenAccounts(query);
@@ -45,9 +44,9 @@ export function rhythm(query) {
       heat.push(Math.round(value * 1200000));
     }
   }
-  const perDay = ACT_PATTERN.map((ranges, day) => ({
+  const perDay = ACT_PATTERN.map((_, day) => ({
     weekday: day,
-    workingHours: round1(sum(ranges.map(([from, to]) => to - from))),
+    workingHours: WORKING_PER_DAY[day],
     blockedHours: BLOCKED_PER_DAY[day],
   }));
   return { heat, perDay };

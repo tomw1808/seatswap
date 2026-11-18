@@ -3,11 +3,45 @@
 // weekday. The page formats and draws the struct; the averages and the blocked
 // hours come from the Rust page.
 
-import { WEEKDAYS, clear, emptyLine, h, pad, tokens } from "../../common.js";
+import { WEEKDAYS, clear, emptyLine, h, hoursText, pad, tokens } from "../../common.js";
 import { bars, heat } from "../../charts.js";
+
+const WEEKDAY_NAMES = [
+  "Monday",
+  "Tuesday",
+  "Wednesday",
+  "Thursday",
+  "Friday",
+  "Saturday",
+  "Sunday",
+];
+
+function weekdayName(category) {
+  const index = WEEKDAYS.indexOf(category);
+  if (index < 0) {
+    throw new Error(`the Rhythm page has no weekday ${JSON.stringify(category)}`);
+  }
+  return WEEKDAY_NAMES[index];
+}
 
 function hourRange(hour) {
   return `${pad(hour)}:00–${pad(hour + 1)}:00`;
+}
+
+// A null is a weekday that has not fully ended in the range: it has no
+// average, and the page writes "—" for it, never 0.
+function valueLabel(value) {
+  return value === null ? "—" : hoursText(value);
+}
+
+// The y axis is 0–24h. A weekday on the day the clocks go back has 25 distinct
+// local hours, so an average can be 25: only then does the axis grow to 25h
+// (a value above 25 is still an error, which `bars()` reports). The labels stay
+// at 0, 6, 12, 18 and 24h.
+const HOUR_TICKS = [0, 6, 12, 18, 24];
+
+function axisTop(values) {
+  return values.some((value) => value !== null && value > 24) ? 25 : 24;
 }
 
 function dayValues(rows, field, name) {
@@ -20,7 +54,7 @@ function dayValues(rows, field, name) {
       throw new Error(`the Rhythm page names ${name} twice for ${WEEKDAYS[row.weekday]}`);
     }
     const value = row[field];
-    if (typeof value !== "number" || !Number.isFinite(value)) {
+    if (value !== null && (typeof value !== "number" || !Number.isFinite(value))) {
       throw new Error(
         `the Rhythm page has no ${name} for ${WEEKDAYS[row.weekday]}: ${JSON.stringify(value)}`
       );
@@ -83,7 +117,7 @@ export async function show(container, env) {
   workingCard.appendChild(
     h("div", { class: "ch" }, [
       h("span", { class: "t", text: "Working hours per day" }),
-      h("span", { class: "s", text: "hours with tokens, per week" }),
+      h("span", { class: "s", text: "hours with tokens, per day" }),
     ])
   );
   const workingBody = h("div", { class: "stats-rhythm-bars-body" });
@@ -94,7 +128,7 @@ export async function show(container, env) {
   blockedCard.appendChild(
     h("div", { class: "ch" }, [
       h("span", { class: "t", text: "Blocked hours per day" }),
-      h("span", { class: "s", text: "the active account was at 100 %, per week" }),
+      h("span", { class: "s", text: "the active account was at 100 %, per day" }),
     ])
   );
   const blockedBody = h("div", { class: "stats-rhythm-bars-body" });
@@ -110,13 +144,20 @@ export async function show(container, env) {
     workingBody.appendChild(
       bars({
         categories: WEEKDAYS,
+        yMax: axisTop(working),
+        yTicks: HOUR_TICKS,
+        yLabel: (value) => `${value}h`,
+        labels: valueLabel,
         series: [
           {
             name: "working hours",
             color: "var(--focus)",
             values: working,
             unit: "h",
-            tip: (category, value) => `${category} | ${value} working hours a week`,
+            tip: (category, value) =>
+              value === null
+                ? `${category} · — : ${weekdayName(category)} has not ended in the range`
+                : `${category} · ${hoursText(value)} on an average ${weekdayName(category)}`,
           },
         ],
       })
@@ -124,13 +165,20 @@ export async function show(container, env) {
     blockedBody.appendChild(
       bars({
         categories: WEEKDAYS,
+        yMax: axisTop(blocked),
+        yTicks: HOUR_TICKS,
+        yLabel: (value) => `${value}h`,
+        labels: valueLabel,
         series: [
           {
             name: "blocked hours",
             color: "var(--danger)",
             values: blocked,
             unit: "h",
-            tip: (category, value) => `${category} | ${value} blocked hours a week`,
+            tip: (category, value) =>
+              value === null
+                ? `${category} · — : ${weekdayName(category)} has not ended in the range`
+                : `${category} · ${hoursText(value)} blocked on an average ${weekdayName(category)}`,
           },
         ],
       })

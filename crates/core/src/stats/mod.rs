@@ -2721,6 +2721,8 @@ pub(crate) mod tests {
     }
     /// A record at 09:00 in +02:00 stays in the heat map's hour 9 even when the
     /// range starts in +01:00: every local hour uses its own instant's offset.
+    /// Monday 30 March ends at 22:00 UTC (00:00 Tuesday in +02:00), so a range
+    /// that stops at 12:00 UTC leaves the day unfinished.
     #[test]
     fn a_summer_record_is_in_its_own_local_hour() {
         let tiny = tiny();
@@ -2741,10 +2743,10 @@ pub(crate) mod tests {
             })
             .expect("the summer record");
         // The range starts in +01:00 and ends after the change; it touches two
-        // calendar weeks.
+        // calendar weeks, and Monday 30 March has fully ended at its end.
         let range = Range {
             from: utc("2026-03-23T00:00:00Z"),
-            to: utc("2026-03-30T12:00:00Z"),
+            to: utc("2026-03-30T22:00:00Z"),
         };
         let ctx = ctx_with(&tiny, SummerZone);
         let page = activity::rhythm_in(&ctx, &range, &all()).expect("the Rhythm page");
@@ -2752,10 +2754,22 @@ pub(crate) mod tests {
         assert!(close(page.heat[9], 500_000.0), "heat 9: {}", page.heat[9]);
         assert!(close(page.heat[8], 0.0), "heat 8: {}", page.heat[8]);
         assert!(
-            close(page.per_day[0].working_hours, 0.5),
-            "Monday: {}",
+            close(
+                page.per_day[0].working_hours.expect("one whole Monday"),
+                1.0
+            ),
+            "Monday: {:?}",
             page.per_day[0].working_hours
         );
+        // The same record with the range ending at 12:00 UTC: Monday 30 March
+        // has not ended there (it ends at 22:00 UTC), so its average is `None`,
+        // never 0.
+        let mid_day = Range {
+            from: utc("2026-03-23T00:00:00Z"),
+            to: utc("2026-03-30T12:00:00Z"),
+        };
+        let mid_day_page = activity::rhythm_in(&ctx, &mid_day, &all()).expect("the Rhythm page");
+        assert_eq!(mid_day_page.per_day[0].working_hours, None);
     }
 
     /// Every column of a range across the change starts at Monday 00:00 local:

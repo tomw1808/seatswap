@@ -197,7 +197,8 @@
 /* Columns narrower than 28px (charts.js `NARROW_COLUMN`): small gaps and
    corners, so the bars keep their width. */
 .chart-narrow .chart-cols-body,
-.chart-narrow .chart-bars-body {
+.chart-narrow .chart-bars-body,
+.chart-narrow .chart-bar-labels {
   gap: 2px;
 }
 
@@ -348,13 +349,59 @@
   flex-shrink: 0;
 }
 
+/* A bar chart with a fixed scale (charts.js `bars({ yMax })`): the plot keeps
+   room above the bars for a full bar's value label (11px line + 3px above it),
+   and `.chart-bars-body` inside it is the one box the grid lines and the bars
+   share. */
+.chart-bars-plot {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  margin-top: 6px;
+  margin-left: 34px;
+  margin-right: 4px;
+  padding-top: 14px;
+  border-left: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
 .chart-bars-body {
+  position: relative;
   flex: 1;
   display: flex;
   align-items: flex-end;
   gap: 8px;
   min-height: 0;
   padding: 8px 4px 0;
+}
+
+/* With a fixed scale the bars' box carries no top padding of its own (the
+   plot has the room for the value label) and the weekday labels wait below
+   it, so the box is exactly the bars' height. */
+.chart-bars-plot .chart-bars-body {
+  padding: 0 4px;
+}
+
+.chart-bar-labels {
+  display: flex;
+  gap: 8px;
+  padding: 2px 4px 0;
+  margin-left: 34px;
+  margin-right: 4px;
+}
+
+/* In this row the labels lie side by side: each slot keeps the 13px line its
+   anchored label needs (the label itself is positioned, so it gives none). */
+.chart-bar-labels > .chart-col-label {
+  flex: 1;
+  width: auto;
+  min-width: 0;
+  height: 13px;
+}
+
+.chart-bar-labels {
+  flex: 0 0 auto;
 }
 
 .chart-bar-col {
@@ -383,6 +430,42 @@
   max-width: 22px;
   border-radius: 4px 4px 0 0;
   min-height: 0;
+}
+
+/* The value above a bar (charts.js `bars({ labels })`): the slot keeps the
+   bar's height scale, and the label stands above the bar or, for a missing
+   value, at the foot where the bar would start. */
+.chart-bar-slot {
+  position: relative;
+  flex: 1;
+  width: 100%;
+  max-width: 22px;
+  height: 100%;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+}
+
+.chart-bar-slot .chart-bar {
+  width: 100%;
+}
+
+.chart-bar-label {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 9px;
+  line-height: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+/* A fixed scale's grid lines are positioned and would paint over the bars in
+   flow; the bars and their value labels paint above them. */
+.chart-bars-plot .chart-bar,
+.chart-bars-plot .chart-bar-slot {
+  position: relative;
+  z-index: 1;
 }
 
 .chart-grid {
