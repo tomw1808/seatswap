@@ -6,8 +6,49 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-11-18
+
+### Added
+
+- Settings → Projects shows one heading per organization, with its origin in words, merged
+  organizations, Split off, empty organizations dimmed, and tokens and sessions of all time;
+  "No organization" comes last. Move to moves a project at once; Merge into and Split off ask first.
+- Statistics → Projects splits every row's bar by subscription, with work without a known account
+  grey and striped, and shows an organization × subscription table whose row, column and total
+  figures keep the part that is known.
+- The Overview's This-week card shows tokens, money used and API value, the top eight projects split
+  by subscription with Show all, and each subscription's running window.
+- The tray app writes its Linux menu entry and icon under `$XDG_DATA_HOME` when they are missing or
+  differ, with the same command as autostart. A symbolic link there, and an entry it did not make,
+  are left alone and named once.
+- The Activity page sums its top row over all hosts, with each host in the tooltip, and draws the
+  strip under the hour bars as a heatmap of working sessions.
+
+### Changed
+
+- A sum keeps its known part when another part is missing and is shown with `≥`; a share, ratio or
+  percent still needs a complete value. A share of an API value is the exception: it counts priced
+  work only, so one model without a price no longer empties every share on Statistics → Projects.
+  The page says "shares count priced work only".
+- Codex and Ollama are polled when found by themselves: Codex when its login file exists, Ollama when
+  the program is on `PATH` or this host has an Ollama subscription. A found Codex login is saved. A
+  stopped Ollama says `Ollama is not running.` quietly.
+- Auto-burn's factor rests on its own measured work from 100 USD on; below that the assumed prior
+  still weighs as 100 USD.
+- Rhythm's working and blocked hours are per weekday over the whole local days that ended in the
+  range, and a weekday that has not ended shows `—`; the bars share a 0–24 h axis that grows to 25 h
+  only when the clocks go back.
+- Statistics → Subscriptions: a subscription without a price says `no price yet · set it`, and the
+  link opens its price field.
+- Settings keeps its scroll position on a redraw; `#settings/accounts?<id>` opens and focuses an
+  account's or subscription's price.
+- Small token counts are lighter but keep at least 3:1 contrast.
+- Sessions: a flash job with one worker and no subagents draws one row, with no worker row or fold.
+
 ### Fixed
 
+- Windows: Codex logins are kept as private files in seatswap's `secrets` folder, because a login is
+  larger than one Credential Manager entry (2,560 bytes). Codex switching works there now.
 - Subscriptions → Tokens a week: the note says the figures are fitted from all work up to now each
   time the page opens; it said "Refit every week", which they never were.
 

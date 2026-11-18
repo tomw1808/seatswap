@@ -244,6 +244,8 @@ Config folder (Rust `dirs` crate):
 
 They use the `keyring` crate, with service `seatswap` and the account `id` as the user. If no keyring is available (a headless Linux box, or a minimal window manager without Secret Service), the fallback is `secrets/<id>.json` with mode `0600` in a `0700` folder. The UI then shows a warning that the logins are stored unencrypted.
 
+On Windows, Codex's saved logins are always private files in the same `secrets` folder, even while the keyring is in use and Claude logins stay in Credential Manager (W-1, documented rule). One Codex login is larger than one Credential Manager entry holds (2,560 bytes), so a saved login would not fit; the copies are private files like the fallback, with no warning of their own. Codex itself keeps its live login in `auth.json` (§7.9).
+
 **Identity.** An account is identified by `accountUuid` + `organizationUuid`. The same person in two organizations counts as two accounts, which is exactly the two-licence case. An OpenAI or Ollama login is a **provider subscription** in `providerSubscriptions`: its account reference, label, abbreviation, colour, plan and monthly price with its `priceCurrency`, one per login, created when the provider's first reading arrives and edited like an account's (§7.9).
 
 **Usage cache.** `usage-cache.json` holds the last response per account and when it was fetched. The pop-up opens at once from the cache and refreshes in the background.
@@ -577,12 +579,15 @@ union over hosts, documented rule): a rise outside that time comes from use seat
 (claude.ai, the phone, a machine without seatswap). The pairs inside one 5 h window give `s` the
 same way.
 
-A factor's estimate is `(Σ gain + prior × 100 USD) / (Σ usd + 100 USD)` whenever the account has a
-prior, measured or not, so the prior's weight fades as the account's own dollars grow; without a prior
-it is `Σ gain / Σ usd`. Its 80 % range is 1.2816 standard
-errors of all pairs around that line, with the prior counted as one more pair of 100 USD (documented
-rule); without pairs the range is the prior itself. A factor that is not above 0 is unknown, never a
-number. A factor is measured at 100 USD of the account's own pairs; below that it leans on its prior.
+A factor's estimate is `(Σ gain + prior × 100 USD) / (Σ usd + 100 USD)` while the account's own pairs
+are below 100 USD and it has a prior, so the prior's weight fades as the account's own dollars grow;
+without a prior it is `Σ gain / Σ usd`. Its 80 % range is 1.2816 standard
+errors of all pairs around that line, with the prior counted as one more pair of 100 USD while the
+prior counts (documented rule); without pairs the range is the prior itself. Once Σ USD reaches
+100 USD the factor is measured and the prior is dropped: value, range and standard error are then
+computed from the account's own pairs alone. A measured account whose own gain is ≤ 0 has no factor,
+never one lifted by a prior. A factor that is not above 0 is unknown, never a number. Below 100 USD of
+the account's own work it leans on its prior.
 
 The prior of an account and a limit comes from the factors of the **other** accounts that are
 measured from their own pairs alone, in this order (documented rule):
@@ -848,13 +853,23 @@ subscriptions; when `OA` or `OL` is taken, the first free `O2` … `O9` is used.
 goes through the same rule as an account's (§8.2). OpenAI's plan comes from the provider's
 `plan_type`; Ollama's reply names no plan, so its plan is typed in Settings and shows `—` until
 then. A price edit writes `priceChanged` for the subscription's account reference; looks and prices
-are shared between hosts like an account's. A provider is polled while its card is on **or** while
-its subscription has a price, so a priced subscription stays current with its card off; a failed
-poll of such a subscription is reported once, without a card to show it.
+are shared between hosts like an account's.
+
+A provider is polled while its card is on **or** when it is found by itself, even with the card off
+(R6). Codex is found when `<codex folder>/auth.json` exists. Ollama is found when the `ollama`
+program is in a folder of `PATH` (`ollama.exe` on Windows) or when this host's `accounts.json` holds
+an Ollama subscription; an Ollama subscription that only another host stores does not bring Ollama
+in. `PATH` is read once at startup, and that one value decides every poll of the run. A found
+provider is polled like a switched-on one: its first reading creates or updates its subscription as
+above, its `priceChanged` and `planChanged` travel, and a found Codex login is saved into seatswap's
+store and may write a `providerSwitch`. With the card off there is no card to show an error, so a
+found provider's error is printed once on standard error, never notified. A provider that is
+neither on nor found is never read and no request is sent.
 
 **The cards.** Two more usage sources are shown as cards under the account cards in the pop-up,
 under a thin heading "Other providers". Each card has its own switch and is off by default; while
-it is off, the card reads nothing and its usage request is not sent. The Sessions area is separate:
+it is off, the pop-up shows no card for it, but a found provider is still polled (above) and its
+reading recorded. The Sessions area is separate:
 while *Read sessions* is on it reads Codex's rollout files whatever the Codex card says (§11.4).
 Neither card signs in or out, refreshes the live login, or sends a request that generates text.
 Their readings go into the history like a Claude account's, under an organization of their own.
@@ -893,7 +908,8 @@ The answer becomes the same limits a Claude account has:
   no severity, so the load colour comes from the percent alone (§7.3).
 
 **Codex logins.** Every ChatGPT login seatswap sees in `auth.json` is kept in the secrets store
-(keyring, or `0600` files, as Claude logins) as the file's whole JSON object, every key in its order,
+(keyring, or `0600` files, as Claude logins; on Windows always private files, §5) as the file's whole
+JSON object, every key in its order,
 under the first 32 hex digits of SHA-256 of `codex:<account id>`. When the live tokens differ from
 the stored copy (Codex renewed them, or the person signed in with `codex login`), the stored copy is
 replaced; a poll that changed nothing writes nothing. A new `account_id` gets a provider
@@ -976,8 +992,11 @@ per-model limit of another length is labelled `{model} · {name}`, for example
 the live one first; a click switches to it, with a pending row until the answer and then the note
 above. An Ollama card on a new plan has the credit rows, in the page's one money rule (§11.5): whole
 dollars from 10 on, two decimals below, so `212 USD of 300 USD` and `3.18 USD`. A first reading
-without limits says `No usage limits in the reply.`; a provider that is switched off has no card. A
-failed poll keeps the last numbers and their time, greys them and shows the error text under them;
+without limits says `No usage limits in the reply.`; a provider that is switched off has no card. An
+Ollama server that does not answer says `Ollama is not running.` as one quiet grey line on its card,
+not as an error in red; the change from running to not running is reported once, no reading is
+recorded, and the next answering poll resumes. A failed poll keeps the last numbers and their time,
+greys them and shows the error text under them;
 the age is printed once the reading is older than two minutes. The next poll tries again.
 
 **A late answer.** The provider thread reads the settings again after every request. If the card was
@@ -1002,7 +1021,8 @@ old numbers before the next round asks the new place, exactly as a save does.
 | an answer of the wrong shape | `Unexpected answer: {reason}` |
 | an HTTP or network failure | the API's own text: `the access token is not authorized` · `{service} limits how often seatswap may ask` · `server error 500` · `HTTP 404: {body}` · `cannot connect: {reason}` (Codex) · `network error: {reason}` · `cannot decode the reply: {reason}` |
 
-For Ollama a refused connection becomes `Ollama is not running on {url}.`; a balance answer of HTTP
+For Ollama a refused connection becomes `Ollama is not running on {url}.` in reports and on standard
+error; its card writes the quiet line `Ollama is not running.` instead. A balance answer of HTTP
 401 or 403 becomes `Ollama on {url} refused the request (HTTP {status}). Is it signed in?` (seatswap
 sends no token, so the card speaks of none); every other API failure keeps the API's text. A failed
 24h usage request is not the card's error at all: its API text is the `not read:` row. The `Setting`
@@ -1106,6 +1126,15 @@ is 256 px (`crates/app/icons/icon.png`, drawn from `icon.svg`); `icon.ico` carri
 64 and 256 px for Windows. It is the launcher's icon, the Windows `.exe`'s, the icon of every window
 (taskbar and Alt+Tab) and of every notification.
 
+**The Linux menu entry and its icon (D-1).** At every start the tray app writes
+`$XDG_DATA_HOME/applications/seatswap.desktop` (else under `~/.local/share`) and the icon
+`$XDG_DATA_HOME/icons/hicolor/256x256/apps/seatswap.png` beside it, when they are missing or differ.
+The entry has a line `X-seatswap-managed=true`, starts the same command and flags as the autostart
+entry, and names the icon's full path; a path or argument with a line break is refused. A symbolic
+link at either path is left alone and named once on standard error, and so is an entry without that
+managed line. The icon is seatswap's own file and is still written when the entry is left alone. A
+write failure is named on standard error and never stops the start. Nothing is written on Windows.
+
 ---
 
 ## 9. Platform support
@@ -1184,9 +1213,9 @@ They give real click handling and exact placement on those desktops. They're not
 | `plan` per account | from the login | read-only `Option<String>`: the identity's `planDisplayName`, else Claude's current name for the login's `subscriptionType` and `rateLimitTier` (Claude renamed its plans: `max` with `_5x` is "Max", `max` with `_20x` is "Ultra", `team` with `_5x` is "Team Premium"), else the capitalised `subscriptionType` with its level from `rateLimitTier` ("Enterprise 20x"; a tier seatswap cannot read as a multiplier in parentheses, "Team (team_premium)"). Team Standard seats are not named yet: their tier value has not been seen. A stored label of seatswap 1.2.0 ("Team 5x", "Max 5x", "Max 20x") that gives way to the current name is saved, but it is no plan change: the history gets no `planChanged`. Shown in the pop-up, Settings → Accounts and `seatswap list` |
 | `agentsRead` | on | agents may run `list`, `status`, `burn plan`, `burn simulate`, `prices` and `history export` (§6.6, §7.7) |
 | `agentsSwitch` | off | agents may run `use` and `next` (§6.6); an agent's `next` does nothing while auto-burn is on (§7.8) |
-| `codexCard` | off | `bool`; show the OpenAI (Codex) card in the pop-up, with every saved Codex login under it. While off, the card reads nothing and sends no usage request, and its logins are not listed; a subscription with a price is still polled (§7.9). The Sessions area still reads Codex's rollout files while *Read sessions* is on. Settings → Providers, "Show a Codex card" |
+| `codexCard` | off | `bool`; show the OpenAI (Codex) card in the pop-up, with every saved Codex login under it. While off, there is no card and its logins are not listed, but a Codex login file found in the Codex folder is still polled and saved (§7.9). The Sessions area still reads Codex's rollout files while *Read sessions* is on. Settings → Providers, "Show a Codex card" |
 | `codexHome` | none | `null` or an absolute folder: where Codex's `auth.json` and `sessions/` are; `null` means `$CODEX_HOME`, else `~/.codex`. A relative folder is refused. Settings → Providers, "Codex folder" (§7.9) |
-| `ollamaCard` | off | `bool`; show a read-only Ollama card. While off, no request is sent to the Ollama server (§7.9). Settings → Providers, "Show an Ollama card" |
+| `ollamaCard` | off | `bool`; show a read-only Ollama card. While off, there is no card, but Ollama is still polled when the `ollama` program is found or this host stores an Ollama subscription (§7.9). Settings → Providers, "Show an Ollama card" |
 | `ollamaUrl` | `"http://127.0.0.1:11434"` | the Ollama server the card asks; must start with `http://` or `https://` and name a host: a DNS name, an IPv4 address or a bracketed IPv6 address. Refused: a whitespace or control character, user info (without quoting the URL), no such scheme, a host that is not one of those, a query string, a fragment, an empty path segment. A port, a path, an IPv6 host and one trailing `/` are accepted. Settings → Providers, "Ollama server" (§7.9) |
 
 Every setting above is edited in the large window's Settings area (§11.4); the last column names the
@@ -1311,7 +1340,11 @@ Every control saves at once; there is no Save button. A refused save shows its e
 and puts the control back to the saved value. Saves run one after another, each built from the
 settings the one before left, so a quick second change never carries a stale copy; while a save is
 pending, an incoming snapshot does not overwrite the page's own copy. The left group menu stays on
-screen while only the content pane scrolls. A text field's focus frame is drawn outside its box, and
+screen while only the content pane scrolls. A redraw of the open group keeps the content pane at the
+same scroll position, and another group opens at the top. The address `settings/accounts?<id>` opens
+Accounts, scrolls that account's or subscription's row into view and focuses its price field; an id
+no row has says `No account {id}.` and focuses nothing. A text field's focus frame is drawn outside
+its box, and
 the table or label cell that holds it shows the whole frame instead of cutting it; the money rows
 are drawn again only when their view changed, so the checked time and the rate do not flicker while
 a snapshot ticks.
@@ -1353,9 +1386,14 @@ a snapshot ticks.
   sessions notify; "An account is usable again"; "All accounts are full" (always on); "Every
   automatic switch"; "A switch by an agent" (always on); a link to the suggested switches under
   Auto-burn; "A login ends", the 5-day, 1-day and ended warnings.
-- **Projects.** §11.6. Under the list stands `+ Add organization`; each organization has a Remove
-  button, except one that comes from a repository owner, which has none and says why. The *Join
-  projects* row keeps its text and its button apart at every width.
+- **Projects.** §11.6. One heading per organization, its projects below it; `No organization` comes
+  last. A project's row shows its name, its tokens and sessions of all time, its organization in
+  words and its menus *Move to* and *Merge into*; an organization's row shows its source, tokens and
+  sessions, *Merge into* and *Split off* (when merged), and *Remove* except for one that comes from
+  a repository owner or is an owner organization of this or another host, which have none and say
+  why. *Move to* lists the other organizations and `No organization` and applies at once. *Merge
+  into* and *Split off* ask first. `+ Add organization` stands under the list. The *Join projects*
+  row keeps its text and its button apart at every width.
 - **Agents.** "Agents may read usage" and "Agents may switch accounts", with the text of §6.6; the
   skill's state, an install and a remove button; the last 20 calls by agents, newest first, with
   their folder and whether they were allowed.
@@ -1450,7 +1488,8 @@ tokens are its transcript totals and its values are unknown with the reason.
 with the unit and no space — 1.54M, 23.4M, 683K, 1.20K, 1.23B — and below 1,000 the plain number (845,
 7; 0 for none). Rounding that carries over moves to the next unit (999,600 is 1.00M, not 1000K).
 Thousands and plain numbers are drawn in a lighter colour than millions and billions, so the large
-numbers stand out; a bold total stays bold. A count inside a sentence or a hover text uses the same
+numbers stand out; a bold total stays bold. The lighter colour keeps at least 3:1 contrast against
+the card and every tinted row it sits on. A count inside a sentence or a hover text uses the same
 spelling.
 
 A session opens to its agents. Its running agents are grouped by each agent's own provider and
@@ -1466,7 +1505,9 @@ with neither kind nor task reads "agent". A flash job's task is the `label` of i
 workers have no task. The label is shown live only and never written to any file. One row per agent
 has kind, task, the model of its last answer (`no answers yet` before its first), running or completed with when it finished, tokens and both values, and its own agents as "1 running ·
 2 done". An agent that started agents opens the same way, to any depth. A flash job is an agent with
-the tag `flash`, its workers below it. Completed agents are folded into one "38 completed" row that opens and that
+the tag `flash`, its workers below it. A flash job with exactly one worker, and that worker has no
+agents of its own, draws no worker row and no fold (N-1); the job row's running and completed counts
+stay as they were. Completed agents are folded into one "38 completed" row that opens and that
 carries the subscription and API value of their tokens — one sum for the session, shown only when the
 row holds all of its completed agents. An agent
 without Claude Code's `finished` mark counts as done once its transcript ends with the agent's final
@@ -1638,9 +1679,10 @@ first reading. A history whose accounts were all removed since stays on show.
   reading whose reset still lies ahead. It starts seven days before that reset; its use so far is
   the newest reading minus `from`, the reading a reset began it at. It is placed by its midpoint
   like a finished window, so it never moves to another week when it ends; that midpoint can lie in
-  last week or next week. Where a page counts it (the Weeks page), it offers one week's price like
-  any window, it has expired nothing yet, and its week is marked "so far". Overview's history counts
-  finished windows only; its This-week card shows the running ones.
+  last week or next week. A page counts it where it shows the range's windows: it offers one week's
+  price like any window, it has expired nothing yet, and its week is marked "so far". The Expired
+  share and auto-burn's averages use finished windows only; the This-week card counts the running
+  ones.
 - **The price of a window** is the account's monthly price at the window's midpoint: the last
   `PriceChanged` at or before it, or the first change when the midpoint lies before all of them, or
   the stored price when there is no change. It counts only in the currency it was entered in, as in
@@ -1671,36 +1713,52 @@ first reading. A history whose accounts were all removed since stays on show.
   the pop-up), *cli* (`seatswap use`), *auto* (auto-burn), *agent* (a call by an agent), and
   *external* (a change seatswap noticed but did not make).
 
-**Overview.** On top stands the card **This week · so far** ("each account's current weekly window,
-by project"). It ignores the range: it always shows the weekly windows running now, so a new install
-sees its use from the first reading on. It shows also when the range holds nothing: then
-"Nothing recorded yet." stands below it instead of the rest of the page. One row per chosen account with a running window, in the
-stored accounts' order: the account and its plan, a bar from 0 to 100 % whose filled part is the use
-so far split into the projects' pieces, then `27 % · 14.20 EUR` (the use so far and its money at the
-window's price; `—` with the reason without a price) and `resets Thu 10:00`. When a reset began the
-window, its tooltip says the newest reading and the reading it began at. A project's piece is its
-share of the account's API value in the window, from the window's start to now: the three largest,
-then *other*. Only token records of Anthropic models count in an account's row, and the host filter
-applies to them. After the account rows comes one row per provider subscription with token records in
-the current calendar week: the subscription's chip, a bar from 0 to 100 % like an account's when it
-has a running window and a price, then the use so far and its money at the subscription's price and
-`resets Thu 10:00`. Without a price the bar is the paler kind and the legend below says `paler: valued
-at API prices only, no price entered`; the row then shows its API value with `at API prices` and gives
-the reason in its tooltip. Its records are those from its running window's start (OpenAI: its
-`weekly_all` week; Ollama: its `monthly_credits` month) to now; the host filter applies, and its
-subscription's chip chooses it like an account's. Work of a company whose subscription cannot be
-named gets one more row per company, named by the company, with its API value and the reason. A line
-below names the projects with their share of the API value over all listed accounts and providers
-together. Before the first usage reading the card says `No usage reading
-yet: this card fills in with the next usage poll.`, followed by the provider rows when there are
-any.
+**Overview.** On top stands the card **This week · so far** ("each subscription's current window").
+It ignores the range: it always shows the weekly windows running now, so a new install sees its use
+from the first reading on. It shows also when the range holds nothing: then "Nothing recorded yet."
+stands below it instead of the rest of the page. The card has three totals over everything it counts:
 
-Everything below counts **finished weekly windows only**: five numbers for the range,
+- **Tokens**: the output tokens, with the project count below.
+- **Used**: the subscription value used, with `27 % of 14.20 EUR paid for this week` below it. The
+  paid sum is one week's price for each running Claude week, one week's price for each running
+  OpenAI week, and `month price × 12 / 52` for an Ollama month (documented rule). A running window
+  without a price adds nothing, the sum is drawn `≥` with the reason (R3), and the percent is `—`
+  while the used value or the paid sum is partial.
+- **At API prices**: what the same work would cost without a subscription.
 
-- **Used**: the money used of the priced account weeks, with the money paid for them below it; its
+Below them, one row per project the card counts, sorted by the known part of its subscription value,
+largest first, ties by tokens then name: the project's name; a bar as long as that known part, split
+by subscription in each subscription's colour (work without a known account grey and striped, R2);
+its tokens; its subscription value and API value. The top eight rows show; the rest stand behind
+`Show all N projects ▾` (`Show fewer ▴` closes them), and the open list scrolls inside the card at
+the height of those eight rows. A total row `all N` repeats the same figures. The first eight rows
+keep their place when the list is opened.
+
+Beside the list stands **Subscriptions this week**, one line per subscription with a running window:
+the chip and plan, the use so far and its money (`27 % · 14.20 EUR`; `—` with the reason without a
+price), and `resets Thu 10:00`; a provider row without a price shows its use and `no price`. Its
+note says `Percent of each subscription's weekly limit; its window resets at the time shown.` The
+account rows stand in the stored accounts' order, then the provider subscriptions in the chips'
+order. A Claude account's row counts its token records of its running window from its start to now,
+and work without a known account from the start of the calendar week; the host filter applies. A
+provider row counts its records from its running window's start (OpenAI: its `weekly_all` week;
+Ollama: its `monthly_credits` month) to now; its subscription's chip chooses it like an account's.
+Before the first usage reading the card says `No usage reading
+yet: this card fills in with the next usage poll.`
+
+The weekly chart below marks a running week `so far`. The card keeps its eight rows, so the whole
+Overview scrolls inside the window under the tabs when the card is tall; the weekly charts keep
+300 px.
+
+Everything below counts the range's **weekly windows, the running ones included where a point says
+so**: five numbers for the range,
+
+- **Used**: the money used of the priced account weeks, the running ones included, with the money
+  paid for them below it; its
   percent is the used money over the money the windows offered, one week's price per window, so a
-  reset week offers two.
-- **Expired unused**: the money that expired and its percent of the same offered windows, split per
+  reset week offers two and a running window offers one.
+- **Expired unused**: the money that expired and its percent of the finished windows' offered money,
+  split per
   account, largest first. A window above 100 % counts all its use, so Used and Expired together can
   pass 100 %; nothing is cut.
 - **Blocked**: one line per company — Anthropic, OpenAI, Ollama — with the working hours in which a
@@ -1715,14 +1773,15 @@ Everything below counts **finished weekly windows only**: five numbers for the r
   §2.13); `—` when the cost or the rates are missing.
 
 Below them, every calendar week of the range carries two stacked bars in money: one stacked in the
-accounts' colours with the expired part hatched on top, and one splitting the projects'
+subscriptions' colours with the expired part hatched on top, and one splitting the projects'
 subscription value among the projects (the three largest, the rest as *other*). The hours blocked
 stand under each week, and the marks say when an account was added and when auto-burn was switched
 on or off. Beside them, "Share that expired, per week" is one line: the expired money over the money
-the week's windows offered, by the same rule as the Expired share; a week without a priced week has
-no point. When no weekly window of the range has finished yet, the chart card says `No weekly window
+the week's finished windows offered, by the same rule as the Expired share; a week without a priced
+finished window has no point. When no weekly window of the range has finished yet, the chart card says `No weekly window
 has finished in this range yet. The card above shows the running ones.` instead of a chart; the
-numbers stay. A project's colour is the same on the card and in the chart. "What the numbers say"
+numbers stay. A subscription has the same colour on the card, in the project rows and in the matrix.
+"What the numbers say"
 holds at most four sentences, in this order, each only when it has data:
 
 1. `{abbr} is where most money expired: {amount} in {n} weeks.` — the account with the largest
@@ -1731,6 +1790,9 @@ holds at most four sentences, in this order, each only when it has data:
 3. `Since auto-burn ({date}): {h} blocked a week, {e} expired. Before: {h0}, {e0}.` — from the latest
    `AutoBurnSet { on: true }` in the range that stayed on, with a full week before and after it.
 4. `{abbr} was full in {n} of {m} weeks.` — the account with the most weeks at 100 %.
+
+The sentences and the Expired share use finished windows only; the Used figure, its paid line and
+the weekly chart count the running ones too.
 
 **Weeks.** Every window as a grid under the heading "Every weekly window": one row per account, one
 column per calendar week, the weeks' dates above, and the chosen week's detail in the card on the
@@ -1777,30 +1839,50 @@ holds their middle.` (`AC's running weekly window counts in …` for one).
   the window that name its reset.
 
 **Projects and organizations.** A tree table with three levels: organization → project → folder.
-An organization's row comes first; its projects follow by API value, and a project's folders appear
-under it when it has more than one. A folder is the first path part below the project's root on
-that host (the common parent of the project's folders), or the top folder. The second view is the
-plain folder tree without organization rows; either view opens and closes its rows. Every row shows
-its tokens, its share of the page's API value, its subscription value and API value, a bar split by
-account in the accounts' colours, and its distinct sessions. Work of another company (OpenAI,
-Ollama) belongs to no Claude account: it is a faded neutral part at the end of the bar, and the
-row's name carries a neutral tag with the company's name, whose tooltip reads `OpenAI · 12 % of this
-project's API value · no subscription price yet`. It counts in the row's API value and share, never
-in a Claude account's subscription value or a matrix cell, and the page notes `OpenAI and Ollama
-work is valued at API prices only; it uses no Claude account.` (naming the companies present). The matrix's `Used` footer repeats the
-column totals, each the sum of the cells above it; a share whose API value or whose page total is
-unknown is `—` with the reason, never `0 %`. A project's detail gives its share of all use
-(`21.9 % of all use · 18 sessions`) and the line `API values at 1 USD = 0.9048 EUR (13 Nov)`, or
+An organization's row comes first, with its source in words — `from the owner of the repositories
+on GitHub`, `from an account's login` or `made here` — its tokens in and out and its distinct
+sessions over all time,
+and its project count; an organization with no project and no account is dimmed. An owner
+organization is never removed and stays as a row (R1), marked empty when it has no account either. Its projects follow by API value, and a project's folders
+appear under it when it has more than one. A folder is the first path part below the project's root
+on that host (the common parent of the project's folders), or the top folder. The second view is the
+plain folder tree without organization rows; either view opens and closes its rows, a project's
+folders start folded, and the fold lasts while the window is open, as on Sessions (R7). Every row
+shows its tokens, its share of the
+page's API value, its subscription value and API value, a bar split by subscription in each
+subscription's colour, and its distinct sessions. A part whose work has no known account (a Claude
+record without an account, a provider record without a named subscription) is grey and striped at
+the end of the bar; its tooltip names it `unknown account`. An OpenAI or Ollama part is the colour
+of its subscription, like a Claude account's; a row's name carries no company tag. The page's note
+says `No price for {subscriptions}: their tokens add no value; shares count priced work only.` when a
+model has no price.
+
+A share whose API value or whose page total has no priced part is `—` with the reason, never `0 %`.
+A share of an API value counts the priced work only (V-2): it divides a part's known API value by
+the whole's known API value, so a part without a price is left out and the others keep their shares.
+The row's share of the page's API value and the split by subscription both use this rule; the other
+ratios on the page, `× paid` and the Used share, use full halves only (R3). A project's detail gives
+its share of all use
+(`21.9 % of all use · 18 sessions`), lists its subscriptions with their shares, and gives the line
+`API values at 1 USD = 0.9048 EUR (13 Nov)`, or
 `API values at each day's rate; latest …` when the rates of the range differed.
 
-- **Organization × account** is the subscription value per organization and account, in the stored
-  accounts' order. For an organization linked to its own subscription it carries the sentence
+- **Organization × subscription** is the subscription value per organization and subscription, in
+  the chips' order: the Claude accounts in the stored accounts' order, then the provider
+  subscriptions. Every subscription has its own column and its own colour. Each cell is the
+  subscription value of that organization's records on that subscription; a cell without one is
+  `—` with the reason, and a measured `0` stays `0`. Each row and column total is the `Values` sum
+  of its cells, so a missing cell leaves the known part and the total is drawn as partial, never
+  unknown (R3). The `Used` footer repeats the column totals, each the sum of the cells above it.
+  For an organization linked to its own Claude account it carries the sentence
   `{abbr} is {org}'s subscription. It covered {n} of the work for {org}.`; below 100 % it adds
   ` The rest ran on {others}: {amount} of their value.` when another account carried some, and, when
   that account's subscription also carried work for other organizations,
-  `The other way round: {abbr} carried {amount} of work for {orgs}.`
+  `The other way round: {abbr} carried {amount} of work for {orgs}.` The sentences name the Claude
+  accounts only.
 - **A project's detail** (a click on a project row): its tokens, the share of answers that came from
-  agents, each host's share of its API value, its subscription and API values, its output tokens per
+  agents, each host's share of its API value, its subscription value, each of its subscriptions with
+  its share, its API value, its output tokens per
   calendar week and model, and its distinct sessions. A folder key belongs to one host: with All
   hosts chosen, the detail of that key counts every host's folder of that name; with one host chosen,
   only that host's.
@@ -1808,7 +1890,8 @@ unknown is `—` with the reason, never `0 %`. A project's detail gives its shar
   those weeks' use (each week's windows summed). A fall means use that left no transcript, such as
   claude.ai, the phone, Claude Desktop or a host without the shared history. The page says that such
   use is in the percent but in no project, and how many tokens of Claude models have no known
-  account at all (another company's tokens are not among them: they use no Claude account).
+  account at all; the note `{tokens} tokens: account taken from the usage readings.` names the work
+  booked from the usage readings (G-1).
 - The page also names the models whose API value is missing because they have no price, and the
   tokens that have no subscription value with the reasons. It does not merge two projects with the
   same name: their keys differ.
@@ -1828,8 +1911,9 @@ Above the cards stands one totals line. **All {n} subscriptions, a month** count
 with a finished week (or Ollama month) in the range and says `No subscription has a finished week in
 this range yet.` when none has; then their monthly cost, their worth at API prices with `× paid`,
 their tokens used a month and `from the last {w} weeks`. Each subscription counts with its average
-week over its own finished weeks in the range × 52 / 12; Ollama counts its average month. A sum with
-a missing part has no figure, never 0, and a sum over nothing has no figure either. A removed
+week over its own finished weeks in the range × 52 / 12; Ollama counts its average month. A monthly
+total with a missing part has no figure, never 0, and a sum over nothing has no figure either; the
+subscription sums on the other pages follow the `Values` rule of §11.5. A removed
 account's periods in the range keep their money and tokens. A price typed at most 15 minutes before a
 plan change belongs to the new plan's period (documented rule), so it makes no minutes-long period of
 the old plan at the new price; a price typed after adding an account or changing its plan counts from
@@ -1853,7 +1937,9 @@ The four cards:
   the price a month (the entered price and currency in the tooltip when converted), the use (its
   average share of the limit over its finished weeks; Ollama: of the monthly credits over its finished
   months), the money expired, the value at API
-  prices and `× paid`. A total row sums them.
+  prices and `× paid`. A total row sums them. A subscription without a price says
+  `no price yet · set it` in its price cell; `set it` links to that subscription's row in Settings →
+  Accounts, where the price field is focused (Q-1).
 - **What 1 % of a limit buys, over the weeks.** Tabs per subscription, then per limit: Week, 5h, and
   Month for Ollama. One point per finished week: the tokens per 1 % of the main model (the model
   with the most work), `1 / (factor_week × usd_per_token(model))`, with the range as two dashed
@@ -1914,9 +2000,15 @@ weeks of history that plan reads. Below it:
 
 **Rhythm.** A heat map of 7 weekdays × 24 clock hours: the output tokens of each hour of the week,
 averaged over the range's calendar weeks (a partial week counts as one), all chosen hosts and
-companies together. Below it, per weekday: the distinct local hours with Anthropic tokens divided
-by the number of calendar weeks ("working hours per week"), and the blocked working hours of
-Anthropic accounts of that weekday divided by the same number. Auto-burn and the Forecast plan with
+companies together. Below it, per weekday: the working hours on that weekday of the range's whole
+local days — the distinct local hours with Anthropic tokens, added up over those days and divided by
+their number — and the blocked working hours of
+Anthropic accounts in the same whole days, divided by the same number. A weekday with no whole local
+day inside the range has not ended there and shows `—`, never 0. A local day on the night the clocks
+go back has 25 distinct hours; the bars' axis then grows to 25h, with its labels still at 0, 6, 12,
+18 and 24h, and a value above 25 is an error. Both charts write each bar's value above it
+(`6h 30min`); its tooltip reads `Mon · 6h 30min on an average Monday`. Auto-burn and the Forecast
+plan with
 the rhythm of the last 4 weeks before now, not with the range's picture; an hour that usually has
 work counts as a working hour.
 
@@ -1931,8 +2023,13 @@ holds the range's end. Each hour is one of four states, decided in this order:
 | Unknown | before the host's first `up` record, or without one |
 
 An hour's tooltip holds its output tokens per model, its sessions and the project that used most;
-the strip below each lane shows how many sessions worked in that hour. On top stand the boxes:
-**Tokens**, the range's output tokens summed over the hosts with each host's below it; **Their
+the strip below each lane is a heatmap of how many sessions worked in that hour: each cell fills the
+strip's height, coloured by that number over the largest in any lane, and an hour without a session
+leaves the bare track. It uses the one heat colour rule Rhythm's cells use. On top stands one
+**Last 7 days** box for the page's span, `{h} working` summed over the hosts with each host's share
+in the tooltip, then `on but idle {h} · off {h}` and `not known {h}` when any is not known; then
+**Tokens**, the range's output tokens summed over the hosts with each
+host's below it; **Their
 value**, the subscription value and the API value summed over the hosts; **Per working hour**, with
 the highest hour. Then **What it shows**: a sentence about the last 7 days — `2 nights with
 work on atlas.` for the first host with work before 05:00, and each other host's evenings and
@@ -2197,6 +2294,36 @@ gets no value in the currency and says its currency is missing; a record with a 
 stored rate is shown in USD and labelled USD. The value of a subscription is left out when
 the account has no price, or when the week's used part or its API value is unknown.
 
+**A partly valued sum.** A sum of `Values` keeps the known part of a half whose other parts are
+missing: the amount is the known part, it is drawn `≥ known part` with the first missing part's
+reason in its tooltip, and the half is marked partial. A half with no known part at all is `—` with
+its reason, never 0; a sum over nothing is a known 0. A `Values` sum is what the project rows, the
+Organization × subscription table and the This-week card add.
+
+A share, ratio or percent comes only from full halves: a partial half is a lower bound, and a
+quotient of a lower bound is no figure. It is `—` with the half's reason, never a guessed percent.
+There is one exception, the one the owner decided on 18 Nov (V-2): **a share of an API value counts
+the priced work only**. It divides a part's known API value by the whole's known API value
+(`stats::priced_api`), so one model without a price no longer empties every share; a row with no
+priced API value has no share (`—`). The project tree's shares, the host shares, the This-week card's
+and Projects' split by subscription all use this rule, and Statistics → Projects says "shares count
+priced work only" when a model has no price. Other ratios — times paid, used of paid, the Expired
+share — keep full halves.
+
+The monthly totals over subscriptions on the Subscriptions page are one sum per figure: a
+subscription in it without a price or a finished week leaves that figure `—`, never 0.
+
+**The account of a record.** A Claude record belongs to the account the history's live and switch
+events name for its host at its time. When they name none, it is booked from the usage readings
+(G-1) to a stored Anthropic account when exactly one qualifies: that account's last reading at or
+before the record's start and first reading at or after its end are both at most 30 minutes away,
+both name the same weekly reset, and the later percent is higher; no other stored Anthropic account
+may have risen around the span by the same reading rule (a change of session reset with a percent
+above 0 is a rise). Without exactly one such account the record's account stays unknown. Such a
+record counts under that account everywhere on the Statistics pages; only the Projects page's note
+says `{tokens} tokens: account taken from the usage readings.` The rhythm, the rates and the Forecast
+still read only the live account.
+
 **How a value is computed.**
 - One token record's API value in USD is
   `(input × input price + output × output price + cache write × cacheWrite price + cache read ×
@@ -2207,8 +2334,9 @@ the account has no price, or when the week's used part or its API value is unkno
   The value in the currency is that USD amount times the rate of the record's day.
 - A token record belongs to its model's company: `claude-*` is Anthropic's, an Ollama cloud id
   (`<name>:cloud`, `<name>:<tag>-cloud`) Ollama's, any other id OpenAI's — the same rule as the
-  price key. A Claude record belongs to the account that the history's live and switch events say
-  was in use on its host at its time. An OpenAI or Ollama record belongs to its company and to its
+  price key. A Claude record belongs to the account named by the history's live and switch events, or
+  else by the usage readings, as the paragraph "The account of a record" says. An OpenAI or Ollama
+  record belongs to its company and to its
   provider subscription, never to a Claude account, whichever account was live. Its subscription
   value comes from that subscription's own window: OpenAI's `weekly_all` week, Ollama's
   `monthly_credits` month. The OpenAI subscription of a record is the `to` of the newest
@@ -2319,18 +2447,35 @@ account's organization is one `accountOrg` record for that account; the latest s
 order, puts the account in the root of its organization, or in none. Nothing else moves an account,
 so moving one account never drops another — even one only another host stores. Organizations have
 an identity, which a rename does not change, and a shown name, which starts as that identity.
-Organizations can be joined like projects; their accounts and projects then count for the
-organization they were joined into. A project can be assigned to another organization by hand, also
-when it came from a repository; its default organization is only where it starts. Names that differ
-only in case are one organization, also in a
+
+The page shows one heading per organization, its projects below it, and `No organization` last. A
+project's *Move to* menu lists the other organizations and `No organization`; choosing one writes
+an `assign` at once, which moves that project alone, also when it came from a repository. An
+organization's *Merge into* menu lists the other organizations; the choice asks first, saying that
+the merged organization's projects and accounts count for the target and that the merged
+organization stops being a row of its own. It writes `orgJoin`. The merged organization's projects,
+accounts and later repositories count for the target; the target's row names it under "merged in"
+with a *Split off* link. *Split off* asks first and writes `orgUnjoin`; the latest `orgJoin` stops
+applying, an `assign` made after the merge keeps the organization it names, and the split-off
+organization gets its old projects and accounts back. *Split off* on an organization that is not
+merged now is refused with `the organization {org} is not merged into another`. An organization's
+name field saves on Enter or when it loses focus; its tooltip reads
+`The shown name; the projects stay linked to {id}.`
+
+An organization that comes from a repository owner is never removed (R1). Its row has no Remove
+button and its tooltip says why; the attempt is refused with `the organization {name} comes from
+the owner of {repository}; it cannot be removed`. When all its projects were moved away it stays as
+a row in Settings, dimmed and marked `empty: its projects were moved; not shown in Statistics` when
+it has no account either; Statistics → Projects
+leaves an empty organization out. An organization whose name only another host's history names is
+shown all the same, as an empty row.
+Organizations can be added and removed by hand: an added one is a log record like the others, and a
+removed one asks first, saying that its projects and accounts go back to none, and then sends them
+back. Names that differ only in case are one organization, also in a
 1.1.0 history, because a GitHub owner is case-insensitive. The spelling shown comes from the shared
 history — the session records and the project log, oldest first — so every host shows the same name;
-a login's own spelling is used only when nothing shared names it. Organizations can be added and
-removed by hand in Settings: an added one is a log record like the others, and a removed one asks
-first, saying that its projects and accounts go back to none, and then sends them back. An
-organization that comes from a repository owner has no Remove button; its tooltip says why, and the
-attempt is refused with `the organization {name} comes from the owner of {repository}; it cannot be
-removed`.
+a login's own spelling is used only when nothing shared names it. A project's row shows its tokens
+and sessions of all time; an organization's row shows the same for all its projects.
 
 **Sessions and folders.** A project's folders per host and its session count come from the session
 records of every host, over all time: distinct session ids, and the folders the sessions ran in. A
@@ -2354,6 +2499,7 @@ row shows the reason.
 | `assign` | `key`, `org` (an identity, or `null` for none) | the project's organization; creating an organization is an `assign` with a new name |
 | `orgRename` | `org`, `name` | an organization's shown name; `org` stays its identity |
 | `orgJoin` | `org`, `into` | `org`'s accounts and projects count for `into` |
+| `orgUnjoin` | `org` | `org`'s latest `orgJoin` stops applying; it is a row of its own again |
 | `orgAdd` | `name` | a new organization, named by hand |
 | `orgRemove` | `org` | the organization goes; its projects and accounts go back to none |
 | `accountOrg` | `account`, `org` (an identity, or `null` for none) | one account's organization |
@@ -2364,9 +2510,10 @@ from a name typed by hand, which is trimmed and must be unique. A project or an 
 joined into itself. A folder project id
 names its host; a repository id does not, because a repository is one project on every host. The
 Projects group shows each project with its repository, its folders per host, its organization
-(chosen from the list or created in place), its session count and the keys joined into it, each
-with an undo. Under it, the organizations with their accounts and project counts. Changes apply to
-the past too, because the history stores the repository's identity, not the shown name.
+(chosen from the list or created in place), its tokens and sessions, and the keys joined into it,
+each with an undo. Under it, the organizations with their source, accounts, projects, tokens and
+sessions. A 1.3.0 host skips an `orgUnjoin` line with a warning instead of failing on it. Changes
+apply to the past too, because the history stores the repository's identity, not the shown name.
 
 **The file.** One line per edit, camelCase, the project id as `{"kind":"repo","id":"…"}` or
 `{"kind":"folder","id":"…","host":"…"}`:
@@ -2394,9 +2541,10 @@ the past too, because the history stores the repository's identity, not the show
 
 - Logins go only into the OS keyring, or a `0600` file if there is none. They are never logged; log lines print the account ID and the token's last 4 characters at most.
 - Network traffic goes only to `api.anthropic.com` and `platform.claude.com` for an account's usage
-  and login; to `chatgpt.com/backend-api/wham/usage` while the Codex card is on or its subscription
-  has a price, and to `auth.openai.com/oauth/token` for a saved login that needs renewal; to the Ollama server
-  at `ollamaUrl` for `/api/balance` and `/api/usage?range=24h` while the Ollama card is on; and — only
+  and login; to `chatgpt.com/backend-api/wham/usage` while the Codex card is on or a Codex login is
+  found, and to `auth.openai.com/oauth/token` for a saved login that needs renewal; to the Ollama server
+  at `ollamaUrl` for `/api/balance` and `/api/usage?range=24h` while the Ollama card is on or the
+  `ollama` program is found on `PATH`; and — only
   while `lookUpPrices` is on — to `models.dev` for API prices and `api.frankfurter.dev` for the dollar
   rate (§11.5). The two look-ups send the User-Agent `seatswap/<version>` and no account, token or
   machine data. The provider requests follow no redirect: a 3xx answer is an error naming where it
@@ -2408,8 +2556,8 @@ the past too, because the history stores the repository's identity, not the show
   from another issuer is not renewed. The Ollama card sends two GETs to the Ollama server and carries no
   secret: the local server signs them with the machine's own key. Neither follows a redirect: a 3xx
   answer is an error naming where it pointed, and nothing is asked there. Each card is off by
-  default; while it is off the card reads nothing and sends no usage request (a subscription with a
-  price is still polled), and no request generates text (§7.9). A Codex switch writes
+  default; while it is off the pop-up shows no card, but a found provider is still polled and its
+  reading recorded, and no request generates text (§7.9). A Codex switch writes
   `auth.json` from seatswap's stored copy, under seatswap's app lock and Codex's two locks; nothing
   else in Codex's files is written. The Sessions area is separate: with *Read sessions* on it reads
   Codex's rollout files whatever the card says, as the next point describes.

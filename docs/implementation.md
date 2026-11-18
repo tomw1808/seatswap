@@ -358,6 +358,13 @@ pub trait SecretStore: Send + Sync {
 pub struct KeyringSecrets;            // keyring crate, service "seatswap", user = account id, JSON value
 pub struct FileSecrets { dir: PathBuf } // <data>/secrets/<id>.json; folder 0700, files 0600, via write_atomic
 impl FileSecrets { pub fn new(dir: PathBuf) -> FileSecrets; }
+/// Windows only (W-1): `get_value`/`set_value` and every other method go to `main`, the recorded
+/// backend, but `get_codex`/`set_codex` go to `codex`, a `FileSecrets` in the same `secrets`
+/// folder. A Codex login is larger than one Credential Manager entry (2,560 bytes), so its copies
+/// are private files even while Claude logins stay in the keyring; `delete` tries both. On other
+/// systems `keyring_store` returns `KeyringSecrets` unchanged.
+pub struct RoutedSecrets { pub main: Box<dyn SecretStore>, pub codex: FileSecrets }
+impl SecretStore for RoutedSecrets { /* value methods → main; codex methods → codex */ }
 /// Where the logins are kept. Chosen once, on first use, and recorded in accounts.json, so the
 /// logins never end up split between two places.
 #[derive(… Serialize, Deserialize)] #[serde(rename_all = "camelCase")]
@@ -370,7 +377,8 @@ pub enum SecretsBackend { Keyring, File }
 ///   Some(File)    → FileSecrets at app.secrets_dir(), no probe.
 ///   None (first use) → probe (set/get/delete of "seatswap-probe"); OK → Keyring, else File.
 /// Returns the store, the backend to record, and a warning when the backend is File
-/// ("logins are stored unencrypted in <dir>") — shown by the UI every time (§5).
+/// ("logins are stored unencrypted in <dir>") — shown by the UI every time (§5). On Windows the
+/// keyring backend is wrapped in `RoutedSecrets`, so Codex logins are files either way (W-1).
 pub fn open_secrets(app: &AppPaths, recorded: Option<SecretsBackend>)
     -> Result<(Box<dyn SecretStore>, SecretsBackend, Option<String>), StoreError>;
 
@@ -771,6 +779,15 @@ pub fn history_root(explicit: Option<&Path>, app: &AppPaths) -> Result<PathBuf, 
 /// [A-Za-z0-9._-], starting with a letter or a digit; anything else is PathsError::HostName.
 /// The result is always in lower case.
 pub fn host_name(explicit: Option<&str>) -> Result<String, PathsError>;
+/// The first `<folder>/<name>` in `path_var` that is a program: a file on Windows, a file with an
+/// execute bit on Unix. Only the value passed in is read, never the process environment; an empty
+/// or relative `PATH` entry is skipped, and no shell or `which` is called. The provider thread
+/// reads `PATH` once at start and passes it here (R6); `ollama.exe` is looked for on Windows.
+pub fn program_on_path(name: &str, path_var: &OsStr) -> Option<PathBuf>;
+/// The Linux menu entry and its icon (D-1): `$XDG_DATA_HOME/applications/seatswap.desktop` and
+/// `$XDG_DATA_HOME/icons/hicolor/256x256/apps/seatswap.png`.
+pub fn applications_entry(xdg_data_home: &Path) -> PathBuf;
+pub fn app_icon(xdg_data_home: &Path) -> PathBuf;
 ```
 
 ## history — records, folder, append, read (step A)
@@ -1236,7 +1253,7 @@ Drawing (tiny-skia, anti-aliased): transparent background; ring of width max(2, 
 
 ## app: GUI (§8, §9, §11) — wave 3, `gui` feature
 
-Files: `crates/app/src/gui/{mod.rs, worker.rs, tray.rs, panel.rs, notify.rs, autostart.rs, ipc.rs, registry.rs}` (`registry.rs` on Windows only), `crates/app/ui/{index.html, panel.css, panel.js}`, `crates/app/capabilities/default.json`. The code is the library `seatswap` (`src/lib.rs`, `pub fn run() -> ExitCode`); two programs call it: `seatswap` (`src/main.rs`) and `seatswap-tray` (`src/bin/seatswap-tray.rs`, built without a console window on Windows for autostart and the Start menu; Linux builds it but does not install it). No subcommand → `gui::run(app: AppPaths, claude_override: Option<PathBuf>, data_override: Option<PathBuf>) -> ExitCode` (the same path resolution as the CLI, one function; the overrides are passed on so `seatswap panel` and autostart start the app with the same flags). Actions both front ends must take the same way live in `crates/app/src/ops.rs`: `save_live_login(claude, store, recorder: Option<&Recorder>, label, now) -> Result<(Account, Option<String>), String>` (a missing, ended or unknown login saved nothing and is an error; the `Option<String>` is the history error, never a failed add, and `accountAdded` is written only when `sync_live` returned `Synced::Added`), `remove_account(store, key, recorder: Option<&Recorder>, now) -> Result<(Account, Option<String>), String>` (the same shape for `accountRemoved`), `switch_message(store, account_id) -> Result<String, String>` ("Switched to AC — Acme"; an unreadable store or unknown id is an error, never the raw id) and `switched_without_list(error) -> String`. The action thread's external-switch check keeps the history read warnings it printed, so a torn month-file line is printed once per run, not at every live-account change.
+Files: `crates/app/src/gui/{mod.rs, worker.rs, tray.rs, panel.rs, notify.rs, autostart.rs, desktop_entry.rs, ipc.rs, registry.rs}` (`desktop_entry.rs` and the Linux entry on every non-Windows system, `registry.rs` on Windows only), `crates/app/ui/{index.html, panel.css, panel.js}`, `crates/app/capabilities/default.json`. The code is the library `seatswap` (`src/lib.rs`, `pub fn run() -> ExitCode`); two programs call it: `seatswap` (`src/main.rs`) and `seatswap-tray` (`src/bin/seatswap-tray.rs`, built without a console window on Windows for autostart and the Start menu; Linux builds it but does not install it). No subcommand → `gui::run(app: AppPaths, claude_override: Option<PathBuf>, data_override: Option<PathBuf>) -> ExitCode` (the same path resolution as the CLI, one function; the overrides are passed on so `seatswap panel` and autostart start the app with the same flags). Actions both front ends must take the same way live in `crates/app/src/ops.rs`: `save_live_login(claude, store, recorder: Option<&Recorder>, label, now) -> Result<(Account, Option<String>), String>` (a missing, ended or unknown login saved nothing and is an error; the `Option<String>` is the history error, never a failed add, and `accountAdded` is written only when `sync_live` returned `Synced::Added`), `remove_account(store, key, recorder: Option<&Recorder>, now) -> Result<(Account, Option<String>), String>` (the same shape for `accountRemoved`), `switch_message(store, account_id) -> Result<String, String>` ("Switched to AC — Acme"; an unreadable store or unknown id is an error, never the raw id) and `switched_without_list(error) -> String`. The action thread's external-switch check keeps the history read warnings it printed, so a torn month-file line is printed once per run, not at every live-account change.
 
 **Threads.**
 - *Main thread:* Tauri event loop, tray, menu, panel window.
@@ -1281,7 +1298,19 @@ settings view; its gear, `,` and the CLI's `panel settings` open the large windo
 
 **Single instance and `seatswap panel`** (`ipc.rs`): the tray app takes `acquire_file_lock(gui_lock, 0)`. Busy → another instance runs: send `open-panel main` to `gui_socket` and exit 0. Held → name the socket only now (the lock created the data folder on first start, and the name needs its real path), remove a leftover socket, listen on it (mode 0600 on Unix; on Windows the file has the data folder's permissions). Windows uses the same Unix socket through `uds_windows` (`std::os::windows::net` is not stable yet); there is no runtime folder, so the socket is `<data>\gui.sock`. One line per connection: `open-panel <view>` → `ok`, anything else → `error unknown command`.
 
-**Autostart** (`autostart.rs`, one entry point `apply_autostart(enabled, arguments)`): at start and on every `save_setting`. The entry is text: a program path or folder argument that is not valid Unicode is `AutostartError::NotUnicode` on both platforms (the one `path_text`), never a path with replaced characters. Linux: `startAtLogin` on → write `autostart_file($XDG_CONFIG_HOME or ~/.config)` with `Exec=<current_exe>` via `write_atomic` (`Access::Shared`); off → remove it if present. Windows: on → the string value `seatswap` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` = `"<folder of current_exe>\seatswap-tray.exe" "<arg>" …` (each part in double quotes, `"` written `\"`, a run of backslashes before a `"` or at the end doubled); a missing `seatswap-tray.exe` (`NoTrayProgram`), a path that is not valid Unicode (`NotUnicode`) or a command over 260 UTF-16 units (`CommandTooLong`) is an error, never shortened; off → delete the value (missing is fine). `gui/registry.rs` (Windows only) is the one module that names `winreg`: `set_string`, `get_string` (tests only), `delete_value`, all under `HKEY_CURRENT_USER`.
+**Autostart** (`autostart.rs`, one entry point `apply_autostart(enabled, arguments)`): at start and on every `save_setting`. The entry is text: a program path or folder argument that is not valid Unicode is `AutostartError::NotUnicode` on both platforms (the one `path_text`), never a path with replaced characters. Linux: `startAtLogin` on → write `autostart_file($XDG_CONFIG_HOME or ~/.config)` with `Exec=<current_exe>` via `write_atomic` (`Access::Shared`); off → remove it if present. Windows: on → the string value `seatswap` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` = `"<folder of current_exe>\seatswap-tray.exe" "<arg>" …` (each part in double quotes, `"` written `\"`, a run of backslashes before a `"` or at the end doubled); a missing `seatswap-tray.exe` (`NoTrayProgram`), a path that is not valid Unicode (`NotUnicode`) or a command over 260 UTF-16 units (`CommandTooLong`) is an error, never shortened; off → delete the value (missing is fine). `gui/registry.rs` (Windows only) is the one module that names `winreg`: `set_string`, `get_string` (tests only), `delete_value`, all under `HKEY_CURRENT_USER`. `autostart::data_home() -> Result<PathBuf, AutostartError>` is `$XDG_DATA_HOME`, else `~/.local/share`, read once at start for the menu entry; `data_home_from(xdg, home)` is the test form and never reads the environment.
+
+**The Linux menu entry** (`gui/desktop_entry.rs`, `gui` feature, D-1): at every start of the tray app,
+`apply_at_start(arguments: &[String]) -> Result<Outcome, String>` writes
+`paths::applications_entry(data_home)` and `paths::app_icon(data_home)` through `write_atomic` when
+they are missing or differ. The entry's `Exec` is the same command and flags as the autostart entry;
+it carries `X-seatswap-managed=true`. `Outcome { written: Vec<PathBuf>, left_alone: Vec<PathBuf> }`
+names what was written and what was left alone, one stderr line per left-alone path. A symbolic link
+at either path is left alone, and so is an entry that does not carry the managed line; the icon is
+seatswap's own file and is still written when the entry is left alone. A line break in a path or
+argument is refused in both entries; the icon path is escaped.
+One embedded icon constant (`APP_ICON_PNG`) serves the tray, the notifications and the entry. The
+whole module returns no effect on Windows.
 
 **Panel UI** (`ui/`, plain HTML/CSS/JS, no build step, `window.__TAURI__` with `app.withGlobalTauri: true`): §11.1–11.2. Views `main` and `add` (the §6.1 steps; shows the unknown live login with a label field and "Save" when there is one); a `settings` request now opens the large window at Settings (step C1), because the pop-up has no settings view. The main view's footer carries the sessions line of §11.1 from `snapshot.sessions`; the line's "N sessions" opens Sessions, "N waiting for you" opens that session's `sessions?<id>` (Sessions itself when no id is there), and "see the plan" opens `statistics/forecast`. A waiting id the window's `parse_target` refuses is shown as the banner's error, never dropped. Every time on the page (reset countdowns, the header's poll age, a card's "usage 5min ago") is an element with `data-time` + `data-time-style` whose text comes from the command `time_texts([{at, style}]) → [text]` (`countdown` → `format_reset_at`, `clock` → `format_reset_clock`, `age` → `format_age`, and `day`, `date`, `dayClock`, `dayYear` → `format::day`, `format::date`, `format::day_clock`, `format::day_year`), asked after each render and every second, so the page has no copy of these rules. Without `window.__TAURI__` it runs on a built-in fixture snapshot so it can be opened in a browser; there `time_texts` answers with stand-ins (the plain clock time, "a moment ago").
 
@@ -1601,12 +1630,16 @@ const Z_80: f64 = 1.2816;               // the two-sided 80 % range of a normal 
 pub fn factor(pairs: &[Pair], prior: Option<f64>) -> Option<Factor>;
 ```
 
-`value = (Σ gain + prior × LEARN_MIN_USD) / (Σ usd + LEARN_MIN_USD)` while a prior exists and
-`Σ gain / Σ usd` without one. `se = sqrt(Σ (gain_i − value · usd_i)² + (prior · w − value · w)²) /
-(Σ usd + w)` with `w` the prior's weight; `low = max(0, value − 1.2816 · se)`, `high = value +
-1.2816 · se`. `basis_usd = Σ usd`; `measured = Σ usd ≥ LEARN_MIN_USD`. `None` without pairs and
-without a prior, when the dollars are 0 and there is no prior, or when the value is not above 0.
-Whether a factor that is neither measured nor has a prior may be used is the caller's rule. Every
+`value = (Σ gain + prior × LEARN_MIN_USD) / (Σ usd + LEARN_MIN_USD)` while the account's own dollars
+are below `LEARN_MIN_USD` and a prior exists, and `Σ gain / Σ usd` once they reach it or without a
+prior: a measured factor drops its prior completely (F-1). `se = sqrt(Σ (gain_i − value · usd_i)² +
+(prior · w − value · w)²) / (Σ usd + w)` while the prior counts, with `w` the prior's weight;
+`low = max(0, value − 1.2816 · se)`, `high = value + 1.2816 · se`. Once `measured`, value, range and
+standard error are computed as if there were no prior. `basis_usd = Σ usd`;
+`measured = Σ usd ≥ LEARN_MIN_USD`. `None` without pairs and
+without a prior, when the dollars are 0 and there is no prior, or when the value is not above 0: a
+measured account whose own gain is ≤ 0 has no factor, never a prior-lifted one. Whether a factor
+that is neither measured nor has a prior may be used is the caller's rule. Every
 factor in auto-burn and the statistics comes from here.
 
 ## burn/rates.rs — rhythm, live account, rates (step B, 1.3)
@@ -2212,7 +2245,16 @@ pages use. Exported: `PALETTE`, `TRAY_GREY`, `LEVEL_COLORS`, `TAURI_GLOBAL`, `HA
 `relativeLuminance`, `contrastText`, `limitLevel`, `shortPercent`, `clear`, `setStyles`, `applyProps`,
 `appendChildren`, `h`, `banner`, `applyTheme`, `followTheme`, `invoke`, `listen`, `money`, `tokens`, `textInput`,
 `selectInput`, `switchControl`, `sanitizeAbbrChar`, `abbrLetterBoxes`, `colorSwatches`, `hexField`,
-`iconPreview`. `switchControl` is the one switch for a boolean setting: the window's `.sws` with its
+`iconPreview`, `foldMemory`, `valueNode`, `valueText`, `subscriptionSplit`. `foldMemory()` is one
+page's fold memory (R7): `isOpen(key, defaultOpen)` and `set(key, open)`, a key the user never
+folded answers its default and a fold lasts while the window is open; Sessions' folds and Projects'
+folders use it. `valueNode(values, unit, viewCurrency)` draws one `Values` half: the amount in its
+own currency, `—` with the reason when missing, and `≥ amount` with the reason when the half is
+partial. `valueText` returns `{ text, title, partial }` for the same half, and `valueNode` wraps it in
+one `span`. `subscriptionSplit(parts, views, tip)` draws a
+bar split by subscription in the chips' colours, the `null` part grey and striped (`stats-split-unknown`)
+with the tooltip the caller gives, the one split for the Overview's project rows and Statistics →
+Projects.
 On/Off word (or `{ words: false }` without it) and, with `{ popup: true }`, the pop-up's `.switch`;
 the caller saves and reverts it through `set`. `followTheme(getSetting)` is the one system light/dark follower both pages call; it
 applies `applyTheme("system")` on a change while `getSetting()` is "system". `money(amount, currency)` gives `"1,234 EUR"` for `(1234, "EUR")` and two decimals
@@ -2524,10 +2566,14 @@ pub(crate) struct WindowMoney { pub(crate) used: f64, pub(crate) paid: f64, pub(
 /// percent) × pv, used = paid − expired.
 pub(crate) fn window_money(price: f64, percent: f64) -> WindowMoney;
 
-/// `account` is the Claude account live on the record's host at its time, or the record's provider
+/// `account` is the Claude account live on the record's host at its time, else the one account the
+/// usage readings name around the record's span (`claude_account`, G-1: both readings within
+/// `READING_REACH_MINUTES` of the span, same weekly reset, a rise, and no other stored Anthropic
+/// account risen around it), or the record's provider
 /// subscription (an OpenAI record by `openai_subscription_at`, every Ollama record by
 /// `ollama_subscription`); `company` is `Company::of_model`. A record whose OpenAI subscription
-/// cannot be named has `account: None`.
+/// cannot be named has `account: None`. `account_from_readings` says the account came from the
+/// readings rather than the live timeline.
 pub struct Valued { pub api: Option<f64>, pub subscription: Option<f64>,
     pub account: Option<AccountRef>, pub company: Company, pub api_currency: Option<String>,
     pub api_missing: Option<Missing>, pub subscription_missing: Option<Missing> }
@@ -2645,20 +2691,23 @@ pub enum ProjectEdit {
     Assign { key: ProjectId, org: Option<String> },
     OrgRename { org: String, name: String },
     OrgJoin { org: String, into: String },
+    OrgUnjoin { org: String },
+    AccountOrg { account: AccountRef, org: Option<String> },
     OrgAdd { name: String },
     OrgRemove { org: String },
-    AccountOrg { account: AccountRef, org: Option<String> },
 }
 impl ProjectEdit { pub fn validate(&self) -> Result<(), ProjectsError>; }
-impl Projects { pub fn validate_edit(&self, edit: &ProjectEdit) -> Result<(), ProjectsError>; }
+impl Projects { pub fn validate_edit(&self, edit: &ProjectEdit) -> Result<(), ProjectsError>;
+                pub fn with_tokens(&mut self, history: &HistoryDir) -> Result<Vec<String>, HistoryError>; }
 // project and organization shown names: 1..=40 characters, not only spaces, no leading or trailing
 // space for a new organization; an organization identity (Assign.org, AccountOrg.org,
-// OrgJoin.org/into, OrgRemove.org) only non-empty, because it comes from a login's orgName or a
-// repository owner, not from typing; a project or organization cannot be joined into itself; a
-// folder id names its host, a repository id does not. `validate_edit` runs `validate` first, then
-// refuses `OrgAdd` for an existing name (`OrganizationExists`) and `OrgRemove` for an unknown
-// organization (`UnknownOrganization`) or one whose `owner_repositories` is not empty
-// (`OwnerOrganization`, naming the first repository).
+// OrgJoin.org/into, OrgRemove.org, OrgUnjoin.org) only non-empty, because it comes from a login's
+// orgName or a repository owner, not from typing; a project or organization cannot be joined into
+// itself; a folder id names its host, a repository id does not. `validate_edit` runs `validate`
+// first, then refuses `OrgAdd` for an existing name (`OrganizationExists`), `OrgRemove` for an
+// unknown organization (`UnknownOrganization`) or one whose `owner_repositories` is not empty
+// (`OwnerOrganization`, naming the first repository), and `OrgUnjoin` for an organization that is
+// not merged now (`NotMerged`).
 
 #[serde(rename_all = "camelCase")]
 pub struct ProjectId {
@@ -2670,17 +2719,27 @@ impl ProjectId { pub fn of(key: &ProjectKey, host: &str) -> ProjectId; } // host
 pub enum ProjectsError { NameLength { what, length }, NameBlank { what }, EmptyOrg,
     FolderWithoutHost, RepoHasHost { host }, JoinIntoItself { what },
     OrganizationExists { name }, UnknownOrganization { org },
-    OwnerOrganization { name, repository }, OrganizationNameSpace, History(HistoryError) }
+    OwnerOrganization { name, repository }, NotMerged { org }, OrganizationNameSpace,
+    History(HistoryError) }
 
 pub struct ProjectsLogRecord { pub t: DateTime<Utc>, #[serde(flatten)] pub edit: ProjectEdit }
 impl Record for ProjectsLogRecord { const KIND: Kind = Kind::Projects; } // "projects"
 
 pub struct Project { pub key: ProjectId, pub name: String, pub repo: Option<String>,
     pub org: Option<String>, pub joined: Vec<JoinedKey>, pub folders: BTreeMap<String, Vec<String>>,
-    pub sessions: u32 }
+    pub sessions: u32,
+    /// Output tokens of all this project's history, all hosts and all time; filled by `with_tokens`.
+    pub tokens: u64 }
 pub struct JoinedKey { pub key: ProjectId, pub name: String } // the key's default name
+pub enum OrgSource { Owner, Login, Added } // serde lowercase
+pub struct MergedOrg { pub id: String, pub name: String, pub source: OrgSource }
 pub struct Org { pub id: String, pub name: String, pub accounts: Vec<AccountRef>, pub projects: u32,
-    pub owner_repositories: Vec<String> } // sorted; a non-empty list is why Remove is refused
+    pub owner_repositories: Vec<String>, pub source: OrgSource, pub merged: Vec<MergedOrg>,
+    /// No project and no account: Settings lists it, Statistics leaves it out.
+    pub empty: bool,
+    /// Output tokens of all its projects, all time (`with_tokens`), and their distinct sessions
+    /// (`resolve`).
+    pub tokens: u64, pub sessions: u32 }
 pub struct AccountEntry { pub id: String, pub account: AccountRef } // the store's id and its AccountRef
 pub struct Projects { pub projects: Vec<Project>, pub orgs: Vec<Org>,
     pub account_refs: Vec<AccountEntry>, /* names, assigned, joins, org_join: private */ }
@@ -2697,13 +2756,19 @@ is the same project everywhere, a folder id carries its host, so the same folder
 two projects until a `Join` makes one. It then applies the log in time order, ties by host name and
 then by line order: `Rename` and `Assign` for the same id replace the previous; `Join` follows the
 chain and, when it would close a cycle, drops the earliest record of that cycle; `Unjoin` removes
-the id's join; `OrgRename` and `OrgJoin` work the same for organizations. Ids are grouped under
-their join root; a group with no session is not a row. A project's name is the last rename of its
-root or the root key's default name; its organization is the last assignment of the root or the
+the id's join; `OrgRename`, `OrgJoin` and `OrgUnjoin` work the same for organizations: `OrgJoin`
+merges `org` into `into` and `OrgUnjoin` stops that latest merge, so the organization is a root of
+its own again (R1). An `Assign` made after a merge keeps the organization it names. Ids are grouped
+under their join root; a group with no session is not a row. A project's name is the last rename of
+its root or the root key's default name; its organization is the last assignment of the root or the
 root key's default (the repository owner); its `joined` ids carry their default names, because a
 joined id's own rename is not shown. Organization identities come from every project's
-organization, every account's `org_name`, every `OrgRename` and every `AccountOrg` organization, and
-both ends of every `OrgJoin`, joined by `OrgJoin`. Organization names that differ only in case are
+organization, every account's `org_name`, every `OrgRename` and every `AccountOrg` organization,
+and both ends of every `OrgJoin`, joined by `OrgJoin`. An organization that comes from a repository
+owner of this or another host stays as an empty row when its last project moves away (decision 30);
+its `empty` is true when it has no project and no account. An organization is `source` `Owner`,
+`Login` or `Added`; a merged organization is a `MergedOrg` of its target, not a row of its own.
+Organization names that differ only in case are
 one organization, in a 1.1.0 history too: an owner spelled `Acme` and a login organization named
 `acme` are the same organization, because GitHub owners are case-insensitive. The key is the
 Unicode lower case of the name; the first spelling in the history's order gives the id and the shown
@@ -2711,6 +2776,9 @@ name, and a stored account's `org_name` spells an organization only when no sess
 names it. `AccountOrg` records are applied in log order:
 the latest record for an account puts that one account in that organization's root, or in none.
 Nothing else moves an account, so an edit for one account leaves every other account where it is.
+`with_tokens` fills every project's output tokens over all time and every organization's tokens with
+one `ProjectId → row` map, so an edit does not read the token lines per project; `resolve` counts an
+organization's sessions from its projects.
 `Projects::of` uses the same maps for an id without a row.
 
 ## app: history additions — hosts, import and export (step C1)
@@ -2889,8 +2957,10 @@ pub const REPORT_STALE_MIN: i64 = 15;
 #[serde(rename_all = "camelCase")] pub enum LiveStatus { Busy, Idle, Waiting, Closed, Other(String) }
 #[serde(rename_all = "camelCase")] pub struct Values { pub api: Option<f64>,
     pub api_currency: Option<String>, pub api_missing: Option<String>,
+    #[serde(default)] pub api_partial: bool,
     pub subscription: Option<f64>, pub currency: Option<String>,
-    pub subscription_missing: Option<String> }
+    pub subscription_missing: Option<String>,
+    #[serde(default)] pub subscription_partial: bool }
 impl Values { pub fn of(valued: &[Valued], settings: &Settings, fx: &Fx, at: DateTime<Utc>,
                         ) -> Values;
               pub fn sum(parts: &[&Values]) -> Values; }
@@ -2981,9 +3051,11 @@ label `<project>-<first two characters of the session id>` and no agents. A clos
 sums the records whose span `[t, t + span())` overlaps `[now - 60 min, now)`: a 5-minute line, or an
 older hourly line from the hour before the window, counts when it reaches into it.
 
-`live_sessions::Values::sum(parts: &[&Values]) -> Values` is the one sum rule: each half is added
-only when every part has it, a missing part makes the sum unknown with the first part's reason, and
-an empty list is a known 0 in both halves with no currency of its own. API parts in two
+`live_sessions::Values::sum(parts: &[&Values]) -> Values` is the one sum rule (R3): each half adds
+its known parts, even when another part is missing. The half is then the known part and
+`api_partial` / `subscription_partial` is true, with the first missing part's reason in
+`api_missing` / `subscription_missing`; a half with no known part stays `None` with its reason and
+`partial = false`. An empty list is a known 0 in both halves with no currency of its own. API parts in two
 `api_currency` values say `TWO_CURRENCIES`, and both `api` and `api_currency` are then `None`;
 subscription parts in two `currency` values say "these sessions are valued in two currencies", and
 both `subscription` and `currency` are then `None` (each host can set its own settings' currency).
@@ -2992,6 +3064,9 @@ stored, `USD` when the currency is set without a rate or look-ups are off, and n
 currency is set; the subscription 0 is in the settings' currency.
 `Values::of(valued, settings, fx, at)` builds one `Values` per record with the settings' currency and
 calls `Values::sum`; a group in the Sessions view uses the same function, never a second addition.
+A page draws a partial half as `≥ amount` with its reason; a share, ratio or percent takes only full
+halves through `stats::full_half`, except a share of an API value, which uses `stats::priced_api`
+(V-2, below).
 `LiveSession` carries `project_id: ProjectId` after the project joins, so the shown `project` name
 and the grouping key stay apart. `last_hour` is `Option<Tokens>`: `None` when the row's total went
 down (Codex), and the reason is the row's warning; a known 0 is an empty last hour, not `—`.
@@ -3387,8 +3462,9 @@ pub fn empty(ctx: &Ctx<Tz>, range: &Range) -> Result<Option<Empty>, StatsError>;
 - `account_weeks_so_far` adds `Valuer::running_windows(ctx.now)` to the finished windows. A running
   window goes into the week of its midpoint like a finished one (its start is seven days before its
   reset), so it never moves when it ends; its week is `running`, it offers one week's price and it
-  expires nothing (`week_lost_percent` leaves the running window out). The Weeks page's summary uses
-  it; Overview's history does not. `running_account_weeks` builds the account weeks of the running
+  expires nothing (`week_lost_percent` leaves the running window out). The Weeks page's summary and
+  Overview's figures and weekly chart use it; the Expired share and the findings leave the running
+  windows out. `running_account_weeks` builds the account weeks of the running
   windows alone, over every week (Overview's This-week card). `running_elsewhere` names the running
   windows whose midpoint lies in last or next week when the range holds now and does not show that
   week.
@@ -3412,7 +3488,10 @@ The shared helpers, used by more than one page:
 |---|---|
 | `accounts_without_price` | the account ids with at least one account week that has no price: stored accounts in `Ctx::accounts` order, then removed accounts by id |
 | `money_of` | the week's money: `paid = 100 × pv` for one week, `expired = the sum of every window's lost × pv`, `used = the week's summed use × pv`; `None` without a price. `offered_money` is `paid × the number of windows`, `offered_finished_money` the same without a running window (the Expired share's denominator), and `percent_of_offered` is the one Used/Expired share rule |
-| `api_shares` | each project's share of a total's API value in percent, through `top_three`; empty when the total's API value is unknown or 0. The Weeks summary's top projects and the This-week card use it |
+| `full_half` | `pub(crate) fn full_half(value: Option<f64>, partial: bool, missing: Option<&str>) -> (Option<f64>, Option<String>)`: a half's value when it is full, else `None` with the half's reason. A share, ratio or percent uses only full halves (R3); an amount alone may stay partial and is drawn `≥` |
+| `priced_api` | `pub(crate) fn priced_api(values: &Values) -> Option<f64>`: the value's known API part, partial or not. A share of an API value divides a part's `priced_api` by the whole's, so priced work keeps its share when other work has no price (V-2); `None` when there is no priced part, and a whole whose priced part is `None` or 0 gives no shares |
+| `api_shares` | `pub(crate) fn api_shares(by_project: BTreeMap<String, Values>, total: &Values) -> Vec<(String, f64)>`: each project's share of a total's priced API value in percent, through `top_three`; empty when the total's priced API value is unknown or 0. The Weeks summary's top projects use it |
+| `subscription_shares` | `pub(crate) fn subscription_shares<'a, Tz>(ctx: &Ctx<Tz>, total: &Values, parts: impl IntoIterator<Item = (Option<String>, &'a Values)>) -> Vec<(Option<String>, f64)>`: each subscription's share of the priced API value of `total`, in percent, largest first, ties in the chips' order (`account_position`). A part without a priced API value is left out. The one split rule of the This-week card's project bars and `Node::by_subscription` / `ProjectDetail::by_subscription` |
 | `lost_percent` | the window's `lost`; a reset window's absent `lost` is 0, and any other window without it is an error, because seatswap always writes it |
 | `SwitchCounts`, `switch_counts` | `Switch` events of a range and host by `By::{User, Cli, Auto, Agent, External}` |
 | `week_columns` | Monday 00:00 local of the week holding `range.from`, then each following Monday 00:00 local while the start is before `range.to` |
@@ -3429,26 +3508,57 @@ taking a `Range` for their tests; each produces one serde camelCase struct:
 
 ```rust
 // overview.rs
-/// `kpis` and `weeks` count finished windows only; the windows running now are the card's
-/// (`this_week_card`).
+/// `kpis`, `weeks`, `marks` and the weekly chart count every weekly window of the range, the
+/// running ones included (`account_weeks_so_far`); the Expired share and the findings use finished
+/// windows only. The card on top is `this_week_card`.
 pub struct Overview { pub without_price: Vec<String>,
     pub kpis: Kpis, pub weeks: Vec<OverviewWeek>, pub marks: Vec<Mark>, pub findings: Vec<String> }
-/// One entry per chosen account with a running weekly window (`running_account_weeks`), stored
-/// accounts' order then others by id; one per other provider subscription with records this
-/// calendar week, `Company` order then stored order; `projects` is the API-value split of all
-/// listed accounts and providers together (`api_shares`).
+/// The three totals over every record the card counts, one row per project in the counted
+/// records, and one row per running subscription window.
+#[derive(Debug, Clone, PartialEq, Serialize)] #[serde(rename_all = "camelCase")]
 pub struct ThisWeek { pub accounts: Vec<ThisWeekAccount>, pub providers: Vec<ThisWeekProvider>,
-    pub projects: Vec<(String, f64)> }
+    pub totals: ThisWeekTotals, pub projects: Vec<ThisWeekProject> }
+#[derive(Debug, Clone, PartialEq, Serialize)] #[serde(rename_all = "camelCase")]
+pub struct ThisWeekTotals {
+    /// The output tokens of every record the card counts.
+    pub tokens_out: u64,
+    /// The number of entries in `ThisWeek::projects`.
+    pub projects: u32,
+    /// The two values of every counted record, summed with `Values::sum`.
+    pub used: Values,
+    /// What the running windows' weeks cost: a Claude account's running week at its week price
+    /// (`money_of`'s `paid`), an OpenAI subscription's running week at its week price, and an
+    /// Ollama month as `price_month × 12 / 52` (documented rule). A window without a price adds
+    /// nothing; `None` while no listed window has a price.
+    pub paid: Option<f64>,
+    /// A listed running window has no price, so `paid` holds only the others' sum (R3).
+    pub paid_partial: bool,
+    /// `used.subscription / paid × 100`; `None` while either is unknown, `paid` is 0, or either
+    /// is partial ([`full_half`], R3).
+    pub used_of_paid: Option<f64> }
+/// One project row: name after the project log's joins, key, output tokens, both `values`, and
+/// each subscription's share of its priced API value (`subscription_shares`, V-2), largest first;
+/// `None` is work without a known account or named subscription. Empty when the project has no
+/// priced API value or it is 0. Sorted by the known subscription part, then tokens, then name; the
+/// page shows the first eight and folds the rest.
+#[derive(Debug, Clone, PartialEq, Serialize)] #[serde(rename_all = "camelCase")]
+pub struct ThisWeekProject { pub name: String, pub key: Option<ProjectKey>,
+    pub tokens_out: u64, pub values: Values,
+    pub by_subscription: Vec<(Option<String>, f64)> }
+/// One entry per chosen account with a running weekly window, stored accounts' order then others
+/// by id; one per stored provider subscription and one per unnamed company with records this week,
+/// `Company` order then stored order. A provider row without a running window has `used: None` and
+/// the page does not draw it.
 /// A provider subscription's row: its records of `[week_start(now), now]` (Ollama: its current
 /// month), host filter applied, account chips ignored, summed with `Values::of` / `Values::sum`.
 /// `api` is `None` with `api_missing` when a record has no price; `api_currency` is the sum's (the
-/// settings' currency, "USD" without a rate). `projects` is `api_shares` of its records; `used` is
+/// settings' currency, "USD" without a rate). `used` is
 /// its window's use (`None` with `resets_at` absent for a finished month), `money` the
 /// subscription value with `money_missing` its reason.
 /// `name` is the subscription's abbr.
 pub struct ThisWeekProvider { pub name: String, pub company: Company, pub api: Option<f64>,
     pub api_currency: Option<String>, pub api_missing: Option<String>,
-    pub projects: Vec<(String, f64)>, pub used: Option<f64>,
+    pub used: Option<f64>,
     pub money: Option<f64>, pub money_missing: Option<String>,
     pub resets_at: Option<DateTime<Utc>> }
 pub struct ThisWeekAccount { pub id: String,
@@ -3457,14 +3567,18 @@ pub struct ThisWeekAccount { pub id: String,
     /// `money_of` of the running account week: `used × pv` at the window's price; `None` with
     /// the price's `Missing` text in `money_missing`.
     pub money: Option<f64>, pub money_missing: Option<String>,
-    pub started_at: DateTime<Utc>, pub resets_at: DateTime<Utc>,
-    /// `api_shares` of the account's token records in `[started_at, now]`.
-    pub projects: Vec<(String, f64)> }
+    pub started_at: DateTime<Utc>, pub resets_at: DateTime<Utc> }
 pub struct Kpis { pub used: f64, pub paid: f64, pub expired: f64,
-    /// The used and expired parts of the weeks the range offered, in percent. Every finished window
-    /// offers one week of its account's price, so a reset week offers two. A window above 100 %
-    /// counts its whole use, so the two shares can pass 100 % together; nothing is cut.
-    pub used_percent: Option<f64>, pub expired_percent: Option<f64>,
+    /// The used part of the offered weeks, in percent: every weekly window of the range — the
+    /// running ones included — offers one week of its account's price, so a week that a reset
+    /// split offers each of its windows. `used + expired + still open` make 100 % of them, except
+    /// that a window whose use passed 100 % counts its whole use, so the two shares can then pass
+    /// 100 % together (nothing is cut). `None` when no account week has a price.
+    pub used_percent: Option<f64>,
+    /// The expired part of the finished weeks, in percent: every finished window's `lost`, over
+    /// the money those finished windows offered (a running window has expired nothing yet, so it
+    /// is not in the denominator). `None` when no finished account week has a price.
+    pub expired_percent: Option<f64>,
     pub expired_by_account: Vec<(String, f64)>,
     /// One entry per company with working hours in the range, Anthropic first: a provider's
     /// blocked hours are not Anthropic's and are never added into them.
@@ -3534,19 +3648,36 @@ pub fn window_detail(ctx: &Ctx<Tz>, account_id: &str, end: DateTime<Utc>)
 pub enum NodeKind { Org, Project, Folder }
 pub struct Node { pub kind: NodeKind, pub level: u8, pub name: String,
     pub key: Option<ProjectKey>, pub org_accounts: Vec<String>, pub tokens: Tokens,
-    pub share: f64, pub subscription: Option<f64>, pub api: Option<f64>,
-    /// Claude accounts only (`None`: a Claude record without a known account); `by_provider`
-    /// is each company's share by `Company::name`, largest first. Together they make up the
-    /// node's API value.
-    pub by_account: Vec<(Option<String>, f64)>, pub by_provider: Vec<(String, f64)>,
+    /// This node's API value as a share of the page's, in %; `None` when the node has no priced
+    /// API value or the page's total has none, or the total is zero.
+    pub share: Option<f64>, pub values: Values,
+    /// Each subscription's share of this node's priced API value in % (`subscription_shares`,
+    /// V-2), largest first, ties in the chips' order; `None` is work without a known account or
+    /// named subscription. Empty without a priced API value or at 0.
+    pub by_subscription: Vec<(Option<String>, f64)>,
     pub sessions: u32 }
 pub struct ProjectsPage { pub nodes: Vec<Node>, pub matrix: Matrix,
     pub tokens_per_percent: Vec<(String, f64)>, pub unknown_account_tokens: Tokens,
-    pub without_price: Vec<String>, pub notes: Vec<String> }
-pub struct Matrix { pub orgs: Vec<String>, pub accounts: Vec<String>,
-    pub cells: Vec<Vec<f64>>, pub sentences: Vec<String> }
+    pub without_price: Vec<String>, pub notes: Vec<String>, pub usd_rate: Option<UsdRate> }
+pub struct UsdRate { pub value: f64, pub date: Option<NaiveDate>, pub currency: String,
+    pub varies: bool }
+pub struct Matrix { pub orgs: Vec<String>,
+    /// The chosen Claude accounts in `Ctx::accounts` order, then the chosen provider
+    /// subscriptions in the chips' order; the ids `Node::by_subscription` writes.
+    pub subscriptions: Vec<String>,
+    /// Subscription value per organization and subscription; `None` when a record there has no
+    /// subscription value, `Some(0.0)` when it has no record there.
+    pub cells: Vec<Vec<Option<f64>>>,
+    /// The cells' `Values::sum` per organization, per subscription, and over everything; a
+    /// missing cell leaves the known part and a partial total (R3), never unknown.
+    pub row_totals: Vec<Values>, pub column_totals: Vec<Values>, pub total: Values,
+    pub sentences: Vec<String> }
 pub struct ProjectDetail { pub name: String, pub tokens: Tokens, pub agent_share: f64,
-    pub hosts: Vec<(String, f64)>, pub subscription: Option<f64>, pub api: Option<f64>,
+    /// Each host's share of the priced API value, largest first.
+    pub hosts: Vec<(String, f64)>, pub values: Values,
+    pub by_subscription: Vec<(Option<String>, f64)>,
+    /// The project's API value as a share of the page's, `None` without priced work.
+    pub share: Option<f64>,
     pub weekly_by_model: Vec<(DateTime<Utc>, Vec<(String, u64)>)>, pub sessions: u32 }
 pub fn projects_page(ctx: &Ctx<Tz>, q: &Query) -> Result<ProjectsPage, StatsError>;
 pub fn project_detail(ctx: &Ctx<Tz>, q: &Query, key: &ProjectKey)
@@ -3695,10 +3826,11 @@ Page details that are easy to miss:
   own `Valuer` over `[now − 7 d, now]`, which holds the running windows and this calendar week; the
   Overview's `Valuer` covers only the range. The card's project split reads the token records of `[min(earliest running start, this week's
   Monday), now]`, keeps the query's host, values each with `Valuer::value` and `Values::of` as the
-  Weeks summary does, and shares them with `api_shares`: a Claude record in its account's running
-  window, an OpenAI or Ollama record (`Valued.company`) from `week_start(now)` on in its provider
-  subscription's `ThisWeekProvider`, with its own `used`, `money`, `money_missing` and
-  `resets_at`.
+  Weeks summary does, and shares them with `subscription_shares`: a Claude record in its account's
+  running window, an OpenAI or Ollama record (`Valued.company`) from `week_start(now)` on in its
+  provider subscription's `ThisWeekProvider`, with its own `used`, `money`, `money_missing` and
+  `resets_at`. The card's totals `Values::sum` the same records, and its project rows use
+  `subscription_shares` on each project's records.
 - Pages of project work (Projects, project detail, Weeks summary, Activity) choose a record with
   `stats::record_chosen(ctx, q, &Valued)`: a Claude record by `account_chosen`, a provider record by
   its subscription. Pages about a subscription's own window (the Subscriptions page, tokens per
@@ -3716,15 +3848,17 @@ Page details that are easy to miss:
   detail card's 5h windows line says "N used, more than the about M your usual working hours hold"
   when `used_more_than_possible` is true, and "of about M possible" otherwise.
 - `projects_page` only adds folder rows when a project has more than one folder (`total_folders >
-  1`); its `by_account` shares are shares of the node's API value, and `share` is the node's API
-  value over the page's. `tokens_per_percent` sums an account's output tokens over all its finished
+  1`); its `by_subscription` shares divide each subscription's `priced_api` by the node's, and
+  `share` is the node's priced API value over the page's (`priced_api`; V-2). `tokens_per_percent`
+  sums an account's output tokens over all its finished
   weeks and divides by the sum of those weeks' final percents; an account without a week, or whose
   weeks total 0 %, is left out. `notes` always carries the "use that leaves no transcript" text and
-  adds the unknown-account and no-subscription-value sentences when they have counts, and
-  `{providers} work is valued at API prices only; it uses no Claude account.` when the page has
-  OpenAI or Ollama records. `unknown_account_tokens` counts Claude records only.
-  `project_detail` filters by `q.host`, so a folder key's detail counts every host's folder of that
-  name only with all hosts chosen.
+  adds the unknown-account and no-subscription-value sentences when they have counts, the
+  `{tokens} tokens: account taken from the usage readings.` note when `Valuer` booked work from the
+  readings (G-1), and `No price for {subscriptions}: their tokens add no value; shares count priced
+  work only.` when the page has an unpriced subscription. `unknown_account_tokens` counts Claude
+  records only. `project_detail` filters by `q.host`, so a folder key's detail counts every host's
+  folder of that name only with all hosts chosen; its `by_subscription` uses the same share rule.
 - `subscriptions`' `since` is the first period of the whole history, not of the range; `plan` and
   `price` are the latest visible period's.
 - `forecast` uses `regime.early` to choose the planned policy (`Eager`/`Lazy`), always computes the
@@ -3912,7 +4046,7 @@ here; a mark with a `tip` shows it on hover and on keyboard focus.
 ```js
 export function stackedColumns({ columns, marks } = {});
 export function lines({ series, yMax, marks, ySuffix, yDecimals, yFormat } = {});
-export function bars({ categories, series } = {});
+export function bars({ categories, series, yMax, labels, yLabel, yTicks } = {});
 export function grid({ rows, headers } = {});
 export function heat({ rows = 7, cols = 24, values, tip } = {});
 export function lanes({ lanes, from, to, ticks } = {});
@@ -3929,8 +4063,12 @@ export { attachTip, hideTip, showTip };
   `yMax` (else the largest value), `ySuffix`, `yDecimals`, `yFormat(value)`. A point is the pair
   `[time, value]` the Rust structs serialise; points become focusable buttons, a `null` value
   breaks the line, and the x axis is the first, middle and last valid time.
-- `bars`: `categories: [label]`, `series: [{ name, color, values: [number],
-  unit?, tip(category, value)? }]`.
+- `bars`: `categories: [label]`, `series: [{ name, color, values: [number], unit?, tip(category, value)? }]`,
+  optional `yMax` (a finite number above 0), `yLabel(value)`, `yTicks` (strictly rising from 0 to
+  `yMax`) and `labels(value)`; a `null` value is a missing bar, written `—` with `labels`. A value
+  that is neither a finite number nor `null` is an error naming the category, never a skipped point;
+  a value above the fixed `yMax` is an error too. The grid lines and their labels sit in the bars'
+  own box, so a line at value v is at the height a bar of v reaches.
 - `grid`: `rows: [{ label, cells: [{ fill?, hatch?, full?, uncertain?, current?, color?,
   textColor?, text?, tip?, onClick? }] }]`, `headers: [label | { label, tip?, onClick?, selected?,
   current? }]`. A cell without `fill` is plain; the fill is its height in percent.
@@ -3941,7 +4079,9 @@ export { attachTip, hideTip, showTip };
   gets a sliver.
 - `hours`: `lanes: [{ label, cells: [{ state: "work"|"idle"|"off"|"unknown", stack:
   [{ value, color }], strip?, tip? }] }]`, `days: [{ label, span }]`. The stack is scaled to the
-  tallest hour, the strip to the most sessions.
+  tallest hour; the strip under each lane is a heatmap of `strip`, the number of sessions working in
+  that hour, scaled to the largest number in any lane and coloured by the one `chart-heat-tone`
+  rule Rhythm's cells use; a missing count is 0, any other non-number or a negative is an error.
 - **Fitting.** Every chart fits its text to the width it gets, once its width is known and again
   when it changes; fitting only shows, hides or rewords text, never resizes the chart. Axis labels
   show all, else every second counted from the newest, else (on a dated axis) month starts (`Oct`,
@@ -3951,8 +4091,9 @@ export { attachTip, hideTip, showTip };
   nothing, else becomes a dot on its line with the text in its tooltip. Line charts draw their dots
   only on hover or focus when points are closer than 14 px. The Weeks grid narrows its columns to
   12 px and then scrolls only itself, keeping the row labels in view.
-- Every builder throws on a missing required list; unreadable points are skipped by the builder
-  that takes them (except `lanes`' `from`/`to`, which is an error). Nothing is clamped silently
+- Every builder throws on a missing required list and on a value it cannot read; a `null` is a
+  missing point or bar, never a skipped or zero value (except `lanes`' `from`/`to`, which is an
+  error). Nothing is clamped silently
   except a percent into 0..100 for a CSS position.
 
 ## `app: the Statistics area (step C3)`
@@ -4010,8 +4151,8 @@ of their own:
 - **Weeks** draws the grid (a date opens the week summary, a cell the window detail), the last-14-days
   curves and the detail card; it opens the newest finished week's summary.
 - **Projects** draws the tree (By organization · Plain folder tree, rows open and close), the
-  organization × account matrix and its sentences, the project detail and the notes; it opens the
-  first project's detail.
+  organization × subscription matrix and its sentences, the project detail and the notes; it opens
+  the first project's detail.
 - **Subscriptions** draws the totals line and the four cards in their order: *What does each plan
   give me?*, *Am I using what I pay for?*, *What 1 % of a limit buys, over the weeks* and *Tokens a
   week, per subscription and model*. There is no what-if replay and no row's period bars any more.
@@ -4592,7 +4733,10 @@ pub struct ProviderReading { pub account: AccountRef, pub plan: Option<String>,
 `api::mark_highest_active` (in the api.rs section below) sets `is_active` on exactly one limit: the
 one with the highest percent, the first of equals. `ProviderError::Setting` carries the text of the
 setting or path that refused the reading; it is not a second setting error. The `Api` variant is
-transparent, so the card prints the API error's own text. The keyring and API-key sentences are
+transparent, so the card prints the API error's own text. `NotRunning { url }` is a refused
+connection to the Ollama server (`Ollama is not running on {url}.`); the poll uses it to report the
+change once, no reading is recorded, and the card writes its own quiet line `Ollama is not
+running.` The keyring and API-key sentences are
 exact: the card shows them as its error, and neither login is saved or switched.
 
 ## codex — `auth.json`, its saved logins and the usage answer (step D, 1.3 R8)
@@ -4906,9 +5050,17 @@ the order Codex, Ollama. `poll_round` calls `settle(settings, previous)`: a card
 its view and its last attempt; a card whose `codexHome`/`ollamaUrl` changed drops its old view,
 because those numbers belong to another login or server, and is polled. `opened` and `settings_saved`
 run the same check, so a folder or URL changed by hand in `accounts.json` drops the old numbers before
-the next round just like a save. `poll_round` polls every switched-on card and every provider whose
-subscription has a price, even with its card off (R4), so a priced OpenAI subscription learns its
-plan and week. `opened` polls a switched-on card whose place changed, or whose last *attempt* is
+the next round just like a save. `poll_round` polls every switched-on card and every provider found
+by itself (R6): Codex when `paths.auth_file.is_file()`, Ollama when this run's `PATH` value holds an
+`ollama` program or this host stores an Ollama subscription (`found`). `spawn` reads `PATH` once and
+the runtime keeps that value; an Ollama subscription only another host stores does not count. A
+found provider's reading is recorded and its subscription ensured like a switched-on one's; with the
+card off its errors go to `PrintedWarnings` (one line on stderr, once per text) through
+`report_provider_error(false, …)`, never to `ReportedErrors`, which would notify.
+`ProviderError::NotRunning { url }` is the Ollama poll's refused connection: it sets
+`ollama_not_running` and is reported only on a change from running to not running; the card shows the
+quiet line `Ollama is not running.`, and the next answering poll clears the flag. `opened` polls a
+switched-on card whose place changed, or whose last *attempt* is
 more than 60 s old (exactly 60 s is not older). `settings_saved` polls a card that was just switched
 on, or whose `codexHome`/`ollamaUrl` changed; a card that is now off is dropped at once, and any
 other save does not poll. `codex_changed` polls Codex at once after a switch or a removal, so the
