@@ -138,6 +138,29 @@
   background: color-mix(in oklab, var(--text) 4%, transparent);
 }
 
+/* A subscription with no price ever entered: the price cell is muted and wraps
+   in its 84 px column, and "set it" is the Settings address for that row. */
+.stats-sub-no-price {
+  white-space: normal;
+  overflow: visible;
+  font-size: 11px;
+  line-height: 12px;
+}
+
+.stats-sub-no-price a {
+  color: var(--muted);
+  text-decoration: underline;
+}
+
+.stats-sub-no-price a:hover {
+  color: var(--text);
+}
+
+.stats-sub-no-price a:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
 .stats-sub-total-label {
   white-space: nowrap;
 }

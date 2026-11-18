@@ -131,10 +131,39 @@ function shareCell(value, reason) {
   return h("span", { class: "n", text: percentText(requireNumber(value, "a used share")) });
 }
 
+// A subscription row whose price was never entered: the row's id is the stored
+// account's id or the provider subscription's `account.acc`, the item the
+// Settings address `#settings/accounts?<id>` accepts. A row whose entered price
+// cannot be shown in the display currency keeps its "—" with its reason.
+function noPriceCell(id) {
+  return h("span", { class: "mf stats-sub-no-price" }, [
+    "no price yet · ",
+    h("a", {
+      href: `#settings/accounts?${id}`,
+      class: "stats-sub-set-price",
+      text: "set it",
+      title: "Enter the monthly price in Settings → Accounts",
+    }),
+  ]);
+}
+
 // A subscribed price in the display currency; the price the user entered stays
 // in the tooltip when the row carries one.
-function priceCell(row, currency, reason) {
+function priceCell(row, currency, reason, env) {
   const price = optionalNumber(row.priceMonth, "a usage row's priceMonth");
+  // The "all" total row is a sum, not a subscription: it never carries a link.
+  if (row.id !== "all" && price === null) {
+    const id = requireString(row.id, "a usage row's id");
+    // Settings can only open a row its account or provider subscription gives:
+    // a Claude account no longer stored has no such row, so its cell keeps
+    // "—" with the row's reason.
+    if (
+      (row.entered === null || row.entered === undefined) &&
+      accountView(env.accounts, id) !== null
+    ) {
+      return noPriceCell(id);
+    }
+  }
   const node = amountCell(price, currency, reason);
   if (row.entered === null || row.entered === undefined) return node;
   requireObject(row.entered, "a usage row's entered price");
@@ -593,7 +622,7 @@ function usageCells(row, currency, env) {
   const timesReason = missing || "no paid money to compare with";
   const expiredReason = missing || "no finished week in this range";
 
-  const cells = [priceCell(row, currency, priceReason)];
+  const cells = [priceCell(row, currency, priceReason, env)];
   const plan = optionalString(row.plan, "a usage row's plan");
   const barTitle =
     used === null

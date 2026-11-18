@@ -112,13 +112,13 @@ const ROWS = [
     abbr: "OL",
     company: "ollama",
     plan: "Pro",
-    price: 18.1,
+    price: null,
     used: Array(12).fill(22),
     workHours: 14,
     perPercent: { [MODELS.deepseek]: 2.4e6 },
     mIx: 2.4,
     since: null,
-    entered: { amount: 20, currency: "USD" },
+    entered: null,
     api: 33,
   },
 ];
@@ -248,6 +248,81 @@ function sizes() {
   };
 }
 
+// `plans.rs`'s `sum_opt` (≈1516): a sum with a missing part is `None`, never
+// 0, and a sum over no value at all is `None` too.
+function sumOpt(values) {
+  let total = 0;
+  let seen = false;
+  for (const value of values) {
+    if (value === null || value === undefined) return null;
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      throw new Error(`a summed value is not a finite number: ${JSON.stringify(value)}`);
+    }
+    total += value;
+    seen = true;
+  }
+  return seen ? total : null;
+}
+
+// The reason a row carries for a figure it does not know: `subscriptions.rs`'s
+// no-price reason when no price was ever entered, else the row's own.
+function missingReason(row) {
+  return row.missing || (row.price === null ? "the account has no monthly price" : null);
+}
+
+// `subscriptions.rs`'s `used_share` (≈1377): the used share of the counted
+// rows, each weighted by its monthly price; `None` when a counted row has no
+// use or no price.
+function usedShare(rows) {
+  let weighted = 0;
+  let total = 0;
+  for (const row of rows) {
+    if (row.average === null || row.price === null) return null;
+    weighted += row.average * row.price;
+    total += row.price;
+  }
+  return total > 0 ? weighted / total : null;
+}
+
+// `subscriptions.rs`'s `times_paid_of` (≈330) over the counted rows: `None`
+// when a counted row has no API value or no paid money. The fixture builds the
+// paid money from each row's price, so an unpriced row leaves it unknown
+// instead of counting 0, as Rust's `paid = None` does.
+function timesPaidOfCounted(rows) {
+  let api = 0;
+  let paid = 0;
+  for (const row of rows) {
+    if (row.api === null) return null;
+    api += row.api;
+    const rowPaid = row.weekPrice === null ? null : row.paid;
+    if (rowPaid === null) return null;
+    paid += rowPaid;
+  }
+  return rows.length > 0 && paid > 0 ? api / paid : null;
+}
+
+// `plans.rs`'s `total_missing` (≈1393): the reason of the counted row whose
+// same figure is missing, checked in the order the Rust checks the figures.
+function totalMissing(rows, figures) {
+  if (rows.length === 0) return NO_FINISHED;
+  const reason = (find) => {
+    const row = rows.find(find);
+    return row === undefined ? null : missingReason(row);
+  };
+  if (figures.priceMonth === null) return reason((row) => row.price === null);
+  if (figures.api === null) return reason((row) => row.api === null);
+  if (figures.usedPercent === null) {
+    return reason((row) => row.average === null || row.price === null);
+  }
+  if (figures.expired === null) return reason((row) => row.weekPrice === null);
+  if (figures.timesPaid === null) {
+    return reason(
+      (row) => row.api === null || row.weekPrice === null || row.paid <= 0
+    );
+  }
+  return null;
+}
+
 function usageRow(row) {
   return {
     id: idOf(row.abbr),
@@ -256,22 +331,26 @@ function usageRow(row) {
     priceMonth: row.price,
     entered: row.entered,
     usedPercent: row.weeks > 0 ? round1(row.average) : null,
-    expired: row.weeks > 0 ? round2(row.expiredMoney) : null,
+    // Without a price nothing expired in money: unknown, as subscriptions.rs
+    // gives it, never 0.
+    expired: row.weeks > 0 && row.weekPrice !== null ? round2(row.expiredMoney) : null,
     api: row.api === null ? null : round2(row.api),
     timesPaid:
       row.api !== null && row.paid > 0 ? round2(row.api / row.paid) : null,
-    missing: row.missing || null,
+    missing: missingReason(row),
   };
 }
 
 function usageGroupsWith(makeRow) {
   return ["anthropic", "openai", "ollama"].map((company) => {
     const rows = ROWS.filter((row) => row.company === company);
-    const prices = rows.map((row) => row.price).filter((price) => price !== null);
+    // `plans.rs`'s group row (≈1327) sums every row of the company, also one
+    // with no price: a missing part makes the group's price unknown.
+    const priceMonth = sumOpt(rows.map((row) => row.price));
     return {
       company,
       count: rows.length,
-      priceMonth: prices.length === 0 ? null : round2(sum(prices)),
+      priceMonth: priceMonth === null ? null : round2(priceMonth),
       rows: rows.map(makeRow),
     };
   });
@@ -282,21 +361,27 @@ function usageGroups() {
 }
 
 function usageTotal() {
-  const priced = ROWS.filter((row) => row.abbr !== "O2");
-  const paid = sum(priced.map((row) => row.paid));
-  const used = sum(priced.map((row) => row.usedMoney));
-  const api = sum(priced.map((row) => row.api || 0));
+  // The row counts the subscriptions with a finished week of the range, as
+  // `plans.rs`'s `usage_groups` (≈1336) and `totals_of` (≈1463) do.
+  const counted = ROWS.filter((row) => row.weeks > 0);
+  const priceMonth = sumOpt(counted.map((row) => row.price));
+  const expired = sumOpt(
+    counted.map((row) => (row.weekPrice === null ? null : row.expiredMoney))
+  );
+  const api = sumOpt(counted.map((row) => row.api));
+  const usedPercent = usedShare(counted);
+  const timesPaid = timesPaidOfCounted(counted);
   return {
     id: "all",
     plan: null,
     since: null,
-    priceMonth: round2(sum(priced.map((row) => row.price || 0))),
+    priceMonth: priceMonth === null ? null : round2(priceMonth),
     entered: null,
-    usedPercent: paid > 0 ? round1((used / paid) * 100) : null,
-    expired: round2(sum(priced.map((row) => row.expiredMoney))),
-    api: round2(api),
-    timesPaid: paid > 0 ? round2(api / paid) : null,
-    missing: null,
+    usedPercent: usedPercent === null ? null : round1(usedPercent),
+    expired: expired === null ? null : round2(expired),
+    api: api === null ? null : round2(api),
+    timesPaid: timesPaid === null ? null : round2(timesPaid),
+    missing: totalMissing(counted, { priceMonth, api, usedPercent, expired, timesPaid }),
   };
 }
 
@@ -497,14 +582,15 @@ function tokensWeek() {
 }
 
 function totals() {
-  const priced = ROWS.filter((row) => row.abbr !== "O2");
-  const priceMonth = sum(priced.map((row) => row.price || 0));
+  // `plans.rs`'s `totals_of` (≈1463): the rows with a finished week of the
+  // range, and a sum with one missing part is unknown.
+  const counted = ROWS.filter((row) => row.weeks > 0);
+  const priceMonth = sumOpt(counted.map((row) => row.price));
   const apiMonth =
-    sum(priced.filter((row) => row.weeks > 0).map((row) => row.api / row.weeks)) *
-    (52 / 12);
+    sum(counted.map((row) => row.api / row.weeks)) * (52 / 12);
   const tokensMonth =
     sum(
-      priced.map(
+      counted.map(
         (row) =>
           row.average *
           row.mIx *
@@ -513,15 +599,18 @@ function totals() {
       )
     ) *
     (52 / 12);
+  // `plans.rs` (≈774) passes the same `times_paid_of_counted` figure to the
+  // totals and the total row.
+  const timesPaid = timesPaidOfCounted(counted);
   return {
-    count: priced.length,
-    priceMonth: round2(priceMonth),
+    count: counted.length,
+    priceMonth: priceMonth === null ? null : round2(priceMonth),
     apiMonth: round2(apiMonth),
-    timesPaid: priceMonth > 0 ? round2(apiMonth / priceMonth) : null,
+    timesPaid: timesPaid === null ? null : round2(timesPaid),
     tokensUsedMonth: Math.round(tokensMonth),
     weeks: 12,
-    partial: priced
-      .filter((row) => row.weeks > 0 && row.weeks < 12)
+    partial: counted
+      .filter((row) => row.weeks < 12)
       .map((row) => ({ id: idOf(row.abbr), weeks: row.weeks })),
   };
 }
