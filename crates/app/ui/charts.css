@@ -736,12 +736,17 @@
   overflow: hidden;
 }
 
+/* The one colour of both heatmaps (Rhythm's cells and Activity's session
+   strip): the focus colour mixed into the track by the cell's strength. */
+.chart-heat-tone {
+  background: color-mix(in oklab, var(--focus) var(--chart-heat-strength, 0%), var(--track));
+}
+
 .chart-heat-cell {
   position: relative;
   min-width: 0;
   min-height: 0;
   border-radius: 3px;
-  background: color-mix(in oklab, var(--focus) var(--chart-heat-strength, 0%), var(--track));
 }
 
 .chart-lanes {
@@ -946,17 +951,7 @@
   flex: 1 1 0;
   min-width: 1px;
   height: 100%;
-  display: flex;
-  align-items: flex-end;
   border-radius: 2px;
-  background: var(--track);
-}
-
-.chart-hours-stripcell i {
-  display: block;
-  width: 100%;
-  background: var(--muted);
-  border-radius: 2px 2px 0 0;
 }
 
 /* The hours chart's history mark: over the lanes, to the right of the host

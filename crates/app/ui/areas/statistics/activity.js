@@ -7,7 +7,6 @@
 
 import {
   WEEKDAYS,
-  amountNode,
   clear,
   dateText,
   hoursText,
@@ -24,6 +23,7 @@ import {
   shortDate,
   showTokens,
   tokens,
+  valueNode,
   valueTip,
   valueText,
   weekdayIndex,
@@ -143,34 +143,55 @@ export async function show(container, env) {
   kpisCard.appendChild(kpis);
   root.appendChild(kpisCard);
 
-  for (const lane of lanes) {
-    const parts = [
-      `on but idle ${hoursText(lane.idle)}`,
-      `off ${hoursText(lane.off)}`,
-    ];
-    if (lane.unknown > 0) {
-      parts.push(`not known ${hoursText(lane.unknown)}`);
+  // One box for the whole page's span, summed over the hosts. A lane whose
+  // hours are not a finite number of 0 or more is an error, never a zero.
+  function laneHours(lane, key) {
+    const value = lane[key];
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+      throw new Error(
+        `lane ${JSON.stringify(lane.host)} has no valid ${key} hours: ${JSON.stringify(value)}`
+      );
     }
-    parts.push(`${tokenText(lane.tokens)} tokens in the range`);
-    kpis.appendChild(
-      kpi(
-        `${lane.host} · last 7 days`,
-        `${hoursText(lane.working)} working`,
-        parts.join(" · "),
-        `${lane.host} | last 7 days: working ${hoursText(lane.working)} · idle ${hoursText(lane.idle)} · off ${hoursText(lane.off)}${
-          lane.unknown > 0
-            ? ` · not known ${hoursText(lane.unknown)}`
-            : ""
-        } | in the range: ${tokensTip(lane.tokens)} | ${valueTip(
-          lane.values,
-          "subscription",
-          "in the range"
-        )} | ${valueTip(lane.values, "api", "in the range")}`
-      )
-    );
+    return value;
   }
 
-  if (lanes.length === 0) {
+  if (lanes.length > 0) {
+    const total = {};
+    for (const key of ["working", "idle", "off", "unknown"]) {
+      total[key] = lanes.reduce((sum, lane) => sum + laneHours(lane, key), 0);
+    }
+    const parts = [`on but idle ${hoursText(total.idle)}`, `off ${hoursText(total.off)}`];
+    if (total.unknown > 0) {
+      parts.push(`not known ${hoursText(total.unknown)}`);
+    }
+    const tips = [
+      "Last 7 days, summed over hosts",
+      `working: ${lanes
+        .map((lane) => `${lane.host} ${hoursText(laneHours(lane, "working"))}`)
+        .join(" · ")}`,
+      `on but idle: ${lanes
+        .map((lane) => `${lane.host} ${hoursText(laneHours(lane, "idle"))}`)
+        .join(" · ")}`,
+      `off: ${lanes
+        .map((lane) => `${lane.host} ${hoursText(laneHours(lane, "off"))}`)
+        .join(" · ")}`,
+    ];
+    if (total.unknown > 0) {
+      tips.push(
+        `not known: ${lanes
+          .map((lane) => `${lane.host} ${hoursText(laneHours(lane, "unknown"))}`)
+          .join(" · ")}`
+      );
+    }
+    kpis.appendChild(
+      kpi(
+        "Last 7 days",
+        `${hoursText(total.working)} working`,
+        parts.join(" · "),
+        tips.join(" | ")
+      )
+    );
+  } else {
     kpis.appendChild(emptyLine("no host recorded in the range"));
   }
 
@@ -208,16 +229,11 @@ export async function show(container, env) {
     valueParts.push(`${lane.host}: ${valueTip(lane.values, "subscription", "in the range")}`);
     valueTips.push(`${lane.host}: ${valueTip(lane.values, "api", "in the range")}`);
   }
-  const subscription = valueText(data.totalValues, "subscription", null);
-  const subscriptionNode = h("span", {
-    text: subscription.text,
-    title: subscription.title || undefined,
-  });
   const api = valueText(data.totalValues, "api", null);
   kpis.appendChild(
     kpi(
       "Their value",
-      subscriptionNode,
+      valueNode(data.totalValues, "subscription", null),
       `of the subscriptions · ${api.text}${api.title ? ` (${api.title})` : ""} at API prices`,
       `Value of the subscriptions, summed over hosts in the range | ${valueTip(
         data.totalValues,
@@ -265,7 +281,7 @@ export async function show(container, env) {
   hoursHead.appendChild(
     h("span", {
       class: "s",
-      text: "bar = the hour · strip = sessions working · hatched = off, plain = on but idle, empty = not known",
+      text: "bar = the hour · strip = sessions working, darker = more · hatched = off, plain = on but idle, empty = not known",
     })
   );
   hoursHead.appendChild(h("span", { class: "sp" }));
@@ -575,12 +591,12 @@ export async function show(container, env) {
       );
       row.appendChild(
         h("span", { class: "n", title: valueTip(week.values, "subscription") }, [
-          amountNode(week.values.subscription, week.values.currency),
+          valueNode(week.values, "subscription", null),
         ])
       );
       row.appendChild(
         h("span", { class: "n", title: valueTip(week.values, "api") }, [
-          amountNode(week.values.api, week.values.apiCurrency),
+          valueNode(week.values, "api", null),
         ])
       );
       row.appendChild(h("span", { class: "n", text: String(week.sessions) }));
@@ -652,12 +668,12 @@ export async function show(container, env) {
       );
       row.appendChild(
         h("span", { class: "n", title: valueTip(session.values, "subscription") }, [
-          amountNode(session.values.subscription, session.values.currency),
+          valueNode(session.values, "subscription", null),
         ])
       );
       row.appendChild(
         h("span", { class: "n", title: valueTip(session.values, "api") }, [
-          amountNode(session.values.api, session.values.apiCurrency),
+          valueNode(session.values, "api", null),
         ])
       );
       const agentsKnown = session.agents !== null && session.agents !== undefined;

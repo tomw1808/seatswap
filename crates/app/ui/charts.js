@@ -1174,7 +1174,7 @@ export function heat({ rows = 7, cols = 24, values, tip } = {}) {
       const value = values[row * cols + col];
       const strength = finite(value) && max > 0 ? clampPercent((value / max) * 100) : 0;
       const cell = h("div", {
-        class: "chart-heat-cell",
+        class: "chart-heat-cell chart-heat-tone",
         style: { "--chart-heat-strength": `${strength}%` },
       });
       if (typeof tip === "function") attachTip(cell, tip(row, col, value));
@@ -1272,25 +1272,48 @@ export function lanes({ lanes, from, to, ticks } = {}) {
 // One lane per host; `cells` is one per hour, oldest first, and each carries
 // its time `t`. A cell's `state` is "work", "idle", "off" or "unknown". Its
 // `stack` (a list of { value, color }) is the bar of that hour, and `strip` the
-// number of sessions working in it. `days` is the axis: { label, span } per day
-// boundary. A `mark` is placed at the left edge of the first hour column after
-// its time.
+// number of sessions working in it: the strip is a heatmap whose cells are as
+// tall as the strip and coloured by that number over the largest in any lane.
+// `days` is the axis: { label, span } per day boundary. A `mark` is placed at
+// the left edge of the first hour column after its time.
 export function hours({ lanes, days, marks } = {}) {
   if (!Array.isArray(lanes)) throw new Error("hours needs a list of lanes");
   const firstCells = lanes.length > 0 && Array.isArray(lanes[0].cells) ? lanes[0].cells : [];
   const count = firstCells.length;
   const columnTimes = firstCells.map((cell) => timeOf(cell && cell.t));
 
+  function laneName(lane) {
+    if (lane.label === undefined || lane.label === null) return "?";
+    return typeof lane.label === "string" ? lane.label : lane.label.textContent;
+  }
+
+  // A missing session count is none; any other non-number or a negative count
+  // is an error, never a silently drawn 0.
+  function stripSessions(lane, index) {
+    const cell = Array.isArray(lane.cells) ? lane.cells[index] : undefined;
+    const sessions = cell ? cell.strip : undefined;
+    if (sessions === undefined || sessions === null) return 0;
+    if (!finite(sessions) || sessions < 0) {
+      throw new Error(
+        `an hour cell has no session count: ${String(sessions)} (lane ${JSON.stringify(
+          laneName(lane)
+        )}, hour ${index})`
+      );
+    }
+    return sessions;
+  }
+
   let maxStack = 0;
   let maxStrip = 0;
   for (const lane of lanes) {
-    for (const cell of Array.isArray(lane.cells) ? lane.cells : []) {
+    for (const [index, cell] of (Array.isArray(lane.cells) ? lane.cells : []).entries()) {
       let total = 0;
       for (const segment of Array.isArray(cell && cell.stack) ? cell.stack : []) {
         if (finite(segment && segment.value) && segment.value > 0) total += segment.value;
       }
       if (total > maxStack) maxStack = total;
-      if (finite(cell && cell.strip) && cell.strip > maxStrip) maxStrip = cell.strip;
+      const sessions = stripSessions(lane, index);
+      if (sessions > maxStrip) maxStrip = sessions;
     }
   }
 
@@ -1326,15 +1349,9 @@ export function hours({ lanes, days, marks } = {}) {
       const cell = Array.isArray(lane.cells) ? lane.cells[index] : undefined;
       const state = cell && cell.state;
       if (typeof state !== "string" || state === "") {
-        const laneName =
-          lane.label !== undefined && lane.label !== null
-            ? typeof lane.label === "string"
-              ? lane.label
-              : lane.label.textContent
-            : "?";
         throw new Error(
           `an hour cell has no state: ${JSON.stringify(state)} (lane ${JSON.stringify(
-            laneName
+            laneName(lane)
           )}, hour ${index})`
         );
       }
@@ -1351,13 +1368,13 @@ export function hours({ lanes, days, marks } = {}) {
       if (cell && typeof cell.tip === "string") attachTip(node, cell.tip);
       cells.appendChild(node);
 
-      const sessions = finite(cell && cell.strip) ? cell.strip : 0;
-      const stripCell = h("div", { class: "chart-hours-stripcell" });
-      if (sessions > 0 && maxStrip > 0) {
-        stripCell.appendChild(
-          h("i", { style: { height: `${clampPercent((sessions / maxStrip) * 100)}%` } })
-        );
-      }
+      const sessions = stripSessions(lane, index);
+      const strength =
+        sessions > 0 && maxStrip > 0 ? clampPercent((sessions / maxStrip) * 100) : 0;
+      const stripCell = h("div", {
+        class: "chart-hours-stripcell chart-heat-tone",
+        style: { "--chart-heat-strength": `${strength}%` },
+      });
       strip.appendChild(stripCell);
     }
     track.appendChild(cells);
