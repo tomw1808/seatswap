@@ -33,7 +33,7 @@ Code's status line.
 </p>
 
 <p>
-  <img src="docs/images/window-subscriptions.png" alt="Statistics, Subscriptions page over 90 days: what each plan gives in hours of typical work per model, the plan sizes measured against Max, what is used of what is paid per company, what 1 % of a limit buys over the weeks with a note that it fell by 20 % since 19 Oct, and the tokens a week per subscription and model" width="760">
+  <img src="docs/images/window-subscriptions.png" alt="Statistics, Subscriptions page over 90 days: what a full limit of each plan holds in hours of your actual work and in tokens, the plan sizes measured against Max, what is used of what is paid per company, what 1 % of a limit buys over the weeks with a note that it fell by 20 % since 19 Oct, and the tokens a week per subscription and model" width="760">
 </p>
 
 <p>

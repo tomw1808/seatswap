@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use crate::burn::fit::Factor;
 use crate::burn::fit::{self, Pair};
-use crate::burn::rates::{self, main_limit, rhythm_of_company, PairLimit, RateAccount};
+use crate::burn::rates::{self, main_limit, worked_hour, PairLimit, RateAccount, WorkedHour};
 use crate::burn::{usd_hours, Rates, RHYTHM_WEEKS};
 use crate::history::{AccountRef, Event, Hosted, Hosts, Range, Sample, TokenRecord, WindowRecord};
 use crate::live_sessions::Values;
@@ -83,28 +83,29 @@ pub struct Partial {
     pub weeks: u32,
 }
 
-/// One subscription and the models it ran, with the hours a full weekly (or
-/// monthly) limit holds at each model's price.
+/// One subscription and what a full weekly (Ollama: monthly) limit holds of
+/// the owner's actual work with its company's models (1.4.1): hours worked and
+/// tokens, both from [`WorkedHour`].
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanRow {
     pub id: String,
     pub company: Company,
     pub plan: Option<String>,
-    pub models: Vec<PlanModel>,
+    /// Hours of actual work a full limit holds: the limit's API dollars over
+    /// the dollars of an hour worked. `None` with `missing`, or when no hour of
+    /// the last 4 weeks holds priced work of the company.
+    pub full_hours: Option<f64>,
+    /// Tokens a full limit holds at the owner's mix of the company's models:
+    /// the limit's API dollars at the dollars per token of the same hours.
+    /// `None` exactly when `full_hours` is.
+    pub full_tokens: Option<f64>,
     pub trend: Option<Change>,
     pub basis_hours: Option<f64>,
     pub thin: bool,
     /// Why the row has no models, no basis and no cells; `None` when it has
     /// them (decision 12 of M-2's fix).
     pub missing: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PlanModel {
-    pub model: String,
-    pub hours: Option<f64>,
 }
 
 /// The plan sizes against the most measured Anthropic plan (decision 5).
@@ -177,6 +178,9 @@ pub struct PerPercent {
     pub points: Vec<Point>,
     pub change: Option<Change>,
     pub now: Vec<Now>,
+    /// Minutes of actual work 1 % of this limit holds ([`WorkedHour`]); `None`
+    /// when no hour of the last 4 weeks holds priced work of the company.
+    pub minutes: Option<f64>,
     pub window_holds_minutes: Option<f64>,
 }
 
@@ -194,7 +198,6 @@ pub struct Point {
 pub struct Now {
     pub model: String,
     pub tokens: f64,
-    pub minutes: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -500,8 +503,7 @@ pub(crate) fn subscriptions_in<Tz: TimeZone + Copy>(
             .push(rates::unpriced_warning(model));
     }
 
-    let mut model_typical_cache: BTreeMap<(String, Company), Option<f64>> = BTreeMap::new();
-    let mut company_typical_cache: BTreeMap<Company, Option<f64>> = BTreeMap::new();
+    let mut worked_cache: BTreeMap<Company, Option<WorkedHour>> = BTreeMap::new();
 
     let range_weeks = week_columns(range, &ctx.zone)
         .iter()
@@ -601,28 +603,15 @@ pub(crate) fn subscriptions_in<Tz: TimeZone + Copy>(
             .and_then(|model| model_upt(&company_models, subject.company, model));
         let learned_rates = learned.rates.get(reference).copied();
         let usable = learned_rates.is_some() && main.is_some() && main_upt.is_some();
-        let models = learned_rates
-            .map(|rates| {
-                plan_models(
-                    ctx,
-                    &rhythm_tokens.records,
-                    owner_model_stats,
-                    &rates.c,
-                    subject.company,
-                    &company_models,
-                    &mut model_typical_cache,
-                )
-            })
-            .unwrap_or_default();
-        let basis_hours = learned_rates.and_then(|rates| {
-            company_typical(
-                ctx,
-                &rhythm_tokens.records,
-                subject.company,
-                &mut company_typical_cache,
-            )
-            .and_then(|typical| usd_hours(rates.c.basis_usd, typical))
-        });
+        let worked = worked_of(
+            ctx,
+            &rhythm_tokens.records,
+            subject.company,
+            &mut worked_cache,
+        );
+        let basis_hours = learned_rates
+            .zip(worked)
+            .and_then(|(rates, hour)| usd_hours(rates.c.basis_usd, hour.usd));
         let lines = lines.get(reference).map(Vec::as_slice).unwrap_or(&[]);
         let main_points = if usable {
             points_for_main(
@@ -648,11 +637,16 @@ pub(crate) fn subscriptions_in<Tz: TimeZone + Copy>(
             (Some(_), Some(_)) if main_upt.is_none() => Some(NO_PRICED_MODEL_REASON.to_string()),
             (Some(_), Some(_)) => None,
         };
+        let (full_hours, full_tokens) = match (missing.is_none(), learned_rates, worked) {
+            (true, Some(rates), Some(hour)) => full_limit(&rates.c, hour),
+            _ => (None, None),
+        };
         plans.push(PlanRow {
             id: id.clone(),
             company: subject.company,
             plan: plan.clone(),
-            models,
+            full_hours,
+            full_tokens,
             trend: if usable { trend.clone() } else { None },
             basis_hours,
             thin: learned_rates.is_some_and(|rates| is_thin(&rates.c)),
@@ -669,7 +663,6 @@ pub(crate) fn subscriptions_in<Tz: TimeZone + Copy>(
                     Company::Anthropic | Company::OpenAI => "week",
                 };
                 per_percent.push(per_percent_row(
-                    ctx,
                     subject,
                     &id,
                     model,
@@ -679,10 +672,13 @@ pub(crate) fn subscriptions_in<Tz: TimeZone + Copy>(
                     &rates.c,
                     owner_model_stats,
                     &company_models,
-                    &rhythm_tokens.records,
-                    &mut model_typical_cache,
+                    worked,
                 ));
-                if subject.company != Company::Ollama && rates.s.is_some() {
+                let session_factor = match subject.company {
+                    Company::Ollama => None,
+                    Company::Anthropic | Company::OpenAI => rates.s,
+                };
+                if let Some(session_factor) = session_factor {
                     let session = session_points(
                         ctx,
                         range,
@@ -699,21 +695,14 @@ pub(crate) fn subscriptions_in<Tz: TimeZone + Copy>(
                         points: session.iter().map(|point| point.point.clone()).collect(),
                         change: change_of(&session, model, main_upt),
                         now: now_of(
-                            ctx,
                             subject,
                             owner_model_stats,
                             &company_models,
-                            rates.s.map_or(0.0, |factor| factor.value),
-                            &rhythm_tokens.records,
-                            &mut model_typical_cache,
+                            session_factor.value,
                         ),
-                        window_holds_minutes: session_minutes(
-                            ctx,
-                            subject,
-                            &rates,
-                            &rhythm_tokens.records,
-                            &mut company_typical_cache,
-                        ),
+                        minutes: percent_minutes(&session_factor, worked),
+                        window_holds_minutes: percent_minutes(&session_factor, worked)
+                            .map(|minutes| 100.0 * minutes),
                     });
                 }
             }
@@ -904,66 +893,34 @@ fn main_model(
         .map(|(model, _)| model.clone())
 }
 
-fn plan_models<Tz: TimeZone + Copy>(
+/// The owner's worked hour of `company` ([`worked_hour`]), once per company and
+/// page.
+fn worked_of<Tz: TimeZone + Copy>(
     ctx: &Ctx<Tz>,
     rhythm_tokens: &[Hosted<TokenRecord>],
-    stats: Option<&BTreeMap<String, ModelStat>>,
-    factor: &Factor,
     company: Company,
-    company_models: &BTreeMap<Company, BTreeMap<String, ModelStat>>,
-    cache: &mut BTreeMap<(String, Company), Option<f64>>,
-) -> Vec<PlanModel> {
-    let Some(stats) = stats else {
-        return Vec::new();
-    };
-    let mut models: Vec<(String, f64)> = stats
-        .iter()
-        .filter(|(model, _)| model_upt(company_models, company, model).is_some())
-        .map(|(model, stat)| (model.clone(), stat.usd))
-        .collect();
-    models.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    models
-        .into_iter()
-        .map(|(model, _)| PlanModel {
-            hours: model_typical(ctx, rhythm_tokens, &model, company, cache)
-                .and_then(|typical| usd_hours(100.0 / factor.value, typical)),
-            model,
-        })
-        .collect()
-}
-
-fn model_typical<Tz: TimeZone + Copy>(
-    ctx: &Ctx<Tz>,
-    rhythm_tokens: &[Hosted<TokenRecord>],
-    model: &str,
-    company: Company,
-    cache: &mut BTreeMap<(String, Company), Option<f64>>,
-) -> Option<f64> {
+    cache: &mut BTreeMap<Company, Option<WorkedHour>>,
+) -> Option<WorkedHour> {
     *cache
-        .entry((model.to_string(), company))
-        .or_insert_with(|| {
-            let filtered: Vec<Hosted<TokenRecord>> = rhythm_tokens
-                .iter()
-                .filter(|hosted| hosted.record.model == model)
-                .cloned()
-                .collect();
-            let typical = rhythm_of_company(&filtered, ctx.now, &ctx.zone, ctx.prices, company)
-                .typical_hour();
-            (typical > 0.0).then_some(typical)
-        })
+        .entry(company)
+        .or_insert_with(|| worked_hour(rhythm_tokens, ctx.now, &ctx.zone, ctx.prices, company))
 }
 
-fn company_typical<Tz: TimeZone + Copy>(
-    ctx: &Ctx<Tz>,
-    rhythm_tokens: &[Hosted<TokenRecord>],
-    company: Company,
-    cache: &mut BTreeMap<Company, Option<f64>>,
-) -> Option<f64> {
-    *cache.entry(company).or_insert_with(|| {
-        let typical = rhythm_of_company(rhythm_tokens, ctx.now, &ctx.zone, ctx.prices, company)
-            .typical_hour();
-        (typical > 0.0).then_some(typical)
-    })
+/// What a full limit holds of the owner's actual work: `100 / factor` API
+/// dollars as hours worked and as tokens, at the worked hour's dollars and
+/// tokens (1.4.1).
+fn full_limit(factor: &Factor, hour: WorkedHour) -> (Option<f64>, Option<f64>) {
+    let usd = 100.0 / factor.value;
+    match usd_hours(usd, hour.usd) {
+        Some(hours) => (Some(hours), Some(hours * hour.tokens)),
+        None => (None, None),
+    }
+}
+
+/// Minutes of actual work 1 % of a limit holds: `1 / factor` API dollars at
+/// the worked hour's dollars.
+fn percent_minutes(factor: &Factor, worked: Option<WorkedHour>) -> Option<f64> {
+    worked.and_then(|hour| usd_hours(1.0 / factor.value, hour.usd).map(|hours| 60.0 * hours))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1163,8 +1120,7 @@ fn session_points<Tz: TimeZone + Copy>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn per_percent_row<Tz: TimeZone + Copy>(
-    ctx: &Ctx<Tz>,
+fn per_percent_row(
     subject: &RateAccount,
     id: &str,
     model: &str,
@@ -1174,8 +1130,7 @@ fn per_percent_row<Tz: TimeZone + Copy>(
     factor: &Factor,
     stats: Option<&BTreeMap<String, ModelStat>>,
     company_models: &BTreeMap<Company, BTreeMap<String, ModelStat>>,
-    rhythm_tokens: &[Hosted<TokenRecord>],
-    cache: &mut BTreeMap<(String, Company), Option<f64>>,
+    worked: Option<WorkedHour>,
 ) -> PerPercent {
     PerPercent {
         id: id.to_string(),
@@ -1183,28 +1138,20 @@ fn per_percent_row<Tz: TimeZone + Copy>(
         model: model.to_string(),
         points: points.iter().map(|point| point.point.clone()).collect(),
         change,
-        now: now_of(
-            ctx,
-            subject,
-            stats,
-            company_models,
-            factor.value,
-            rhythm_tokens,
-            cache,
-        ),
+        now: now_of(subject, stats, company_models, factor.value),
+        minutes: percent_minutes(factor, worked),
         // Only the 5 h line holds a window (decision 7 of M-2's fix).
         window_holds_minutes: None,
     }
 }
 
-fn now_of<Tz: TimeZone + Copy>(
-    ctx: &Ctx<Tz>,
+/// The tokens 1 % of a limit buys of each priced model the subscription ran,
+/// the model with the most dollars first.
+fn now_of(
     subject: &RateAccount,
     stats: Option<&BTreeMap<String, ModelStat>>,
     company_models: &BTreeMap<Company, BTreeMap<String, ModelStat>>,
     factor_value: f64,
-    rhythm_tokens: &[Hosted<TokenRecord>],
-    cache: &mut BTreeMap<(String, Company), Option<f64>>,
 ) -> Vec<Now> {
     let Some(stats) = stats else {
         return Vec::new();
@@ -1218,31 +1165,12 @@ fn now_of<Tz: TimeZone + Copy>(
     rows.into_iter()
         .filter_map(|(model, _)| {
             let upt = model_upt(company_models, subject.company, &model)?;
-            let tokens = 1.0 / (factor_value * upt);
-            let minutes = model_typical(ctx, rhythm_tokens, &model, subject.company, cache)
-                .map(|typical| 60.0 * (1.0 / factor_value) / typical);
             Some(Now {
                 model,
-                tokens,
-                minutes,
+                tokens: 1.0 / (factor_value * upt),
             })
         })
         .collect()
-}
-
-fn session_minutes<Tz: TimeZone + Copy>(
-    ctx: &Ctx<Tz>,
-    subject: &RateAccount,
-    rates: &Rates,
-    rhythm_tokens: &[Hosted<TokenRecord>],
-    cache: &mut BTreeMap<Company, Option<f64>>,
-) -> Option<f64> {
-    let session = rates.s?;
-    if subject.company == Company::Ollama {
-        return None;
-    }
-    let typical = company_typical(ctx, rhythm_tokens, subject.company, cache)?;
-    Some(60.0 * (100.0 / session.value) / typical)
 }
 
 fn sizes_of<Tz: TimeZone + Copy>(
@@ -1780,55 +1708,21 @@ mod tests {
         }
     }
 
+    /// A full limit at 0.5 % per dollar is 200 USD; with 50 USD and 2.5M
+    /// tokens an hour worked, that is 4 hours and 10M tokens, and 1 % is 2.4
+    /// minutes (1.4.1).
     #[test]
-    fn a_full_week_holds_100_over_the_factor_in_dollars_per_model() {
-        let tiny = tiny();
-        let ctx = tiny.ctx();
-        let record = TokenRecord {
-            t: utc("2026-11-18T09:00:00Z"),
-            minutes: 60,
-            session: "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34".to_string(),
-            cwd: "/home/sam/projects/atlas".to_string(),
-            project: ProjectKey::Repo("github.com/sam/atlas".to_string()),
-            model: "claude-opus-5-5".to_string(),
-            input: 0,
-            out: 3_000_000,
-            cw: 0,
-            cr: 0,
-            answers: 1,
-            agent_answers: 0,
+    fn a_full_limit_holds_its_dollars_in_hours_worked_and_tokens() {
+        let hour = WorkedHour {
+            usd: 50.0,
+            tokens: 2_500_000.0,
         };
-        let rhythm = vec![Hosted {
-            host: "atlas".to_string(),
-            record,
-        }];
-        let mut stats = BTreeMap::new();
-        stats.insert(
-            "claude-opus-5-5".to_string(),
-            ModelStat {
-                tokens: 3_000_000,
-                usd: 60.0,
-                unpriced: false,
-                mix: [0, 3_000_000, 0, 0],
-            },
-        );
-        let mut cache = BTreeMap::new();
-        let typical =
-            rhythm_of_company(&rhythm, ctx.now, &ctx.zone, ctx.prices, Company::Anthropic)
-                .typical_hour();
-        let models = plan_models(
-            &ctx,
-            &rhythm,
-            Some(&stats),
-            &factor(0.5, 0.4, 0.6, 100.0),
-            Company::Anthropic,
-            &BTreeMap::from([(Company::Anthropic, stats.clone())]),
-            &mut cache,
-        );
-        assert_eq!(models.len(), 1);
-        // 100 % at 0.5 % per dollar is 200 dollars over the model's typical hour.
-        assert!(close(models[0].hours.expect("hours"), 200.0 / typical));
-        assert!(typical > 0.0);
+        let (hours, tokens) = full_limit(&factor(0.5, 0.4, 0.6, 100.0), hour);
+        assert!(close(hours.expect("hours"), 4.0), "{hours:?}");
+        assert!(close(tokens.expect("tokens"), 10_000_000.0), "{tokens:?}");
+        let minutes = percent_minutes(&factor(0.5, 0.4, 0.6, 100.0), Some(hour));
+        assert!(close(minutes.expect("minutes"), 2.4), "{minutes:?}");
+        assert_eq!(percent_minutes(&factor(0.5, 0.4, 0.6, 100.0), None), None);
     }
 
     #[test]
@@ -2500,7 +2394,7 @@ mod tests {
             .find(|row| row.id == ac_id)
             .expect("AC's row");
         assert_eq!(row.missing.as_deref(), Some(NO_FACTOR_REASON));
-        assert!(row.models.is_empty(), "{:?}", row.models);
+        assert_eq!((row.full_hours, row.full_tokens), (None, None));
         assert_eq!(row.basis_hours, None);
         assert_eq!(row.trend, None);
         let week_row = page
@@ -2846,12 +2740,12 @@ mod tests {
 
         let plan = page.plans.first().expect("one plan row");
         assert_eq!(plan.company, Company::Anthropic);
-        assert!(!plan.models.is_empty(), "{:?}", plan.models);
+        assert!(plan.full_hours.is_some_and(|hours| hours > 0.0), "{plan:?}");
         assert!(
-            plan.models.iter().all(|model| model.hours.is_some()),
-            "{:?}",
-            plan.models
+            plan.full_tokens.is_some_and(|tokens| tokens > 0.0),
+            "{plan:?}"
         );
+        assert!(plan.basis_hours.is_some(), "{plan:?}");
         assert_eq!(plan.missing, None);
         assert!(page.totals.partial.is_empty(), "{:?}", page.totals.partial);
         assert_eq!(page.totals.times_paid, page.usage_total.times_paid);

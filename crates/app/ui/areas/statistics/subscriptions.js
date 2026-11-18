@@ -31,6 +31,10 @@ const LIMITS = {
   month: { tab: "Month", phrase: "month" },
 };
 
+// Why a figure in hours of work is missing: no hour of the last 4 weeks holds
+// priced work of the company's models (the Rust page's worked hour).
+const NO_WORKED_HOUR = "no hour with priced work of this company in the last 4 weeks";
+
 function requireObject(value, what) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new Error(`${what} must be an object, not ${JSON.stringify(value)}`);
@@ -340,7 +344,9 @@ function planRowNode(row, env, unmeasured) {
   requireObject(row, "a plan row");
   const id = requireString(row.id, "a plan row's id");
   companyText(row.company);
-  const models = requireArray(row.models, "a plan row's models");
+  const company = requireString(row.company, "a plan row's company");
+  const fullHours = optionalNumber(row.fullHours, "a plan row's fullHours");
+  const fullTokens = optionalNumber(row.fullTokens, "a plan row's fullTokens");
   const basis = optionalNumber(row.basisHours, "a plan row's basisHours");
   const thin = requireBoolean(row.thin, "a plan row's thin");
   const missing = optionalString(row.missing, "a plan row's missing reason");
@@ -354,54 +360,20 @@ function planRowNode(row, env, unmeasured) {
   const work = h("span", { class: "stats-sub-work" });
   if (missing !== null) {
     work.appendChild(h("span", { class: "mf", text: "—", title: missing }));
-  } else if (models.length === 0) {
-    throw new Error(`a plan row ${JSON.stringify(id)} has no models and no missing reason`);
+  } else if ((fullHours === null) !== (fullTokens === null)) {
+    throw new Error(`a plan row ${JSON.stringify(id)} has only one of fullHours and fullTokens`);
+  } else if (fullHours === null) {
+    work.appendChild(h("span", { class: "mf", text: "—", title: NO_WORKED_HOUR }));
   } else {
-    // The card shows the two models that do most work; the rest sit behind
-    // "+N", whose title still names every model and its hours.
-    const parsed = models.map((entry) => {
-      requireObject(entry, "a plan row's model");
-      const model = requireString(entry.model, "a plan row's model id");
-      const hours = optionalNumber(entry.hours, "a plan row's model hours");
-      if (hours !== null && hours < 0) {
-        throw new Error(`a plan row's model hours are negative: ${hours}`);
-      }
-      return { model, hours };
-    });
-    for (const [index, entry] of parsed.slice(0, 2).entries()) {
-      if (index > 0) work.appendChild(document.createTextNode(" · "));
-      work.appendChild(document.createTextNode(`${modelName(entry.model)} `));
-      if (entry.hours === null) {
-        work.appendChild(
-          h("span", {
-            class: "mf",
-            text: "—",
-            title: "no typical hour for this model in the last 4 weeks",
-          })
-        );
-      } else {
-        work.appendChild(h("b", { text: workHoursText(entry.hours) }));
-      }
-    }
-    if (parsed.length > 2) {
-      work.appendChild(document.createTextNode(" · "));
-      work.appendChild(
-        h("span", {
-          class: "stats-plan",
-          text: `+${parsed.length - 2}`,
-          title: parsed
-            .map(
-              (entry) =>
-                `${modelName(entry.model)} ${
-                  entry.hours === null ? "—" : workHoursText(entry.hours)
-                }`
-            )
-            .join(" · "),
-        })
-      );
-    }
+    if (fullHours < 0) throw new Error(`a plan row's fullHours are negative: ${fullHours}`);
+    if (fullTokens < 0) throw new Error(`a plan row's fullTokens are negative: ${fullTokens}`);
+    work.appendChild(h("b", { text: workHoursText(fullHours) }));
+    work.appendChild(document.createTextNode(" of work · "));
+    work.appendChild(h("b", { text: tokens(fullTokens) }));
+    work.appendChild(document.createTextNode(" tokens"));
+    if (company === "ollama") work.appendChild(h("span", { class: "mf", text: " a month" }));
     work.title =
-      "hours of typical work a full limit holds: the tokens a full limit buys ÷ your usual tokens per working hour";
+      "a full limit in hours you actually worked with this company's models over the last 4 weeks, at their average cost, and in tokens at your mix of models";
   }
   line.appendChild(work);
 
@@ -551,7 +523,7 @@ function planSizes(sizes, env, body) {
 function plansCard(plans, sizes, env) {
   const rows = requireArray(plans, "plans");
   const card = h("div", { class: "hcard stats-sub-plans" });
-  card.appendChild(cardHead("What does each plan give me?", "hours of your typical work, measured"));
+  card.appendChild(cardHead("What does each plan give me?", "your actual work, measured"));
   const body = h("div", { class: "stats-sub-plans-body" });
   if (rows.length === 0) {
     body.appendChild(emptyLine("no subscription in this range"));
@@ -560,9 +532,9 @@ function plansCard(plans, sizes, env) {
       h("div", { class: "lr hd stats-sub-plans-row" }, [
         h("span", { text: "Subscription" }),
         h("span", {
-          text: "Typical work a week",
+          text: "A full limit holds",
           title:
-            "an hour of typical work: your usual tokens per working hour, over the range",
+            "an hour of work: an hour of the last 4 weeks with work of this company's models, at their average cost and tokens; Ollama: a month's limit",
         }),
         h("span", { text: "Over the weeks" }),
         h("span", {
@@ -753,26 +725,21 @@ function nowLines(entry, limit, env, panel) {
     requireObject(item, "a per-percent entry's now row");
     const model = requireString(item.model, "a now row's model");
     const value = requireNumber(item.tokens, "a now row's tokens");
-    const minutes = optionalNumber(item.minutes, "a now row's minutes");
-    if (minutes !== null && minutes < 0) throw new Error("a now row's minutes are negative");
-    const line = h("p", { class: "stats-sub-now" });
-    line.appendChild(
-      document.createTextNode(`1 % buys ${modelName(model)} ${tokens(value)} ≈ `)
+    panel.appendChild(
+      h("p", { class: "stats-sub-now", text: `1 % buys ${modelName(model)} ${tokens(value)} tokens` })
     );
-    if (minutes === null) {
-      line.appendChild(
-        h("span", {
-          class: "mf",
-          text: "—",
-          title: "no typical hour for this model in the last 4 weeks",
-        })
-      );
-    } else {
-      line.appendChild(document.createTextNode(durationText(Math.round(minutes * 60))));
-    }
-    line.appendChild(document.createTextNode(" of typical work"));
-    panel.appendChild(line);
   }
+  const minutes = optionalNumber(entry.minutes, "a per-percent entry's minutes");
+  if (minutes !== null && minutes < 0) throw new Error("a per-percent entry's minutes are negative");
+  const worth = h("p", { class: "stats-sub-now" });
+  worth.appendChild(document.createTextNode("1 % ≈ "));
+  worth.appendChild(
+    minutes === null
+      ? h("span", { class: "mf", text: "—", title: NO_WORKED_HOUR })
+      : document.createTextNode(durationText(Math.round(minutes * 60)))
+  );
+  worth.appendChild(document.createTextNode(" of your work"));
+  panel.appendChild(worth);
 
   const holds = optionalNumber(entry.windowHoldsMinutes, "windowHoldsMinutes");
   if (limit === "5h") {
@@ -783,14 +750,14 @@ function nowLines(entry, limit, env, panel) {
         h("span", {
           class: "mf",
           text: "—",
-          title: "no typical hour for this model in the last 4 weeks",
+          title: NO_WORKED_HOUR,
         })
       );
     } else {
       if (holds < 0) throw new Error("windowHoldsMinutes is negative");
       line.appendChild(document.createTextNode(durationText(Math.round(holds * 60))));
     }
-    line.appendChild(document.createTextNode(" of typical work."));
+    line.appendChild(document.createTextNode(" of your work."));
     panel.appendChild(line);
   } else if (holds !== null) {
     throw new Error(`windowHoldsMinutes is set on a ${limit} line; it is only set on 5h lines`);

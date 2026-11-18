@@ -85,6 +85,64 @@ pub(crate) fn rhythm_of_company<Tz: TimeZone + Copy>(
     Rhythm { usd }
 }
 
+/// One company's work per hour you actually worked (1.4.1): the API dollars and
+/// tokens of an average local clock hour that holds work of its models, over
+/// `[now - 4 weeks, now)` and every host. An hour counts once however many
+/// hosts worked in it. Unlike [`rhythm_of_company`], an hour without work
+/// counts nowhere, so a model or a weekday used now and then does not thin the
+/// average out. It filters the records as [`rhythm_of_company`] does: another
+/// company's model, a model without a price and a record without a price are
+/// left out. `None` when no hour holds such work.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct WorkedHour {
+    /// API dollars per worked hour, always above 0.
+    pub usd: f64,
+    /// Tokens (input, output, cache writes and reads) per worked hour.
+    pub tokens: f64,
+}
+
+pub(crate) fn worked_hour<Tz: TimeZone + Copy>(
+    tokens: &[Hosted<TokenRecord>],
+    now: DateTime<Utc>,
+    zone: &Tz,
+    prices: &Prices,
+    company: Company,
+) -> Option<WorkedHour> {
+    let unpriced = unpriced_models(tokens, prices);
+    let mut hours: BTreeSet<DateTime<Utc>> = BTreeSet::new();
+    let mut usd_sum = 0.0;
+    let mut token_sum = 0.0;
+    for hosted in tokens {
+        let record = &hosted.record;
+        if record.t >= now || now.signed_duration_since(record.t) >= Duration::weeks(RHYTHM_WEEKS) {
+            continue;
+        }
+        if Company::of_model(&record.model) != company || unpriced.contains(&record.model) {
+            continue;
+        }
+        let Some(usd) = api_usd(record, prices) else {
+            continue;
+        };
+        let counted = crate::transcripts::Tokens::from(record);
+        usd_sum += usd;
+        token_sum += (counted.input + counted.out + counted.cw + counted.cr) as f64;
+        hours.extend(
+            hour_shares(record, |at| local_hour_start(at, zone))
+                .into_iter()
+                .filter(|(_, share)| *share > 0.0)
+                .map(|(hour, _)| hour),
+        );
+    }
+    if hours.is_empty() || usd_sum <= 0.0 {
+        return None;
+    }
+    let count = hours.len() as f64;
+    Some(WorkedHour {
+        usd: usd_sum / count,
+        tokens: token_sum / count,
+    })
+}
+
 /// Add the work of one record's span to the clock hours it covers, by the share
 /// of the span each one holds. A whole-hour offset leaves it in one hour. The
 /// hour boundaries and the hour-of-week index are the statistics' one rule.
@@ -1328,6 +1386,74 @@ mod tests {
         // Monday 09:30 local is that hour; Tuesday 09:00 local is another one.
         assert!((rhythm.at(utc("2026-11-23T08:30:00Z"), east_one()) - 2.0).abs() < EPS);
         assert!((rhythm.at(utc("2026-11-24T08:00:00Z"), east_one()) - 0.0).abs() < EPS);
+    }
+
+    /// The 1.4.1 fix: work in one of the four weeks only, 20 USD in each of two
+    /// hours. The rhythm spreads it over all four weeks, so its typical hour is
+    /// 20 × 2 / 6 (the newer two weeks weigh 2 of 6) and a full limit looked
+    /// three times as long; the worked hour is the 20 USD the hours held.
+    #[test]
+    fn a_worked_hour_is_not_thinned_by_weeks_without_work() {
+        let tokens = vec![
+            token("atlas", "2026-11-23T08:00:00Z", 20.0),
+            token("atlas", "2026-11-23T09:00:00Z", 20.0),
+        ];
+        let now = utc("2026-11-23T12:00:00Z");
+        let rhythm_hour = rhythm(&tokens, now, &east_one(), &prices()).typical_hour();
+        assert!(
+            (rhythm_hour - 20.0 * 2.0 / 6.0).abs() < 1e-6,
+            "{rhythm_hour}"
+        );
+
+        let hour = worked_hour(&tokens, now, &east_one(), &prices(), Company::Anthropic)
+            .expect("two worked hours");
+        assert!((hour.usd - 20.0).abs() < 1e-6, "{hour:?}");
+        assert!(
+            (hour.tokens - 20.0 * TOKENS_PER_USD).abs() < 1.0,
+            "{hour:?}"
+        );
+    }
+
+    /// Two hosts in the same hour are one hour of work; a record of a model
+    /// without a price, of another company, from the future or older than four
+    /// weeks is left out.
+    #[test]
+    fn a_worked_hour_counts_each_clock_hour_once_and_only_priced_work() {
+        let now = utc("2026-11-23T12:00:00Z");
+        let tokens = vec![
+            token("atlas", "2026-11-23T08:00:00Z", 6.0),
+            token("vega", "2026-11-23T08:00:00Z", 4.0),
+            token_of("claude-new-9", "atlas", "2026-11-23T10:00:00Z", 30.0),
+            token_of("gpt-6-astra", "atlas", "2026-11-23T11:00:00Z", 30.0),
+            token("atlas", "2026-11-23T13:00:00Z", 30.0),
+            token("atlas", "2026-10-25T08:00:00Z", 30.0),
+        ];
+        let hour = worked_hour(&tokens, now, &east_one(), &prices(), Company::Anthropic)
+            .expect("one worked hour");
+        assert!((hour.usd - 10.0).abs() < 1e-6, "{hour:?}");
+        assert!(
+            (hour.tokens - 10.0 * TOKENS_PER_USD).abs() < 1.0,
+            "{hour:?}"
+        );
+    }
+
+    #[test]
+    fn no_worked_hour_without_priced_work() {
+        let now = utc("2026-11-23T12:00:00Z");
+        assert_eq!(
+            worked_hour(&[], now, &east_one(), &prices(), Company::Anthropic),
+            None
+        );
+        let unpriced = vec![token_of(
+            "claude-new-9",
+            "atlas",
+            "2026-11-23T08:00:00Z",
+            3.0,
+        )];
+        assert_eq!(
+            worked_hour(&unpriced, now, &east_one(), &prices(), Company::Anthropic),
+            None
+        );
     }
 
     #[test]

@@ -6,6 +6,18 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-11-18
+
+### Fixed
+
+- Statistics → Subscriptions, "What does each plan give me?": a full limit is now shown as hours of
+  your actual work and as tokens, `52h of work · 3.1B tokens`. An hour of work is an hour of the
+  last 4 weeks that holds work with the company's models, at its average cost and tokens, all models
+  mixed. The per-model hours are gone: they spread a model's work over all four weeks, so a model
+  used in one week only (Ultra: "509h Fable") looked three to four times as long. The split by model
+  is the "Tokens a week" card's. "Based on", "1 % ≈ N min of your work" and "A full 5 h window holds"
+  use the same hours.
+
 ## [1.4.0] - 2026-11-18
 
 ### Added
@@ -594,7 +606,9 @@ All notable changes to this project are documented here. The format follows
   starts later): it says so and shows the icon as soon as a tray appears; `seatswap panel` opens
   the pop-up meanwhile.
 
-[Unreleased]: https://github.com/ymihere/seatswap/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/ymihere/seatswap/compare/v1.4.1...HEAD
+[1.4.1]: https://github.com/ymihere/seatswap/compare/v1.4.0...v1.4.1
+[1.4.0]: https://github.com/ymihere/seatswap/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/ymihere/seatswap/compare/v1.2.2...v1.3.0
 [1.2.2]: https://github.com/ymihere/seatswap/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/ymihere/seatswap/compare/v1.2.0...v1.2.1

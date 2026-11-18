@@ -1649,6 +1649,13 @@ pub fn rhythm<Tz: TimeZone + Copy>(tokens: &[Hosted<TokenRecord>], now: DateTime
                                    zone: &Tz, prices: &Prices) -> Rhythm;
 pub(crate) fn rhythm_of_company<Tz: TimeZone + Copy>(tokens: &[Hosted<TokenRecord>],
     now: DateTime<Utc>, zone: &Tz, prices: &Prices, company: Company) -> Rhythm;
+/// One company's work per hour actually worked (1.4.1): API dollars and tokens of the average
+/// local clock hour of [now - 4 weeks, now) that holds its priced work, on any host (an hour
+/// counts once). Filters as rhythm_of_company; an hour without work counts nowhere. None
+/// without such an hour. The Subscriptions page's hours of work; auto-burn keeps the rhythm.
+pub(crate) struct WorkedHour { pub usd: f64, pub tokens: f64 }
+pub(crate) fn worked_hour<Tz: TimeZone + Copy>(tokens: &[Hosted<TokenRecord>],
+    now: DateTime<Utc>, zone: &Tz, prices: &Prices, company: Company) -> Option<WorkedHour>;
 pub(crate) fn hour_shares(record: &TokenRecord,
     hour_of: impl Fn(DateTime<Utc>) -> DateTime<Utc>) -> Vec<(DateTime<Utc>, f64)>;
 pub fn account_at(events: &[Hosted<Event>], host: &str, t: DateTime<Utc>) -> Option<AccountRef>;
@@ -3695,11 +3702,14 @@ pub struct Totals { pub count: u32, pub price_month: Option<f64>, pub api_month:
     pub partial: Vec<Partial> }
 pub struct Partial { pub id: String, pub weeks: u32 }
 pub struct PlanRow { pub id: String, pub company: Company, pub plan: Option<String>,
-    pub models: Vec<PlanModel>, pub trend: Option<Change>, pub basis_hours: Option<f64>,
+    /// A full limit (Ollama: a month's) as hours of actual work and as tokens: 100 / factor
+    /// API dollars over the company's WorkedHour (1.4.1). None with `missing`, or without a
+    /// worked hour; both or neither.
+    pub full_hours: Option<f64>, pub full_tokens: Option<f64>,
+    pub trend: Option<Change>, pub basis_hours: Option<f64>,  // basis_usd in worked hours
     pub thin: bool,
-    /// Why the row has no models, no basis and no cells; None when it has them.
+    /// Why the row has no figures, no basis and no cells; None when it has them.
     pub missing: Option<String> }
-pub struct PlanModel { pub model: String, pub hours: Option<f64> }
 /// Against the most measured Anthropic plan; `reference` is None when none is measured.
 pub struct Sizes { pub reference: Option<String>, pub rows: Vec<SizeRow> }
 pub struct SizeRow { pub id: String, pub plan: Option<String>,
@@ -3716,10 +3726,12 @@ pub struct UsageRow { pub id: String, pub plan: Option<String>, pub since: Optio
 pub struct EnteredPrice { pub amount: f64, pub currency: Option<String> }
 pub struct PerPercent { pub id: String, pub limit: String, pub model: String,
     pub points: Vec<Point>, pub change: Option<Change>, pub now: Vec<Now>,
-    pub window_holds_minutes: Option<f64> }
+    /// Minutes of actual work 1 % of the limit holds (1 / factor over the worked hour).
+    pub minutes: Option<f64>,
+    pub window_holds_minutes: Option<f64> }  // 5h only: 100 × minutes
 pub struct Point { pub week: DateTime<Utc>, pub tokens: f64, pub low: f64,
     pub high: Option<f64> }
-pub struct Now { pub model: String, pub tokens: f64, pub minutes: Option<f64> }
+pub struct Now { pub model: String, pub tokens: f64 }  // tokens 1 % buys of the model
 pub struct Change { pub model: String, pub since: DateTime<Utc>, pub percent: f64,
     pub before: f64, pub after: f64 }
 pub struct TokensWeek { pub models: Vec<TokenModel>, pub rows: Vec<TokensWeekRow> }

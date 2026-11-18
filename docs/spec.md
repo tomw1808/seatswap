@@ -1929,12 +1929,18 @@ that plan's start.
 
 The four cards:
 
-- **What does each plan give me?** For each subscription and each model it ran in the range, **hours
-  of typical work a full limit holds**: `100 / factor` API dollars divided by the typical-hour dollars
-  of the owner's work with that model (the mean API dollars per working hour with it over the last 4
-  weeks). **Over the weeks** says `steady`, or names a change (`gpt-6-astra 24h → 19h since 19 Oct`)
+- **What does each plan give me?** For each subscription, what a full limit (Ollama: a month's)
+  holds of the owner's actual work: **hours of work** and **tokens**, `100 / factor` API dollars
+  over the **worked hour** of the subscription's company. The worked hour is the average local clock
+  hour of the last 4 weeks that holds priced work of the company's models, on any host (an hour
+  counts once, however many hosts worked in it): its API dollars and its tokens, all of the
+  company's models mixed as the owner used them. An hour without work counts nowhere, so a model or a
+  weekday used now and then does not thin it out (1.4.1; the per-model hours of 1.3 and 1.4 spread
+  a model's work over all four weeks and showed a model used in one week three to four times too
+  long). The split by model is the **Tokens a week** card's. Without a worked hour the cell is `—`
+  titled `no hour with priced work of this company in the last 4 weeks`. **Over the weeks** says `steady`, or names a change (`gpt-6-astra 24h → 19h since 19 Oct`)
   when two consecutive finished weeks (one calendar week apart; a week without a point breaks the
-  run) lie on the same side outside the range of the 8 weeks before (documented rule). **Based on** shows the factor's `basis_usd` as typical hours; the figure is
+  run) lie on the same side outside the range of the 8 weeks before (documented rule). **Based on** shows the factor's `basis_usd` in worked hours; the figure is
   marked `thin` when half its range's width is more than 20 % of its value (documented rule). Below
   it, **Plan sizes, measured**: each plan's week factor against the reference plan — the measured
   Anthropic plan with the largest `basis_usd`, or no reference when none is measured — as
@@ -1954,8 +1960,8 @@ The four cards:
   lines. A change is found by the same two-week rule as above; the sentence above the chart says
   `Since <date>, 1 % of <abbr>'s week buys about N % fewer <model> tokens: A instead of B` and a mark
   shows the week; otherwise it says `Steady. No week left its usual range.` Under it stand the
-  current figures per model as tokens and typical-work minutes; for 5h also how much work a full
-  window holds.
+  tokens 1 % buys of each model, then `1 % ≈ N min of your work` (`1 / factor` API dollars over the
+  worked hour); for 5h also how much work a full window holds, in the same worked hours.
 - **Tokens a week, per subscription and model.** Rows are the subscriptions with a week (Ollama has
   none); columns are the models of those rows' companies seen in the range, priced or not, plus each
   company's other priced models of the same line-up (Opus, Sonnet, Haiku, Fable for Anthropic). A cell is the tokens a full weekly limit holds: `100 / factor` API

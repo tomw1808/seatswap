@@ -33,12 +33,12 @@ const NOT_MEASURED = "not measured yet: no pair with priced work in this range";
 // for Ollama, monthly) window.
 const NO_FINISHED = "no finished week yet in this range";
 
-// The mock-up's typical tokens per hour of work, in millions (data.py TYP).
-const TOKENS_PER_HOUR = {
-  [MODELS.opus]: 5.3e6,
-  [MODELS.sonnet]: 5.6e6,
-  [MODELS.gpt]: 3.1e6,
-  [MODELS.deepseek]: 3.0e6,
+// The mock-up's tokens per hour actually worked with each company's models,
+// all its models mixed (the Rust page's worked hour).
+const TOKENS_PER_WORKED_HOUR = {
+  anthropic: 5.4e6,
+  openai: 3.1e6,
+  ollama: 3.0e6,
 };
 
 // The mock-up's subscriptions: its plans, monthly prices and used percentages
@@ -179,13 +179,20 @@ function idOf(abbr) {
   return rowByAbbr(abbr).company === "anthropic" ? accountId(abbr) : subscriptionId(abbr);
 }
 
-// A model's hours of typical work in a full limit: 100 % × what 1 % buys,
-// divided by the mock-up's usual tokens per working hour. Ollama's month is
-// shown per week, as the mock-up's "a month: 80 h" note does.
-function modelHours(row, model) {
-  const per = row.perPercent[model];
-  const hours = (100 * per) / TOKENS_PER_HOUR[model];
-  return row.abbr === "OL" ? (hours * 12) / 52 : hours;
+// What a full limit holds: 100 % × what 1 % buys of the main model (the
+// first), as tokens and as hours worked at the company's tokens per hour.
+// Ollama's limit is a month.
+function fullLimit(row) {
+  const main = Object.keys(row.perPercent)[0];
+  if (main === undefined || row.missing) return { fullHours: null, fullTokens: null };
+  const fullTokens = 100 * row.perPercent[main];
+  return { fullHours: fullTokens / TOKENS_PER_WORKED_HOUR[row.company], fullTokens };
+}
+
+// Minutes of work 1 % of a limit holds: `tokensPerPercent` at the company's
+// tokens per hour worked.
+function percentMinutes(company, tokensPerPercent) {
+  return round1((tokensPerPercent / TOKENS_PER_WORKED_HOUR[company]) * 60);
 }
 
 function planRows() {
@@ -193,10 +200,7 @@ function planRows() {
     id: idOf(row.abbr),
     company: row.company,
     plan: row.plan,
-    models: Object.keys(row.perPercent).map((model) => ({
-      model,
-      hours: modelHours(row, model),
-    })),
+    ...fullLimit(row),
     trend:
       row.abbr === "AC"
         ? {
@@ -399,13 +403,7 @@ function weekPoints(values, spread) {
 }
 
 function nowRow(model, tokensPerPercent) {
-  return [
-    {
-      model,
-      tokens: Math.round(tokensPerPercent),
-      minutes: round1((tokensPerPercent / TOKENS_PER_HOUR[model]) * 60),
-    },
-  ];
+  return [{ model, tokens: Math.round(tokensPerPercent) }];
 }
 
 function perPercentRows() {
@@ -416,9 +414,9 @@ function perPercentRows() {
   const olMonth = Array(12).fill(2.4);
   const flat = (value, length) => Array(length).fill(value);
 
-  const lbHold = round1(((100 * 0.16e6) / TOKENS_PER_HOUR[MODELS.opus]) * 60);
-  const acHold = round1(((100 * 0.12e6) / TOKENS_PER_HOUR[MODELS.opus]) * 60);
-  const oaHold = round1(((100 * 0.07e6) / TOKENS_PER_HOUR[MODELS.gpt]) * 60);
+  const lbHold = round1(100 * percentMinutes("anthropic", 0.16e6));
+  const acHold = round1(100 * percentMinutes("anthropic", 0.12e6));
+  const oaHold = round1(100 * percentMinutes("openai", 0.07e6));
 
   return [
     {
@@ -427,6 +425,7 @@ function perPercentRows() {
       model: MODELS.opus,
       points: weekPoints(lbWeek, 0.06),
       change: null,
+      minutes: percentMinutes("anthropic", 1.6e6),
       now: [
         ...nowRow(MODELS.opus, 1.6e6),
         ...nowRow(MODELS.sonnet, 2.7e6),
@@ -438,6 +437,7 @@ function perPercentRows() {
       model: MODELS.opus,
       points: weekPoints(flat(0.16, 12), flat(0.01, 12)),
       change: null,
+      minutes: percentMinutes("anthropic", 0.16e6),
       now: nowRow(MODELS.opus, 0.16e6),
       windowHoldsMinutes: lbHold,
     },
@@ -453,6 +453,7 @@ function perPercentRows() {
         before: 1.28e6,
         after: 1.02e6,
       },
+      minutes: percentMinutes("anthropic", 1.02e6),
       now: [
         ...nowRow(MODELS.opus, 1.02e6),
         ...nowRow(MODELS.sonnet, 2.16e6),
@@ -464,6 +465,7 @@ function perPercentRows() {
       model: MODELS.opus,
       points: weekPoints(flat(0.12, 12), flat(0.01, 12)),
       change: null,
+      minutes: percentMinutes("anthropic", 0.12e6),
       now: nowRow(MODELS.opus, 0.12e6),
       windowHoldsMinutes: acHold,
     },
@@ -473,6 +475,7 @@ function perPercentRows() {
       model: MODELS.opus,
       points: weekPoints(prWeek, [0.12, 0.12, 0.12, 0.12, 0.12, 0.12, 0.25]),
       change: null,
+      minutes: percentMinutes("anthropic", 3.2e6),
       now: [
         ...nowRow(MODELS.opus, 3.2e6),
         ...nowRow(MODELS.sonnet, 5.4e6),
@@ -484,6 +487,7 @@ function perPercentRows() {
       model: MODELS.gpt,
       points: weekPoints(oaWeek, 0.03),
       change: null,
+      minutes: percentMinutes("openai", 0.42e6),
       now: nowRow(MODELS.gpt, 0.42e6),
     },
     {
@@ -492,6 +496,7 @@ function perPercentRows() {
       model: MODELS.gpt,
       points: weekPoints(flat(0.07, 12), flat(0.01, 12)),
       change: null,
+      minutes: percentMinutes("openai", 0.07e6),
       now: nowRow(MODELS.gpt, 0.07e6),
       windowHoldsMinutes: oaHold,
     },
@@ -501,6 +506,7 @@ function perPercentRows() {
       model: MODELS.deepseek,
       points: weekPoints(olMonth, 0.02),
       change: null,
+      minutes: percentMinutes("ollama", 2.4e6),
       now: nowRow(MODELS.deepseek, 2.4e6),
     },
   ];
