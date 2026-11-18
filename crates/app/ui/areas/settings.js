@@ -68,7 +68,15 @@ const state = {
   context: null,
   container: null,
   group: "general",
+  // The group the last `renderGroup` drew: a redraw of that group keeps the
+  // body's scroll position; another group starts at the top.
+  drawnGroup: null,
   sub: null,
+  // The item an Accounts address named (a stored account's id or a provider
+  // subscription's `account.acc`), or null outside Accounts. The card looks it
+  // up again in every snapshot it draws, so a snapshot that drops the account
+  // says "No account {id}." and selects nothing.
+  addressItem: null,
   // The account whose chip editor is open, and the row the target marks.
   openEditorId: null,
   selectedId: null,
@@ -233,13 +241,36 @@ export async function render(container, context) {
   const groupChanged = group !== state.group;
   const sameTarget = state.sub === context.sub;
   const openRequest = context.fromOpen === true;
+  // One address form: `settings/accounts?<id>` names a stored account or a
+  // provider subscription. `groupFrom` is the only parser; this looks the item
+  // up in the snapshot the address was opened with.
+  const item =
+    group === "accounts" && typeof parsed.item === "string" && parsed.item !== ""
+      ? parsed.item
+      : null;
+  const target = item === null ? null : accountTarget(snapshot, item);
+  // An address change under Accounts is navigation, not a snapshot: it applies
+  // even while a field has focus, because it names the row to show.
+  const addressChange = group === "accounts" && (!sameTarget || openRequest);
   if (groupChanged) state.confirmRemoveOrgId = null;
   state.sub = context.sub;
-  if (parsed.item && (!sameTarget || openRequest)) {
-    state.selectedId = parsed.item;
-    state.openEditorId = parsed.item;
+  // The address's item is kept for every Accounts redraw; `accountsCard` looks
+  // it up again in the snapshot it draws.
+  state.addressItem = item;
+  // A Claude account opens its chip editor when the address changed or an
+  // `open-area` asked for it; a plain re-render keeps the editor as it is. A
+  // provider subscription is a row of its own and has no chip editor.
+  if (item !== null && (!sameTarget || openRequest)) {
+    state.selectedId = target && target.account ? target.account.id : null;
+    state.openEditorId = target && target.account ? target.account.id : null;
   }
-  if (focusInside(state.container) && group === state.group && state.container === container && !openRequest) {
+  if (
+    focusInside(state.container) &&
+    group === state.group &&
+    state.container === container &&
+    !openRequest &&
+    !addressChange
+  ) {
     // Keep the control (and what was typed) until it is saved on change.
     container.classList.add("settings-fixed");
     state.snapshot = snapshot;
@@ -272,6 +303,14 @@ export async function render(container, context) {
     if (groupChanged || !state.callsLoaded) await loadCallsView();
   }
 
+  // `clear` below builds a new group body, so a full redraw of the group drawn
+  // before reads the old body's scroll here and hands it to `renderGroup`. A
+  // changed group, an address change or an `open-area` request starts at the
+  // top as before.
+  const keptScroll =
+    state.drawnGroup === state.group && !addressChange && !openRequest
+      ? groupScroll(container)
+      : undefined;
   clear(container);
   const right = h("div", { class: "col settings-col" });
   const grid = h("div", { class: "g settings-area" }, [
@@ -285,7 +324,25 @@ export async function render(container, context) {
     right,
   ]);
   container.appendChild(grid);
-  renderGroup(right, state.group);
+  renderGroup(right, state.group, keptScroll);
+  if (addressChange && target) {
+    // A later render can change the group or the address while this one waits
+    // for `loadProjects`: reveal only when the page this render drew is
+    // Accounts and the row's field is still the one the current address names.
+    // A missing row while Accounts is drawn stays an error in
+    // `revealAccountRow`, as before.
+    let currentTarget = null;
+    if (state.group === "accounts") {
+      const current = groupFrom(state.sub);
+      currentTarget =
+        current.group === "accounts" && typeof current.item === "string" && current.item !== ""
+          ? accountTarget(state.snapshot || {}, current.item)
+          : null;
+    }
+    if (currentTarget !== null && currentTarget.field === target.field) {
+      revealAccountRow(target.field);
+    }
+  }
 }
 
 // A snapshot: store it, then redraw the open group from the stored views. No
@@ -338,12 +395,33 @@ function selectGroup(id, right) {
   location.hash = target;
 }
 
-function renderGroup(right, id) {
+// The element whose scrollTop changes when a Settings group's content scrolls:
+// the card's `.settings-body` (the area itself has `overflow: hidden` while
+// `.settings-fixed` is on). Without `top` it reads the position; with one it
+// sets it. One helper for every `renderGroup` caller.
+function groupScroll(right, top) {
+  const body = right.querySelector(".settings-body");
+  if (!body) return 0;
+  if (top === undefined) return body.scrollTop;
+  body.scrollTop = top;
+  return body.scrollTop;
+}
+
+function renderGroup(right, id, keptScroll) {
+  // Read the old body before `clear`: a redraw of the group drawn before keeps
+  // its position, another group starts at the top. `render` hands the position
+  // on because it builds a new body before calling this.
+  let scroll = keptScroll;
+  if (scroll === undefined) {
+    scroll = state.drawnGroup === id ? groupScroll(right) : 0;
+  }
   clear(right);
   state.group = id;
+  state.drawnGroup = id;
   state.right = right;
   if (!GROUPS.some((group) => group.id === id)) {
     right.appendChild(panel("Settings", "", [message("Unknown setting group.")]));
+    groupScroll(right, scroll);
     return;
   }
   if (id === "general") right.appendChild(generalCard());
@@ -354,6 +432,7 @@ function renderGroup(right, id) {
   else if (id === "providers") right.appendChild(providersCard());
   else if (id === "history") right.appendChild(historyCard());
   else right.appendChild(agentsCard());
+  groupScroll(right, scroll);
 }
 
 function section(text) {
@@ -1325,6 +1404,42 @@ function accountRows() {
   return accountsOf(state.snapshot || {});
 }
 
+// The row an Accounts address names: a stored account's `id` or a provider
+// subscription's `account.acc`. The one address form stays `?<item>`
+// (`groupFrom` parses it); null means the snapshot holds neither, so the card
+// says so instead of quietly opening another row.
+function accountTarget(snapshot, item) {
+  const account =
+    accountsOf(snapshot).find((row) => isObject(row) && row.id === item) || null;
+  if (account) return { account, field: `account:${account.id}` };
+  const subscription =
+    providerSubscriptionsOf(snapshot).find(
+      (row) => isObject(row) && isObject(row.account) && row.account.acc === item
+    ) || null;
+  if (subscription) {
+    return {
+      subscription,
+      field: `subscription:${subscription.account.org}:${subscription.account.acc}`,
+    };
+  }
+  return null;
+}
+
+// Bring an address's row into view and put the cursor in its price field. It
+// runs after `renderGroup`, once per address change; a later snapshot redraw
+// does not call it, and `update` keeps out while a field has focus.
+function revealAccountRow(field) {
+  if (!state.right) return;
+  const row = Array.from(state.right.querySelectorAll(".acc-wrap")).find(
+    (node) => node.dataset.field === field
+  );
+  if (!row) throw new Error(`the ${field} row is not on the page`);
+  row.scrollIntoView({ block: "nearest", inline: "nearest" });
+  const price = row.querySelector(".acc-price");
+  if (!price) throw new Error(`the ${field} row has no price field`);
+  price.focus();
+}
+
 // The currency code saved under General: three capital letters, or null when
 // none is set. Without one, a price says its currency is unknown and
 // `amountText` writes "—" instead of a made-up code.
@@ -1359,6 +1474,19 @@ function accountsCard() {
     [h("span", { class: "mf", text: "The ✎ in the pop-up opens this group." })]
   );
   const body = card.querySelector(".settings-body");
+  // The address's item is looked up again in the snapshot this card draws: a
+  // snapshot that dropped it says so above the list; it never falls back to
+  // the first row.
+  const addressTarget =
+    state.addressItem === null ? null : accountTarget(state.snapshot || {}, state.addressItem);
+  if (state.addressItem !== null && addressTarget === null) {
+    body.appendChild(
+      h("div", {
+        class: "row-error",
+        text: `No account ${state.addressItem}.`,
+      })
+    );
+  }
   body.appendChild(
     h("div", { class: "lr hd acc-grid" }, [
       h("span", { text: "Abbr." }),
@@ -3458,6 +3586,7 @@ function importRow() {
 // menu stayed fixed only while this page showed (item 27).
 export function unmount() {
   if (state.container) state.container.classList.remove("settings-fixed");
+  state.drawnGroup = null;
   // The next mount asks the version again, once (R7).
   state.version = null;
   state.versionError = null;

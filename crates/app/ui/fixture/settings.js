@@ -4,7 +4,7 @@
 // `lookup_now`, `save_setting` and the status line's saved settings).
 
 import { clone, isObject } from "../common.js";
-import { DEFAULT_SETTINGS, fixtureOpenProviders } from "../fixture.js";
+import { DEFAULT_SETTINGS, fixtureInvoke, fixtureOpenProviders } from "../fixture.js";
 
 // The history view as the app opened it, plus the saved settings' values when
 // they differ: a restart would use those, as the real command reports.
@@ -99,6 +99,63 @@ function fixtureAccountRef(account) {
   return { acc: account.id, org: `org:${account.orgName || account.id}` };
 }
 
+// At 1280 × 760 the Settings body is 601 px high but the fixture's two
+// organizations fill only 541 px, so the page check could not scroll it to
+// 210 px. A third organization with its own projects makes the list long
+// enough. It is made-up data like the rest of the fixture, and it goes into
+// the same view `projects_edit` changes, so an edit on one of these rows works.
+const FIXTURE_LEDGER_PROJECTS = [
+  ["ledger-site", 34],
+  ["ledger-api", 27],
+  ["ledger-cli", 19],
+  ["ledger-docs", 15],
+  ["ledger-web", 12],
+  ["ledger-infra", 9],
+  ["ledger-mobile", 6],
+  ["ledger-tools", 4],
+];
+
+let fixtureProjectsSeeded = false;
+
+function fixtureSeedProjects(fixture) {
+  if (fixtureProjectsSeeded || !isObject(fixture.projectView)) return;
+  fixtureProjectsSeeded = true;
+  const view = fixture.projectView;
+  if (!Array.isArray(view.projects) || !Array.isArray(view.orgs)) return;
+  if (view.orgs.some((org) => isObject(org) && org.id === "ledger-co")) return;
+  const projects = FIXTURE_LEDGER_PROJECTS.map(([name, sessions]) => ({
+    key: { kind: "repo", id: `github.com/ledger-co/${name}` },
+    name,
+    repo: `github.com/ledger-co/${name}`,
+    org: "ledger-co",
+    joined: [],
+    folders: { atlas: [`~/projects/${name}`] },
+    sessions,
+  }));
+  view.projects.push(...projects);
+  view.orgs.push({
+    id: "ledger-co",
+    name: "ledger-co",
+    accounts: [],
+    projects: projects.length,
+  });
+  // The organization headings show the number of rows below them.
+  for (const org of view.orgs) {
+    org.projects = view.projects.filter((project) => project.org === org.id).length;
+  }
+}
+
+// The bench pushes a snapshot into the window the way the app does: the page
+// listens for the `snapshot` event (common.js `listen`) and redraws in place.
+export async function fixturePushSnapshot() {
+  if (typeof window === "undefined") {
+    throw new Error("a window is needed to push a snapshot");
+  }
+  const snapshot = await fixtureInvoke("get_snapshot", {});
+  window.dispatchEvent(new CustomEvent("snapshot", { detail: snapshot }));
+  return snapshot;
+}
+
 function fixtureIdText(id) {
   if (!isObject(id) || typeof id.id !== "string") return "";
   return typeof id.host === "string" && id.host !== ""
@@ -111,6 +168,7 @@ function fixtureSameRef(first, second) {
 }
 
 export function fixtureProjectView(fixture) {
+  fixtureSeedProjects(fixture);
   return {
     projects: clone(fixture.projectView.projects),
     orgs: fixture.projectView.orgs.map((org) =>
