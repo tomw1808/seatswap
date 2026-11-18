@@ -741,6 +741,23 @@ pub fn autostart_file(xdg_config_home: &Path) -> PathBuf {
     xdg_config_home.join("autostart").join("seatswap.desktop")
 }
 
+/// The Linux menu entry the tray app writes at start
+/// (`$XDG_DATA_HOME/applications/seatswap.desktop`).
+pub fn applications_entry(xdg_data_home: &Path) -> PathBuf {
+    xdg_data_home.join("applications").join("seatswap.desktop")
+}
+
+/// The icon of that menu entry
+/// (`$XDG_DATA_HOME/icons/hicolor/256x256/apps/seatswap.png`).
+pub fn app_icon(xdg_data_home: &Path) -> PathBuf {
+    xdg_data_home
+        .join("icons")
+        .join("hicolor")
+        .join("256x256")
+        .join("apps")
+        .join("seatswap.png")
+}
+
 /// FNV-1a 64 written out by hand, so the socket name stays the same across Rust
 /// versions (unlike `DefaultHasher`).
 fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -1074,6 +1091,18 @@ mod tests {
         assert_eq!(
             autostart_file(Path::new("/home/u/.config")),
             Path::new("/home/u/.config/autostart/seatswap.desktop")
+        );
+    }
+
+    #[test]
+    fn the_menu_entry_and_its_icon_live_in_the_xdg_data_folder() {
+        assert_eq!(
+            applications_entry(Path::new("/home/u/.local/share")),
+            Path::new("/home/u/.local/share/applications/seatswap.desktop")
+        );
+        assert_eq!(
+            app_icon(Path::new("/home/u/.local/share")),
+            Path::new("/home/u/.local/share/icons/hicolor/256x256/apps/seatswap.png")
         );
     }
 

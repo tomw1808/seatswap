@@ -30,6 +30,7 @@ use seatswap_core::switcher::UnsavedPolicy;
 #[cfg(windows)]
 use super::registry;
 use super::worker::{LiveView, Snapshot, Waiting};
+use super::APP_ICON_PNG;
 use crate::burn_text::SwitchSuggestion;
 
 /// What the de-duplicator decided to show.
@@ -424,10 +425,6 @@ fn notify_in_background(job: impl FnOnce() + Send + 'static) {
     }
 }
 
-/// The app icon (crates/app/icons/icon.png, 256 px): the toast image on Windows
-/// and the `image-path` hint on Linux.
-const APP_ICON: &[u8] = include_bytes!("../../icons/icon.png");
-
 /// The file a notification's icon is read from: `<data_dir>/notification-icon.png`,
 /// written when it is missing or holds another picture (a new data folder, one
 /// a cleaner emptied, or the icon of an older seatswap). The path comes from
@@ -436,10 +433,10 @@ const APP_ICON: &[u8] = include_bytes!("../../icons/icon.png");
 /// without an image and the failure is printed.
 fn notification_icon(paths: &AppPaths) -> Result<PathBuf, String> {
     let path = paths.notification_icon();
-    if std::fs::read(&path).is_ok_and(|bytes| bytes == APP_ICON) {
+    if std::fs::read(&path).is_ok_and(|bytes| bytes == APP_ICON_PNG) {
         return Ok(path);
     }
-    seatswap_core::atomic::write_atomic(&path, APP_ICON, seatswap_core::atomic::Access::Shared)
+    seatswap_core::atomic::write_atomic(&path, APP_ICON_PNG, seatswap_core::atomic::Access::Shared)
         .map_err(|error| format!("icon {}: {error}", path.display()))?;
     Ok(path)
 }
@@ -2031,7 +2028,7 @@ mod tests {
         );
         let icon = notification_icon(&paths).expect("the icon is written");
         assert_eq!(icon, paths.notification_icon());
-        assert_eq!(std::fs::read(&icon).expect("the icon file"), APP_ICON);
+        assert_eq!(std::fs::read(&icon).expect("the icon file"), APP_ICON_PNG);
     }
 
     /// A cleaner may delete the icon: the next notification writes it again.
@@ -2043,7 +2040,7 @@ mod tests {
         std::fs::remove_file(&first).expect("the icon is removed");
         let second = notification_icon(&paths).expect("the icon is written again");
         assert_eq!(second, first);
-        assert_eq!(std::fs::read(&second).expect("the icon file"), APP_ICON);
+        assert_eq!(std::fs::read(&second).expect("the icon file"), APP_ICON_PNG);
     }
 
     /// An icon file that holds another picture (an older seatswap's icon) is
@@ -2054,7 +2051,7 @@ mod tests {
         let paths = AppPaths::at(tmp.path());
         std::fs::write(paths.notification_icon(), b"an older icon").expect("an old icon");
         let icon = notification_icon(&paths).expect("the icon is written");
-        assert_eq!(std::fs::read(&icon).expect("the icon file"), APP_ICON);
+        assert_eq!(std::fs::read(&icon).expect("the icon file"), APP_ICON_PNG);
     }
 
     /// A failed write returns an error naming the icon's path, so the

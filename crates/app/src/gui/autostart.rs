@@ -23,11 +23,14 @@ use super::registry;
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AutostartError {
     #[cfg(not(windows))]
-    #[error("cannot find the user config folder: $XDG_CONFIG_HOME and $HOME are not set")]
-    NoConfigHome,
+    #[error("cannot find the user folder: ${variable} and $HOME are not set")]
+    NoXdgHome { variable: &'static str },
     #[cfg(not(windows))]
     #[error("$HOME is empty or not an absolute path: {0:?}")]
     HomeNotAbsolute(OsString),
+    #[cfg(not(windows))]
+    #[error("the desktop entry cannot hold a line break in {value:?}")]
+    LineBreak { value: String },
     #[error("autostart argument {0} is not an absolute path")]
     RelativePath(PathBuf),
     #[cfg(not(windows))]
@@ -58,15 +61,18 @@ pub(crate) enum AutostartError {
     },
 }
 
-/// `$XDG_CONFIG_HOME`, else `~/.config`. Following the XDG spec, a relative
-/// `$XDG_CONFIG_HOME` is ignored; a `$HOME` that is empty or relative is an
-/// error, never quietly replaced.
+/// The XDG folder rule both the autostart entry and the Linux menu entry use:
+/// `$XDG_<kind>_HOME`, else `$HOME/<fallback>`. Following the XDG spec, a
+/// relative or empty `$XDG_<kind>_HOME` is ignored; a `$HOME` that is empty or
+/// relative is an error, never quietly replaced.
 #[cfg(not(windows))]
-pub(crate) fn config_home_from(
-    xdg_config_home: Option<&OsStr>,
+fn xdg_home_from(
+    xdg_home: Option<&OsStr>,
     home: Option<&OsStr>,
+    variable: &'static str,
+    fallback: &[&str],
 ) -> Result<PathBuf, AutostartError> {
-    if let Some(dir) = xdg_config_home {
+    if let Some(dir) = xdg_home {
         if !dir.is_empty() {
             let path = PathBuf::from(dir);
             if path.is_absolute() {
@@ -75,16 +81,38 @@ pub(crate) fn config_home_from(
         }
     }
     let Some(home) = home else {
-        return Err(AutostartError::NoConfigHome);
+        return Err(AutostartError::NoXdgHome { variable });
     };
     if home.is_empty() {
         return Err(AutostartError::HomeNotAbsolute(OsString::new()));
     }
-    let path = PathBuf::from(home);
+    let mut path = PathBuf::from(home);
     if !path.is_absolute() {
         return Err(AutostartError::HomeNotAbsolute(path.into_os_string()));
     }
-    Ok(path.join(".config"))
+    for component in fallback {
+        path.push(component);
+    }
+    Ok(path)
+}
+
+/// `$XDG_CONFIG_HOME`, else `~/.config`.
+#[cfg(not(windows))]
+pub(crate) fn config_home_from(
+    xdg_config_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Result<PathBuf, AutostartError> {
+    xdg_home_from(xdg_config_home, home, "XDG_CONFIG_HOME", &[".config"])
+}
+
+/// `$XDG_DATA_HOME`, else `~/.local/share`: the folder of the Linux menu entry
+/// and its icon.
+#[cfg(not(windows))]
+pub(crate) fn data_home_from(
+    xdg_data_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Result<PathBuf, AutostartError> {
+    xdg_home_from(xdg_data_home, home, "XDG_DATA_HOME", &[".local", "share"])
 }
 
 /// `$XDG_CONFIG_HOME`, else `~/.config` from the process environment.
@@ -92,6 +120,15 @@ pub(crate) fn config_home_from(
 pub(crate) fn config_home() -> Result<PathBuf, AutostartError> {
     config_home_from(
         std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+/// `$XDG_DATA_HOME`, else `~/.local/share` from the process environment.
+#[cfg(not(windows))]
+pub(crate) fn data_home() -> Result<PathBuf, AutostartError> {
+    data_home_from(
+        std::env::var_os("XDG_DATA_HOME").as_deref(),
         std::env::var_os("HOME").as_deref(),
     )
 }
@@ -153,11 +190,26 @@ fn quote_argument(argument: &str) -> String {
     quoted.replace('\\', "\\\\")
 }
 
+/// Refuse text that holds a line break: in a desktop entry it would end the
+/// line and add a key. The value is named in the error.
 #[cfg(not(windows))]
-fn exec_line(exe: &Path, arguments: &[String]) -> Result<String, AutostartError> {
+fn no_line_break(text: &str) -> Result<(), AutostartError> {
+    if text.contains(['\n', '\r']) {
+        return Err(AutostartError::LineBreak {
+            value: text.to_string(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub(crate) fn exec_line(exe: &Path, arguments: &[String]) -> Result<String, AutostartError> {
     let mut parts = Vec::with_capacity(arguments.len() + 1);
-    parts.push(quote_argument(path_text(exe)?));
+    let exe = path_text(exe)?;
+    no_line_break(exe)?;
+    parts.push(quote_argument(exe));
     for argument in arguments {
+        no_line_break(argument)?;
         parts.push(quote_argument(argument));
     }
     Ok(format!("Exec={}", parts.join(" ")))
@@ -497,6 +549,33 @@ mod tests {
         }
 
         #[test]
+        fn exec_line_refuses_a_line_break_in_the_program_or_an_argument() {
+            let exe = Path::new("/opt/seat\nswap");
+            match exec_line(exe, &[]) {
+                Err(AutostartError::LineBreak { value }) => assert_eq!(value, "/opt/seat\nswap"),
+                other => panic!("expected LineBreak for the program, got {other:?}"),
+            }
+            let argument = "/home/u/my\rdata".to_string();
+            match exec_line(Path::new("/opt/seatswap"), std::slice::from_ref(&argument)) {
+                Err(AutostartError::LineBreak { value }) => assert_eq!(value, argument),
+                other => panic!("expected LineBreak for the argument, got {other:?}"),
+            }
+            // The autostart entry gets the same refusal, before it is written.
+            let tmp = tempfile::tempdir().expect("tempdir");
+            assert!(apply(
+                true,
+                Path::new("/opt/seatswap"),
+                tmp.path(),
+                std::slice::from_ref(&argument)
+            )
+            .is_err());
+            assert!(
+                !autostart_file(tmp.path()).exists(),
+                "an entry that cannot hold the argument is not written"
+            );
+        }
+
+        #[test]
         fn the_entry_passes_the_startup_flags() {
             let tmp = tempfile::tempdir().expect("tempdir");
             let arguments = vec![
@@ -539,6 +618,23 @@ mod tests {
             assert!(config_home_from(None, Some(OsStr::new(""))).is_err());
             assert!(config_home_from(None, Some(OsStr::new("relative"))).is_err());
             assert!(config_home_from(Some(OsStr::new("relative")), None).is_err());
+        }
+
+        #[test]
+        fn data_home_follows_the_xdg_rules() {
+            assert_eq!(
+                data_home_from(Some(OsStr::new("/xdg")), Some(OsStr::new("/home/u")))
+                    .expect("absolute xdg"),
+                PathBuf::from("/xdg")
+            );
+            assert_eq!(
+                data_home_from(Some(OsStr::new("relative")), Some(OsStr::new("/home/u")))
+                    .expect("relative xdg ignored"),
+                PathBuf::from("/home/u/.local/share")
+            );
+            assert!(data_home_from(None, Some(OsStr::new(""))).is_err());
+            assert!(data_home_from(None, Some(OsStr::new("relative"))).is_err());
+            assert!(data_home_from(Some(OsStr::new("relative")), None).is_err());
         }
 
         #[test]

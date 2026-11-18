@@ -18,6 +18,8 @@ pub(crate) mod autostart;
 #[cfg(feature = "gui")]
 pub(crate) mod burn_rt;
 #[cfg(feature = "gui")]
+pub(crate) mod desktop_entry;
+#[cfg(feature = "gui")]
 pub(crate) mod lookup_rt;
 #[cfg(feature = "gui")]
 pub(crate) mod notify;
@@ -79,6 +81,11 @@ use worker::SessionsSummary;
 use worker::{
     ActionCommand, ActionReply, EngineCommand, PendingSwitch, PrintedWarnings, Snapshot, UiEvent,
 };
+
+/// The app icon (`crates/app/icons/icon.png`, 256 px), built into the program:
+/// the notifications' image, the window icon and the Linux menu entry's icon.
+#[cfg(feature = "gui")]
+pub(crate) const APP_ICON_PNG: &[u8] = include_bytes!("../../icons/icon.png");
 
 /// Prints and notifies an app error once per text for this run. The snapshot,
 /// the action thread's history failures and the provider thread all report
@@ -466,6 +473,21 @@ fn setup(
         if let Err(error) = autostart::apply_autostart(settings.start_at_login, &autostart_args) {
             startup_errors.push(error);
         }
+    }
+
+    // The Linux menu entry and its icon are written at every start, whatever
+    // `startAtLogin` says. A path that is not seatswap's own is left alone with
+    // one line; a failure is reported and never stops the start.
+    match desktop_entry::apply_at_start(&autostart_args) {
+        Ok(outcome) => {
+            for path in &outcome.left_alone {
+                eprintln!(
+                    "seatswap: {} was not made by seatswap; it is left as it is.",
+                    path.display()
+                );
+            }
+        }
+        Err(error) => startup_errors.push(format!("menu entry: {error}")),
     }
 
     let startup_error = if startup_errors.is_empty() {
@@ -1016,8 +1038,8 @@ mod tests {
         let icon = context
             .default_window_icon()
             .expect("the bundle icon is the default window icon");
-        let app_icon = tauri::image::Image::from_bytes(include_bytes!("../../icons/icon.png"))
-            .expect("the app icon is a PNG");
+        let app_icon =
+            tauri::image::Image::from_bytes(APP_ICON_PNG).expect("the app icon is a PNG");
         assert_eq!((icon.width(), icon.height()), (256, 256));
         assert_eq!(
             icon.rgba(),
