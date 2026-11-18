@@ -29,15 +29,19 @@ pub struct Factor {
     pub measured: bool,
 }
 
-/// The factor of `pairs` with an optional prior (spec R2 of 1.3):
+/// The factor of `pairs` with an optional prior (spec R2 of 1.3, R7 of
+/// `specs/plan-1.4/PLAN.md`):
 ///
 /// - value: `(Σ gain + prior × w) / (Σ usd + w)` with `w` = [`LEARN_MIN_USD`]
-///   while a prior exists, `Σ gain / Σ usd` without one;
-/// - range: `se = sqrt(Σ (gain_i − value · usd_i)² + (prior · w − value · w)²)
-///   / (Σ usd + w)`, `low = max(0, value − 1.2816 · se)`, `high = value +
-///   1.2816 · se`. The prior counts as one more pair `(prior × w, w)` with its
-///   own residual: it widens the range when it disagrees with the pairs, and
-///   without pairs the range is the prior itself;
+///   while the pairs' dollars are below `w` and a prior exists, `Σ gain / Σ usd`
+///   once they reach `w` or without a prior;
+/// - range: while the prior counts, `se = sqrt(Σ (gain_i − value · usd_i)² +
+///   (prior · w − value · w)²) / (Σ usd + w)`, `low = max(0, value − 1.2816 ·
+///   se)`, `high = value + 1.2816 · se`. The prior counts as one more pair
+///   `(prior × w, w)` with its own residual: it widens the range when it
+///   disagrees with the pairs, and without pairs the range is the prior itself.
+///   Once the pairs are measured the prior is ignored completely: value, range
+///   and standard error are computed exactly as with no prior;
 /// - `basis_usd = Σ usd`, `measured = Σ usd ≥ LEARN_MIN_USD`.
 ///
 /// `None` without pairs and without a prior, when the dollars are 0 and there
@@ -47,6 +51,8 @@ pub struct Factor {
 pub fn factor(pairs: &[Pair], prior: Option<f64>) -> Option<Factor> {
     let gain: f64 = pairs.iter().map(|pair| pair.gain).sum();
     let usd: f64 = pairs.iter().map(|pair| pair.usd).sum();
+    let measured = usd >= LEARN_MIN_USD;
+    let prior = if measured { None } else { prior };
     let (prior_gain, weight) = match prior {
         Some(prior) => (prior * LEARN_MIN_USD, LEARN_MIN_USD),
         None => (0.0, 0.0),
@@ -72,7 +78,7 @@ pub fn factor(pairs: &[Pair], prior: Option<f64>) -> Option<Factor> {
         low: (value - Z_80 * se).max(0.0),
         high: value + Z_80 * se,
         basis_usd: usd,
-        measured: usd >= LEARN_MIN_USD,
+        measured,
     })
 }
 
@@ -146,16 +152,47 @@ mod tests {
     }
 
     #[test]
+    fn a_measured_factor_ignores_its_prior() {
+        // 600 USD of own work at 0.15 % per USD: the prior of 0.5 no longer counts,
+        // so the value is 90 / 600 and the range rests on the two pairs alone.
+        let pairs = [
+            Pair {
+                gain: 60.0,
+                usd: 400.0,
+            },
+            Pair {
+                gain: 30.0,
+                usd: 200.0,
+            },
+        ];
+        let factor = factor(&pairs, Some(0.5)).expect("two pairs");
+        assert!((factor.value - 0.15).abs() < EPS, "{}", factor.value);
+        assert!(factor.measured, "600 USD of its own");
+        assert!((factor.basis_usd - 600.0).abs() < EPS);
+        assert_eq!(
+            factor,
+            super::factor(&pairs, None).expect("two pairs"),
+            "the prior is ignored completely"
+        );
+        assert!((factor.low - 0.15).abs() < EPS, "{factor:?}");
+        assert!((factor.high - 0.15).abs() < EPS, "{factor:?}");
+    }
+
+    #[test]
     fn a_prior_weighs_like_100_dollars() {
-        // 100 USD of own work at 0.2 % per USD next to a prior of 0.1: half way.
+        // 40 USD of own work at 0.2 % per USD next to a prior of 0.1: (8 + 10) / 140.
         let own = [Pair {
-            gain: 20.0,
-            usd: 100.0,
+            gain: 8.0,
+            usd: 40.0,
         }];
         let blended = factor(&own, Some(0.1)).expect("a pair and a prior");
-        assert!((blended.value - 0.15).abs() < EPS, "{}", blended.value);
-        assert!(blended.measured, "100 USD of its own");
-        assert!((blended.basis_usd - 100.0).abs() < EPS);
+        assert!(
+            (blended.value - 18.0 / 140.0).abs() < EPS,
+            "{}",
+            blended.value
+        );
+        assert!(!blended.measured, "40 USD is less than 100");
+        assert!((blended.basis_usd - 40.0).abs() < EPS);
 
         // Without pairs the prior is the factor, not measured, with no range.
         let assumed = factor(&[], Some(0.15)).expect("a prior");
@@ -185,23 +222,49 @@ mod tests {
     }
 
     #[test]
+    fn the_prior_stops_at_exactly_learn_min_usd() {
+        // Exactly 100 USD of own work: 10 / 100 is the pairs' own factor, as if
+        // there were no prior, even though a prior of 0.5 would have made 0.3.
+        let pairs = [
+            Pair {
+                gain: 6.0,
+                usd: 60.0,
+            },
+            Pair {
+                gain: 4.0,
+                usd: 40.0,
+            },
+        ];
+        let factor = factor(&pairs, Some(0.5)).expect("two pairs");
+        assert!((factor.value - 0.1).abs() < EPS, "{}", factor.value);
+        assert!(factor.measured, "exactly 100 USD of its own");
+        assert!((factor.basis_usd - 100.0).abs() < EPS);
+        assert_eq!(
+            factor,
+            super::factor(&pairs, None).expect("two pairs"),
+            "no prior in the value"
+        );
+    }
+
+    #[test]
     fn a_prior_that_disagrees_widens_the_range() {
-        // The pair (20, 100) and a prior of 0.1: the value is 0.15, and the
-        // prior's own residual (10 − 15)² is counted beside the pair's (20 −
-        // 15)², so se = sqrt(50) / 200.
+        // The pair (8, 40) and a prior of 0.1: the value is (8 + 10) / 140, and
+        // the prior's own residual (10 − value·100)² is counted beside the
+        // pair's (8 − value·40)², so se = sqrt(50 · 16 / 49) / 140.
         let own = [Pair {
-            gain: 20.0,
-            usd: 100.0,
+            gain: 8.0,
+            usd: 40.0,
         }];
         let factor = factor(&own, Some(0.1)).expect("a pair and a prior");
-        let se = 50.0_f64.sqrt() / 200.0;
-        assert!((factor.value - 0.15).abs() < EPS, "{}", factor.value);
+        let value: f64 = 18.0 / 140.0;
+        let se = ((8.0 - value * 40.0).powi(2) + (10.0 - value * 100.0).powi(2)).sqrt() / 140.0;
+        assert!((factor.value - value).abs() < EPS, "{}", factor.value);
         assert!(
-            (factor.low - (0.15 - 1.2816 * se)).abs() < EPS,
+            (factor.low - (value - 1.2816 * se)).abs() < EPS,
             "{factor:?}"
         );
         assert!(
-            (factor.high - (0.15 + 1.2816 * se)).abs() < EPS,
+            (factor.high - (value + 1.2816 * se)).abs() < EPS,
             "{factor:?}"
         );
         assert!(factor.high - factor.low > 0.0, "{factor:?}");
@@ -222,7 +285,7 @@ mod tests {
         assert!(factor(&falling, None).is_none());
         assert!(
             factor(&falling, Some(0.001)).is_none(),
-            "(−1 + 0.1) / 250 < 0"
+            "150 USD is measured: −1 / 150 < 0"
         );
     }
 }

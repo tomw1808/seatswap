@@ -414,7 +414,9 @@ pub(crate) fn rates_in_with(
 }
 
 /// The factor of an account's own pairs and its prior, when it may be used:
-/// with a prior always, without one only once it is measured.
+/// with a prior while it is not measured, and once it is measured on its own
+/// pairs alone (the prior dropped). A measured factor that is not positive is
+/// unknown, prior or not.
 fn usable(pairs: &[fit::Pair], prior: Option<f64>) -> Option<Factor> {
     fit::factor(pairs, prior).filter(|factor| prior.is_some() || factor.measured)
 }
@@ -2419,9 +2421,8 @@ mod tests {
     fn a_measured_plan_moves_the_assumption_of_the_others() {
         // LB (capacity 20) gained 10 % of its week over 200 USD while live: at
         // capacity 1 that is 10 × 20 / 200 = 1 % per USD, and AC (capacity 5,
-        // never measured) assumes a fifth of it. LB itself has no measured
-        // account beside it, so its prior is the built-in factor over 20,
-        // weighed as 100 USD next to its own 200.
+        // never measured) assumes a fifth of it. LB's own 200 USD are measured,
+        // so its prior is dropped: its factor is 10 / 200.
         let samples = vec![
             sample(
                 "atlas",
@@ -2459,7 +2460,7 @@ mod tests {
         assert!((ac_c.value - 1.0 / 5.0).abs() < EPS, "{ac_c:?}");
         assert!(!ac_c.measured);
         let lb_c = learned.get(&lb()).expect("LB").c;
-        let lb_expected = (10.0 + ASSUMED_WEEK_PERCENT_PER_USD_AT_1X / 20.0 * 100.0) / 300.0;
+        let lb_expected = 10.0 / 200.0;
         assert!((lb_c.value - lb_expected).abs() < EPS, "{lb_c:?}");
         assert!(lb_c.measured);
     }
@@ -2764,9 +2765,9 @@ mod tests {
             "{pr_c:?}"
         );
         assert!(!learned.contains_key(&or()), "no plan peer, no capacity");
-        // LB's own prior is the built-in factor over 5: nobody else is measured.
+        // LB's own 200 USD are measured, so its prior is dropped: 10 / 200.
         let lb_c = learned.get(&lb()).expect("LB").c;
-        let lb_expected = (10.0 + 0.75 / 5.0 * 100.0) / 300.0;
+        let lb_expected = 10.0 / 200.0;
         assert!((lb_c.value - lb_expected).abs() < EPS, "{lb_c:?}");
     }
 

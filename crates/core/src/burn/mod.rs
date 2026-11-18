@@ -17,8 +17,9 @@ pub mod tied;
 use fit::Factor;
 
 /// A factor is measured from this much work of its own, in USD (spec R2 of
-/// 1.3). An assumed factor (the prior) weighs as much as this many dollars of
-/// the account's own measurement.
+/// 1.3). While the account's own work is below it, an assumed factor (the
+/// prior) weighs as much as this many dollars of its own measurement; from it
+/// on the prior is dropped (R7 of 1.4).
 pub const LEARN_MIN_USD: f64 = 100.0;
 /// The assumed weekly percent per API dollar of a plan with capacity 1 (spec
 /// R2 of 1.3, "assumed factor"): a plan of capacity `n` (its tier ends in
