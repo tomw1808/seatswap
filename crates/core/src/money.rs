@@ -40,6 +40,12 @@ const MONEY_VERSION: u32 = 1;
 /// sides and every window it values is read whole.
 const LONGEST_WINDOW_DAYS: i64 = 31;
 
+/// How far a usage reading may lie from a record's span and still book its
+/// work to the reading's account (R4, documented rule): 30 minutes before the
+/// record's start for the last reading, and 30 minutes after its end for the
+/// first.
+const READING_REACH_MINUTES: i64 = 30;
+
 const MICRO: f64 = 1_000_000.0;
 
 #[derive(Debug, thiserror::Error)]
@@ -1093,10 +1099,16 @@ pub struct Valued {
     /// [`Self::subscription_missing`], never 0.
     pub subscription: Option<f64>,
     /// The subscription the record belongs to: the Claude account that was
-    /// live on its host at its time, or the provider subscription its work
-    /// belongs to (decision P-2 2, 4). `None` only for a Claude record without a
-    /// known account, or a provider record whose subscription cannot be named.
+    /// live on its host at its time, or the account taken from the usage
+    /// readings when [`Self::account_from_readings`] is true, or the provider
+    /// subscription its work belongs to (decision P-2 2, 4). `None` only for a
+    /// Claude record without a known account, or a provider record whose
+    /// subscription cannot be named.
     pub account: Option<AccountRef>,
+    /// Whether `account` was taken from the usage readings (R4) rather than
+    /// from a live account on the record's host. A provider record's
+    /// subscription always comes from its own logins, so it is false there.
+    pub account_from_readings: bool,
     /// The company of the record's model ([`Company::of_model`]).
     pub company: Company,
     /// The currency `api` is in: the settings' currency with a rate, "USD"
@@ -1155,6 +1167,16 @@ pub(crate) struct MonthWindow {
 /// and the currency it was entered in (`None` before a currency was set).
 type PriceChanges = BTreeMap<AccountRef, Vec<(DateTime<Utc>, Option<f64>, Option<String>)>>;
 
+/// One stored Anthropic account's usage reading, as R4 reads it: its time and
+/// the `weekly_all` and `session` limits it holds, with percent and reset time.
+/// A limit the reading does not hold is `None`, never a default.
+#[derive(Debug, Clone, Copy)]
+struct Reading {
+    at: DateTime<Utc>,
+    weekly: Option<(f64, Option<DateTime<Utc>>)>,
+    session: Option<(f64, Option<DateTime<Utc>>)>,
+}
+
 /// The value of token records, built once for a range (spec §3.6): the account
 /// of every record, its weekly window, and the window's price at its midpoint.
 pub struct Valuer {
@@ -1167,6 +1189,10 @@ pub struct Valuer {
     /// `providerSwitch` events. A host without a `providerSwitch` uses the one
     /// of them when there is exactly one.
     openai_accounts: BTreeSet<AccountRef>,
+    /// Each stored Anthropic account's readings, sorted by time: R4 books a
+    /// Claude record without a live account from them. A provider
+    /// subscription's readings are never kept here.
+    readings: HashMap<AccountRef, Vec<Reading>>,
     windows: Vec<WeekWindow>,
     /// Each account's windows, by their place in `windows`, in the order they
     /// were added: a lookup reads only the account's own windows.
@@ -1209,6 +1235,112 @@ fn open_window_used(
         from,
     };
     window_used(&record)
+}
+
+/// Whether one limit's percent rose between two readings of one account: both
+/// name the same reset time and the later percent is greater. A different or
+/// missing reset time on either side means a reset may lie between, and a drop
+/// is no rise.
+fn limit_rose(
+    before: Option<(f64, Option<DateTime<Utc>>)>,
+    after: Option<(f64, Option<DateTime<Utc>>)>,
+) -> bool {
+    let (Some((before_percent, Some(before_reset))), Some((after_percent, Some(after_reset)))) =
+        (before, after)
+    else {
+        return false;
+    };
+    same_reset(before_reset, after_reset) && after_percent > before_percent
+}
+
+/// Whether `readings` show the `weekly_all` rise that makes an account X of R4:
+/// its last reading at or before `start` and its first reading at or after
+/// `end` are both within `reach` of that end of the span, both hold a
+/// `weekly_all` limit, and that limit rose between them.
+fn reading_rise(
+    readings: &[Reading],
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    reach: Duration,
+) -> bool {
+    let before = readings.partition_point(|reading| reading.at <= start);
+    let Some(earlier) = before.checked_sub(1).and_then(|index| readings.get(index)) else {
+        return false;
+    };
+    if start - earlier.at > reach {
+        return false;
+    }
+    let after = readings.partition_point(|reading| reading.at < end);
+    let Some(later) = readings.get(after) else {
+        return false;
+    };
+    if later.at - end > reach {
+        return false;
+    }
+    limit_rose(earlier.weekly, later.weekly)
+}
+
+/// Whether a new `session` window began between two readings of one account:
+/// the later reading holds a `session` percent above 0 whose reset time differs
+/// from the earlier reading's beyond [`same_reset`]'s jitter, or whose earlier
+/// reading held no session reset at all (no `session` limit or none with a
+/// reset). A 5-hour session that starts during the span is use even when its
+/// first percent is below the old session's last one. A later reading without a
+/// session reset proves nothing, and a session with a reset equal on both sides
+/// rises only through [`limit_rose`].
+fn session_reset_rose(
+    before: Option<(f64, Option<DateTime<Utc>>)>,
+    after: Option<(f64, Option<DateTime<Utc>>)>,
+) -> bool {
+    let Some((after_percent, after_reset)) = after else {
+        return false;
+    };
+    if after_percent <= 0.0 {
+        return false;
+    }
+    let before_reset = before.and_then(|(_, reset)| reset);
+    match (before_reset, after_reset) {
+        (Some(before), Some(after)) => !same_reset(before, after),
+        (None, Some(_)) => true,
+        _ => false,
+    }
+}
+
+/// Whether `readings` show a rise of `session` or `weekly_all` around
+/// `[start, end]`: of another stored Anthropic account Y of R4. Y's readings
+/// between its last one at or before `start` (taken only when within `reach`)
+/// and its first one at or after `end` (likewise; a side without one within
+/// the reach is the span's own edge) are walked in pairs. A pair rose when a
+/// limit's percent grew between two readings whose reset time is the same, or
+/// (the `session` limit only, R4's other-account rule) when the later reading's
+/// session reset differs from the earlier one's beyond [`same_reset`]'s jitter
+/// or appears where the earlier had none, and the later session percent is
+/// above 0: a new 5-hour session began, so Y was working. X's own rise is
+/// [`reading_rise`]'s stricter `weekly_all` rule. An account with no readings
+/// there did not rise.
+fn rising_around(
+    readings: &[Reading],
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    reach: Duration,
+) -> bool {
+    let before = readings.partition_point(|reading| reading.at <= start);
+    let from = match before.checked_sub(1).and_then(|index| readings.get(index)) {
+        Some(last) if start - last.at <= reach => last.at,
+        _ => start,
+    };
+    let after = readings.partition_point(|reading| reading.at < end);
+    let to = match readings.get(after) {
+        Some(first) if first.at - end <= reach => first.at,
+        _ => end,
+    };
+    let first = readings.partition_point(|reading| reading.at < from);
+    let last = readings.partition_point(|reading| reading.at <= to);
+    readings[first..last].windows(2).any(|pair| {
+        limit_rose(pair[0].weekly, pair[1].weekly)
+            || limit_rose(pair[0].session, pair[1].session)
+            || session_reset_rose(pair[0].session, pair[1].session)
+    })
 }
 
 impl Valuer {
@@ -1314,10 +1446,38 @@ impl Valuer {
             }
         }
 
+        // R4's readings: every stored Anthropic account's samples, sorted by
+        // time, with the two limits the rule reads. A provider subscription
+        // never books work from readings, and a sample of an account that is no
+        // longer stored cannot book any either.
+        let stored_anthropic: BTreeSet<AccountRef> = accounts
+            .iter()
+            .map(AccountRef::of)
+            .filter(AccountRef::is_claude)
+            .collect();
+        let mut readings: HashMap<AccountRef, Vec<Reading>> = HashMap::new();
+        for hosted in &samples.records {
+            let account = &hosted.record.account;
+            if !stored_anthropic.contains(account) {
+                continue;
+            }
+            let limit =
+                |kind: &LimitKind| hosted.record.limit(kind).map(|limit| (limit.p, limit.r));
+            readings.entry(account.clone()).or_default().push(Reading {
+                at: hosted.record.t,
+                weekly: limit(&LimitKind::WeeklyAll),
+                session: limit(&LimitKind::Session),
+            });
+        }
+        for lines in readings.values_mut() {
+            lines.sort_by_key(|reading| reading.at);
+        }
+
         let mut valuer = Valuer {
             timelines: timelines(&events.records),
             provider_timelines,
             openai_accounts,
+            readings,
             windows: Vec::new(),
             account_windows: HashMap::new(),
             window_starts,
@@ -1527,15 +1687,15 @@ impl Valuer {
         }
         let company = Company::of_model(&record.model);
         let (account, kind) = match company {
-            Company::Anthropic => match self
-                .timelines
-                .get(&hosted.host)
-                .and_then(|timeline| timeline.at(record.t))
-                .cloned()
-            {
-                Some(account) => (account, LimitKind::WeeklyAll),
-                None => return,
-            },
+            Company::Anthropic => {
+                // The same account the record's value uses (R4): work booked
+                // from the readings belongs to X's window, so the window's API
+                // sum and its records' values add up.
+                let Some(account) = self.claude_account(&hosted.host, record).0 else {
+                    return;
+                };
+                (account, LimitKind::WeeklyAll)
+            }
             Company::OpenAI => match self.openai_subscription(&hosted.host, record.t) {
                 Ok(account) => (account, LimitKind::WeeklyAll),
                 Err(_) => return,
@@ -1664,6 +1824,67 @@ impl Valuer {
         openai_subscription_at(&self.provider_timelines, &self.openai_accounts, host, t)
     }
 
+    /// The Claude account a record of `host` is booked to (R4), and whether it
+    /// came from the usage readings rather than from a live account.
+    ///
+    /// The documented rule: the live timeline names the account when it has one
+    /// at the record's start. Otherwise the work is booked from the readings
+    /// when exactly one stored Anthropic account X qualifies: X's last reading
+    /// at or before the record's start and its first reading at or after the
+    /// record's end are both at most [`READING_REACH_MINUTES`] away from that
+    /// end of the span, both hold a `weekly_all` limit whose reset time is the
+    /// same, and the later percent is greater. No other stored Anthropic account
+    /// may have risen around the span: among its readings between its last one
+    /// at or before the start and its first one at or after the end (each taken
+    /// only when within the same reach; a side without one is the span's own
+    /// edge), two consecutive readings with the same reset time for `session`
+    /// or `weekly_all` must not show a greater percent, and a later `session`
+    /// reading whose reset differs from the earlier one's or appears where it
+    /// had none, with a percent above 0, is a new session and a rise
+    /// ([`rising_around`]). An account with no reading within the reach did not
+    /// rise. Without exactly one qualifying account, or when another account
+    /// rose (two hosts busy on two accounts, one host not yet recorded), the
+    /// record stays unknown.
+    fn claude_account(&self, host: &str, record: &TokenRecord) -> (Option<AccountRef>, bool) {
+        if let Some(account) = self
+            .timelines
+            .get(host)
+            .and_then(|timeline| timeline.at(record.t))
+        {
+            return (Some(account.clone()), false);
+        }
+        match self.account_from_readings(record) {
+            Some(account) => (Some(account), true),
+            None => (None, false),
+        }
+    }
+
+    /// [`Valuer::claude_account`]'s reading rule, over the readings
+    /// [`Valuer::build`] kept per stored Anthropic account.
+    fn account_from_readings(&self, record: &TokenRecord) -> Option<AccountRef> {
+        let start = record.t;
+        let end = start + record.span();
+        let reach = Duration::minutes(READING_REACH_MINUTES);
+        let mut qualifying: Option<&AccountRef> = None;
+        for (account, readings) in &self.readings {
+            if !reading_rise(readings, start, end, reach) {
+                continue;
+            }
+            // Two accounts' readings rose: the work is not one account's.
+            if qualifying.is_some() {
+                return None;
+            }
+            qualifying = Some(account);
+        }
+        let account = qualifying?;
+        for (other, readings) in &self.readings {
+            if other != account && rising_around(readings, start, end, reach) {
+                return None;
+            }
+        }
+        Some(account.clone())
+    }
+
     /// The dollar rate this valuer was built with: the API column's rate at a
     /// record's day, and at the view's day for a list without records.
     pub fn fx(&self) -> &Fx {
@@ -1678,20 +1899,16 @@ impl Valuer {
     pub fn value(&self, host: &str, record: &TokenRecord) -> Valued {
         let company = Company::of_model(&record.model);
         let mut account_missing = None;
-        let account = match company {
-            Company::Anthropic => self
-                .timelines
-                .get(host)
-                .and_then(|timeline| timeline.at(record.t))
-                .cloned(),
+        let (account, account_from_readings) = match company {
+            Company::Anthropic => self.claude_account(host, record),
             Company::OpenAI => match self.openai_subscription(host, record.t) {
-                Ok(account) => Some(account),
+                Ok(account) => (Some(account), false),
                 Err(missing) => {
                     account_missing = Some(missing);
-                    None
+                    (None, false)
                 }
             },
-            Company::Ollama => Some(ollama_subscription()),
+            Company::Ollama => (Some(ollama_subscription()), false),
         };
         let usd = api_usd(record, &self.prices);
         let (api, api_currency, api_missing) = match usd {
@@ -1742,6 +1959,7 @@ impl Valuer {
             api,
             subscription,
             account,
+            account_from_readings,
             company,
             api_currency,
             api_missing,
@@ -1878,7 +2096,7 @@ pub(crate) mod tests {
     use tempfile::tempdir;
 
     use crate::api::LimitKind;
-    use crate::history::{Source, WindowRecord};
+    use crate::history::{LimitSample, Source, WindowRecord};
     use crate::project::ProjectKey;
     use crate::stats::tests::{append_codex_records, tiny};
 
@@ -1908,6 +2126,20 @@ pub(crate) mod tests {
         AccountRef {
             acc: AC_ACC.to_string(),
             org: AC_ORG.to_string(),
+        }
+    }
+
+    fn lb() -> AccountRef {
+        AccountRef {
+            acc: "3b7d1f04-9c2e-4a61-8d5b-0e7f2a4c9b13".to_string(),
+            org: "c41e6b82-7d3a-4f95-b2c8-5a1d9e3f7b46".to_string(),
+        }
+    }
+
+    fn pr() -> AccountRef {
+        AccountRef {
+            acc: "8e2c5a17-4b9d-4f30-a6e1-2d7b9c0f5a84".to_string(),
+            org: "f0a3d6c9-2e8b-4c71-9b54-7a1e3d6f8c20".to_string(),
         }
     }
 
@@ -1954,20 +2186,25 @@ pub(crate) mod tests {
     }
 
     fn account_with_price(price: Option<f64>) -> Account {
+        stored_account(&ac(), "AC", price)
+    }
+
+    /// A stored account of `account`'s identity, as `accounts.json` holds it.
+    fn stored_account(account: &AccountRef, abbr: &str, price: Option<f64>) -> Account {
         serde_json::from_value(json!({
-            "id": "0b4f6a2c8d1e4f7a9c3b5d7e9f1a2b4c",
-            "accountUuid": AC_ACC,
-            "organizationUuid": AC_ORG,
-            "label": "AC",
-            "abbr": "AC",
+            "id": format!("{}{}", &account.acc[..8], &account.org[..8]),
+            "accountUuid": account.acc,
+            "organizationUuid": account.org,
+            "label": abbr,
+            "abbr": abbr,
             "color": "#3b82f6",
             "email": "sam@example.com",
             "orgName": "Acme",
             "plan": "Team Premium",
             "price": price,
             "oauthAccount": {
-                "accountUuid": AC_ACC,
-                "organizationUuid": AC_ORG,
+                "accountUuid": account.acc,
+                "organizationUuid": account.org,
                 "emailAddress": "sam@example.com"
             },
             "addedAt": "2026-09-01T00:00:00Z",
@@ -2024,6 +2261,38 @@ pub(crate) mod tests {
                 r: Some(end),
                 b: false,
             }],
+        }
+    }
+
+    /// One stored account's reading: its `weekly_all` percent and reset, and a
+    /// `session` percent and reset when `session` is given.
+    fn reading(
+        at: DateTime<Utc>,
+        account: &AccountRef,
+        weekly: (f64, DateTime<Utc>),
+        session: Option<(f64, DateTime<Utc>)>,
+    ) -> Sample {
+        let mut l = vec![LimitSample {
+            k: LimitKind::WeeklyAll,
+            m: None,
+            p: weekly.0,
+            r: Some(weekly.1),
+            b: false,
+        }];
+        if let Some((percent, reset)) = session {
+            l.push(LimitSample {
+                k: LimitKind::Session,
+                m: None,
+                p: percent,
+                r: Some(reset),
+                b: false,
+            });
+        }
+        Sample {
+            t: at,
+            account: account.clone(),
+            src: Source::Poll,
+            l,
         }
     }
 
@@ -2732,6 +3001,636 @@ pub(crate) mod tests {
         history.append(&opus).expect("a token record");
         history.append(&haiku).expect("a token record");
         (history, dir, opus, haiku, prices)
+    }
+
+    /// R4's history: three stored accounts' readings, the first `live` event at
+    /// 10:00 and a 5-minute record 09:25–09:30 on atlas.
+    fn readings_record(samples: Vec<Sample>) -> (HistoryDir, tempfile::TempDir, TokenRecord) {
+        readings_record_on(
+            samples
+                .into_iter()
+                .map(|sample| ("atlas", sample))
+                .collect(),
+            utc("2026-11-14T09:25:00Z"),
+            5,
+        )
+    }
+
+    /// [`readings_record`] with each reading on the host named beside it, and
+    /// the record's start and minutes: one account's readings from two hosts
+    /// are one series.
+    fn readings_record_on(
+        samples: Vec<(&str, Sample)>,
+        start: DateTime<Utc>,
+        minutes: u32,
+    ) -> (HistoryDir, tempfile::TempDir, TokenRecord) {
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        for (host, sample) in &samples {
+            HistoryDir::at(dir.path(), host)
+                .append(sample)
+                .expect("a reading");
+        }
+        history
+            .append(&live(utc("2026-11-14T10:00:00Z"), Some(ac())))
+            .expect("the first live event");
+        history
+            .append(&price_changed(
+                utc("2026-11-06T00:00:00Z"),
+                Some(140.0),
+                Some("EUR"),
+            ))
+            .expect("AC's price");
+        let mut record = token(start, "claude-opus-5-5", 1_000_000, 0, 0, 0);
+        record.minutes = minutes;
+        history.append(&record).expect("a token record");
+        (history, dir, record)
+    }
+
+    fn stored_three() -> [Account; 3] {
+        [
+            stored_account(&ac(), "AC", Some(140.0)),
+            stored_account(&lb(), "LB", None),
+            stored_account(&pr(), "PR", None),
+        ]
+    }
+
+    fn the_valuer(history: &HistoryDir) -> Valuer {
+        Valuer::build(
+            history,
+            &range("2026-11-14T00:00:00Z", "2026-11-15T00:00:00Z"),
+            &priced_prices(utc("2026-01-01T00:00:00Z")),
+            &fx_eur(),
+            &settings_eur(),
+            &stored_three(),
+            &[],
+            &RefCell::new(Vec::new()),
+        )
+        .expect("a valuer")
+    }
+
+    #[test]
+    fn work_before_the_first_live_event_takes_the_account_whose_reading_rose() {
+        let week_end = utc("2026-11-18T10:00:00Z");
+        let session_end = utc("2026-11-14T14:00:00Z");
+        let samples = vec![
+            reading(
+                utc("2026-11-14T09:20:00Z"),
+                &ac(),
+                (41.0, week_end),
+                Some((10.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:50:00Z"),
+                &ac(),
+                (43.0, week_end),
+                Some((20.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:20:00Z"),
+                &lb(),
+                (10.0, week_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:50:00Z"),
+                &lb(),
+                (10.0, week_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:20:00Z"),
+                &pr(),
+                (5.0, week_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:50:00Z"),
+                &pr(),
+                (5.0, week_end),
+                Some((0.0, session_end)),
+            ),
+        ];
+        let (history, _dir, record) = readings_record(samples);
+        let value = the_valuer(&history).value("atlas", &record);
+
+        assert_eq!(value.account, Some(ac()));
+        assert!(value.account_from_readings);
+        assert_eq!(value.api, Some(4.0));
+        // The record is valued as any record of AC: its share of the running
+        // week that AC's readings opened, whose only record it is.
+        assert!(
+            (value.subscription.expect("a value") - 43.0 * percent_value(140.0)).abs() < 1e-9,
+            "{value:?}"
+        );
+    }
+
+    #[test]
+    fn two_accounts_rising_leave_the_work_unknown() {
+        let week_end = utc("2026-11-18T10:00:00Z");
+        let session_end = utc("2026-11-14T14:00:00Z");
+        let samples = vec![
+            reading(
+                utc("2026-11-14T09:20:00Z"),
+                &ac(),
+                (41.0, week_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:50:00Z"),
+                &ac(),
+                (43.0, week_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:20:00Z"),
+                &lb(),
+                (15.0, week_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:50:00Z"),
+                &lb(),
+                (16.0, week_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:20:00Z"),
+                &pr(),
+                (5.0, week_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:50:00Z"),
+                &pr(),
+                (5.0, week_end),
+                Some((0.0, session_end)),
+            ),
+        ];
+        let (history, _dir, record) = readings_record(samples);
+        let value = the_valuer(&history).value("atlas", &record);
+
+        assert_eq!(value.account, None);
+        assert!(!value.account_from_readings);
+        assert_eq!(value.subscription, None);
+        assert_eq!(value.subscription_missing, Some(Missing::NoAccount));
+    }
+
+    #[test]
+    fn readings_more_than_30_minutes_away_leave_the_work_unknown() {
+        let week_end = utc("2026-11-18T10:00:00Z");
+        let session_end = utc("2026-11-14T14:00:00Z");
+        let samples = vec![
+            reading(
+                utc("2026-11-14T08:40:00Z"),
+                &ac(),
+                (41.0, week_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T10:10:00Z"),
+                &ac(),
+                (43.0, week_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:20:00Z"),
+                &lb(),
+                (10.0, week_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:50:00Z"),
+                &lb(),
+                (10.0, week_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:20:00Z"),
+                &pr(),
+                (5.0, week_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:50:00Z"),
+                &pr(),
+                (5.0, week_end),
+                Some((0.0, session_end)),
+            ),
+        ];
+        let (history, _dir, record) = readings_record(samples);
+        let value = the_valuer(&history).value("atlas", &record);
+
+        assert_eq!(value.account, None);
+        assert!(!value.account_from_readings);
+        assert_eq!(value.subscription, None);
+        assert_eq!(value.subscription_missing, Some(Missing::NoAccount));
+    }
+
+    #[test]
+    fn a_reset_between_the_readings_is_no_rise() {
+        let first_end = utc("2026-11-18T10:00:00Z");
+        let second_end = utc("2026-11-19T10:00:00Z");
+        let session_end = utc("2026-11-14T14:00:00Z");
+        let samples = vec![
+            reading(
+                utc("2026-11-14T09:20:00Z"),
+                &ac(),
+                (41.0, first_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:50:00Z"),
+                &ac(),
+                (43.0, second_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:20:00Z"),
+                &lb(),
+                (10.0, first_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:50:00Z"),
+                &lb(),
+                (10.0, first_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:20:00Z"),
+                &pr(),
+                (5.0, first_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:50:00Z"),
+                &pr(),
+                (5.0, first_end),
+                Some((0.0, session_end)),
+            ),
+        ];
+        let (history, _dir, record) = readings_record(samples);
+        let value = the_valuer(&history).value("atlas", &record);
+
+        assert_eq!(value.account, None);
+        assert!(!value.account_from_readings);
+        assert_eq!(value.subscription, None);
+        assert_eq!(value.subscription_missing, Some(Missing::NoAccount));
+    }
+
+    #[test]
+    fn another_accounts_new_session_leaves_the_work_unknown() {
+        let week_end = utc("2026-11-18T10:00:00Z");
+        let old_session_end = utc("2026-11-14T09:00:00Z");
+        let new_session_end = utc("2026-11-14T14:10:00Z");
+        let samples = vec![
+            reading(
+                utc("2026-11-14T09:20:00Z"),
+                &ac(),
+                (41.0, week_end),
+                Some((0.0, new_session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:50:00Z"),
+                &ac(),
+                (43.0, week_end),
+                Some((0.0, new_session_end)),
+            ),
+            // LB starts a new 5-hour session during the span: its session reset
+            // moves from 09:00 to 14:10 and its percent falls from 78 to 2.
+            reading(
+                utc("2026-11-14T09:20:00Z"),
+                &lb(),
+                (10.0, week_end),
+                Some((78.0, old_session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:50:00Z"),
+                &lb(),
+                (10.0, week_end),
+                Some((2.0, new_session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:20:00Z"),
+                &pr(),
+                (5.0, week_end),
+                Some((0.0, new_session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:50:00Z"),
+                &pr(),
+                (5.0, week_end),
+                Some((0.0, new_session_end)),
+            ),
+        ];
+        let (history, _dir, record) = readings_record(samples);
+        let value = the_valuer(&history).value("atlas", &record);
+
+        // AC's week rose, but LB was clearly working in a new session: the
+        // work is not AC's alone.
+        assert_eq!(value.account, None);
+        assert!(!value.account_from_readings);
+        assert_eq!(value.subscription, None);
+        assert_eq!(value.subscription_missing, Some(Missing::NoAccount));
+    }
+
+    #[test]
+    fn another_accounts_first_session_reset_leaves_the_work_unknown() {
+        let week_end = utc("2026-11-18T10:00:00Z");
+        let session_end = utc("2026-11-14T14:10:00Z");
+        let samples = vec![
+            reading(
+                utc("2026-11-14T09:20:00Z"),
+                &ac(),
+                (41.0, week_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:50:00Z"),
+                &ac(),
+                (43.0, week_end),
+                Some((0.0, session_end)),
+            ),
+            // LB's earlier reading has no `session` limit; the later one has
+            // one with a reset and a percent above 0: a session appeared.
+            reading(utc("2026-11-14T09:20:00Z"), &lb(), (10.0, week_end), None),
+            reading(
+                utc("2026-11-14T09:50:00Z"),
+                &lb(),
+                (10.0, week_end),
+                Some((5.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:20:00Z"),
+                &pr(),
+                (5.0, week_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:50:00Z"),
+                &pr(),
+                (5.0, week_end),
+                Some((0.0, session_end)),
+            ),
+        ];
+        let (history, _dir, record) = readings_record(samples);
+        let value = the_valuer(&history).value("atlas", &record);
+
+        assert_eq!(value.account, None);
+        assert!(!value.account_from_readings);
+        assert_eq!(value.subscription, None);
+        assert_eq!(value.subscription_missing, Some(Missing::NoAccount));
+    }
+
+    #[test]
+    fn a_reading_exactly_30_minutes_away_counts() {
+        let week_end = utc("2026-11-18T10:00:00Z");
+        let session_end = utc("2026-11-14T14:00:00Z");
+        let samples = vec![
+            reading(
+                utc("2026-11-14T08:55:00Z"),
+                &ac(),
+                (41.0, week_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T10:00:00Z"),
+                &ac(),
+                (43.0, week_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:20:00Z"),
+                &lb(),
+                (10.0, week_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:50:00Z"),
+                &lb(),
+                (10.0, week_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:20:00Z"),
+                &pr(),
+                (5.0, week_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:50:00Z"),
+                &pr(),
+                (5.0, week_end),
+                Some((0.0, session_end)),
+            ),
+        ];
+        let (history, _dir, record) = readings_record(samples);
+        let value = the_valuer(&history).value("atlas", &record);
+
+        // 08:55 is exactly 30 minutes before the 09:25 start and 10:00 exactly
+        // 30 minutes after the 09:30 end: both are within the reach.
+        assert_eq!(value.account, Some(ac()));
+        assert!(value.account_from_readings);
+        assert!(value.subscription.is_some());
+    }
+
+    #[test]
+    fn a_reading_30_minutes_and_a_second_away_does_not_count() {
+        let week_end = utc("2026-11-18T10:00:00Z");
+        let session_end = utc("2026-11-14T14:00:00Z");
+        let samples = vec![
+            // 08:54:59 is 30 minutes and one second before the 09:25 start.
+            reading(
+                utc("2026-11-14T08:54:59Z"),
+                &ac(),
+                (41.0, week_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T10:00:00Z"),
+                &ac(),
+                (43.0, week_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:20:00Z"),
+                &lb(),
+                (10.0, week_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:50:00Z"),
+                &lb(),
+                (10.0, week_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:20:00Z"),
+                &pr(),
+                (5.0, week_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:50:00Z"),
+                &pr(),
+                (5.0, week_end),
+                Some((0.0, session_end)),
+            ),
+        ];
+        let (history, _dir, record) = readings_record(samples);
+        let value = the_valuer(&history).value("atlas", &record);
+
+        assert_eq!(value.account, None);
+        assert!(!value.account_from_readings);
+        assert_eq!(value.subscription, None);
+        assert_eq!(value.subscription_missing, Some(Missing::NoAccount));
+    }
+
+    #[test]
+    fn readings_of_one_account_from_two_hosts_are_one_series() {
+        let week_end = utc("2026-11-18T10:00:00Z");
+        let session_end = utc("2026-11-14T14:00:00Z");
+        let samples = vec![
+            (
+                "atlas",
+                reading(
+                    utc("2026-11-14T09:05:00Z"),
+                    &ac(),
+                    (41.0, week_end),
+                    Some((0.0, session_end)),
+                ),
+            ),
+            (
+                "vega",
+                reading(
+                    utc("2026-11-14T09:12:00Z"),
+                    &ac(),
+                    (41.0, week_end),
+                    Some((0.0, session_end)),
+                ),
+            ),
+            (
+                "atlas",
+                reading(
+                    utc("2026-11-14T09:20:00Z"),
+                    &lb(),
+                    (10.0, week_end),
+                    Some((0.0, session_end)),
+                ),
+            ),
+            (
+                "atlas",
+                reading(
+                    utc("2026-11-14T09:50:00Z"),
+                    &lb(),
+                    (10.0, week_end),
+                    Some((0.0, session_end)),
+                ),
+            ),
+            (
+                "atlas",
+                reading(
+                    utc("2026-11-14T09:20:00Z"),
+                    &pr(),
+                    (5.0, week_end),
+                    Some((0.0, session_end)),
+                ),
+            ),
+            (
+                "atlas",
+                reading(
+                    utc("2026-11-14T09:50:00Z"),
+                    &pr(),
+                    (5.0, week_end),
+                    Some((0.0, session_end)),
+                ),
+            ),
+            (
+                "vega",
+                reading(
+                    utc("2026-11-14T09:40:00Z"),
+                    &ac(),
+                    (43.0, week_end),
+                    Some((0.0, session_end)),
+                ),
+            ),
+            (
+                "atlas",
+                reading(
+                    utc("2026-11-14T09:47:00Z"),
+                    &ac(),
+                    (43.0, week_end),
+                    Some((0.0, session_end)),
+                ),
+            ),
+        ];
+        let (history, dir, record) = readings_record_on(samples, utc("2026-11-14T09:15:00Z"), 15);
+        fs::write(
+            dir.path().join("vega/host.json"),
+            "{\"machineId\":\"0b4e7c22-6a1d-4e3f-8c59-2d7a9e1b4f60\"}",
+        )
+        .expect("the other host's marker");
+
+        let value = the_valuer(&history).value("atlas", &record);
+
+        assert_eq!(value.account, Some(ac()));
+        assert!(value.account_from_readings);
+    }
+
+    #[test]
+    fn work_after_a_logout_takes_the_account_whose_reading_rose() {
+        let week_end = utc("2026-11-18T10:00:00Z");
+        let session_end = utc("2026-11-14T14:00:00Z");
+        let samples = vec![
+            reading(
+                utc("2026-11-14T09:20:00Z"),
+                &ac(),
+                (41.0, week_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:50:00Z"),
+                &ac(),
+                (43.0, week_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:20:00Z"),
+                &lb(),
+                (10.0, week_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:50:00Z"),
+                &lb(),
+                (10.0, week_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:20:00Z"),
+                &pr(),
+                (5.0, week_end),
+                Some((0.0, session_end)),
+            ),
+            reading(
+                utc("2026-11-14T09:50:00Z"),
+                &pr(),
+                (5.0, week_end),
+                Some((0.0, session_end)),
+            ),
+        ];
+        let (history, _dir, record) = readings_record(samples);
+        history
+            .append(&live(utc("2026-11-14T09:00:00Z"), None))
+            .expect("the host logged out");
+
+        let value = the_valuer(&history).value("atlas", &record);
+
+        // The host was logged out at 09:25, but AC's reading rose: work after
+        // the logout is AC's.
+        assert_eq!(value.account, Some(ac()));
+        assert!(value.account_from_readings);
     }
 
     #[test]

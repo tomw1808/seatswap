@@ -1408,6 +1408,57 @@ mod tests {
         assert!((s.value - 0.8).abs() < EPS, "{s:?}");
     }
 
+    #[test]
+    fn rates_ignore_accounts_from_readings() {
+        // AC's readings rise 41 → 43 between 09:20 and 09:50, and a 5-minute
+        // record 09:25–09:30 lies before the first `live` event at 10:00: R4
+        // books it to AC in the valuer. Auto-burn's rates learn AC's factor
+        // from its live pairs only, 4 % over the 100 USD of 10:00–11:00; a rate
+        // that counted the record from the readings would pool 6 % over 200 USD.
+        let samples = vec![
+            sample(
+                "atlas",
+                "2026-11-14T09:20:00Z",
+                ac(),
+                vec![weekly(41.0, WEEK_RESET)],
+            ),
+            sample(
+                "atlas",
+                "2026-11-14T09:50:00Z",
+                ac(),
+                vec![weekly(43.0, WEEK_RESET)],
+            ),
+            sample(
+                "atlas",
+                "2026-11-14T10:00:00Z",
+                ac(),
+                vec![weekly(43.0, WEEK_RESET)],
+            ),
+            sample(
+                "atlas",
+                "2026-11-14T11:00:00Z",
+                ac(),
+                vec![weekly(47.0, WEEK_RESET)],
+            ),
+        ];
+        let tokens = vec![
+            five_minute_token("atlas", "2026-11-14T09:25:00Z", 100.0),
+            token("atlas", "2026-11-14T10:00:00Z", 100.0),
+        ];
+        let events = vec![live("atlas", "2026-11-14T10:00:00Z", Some(ac()))];
+        let rates = rates_of(
+            &ac(),
+            &samples,
+            &tokens,
+            &events,
+            utc("2026-11-14T12:00:00Z"),
+        )
+        .expect("100 USD is enough work");
+
+        assert!((rates.c.value - 0.04).abs() < EPS, "{:?}", rates.c);
+        assert!((rates.c.basis_usd - 100.0).abs() < EPS, "{:?}", rates.c);
+    }
+
     /// The same line as [`token`], but one 5-minute bucket long.
     fn five_minute_token(host: &str, at: &str, usd: f64) -> Hosted<TokenRecord> {
         let mut hosted = token(host, at, usd);
