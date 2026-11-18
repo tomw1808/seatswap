@@ -117,29 +117,96 @@ const FIXTURE_LEDGER_PROJECTS = [
 
 let fixtureProjectsSeeded = false;
 
+// A made-up token count of all time for a project; the multiplier leaves the
+// smaller projects below a million, so the page's lighter spelling shows.
+function fixtureProjectTokens(project) {
+  const sessions = Number.isFinite(project.sessions) ? project.sessions : 0;
+  const key = isObject(project.key) ? String(project.key.id || "") : "";
+  let hash = 0;
+  for (const char of key) hash = (hash * 31 + char.codePointAt(0)) % 100003;
+  return Math.round(sessions * 42000 + (hash % 7000) * 3);
+}
+
+function fixtureTokensOf(project) {
+  if (
+    typeof project.tokens !== "number" ||
+    !Number.isFinite(project.tokens) ||
+    project.tokens < 0
+  ) {
+    throw new Error(`the fixture project ${project.name} has no token count`);
+  }
+  return project.tokens;
+}
+
+function fixtureSessionsOf(project) {
+  if (!Number.isInteger(project.sessions) || project.sessions < 0) {
+    throw new Error(`the fixture project ${project.name} has no session count`);
+  }
+  return project.sessions;
+}
+
 function fixtureSeedProjects(fixture) {
   if (fixtureProjectsSeeded || !isObject(fixture.projectView)) return;
   fixtureProjectsSeeded = true;
   const view = fixture.projectView;
   if (!Array.isArray(view.projects) || !Array.isArray(view.orgs)) return;
-  if (view.orgs.some((org) => isObject(org) && org.id === "ledger-co")) return;
-  const projects = FIXTURE_LEDGER_PROJECTS.map(([name, sessions]) => ({
-    key: { kind: "repo", id: `github.com/ledger-co/${name}` },
-    name,
-    repo: `github.com/ledger-co/${name}`,
-    org: "ledger-co",
-    joined: [],
-    folders: { atlas: [`~/projects/${name}`] },
-    sessions,
-  }));
-  view.projects.push(...projects);
-  view.orgs.push({
-    id: "ledger-co",
-    name: "ledger-co",
-    accounts: [],
-    projects: projects.length,
-  });
-  // The organization headings show the number of rows below them.
+  if (!view.orgs.some((org) => isObject(org) && org.id === "ledger-co")) {
+    const projects = FIXTURE_LEDGER_PROJECTS.map(([name, sessions]) => ({
+      key: { kind: "repo", id: `github.com/ledger-co/${name}` },
+      name,
+      repo: `github.com/ledger-co/${name}`,
+      org: "ledger-co",
+      joined: [],
+      folders: { atlas: [`~/projects/${name}`] },
+      sessions,
+    }));
+    view.projects.push(...projects);
+    view.orgs.push({
+      id: "ledger-co",
+      name: "ledger-co",
+      accounts: [],
+      projects: projects.length,
+    });
+    // A repository whose owner no longer has a project: the owner stays an
+    // organization, empty, and cannot be removed.
+    view.projects.push({
+      key: { kind: "repo", id: "github.com/acme-research/notes" },
+      name: "notes",
+      repo: "github.com/acme-research/notes",
+      org: "acme",
+      joined: [],
+      folders: { atlas: ["~/projects/notes"] },
+      sessions: 9,
+    });
+    view.orgs.push({
+      id: "acme-research",
+      name: "acme-research",
+      accounts: [],
+      projects: 0,
+    });
+    // One organization from an account's login: LB's stored login names it,
+    // and no repository owner does.
+    const labAccount = (fixture.accounts || []).find(
+      (account) => isObject(account) && account.abbr === "LB"
+    );
+    if (!labAccount) {
+      throw new Error("the fixture has no LB account for the login organization");
+    }
+    labAccount.orgName = "lab";
+    for (const org of view.orgs) {
+      if (!Array.isArray(org.accounts)) org.accounts = [];
+      org.accounts = org.accounts.filter((ref) => ref.acc !== labAccount.id);
+    }
+    view.orgs.push({
+      id: "lab",
+      name: "lab",
+      accounts: [fixtureAccountRef(labAccount)],
+      projects: 0,
+    });
+  }
+  for (const project of view.projects) {
+    if (!Number.isFinite(project.tokens)) project.tokens = fixtureProjectTokens(project);
+  }
   for (const org of view.orgs) {
     org.projects = view.projects.filter((project) => project.org === org.id).length;
   }
@@ -167,15 +234,113 @@ function fixtureSameRef(first, second) {
   return Boolean(first && second && first.acc === second.acc && first.org === second.org);
 }
 
+// The organizations merged into this one, directly and through another
+// merged organization. A merge never changes a project's own organization; it
+// resolves to the target here, as the core's joins do.
+function fixtureMergedOrgs(view, rootId) {
+  const merged = [];
+  const seen = new Set([rootId.toLowerCase()]);
+  const visit = (id) => {
+    for (const org of view.orgs) {
+      if (typeof org.mergedInto !== "string") continue;
+      if (!fixtureOrganizationNamesMatch(org.mergedInto, id)) continue;
+      const key = org.id.toLowerCase();
+      if (seen.has(key)) {
+        throw new Error(
+          `the organizations ${rootId} and ${org.id} are merged into each other`
+        );
+      }
+      seen.add(key);
+      merged.push(org);
+      visit(org.id);
+    }
+  };
+  visit(rootId);
+  return merged;
+}
+
+function fixtureOwnerRepositoriesFor(projects, ids) {
+  const found = new Set();
+  for (const id of ids) {
+    for (const repo of fixtureOwnerRepositories(projects, id)) found.add(repo);
+  }
+  return [...found].sort();
+}
+
+// The same precedence as core::projects' `source_of`: a repository owner, else
+// an account's login, else an edit made here.
+function fixtureOrgSource(fixture, projects, org) {
+  if (fixtureOwnerRepositories(projects, org.id).length > 0) return "owner";
+  const fromLogin = (fixture.accounts || []).some(
+    (account) =>
+      typeof account.orgName === "string" &&
+      fixtureOrganizationNamesMatch(account.orgName, org.id)
+  );
+  return fromLogin ? "login" : "added";
+}
+
+function fixtureOrgView(fixture, view, projects, org) {
+  const mergedOrgs = fixtureMergedOrgs(view, org.id);
+  const ids = [org.id, ...mergedOrgs.map((entry) => entry.id)];
+  const own = projects.filter(
+    (project) =>
+      typeof project.org === "string" &&
+      ids.some((id) => fixtureOrganizationNamesMatch(project.org, id))
+  );
+  const accounts = [];
+  for (const entry of [org, ...mergedOrgs]) {
+    const refs = Array.isArray(entry.accounts) ? entry.accounts : [];
+    for (const ref of refs) {
+      if (!accounts.some((other) => fixtureSameRef(other, ref))) accounts.push(clone(ref));
+    }
+  }
+  const tokens = own.reduce((total, project) => total + fixtureTokensOf(project), 0);
+  const sessions = own.reduce((total, project) => total + fixtureSessionsOf(project), 0);
+  const merged = mergedOrgs
+    .map((entry) => ({
+      id: entry.id,
+      name: entry.name,
+      source: fixtureOrgSource(fixture, projects, entry),
+    }))
+    .sort(
+      (first, second) =>
+        first.name.localeCompare(second.name) || first.id.localeCompare(second.id)
+    );
+  return {
+    id: org.id,
+    name: org.name,
+    accounts,
+    projects: own.length,
+    ownerRepositories: fixtureOwnerRepositoriesFor(projects, ids),
+    source: fixtureOrgSource(fixture, projects, org),
+    merged,
+    empty: own.length === 0 && accounts.length === 0,
+    tokens,
+    sessions,
+  };
+}
+
 export function fixtureProjectView(fixture) {
   fixtureSeedProjects(fixture);
+  const view = fixture.projectView;
+  if (!Array.isArray(view.projects) || !Array.isArray(view.orgs)) {
+    throw new Error("the fixture's project view has no project or organization list");
+  }
+  const projects = clone(view.projects);
+  for (const project of projects) {
+    fixtureTokensOf(project);
+    fixtureSessionsOf(project);
+  }
+  const orgs = view.orgs
+    .filter((org) => !org.mergedInto)
+    .map((org) => fixtureOrgView(fixture, view, projects, org))
+    .sort(
+      (first, second) =>
+        first.name.localeCompare(second.name) || first.id.localeCompare(second.id)
+    );
   return {
-    projects: clone(fixture.projectView.projects),
-    orgs: fixture.projectView.orgs.map((org) =>
-      Object.assign(clone(org), {
-        ownerRepositories: fixtureOwnerRepositories(fixture.projectView.projects, org.id),
-      })
-    ),
+    projects,
+    orgs,
     accountRefs: fixture.accounts.map((account) => ({
       id: account.id,
       account: fixtureAccountRef(account),
@@ -257,6 +422,7 @@ export function fixtureEditProject(fixture, edit) {
         for (const cwd of list) if (!folders.includes(cwd)) folders.push(cwd);
       }
       into.sessions = (Number(into.sessions) || 0) + (Number(from.sessions) || 0);
+      into.tokens = fixtureTokensOf(into) + fixtureTokensOf(from);
       into.joined = [...(into.joined || []), { key: clone(from.key), name: from.name }];
       view.projects = view.projects.filter((project) => project !== from);
       break;
@@ -277,6 +443,7 @@ export function fixtureEditProject(fixture, edit) {
           joined: [],
           folders: {},
           sessions: 0,
+          tokens: 0,
         });
         break;
       }
@@ -296,17 +463,31 @@ export function fixtureEditProject(fixture, edit) {
     case "orgJoin": {
       const org = fixtureCheckIdentity(edit.org);
       const into = fixtureCheckIdentity(edit.into);
-      if (org === into) throw new Error("an organization cannot be joined into itself");
+      if (fixtureOrganizationNamesMatch(org, into)) {
+        throw new Error("an organization cannot be joined into itself");
+      }
       const source = fixtureFindOrg(view.orgs, org);
       const target = fixtureFindOrg(view.orgs, into);
       if (!source || !target) throw new Error("unknown organization");
-      for (const account of source.accounts || []) {
-        if (!target.accounts.some((entry) => fixtureSameRef(entry, account))) {
-          target.accounts.push(account);
-        }
+      if (typeof source.mergedInto === "string") {
+        throw new Error(`the organization ${org} is already merged into ${source.mergedInto}`);
       }
-      for (const project of view.projects) if (project.org === org) project.org = into;
-      view.orgs = view.orgs.filter((entry) => entry !== source);
+      if (typeof target.mergedInto === "string") {
+        throw new Error(`the organization ${into} is merged into ${target.mergedInto}`);
+      }
+      // The source leaves the headings and is named under its target. Its
+      // projects keep their own organization, so a later split-off gives them
+      // back; a project assigned by hand in between keeps the new one.
+      source.mergedInto = target.id;
+      break;
+    }
+    case "orgUnjoin": {
+      const id = fixtureCheckIdentity(edit.org);
+      const org = fixtureFindOrg(view.orgs, id);
+      if (!org || typeof org.mergedInto !== "string") {
+        throw new Error(`the organization ${id} is not merged into another`);
+      }
+      delete org.mergedInto;
       break;
     }
     case "accountOrg": {
@@ -358,9 +539,6 @@ export function fixtureEditProject(fixture, edit) {
     }
     default:
       throw new Error(`unknown project edit ${String(edit.edit)}`);
-  }
-  for (const org of view.orgs) {
-    org.projects = view.projects.filter((project) => project.org === org.id).length;
   }
 }
 

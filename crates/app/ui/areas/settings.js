@@ -26,6 +26,7 @@ import {
   providerName,
   selectInput,
   shortPercent,
+  showTokens,
   switchControl,
   textInput,
 } from "../common.js";
@@ -85,6 +86,10 @@ const state = {
   // `saved:<org>:<acc>`, or null.
   confirmSavedLoginId: null,
   confirmRemoveOrgId: null,
+  // The organization edit waiting for its confirmation: `{ kind: "orgJoin",
+  // org, orgName, into, intoName }` or `{ kind: "orgUnjoin", org, orgName }`.
+  // One field for both kinds, so no confirm outlives the one under it.
+  confirmOrgEdit: null,
   right: null,
   errors: Object.create(null),
   // "seatswap <version>" above the Money section: the command is asked once
@@ -252,7 +257,10 @@ export async function render(container, context) {
   // An address change under Accounts is navigation, not a snapshot: it applies
   // even while a field has focus, because it names the row to show.
   const addressChange = group === "accounts" && (!sameTarget || openRequest);
-  if (groupChanged) state.confirmRemoveOrgId = null;
+  if (groupChanged) {
+    state.confirmRemoveOrgId = null;
+    state.confirmOrgEdit = null;
+  }
   state.sub = context.sub;
   // The address's item is kept for every Accounts redraw; `accountsCard` looks
   // it up again in the snapshot it draws.
@@ -385,6 +393,7 @@ function selectGroup(id, right) {
   state.selectedId = null;
   state.confirmRemoveId = null;
   state.confirmRemoveOrgId = null;
+  state.confirmOrgEdit = null;
   state.confirmSavedLoginId = null;
   const target = `settings/${id}`;
   if (location.hash.slice(1) === target) {
@@ -2272,10 +2281,105 @@ function foldersText(folders) {
   return parts.length > 0 ? parts.join(" · ") : "—";
 }
 
+// Where an organization's identity came from (spec §11.6): the words the
+// mock-up writes in an organization's heading and under "merged in".
+const ORG_ORIGIN = {
+  owner: "from the owner of the repositories on GitHub",
+  login: "from an account's login",
+  added: "made here",
+};
+
+const MERGED_ORIGIN = {
+  owner: "owner on GitHub, also its new repositories",
+  login: "from an account's login",
+  added: "made here",
+};
+
+function orgOrigin(org) {
+  if (!Object.prototype.hasOwnProperty.call(ORG_ORIGIN, org.source)) {
+    throw new Error(
+      `the organization ${org.id} has no origin: ${JSON.stringify(org.source)}`
+    );
+  }
+  return org.source;
+}
+
+function orgEmpty(org) {
+  if (typeof org.empty !== "boolean") {
+    throw new Error(
+      `the organization ${org.id} has no empty flag: ${JSON.stringify(org.empty)}`
+    );
+  }
+  return org.empty;
+}
+
+// A malformed account list is an error the page shows, never an empty list.
+function orgAccounts(org) {
+  if (!Array.isArray(org.accounts)) {
+    throw new Error(
+      `the organization ${org.id} has no account list: ${JSON.stringify(org.accounts)}`
+    );
+  }
+  return org.accounts;
+}
+
+// The organizations merged into this one, as the core sends them.
+function orgMerged(org) {
+  if (!Array.isArray(org.merged)) {
+    throw new Error(
+      `the organization ${org.id} has no merged list: ${JSON.stringify(org.merged)}`
+    );
+  }
+  return org.merged.map((merged) => {
+    if (!isObject(merged)) {
+      throw new Error(
+        `the organization ${org.id} has a merged entry that is not an object: ${JSON.stringify(merged)}`
+      );
+    }
+    for (const field of ["id", "name"]) {
+      if (typeof merged[field] !== "string" || merged[field] === "") {
+        throw new Error(
+          `the organization ${org.id} has a merged entry without a ${field}: ${JSON.stringify(merged)}`
+        );
+      }
+    }
+    if (!Object.prototype.hasOwnProperty.call(MERGED_ORIGIN, merged.source)) {
+      throw new Error(
+        `the organization ${merged.id} has no origin: ${JSON.stringify(merged.source)}`
+      );
+    }
+    return { id: merged.id, name: merged.name, source: merged.source };
+  });
+}
+
+function tokenValue(what, value) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new Error(`the ${what} has no token count: ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
+function sessionValue(what, value) {
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`the ${what} has no session count: ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
+// A token cell in the one spelling (`showTokens`): below a million the
+// `tokens-small` colour shows, as in the mock-up.
+function tokenCell(what, value) {
+  return showTokens(h("span", { class: "n" }), tokenValue(what, value));
+}
+
+function sessionCell(what, value) {
+  return h("span", { class: "n", text: String(sessionValue(what, value)) });
+}
+
 function projectsCard() {
   const card = panel(
     "Projects",
-    "a project is a repository; an organization is several projects · the same on all your hosts",
+    "a project is a repository; an organization is several projects · the same on all your hosts · tokens and sessions: all time",
     [],
     [
       h("span", {
@@ -2290,43 +2394,126 @@ function projectsCard() {
     body.appendChild(message(state.projectsError || "The projects could not be read."));
     return card;
   }
+  if (!Array.isArray(projects.projects) || !Array.isArray(projects.orgs)) {
+    throw new Error(
+      "the projects view has no project or organization list: " +
+        JSON.stringify({ projects: projects.projects, orgs: projects.orgs })
+    );
+  }
   body.appendChild(
     h("div", { class: "lr hd proj-grid" }, [
       h("span", { text: "Project" }),
       h("span", { text: "Repository" }),
       h("span", { text: "Folders, per host" }),
-      h("span", { text: "Organization" }),
+      h("span", { class: "n", text: "Tokens" }),
       h("span", { class: "n", text: "Sessions" }),
+      h("span"),
     ])
   );
-  if (projects.projects.length === 0) {
+  if (projects.projects.length === 0 && projects.orgs.length === 0) {
     body.appendChild(
       h("div", { class: "lr mf", text: "No sessions recorded yet, so no project is known." })
     );
   }
-  for (const project of projects.projects) body.appendChild(projectRow(project, projects));
+
+  // One heading per organization that is not merged into another; a project
+  // whose organization is merged in is drawn under its target's heading.
+  const index = organizationIndex(projects);
+  const groups = new Map(projects.orgs.map((org) => [org.id, []]));
+  const unassigned = [];
+  for (const project of projects.projects) {
+    const heading = projectHeadingId(project, index);
+    if (heading === null) unassigned.push(project);
+    else groups.get(heading).push(project);
+  }
+  for (const org of projects.orgs) {
+    body.appendChild(orgRow(org, projects));
+    for (const project of groups.get(org.id)) {
+      body.appendChild(projectRow(project, projects, org.id));
+    }
+  }
+  body.appendChild(noOrganizationRow(unassigned));
+  for (const project of unassigned) body.appendChild(projectRow(project, projects, null));
 
   body.appendChild(section("Join projects"));
   body.appendChild(joinRow(projects));
 
-  body.appendChild(section("Organizations"));
-  if (projects.orgs.length === 0) {
-    body.appendChild(h("div", { class: "lr mf", text: "No organization yet." }));
-  }
-  for (const org of projects.orgs) body.appendChild(orgRow(org, projects));
+  body.appendChild(section("New organization"));
   body.appendChild(orgAddRow(projects));
   body.appendChild(
     note([
       h("b", { text: "Found by the repository." }),
-      " The address of a repository (here its GitHub name) is the same on every host, so the same project needs no set-up anywhere. Its owner becomes the organization. What you rename, join or assign here is shared with your other hosts through the history folder.",
+      " The owner of a repository on GitHub becomes its organization, on every host. ",
+      h("b", { text: "Move to" }),
+      " moves one project. ",
+      h("b", { text: "Merge into" }),
+      " moves a whole organization, also the repositories of that owner you start later. Everything here is shared with your other hosts through the history folder, and applies to the past too.",
     ])
   );
   return card;
 }
 
-function projectRow(project, projects) {
+// The direct organizations and the merged ones they name, by lower-case
+// identity: a project's organization is drawn under the heading it resolves to.
+function organizationIndex(projects) {
+  const direct = new Map();
+  const merged = new Map();
+  for (const org of projects.orgs) {
+    direct.set(org.id.toLowerCase(), org.id);
+    for (const entry of orgMerged(org)) {
+      const key = entry.id.toLowerCase();
+      if (merged.has(key)) {
+        throw new Error(
+          `the organization ${entry.id} is merged into more than one organization`
+        );
+      }
+      merged.set(key, org.id);
+    }
+  }
+  return { direct, merged };
+}
+
+function projectHeadingId(project, index) {
+  if (project.org === null) return null;
+  if (typeof project.org !== "string" || project.org === "") {
+    throw new Error(
+      `the project ${projectKeyText(project.key)} has no organization: ${JSON.stringify(project.org)}`
+    );
+  }
+  const key = project.org.toLowerCase();
+  const heading = index.direct.get(key) ?? index.merged.get(key);
+  if (heading === undefined) {
+    throw new Error(
+      `the project ${projectKeyText(project.key)} names the organization ${project.org}, which is not in the view`
+    );
+  }
+  return heading;
+}
+
+// The last heading: the projects no organization owns, with the sums the page
+// computes from those projects' own figures.
+function noOrganizationRow(projects) {
+  let tokens = 0;
+  let sessions = 0;
+  for (const project of projects) {
+    tokens += tokenValue(`project ${projectKeyText(project.key)}`, project.tokens);
+    sessions += sessionValue(`project ${projectKeyText(project.key)}`, project.sessions);
+  }
+  return h("div", { class: "lr ogh proj-grid" }, [
+    h("span", {}, [h("b", { text: "No organization" })]),
+    h("span", { class: "mf ogl", text: "counted as Unassigned in Statistics" }),
+    tokenCell("No organization", tokens),
+    h("span", { class: "n", text: String(sessions) }),
+    h("span"),
+  ]);
+}
+
+function projectRow(project, projects, heading) {
   const field = `project:${projectKeyText(project.key)}`;
-  const wrap = h("div", { class: "proj-wrap", dataset: { field } });
+  const wrap = h("div", {
+    class: "proj-wrap",
+    dataset: { field, org: heading === null ? "" : heading },
+  });
 
   const nameInput = textInput({
     class: "inp tall proj-name",
@@ -2352,8 +2539,9 @@ function projectRow(project, projects) {
       nameInput,
       repo,
       h("span", { class: "mono x11 mf", title: folders, text: folders }),
-      projectOrgCell(project, projects, field),
-      h("span", { class: "n", text: String(project.sessions) }),
+      tokenCell(`project ${projectKeyText(project.key)}`, project.tokens),
+      sessionCell(`project ${projectKeyText(project.key)}`, project.sessions),
+      projectMoveCell(project, projects, heading, field),
     ])
   );
   if (Array.isArray(project.joined) && project.joined.length > 0) {
@@ -2363,64 +2551,32 @@ function projectRow(project, projects) {
   return wrap;
 }
 
-function projectOrgCell(project, projects, field) {
-  const NEW_ORG = "\u0000new-organization";
-  const select = selectInput(
-    [
-      ["", "none"],
-      ...projects.orgs.map((org) => [org.id, org.name]),
-      [NEW_ORG, "new…"],
-    ],
-    project.org || "",
-    async (next) => {
-      if (next === NEW_ORG) {
-        newWrap.hidden = false;
-        newInput.focus();
-        select.value = project.org || "";
-        return;
-      }
-      const ok = await saveProject(
-        { edit: "assign", key: project.key, org: next === "" ? null : next },
-        field
-      );
-      if (!ok) select.value = project.org || "";
-    }
+// "Move to…" replaces the organization dropdown: the other organizations
+// (the merged ones are not headings), then "No organization". A choice sends
+// the `assign` edit at once; the menu goes back to its placeholder.
+function projectMoveCell(project, projects, heading, field) {
+  const NO_ORGANIZATION = "\u0000no-organization";
+  const options = [["", "Move to…"]];
+  for (const org of projects.orgs) {
+    if (heading !== null && organizationNamesMatch(org.id, heading)) continue;
+    options.push([org.id, org.name]);
+  }
+  options.push([NO_ORGANIZATION, "No organization"]);
+  const select = selectInput(options, "", async (next) => {
+    if (next === "") return;
+    select.value = "";
+    const ok = await saveProject(
+      { edit: "assign", key: project.key, org: next === NO_ORGANIZATION ? null : next },
+      field
+    );
+    if (!ok) select.value = "";
+  });
+  select.options[0].disabled = true;
+  select.setAttribute(
+    "aria-label",
+    `Move ${project.name || "the project"} to another organization`
   );
-  select.setAttribute("aria-label", `Organization of ${project.name || "the project"}`);
-  selectWidth(select, 130);
-
-  const newInput = textInput({
-    class: "inp tall proj-new-input",
-    placeholder: "organization name",
-    "aria-label": "New organization name",
-  });
-  const use = h("button", { type: "button", class: "hbtn xs", text: "Use" });
-  const saveNew = async () => {
-    const next = newInput.value.trim();
-    if (next === "") {
-      fieldError(field, "An organization name must not be empty.");
-      newInput.focus();
-      return;
-    }
-    use.disabled = true;
-    const ok = await saveProject({ edit: "assign", key: project.key, org: next }, field);
-    use.disabled = false;
-    if (!ok) {
-      newInput.focus();
-      return;
-    }
-    newWrap.hidden = true;
-    newInput.value = "";
-  };
-  use.addEventListener("click", saveNew);
-  newInput.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") {
-      event.preventDefault();
-      saveNew();
-    }
-  });
-  const newWrap = h("span", { class: "proj-new-org", hidden: true }, [newInput, use]);
-  return h("span", { class: "proj-org" }, [select, newWrap]);
+  return selectWidth(select, 136);
 }
 
 // A joined project has no row of its own: the core sends its key and the
@@ -2522,19 +2678,28 @@ function orgOwnerRepositories(org) {
   });
 }
 
-// An organization from a repository owner has no Remove button; its name says
-// in a tooltip why (decision 30).
+// One organization's heading: its name field, its accounts and origin, the
+// organizations merged into it with a split-off link each, its sums and its
+// "Merge into…" menu. The merged organizations are not headings of their own.
 function orgRow(org, projects) {
   const field = `org:${org.id}`;
   const owners = orgOwnerRepositories(org);
+  const accounts = orgAccounts(org);
+  const merged = orgMerged(org);
+  const empty = orgEmpty(org);
+  const source = orgOrigin(org);
+  const orgTokens = tokenValue(`organization ${org.id}`, org.tokens);
+  const orgSessions = sessionValue(`organization ${org.id}`, org.sessions);
+  const wrap = h("div", {
+    class: `org-wrap${empty ? " empty" : ""}`,
+    dataset: { field, org: org.id },
+  });
   const nameInput = textInput({
     class: "inp tall org-name",
     value: org.name || "",
     "aria-label": "Organization name",
   });
-  if (owners.length > 0) {
-    nameInput.title = `the organization ${org.name} comes from the owner of ${owners[0]}; it cannot be removed`;
-  }
+  nameInput.title = `The shown name; the projects stay linked to ${org.id}.`;
   nameInput.addEventListener("change", async () => {
     const next = nameInput.value.trim();
     if (next === org.name) {
@@ -2544,40 +2709,191 @@ function orgRow(org, projects) {
     const ok = await saveProject({ edit: "orgRename", org: org.id, name: next }, field);
     if (!ok) nameInput.value = org.name || "";
   });
-  const chips = (org.accounts || []).map((ref) => accountChip(ref, projects));
-  const accounts =
-    chips.length > 0
-      ? h("span", { class: "org-chips" }, chips)
-      : h("span", { class: "mf", text: "no account" });
-  const control = h("span", { class: "org-actions" }, [accounts]);
-  if (owners.length === 0) {
-    control.appendChild(
-      h("button", {
-        type: "button",
-        class: "hbtn xs danger org-remove",
-        text: "Remove",
-        "aria-label": `Remove organization ${org.name}`,
-        onclick: () => {
-          state.confirmRemoveOrgId = org.id;
-          renderGroup(state.right, "projects");
-        },
-      })
+
+  const line = h("span", { class: "row ogl" });
+  if (accounts.length > 0) {
+    line.appendChild(
+      h("span", { class: "org-chips" }, accounts.map((ref) => accountChip(ref, projects)))
     );
   }
-  const counts = `${countText(org.accounts.length, "account", "accounts")} · ${countText(
-    org.projects,
-    "project",
-    "projects"
-  )}`;
-  const source =
-    owners.length > 0
-      ? "from the owner of the repositories"
-      : org.accounts.length > 0
-        ? "from the account's login"
-        : "added here";
-  const row = setting(nameInput, control, `${source} · ${counts}`, field);
-  if (state.confirmRemoveOrgId === org.id) row.appendChild(orgRemoveConfirm(org, field));
-  return row;
+  line.appendChild(h("span", { class: "mf org-source", text: ORG_ORIGIN[source] }));
+  if (empty) {
+    line.appendChild(
+      h("span", { class: "mf org-empty" }, [
+        " · ",
+        h("b", { text: "empty" }),
+        ": its projects were moved; not shown in Statistics",
+      ])
+    );
+  }
+  if (merged.length > 0) {
+    const mergedLine = h("span", { class: "mf org-merged" }, [
+      " · ",
+      h("b", { text: "merged in:" }),
+      " ",
+    ]);
+    merged.forEach((entry, index) => {
+      if (index > 0) mergedLine.appendChild(document.createTextNode(", "));
+      mergedLine.appendChild(h("span", { text: entry.name }));
+      mergedLine.appendChild(
+        h("span", { class: "mf", text: ` (${MERGED_ORIGIN[entry.source]})` })
+      );
+      const split = h("button", {
+        type: "button",
+        class: "lnk",
+        text: "split off…",
+        "aria-label": `Split off ${entry.name}`,
+      });
+      split.addEventListener("click", () => {
+        state.confirmRemoveOrgId = null;
+        state.confirmOrgEdit = {
+          kind: "orgUnjoin",
+          org: entry.id,
+          orgName: entry.name,
+        };
+        renderGroup(state.right, "projects");
+      });
+      mergedLine.appendChild(document.createTextNode(" "));
+      mergedLine.appendChild(split);
+    });
+    line.appendChild(mergedLine);
+  }
+  if (owners.length === 0) {
+    // The rule of decision 30: only an organization that is not a repository
+    // owner has a Remove button; an owner would come back with its repository.
+    const remove = h("button", {
+      type: "button",
+      class: "hbtn xs danger org-remove",
+      text: "Remove",
+      "aria-label": `Remove organization ${org.name}`,
+    });
+    remove.addEventListener("click", () => {
+      state.confirmOrgEdit = null;
+      state.confirmRemoveOrgId = org.id;
+      renderGroup(state.right, "projects");
+    });
+    line.appendChild(document.createTextNode(" · "));
+    line.appendChild(remove);
+  }
+
+  const options = [["", "Merge into…"]];
+  for (const other of projects.orgs) {
+    if (organizationNamesMatch(other.id, org.id)) continue;
+    options.push([other.id, other.name]);
+  }
+  const merge = selectInput(options, "", (next) => {
+    if (next === "") return;
+    const into = projects.orgs.find((other) => other.id === next);
+    if (!into) throw new Error(`unknown organization ${next}`);
+    merge.value = "";
+    state.confirmRemoveOrgId = null;
+    state.confirmOrgEdit = {
+      kind: "orgJoin",
+      org: org.id,
+      orgName: org.name,
+      into: into.id,
+      intoName: into.name,
+    };
+    renderGroup(state.right, "projects");
+  });
+  merge.options[0].disabled = true;
+  merge.setAttribute("aria-label", `Merge ${org.name} into another organization`);
+  selectWidth(merge, 136);
+
+  wrap.appendChild(
+    h("div", { class: `lr ogh proj-grid${empty ? " empty" : ""}` }, [
+      nameInput,
+      line,
+      empty ? h("span") : showTokens(h("span", { class: "n" }), orgTokens),
+      empty ? h("span") : h("span", { class: "n", text: String(orgSessions) }),
+      merge,
+    ])
+  );
+  const confirm = state.confirmOrgEdit;
+  if (isObject(confirm) && confirm.kind === "orgJoin" && organizationNamesMatch(confirm.org, org.id)) {
+    wrap.appendChild(orgMergeConfirm(confirm, field));
+  }
+  if (
+    isObject(confirm) &&
+    confirm.kind === "orgUnjoin" &&
+    merged.some((entry) => organizationNamesMatch(entry.id, confirm.org))
+  ) {
+    wrap.appendChild(orgSplitConfirm(confirm, field));
+  }
+  if (state.confirmRemoveOrgId === org.id) wrap.appendChild(orgRemoveConfirm(org, field));
+  paintRowError(wrap, field);
+  return wrap;
+}
+
+// A merge waits for its confirmation under the source heading. The text says
+// what the merge does to later repositories; nothing is sent before Merge.
+function orgMergeConfirm(confirm, field) {
+  return h("div", { class: "confirm org-confirm org-head-confirm" }, [
+    h("div", {
+      class: "confirm-text",
+      text: `Merge ${confirm.orgName} into ${confirm.intoName}? Its projects count for ${confirm.intoName}, also repositories of its owner started later.`,
+    }),
+    h("div", { class: "confirm-actions" }, [
+      h("button", {
+        type: "button",
+        class: "hbtn xs",
+        text: "Merge",
+        onclick: async () => {
+          const ok = await saveProject(
+            { edit: "orgJoin", org: confirm.org, into: confirm.into },
+            field
+          );
+          if (ok) {
+            state.confirmOrgEdit = null;
+            renderGroup(state.right, "projects");
+          }
+        },
+      }),
+      h("button", {
+        type: "button",
+        class: "hbtn xs ghost",
+        text: "Cancel",
+        onclick: () => {
+          state.confirmOrgEdit = null;
+          renderGroup(state.right, "projects");
+        },
+      }),
+    ]),
+  ]);
+}
+
+// A split-off waits for its confirmation under the target heading, where the
+// merged organization is named.
+function orgSplitConfirm(confirm, field) {
+  return h("div", { class: "confirm org-confirm org-head-confirm" }, [
+    h("div", {
+      class: "confirm-text",
+      text: `Split off ${confirm.orgName}? It gets its projects back; projects moved by hand since stay where they are.`,
+    }),
+    h("div", { class: "confirm-actions" }, [
+      h("button", {
+        type: "button",
+        class: "hbtn xs",
+        text: "Split off",
+        onclick: async () => {
+          const ok = await saveProject({ edit: "orgUnjoin", org: confirm.org }, field);
+          if (ok) {
+            state.confirmOrgEdit = null;
+            renderGroup(state.right, "projects");
+          }
+        },
+      }),
+      h("button", {
+        type: "button",
+        class: "hbtn xs ghost",
+        text: "Cancel",
+        onclick: () => {
+          state.confirmOrgEdit = null;
+          renderGroup(state.right, "projects");
+        },
+      }),
+    ]),
+  ]);
 }
 
 // The confirmation first says what happens: the organization's projects and
@@ -2660,11 +2976,19 @@ function orgAddRow(projects) {
       input.focus();
       return;
     }
-    const exists = (projects.orgs || []).some(
-      (org) =>
-        organizationNamesMatch(org.id, name) ||
-        organizationNamesMatch(org.name, name)
-    );
+    const exists =
+      projects.orgs.some(
+        (org) =>
+          organizationNamesMatch(org.id, name) ||
+          organizationNamesMatch(org.name, name)
+      ) ||
+      projects.orgs.some((org) =>
+        orgMerged(org).some(
+          (merged) =>
+            organizationNamesMatch(merged.id, name) ||
+            organizationNamesMatch(merged.name, name)
+        )
+      );
     if (exists) {
       fieldError(field, `an organization named ${name} already exists`);
       input.focus();
@@ -2689,7 +3013,7 @@ function orgAddRow(projects) {
   return setting(
     "+ Add organization",
     h("span", { class: "org-add" }, [input, add]),
-    "a new organization starts with no projects and no accounts",
+    "a new organization starts empty",
     field
   );
 }

@@ -361,7 +361,7 @@
 /* ---------- the Projects group (spec §3.6) ---------- */
 
 .proj-grid {
-  grid-template-columns: 150px minmax(120px, 204px) minmax(0, 1fr) 190px 66px;
+  grid-template-columns: 150px 290px minmax(0, 1fr) 64px 64px 148px;
 }
 
 .proj-wrap {
@@ -370,6 +370,68 @@
 
 .proj-wrap .lr {
   border-top: 0;
+}
+
+/* An organization heading: its name, accounts and origin, the organizations
+   merged into it, its sums and its "Merge into…" menu. The heading is dimmed
+   when it is empty (its projects were moved away). */
+.org-wrap {
+  border-top: 1px solid var(--border);
+}
+
+.org-wrap .lr {
+  border-top: 0;
+}
+
+.lr.ogh {
+  height: auto;
+  min-height: 38px;
+  background: var(--hover);
+}
+
+.lr.ogh.empty {
+  opacity: 0.75;
+}
+
+.lr.ogh .ogl {
+  flex-wrap: wrap;
+  row-gap: 2px;
+  white-space: normal;
+  line-height: 16px;
+}
+
+.ogl {
+  grid-column: span 2;
+}
+
+.org-source,
+.org-empty,
+.org-merged {
+  font-size: 12px;
+}
+
+.org-merged b,
+.org-empty b {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.org-merged .lnk {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--focus);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.org-wrap .row-error {
+  padding: 0 12px 6px;
+  color: var(--danger);
+  font-size: 12px;
+  line-height: 16px;
+  white-space: normal;
 }
 
 .proj-wrap .row-error {
@@ -457,7 +519,7 @@
 }
 
 .org-confirm {
-  margin-left: 262px;
+  margin-left: 12px;
 }
 
 .org-chips {
