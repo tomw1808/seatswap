@@ -121,7 +121,9 @@ pub struct ThisWeekProject {
     /// [`AccountRef::acc`]. The plan's comment calls this "subscription value
     /// per chip id"; the share of the API value is what R2's bars split by on
     /// every page and what Statistics → Projects gives, so both pages draw the
-    /// same split. Empty while the project's API value is unknown or 0.
+    /// same split. A share of an API value counts the priced work only
+    /// (`stats::priced_api`): a part with no priced API value is left out. Empty
+    /// while the project's API value is unknown or 0.
     pub by_subscription: Vec<(Option<String>, f64)>,
 }
 
@@ -2048,11 +2050,11 @@ mod tests {
     }
 
     /// A project with one priced record and one record whose model has no price
-    /// has a partial API half. A share of a lower bound is no share (R3), so the
-    /// project's `by_subscription` is empty; before the one share helper, the
-    /// Overview divided the known part and sent AC as 100 %.
+    /// has a partial API half, but a share of an API value counts the priced work
+    /// only: the project's `by_subscription` is its priced record's split, AC 100 %
+    /// here, not the empty list a partial half used to give.
     #[test]
-    fn a_project_with_an_unpriced_record_has_no_subscription_share() {
+    fn a_project_with_an_unpriced_record_splits_its_priced_work() {
         let tiny = tiny();
         let atlas = crate::project::ProjectKey::Repo("github.com/sam/atlas".to_string());
         tiny.history
@@ -2080,9 +2082,10 @@ mod tests {
             project.values.api_partial,
             "the unpriced record leaves the API half a lower bound"
         );
-        assert!(
-            project.by_subscription.is_empty(),
-            "a share of a lower bound is no share: {:?}",
+        assert_eq!(
+            project.by_subscription,
+            vec![(Some(tiny.ac().id.clone()), 100.0)],
+            "the priced record's split is all of the priced work: {:?}",
             project.by_subscription
         );
     }

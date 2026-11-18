@@ -20,8 +20,8 @@ use crate::transcripts::Tokens;
 use super::{
     account_abbr, account_chosen, account_id, account_weeks_valued, add_opt_value, add_value,
     full_half, join_names, keep_warnings, money_text, output_by_account_week, percent_text,
-    range_of, record_chosen, subscription_shares, thousands, week_start, windows_span, Ctx, Query,
-    StatsError,
+    priced_api, range_of, record_chosen, subscription_shares, thousands, week_start, windows_span,
+    Ctx, Query, StatsError,
 };
 
 /// The level of a row of the tree.
@@ -47,8 +47,8 @@ pub struct Node {
     pub org_accounts: Vec<String>,
     pub tokens: Tokens,
     /// This node's API value as a share of the page's API value, in %; `None`
-    /// when the node's own value or the page's total is missing (an unknown
-    /// share is not a measured zero), or when the page's total is zero.
+    /// when the node has no priced API value or the page's total has none (an
+    /// unknown share is not a measured zero), or when the page's total is zero.
     pub share: Option<f64>,
     /// The two values of the node's records, built with [`Values::of`]: a
     /// missing half names its reason, and the API half names its currency.
@@ -58,8 +58,10 @@ pub struct Node {
     /// Claude account's id ([`account_id`]) or a provider subscription's
     /// `account.acc`; `None` is work without a known subscription (a Claude
     /// record without an account, a provider record without a named
-    /// subscription). Empty when the node's API value is unknown, 0 or partial
-    /// ([`full_half`]); a part whose API half is partial or unknown is left out.
+    /// subscription). A share of an API value counts the priced work only
+    /// ([`priced_api`]): it divides a subscription's known API part by the
+    /// node's known API part, so a part without a price is left out. Empty when
+    /// the node has no priced API value or it is 0.
     pub by_subscription: Vec<(Option<String>, f64)>,
     /// The distinct sessions of the node's records.
     pub sessions: u32,
@@ -146,7 +148,8 @@ pub struct ProjectDetail {
     /// The agent answers as a share of all answers, in %; 0 when the records
     /// have no answers.
     pub agent_share: f64,
-    /// Each host's share of the API value, in %, largest first.
+    /// Each host's share of the project's API value, in %, largest first; a
+    /// share of an API value counts the priced work only, like a node's share.
     pub hosts: Vec<(String, f64)>,
     /// The two values of the project's records, built with [`Values::of`].
     pub values: Values,
@@ -154,8 +157,8 @@ pub struct ProjectDetail {
     /// rule as [`Node::by_subscription`].
     pub by_subscription: Vec<(Option<String>, f64)>,
     /// The project's API value as a share of the page's API value, in %; `None`
-    /// when the project's own value or the page's total is missing (an unknown
-    /// share is not a measured zero), or when the page's total is zero.
+    /// when the project has no priced API value or the page's total has none (an
+    /// unknown share is not a measured zero), or when the page's total is zero.
     pub share: Option<f64>,
     /// The output tokens per calendar week and model, weeks oldest first and
     /// models by tokens.
@@ -704,8 +707,9 @@ pub(crate) fn project_detail_in<Tz: TimeZone + Copy>(
         let parts: Vec<&Values> = hosts.values().collect();
         Values::sum(&parts)
     };
-    // A host's share divides the host's value by all hosts' value; both must be
-    // full halves (R3), so a partial one leaves the share out.
+    // A host's share divides the host's value by all hosts' value; a share of an
+    // API value counts the priced work only ([`priced_api`]), so a host whose
+    // value is partial keeps the share of its known part.
     let mut host_shares: Vec<(String, f64)> = hosts
         .iter()
         .filter_map(|(host, values)| {
@@ -867,19 +871,13 @@ fn node_from<Tz: TimeZone + Copy>(
     }
 }
 
-/// A value as a share of the page's total, in %: unknown when either value is
-/// missing or the total is zero, never a made-up 0 %. A share, ratio or percent
-/// is computed only from halves that are not partial (R3); a partial half is a
-/// lower bound, so it gives no share.
+/// A value as a share of the page's total, in %: unknown when either value has
+/// no priced API part or the total is zero, never a made-up 0 %. A share of an
+/// API value counts the priced work only ([`priced_api`]): it divides the
+/// value's known API part by the page's known API part, partial or not.
 fn share_of(values: &Values, page: Option<&Values>) -> Option<f64> {
-    let (api, _) = full_half(
-        values.api,
-        values.api_partial,
-        values.api_missing.as_deref(),
-    );
-    let (total, _) = page
-        .map(|page| full_half(page.api, page.api_partial, page.api_missing.as_deref()))
-        .unwrap_or((None, None));
+    let api = priced_api(values);
+    let total = page.and_then(priced_api);
     match (api, total) {
         (Some(api), Some(total)) if total > 0.0 => Some(api / total * 100.0),
         _ => None,
@@ -2427,57 +2425,109 @@ mod tests {
 
     // ---- proof tests of the fix of T-5 ----
 
-    /// A project whose model has no price keeps the known part of its API value
-    /// (R3), but a share divides only full halves, so its share of all use is
-    /// unknown, never a made-up 0 %: the page writes "—".
+    /// A share of an API value counts the priced work only: a range with one
+    /// priced project and one project whose model has no price puts the priced
+    /// project's part over the priced total, leaves the wholly unpriced project
+    /// without a share, and gives their organization the split of its priced
+    /// work. The unpriced project still keeps its known tokens and sessions.
     #[test]
-    fn a_project_without_a_price_has_no_share() {
+    fn an_unpriced_project_has_no_share_and_a_priced_one_keeps_the_priced_total() {
         let tiny = tiny();
+        let ledger = ProjectKey::Repo("github.com/sam/ledger".to_string());
         tiny.history
             .append(&record(
                 "2026-11-15T09:00:00Z",
                 "s5",
-                "/home/sam/projects/atlas/engine",
-                atlas(),
+                "/home/sam/projects/ledger",
+                ledger.clone(),
                 "claude-x",
                 1_000_000,
             ))
             .expect("a record without a price");
+        let week = Range {
+            from: utc("2026-11-11T00:00:00Z"),
+            to: utc("2026-11-16T00:00:00Z"),
+        };
 
-        let page = projects_page_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
+        let page = projects_page_in(&tiny.ctx(), &week, &all()).unwrap();
         let atlas_row = node(&page, "atlas");
-        assert!(
-            atlas_row.values.api.is_some(),
-            "the priced part stays known"
-        );
-        assert!(atlas_row.values.api_partial, "one part without a price");
         assert_eq!(
-            atlas_row.share, None,
+            atlas_row.values.api,
+            Some(80.0),
+            "the priced part of atlas stays known"
+        );
+        assert!(
+            !atlas_row.values.api_partial,
+            "every atlas record is priced"
+        );
+        assert!(
+            close(atlas_row.share.unwrap(), 100.0),
+            "the only priced project is the whole priced total: {:?}",
+            atlas_row.share
+        );
+
+        let ledger_row = node(&page, "ledger");
+        assert_eq!(
+            ledger_row.values.api, None,
+            "a wholly unpriced project has no priced API part"
+        );
+        assert_eq!(
+            ledger_row.share, None,
+            "no priced API value is no share, not 0 %"
+        );
+        assert_eq!(ledger_row.tokens.out, 1_000_000);
+
+        let sam_row = node(&page, "sam");
+        assert_eq!(
+            sam_row.values.api,
+            Some(80.0),
+            "the organization's known part is its priced work"
+        );
+        assert!(close(sam_row.share.unwrap(), 100.0));
+        let lb = sam_row
+            .by_subscription
+            .iter()
+            .find(|(account, _)| account.as_deref() == Some(&tiny.lb().id))
+            .expect("LB's share of sam");
+        let ac = sam_row
+            .by_subscription
+            .iter()
+            .find(|(account, _)| account.as_deref() == Some(&tiny.ac().id))
+            .expect("AC's share of sam");
+        assert!(close(lb.1, 25.0), "LB {}", lb.1);
+        assert!(close(ac.1, 75.0), "AC {}", ac.1);
+        assert_eq!(
+            sam_row.by_subscription.len(),
+            2,
+            "the unpriced record adds no split part: {:?}",
+            sam_row.by_subscription
+        );
+
+        let atlas_detail = project_detail_in(&tiny.ctx(), &week, &all(), &atlas()).unwrap();
+        assert!(close(atlas_detail.share.unwrap(), 100.0));
+        let ledger_detail = project_detail_in(&tiny.ctx(), &week, &all(), &ledger).unwrap();
+        assert_eq!(
+            ledger_detail.share, None,
             "an unknown share is unknown, not 0 %"
         );
 
-        let detail = project_detail_in(&tiny.ctx(), &two_weeks(), &all(), &atlas()).unwrap();
-        assert!(detail.values.api.is_some(), "the priced part stays known");
-        assert!(detail.values.api_partial, "one part without a price");
-        assert_eq!(detail.share, None, "an unknown share is unknown, not 0 %");
-
-        // The page reads the JSON `null`: a tree row's `share` and the detail's.
+        // The page reads the JSON `null` for the unpriced project's share.
         let json = serde_json::to_value(&page).expect("the page's JSON shape");
-        let atlas_json = json["nodes"]
+        let ledger_json = json["nodes"]
             .as_array()
             .expect("the nodes")
             .iter()
-            .find(|node| node["name"] == "atlas")
-            .expect("atlas's row");
-        assert!(atlas_json["share"].is_null());
-        let detail_json = serde_json::to_value(&detail).expect("the detail's JSON shape");
-        assert!(detail_json["share"].is_null());
+            .find(|node| node["name"] == "ledger")
+            .expect("ledger's row");
+        assert!(ledger_json["share"].is_null());
     }
 
-    /// A host's share and the organizations' sentences divide a value; a partial
-    /// half is a lower bound, so neither is a figure and both are left out (R3).
+    /// A host's share divides API values, so it counts the priced work too: a
+    /// host whose value has an unpriced record keeps the share of its known
+    /// part. The organizations' sentences divide subscription values, whose
+    /// partial halves are still lower bounds, so they are left out (R3).
     #[test]
-    fn a_partial_value_leaves_out_a_host_share_and_the_sentences() {
+    fn a_partial_value_keeps_a_host_share_and_leaves_out_the_sentences() {
         let tiny = tiny();
         tiny.history
             .append(&record(
@@ -2492,10 +2542,17 @@ mod tests {
 
         let detail = project_detail_in(&tiny.ctx(), &two_weeks(), &all(), &atlas()).unwrap();
         assert!(detail.values.api_partial, "{:?}", detail.values);
-        assert!(
-            detail.hosts.is_empty(),
-            "a host's share of a partial value is no figure: {:?}",
+        assert_eq!(
+            detail.hosts.len(),
+            1,
+            "the host keeps its share of the priced work: {:?}",
             detail.hosts
+        );
+        assert_eq!(detail.hosts[0].0, "atlas");
+        assert!(
+            close(detail.hosts[0].1, 100.0),
+            "the only host holds all of the priced value: {}",
+            detail.hosts[0].1
         );
 
         let projects = with_acme_account(&tiny);

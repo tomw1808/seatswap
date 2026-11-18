@@ -73,6 +73,10 @@ pub(crate) fn add_value<K: Ord>(values: &mut BTreeMap<K, Values>, key: K, next: 
 /// share, ratio or percent is computed only from halves that are not partial
 /// (R3): a partial half is a known lower bound, and a quotient of a lower bound
 /// is not a figure. An amount on its own may stay partial and is drawn "≥".
+///
+/// The one exception is a share of an API value: it divides the priced part of
+/// a part by the priced part of the whole ([`priced_api`]), so priced work keeps
+/// its share when other work has no price.
 pub(crate) fn full_half(
     value: Option<f64>,
     partial: bool,
@@ -83,6 +87,15 @@ pub(crate) fn full_half(
     } else {
         (value, None)
     }
+}
+
+/// The priced API part of a value: its known API value, whether or not some of
+/// its records have no price (R3). A share of an API value divides this part of
+/// a part by this part of the whole, so a missing price hides only the work it
+/// belongs to, never the rest. `None` when the value has no priced API part at
+/// all. A whole whose priced part is `None` or 0 gives no shares.
+pub(crate) fn priced_api(values: &Values) -> Option<f64> {
+    values.api
 }
 
 /// The span of one account week: from the start of its first window to the end
@@ -1043,27 +1056,22 @@ pub(crate) fn top_three(mut items: Vec<(String, f64)>) -> Vec<(String, f64)> {
 }
 
 /// Each project's share of the API value of `total`, in percent, the three
-/// largest then `other` ([`top_three`]). A share is computed only from halves
-/// that are not partial (R3): a partial total has no shares, as an unknown or 0
-/// one has none, and a project whose API half is partial or unknown is left out.
-/// Empty when the total's API value is unknown or 0: a share of nothing is no
-/// share. `by_project` and `total` are sums of [`Values::of`].
+/// largest then `other` ([`top_three`]). A share of an API value counts the
+/// priced work only ([`priced_api`]): it divides a project's known API part by
+/// the total's known API part, so a missing price in one project leaves the
+/// others' shares. A project without a priced API part is left out, as is a
+/// total whose API value is unknown or 0: a share of nothing is no share.
+/// `by_project` and `total` are sums of [`Values::of`].
 pub(crate) fn api_shares(
     by_project: BTreeMap<String, Values>,
     total: &Values,
 ) -> Vec<(String, f64)> {
-    let (total, _) = full_half(total.api, total.api_partial, total.api_missing.as_deref());
-    match total {
+    match priced_api(total) {
         Some(total) if total > 0.0 => top_three(
             by_project
                 .into_iter()
                 .filter_map(|(name, values)| {
-                    let (value, _) = full_half(
-                        values.api,
-                        values.api_partial,
-                        values.api_missing.as_deref(),
-                    );
-                    value.map(|value| (name, value / total * 100.0))
+                    priced_api(&values).map(|value| (name, value / total * 100.0))
                 })
                 .collect(),
         ),
@@ -1079,17 +1087,17 @@ pub(crate) fn api_shares(
 /// without a named subscription (provider). This is the one rule both pages
 /// use: the This-week card's project rows split their bars by it and
 /// Statistics → Projects' `Node::by_subscription` splits a project's API value
-/// by it, so both pages draw the same split. A share is computed only from
-/// halves that are not partial (R3): a partial or unknown total gives no
-/// shares, as a partial or unknown part is left out; an unknown or 0 total
-/// gives an empty list.
+/// by it, so both pages draw the same split. A share of an API value counts the
+/// priced work only ([`priced_api`]): it divides each part's known API value by
+/// the total's known API value, so a part without a price is left out and the
+/// others keep their shares. A total whose API value is unknown or 0 gives an
+/// empty list.
 pub(crate) fn subscription_shares<'a, Tz: TimeZone + Copy>(
     ctx: &Ctx<Tz>,
     total: &Values,
     parts: impl IntoIterator<Item = (Option<String>, &'a Values)>,
 ) -> Vec<(Option<String>, f64)> {
-    let (Some(api), _) = full_half(total.api, total.api_partial, total.api_missing.as_deref())
-    else {
+    let Some(api) = priced_api(total) else {
         return Vec::new();
     };
     if api <= 0.0 {
@@ -1097,14 +1105,7 @@ pub(crate) fn subscription_shares<'a, Tz: TimeZone + Copy>(
     }
     let mut shares: Vec<(Option<String>, f64)> = parts
         .into_iter()
-        .filter_map(|(id, values)| {
-            let (value, _) = full_half(
-                values.api,
-                values.api_partial,
-                values.api_missing.as_deref(),
-            );
-            value.map(|value| (id, value / api * 100.0))
-        })
+        .filter_map(|(id, values)| priced_api(values).map(|value| (id, value / api * 100.0)))
         .collect();
     shares.sort_by(|a, b| {
         b.1.total_cmp(&a.1).then_with(|| match (&a.0, &b.0) {
@@ -3581,10 +3582,13 @@ pub(crate) mod tests {
         assert_eq!(folded.subscription_partial, flat.subscription_partial);
     }
 
-    /// A share is computed only from halves that are not partial (R3): a partial
-    /// total has no shares, and a partial part is left out of them.
+    /// A share of an API value counts the priced work only (the one named
+    /// exception of [`full_half`]): it divides a part's known API value by the
+    /// whole's known API value, so a partial whole still gives shares and a
+    /// partial part keeps its share. A part with no priced API value at all is
+    /// left out, and a whole without one, or a known 0, gives no shares.
     #[test]
-    fn no_share_comes_from_a_partial_half() {
+    fn an_api_share_counts_the_priced_work_only() {
         let full = |api: f64| values_in("EUR", api, 0.0);
         let partial = Values {
             api: Some(40.0),
@@ -3596,23 +3600,52 @@ pub(crate) mod tests {
             subscription_missing: Some("no price for claude-x".to_string()),
             subscription_partial: false,
         };
+        let unknown = Values {
+            api: None,
+            api_currency: None,
+            api_missing: Some("no price for claude-y".to_string()),
+            api_partial: false,
+            subscription: None,
+            currency: None,
+            subscription_missing: Some("no price for claude-y".to_string()),
+            subscription_partial: false,
+        };
         let by_project = BTreeMap::from([
             ("atlas".to_string(), full(60.0)),
             ("ledger".to_string(), partial.clone()),
+            ("notes".to_string(), unknown.clone()),
         ]);
 
         let partial_total = Values::sum(&[&full(60.0), &partial]);
         assert!(partial_total.api_partial, "{partial_total:?}");
-        assert!(
-            api_shares(by_project.clone(), &partial_total).is_empty(),
-            "a share of a partial total is no figure"
+        assert_eq!(
+            api_shares(by_project.clone(), &partial_total),
+            vec![("atlas".to_string(), 60.0), ("ledger".to_string(), 40.0)],
+            "the priced parts share the priced total; the unpriced project is left out"
         );
 
         let full_total = Values::sum(&[&full(60.0), &full(60.0)]);
         assert_eq!(
-            api_shares(by_project, &full_total),
-            vec![("atlas".to_string(), 50.0)],
-            "the partial project is left out, the full one keeps its share"
+            api_shares(by_project.clone(), &full_total),
+            vec![
+                ("atlas".to_string(), 50.0),
+                ("ledger".to_string(), 40.0 / 120.0 * 100.0)
+            ],
+            "the unpriced project is left out, the priced parts share the full total"
+        );
+
+        let unknown_total = Values::sum(&[&unknown]);
+        assert_eq!(unknown_total.api, None);
+        assert!(
+            api_shares(by_project.clone(), &unknown_total).is_empty(),
+            "a whole without a priced part gives no shares"
+        );
+
+        let zero_total = Values::sum(&[]);
+        assert_eq!(zero_total.api, Some(0.0));
+        assert!(
+            api_shares(by_project, &zero_total).is_empty(),
+            "a share of a known 0 is no share"
         );
     }
 }

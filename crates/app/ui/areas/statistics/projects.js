@@ -106,12 +106,13 @@ function splitBar(node, env) {
     `${name} · ${percentText(percent)} of this ${noun}'s API value`);
 }
 
-// The reason a share is unknown: projects.rs sends `null` when the project's
-// own API value or the page's total is missing.
-const NO_SHARE = "no API value for some of this project's use";
+// The reason a share is unknown: projects.rs sends `null` when the row has no
+// priced API value or the page's total has none.
+const NO_SHARE = "no priced API value for this row's use";
 
-// A share of all use: "21.9 %", or "—" with the reason when projects.rs has no
-// value for one of its two parts (it never sends a made-up 0 %).
+// A share of all use: "21.9 %", or "—" with the reason when the row has no
+// priced API value or the page's priced total is unknown or 0 (projects.rs never
+// sends a made-up 0 %).
 function shareText(share) {
   if (share === null || share === undefined) return { text: "—", title: NO_SHARE };
   return { text: percentText(share), title: "" };
@@ -309,7 +310,7 @@ export async function show(container, env) {
       notes.appendChild(
         h("p", {
           class: "stats-note",
-          text: `No price for ${data.withoutPrice.join(", ")}: their tokens add no value.`,
+          text: `No price for ${data.withoutPrice.join(", ")}: their tokens add no value; shares count priced work only.`,
         })
       );
     }

@@ -266,12 +266,12 @@ const USD_RATE = {
 };
 
 // One project used a model that has no price, early on: only the range `All`
-// holds that work. There, as projects.rs answers: the project's API value is
-// unknown while its tokens and sessions are there; its organization's and the
-// page's API sums are partial; and a share or a subscription split is computed
-// only from full halves (R3), so every row's share is `null` and the
-// organization above the project has no split. The other ranges are fully
-// priced.
+// holds that work. There, as projects.rs answers: the project's own API value
+// is unknown while its tokens and sessions are there; its organization's and
+// the page's API sums keep the known priced part; and a share of an API value
+// counts the priced work only, so every other row's share divides by the priced
+// total and the organization above the project keeps its split of its priced
+// work. The other ranges are fully priced.
 const UNPRICED_PROJECT = "notes";
 const UNPRICED_MODEL = "claude-sonnet-3-9";
 
@@ -292,6 +292,25 @@ function unpricedOrg() {
     if (TREE[i].level === 0) return TREE[i].name;
   }
   throw new Error("the unpriced project has no organization above it");
+}
+
+// The page's priced API value as a share of all use: the unpriced project adds
+// no value, so every other row divides by the rest.
+function pricedTotalShare() {
+  return 100 - unpricedEntry().share;
+}
+
+// A row's share of the priced total: its priced part over the page's priced
+// part. The unpriced project itself has no priced API value, and the
+// organization above it holds the priced part of its own share.
+function pricedShare(entry, anyUnpriced) {
+  if (!anyUnpriced) return entry.share;
+  if (entry.level === 1 && entry.name === UNPRICED_PROJECT) return null;
+  const pricedPart =
+    entry.level === 0 && entry.name === unpricedOrg()
+      ? entry.share - unpricedEntry().share
+      : entry.share;
+  return (pricedPart / pricedTotalShare()) * 100;
 }
 
 function unpricedValues(subscription) {
@@ -327,10 +346,9 @@ export function projects(query) {
       entry.level === 0
         ? orgMoney(entry.name, usedTotal)
         : (entry.share / 100) * usedTotal;
-    // The organization that holds the unpriced project sums a missing part:
-    // its API value is partial (the known part, "≥"), and projects.rs gives a
-    // partial or unknown value no subscription shares (R3), so neither row
-    // carries a split.
+    // The organization that holds the unpriced project sums a missing part: its
+    // API value is partial (the known part, "≥"). Its share and its split count
+    // the priced work only, like every other row's.
     const holdsUnpriced = anyUnpriced && entry.level === 0 && entry.name === unpricedOrg();
     let values;
     if (unpriced) {
@@ -350,9 +368,9 @@ export function projects(query) {
       key: keyOf(entry),
       orgAccounts,
       tokens: tokenCounts(out),
-      share: anyUnpriced ? null : entry.share,
+      share: pricedShare(entry, anyUnpriced),
       values,
-      bySubscription: unpriced || holdsUnpriced ? [] : subscriptionParts(entry),
+      bySubscription: unpriced ? [] : subscriptionParts(entry),
       sessions: Math.round(entry.sessions * keptFraction),
     };
   });
@@ -441,7 +459,7 @@ export function projectDetail(query, key) {
           subscription
         ),
     bySubscription: unpriced ? [] : subscriptionParts(entry),
-    share: unpricedIn(query) ? null : entry.share,
+    share: pricedShare(entry, unpricedIn(query)),
     weeklyByModel,
     sessions: Math.round(entry.sessions * (indexes.length / WEEKS.length)),
   };
