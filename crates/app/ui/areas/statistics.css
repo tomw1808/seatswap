@@ -86,6 +86,22 @@
   font-weight: 600;
 }
 
+/* A subscription's share of a limit: the Projects tree and the Subscriptions
+   page both draw it, so the rule lives here. */
+.stats-ubar {
+  display: block;
+  height: 8px;
+  border-radius: 4px;
+  background: var(--track);
+  overflow: hidden;
+}
+
+.stats-ubar i {
+  display: block;
+  height: 100%;
+  background: var(--focus);
+}
+
 .stats-host {
   height: 26px;
   min-width: 105px;

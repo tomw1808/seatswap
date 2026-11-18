@@ -9,7 +9,7 @@ import { FORECAST_NO_PLAN, forecastPage } from "./fixture/stats-forecast.js";
 import { overview, thisWeek } from "./fixture/stats-overview.js";
 import { projectDetail, projects } from "./fixture/stats-projects.js";
 import { rhythm } from "./fixture/stats-rhythm.js";
-import { subscriptions, whatIf } from "./fixture/stats-subscriptions.js";
+import { subscriptions } from "./fixture/stats-subscriptions.js";
 import { weekSummary, weeks, windowDetail } from "./fixture/stats-weeks.js";
 
 export function fixtureStats(command, args) {
@@ -35,8 +35,6 @@ export function fixtureStats(command, args) {
       return answer(query, (value) => projectDetail(value, params.key));
     case "stats_subscriptions":
       return answer(query, subscriptions);
-    case "stats_what_if":
-      return answer(query, (value) => whatIf(value, params.without));
     case "stats_forecast":
       // The forecast never answers "empty": without a plan its one error is the
       // plain line the page shows.

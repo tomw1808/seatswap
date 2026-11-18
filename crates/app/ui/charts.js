@@ -615,6 +615,8 @@ export function lines({ series, yMax, marks, hlines, ySuffix, yDecimals, yFormat
         "stroke-linecap": "round",
         "vector-effect": "non-scaling-stroke",
       });
+      // A likely range is drawn as a dashed line without its own point markers.
+      if (entry.dash === true) path.setAttribute("stroke-dasharray", "4 3");
       svg.appendChild(path);
       if (entry.area) {
         const first = run[0];
@@ -631,6 +633,7 @@ export function lines({ series, yMax, marks, hlines, ySuffix, yDecimals, yFormat
 
     for (const point of points) {
       if (!finite(point.value)) continue;
+      if (entry.dots === false) continue;
       const dot = h("button", {
         type: "button",
         class: "chart-point",

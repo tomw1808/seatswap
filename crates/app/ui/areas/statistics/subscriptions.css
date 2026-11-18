@@ -3,221 +3,316 @@
 
 .stats-subscriptions {
   flex: 1;
-  grid-template-columns: minmax(0, 1fr);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   grid-template-rows: auto auto minmax(0, 1fr);
   gap: 12px;
-}
-
-.stats-subscriptions > .stats-note {
-  grid-column: 1;
-  padding: 0 2px;
-}
-
-.stats-periods-card,
-.stats-sub-rows-card {
   min-width: 0;
+  min-height: 0;
 }
 
-.stats-periods-body {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  padding: 0 12px 8px;
+.stats-subscriptions > .hcard {
+  min-width: 0;
+  min-height: 0;
 }
 
-.stats-gantt-axis,
-.stats-gantt-row {
-  display: grid;
-  grid-template-columns: 260px minmax(0, 1fr);
-  gap: 8px;
-  align-items: center;
-}
+/* ---------- the totals line ---------- */
 
-.stats-gantt-axis {
-  min-height: 14px;
-  font-size: 9px;
-  color: var(--muted);
-}
-
-.stats-gantt-row {
-  min-height: 20px;
-}
-
-.stats-gantt-label {
-  display: flex;
+.stats-sub-totals {
+  grid-column: 1 / -1;
+  flex-direction: row;
   flex-wrap: wrap;
   align-items: center;
-  gap: 2px 5px;
+  gap: 4px 18px;
+  padding: 7px 12px;
+  font-size: 13px;
+  line-height: 18px;
+}
+
+.stats-sub-totals-title {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.stats-sub-totals b {
+  font-weight: 600;
+}
+
+/* ---------- the shared row pieces ---------- */
+
+.stats-sub-account {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   min-width: 0;
-  white-space: normal;
+}
+
+.stats-sub-work {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.stats-sub-basis {
+  white-space: nowrap;
+}
+
+.stats-warn {
+  color: var(--warn);
+}
+
+/* ---------- card 1: what does each plan give me? ---------- */
+
+.stats-sub-plans-body {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.stats-sub-plans-row {
+  grid-template-columns: 104px minmax(0, 1fr) 166px 64px;
+  column-gap: 8px;
+}
+
+.stats-sub-sizes-head {
+  grid-template-columns: 1fr;
+  height: 22px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 15px;
+}
+
+.stats-sub-size-row {
+  grid-template-columns: 30px minmax(0, 1fr) 150px 84px;
+  height: 22px;
+}
+
+.stats-sub-size-text {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+
+.stats-sub-size-name {
+  white-space: nowrap;
+}
+
+/* ---------- card 2: am I using what I pay for? ---------- */
+
+.stats-sub-usage-body {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.stats-sub-usage-row {
+  grid-template-columns: 136px 84px minmax(0, 1fr) 40px 64px 128px;
+  height: 26px;
+}
+
+.stats-sub-usage-group {
+  grid-template-columns: 1fr auto;
+  height: 20px;
   font-size: 11px;
 }
 
-.stats-gantt-label .stats-plan {
-  color: var(--muted);
-  font-size: 10px;
-  white-space: nowrap;
-}
-
-.stats-gantt-track {
-  position: relative;
-  height: 100%;
-  min-height: 16px;
-  border-radius: 5px;
-  background: var(--track);
-}
-
-.stats-gantt-axis .stats-gantt-track {
-  min-height: 14px;
-  background: none;
-}
-
-.stats-gantt-row .stats-gantt-track i {
-  position: absolute;
-  top: 2px;
-  bottom: 2px;
-  min-width: 3px;
-  border-radius: 4px;
-}
-
-.stats-gantt-axis .chart-axis-label {
-  line-height: 14px;
-}
-
-.stats-sub-rows-body {
-  padding: 0 12px 8px;
-  overflow-x: auto;
-}
-
-.stats-subrow {
-  display: grid;
-  grid-template-columns:
-    52px 62px 84px 62px 46px minmax(84px, 1fr) 50px
-    112px 62px 80px 128px 92px;
-  column-gap: 6px;
+.stats-sub-group-company {
+  display: flex;
   align-items: center;
-  min-height: 26px;
-  padding: 0 6px;
-  border-top: 1px solid var(--border);
-  border-radius: 5px;
-  font-size: 12px;
-}
-
-.stats-subrow > * {
+  gap: 4px;
   min-width: 0;
+  white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.stats-sub-usage-total {
+  font-weight: 600;
+  background: color-mix(in oklab, var(--text) 4%, transparent);
+}
+
+.stats-sub-total-label {
   white-space: nowrap;
 }
 
-.stats-subrow-head {
-  min-height: 18px;
-  border-top: 0;
-  color: var(--muted);
-  font-size: 9px;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
+.stats-sub-api {
+  white-space: nowrap;
 }
 
-.stats-subrow[role="button"] {
-  cursor: pointer;
+/* ---------- card 3: what 1 % of a limit buys ---------- */
+
+.stats-sub-acc-tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  min-width: 0;
 }
 
-.stats-subrow[role="button"]:hover,
-.stats-subrow[role="button"]:focus-visible {
+.stats-sub-acc-tab {
+  display: inline-flex;
+  align-items: center;
+  height: 24px;
+  padding: 0 1px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: none;
+  color: var(--text);
+}
+
+.stats-sub-acc-tab:hover {
   background: var(--hover);
 }
 
-.stats-subrow-selected {
-  background: var(--info-bg);
-  box-shadow: inset 2px 0 0 var(--focus);
+.stats-sub-acc-tab-on {
+  background: var(--card-raised);
+  border-color: var(--border);
+  box-shadow: 0 1px 2px var(--border);
 }
 
-.stats-sub-cell-account {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.stats-sub-cell-wide {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-}
-
-.stats-sub-cell-wide .stats-ubar {
+.stats-sub-onepct-body {
   flex: 1;
-  min-width: 20px;
-}
-
-.stats-tag-good {
-  color: var(--pill-text);
-  background: var(--pill-bg);
-  border: 1px solid var(--border);
-}
-
-.stats-tag-focus {
-  color: var(--focus);
-  background: var(--info-bg);
-  border: 1px solid var(--info-border);
-}
-
-.stats-tag-plain {
-  color: var(--muted);
-  background: var(--button-bg);
-  border: 1px solid var(--border);
-}
-
-.stats-whatif-card {
   min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
-.stats-whatif-body {
+.stats-sub-onepct {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0 12px 8px;
+}
+
+.stats-sub-onepct-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.stats-sub-models {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 14px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.stats-sub-onepct-panels {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.stats-sub-limit {
   flex: 1;
   min-height: 0;
   display: flex;
   flex-direction: column;
   gap: 4px;
-  padding: 0 12px 8px;
-  overflow: hidden;
 }
 
-.stats-whatif-kpis {
-  padding: 2px 0 2px;
+.stats-sub-limit .chart {
+  flex: 1;
+  min-height: 78px;
 }
 
-.stats-kpi-value-small {
-  font-size: 13px;
+.stats-sub-note {
+  margin: 0;
+  padding: 5px 10px;
+  border-left: 2px solid currentColor;
+  border-radius: 7px;
+  font-size: 12px;
   line-height: 17px;
 }
 
-.stats-kpi-sentence .stats-kpi-value {
-  font-size: 12px;
-  line-height: 16px;
-  white-space: normal;
-  overflow: visible;
+.stats-sub-note-ok {
+  border-color: var(--focus);
+  background: color-mix(in oklab, var(--focus) 10%, transparent);
+  color: var(--text);
 }
 
-.stats-whatif-charts {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  gap: 12px;
+.stats-sub-note-warn {
+  border-color: var(--warn);
+  background: color-mix(in oklab, var(--warn) 14%, transparent);
+  color: var(--text);
 }
 
-.stats-whatif-chart {
-  flex: 2 1 0;
-  min-width: 0;
-  min-height: 0;
+.stats-sub-now {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 15px;
+}
+
+/* ---------- card 4: tokens a week, per subscription and model ---------- */
+
+.stats-sub-tokens-body {
   display: flex;
   flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
 }
 
-.stats-whatif-tokens {
-  flex: 1 1 0;
+.stats-sub-model-row {
+  column-gap: 10px;
 }
 
-.stats-whatif-chart .chart {
-  min-height: 92px;
+.lr.hd.stats-sub-model-head {
+  height: 26px;
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 11px;
+  line-height: 12px;
+  white-space: normal;
 }
 
+.lr.hd.stats-sub-model-head > * {
+  white-space: normal;
+}
+
+.stats-sub-token-row {
+  height: 26px;
+}
+
+.stats-sub-token-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.stats-sub-token-text {
+  font-size: 11px;
+  line-height: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* An estimated figure has no measured range: its bar is striped. */
+.stats-subscriptions .stats-ubar-est i {
+  background: repeating-linear-gradient(135deg, var(--c) 0 3px, transparent 3px 6px);
+  box-shadow: inset 0 0 0 1px var(--c);
+  border-radius: 4px;
+}
+
+.stats-sub-token-note {
+  margin: auto 0 0;
+  padding: 2px 12px 4px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 15px;
+}

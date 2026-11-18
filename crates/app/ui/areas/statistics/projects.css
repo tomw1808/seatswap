@@ -123,20 +123,6 @@
   min-width: 0;
 }
 
-.stats-ubar {
-  display: block;
-  height: 8px;
-  border-radius: 4px;
-  background: var(--track);
-  overflow: hidden;
-}
-
-.stats-ubar i {
-  display: block;
-  height: 100%;
-  background: var(--focus);
-}
-
 .stats-split {
   display: flex;
   height: 8px;
