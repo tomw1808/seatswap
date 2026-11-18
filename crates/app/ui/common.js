@@ -698,15 +698,20 @@ function weekdayTimeText(value) {
 // "12s", "12min", "2h 31min", "3d 4h": the one duration spelling (review item
 // 42). No space between a number and its unit, one space between the two units,
 // at most two units; from a day on the minutes are left out. The caller rounds;
-// this function floors the seconds it is given.
-function durationText(seconds) {
+// this function floors the seconds it is given. `{ upTo: "h" }` keeps hours
+// from rolling over into days ("30h", "380h"): hours of work, not a span of
+// the calendar.
+function durationText(seconds, { upTo = "d" } = {}) {
   if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 0) {
     throw new Error(`invalid number of seconds ${String(seconds)}: use a finite number of 0 or more`);
+  }
+  if (upTo !== "d" && upTo !== "h") {
+    throw new Error(`invalid largest unit ${JSON.stringify(upTo)}: use "d" or "h"`);
   }
   const total = Math.floor(seconds);
   if (total < 60) return `${total}s`;
   if (total < 3600) return `${Math.floor(total / 60)}min`;
-  if (total < 86400) {
+  if (total < 86400 || upTo === "h") {
     const hours = Math.floor(total / 3600);
     const minutes = Math.floor((total % 3600) / 60);
     return minutes === 0 ? `${hours}h` : `${hours}h ${minutes}min`;

@@ -178,14 +178,13 @@ function ratioText(value, what) {
   return fixed.endsWith("0") ? fixed.slice(0, -1) : fixed;
 }
 
-// An hours figure as the mock-up writes it: whole hours from 1 h up, minutes
-// below ("30 h", "40 min"). Card 3's minutes stay durationText's.
+// An hours figure of work: whole hours from 1h up, minutes below ("30h",
+// "40min"), in the one duration spelling, hours not rolled into days.
 function hoursText(hours) {
   const value = requireNumber(hours, "a number of hours");
   if (value < 0) throw new Error(`a number of hours ${String(value)} is negative`);
-  const minutes = Math.round(value * 60);
-  if (minutes < 60) return `${minutes} min`;
-  return `${Math.round(minutes / 60)} h`;
+  const seconds = value >= 1 ? Math.round(value) * 3600 : Math.round(value * 60) * 60;
+  return durationText(seconds, { upTo: "h" });
 }
 
 function signedPercentText(value) {
