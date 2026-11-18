@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::history::{
     AccountRef, HistoryDir, HistoryError, Hosted, Hosts, Kind, Range, Record, SessionRecord,
+    TokenRecord,
 };
 use crate::project::ProjectKey;
 use crate::store::Account;
@@ -77,6 +78,11 @@ pub enum ProjectEdit {
         org: String,
         into: String,
     },
+    /// `org`'s merge into another organization stops applying; an `Assign`
+    /// made after the merge keeps the organization it names.
+    OrgUnjoin {
+        org: String,
+    },
     /// One account's organization; `None` = no organization.
     AccountOrg {
         account: AccountRef,
@@ -129,6 +135,7 @@ impl ProjectEdit {
                     None => Ok(()),
                 }
             }
+            ProjectEdit::OrgUnjoin { org } => validate_identity(org),
             ProjectEdit::AccountOrg { org, .. } => match org {
                 Some(org) => validate_identity(org),
                 None => Ok(()),
@@ -163,6 +170,8 @@ pub enum ProjectsError {
     OrganizationExists { name: String },
     #[error("the organization {org} does not exist")]
     UnknownOrganization { org: String },
+    #[error("the organization {org} is not merged into another")]
+    NotMerged { org: String },
     #[error("the organization {name} comes from the owner of {repository}; it cannot be removed")]
     OwnerOrganization { name: String, repository: String },
     #[error("an organization name must not start or end with a space")]
@@ -201,6 +210,7 @@ fn log_organizations(edit: &ProjectEdit) -> Vec<&str> {
         ProjectEdit::Assign { org: Some(org), .. }
         | ProjectEdit::OrgRename { org, .. }
         | ProjectEdit::OrgRemove { org }
+        | ProjectEdit::OrgUnjoin { org }
         | ProjectEdit::AccountOrg { org: Some(org), .. } => vec![org],
         ProjectEdit::OrgJoin { org, into } if !same_organization_name(org, into) => {
             vec![org, into]
@@ -267,6 +277,9 @@ pub struct Project {
     /// host → the folders seen there, sorted.
     pub folders: BTreeMap<String, Vec<String>>,
     pub sessions: u32,
+    /// The output tokens of all of this project's history, all hosts and all
+    /// time: filled by [`Projects::with_tokens`], 0 before it runs.
+    pub tokens: u64,
 }
 
 /// A project joined into another, with the name the core gives its key: a
@@ -294,11 +307,37 @@ impl Project {
             joined: Vec::new(),
             folders: BTreeMap::new(),
             sessions: 0,
+            tokens: 0,
         }
     }
 }
 
-/// An organization (spec §3.6): a name for several projects and the accounts
+/// Where an organization's identity came from (spec §11.6, documented rule):
+/// `owner` when the identity is the owner of a repository the history names,
+/// else `login` when a stored account's `orgName` names it, else `added`: every
+/// other identity came from an edit made in Settings (`OrgAdd`, or an
+/// `Assign`, `OrgJoin` or `AccountOrg` naming it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OrgSource {
+    Owner,
+    Login,
+    Added,
+}
+
+/// An organization merged into another (spec §11.6): the target's row names it
+/// under "merged in"; it is not a row of its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergedOrg {
+    /// The identity the project log names.
+    pub id: String,
+    /// The shown name: the identity unless an `OrgRename` changed it.
+    pub name: String,
+    pub source: OrgSource,
+}
+
+/// An organization (spec §11.6): a name for several projects and the accounts
 /// that are its subscriptions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -313,6 +352,18 @@ pub struct Org {
     /// The repositories whose owner this organization is, sorted. One of them
     /// is why the organization cannot be removed (decision 30).
     pub owner_repositories: Vec<String>,
+    /// Where the identity came from.
+    pub source: OrgSource,
+    /// The organizations merged into this one, sorted by name. They are not
+    /// rows of their own.
+    pub merged: Vec<MergedOrg>,
+    /// No project and no account: Settings lists it; Statistics leaves it out.
+    pub empty: bool,
+    /// The output tokens of all of this organization's projects, all time:
+    /// filled by [`Projects::with_tokens`], 0 before it runs.
+    pub tokens: u64,
+    /// The sessions of all of this organization's projects.
+    pub sessions: u32,
 }
 
 /// A stored account with the reference the history uses, so the page can write
@@ -517,6 +568,12 @@ impl Projects {
                         position,
                     ));
                 }
+                ProjectEdit::OrgUnjoin { org } => {
+                    // The latest `OrgJoin` of `org` stops applying: a later
+                    // `OrgJoin` of it merges it again. A project assigned after
+                    // the merge keeps the organization its `Assign` names.
+                    org_join.remove(&organization_key(org));
+                }
                 ProjectEdit::OrgAdd { name } => {
                     // The first spelling is the identity; a later add of the
                     // same name only moves the latest add's order.
@@ -566,11 +623,13 @@ impl Projects {
         }
 
         // The organizations that come from a repository owner (decision 30):
-        // only a project as it resolves now counts, so a joined member is out
-        // (its group's root repository is what the project shows) and a
-        // project assigned elsewhere is out. An organization whose
-        // repositories all went into other projects can be removed.
+        // a repository that is a project of its own now counts for the owner
+        // its group shows, also when an `Assign` moved the project to another
+        // organization. A repository joined into another project does not: its
+        // group's root repository is what the project shows, so an organization
+        // whose repositories all went into other projects can be removed.
         let mut owner_repos: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut owner_identities: BTreeSet<String> = BTreeSet::new();
         for (root, members) in &groups {
             if !members.iter().any(|key| sessions_of.contains_key(key)) {
                 // Nothing was ever seen in this project: it is not a row.
@@ -583,20 +642,11 @@ impl Projects {
                 continue;
             };
             let owner_root = join_root(&org_join, &organization_key(&owner));
-            let raw_org = match assigned.get(root) {
-                Some((org, _)) => org.clone(),
-                None => default_org_key(&root.key),
-            };
-            let Some(raw_org) = raw_org else {
-                continue;
-            };
-            let project_root = join_root(&org_join, &raw_org);
-            if same_organization_name(&project_root, &owner_root) {
-                owner_repos
-                    .entry(owner_root)
-                    .or_default()
-                    .insert(repo.clone());
-            }
+            owner_repos
+                .entry(owner_root)
+                .or_default()
+                .insert(repo.clone());
+            owner_identities.insert(organization_key(&owner));
         }
         let owner_roots: BTreeSet<String> = owner_repos.keys().cloned().collect();
 
@@ -658,6 +708,7 @@ impl Projects {
                     .map(|(host, cwds)| (host, cwds.into_iter().collect()))
                     .collect(),
                 sessions: session_ids.len() as u32,
+                tokens: 0,
             });
         }
 
@@ -680,6 +731,9 @@ impl Projects {
         identities.extend(org_names.keys().cloned());
         identities.extend(org_join.keys().cloned());
         identities.extend(org_join.values().map(|(into, _)| into.clone()));
+        // A repository owner stays an organization even when every project it
+        // owns was moved away (decision 30): it is then an empty row.
+        identities.extend(owner_identities.iter().cloned());
         identities.extend(
             account_org_edits
                 .iter()
@@ -786,32 +840,75 @@ impl Projects {
             accounts_in.entry(root).or_default().insert(account);
         }
 
+        let source_of = |identity: &str| -> OrgSource {
+            if owner_identities.contains(identity) {
+                return OrgSource::Owner;
+            }
+            let from_login = accounts.iter().any(|account| {
+                account.org_name.as_deref().is_some_and(|org| {
+                    !org.trim().is_empty() && same_organization_name(org, identity)
+                })
+            });
+            if from_login {
+                OrgSource::Login
+            } else {
+                OrgSource::Added
+            }
+        };
+
         let mut orgs: Vec<Org> = Vec::new();
-        for (root, _group) in by_root {
+        for (root, group) in by_root {
             let name = org_names
                 .get(&root)
                 .cloned()
                 .unwrap_or_else(|| spelled(&org_spelling, &root));
-            let project_count = projects
+            // The root's projects count, and so do the projects of every
+            // organization merged into it: their projects resolve to this root.
+            let mut project_count = 0u32;
+            let mut project_sessions = 0u32;
+            let mut project_tokens = 0u64;
+            for project in &projects {
+                if project
+                    .org
+                    .as_deref()
+                    .is_some_and(|org| same_organization_name(org, &root))
+                {
+                    project_count += 1;
+                    project_sessions += project.sessions;
+                    project_tokens += project.tokens;
+                }
+            }
+            let accounts: Vec<AccountRef> = accounts_in
+                .remove(&root)
+                .map(|own| own.into_iter().collect())
+                .unwrap_or_default();
+            let empty = project_count == 0 && accounts.is_empty();
+            let mut merged: Vec<MergedOrg> = group
                 .iter()
-                .filter(|project| {
-                    project
-                        .org
-                        .as_deref()
-                        .is_some_and(|org| same_organization_name(org, &root))
+                .filter(|identity| identity.as_str() != root.as_str())
+                .map(|identity| MergedOrg {
+                    id: spelled(&org_spelling, identity),
+                    name: org_names
+                        .get(identity)
+                        .cloned()
+                        .unwrap_or_else(|| spelled(&org_spelling, identity)),
+                    source: source_of(identity),
                 })
-                .count();
+                .collect();
+            merged.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
             orgs.push(Org {
                 name,
-                accounts: accounts_in
-                    .remove(&root)
-                    .map(|own| own.into_iter().collect())
-                    .unwrap_or_default(),
-                projects: project_count as u32,
+                accounts,
+                projects: project_count,
                 owner_repositories: owner_repos
                     .get(&root)
                     .map(|repos| repos.iter().cloned().collect())
                     .unwrap_or_default(),
+                source: source_of(&root),
+                merged,
+                empty,
+                tokens: project_tokens,
+                sessions: project_sessions,
                 id: spelled(&org_spelling, &root),
             });
         }
@@ -892,9 +989,51 @@ impl Projects {
         project
     }
 
+    /// Fill [`Project::tokens`] and the organizations' [`Org::tokens`] from the
+    /// history's token lines of every host and all time (spec §11.6). Each line
+    /// is resolved through the project joins with the same [`join_root`] that
+    /// [`resolve`](Projects::resolve) uses, and looked up in a map of the
+    /// project rows built once, so every line costs one lookup. A line whose
+    /// project is not a row (a key no session ever named) is still resolved
+    /// through the joins and counted if the project it resolves to is a row;
+    /// otherwise it has no row to be shown on and is left out. The read
+    /// warnings are returned, in the order the read makes them.
+    pub fn with_tokens(&mut self, history: &HistoryDir) -> Result<Vec<String>, HistoryError> {
+        let read = history.read::<TokenRecord>(&Range::ALL, &Hosts::All)?;
+        let mut row_of: BTreeMap<ProjectId, usize> = BTreeMap::new();
+        for (row, project) in self.projects.iter_mut().enumerate() {
+            project.tokens = 0;
+            row_of.insert(project.key.clone(), row);
+        }
+        for hosted in &read.records {
+            let key = join_root(
+                &self.joins,
+                &ProjectId::of(&hosted.record.project, &hosted.host),
+            );
+            if let Some(&row) = row_of.get(&key) {
+                self.projects[row].tokens += hosted.record.out;
+            }
+        }
+        for org in &mut self.orgs {
+            org.tokens = self
+                .projects
+                .iter()
+                .filter(|project| {
+                    project
+                        .org
+                        .as_deref()
+                        .is_some_and(|project_org| same_organization_name(project_org, &org.id))
+                })
+                .map(|project| project.tokens)
+                .sum();
+        }
+        Ok(read.warnings)
+    }
+
     /// Check an edit against what is resolved now: `OrgAdd` refuses a name
-    /// that already exists, and `OrgRemove` refuses an organization that comes
-    /// from a repository owner (decision 30). The structural checks of
+    /// that already exists, `OrgRemove` refuses an organization that comes
+    /// from a repository owner (decision 30), and `OrgUnjoin` refuses an
+    /// organization that is not merged now. The structural checks of
     /// [`ProjectEdit::validate`] run first. A refused edit appends nothing.
     pub fn validate_edit(&self, edit: &ProjectEdit) -> Result<(), ProjectsError> {
         edit.validate()?;
@@ -922,6 +1061,20 @@ impl Projects {
                         name: found.name.clone(),
                         repository: repository.clone(),
                     });
+                }
+                Ok(())
+            }
+            ProjectEdit::OrgUnjoin { org } => {
+                // Only an identity can be split off: the shown name is not
+                // the key `OrgUnjoin` removes from the join map.
+                let merged = self.orgs.iter().any(|found| {
+                    found
+                        .merged
+                        .iter()
+                        .any(|merged| same_organization_name(&merged.id, org))
+                });
+                if !merged {
+                    return Err(ProjectsError::NotMerged { org: org.clone() });
                 }
                 Ok(())
             }
@@ -1132,6 +1285,23 @@ mod tests {
         Hosted {
             host: host.to_string(),
             record: ProjectsLogRecord { t: utc(at), edit },
+        }
+    }
+
+    fn token(at: &str, session: &str, project: &ProjectId, out: u64) -> TokenRecord {
+        TokenRecord {
+            t: utc(at),
+            minutes: 5,
+            session: session.to_string(),
+            cwd: "/home/sam/projects/atlas".to_string(),
+            project: project.key.clone(),
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            input: 1234,
+            out,
+            cw: 12345,
+            cr: 67890,
+            answers: 3,
+            agent_answers: 0,
         }
     }
 
@@ -1485,7 +1655,14 @@ mod tests {
         )];
         let projects = Projects::resolve(&log, &sessions, &[]);
         assert_eq!(projects.projects[0].org, None);
-        assert!(projects.orgs.is_empty());
+        // The repository's owner organization stays, empty (decision 30).
+        let acme = projects
+            .orgs
+            .iter()
+            .find(|org| org.id == "acme")
+            .expect("the owner organization stays");
+        assert_eq!(acme.projects, 0);
+        assert!(acme.empty);
     }
 
     #[test]
@@ -1511,6 +1688,7 @@ mod tests {
                 joined: Vec::new(),
                 folders: BTreeMap::new(),
                 sessions: 0,
+                tokens: 0,
             }
         );
 
@@ -1525,6 +1703,7 @@ mod tests {
                 joined: Vec::new(),
                 folders: BTreeMap::new(),
                 sessions: 0,
+                tokens: 0,
             }
         );
     }
@@ -1551,6 +1730,20 @@ mod tests {
         );
         let read: ProjectsLogRecord = serde_json::from_str(&line).expect("the line reads back");
         assert_eq!(read, record);
+
+        let unjoin = ProjectsLogRecord {
+            t: utc("2026-11-14T10:00:00Z"),
+            edit: ProjectEdit::OrgUnjoin {
+                org: "acme".to_string(),
+            },
+        };
+        let line = serde_json::to_string(&unjoin).expect("a split-off line");
+        assert_eq!(
+            line,
+            "{\"t\":\"2026-11-14T10:00:00Z\",\"edit\":\"orgUnjoin\",\"org\":\"acme\"}"
+        );
+        let read: ProjectsLogRecord = serde_json::from_str(&line).expect("the line reads back");
+        assert_eq!(read, unjoin);
     }
 
     #[test]
@@ -1613,6 +1806,11 @@ mod tests {
         }
         .validate()
         .is_err());
+        assert!(ProjectEdit::OrgUnjoin {
+            org: " ".to_string()
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]
@@ -1658,6 +1856,16 @@ mod tests {
             ProjectEdit::OrgJoin {
                 org: org.to_string(),
                 into: into.to_string(),
+            },
+        )
+    }
+
+    fn org_unjoin(at: &str, org: &str) -> Hosted<ProjectsLogRecord> {
+        edit(
+            "atlas",
+            at,
+            ProjectEdit::OrgUnjoin {
+                org: org.to_string(),
             },
         )
     }
@@ -2082,8 +2290,23 @@ mod tests {
         );
         assert_eq!(projects.projects[0].org, None, "{:?}", projects.projects);
         // The account's only organization was removed, so it has none. The
-        // stored account itself is untouched.
-        assert!(projects.orgs.is_empty(), "{:?}", projects.orgs);
+        // stored account itself is untouched. The repository's owner
+        // organization acme stays, empty (decision 30).
+        assert!(
+            !projects
+                .orgs
+                .iter()
+                .any(|org| same_organization_name(&org.id, "Acme Inc.")),
+            "{:?}",
+            projects.orgs
+        );
+        let acme = projects
+            .orgs
+            .iter()
+            .find(|org| org.id == "acme")
+            .expect("the owner organization stays");
+        assert_eq!(acme.projects, 0);
+        assert!(acme.empty);
         assert!(projects
             .account_refs
             .iter()
@@ -2535,5 +2758,443 @@ mod tests {
             org: "LEDGER".to_string(),
         });
         assert!(removal.is_ok(), "{removal:?}");
+    }
+
+    #[test]
+    fn a_repository_first_seen_after_a_merge_counts_for_the_target() {
+        let existing = repo("github.com/acme/acme-kb");
+        let new_repo = repo("github.com/acme/new-repo");
+        let sessions = vec![
+            session(
+                "atlas",
+                "2026-11-14T09:00:00Z",
+                SESSION_A,
+                "/home/sam/projects/acme-kb",
+                existing.clone(),
+            ),
+            // The owner starts this repository after the merge was made.
+            session(
+                "vega",
+                "2026-11-14T11:00:00Z",
+                SESSION_B,
+                "/home/sam/src/new-repo",
+                new_repo.clone(),
+            ),
+        ];
+        let log = vec![org_join("2026-11-14T10:00:00Z", "acme", "ledger-co")];
+        let projects = Projects::resolve(&log, &sessions, &[]);
+
+        for key in [&existing, &new_repo] {
+            let project = projects
+                .projects
+                .iter()
+                .find(|project| &project.key == key)
+                .unwrap_or_else(|| panic!("the project {key:?} is a row"));
+            assert_eq!(project.org.as_deref(), Some("ledger-co"));
+        }
+        let ledger = projects
+            .orgs
+            .iter()
+            .find(|org| org.id == "ledger-co")
+            .expect("the target is the only row");
+        assert_eq!(projects.orgs.len(), 1, "{:?}", projects.orgs);
+        assert_eq!(ledger.projects, 2);
+        assert_eq!(
+            ledger.merged,
+            vec![MergedOrg {
+                id: "acme".to_string(),
+                name: "acme".to_string(),
+                source: OrgSource::Owner,
+            }]
+        );
+    }
+
+    #[test]
+    fn split_off_gives_back_the_projects_and_keeps_later_moves() {
+        let atlas = repo("github.com/acme/atlas");
+        let kb = repo("github.com/acme/acme-kb");
+        let sessions = vec![
+            session(
+                "atlas",
+                "2026-11-14T09:00:00Z",
+                SESSION_A,
+                "/home/sam/projects/atlas",
+                atlas.clone(),
+            ),
+            session(
+                "atlas",
+                "2026-11-14T09:05:00Z",
+                SESSION_B,
+                "/home/sam/projects/acme-kb",
+                kb.clone(),
+            ),
+        ];
+        let log = vec![
+            org_join("2026-11-14T10:00:00Z", "acme", "ledger-co"),
+            // Moved by hand after the merge: the later record wins.
+            edit(
+                "atlas",
+                "2026-11-14T10:05:00Z",
+                ProjectEdit::Assign {
+                    key: atlas.clone(),
+                    org: None,
+                },
+            ),
+            org_unjoin("2026-11-14T10:10:00Z", "acme"),
+        ];
+        let projects = Projects::resolve(&log, &sessions, &[]);
+
+        let atlas_project = projects
+            .projects
+            .iter()
+            .find(|project| project.key == atlas)
+            .expect("atlas is a row");
+        assert_eq!(atlas_project.org, None);
+        let kb_project = projects
+            .projects
+            .iter()
+            .find(|project| project.key == kb)
+            .expect("acme-kb is a row");
+        assert_eq!(kb_project.org.as_deref(), Some("acme"));
+        let acme = projects
+            .orgs
+            .iter()
+            .find(|org| org.id == "acme")
+            .expect("acme is a row again");
+        assert_eq!(acme.projects, 1);
+        assert_eq!(acme.sessions, 1);
+        assert!(acme.merged.is_empty(), "{acme:?}");
+        assert_eq!(acme.source, OrgSource::Owner);
+        assert!(
+            !projects.orgs.iter().any(|org| org.id == "ledger-co"),
+            "{:?}",
+            projects.orgs
+        );
+
+        let refused = projects
+            .validate_edit(&ProjectEdit::OrgUnjoin {
+                org: "acme".to_string(),
+            })
+            .expect_err("acme is not merged any more");
+        assert_eq!(
+            refused.to_string(),
+            "the organization acme is not merged into another"
+        );
+    }
+
+    #[test]
+    fn proof_split_off_by_shown_name_is_refused() {
+        let (_, sessions) = acme_repo_session("acme");
+        let log = vec![
+            org_join("2026-11-14T10:00:00Z", "acme", "ledger-co"),
+            edit(
+                "atlas",
+                "2026-11-14T10:01:00Z",
+                ProjectEdit::OrgRename {
+                    org: "acme".to_string(),
+                    name: "Acme Inc".to_string(),
+                },
+            ),
+        ];
+        let p = Projects::resolve(&log, &sessions, &[]);
+        let by_name = p.validate_edit(&ProjectEdit::OrgUnjoin {
+            org: "Acme Inc".to_string(),
+        });
+        assert!(by_name.is_err(), "{by_name:?}");
+        assert_eq!(
+            by_name
+                .expect_err("a shown name is not an identity")
+                .to_string(),
+            "the organization Acme Inc is not merged into another"
+        );
+        assert!(p
+            .validate_edit(&ProjectEdit::OrgUnjoin {
+                org: "acme".to_string(),
+            })
+            .is_ok());
+    }
+
+    #[test]
+    fn an_unknown_edit_is_skipped_with_a_warning() {
+        // A line a newer host wrote (here `somethingNew`, as a 1.3.0 host
+        // would meet `orgUnjoin`): the real reader keeps it as a warning and
+        // the other lines still apply.
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct SomethingNew {
+            t: DateTime<Utc>,
+            edit: String,
+            org: String,
+        }
+
+        impl Record for SomethingNew {
+            const KIND: Kind = Kind::Projects;
+
+            fn at(&self) -> DateTime<Utc> {
+                self.t
+            }
+        }
+
+        let tmp = tempfile::tempdir().expect("a temp folder");
+        let history = HistoryDir::at(tmp.path(), "atlas");
+        let key = repo("github.com/acme/acme-kb");
+        history
+            .append(
+                &session(
+                    "atlas",
+                    "2026-11-14T09:00:00Z",
+                    SESSION_A,
+                    "/home/sam/projects/acme-kb",
+                    key.clone(),
+                )
+                .record,
+            )
+            .expect("a session line");
+        history
+            .append(&ProjectsLogRecord {
+                t: utc("2026-11-14T10:00:00Z"),
+                edit: ProjectEdit::Rename {
+                    key: key.clone(),
+                    name: "Atlas engine".to_string(),
+                },
+            })
+            .expect("a rename line");
+        history
+            .append(&SomethingNew {
+                t: utc("2026-11-14T10:05:00Z"),
+                edit: "somethingNew".to_string(),
+                org: "acme".to_string(),
+            })
+            .expect("the newer line");
+        history
+            .append(&ProjectsLogRecord {
+                t: utc("2026-11-14T10:10:00Z"),
+                edit: ProjectEdit::Assign {
+                    key: key.clone(),
+                    org: Some("ledger-co".to_string()),
+                },
+            })
+            .expect("an assign line");
+
+        let (projects, warnings) = load(&history, &[]).expect("the log still reads");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("somethingNew"), "{warnings:?}");
+        assert_eq!(projects.projects.len(), 1, "{:?}", projects.projects);
+        assert_eq!(projects.projects[0].name, "Atlas engine");
+        assert_eq!(projects.projects[0].org.as_deref(), Some("ledger-co"));
+    }
+
+    #[test]
+    fn an_owner_organization_with_no_project_is_empty_and_kept() {
+        let key = repo("github.com/acme/acme-kb");
+        let sessions = vec![session(
+            "atlas",
+            "2026-11-14T10:00:00Z",
+            SESSION_A,
+            "/home/sam/projects/acme-kb",
+            key.clone(),
+        )];
+        let log = vec![edit(
+            "atlas",
+            "2026-11-14T10:05:00Z",
+            ProjectEdit::Assign {
+                key: key.clone(),
+                org: None,
+            },
+        )];
+        let projects = Projects::resolve(&log, &sessions, &[]);
+        assert_eq!(projects.projects[0].org, None);
+
+        let acme = projects
+            .orgs
+            .iter()
+            .find(|org| org.id == "acme")
+            .expect("the owner organization stays");
+        assert_eq!(acme.projects, 0);
+        assert!(acme.accounts.is_empty());
+        assert!(acme.empty);
+        assert_eq!(acme.sessions, 0);
+        assert_eq!(acme.source, OrgSource::Owner);
+        assert_eq!(
+            acme.owner_repositories,
+            vec!["github.com/acme/acme-kb".to_string()]
+        );
+        let refused = projects
+            .validate_edit(&ProjectEdit::OrgRemove {
+                org: "acme".to_string(),
+            })
+            .expect_err("an owner organization is never removed");
+        assert_eq!(
+            refused.to_string(),
+            "the organization acme comes from the owner of github.com/acme/acme-kb; it cannot be removed"
+        );
+    }
+
+    #[test]
+    fn the_origin_of_an_organization() {
+        let (_, sessions) = acme_repo_session("acme");
+        let accounts = vec![account("lb-local", Some("Ledger Team"))];
+        let log = vec![add("atlas", "2026-11-14T10:05:00Z", "notes")];
+        let projects = Projects::resolve(&log, &sessions, &accounts);
+        let source = |id: &str| {
+            projects
+                .orgs
+                .iter()
+                .find(|org| same_organization_name(&org.id, id))
+                .unwrap_or_else(|| panic!("the organization {id} is a row"))
+                .source
+        };
+        assert_eq!(source("acme"), OrgSource::Owner);
+        assert_eq!(source("Ledger Team"), OrgSource::Login);
+        assert_eq!(source("notes"), OrgSource::Added);
+    }
+
+    #[test]
+    fn tokens_are_summed_per_project_through_joins_and_per_organization() {
+        let tmp = tempfile::tempdir().expect("a temp folder");
+        let atlas_history = HistoryDir::at(tmp.path(), "atlas");
+        let vega_history = HistoryDir::at(tmp.path(), "vega");
+        let atlas = repo("github.com/acme/atlas");
+        let kb = repo("github.com/acme/acme-kb");
+        let old = folder("atlas-old", "atlas");
+        let ghost = folder("ghost", "atlas");
+        let stranger = repo("github.com/other/stranger");
+
+        for (at, id, key) in [
+            ("2026-11-14T09:00:00Z", SESSION_A, atlas.clone()),
+            ("2026-11-14T09:01:00Z", SESSION_B, kb.clone()),
+            ("2026-11-14T09:02:00Z", SESSION_B, old.clone()),
+        ] {
+            atlas_history
+                .append(&session("atlas", at, id, "/home/sam/projects/atlas", key).record)
+                .expect("a session line");
+        }
+        atlas_history
+            .append(&ProjectsLogRecord {
+                t: utc("2026-11-14T09:03:00Z"),
+                edit: ProjectEdit::Join {
+                    key: old.clone(),
+                    into: atlas.clone(),
+                },
+            })
+            .expect("a join line");
+        atlas_history
+            .append(&ProjectsLogRecord {
+                t: utc("2026-11-14T09:04:00Z"),
+                edit: ProjectEdit::Join {
+                    key: ghost.clone(),
+                    into: atlas.clone(),
+                },
+            })
+            .expect("a join line for a key no session named");
+        atlas_history
+            .append(&org_join("2026-11-14T09:05:00Z", "acme", "ledger-co").record)
+            .expect("an organization join line");
+
+        for (at, project, out) in [
+            ("2026-11-14T11:00:00Z", &atlas, 1200),
+            ("2026-11-14T11:01:00Z", &old, 340),
+            // A key no session named, joined into atlas: its line counts for
+            // atlas.
+            ("2026-11-14T11:02:00Z", &ghost, 90),
+            ("2026-11-14T11:03:00Z", &kb, 210),
+            // A key no session named and joined into nothing: it has no row,
+            // so it is not shown.
+            ("2026-11-14T11:04:00Z", &stranger, 70),
+        ] {
+            atlas_history
+                .append(&token(at, SESSION_A, project, out))
+                .expect("a token line");
+        }
+        // A token line of another host counts too: all hosts, all time.
+        vega_history
+            .append(&token("2026-11-14T11:05:00Z", SESSION_A, &atlas, 40))
+            .expect("a token line of another host");
+        // A host folder the reader recognizes: the marker a real host writes.
+        std::fs::write(
+            tmp.path().join("vega/host.json"),
+            "{\"machineId\":\"7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34\"}",
+        )
+        .expect("a host marker");
+
+        let (mut projects, warnings) = load(&atlas_history, &[]).expect("the history reads");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let token_warnings = projects
+            .with_tokens(&atlas_history)
+            .expect("the token lines read");
+        assert!(token_warnings.is_empty(), "{token_warnings:?}");
+
+        let tokens = |key: &ProjectId| {
+            projects
+                .projects
+                .iter()
+                .find(|project| &project.key == key)
+                .unwrap_or_else(|| panic!("the project {key:?} is a row"))
+                .tokens
+        };
+        assert_eq!(tokens(&atlas), 1200 + 340 + 90 + 40);
+        assert_eq!(tokens(&kb), 210);
+
+        let ledger = projects
+            .orgs
+            .iter()
+            .find(|org| org.id == "ledger-co")
+            .expect("the merged target");
+        assert_eq!(ledger.projects, 2);
+        assert_eq!(ledger.sessions, 3);
+        assert_eq!(ledger.tokens, 1200 + 340 + 90 + 40 + 210);
+    }
+
+    #[test]
+    fn with_tokens_gives_the_same_sums_for_300_projects() {
+        // The token lines of many projects: the map the reader builds once
+        // must find every row, with the same sums a lookup per line gives.
+        let tmp = tempfile::tempdir().expect("a temp folder");
+        let history = HistoryDir::at(tmp.path(), "atlas");
+        let mut keys: Vec<ProjectId> = Vec::new();
+        let mut sessions = Vec::new();
+        let mut token_lines = Vec::new();
+        for number in 0..300u64 {
+            let key = repo(&format!("github.com/acme/atlas-{number:03}"));
+            sessions.push(
+                session(
+                    "atlas",
+                    "2026-11-14T10:00:00Z",
+                    SESSION_A,
+                    "/home/sam/projects/atlas",
+                    key.clone(),
+                )
+                .record,
+            );
+            token_lines.push(token("2026-11-14T11:00:00Z", SESSION_A, &key, number + 1));
+            keys.push(key);
+        }
+        history.append_many(&sessions).expect("the session lines");
+        history.append_many(&token_lines).expect("the token lines");
+
+        let (mut projects, warnings) = load(&history, &[]).expect("the history reads");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(projects.projects.len(), 300);
+        let token_warnings = projects
+            .with_tokens(&history)
+            .expect("the token lines read");
+        assert!(token_warnings.is_empty(), "{token_warnings:?}");
+
+        let mut total = 0u64;
+        for (number, key) in keys.iter().enumerate() {
+            let project = projects
+                .projects
+                .iter()
+                .find(|project| &project.key == key)
+                .unwrap_or_else(|| panic!("the project {key:?} is a row"));
+            assert_eq!(project.tokens, number as u64 + 1);
+            total += project.tokens;
+        }
+        let acme = projects
+            .orgs
+            .iter()
+            .find(|org| org.id == "acme")
+            .expect("the owner organization");
+        assert_eq!(acme.projects, 300);
+        assert_eq!(acme.tokens, total);
     }
 }

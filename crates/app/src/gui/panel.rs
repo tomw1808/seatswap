@@ -946,8 +946,13 @@ fn projects_from(
     home: &Path,
     accounts: &[Account],
 ) -> Result<(Projects, Vec<String>), String> {
-    let (mut projects, warnings) =
+    let (mut projects, mut warnings) =
         projects::load(history, accounts).map_err(|error| error.to_string())?;
+    warnings.extend(
+        projects
+            .with_tokens(history)
+            .map_err(|error| error.to_string())?,
+    );
     for project in &mut projects.projects {
         for cwds in project.folders.values_mut() {
             for cwd in cwds.iter_mut() {
@@ -970,8 +975,10 @@ fn edit_projects(
 ) -> Result<(Projects, Vec<String>), String> {
     // The edit is checked on its own and against the projects as they are now
     // (a second organization of one name, an owner's organization removed):
-    // a refused edit never reaches the shared history.
-    let (current, _) = projects_from(history, home, accounts)?;
+    // a refused edit never reaches the shared history. This pass needs the
+    // resolution only, not the token lines or the `~` folders: read it
+    // directly, so one Settings edit does not read every token line twice.
+    let (current, _) = projects::load(history, accounts).map_err(|error| error.to_string())?;
     current
         .validate_edit(&edit)
         .map_err(|error| error.to_string())?;
