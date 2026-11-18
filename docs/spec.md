@@ -1054,6 +1054,8 @@ for closed Codex sessions. Auto-burn stays Anthropic-only.
                                (lock badge bottom right at 100 %, grey ring while unknown)
 ```
 
+- **Letters or percent.** The setting `iconText` puts the ring's percent in the disc instead of the letters: the whole percent of the limit `iconLimit` names, `0` to `99`, with 100 % (or more) shown as `99` so the disc never holds three digits; the closed ring and the lock badge show a full limit. While that limit has no reading yet, the disc keeps the letters beside the grey ring.
+
 - The icon is drawn at run time with `tiny-skia` and a bundled font, at each size the platform asks for (16, 20, 22, 24 and 32 px, and @2x/@3x). It is redrawn when the usage or the account changes. On Cinnamon a new icon every 0.5 s showed at once, at 1–2 ms per update *(tested)*.
 - **Text next to the icon, where the platform shows it:**
   - macOS: the menu bar title.
@@ -1153,6 +1155,7 @@ They give real click handling and exact placement on those desktops. They're not
 | `abbr`, `label`, `color`, `autoBurn` per account | from the account | **shared**. `autoBurn`: auto-burn may use this account, §7.4.4 |
 | `trayText` | `percent` | `percent` · `percent+reset` · `off` |
 | `iconLimit` | `binding` | which limit the ring shows: `binding` · `session` · `week` |
+| `iconText` | `letters` | what the disc shows: `letters` (the account's abbreviation) · `percent` (the ring's percent, 100 as `99`), §8.1 |
 | `pollActive` / `pollInactive` | 120 s / 900 s | |
 | `autoBurn` | off | auto-burn switches by itself, §7.4 |
 | `suggestSwitches` | on | when auto-burn is off, say what it would do, §7.4 |

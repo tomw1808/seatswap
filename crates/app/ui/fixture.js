@@ -43,6 +43,7 @@ export function refuseNextFixtureCall(command, text) {
 export const DEFAULT_SETTINGS = {
   trayText: "percent",
   iconLimit: "binding",
+  iconText: "letters",
   pollActiveSecs: 120,
   pollInactiveSecs: 900,
   autoBurn: false,

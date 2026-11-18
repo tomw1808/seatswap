@@ -1,8 +1,9 @@
 //! Tray icon drawing (spec §8.1, §8.2, §7.3).
 //!
-//! The icon is a disc in the active account's colour with its abbreviation and a
-//! ring that shows how much of the binding usage limit is used. Everything is
-//! drawn at run time so every size the platform asks for is sharp.
+//! The icon is a disc in the active account's colour with its abbreviation (or
+//! the ring's percent, setting `iconText`) and a ring that shows how much of
+//! the binding usage limit is used. Everything is drawn at run time so every
+//! size the platform asks for is sharp.
 
 use ab_glyph::{point, Font, FontRef, Glyph, PxScale, ScaleFont};
 use tiny_skia::{FillRule, LineCap, Paint, Path, PathBuilder, Pixmap, Stroke, Transform};
@@ -17,8 +18,9 @@ const WHITE: [u8; 3] = [0xff, 0xff, 0xff];
 
 /// What the tray icon shows for the active account (docs/implementation.md).
 pub struct IconSpec {
-    /// 1–2 characters, already validated.
-    pub abbr: String,
+    /// What the disc shows: 1–2 characters, the account's validated
+    /// abbreviation or the ring's percent (`tray::icon_spec`).
+    pub text: String,
     /// The account's colour.
     pub account_color: [u8; 3],
     /// Binding limit: percent 0..=100+ and its load colour. `None` = unknown → grey ring.
@@ -180,7 +182,7 @@ fn draw_disc(pixmap: &mut Pixmap, spec: &IconSpec, geometry: &Geometry) {
 }
 
 fn draw_letters(pixmap: &mut Pixmap, spec: &IconSpec, geometry: &Geometry) {
-    let chars: Vec<char> = spec.abbr.chars().take(2).collect();
+    let chars: Vec<char> = spec.text.chars().take(2).collect();
     if chars.is_empty() || geometry.disc_radius <= 0.0 {
         return;
     }
@@ -450,7 +452,7 @@ mod tests {
 
     fn spec(abbr: &str, account_color: [u8; 3], ring: Option<(f64, [u8; 3])>) -> IconSpec {
         IconSpec {
-            abbr: abbr.to_string(),
+            text: abbr.to_string(),
             account_color,
             ring,
             locked: false,
@@ -709,7 +711,7 @@ mod tests {
     #[test]
     fn letters_grow_with_the_icon() {
         let spec = IconSpec {
-            abbr: "H".to_string(),
+            text: "H".to_string(),
             account_color: [0x1e, 0x3a, 0x8a],
             ring: None,
             locked: false,
@@ -741,7 +743,7 @@ mod tests {
                 "as-22",
                 22,
                 IconSpec {
-                    abbr: "AS".to_string(),
+                    text: "AS".to_string(),
                     account_color: [0x1e, 0x3a, 0x8a],
                     ring: Some((37.0, [0x22, 0xc5, 0x5e])),
                     locked: false,
@@ -752,7 +754,7 @@ mod tests {
                 "p-32",
                 32,
                 IconSpec {
-                    abbr: "P".to_string(),
+                    text: "P".to_string(),
                     account_color: [0x0f, 0x76, 0x6e],
                     ring: Some((72.0, [0xf5, 0x9e, 0x0b])),
                     locked: false,
@@ -763,7 +765,7 @@ mod tests {
                 "wm-64-locked",
                 64,
                 IconSpec {
-                    abbr: "WM".to_string(),
+                    text: "WM".to_string(),
                     account_color: [0xfd, 0xe0, 0x47],
                     ring: Some((100.0, [0xef, 0x44, 0x44])),
                     locked: true,
@@ -774,7 +776,7 @@ mod tests {
                 "as-64-mono",
                 64,
                 IconSpec {
-                    abbr: "AS".to_string(),
+                    text: "AS".to_string(),
                     account_color: [0x1e, 0x3a, 0x8a],
                     ring: Some((58.0, [0x22, 0xc5, 0x5e])),
                     locked: false,
@@ -785,7 +787,7 @@ mod tests {
                 "unknown-64",
                 64,
                 IconSpec {
-                    abbr: "AS".to_string(),
+                    text: "AS".to_string(),
                     account_color: [0x1e, 0x3a, 0x8a],
                     ring: None,
                     locked: false,

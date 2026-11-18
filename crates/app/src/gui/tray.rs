@@ -8,7 +8,7 @@ use chrono::{DateTime, Local, Utc};
 use seatswap_core::api::Usage;
 use seatswap_core::engine::AccountView;
 use seatswap_core::paths::AppPaths;
-use seatswap_core::store::{IconLimit, LoginState, Settings, TrayText};
+use seatswap_core::store::{IconLimit, IconText, LoginState, Settings, TrayText};
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -36,11 +36,11 @@ fn active_view(views: &[AccountView]) -> Option<&AccountView> {
     views.iter().find(|view| view.is_active)
 }
 
-/// The icon for the live account and the `iconLimit` setting.
+/// The icon for the live account and the `iconLimit` and `iconText` settings.
 pub(crate) fn icon_spec(views: &[AccountView], settings: Option<&Settings>) -> IconSpec {
     let Some(view) = active_view(views).filter(|_| settings.is_some()) else {
         return IconSpec {
-            abbr: "?".to_string(),
+            text: "?".to_string(),
             account_color: GREY,
             ring: None,
             locked: false,
@@ -49,7 +49,7 @@ pub(crate) fn icon_spec(views: &[AccountView], settings: Option<&Settings>) -> I
     };
     let Some(settings) = settings else {
         return IconSpec {
-            abbr: "?".to_string(),
+            text: "?".to_string(),
             account_color: GREY,
             ring: None,
             locked: false,
@@ -67,12 +67,33 @@ pub(crate) fn icon_spec(views: &[AccountView], settings: Option<&Settings>) -> I
         let level_color = format::parse_color(limit.level().color()).unwrap_or(GREY);
         (limit.percent, level_color)
     });
+    let text = match settings.icon_text {
+        IconText::Letters => view.abbr.clone(),
+        // No reading yet: the letters, beside the grey ring that says so.
+        IconText::Percent => {
+            limit.map_or_else(|| view.abbr.clone(), |limit| icon_percent(limit.percent))
+        }
+    };
     IconSpec {
-        abbr: view.abbr.clone(),
+        text,
         account_color: color,
         ring,
         locked: limit.is_some_and(|limit| limit.percent >= 100.0),
         monochrome: false,
+    }
+}
+
+/// The ring's percent as the disc's text (`iconText` `percent`): the whole
+/// percent, and 100 (or more) as `99`, so the disc never holds three digits
+/// (owner, 18 Nov 2026). A full limit still shows: the ring is closed and the
+/// lock badge is drawn.
+fn icon_percent(percent: f64) -> String {
+    debug_assert!(percent >= 0.0, "a usage percent is never negative");
+    let whole = percent.round();
+    if whole >= 100.0 {
+        "99".to_string()
+    } else {
+        format!("{whole:.0}")
     }
 }
 
@@ -673,6 +694,54 @@ mod tests {
     }
 
     #[test]
+    fn icon_text_percent_shows_the_rings_limit_with_100_as_99() {
+        let mut settings = Settings::default();
+        let views = vec![view(
+            "AC",
+            "Acme",
+            true,
+            Some(both_limits()),
+            LoginState::Ok,
+        )];
+        assert_eq!(icon_spec(&views, Some(&settings)).text, "AC");
+
+        settings.icon_text = IconText::Percent;
+        assert_eq!(icon_spec(&views, Some(&settings)).text, "97");
+        settings.icon_limit = IconLimit::Week;
+        assert_eq!(icon_spec(&views, Some(&settings)).text, "48");
+
+        settings.icon_limit = IconLimit::Session;
+        for (percent, shown) in [
+            (100.0, "99"),
+            (99.6, "99"),
+            (99.4, "99"),
+            (7.2, "7"),
+            (0.0, "0"),
+        ] {
+            let full = vec![view(
+                "AC",
+                "Acme",
+                true,
+                Some(usage(vec![limit(LimitKind::Session, percent, true, None)])),
+                LoginState::Ok,
+            )];
+            assert_eq!(icon_spec(&full, Some(&settings)).text, shown, "{percent} %");
+        }
+    }
+
+    #[test]
+    fn icon_text_percent_without_a_reading_shows_the_letters() {
+        let settings = Settings {
+            icon_text: IconText::Percent,
+            ..Settings::default()
+        };
+        let views = vec![view("AC", "Acme", true, None, LoginState::Ok)];
+        let spec = icon_spec(&views, Some(&settings));
+        assert_eq!(spec.text, "AC");
+        assert_eq!(spec.ring, None);
+    }
+
+    #[test]
     fn a_full_limit_is_locked() {
         let settings = Settings {
             icon_limit: IconLimit::Session,
@@ -687,7 +756,7 @@ mod tests {
         )];
         let spec = icon_spec(&views, Some(&settings));
         assert!(spec.locked);
-        assert_eq!(spec.abbr, "AC");
+        assert_eq!(spec.text, "AC");
         assert_eq!(spec.account_color, [0x1e, 0x3a, 0x8a]);
     }
 
@@ -698,7 +767,7 @@ mod tests {
         assert_eq!(icon_spec(&views, Some(&settings)).ring, None);
 
         let spec = icon_spec(&[], Some(&settings));
-        assert_eq!(spec.abbr, "?");
+        assert_eq!(spec.text, "?");
         assert_eq!(spec.account_color, GREY);
         assert_eq!(spec.ring, None);
         assert!(!spec.locked);

@@ -1250,7 +1250,7 @@ pub(crate) fn icon_preview(abbr: String, color: String) -> Result<Vec<IconPx>, S
     let account_color =
         format::parse_color(&color).ok_or_else(|| format!("invalid colour {color:?}"))?;
     let spec = IconSpec {
-        abbr,
+        text: abbr,
         account_color,
         ring: None,
         locked: false,

@@ -314,6 +314,9 @@ export function validateFixtureSettings(settings) {
   if (!["binding", "session", "week"].includes(merged.iconLimit)) {
     throw new Error(`invalid iconLimit ${JSON.stringify(merged.iconLimit)}`);
   }
+  if (!["letters", "percent"].includes(merged.iconText)) {
+    throw new Error(`invalid iconText ${JSON.stringify(merged.iconText)}`);
+  }
   if (!["system", "light", "dark"].includes(merged.theme)) {
     throw new Error(`invalid theme ${JSON.stringify(merged.theme)}`);
   }

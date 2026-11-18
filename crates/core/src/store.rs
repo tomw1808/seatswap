@@ -161,6 +161,15 @@ pub enum TrayText {
     Off,
 }
 
+/// What the tray icon's disc shows (spec §8.1, §10): the live account's letters,
+/// or the percent of the limit the ring shows ([`IconLimit`]), 100 as `99`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum IconText {
+    Letters,
+    Percent,
+}
+
 /// Which limit the tray ring shows (spec §10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -767,6 +776,10 @@ fn default_icon_limit() -> IconLimit {
     IconLimit::Binding
 }
 
+fn default_icon_text() -> IconText {
+    IconText::Letters
+}
+
 fn default_poll_active_secs() -> u64 {
     DEFAULT_POLL_ACTIVE_SECS
 }
@@ -915,6 +928,8 @@ pub struct Settings {
     pub tray_text: TrayText,
     #[serde(default = "default_icon_limit")]
     pub icon_limit: IconLimit,
+    #[serde(default = "default_icon_text")]
+    pub icon_text: IconText,
     #[serde(default = "default_poll_active_secs")]
     pub poll_active_secs: u64,
     #[serde(default = "default_poll_inactive_secs")]
@@ -1012,6 +1027,7 @@ impl Default for Settings {
         Settings {
             tray_text: default_tray_text(),
             icon_limit: default_icon_limit(),
+            icon_text: default_icon_text(),
             poll_active_secs: default_poll_active_secs(),
             poll_inactive_secs: default_poll_inactive_secs(),
             auto_burn: default_auto_burn(),
@@ -2317,6 +2333,7 @@ mod tests {
         file.settings = Settings {
             tray_text: TrayText::PercentReset,
             icon_limit: IconLimit::Week,
+            icon_text: IconText::Percent,
             theme: Theme::Dark,
             claude_config_dir: Some(PathBuf::from("/home/u/.claude")),
             ..Settings::default()
@@ -2348,6 +2365,7 @@ mod tests {
             "\"emailAddress\"",
             "\"trayText\": \"percentReset\"",
             "\"iconLimit\": \"week\"",
+            "\"iconText\": \"percent\"",
             "\"theme\": \"dark\"",
             "\"claudeConfigDir\"",
         ] {
@@ -2380,6 +2398,7 @@ mod tests {
         assert!(file.settings.suggest_switches);
         assert_eq!(file.settings.tray_text, TrayText::PercentReset);
         assert_eq!(file.settings.icon_limit, IconLimit::Binding);
+        assert_eq!(file.settings.icon_text, IconText::Letters);
         assert_eq!(file.settings.theme, Theme::System);
         assert_eq!(file.settings.hotkey, "Ctrl+Alt+C");
         assert!(file.settings.notify_on_switch);

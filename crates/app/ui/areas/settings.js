@@ -2628,6 +2628,21 @@ function generalCard() {
       "iconLimit"
     )
   );
+  body.appendChild(
+    setting(
+      "The tray icon shows",
+      selectSetting(
+        "iconText",
+        [
+          ["letters", "The account's letters"],
+          ["percent", "The ring's percent (100 as 99)"],
+        ],
+        "The tray icon shows"
+      ),
+      "",
+      "iconText"
+    )
+  );
   body.appendChild(section("Start and polling"));
   body.appendChild(
     setting("Start at login", toggle("startAtLogin", "Start at login"), "", "startAtLogin")

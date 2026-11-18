@@ -24,6 +24,8 @@ All notable changes to this project are documented here. The format follows
 - Codex sessions write token lines too, from the growth of their rollout files' running totals, so
   their work is counted at API prices in the statistics.
 - Settings → General shows `seatswap <version>`.
+- Settings → General → "The tray icon shows": the account's letters (as before) or the ring's percent,
+  with 100 % shown as 99 so it stays two digits.
 
 ### Changed
 
@@ -40,6 +42,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Windows: Sessions now shows a flash job's task. flash-agents keeps its job reports in
+  `%LOCALAPPDATA%\flash-agents` there, and seatswap looked in `~/.local/state/flash-agents`; it now
+  follows flash-agents' own rule on every system, `$FLASH_DATA_DIR` included.
 - A price typed at most 15 minutes before a plan change belongs to the new plan's period, so it no
   longer makes a minutes-long period at the new price.
 - Windows: Sessions now shows a flash job's task. flash-agents keeps its job reports in
