@@ -5203,9 +5203,11 @@ mod tests {
                 api: None,
                 api_currency: None,
                 api_missing: None,
+                api_partial: false,
                 subscription: None,
                 currency: None,
                 subscription_missing: None,
+                subscription_partial: false,
             },
         }
     }

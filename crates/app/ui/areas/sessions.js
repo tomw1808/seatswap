@@ -20,6 +20,7 @@ import {
   readChoice,
   sessionName,
   showTokens,
+  valueNode,
   valueSummary,
   valueText,
   writeChoice,
@@ -273,15 +274,6 @@ function otherHostStale(row) {
   if (!view || !Array.isArray(view.hosts)) return null;
   if (row.host && row.host === view.thisHost) return null;
   return view.hosts.find((host) => host.host === row.host) || null;
-}
-
-function valueNode(values, kind, viewCurrency, className) {
-  const value = valueText(values, kind, viewCurrency);
-  return h(
-    "span",
-    { class: className || "n", title: value.title || null },
-    value.text
-  );
 }
 
 function tokenNode(count, className) {
@@ -1427,6 +1419,10 @@ function sessionCells(row, options, now) {
         tiedNode(row),
       ]);
   const lastHour = lastHourCell(row);
+  const subscription = valueNode(row.values, "subscription", currency);
+  subscription.className = "n";
+  const api = valueNode(row.values, "api", currency);
+  api.className = "n";
   return [
     h(
       "span",
@@ -1438,8 +1434,8 @@ function sessionCells(row, options, now) {
     agentsCell(row.agentsRunning, row.agentsDone, hasAgentData(row)),
     tokenNode(row.tokens ? row.tokens.out : 0),
     lastHour,
-    valueNode(row.values, "subscription", currency),
-    valueNode(row.values, "api", currency),
+    subscription,
+    api,
     hostNode(row),
   ];
 }
@@ -1682,6 +1678,10 @@ function agentCells(agent, children, depth) {
   const name = agentNameNode(agent);
   const running = children.filter((child) => child.running).length;
   const done = children.length - running;
+  const subscription = valueNode(agent.values, "subscription", view.currency);
+  subscription.className = "n";
+  const api = valueNode(agent.values, "api", view.currency);
+  api.className = "n";
   return [
     h(
       "span",
@@ -1693,8 +1693,8 @@ function agentCells(agent, children, depth) {
     children.length ? agentsCell(running, done, true) : h("span", {}, ""),
     tokenNode(agent.tokens ? agent.tokens.out : 0),
     h("span", { class: "n" }, ""),
-    valueNode(agent.values, "subscription", view.currency),
-    valueNode(agent.values, "api", view.currency),
+    subscription,
+    api,
     h("span", {}, ""),
   ];
 }
@@ -1743,8 +1743,10 @@ function completedNode(session, agents, depth, parentKey, values) {
     typeof values === "string"
       ? { subscription: null, subscriptionMissing: values, api: null, apiMissing: values }
       : values;
-  const subscription = valueNode(lineValues, "subscription", state.view.currency, "n");
-  const api = valueNode(lineValues, "api", state.view.currency, "n");
+  const subscription = valueNode(lineValues, "subscription", state.view.currency);
+  subscription.className = "n";
+  const api = valueNode(lineValues, "api", state.view.currency);
+  api.className = "n";
   const row = h("div", { class: "sess-row sess-agent sess-completed" }, [
     h(
       "span",

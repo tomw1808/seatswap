@@ -2483,9 +2483,11 @@ mod tests {
                 api: Some(api),
                 api_currency: Some(currency.to_string()),
                 api_missing: None,
+                api_partial: false,
                 subscription: Some(subscription),
                 currency: Some(currency.to_string()),
                 subscription_missing: None,
+                subscription_partial: false,
             }
         }
 
@@ -2607,9 +2609,11 @@ mod tests {
                 api: Some(api),
                 api_currency: Some(currency.to_string()),
                 api_missing: None,
+                api_partial: false,
                 subscription: Some(subscription),
                 currency: Some(currency.to_string()),
                 subscription_missing: None,
+                subscription_partial: false,
             }
         }
 
@@ -2725,9 +2729,11 @@ mod tests {
             api: Some(20.357),
             api_currency: Some("EUR".to_string()),
             api_missing: None,
+            api_partial: false,
             subscription: Some(1.47),
             currency: Some("EUR".to_string()),
             subscription_missing: None,
+            subscription_partial: false,
         };
         let view = view_of(
             now,
@@ -2782,9 +2788,11 @@ mod tests {
             api: None,
             api_currency: None,
             api_missing: Some(REASON.to_string()),
+            api_partial: false,
             subscription: None,
             currency: Some("EUR".to_string()),
             subscription_missing: Some(REASON.to_string()),
+            subscription_partial: false,
         };
         let view = view_of(
             now,
@@ -2840,9 +2848,11 @@ mod tests {
                 api: Some(api),
                 api_currency: Some(currency.to_string()),
                 api_missing: None,
+                api_partial: false,
                 subscription: Some(subscription),
                 currency: Some(currency.to_string()),
                 subscription_missing: None,
+                subscription_partial: false,
             }
         }
 
@@ -2872,9 +2882,11 @@ mod tests {
             api: None,
             api_currency: None,
             api_missing: Some(REASON.to_string()),
+            api_partial: false,
             subscription: None,
             currency: Some("EUR".to_string()),
             subscription_missing: Some(REASON.to_string()),
+            subscription_partial: false,
         };
         codex.values = valued(1.0, 10.0, "EUR");
         let view = view_of(

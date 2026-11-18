@@ -69,6 +69,22 @@ pub(crate) fn add_value<K: Ord>(values: &mut BTreeMap<K, Values>, key: K, next: 
     }
 }
 
+/// One half's value when it is full, else `None` with the half's reason. A
+/// share, ratio or percent is computed only from halves that are not partial
+/// (R3): a partial half is a known lower bound, and a quotient of a lower bound
+/// is not a figure. An amount on its own may stay partial and is drawn "≥".
+pub(crate) fn full_half(
+    value: Option<f64>,
+    partial: bool,
+    missing: Option<&str>,
+) -> (Option<f64>, Option<String>) {
+    if partial || value.is_none() {
+        (None, missing.map(str::to_string))
+    } else {
+        (value, None)
+    }
+}
+
 /// The span of one account week: from the start of its first window to the end
 /// of its last one. A week may hold several windows after a reset.
 pub(crate) fn week_span(week: &AccountWeek) -> Range {
@@ -1027,18 +1043,28 @@ pub(crate) fn top_three(mut items: Vec<(String, f64)>) -> Vec<(String, f64)> {
 }
 
 /// Each project's share of the API value of `total`, in percent, the three
-/// largest then `other` ([`top_three`]); a project whose API value is unknown
-/// is left out. Empty when the total's API value is unknown or 0: a share of
-/// nothing is no share. `by_project` and `total` are sums of [`Values::of`].
+/// largest then `other` ([`top_three`]). A share is computed only from halves
+/// that are not partial (R3): a partial total has no shares, as an unknown or 0
+/// one has none, and a project whose API half is partial or unknown is left out.
+/// Empty when the total's API value is unknown or 0: a share of nothing is no
+/// share. `by_project` and `total` are sums of [`Values::of`].
 pub(crate) fn api_shares(
     by_project: BTreeMap<String, Values>,
     total: &Values,
 ) -> Vec<(String, f64)> {
-    match total.api {
+    let (total, _) = full_half(total.api, total.api_partial, total.api_missing.as_deref());
+    match total {
         Some(total) if total > 0.0 => top_three(
             by_project
                 .into_iter()
-                .filter_map(|(name, values)| values.api.map(|value| (name, value / total * 100.0)))
+                .filter_map(|(name, values)| {
+                    let (value, _) = full_half(
+                        values.api,
+                        values.api_partial,
+                        values.api_missing.as_deref(),
+                    );
+                    value.map(|value| (name, value / total * 100.0))
+                })
                 .collect(),
         ),
         _ => Vec::new(),
@@ -3438,5 +3464,93 @@ pub(crate) mod tests {
             external: 5,
         };
         assert_eq!(counts.total(), 15);
+    }
+
+    /// A value whose halves are in `currency`, both known.
+    fn values_in(currency: &str, api: f64, subscription: f64) -> Values {
+        Values {
+            api: Some(api),
+            api_currency: Some(currency.to_string()),
+            api_missing: None,
+            api_partial: false,
+            subscription: Some(subscription),
+            currency: Some(currency.to_string()),
+            subscription_missing: None,
+            subscription_partial: false,
+        }
+    }
+
+    /// Folding values one by one goes through `Values::sum`, so a half that two
+    /// currencies made unknown stays unknown with that reason when a third
+    /// value of one of the currencies is added (R3, one way per job).
+    #[test]
+    fn folding_values_one_by_one_is_one_sum_when_two_currencies_meet() {
+        let eur1 = values_in("EUR", 1.0, 0.5);
+        let usd = values_in("USD", 2.0, 0.75);
+        let eur2 = values_in("EUR", 3.0, 1.5);
+        let flat = Values::sum(&[&eur1, &usd, &eur2]);
+
+        let mut folded: Option<Values> = None;
+        add_opt_value(&mut folded, &eur1);
+        add_opt_value(&mut folded, &usd);
+        add_opt_value(&mut folded, &eur2);
+        let folded = folded.expect("the three folded values");
+
+        assert_eq!(flat.api, None, "two API currencies are never added");
+        assert_eq!(
+            flat.api_missing.as_deref(),
+            Some(
+                "the dollar rate is missing for some of these days, so the values are in two currencies"
+            )
+        );
+        assert_eq!(folded.api, flat.api, "folding changed the API half");
+        assert_eq!(folded.api_missing, flat.api_missing);
+        assert_eq!(folded.api_partial, flat.api_partial);
+        assert_eq!(flat.subscription, None);
+        assert_eq!(
+            flat.subscription_missing.as_deref(),
+            Some("these sessions are valued in two currencies")
+        );
+        assert_eq!(
+            folded.subscription, flat.subscription,
+            "folding changed the subscription half"
+        );
+        assert_eq!(folded.subscription_missing, flat.subscription_missing);
+        assert_eq!(folded.subscription_partial, flat.subscription_partial);
+    }
+
+    /// A share is computed only from halves that are not partial (R3): a partial
+    /// total has no shares, and a partial part is left out of them.
+    #[test]
+    fn no_share_comes_from_a_partial_half() {
+        let full = |api: f64| values_in("EUR", api, 0.0);
+        let partial = Values {
+            api: Some(40.0),
+            api_currency: Some("EUR".to_string()),
+            api_missing: Some("no price for claude-x".to_string()),
+            api_partial: true,
+            subscription: None,
+            currency: Some("EUR".to_string()),
+            subscription_missing: Some("no price for claude-x".to_string()),
+            subscription_partial: false,
+        };
+        let by_project = BTreeMap::from([
+            ("atlas".to_string(), full(60.0)),
+            ("ledger".to_string(), partial.clone()),
+        ]);
+
+        let partial_total = Values::sum(&[&full(60.0), &partial]);
+        assert!(partial_total.api_partial, "{partial_total:?}");
+        assert!(
+            api_shares(by_project.clone(), &partial_total).is_empty(),
+            "a share of a partial total is no figure"
+        );
+
+        let full_total = Values::sum(&[&full(60.0), &full(60.0)]);
+        assert_eq!(
+            api_shares(by_project, &full_total),
+            vec![("atlas".to_string(), 50.0)],
+            "the partial project is left out, the full one keeps its share"
+        );
     }
 }

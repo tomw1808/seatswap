@@ -1285,43 +1285,37 @@ mod tests {
                 .sum::<u64>();
             working += lane.working;
         }
-        // A `Values` sum is all or nothing: a half one host misses makes the
-        // total unknown with that reason.
-        let subscription = page
+        // A `Values` sum keeps the known part when a host misses a half (R3):
+        // the total is the sum of the hosts that have it, marked partial.
+        let known_subscription: f64 = page
             .lanes
             .iter()
-            .map(|lane| lane.values.subscription)
-            .try_fold(0.0, |sum, value| value.map(|value| sum + value));
-        let api = page
-            .lanes
-            .iter()
-            .map(|lane| lane.values.api)
-            .try_fold(0.0, |sum, value| value.map(|value| sum + value));
+            .filter_map(|lane| lane.values.subscription)
+            .sum();
+        let known_api: f64 = page.lanes.iter().filter_map(|lane| lane.values.api).sum();
         assert_eq!(page.total_tokens, tokens);
         assert_eq!(
             page.total_tokens.out,
             lane(&page, "atlas").tokens.out + lane(&page, "vega").tokens.out
         );
-        match (page.total_values.subscription, subscription) {
-            (Some(total), Some(sum)) => assert!(
-                close(total, sum),
-                "the subscription total {total} is the sum over hosts {sum}"
+        assert!(
+            close(
+                page.total_values
+                    .subscription
+                    .expect("a known subscription part"),
+                known_subscription
             ),
-            (None, None) => {}
-            (total, sum) => {
-                panic!("the subscription total {total:?} must be the sum over hosts {sum:?}")
-            }
-        }
-        match (page.total_values.api, api) {
-            (Some(total), Some(sum)) => {
-                assert!(
-                    close(total, sum),
-                    "the API total {total} is the sum over hosts {sum}"
-                )
-            }
-            (None, None) => {}
-            (total, sum) => panic!("the API total {total:?} must be the sum over hosts {sum:?}"),
-        }
+            "the subscription total is the known part over hosts {}",
+            known_subscription
+        );
+        assert!(
+            page.total_values.subscription_partial,
+            "a host without a subscription part makes the total partial"
+        );
+        assert!(
+            close(page.total_values.api.expect("a known API part"), known_api),
+            "the API total is the known part over hosts"
+        );
         assert!(
             close(
                 page.per_working_hour.expect("a working hour in the lanes"),

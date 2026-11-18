@@ -63,16 +63,26 @@ pub enum LiveStatus {
 /// a dollar rate, and "USD" when a currency is set but its rate is not known
 /// yet. `subscription` is always in `currency`, the settings' currency. A
 /// missing half names its reason with the text of [`crate::money::Missing`];
-/// the two halves are never mixed and a sum is all or nothing.
+/// the two halves are never mixed.
+///
+/// A sum keeps the known part of a half whose other parts are missing (R3): the
+/// amount is the known part, `api_partial` / `subscription_partial` is true and
+/// the first missing part's reason is in `api_missing` / `subscription_missing`.
+/// A half with no known part at all stays `None` with its reason and
+/// `partial = false`, as an empty sum stays a known 0.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Values {
     pub api: Option<f64>,
     pub api_currency: Option<String>,
     pub api_missing: Option<String>,
+    #[serde(default)]
+    pub api_partial: bool,
     pub subscription: Option<f64>,
     pub currency: Option<String>,
     pub subscription_missing: Option<String>,
+    #[serde(default)]
+    pub subscription_partial: bool,
 }
 
 impl Values {
@@ -97,9 +107,11 @@ impl Values {
                 api,
                 api_currency,
                 api_missing,
+                api_partial: false,
                 subscription: Some(0.0),
                 currency: settings.currency.clone(),
                 subscription_missing: None,
+                subscription_partial: false,
             };
         }
         let parts: Vec<Values> = valued
@@ -108,9 +120,11 @@ impl Values {
                 api: part.api,
                 api_currency: part.api_currency.clone(),
                 api_missing: part.api_missing.as_ref().map(ToString::to_string),
+                api_partial: false,
                 subscription: part.subscription,
                 currency: settings.currency.clone(),
                 subscription_missing: part.subscription_missing.as_ref().map(ToString::to_string),
+                subscription_partial: false,
             })
             .collect();
         let parts: Vec<&Values> = parts.iter().collect();
@@ -120,21 +134,32 @@ impl Values {
         sum
     }
 
-    /// The sum of built values, with the same rule as [`Values::of`]: each
-    /// half is added only when every part has it; a missing part makes the sum
-    /// unknown with the first part's reason; parts whose `api_currency` or
-    /// `currency` differ are not added. The currency is the first part's; the
-    /// view is built with one settings' currency, so all parts agree. An empty
-    /// list is a known 0 in both halves, with no currency of its own.
+    /// The sum of built values per R3: each half adds the parts that have it,
+    /// and keeps their sum as the known part while at least one part is
+    /// missing. Such a half is `partial` with the first missing part's reason;
+    /// a half with no known part is `None` with that reason, and `partial` is
+    /// false whenever the half is `None`. A part whose half is `None` because
+    /// of two currencies keeps that half `None` with that reason, whatever else
+    /// is added. Parts whose `api_currency` or `currency` differ are not added,
+    /// as before; a part that is itself partial keeps the sum partial. The
+    /// currency is the first part's; the view is built with one settings'
+    /// currency, so all parts agree. An empty list is a known 0 in both halves,
+    /// with no currency of its own.
     pub fn sum(parts: &[&Values]) -> Values {
-        let mut api = Some(0.0);
+        let mut api_sum = 0.0;
         let mut api_currency: Option<String> = None;
         let mut api_missing: Option<String> = None;
+        let mut api_known = 0usize;
+        let mut api_missing_parts = 0usize;
         let mut two_currencies = false;
-        let mut subscription = Some(0.0);
+        let mut api_two_currency_part = false;
+        let mut subscription_sum = 0.0;
         let mut subscription_missing: Option<String> = None;
+        let mut subscription_known = 0usize;
+        let mut subscription_missing_parts = 0usize;
         let mut currency: Option<String> = None;
         let mut two_subscription_currencies = false;
+        let mut subscription_two_currency_part = false;
         for part in parts {
             if let Some(part_currency) = &part.currency {
                 match &currency {
@@ -145,14 +170,22 @@ impl Values {
             }
             match part.api {
                 None => {
-                    api = None;
+                    api_missing_parts += 1;
+                    if part.api_missing.as_deref() == Some(TWO_CURRENCIES) {
+                        api_two_currency_part = true;
+                    }
                     if api_missing.is_none() {
                         api_missing = part.api_missing.clone();
                     }
                 }
                 Some(value) => {
-                    if let Some(sum) = &mut api {
-                        *sum += value;
+                    api_known += 1;
+                    api_sum += value;
+                    if part.api_partial {
+                        api_missing_parts += 1;
+                        if api_missing.is_none() {
+                            api_missing = part.api_missing.clone();
+                        }
                     }
                     match &api_currency {
                         None => api_currency = part.api_currency.clone(),
@@ -165,39 +198,72 @@ impl Values {
             }
             match part.subscription {
                 None => {
-                    subscription = None;
+                    subscription_missing_parts += 1;
+                    if part.subscription_missing.as_deref() == Some(TWO_SUBSCRIPTION_CURRENCIES) {
+                        subscription_two_currency_part = true;
+                    }
                     if subscription_missing.is_none() {
                         subscription_missing = part.subscription_missing.clone();
                     }
                 }
                 Some(value) => {
-                    if let Some(sum) = &mut subscription {
-                        *sum += value;
+                    subscription_known += 1;
+                    subscription_sum += value;
+                    if part.subscription_partial {
+                        subscription_missing_parts += 1;
+                        if subscription_missing.is_none() {
+                            subscription_missing = part.subscription_missing.clone();
+                        }
                     }
                 }
             }
         }
-        if api.is_some() && two_currencies {
+        // An empty list is a known 0; a half with no known part is unknown.
+        let mut api = if api_known == 0 && !parts.is_empty() {
+            None
+        } else {
+            Some(api_sum)
+        };
+        if two_currencies || api_two_currency_part {
             api = None;
             api_missing = Some(TWO_CURRENCIES.to_string());
+            api_missing_parts = 0;
         }
         if api.is_none() {
             api_currency = None;
+            api_missing_parts = 0;
+        }
+        let api_partial = api.is_some() && api_missing_parts > 0 && api_known > 0;
+        let mut subscription = if subscription_known == 0 && !parts.is_empty() {
+            None
+        } else {
+            Some(subscription_sum)
+        };
+        if subscription_two_currency_part {
+            subscription = None;
+            subscription_missing = Some(TWO_SUBSCRIPTION_CURRENCIES.to_string());
+            subscription_missing_parts = 0;
+            currency = None;
         }
         if two_subscription_currencies {
             if subscription.is_some() {
                 subscription = None;
                 subscription_missing = Some(TWO_SUBSCRIPTION_CURRENCIES.to_string());
+                subscription_missing_parts = 0;
             }
             currency = None;
         }
+        let subscription_partial =
+            subscription.is_some() && subscription_missing_parts > 0 && subscription_known > 0;
         Values {
             api,
             api_currency,
             api_missing,
+            api_partial,
             subscription,
             currency,
             subscription_missing,
+            subscription_partial,
         }
     }
 
@@ -207,9 +273,11 @@ impl Values {
             api: None,
             api_currency: None,
             api_missing: Some(reason.to_string()),
+            api_partial: false,
             subscription: None,
             currency: settings.currency.clone(),
             subscription_missing: Some(reason.to_string()),
+            subscription_partial: false,
         }
     }
 
@@ -220,9 +288,11 @@ impl Values {
             api: None,
             api_currency: None,
             api_missing: Some(reason.to_string()),
+            api_partial: false,
             subscription: None,
             currency: None,
             subscription_missing: Some(reason.to_string()),
+            subscription_partial: false,
         }
     }
 }
@@ -1145,6 +1215,9 @@ pub fn take_provider_cost(
                 values.api = Some(api);
                 values.api_currency = Some(currency);
                 values.api_missing = None;
+                // The provider's cost covers the whole session, so the API half
+                // is no longer only partly known.
+                values.api_partial = false;
             }
             None
         }
@@ -1152,6 +1225,8 @@ pub fn take_provider_cost(
             values.api = None;
             values.api_currency = None;
             values.api_missing = Some(missing.to_string());
+            // A half with no value is never partial.
+            values.api_partial = false;
             None
         }
     }
@@ -2543,12 +2618,22 @@ mod tests {
 
         let row = &rows.sessions[0];
         assert_eq!(row.agents_done, 2);
-        assert_eq!(row.agents_done_values.api, None);
+        assert!(
+            row.agents_done_values.api.is_some(),
+            "the priced agent's API value is the known part: {:?}",
+            row.agents_done_values
+        );
+        assert!(row.agents_done_values.api_partial);
         assert_eq!(
             row.agents_done_values.api_missing.as_deref(),
             Some("no price for claude-x"),
             "the unpriced agent's reason stays in the sum"
         );
+        assert!(
+            row.agents_done_values.subscription.is_none(),
+            "no agent's subscription share is known here"
+        );
+        assert!(!row.agents_done_values.subscription_partial);
         assert_eq!(
             row.agents_done_values.subscription_missing.as_deref(),
             Some("no price for claude-x")
@@ -3560,8 +3645,13 @@ mod tests {
             "the API value is known: {:?}",
             running_row.values
         );
-        assert_eq!(
-            running_row.values.subscription, None,
+        assert!(
+            running_row.values.subscription.is_some(),
+            "the priced part's share is kept: {:?}",
+            running_row.values
+        );
+        assert!(
+            running_row.values.subscription_partial,
             "the worker's Ollama history names no month window here, so its share is unknown"
         );
         assert_eq!(
@@ -3810,14 +3900,17 @@ mod tests {
             "the API half keeps the price rule's reason"
         );
 
-        // P-2: a provider row's subscription is its own, so a row without one
-        // leaves the total's subscription unknown instead of a known 0.
+        // P-2: a provider row's subscription is its own; a row without one keeps
+        // the known part of the total and makes the half partial (R3).
         let all = Values::sum(&[&claude.values, &codex.values]);
-        assert_eq!(all.subscription, None);
+        assert_eq!(all.subscription, claude.values.subscription);
+        assert!(all.subscription_partial);
         assert_eq!(
             all.subscription_missing.as_deref(),
             Some("no price for gpt-6.1-sol")
         );
+        assert_eq!(all.api, claude.values.api);
+        assert!(all.api_partial);
         assert_eq!(all.api_missing.as_deref(), Some("no price for gpt-6.1-sol"));
     }
 
@@ -4387,7 +4480,8 @@ mod tests {
     }
 
     #[test]
-    /// One part without a price makes the whole sum missing, with that part's reason.
+    /// A list with one unpriced part and one priced part keeps the priced
+    /// part as the known sum, partial with the unpriced part's reason (R3).
     fn values_of_a_list_with_a_missing_part() {
         let missing = Valued {
             api: None,
@@ -4418,9 +4512,11 @@ mod tests {
             Utc::now(),
         );
 
-        assert_eq!(values.api, None);
+        assert_eq!(values.api, Some(2.0));
+        assert!(values.api_partial);
         assert_eq!(values.api_missing.as_deref(), Some("no price for claude-x"));
-        assert_eq!(values.subscription, None);
+        assert_eq!(values.subscription, Some(0.5));
+        assert!(values.subscription_partial);
         assert_eq!(
             values.subscription_missing.as_deref(),
             Some("no price for claude-x")
@@ -4428,45 +4524,56 @@ mod tests {
     }
 
     #[test]
-    /// A sum is all or nothing per half, never adds two API currencies, and
-    /// keeps the first missing part's reason. An empty sum is a known 0.
-    fn a_sum_of_values_is_all_or_nothing() {
+    /// The sum never adds two API currencies and keeps the first missing part's
+    /// reason. A mixed half keeps its known part and is partial (R3); an empty
+    /// sum is a known 0.
+    fn a_sum_never_adds_two_currencies_and_keeps_a_known_part() {
         let eur = Values {
             api: Some(1.0),
             api_currency: Some("EUR".to_string()),
             api_missing: None,
+            api_partial: false,
             subscription: Some(0.5),
             currency: Some("EUR".to_string()),
             subscription_missing: None,
+            subscription_partial: false,
         };
         let usd = Values {
             api: Some(2.0),
             api_currency: Some("USD".to_string()),
             api_missing: None,
+            api_partial: false,
             subscription: Some(0.75),
             currency: Some("EUR".to_string()),
             subscription_missing: None,
+            subscription_partial: false,
         };
         let sum = Values::sum(&[&eur, &usd]);
         assert_eq!(sum.api, None);
         assert_eq!(sum.api_currency, None);
         assert_eq!(sum.api_missing.as_deref(), Some(TWO_CURRENCIES));
+        assert!(!sum.api_partial, "a half that is None is never partial");
         assert_eq!(sum.subscription, Some(1.25));
         assert_eq!(sum.subscription_missing, None);
+        assert!(!sum.subscription_partial);
         assert_eq!(sum.currency.as_deref(), Some("EUR"));
 
         let unpriced = Values {
             api: None,
             api_currency: None,
             api_missing: Some("no price for claude-x".to_string()),
+            api_partial: false,
             subscription: None,
             currency: Some("EUR".to_string()),
             subscription_missing: Some("no price for claude-x".to_string()),
+            subscription_partial: false,
         };
         let sum = Values::sum(&[&eur, &unpriced]);
-        assert_eq!(sum.api, None);
+        assert_eq!(sum.api, Some(1.0), "the known API part is kept");
+        assert!(sum.api_partial);
         assert_eq!(sum.api_missing.as_deref(), Some("no price for claude-x"));
-        assert_eq!(sum.subscription, None);
+        assert_eq!(sum.subscription, Some(0.5), "the known part is kept");
+        assert!(sum.subscription_partial);
         assert_eq!(
             sum.subscription_missing.as_deref(),
             Some("no price for claude-x")
@@ -4477,9 +4584,156 @@ mod tests {
         assert_eq!(empty.api, Some(0.0), "nothing used is a known 0");
         assert_eq!(empty.api_currency, None);
         assert_eq!(empty.api_missing, None);
+        assert!(!empty.api_partial);
         assert_eq!(empty.subscription, Some(0.0));
         assert_eq!(empty.subscription_missing, None);
+        assert!(!empty.subscription_partial);
         assert_eq!(empty.currency, None);
+    }
+
+    #[test]
+    /// A half with one known part and one missing part is the known part,
+    /// marked partial with the first missing part's reason (R3).
+    fn a_partly_valued_sum_keeps_its_known_part() {
+        let priced = |subscription: f64| Values {
+            api: Some(0.0),
+            api_currency: Some("EUR".to_string()),
+            api_missing: None,
+            api_partial: false,
+            subscription: Some(subscription),
+            currency: Some("EUR".to_string()),
+            subscription_missing: None,
+            subscription_partial: false,
+        };
+        let missing = Values {
+            api: Some(0.0),
+            api_currency: Some("EUR".to_string()),
+            api_missing: None,
+            api_partial: false,
+            subscription: None,
+            currency: Some("EUR".to_string()),
+            subscription_missing: Some("no price entered".to_string()),
+            subscription_partial: false,
+        };
+
+        let sum = Values::sum(&[&priced(0.60), &missing, &priced(0.37)]);
+
+        assert_eq!(sum.subscription, Some(0.97));
+        assert!(sum.subscription_partial);
+        assert_eq!(
+            sum.subscription_missing.as_deref(),
+            Some("no price entered")
+        );
+        assert_eq!(sum.currency.as_deref(), Some("EUR"));
+        assert_eq!(
+            sum.api,
+            Some(0.0),
+            "every API part is known, so that half is not partial"
+        );
+        assert!(!sum.api_partial);
+    }
+
+    #[test]
+    /// No known part in a half keeps it unknown with the first reason, and a
+    /// half that is None is never partial.
+    fn a_sum_of_only_unknown_parts_is_unknown() {
+        let no_price = Values {
+            api: None,
+            api_currency: None,
+            api_missing: Some("no price entered".to_string()),
+            api_partial: false,
+            subscription: None,
+            currency: Some("EUR".to_string()),
+            subscription_missing: Some("no price entered".to_string()),
+            subscription_partial: false,
+        };
+        let no_account = Values {
+            api: None,
+            api_currency: None,
+            api_missing: Some("no account was in use at that time".to_string()),
+            api_partial: false,
+            subscription: None,
+            currency: Some("EUR".to_string()),
+            subscription_missing: Some("no account was in use at that time".to_string()),
+            subscription_partial: false,
+        };
+
+        let sum = Values::sum(&[&no_price, &no_account]);
+
+        assert_eq!(sum.api, None);
+        assert_eq!(sum.api_missing.as_deref(), Some("no price entered"));
+        assert!(!sum.api_partial);
+        assert_eq!(sum.subscription, None);
+        assert_eq!(
+            sum.subscription_missing.as_deref(),
+            Some("no price entered")
+        );
+        assert!(!sum.subscription_partial);
+    }
+
+    #[test]
+    /// Nothing used is a known 0 in both halves, never an unknown value.
+    fn an_empty_sum_is_a_known_zero() {
+        let sum = Values::sum(&[]);
+
+        assert_eq!(sum.api, Some(0.0));
+        assert_eq!(sum.subscription, Some(0.0));
+        assert_eq!(sum.api_currency, None);
+        assert_eq!(sum.currency, None);
+        assert_eq!(sum.api_missing, None);
+        assert_eq!(sum.subscription_missing, None);
+        assert!(!sum.api_partial);
+        assert!(!sum.subscription_partial);
+    }
+
+    #[test]
+    /// A partial half stays partial when it is added to a full value: the known
+    /// parts add up and the first missing reason stays (R3).
+    fn a_partial_sum_stays_partial_when_added_again() {
+        let known = Values {
+            api: Some(1.0),
+            api_currency: Some("EUR".to_string()),
+            api_missing: None,
+            api_partial: false,
+            subscription: Some(0.97),
+            currency: Some("EUR".to_string()),
+            subscription_missing: None,
+            subscription_partial: false,
+        };
+        let missing = Values {
+            api: None,
+            api_currency: None,
+            api_missing: Some("no price entered".to_string()),
+            api_partial: false,
+            subscription: None,
+            currency: Some("EUR".to_string()),
+            subscription_missing: Some("no price entered".to_string()),
+            subscription_partial: false,
+        };
+        let partial = Values::sum(&[&known, &missing]);
+        assert!(partial.subscription_partial);
+
+        let full = Values {
+            api: Some(2.0),
+            api_currency: Some("EUR".to_string()),
+            api_missing: None,
+            api_partial: false,
+            subscription: Some(1.0),
+            currency: Some("EUR".to_string()),
+            subscription_missing: None,
+            subscription_partial: false,
+        };
+        let sum = Values::sum(&[&partial, &full]);
+
+        assert_eq!(sum.subscription, Some(1.97));
+        assert!(sum.subscription_partial);
+        assert_eq!(
+            sum.subscription_missing.as_deref(),
+            Some("no price entered")
+        );
+        assert_eq!(sum.api, Some(3.0));
+        assert!(sum.api_partial);
+        assert_eq!(sum.api_missing.as_deref(), Some("no price entered"));
     }
 
     #[test]
@@ -4490,17 +4744,21 @@ mod tests {
             api: Some(1.0),
             api_currency: Some("EUR".to_string()),
             api_missing: None,
+            api_partial: false,
             subscription: Some(2.0),
             currency: Some("EUR".to_string()),
             subscription_missing: None,
+            subscription_partial: false,
         };
         let vega = Values {
             api: Some(3.0),
             api_currency: Some("USD".to_string()),
             api_missing: None,
+            api_partial: false,
             subscription: Some(4.0),
             currency: Some("USD".to_string()),
             subscription_missing: None,
+            subscription_partial: false,
         };
         let sum = Values::sum(&[&atlas, &vega]);
         assert_eq!(sum.subscription, None);
@@ -4509,9 +4767,11 @@ mod tests {
             sum.subscription_missing.as_deref(),
             Some(TWO_SUBSCRIPTION_CURRENCIES)
         );
+        assert!(!sum.subscription_partial);
         assert_eq!(sum.api, None);
         assert_eq!(sum.api_currency, None);
         assert_eq!(sum.api_missing.as_deref(), Some(TWO_CURRENCIES));
+        assert!(!sum.api_partial);
     }
 
     #[test]
@@ -4565,9 +4825,15 @@ mod tests {
             .collect();
         let parts: Vec<&Values> = parts.iter().collect();
         assert_eq!(of, Values::sum(&parts));
-        assert_eq!(of.api, None);
+        assert_eq!(of.api, Some(5.0), "the two priced records are kept");
+        assert!(of.api_partial);
         assert_eq!(of.api_missing.as_deref(), Some("no price for claude-x"));
-        assert_eq!(of.subscription, None);
+        assert_eq!(of.subscription, Some(0.75));
+        assert!(of.subscription_partial);
+        assert_eq!(
+            of.subscription_missing.as_deref(),
+            Some("no price for claude-x")
+        );
     }
 
     #[test]
@@ -6237,9 +6503,11 @@ mod tests {
             api: Some(9.0),
             api_currency: Some("EUR".to_string()),
             api_missing: None,
+            api_partial: false,
             subscription: Some(2.0),
             currency: Some("EUR".to_string()),
             subscription_missing: None,
+            subscription_partial: false,
         };
         assert_eq!(
             take_provider_cost(&mut values, Some(1.5), &settings, &fx, now),
@@ -6326,5 +6594,70 @@ mod tests {
             .expect("a non-finite conversion says why");
         assert!(warning.contains("not used"), "{warning}");
         assert_eq!(values, before, "the valuer's value stays");
+    }
+
+    #[test]
+    fn a_provider_cost_makes_a_partial_api_half_full() {
+        let now = utc("2026-11-14T10:00:00Z");
+        let settings = settings_eur();
+        let mut fx = Fx {
+            currency: "EUR".to_string(),
+            ..Fx::default()
+        };
+        fx.take(now.date_naive(), 2.0);
+
+        let mut partial = Values {
+            api: Some(1.25),
+            api_currency: Some("EUR".to_string()),
+            api_missing: Some("no price for claude-x".to_string()),
+            api_partial: true,
+            subscription: Some(2.0),
+            currency: Some("EUR".to_string()),
+            subscription_missing: None,
+            subscription_partial: false,
+        };
+        assert_eq!(
+            take_provider_cost(&mut partial, Some(1.5), &settings, &fx, now),
+            None
+        );
+        assert_eq!(partial.api, Some(3.0));
+        assert!(
+            !partial.api_partial,
+            "the provider's cost covers the whole session, so the half is no longer partial"
+        );
+        assert_eq!(partial.api_missing, None);
+        assert_eq!(
+            partial.subscription,
+            Some(2.0),
+            "the subscription half is not touched"
+        );
+
+        // No currency in the settings: the cost cannot be named, so the API
+        // half becomes unknown with that reason and is never partial.
+        let mut bare = settings.clone();
+        bare.currency = None;
+        let mut missing = Values {
+            api: Some(1.25),
+            api_currency: Some("EUR".to_string()),
+            api_missing: Some("no price for claude-x".to_string()),
+            api_partial: true,
+            subscription: Some(2.0),
+            currency: Some("EUR".to_string()),
+            subscription_missing: None,
+            subscription_partial: false,
+        };
+        assert_eq!(
+            take_provider_cost(&mut missing, Some(1.5), &bare, &fx, now),
+            None
+        );
+        assert_eq!(missing.api, None);
+        assert!(
+            !missing.api_partial,
+            "a half with no value is never partial"
+        );
+        assert_eq!(
+            missing.api_missing.as_deref(),
+            Some("set a currency in Settings → General")
+        );
     }
 }

@@ -796,36 +796,64 @@ function valuePart(values, unit) {
     amount: api ? values.api : values.subscription,
     currency: api ? values.apiCurrency : values.currency,
     missing: api ? values.apiMissing : values.subscriptionMissing,
+    partial: api ? values.apiPartial === true : values.subscriptionPartial === true,
   };
 }
 
 // One `Values` half as text: the money in its own currency, or "—" with the
 // reason as the title. `viewCurrency` is the currency the page's column header
 // names: an amount in it leaves the currency to the header, another currency
-// is written beside the amount.
+// is written beside the amount. A half whose known part is only some of its
+// parts is "≥ " before that amount (R3), titled with the first missing reason.
 function valueText(values, unit, viewCurrency) {
   if (!isObject(values)) {
-    return { text: "—", title: "the view has no value for this row" };
+    return {
+      text: "—",
+      title: "the view has no value for this row",
+      partial: false,
+    };
   }
   const part = valuePart(values, unit);
-  if (part.missing !== null && part.missing !== undefined) {
-    return { text: "—", title: String(part.missing) };
-  }
+  const hasReason = part.missing !== null && part.missing !== undefined;
   if (part.amount === null || part.amount === undefined) {
-    return { text: "—", title: "the value is missing without a reason" };
+    return {
+      text: "—",
+      title: hasReason ? String(part.missing) : "the value is missing without a reason",
+      partial: false,
+    };
+  }
+  if (hasReason && !part.partial) {
+    return { text: "—", title: String(part.missing), partial: false };
   }
   const text = amountText(part.amount, part.currency);
   if (text === "—") {
-    return { text, title: "no currency set in Settings" };
+    return { text, title: "no currency set in Settings", partial: false };
   }
-  if (
+  const shown =
     typeof viewCurrency === "string" &&
     part.currency === viewCurrency &&
     text.endsWith(` ${part.currency}`)
-  ) {
-    return { text: text.slice(0, -(part.currency.length + 1)), title: "" };
+      ? text.slice(0, -(part.currency.length + 1))
+      : text;
+  if (part.partial) {
+    if (!hasReason) {
+      throw new Error("a partial value has no reason");
+    }
+    return {
+      text: `≥ ${shown}`,
+      title: `at least: ${part.missing}`,
+      partial: true,
+    };
   }
-  return { text, title: "" };
+  return { text: shown, title: "", partial: false };
+}
+
+// One `Values` half as an element, with the "≥" and the missing part's reason
+// the struct carries (R3). The one helper a page uses for a `Values` half; an
+// amount that is not a half (a week price, a used total) uses `amountNode`.
+function valueNode(values, unit, viewCurrency) {
+  const value = valueText(values, unit, viewCurrency);
+  return h("span", { title: value.title || null, text: value.text });
 }
 
 // Both halves of `Values` for a KPI's sub-line: "1.23 EUR subscription · 4.56
@@ -1255,6 +1283,7 @@ export {
   amountNode,
   amountTip,
   valueText,
+  valueNode,
   valueSummary,
   valueTip,
   accountView,

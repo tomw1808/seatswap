@@ -25,6 +25,7 @@ import {
   showTokens,
   switchText,
   tokens,
+  valueNode,
   valueTip,
 } from "../../common.js";
 import { grid, lines } from "../../charts.js";
@@ -173,8 +174,10 @@ export async function show(container, env) {
       card.appendChild(h("p", { class: "stats-note", text: missingTitle }));
     }
 
-    const apiValue = amountNode(summary.values.api, summary.values.apiCurrency);
-    apiValue.title = valueTip(summary.values, "api", "in this week");
+    const apiValue = valueNode(summary.values, "api", null);
+    if (summary.values.apiPartial !== true) {
+      apiValue.title = valueTip(summary.values, "api", "in this week");
+    }
     const beforeTitle = missingTitle || undefined;
     const tokenLine = h("span", {}, [
       showTokens(h("span"), summary.tokens.out),

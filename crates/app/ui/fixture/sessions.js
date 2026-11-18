@@ -47,18 +47,22 @@ function fixtureSessionValues(million, currency = "EUR") {
       api: 0,
       apiCurrency: currency,
       apiMissing: null,
+      apiPartial: false,
       subscription: 0,
       currency,
       subscriptionMissing: null,
+      subscriptionPartial: false,
     };
   }
   return {
     api: Number((million * SESSION_APIV).toFixed(2)),
     apiCurrency: currency,
     apiMissing: null,
+    apiPartial: false,
     subscription: Number((million * SESSION_SUBV).toFixed(2)),
     currency,
     subscriptionMissing: null,
+    subscriptionPartial: false,
   };
 }
 
@@ -68,9 +72,22 @@ function fixtureMissingValues(reason) {
     api: null,
     apiCurrency: null,
     apiMissing: reason,
+    apiPartial: false,
     subscription: null,
     currency: "EUR",
     subscriptionMissing: reason,
+    subscriptionPartial: false,
+  };
+}
+
+// The work of an unpriced subscription (R3): its API value is known, its
+// subscription half is missing with the reason, so a sum keeps the priced part.
+function fixtureUnpricedSubscriptionValues(million, reason, currency = "EUR") {
+  return {
+    ...fixtureSessionValues(million, currency),
+    subscription: null,
+    subscriptionMissing: reason,
+    subscriptionPartial: false,
   };
 }
 
@@ -474,7 +491,13 @@ function fixtureSessionRows() {
     agents,
     tokens: fixtureTokenCounts(million),
     lastHour: options.lastHourMissing ? null : fixtureTokenCounts(lastHour),
-    values: fixtureSessionValues(million, options.currency || "EUR"),
+    values: options.subscriptionMissing
+      ? fixtureUnpricedSubscriptionValues(
+          million,
+          options.subscriptionMissing,
+          options.currency || "EUR"
+        )
+      : fixtureSessionValues(million, options.currency || "EUR"),
     lastHourValues: options.lastHourMissing
       ? fixtureMissingValues(options.lastHourMissing)
       : fixtureSessionValues(lastHour, options.currency || "EUR"),
@@ -525,6 +548,7 @@ function fixtureSessionRows() {
       provider: "Codex",
       title: "Identify the ledger rounding",
       lastHourMissing: CODEX_LAST_HOUR_UNKNOWN,
+      subscriptionMissing: "no price entered",
     }),
     make("dsh-b7", "atlas", "atlas", "busy", DEEPSEEK_MODEL, isoIn(-11 * 60000), 0.7, 0.6, 2, 1, harnessAgents, {
       provider: "DeepSeek Harness",
@@ -598,15 +622,46 @@ function fixtureAddTokens(one, other) {
   };
 }
 
-// The values of a group: a missing half of any row makes the sum missing with
-// that reason, as `Values::sum` does; the made-up rows are all priced at the
-// same rate, so the amounts add up.
-function fixtureSumValues(rows, field, million, of) {
+// The values of a group per R3: a row's missing half keeps the known parts of
+// the other rows and makes that half partial with the first reason; a half with
+// no known part stays missing. The made-up rows are all priced at the same
+// rate, so the known parts add up through `of`.
+function fixtureSumValues(rows, field, millionOf, of) {
+  const known = { api: 0, subscription: 0 };
+  const missing = { api: 0, subscription: 0 };
+  const millions = { api: 0, subscription: 0 };
+  const reason = { api: null, subscription: null };
   for (const row of rows) {
     const values = row[field];
-    if (isObject(values) && typeof values.apiMissing === "string") return { ...values };
+    if (!isObject(values)) continue;
+    for (const half of ["api", "subscription"]) {
+      const amount = half === "api" ? values.api : values.subscription;
+      const why = half === "api" ? values.apiMissing : values.subscriptionMissing;
+      const partial =
+        half === "api" ? values.apiPartial === true : values.subscriptionPartial === true;
+      if (amount !== null && amount !== undefined) {
+        known[half] += 1;
+        millions[half] += millionOf(row);
+      }
+      if (amount === null || amount === undefined || partial) {
+        missing[half] += 1;
+        if (reason[half] === null && typeof why === "string") reason[half] = why;
+      }
+    }
   }
-  return of(million);
+  const api = known.api > 0 ? of(millions.api) : null;
+  const subscription = known.subscription > 0 ? of(millions.subscription) : null;
+  const zero = of(0);
+  return {
+    api: api ? api.api : null,
+    apiCurrency: api ? api.apiCurrency : null,
+    apiMissing: missing.api > 0 ? reason.api : null,
+    apiPartial: api !== null && missing.api > 0,
+    subscription: subscription ? subscription.subscription : null,
+    currency: subscription ? subscription.currency : zero.currency,
+    subscriptionMissing: missing.subscription > 0 ? reason.subscription : null,
+    subscriptionPartial: subscription !== null && missing.subscription > 0,
+  };
 }
 
 function fixtureSums(rows) {
@@ -655,11 +710,16 @@ function fixtureSums(rows) {
     agentsDone: found.agentsDone,
     tokens: found.tokens,
     lastHour: found.lastHourUnknown ? null : found.lastHour,
-    values: fixtureSumValues(found.rows, "values", found.tokens.out / 1000000, fixtureSessionValues),
+    values: fixtureSumValues(
+      found.rows,
+      "values",
+      (row) => (row.tokens ? row.tokens.out : 0) / 1000000,
+      fixtureSessionValues
+    ),
     lastHourValues: fixtureSumValues(
       found.rows,
       "lastHourValues",
-      found.lastHour.out / 1000000,
+      (row) => (row.lastHour ? row.lastHour.out : 0) / 1000000,
       fixtureSessionValues
     ),
   }));

@@ -15,7 +15,8 @@ use crate::money::{Company, Missing, Valuer};
 
 use super::plans::{sum_opt, EnteredPrice, UsageRow};
 use super::{
-    account_chosen, account_id, money_of, AccountWeek, Ctx, MonthValued, Query, StatsError,
+    account_chosen, account_id, full_half, money_of, AccountWeek, Ctx, MonthValued, Query,
+    StatsError,
 };
 
 /// A price typed at most this many minutes before a plan change belongs to the
@@ -292,10 +293,16 @@ fn mean(values: impl Iterator<Item = f64>) -> Option<f64> {
 }
 
 /// The API value in the page's currency, with the reason when it is in another
-/// one or has none.
+/// one or has none. A partial API half is a lower bound, so the row has no API
+/// amount and no ratio divides it: it is `None` with the half's reason (R3).
 fn api_of(values: &Values, currency: Option<&str>) -> (Option<f64>, Option<String>) {
-    let Some(api) = values.api else {
-        return (None, values.api_missing.clone());
+    let (api, reason) = full_half(
+        values.api,
+        values.api_partial,
+        values.api_missing.as_deref(),
+    );
+    let Some(api) = api else {
+        return (None, reason);
     };
     match values.api_currency.as_deref() {
         Some(api_currency) if Some(api_currency) == currency => (Some(api), None),
@@ -317,7 +324,9 @@ fn api_of(values: &Values, currency: Option<&str>) -> (Option<f64>, Option<Strin
 }
 
 /// The API value over the paid money of the same finished weeks, with the
-/// reason when it cannot be a ratio in the settings' currency.
+/// reason when it cannot be a ratio in the settings' currency. A share, ratio
+/// or percent is computed only from halves that are not partial (R3): a
+/// partial API half is no ratio, and its reason is the row's.
 fn times_paid_of(
     values: &Values,
     paid: Option<f64>,
@@ -729,5 +738,33 @@ mod tests {
         assert_eq!(lb[1].plan.as_deref(), Some("Max"));
         assert_eq!(lb[1].from, utc("2026-11-09T05:39:00Z"));
         assert_eq!(lb[1].price, Some(100.0));
+    }
+
+    /// A partial API half is an amount with a known lower bound, never a figure
+    /// a ratio can divide: the row's API value and its times paid are unknown
+    /// with the half's reason (R3).
+    #[test]
+    fn a_partial_api_value_is_no_api_value_and_no_ratio() {
+        let values = Values {
+            api: Some(9.0),
+            api_currency: Some("EUR".to_string()),
+            api_missing: Some("no price for claude-x".to_string()),
+            api_partial: true,
+            subscription: None,
+            currency: Some("EUR".to_string()),
+            subscription_missing: Some("no price for claude-x".to_string()),
+            subscription_partial: false,
+        };
+
+        assert_eq!(
+            api_of(&values, Some("EUR")),
+            (None, Some("no price for claude-x".to_string())),
+            "a partial API half is no amount the row can show"
+        );
+        assert_eq!(
+            times_paid_of(&values, Some(10.0), Some("EUR"), 1),
+            (None, Some("no price for claude-x".to_string())),
+            "a quotient of a lower bound is no figure"
+        );
     }
 }

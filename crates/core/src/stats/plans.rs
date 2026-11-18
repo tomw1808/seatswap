@@ -20,9 +20,9 @@ use crate::transcripts::Tokens;
 
 use super::subscriptions::{self, HistoryReads, Period, UsageInput};
 use super::{
-    account_chosen, account_id, account_weeks_valued, add_value, keep_warnings, next_week_start,
-    range_of, stored_account, stored_subscription, subscription_months, week_columns,
-    week_of_record, AccountWeek, Ctx, MonthValued, Query, StatsError,
+    account_chosen, account_id, account_weeks_valued, add_value, full_half, keep_warnings,
+    next_week_start, range_of, stored_account, stored_subscription, subscription_months,
+    week_columns, week_of_record, AccountWeek, Ctx, MonthValued, Query, StatsError,
 };
 
 /// A factor's range is "thin" when half its width is more than this share of
@@ -1337,7 +1337,14 @@ fn usage_groups(rows: &[UsageEntry], times_paid: Option<f64>) -> (Vec<UsageGroup
     let counted: Vec<&UsageEntry> = rows.iter().filter(|entry| entry.periods > 0).collect();
     let price_month = sum_opt(counted.iter().map(|entry| entry.row.price_month));
     let expired = sum_opt(counted.iter().map(|entry| entry.row.expired));
-    let api = sum_opt(counted.iter().map(|entry| entry.row.api));
+    let api = sum_opt(counted.iter().map(|entry| {
+        full_half(
+            entry.row.api,
+            entry.values.api_partial,
+            entry.values.api_missing.as_deref(),
+        )
+        .0
+    }));
     let used_percent = used_share(&counted);
     let missing = total_missing(
         &counted,
@@ -1425,14 +1432,21 @@ fn total_missing(
 /// The API dollars over what was paid, over the rows the totals count: the
 /// same figure for `Totals.timesPaid` and `usageTotal.timesPaid` (decision 3 of
 /// M-2's fix). `None` when a counted row has no API value or no paid money, or
-/// nothing was paid.
+/// nothing was paid. A share, ratio or percent is computed only from halves
+/// that are not partial (R3): a partial API half is a lower bound, so its row
+/// gives no times-paid figure.
 fn times_paid_of_counted(entries: &[UsageEntry]) -> Option<f64> {
     let mut api = 0.0;
     let mut paid = 0.0;
     let mut counted = false;
     for entry in entries.iter().filter(|entry| entry.periods > 0) {
         counted = true;
-        api += entry.row.api?;
+        let (row_api, _) = full_half(
+            entry.row.api,
+            entry.values.api_partial,
+            entry.values.api_missing.as_deref(),
+        );
+        api += row_api?;
         paid += entry.paid?;
     }
     (counted && paid > 0.0).then(|| api / paid)
@@ -1464,9 +1478,16 @@ fn totals_of(
 }
 
 /// One counted subscription's API dollars a month, in the display currency:
-/// `None` when it has no API value or its value is in another currency.
+/// `None` when it has no API value, its value is in another currency, or its
+/// API half is partial. A share, ratio or percent is computed only from halves
+/// that are not partial (R3): a month's share of a lower bound is no figure.
 fn api_month_of(entry: &UsageEntry, currency: Option<&str>) -> Option<f64> {
-    let api = match entry.values.api {
+    let (api, _) = full_half(
+        entry.values.api,
+        entry.values.api_partial,
+        entry.values.api_missing.as_deref(),
+    );
+    let api = match api {
         Some(api) if entry.values.api_currency.as_deref() == currency => api,
         _ => return None,
     };
@@ -2246,9 +2267,11 @@ mod tests {
             api: Some(api),
             api_currency: Some("EUR".to_string()),
             api_missing: None,
+            api_partial: false,
             subscription: None,
             currency: Some("EUR".to_string()),
             subscription_missing: None,
+            subscription_partial: false,
         }
     }
 
@@ -2306,6 +2329,30 @@ mod tests {
         // What was paid over the range's finished periods, not one month's price.
         assert!(close(times_paid.expect("times paid"), 100.0 / 440.0));
         assert_eq!(totals.partial, partial);
+    }
+
+    /// A partial API half is a lower bound, not a figure a ratio may divide: its
+    /// times paid, its API month and the total's API value are all unknown with
+    /// the half's reason (R3).
+    #[test]
+    fn a_partial_api_value_gives_no_times_paid_and_no_api_month() {
+        let mut entry = usage_entry(
+            "7c1e4b2a-9d3f-4e6a-b8c5-2f0a1d7e9b34",
+            100.0,
+            40.0,
+            100.0,
+            2,
+        );
+        entry.values.api_partial = true;
+        entry.values.api_missing = Some("no price for claude-x".to_string());
+
+        assert_eq!(times_paid_of_counted(std::slice::from_ref(&entry)), None);
+        assert_eq!(api_month_of(&entry, Some("EUR")), None);
+
+        let totals = totals_of(2, std::slice::from_ref(&entry), &[], Some("EUR"), None);
+        assert_eq!(totals.api_month, None);
+        let (_, total) = usage_groups(std::slice::from_ref(&entry), None);
+        assert_eq!(total.api, None);
     }
 
     #[test]

@@ -19,9 +19,9 @@ use crate::transcripts::Tokens;
 
 use super::{
     account_abbr, account_chosen, account_id, account_position, account_weeks_valued,
-    add_opt_value, add_value, join_names, keep_warnings, money_text, output_by_account_week,
-    percent_text, range_of, record_chosen, thousands, week_start, windows_span, Ctx, Query,
-    StatsError,
+    add_opt_value, add_value, full_half, join_names, keep_warnings, money_text,
+    output_by_account_week, percent_text, range_of, record_chosen, thousands, week_start,
+    windows_span, Ctx, Query, StatsError,
 };
 
 /// The level of a row of the tree.
@@ -224,7 +224,6 @@ pub(crate) fn projects_page_in<Tz: TimeZone + Copy>(
         let parts: Vec<&Values> = entries.iter().map(|entry| &entry.values).collect();
         Values::sum(&parts)
     };
-    let page_api = page_values.api;
 
     // The organizations with records, by API value, the unassigned ones last.
     let mut org_members: BTreeMap<Option<String>, Vec<ProjectId>> = BTreeMap::new();
@@ -294,7 +293,7 @@ pub(crate) fn projects_page_in<Tz: TimeZone + Copy>(
                 org_accounts,
             },
             &org.sums,
-            page_api,
+            &page_values,
         ));
         matrix_orgs.push(org.name.clone());
         cells.push(org_cells(org, &chosen_accounts));
@@ -317,7 +316,7 @@ pub(crate) fn projects_page_in<Tz: TimeZone + Copy>(
                     org_accounts: Vec::new(),
                 },
                 &sums[&key],
-                page_api,
+                &page_values,
             ));
             let total_folders: usize = project.folders.values().map(Vec::len).sum();
             if total_folders > 1 {
@@ -340,7 +339,7 @@ pub(crate) fn projects_page_in<Tz: TimeZone + Copy>(
                             org_accounts: Vec::new(),
                         },
                         &folders[&name],
-                        page_api,
+                        &page_values,
                     ));
                 }
             }
@@ -680,19 +679,18 @@ pub(crate) fn project_detail_in<Tz: TimeZone + Copy>(
             .or_insert(0) += hosted.record.out;
     }
 
-    let page_api = page_values.as_ref().and_then(|values| values.api);
-
     let host_values = {
         let parts: Vec<&Values> = hosts.values().collect();
         Values::sum(&parts)
     };
-    let mut host_shares: Vec<(String, f64)> = match host_values.api {
-        Some(total) if total > 0.0 => hosts
-            .iter()
-            .filter_map(|(host, values)| values.api.map(|api| (host.clone(), api / total * 100.0)))
-            .collect(),
-        _ => Vec::new(),
-    };
+    // A host's share divides the host's value by all hosts' value; both must be
+    // full halves (R3), so a partial one leaves the share out.
+    let mut host_shares: Vec<(String, f64)> = hosts
+        .iter()
+        .filter_map(|(host, values)| {
+            share_of(values, Some(&host_values)).map(|share| (host.clone(), share))
+        })
+        .collect();
     host_shares.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     let weekly_by_model: WeeklyByModel = weekly
@@ -714,7 +712,7 @@ pub(crate) fn project_detail_in<Tz: TimeZone + Copy>(
         },
         hosts: host_shares,
         values: sums.values(),
-        share: share_of(sums.api(), page_api),
+        share: share_of(&sums.values(), page_values.as_ref()),
         weekly_by_model,
         sessions: sums.sessions.len() as u32,
     })
@@ -814,7 +812,7 @@ fn node_from<Tz: TimeZone + Copy>(
     ctx: &Ctx<Tz>,
     label: NodeLabel,
     sums: &Sums,
-    page_api: Option<f64>,
+    page: &Values,
 ) -> Node {
     let level = match label.kind {
         NodeKind::Org => 0,
@@ -829,7 +827,7 @@ fn node_from<Tz: TimeZone + Copy>(
         key: label.key,
         org_accounts: label.org_accounts,
         tokens: sums.tokens,
-        share: share_of(values.api, page_api),
+        share: share_of(&values, Some(page)),
         values,
         by_account: by_account(ctx, sums),
         by_provider: by_provider(sums),
@@ -884,9 +882,19 @@ fn by_provider(sums: &Sums) -> Vec<(Company, f64)> {
 }
 
 /// A value as a share of the page's total, in %: unknown when either value is
-/// missing or the total is zero, never a made-up 0 %.
-fn share_of(api: Option<f64>, page_api: Option<f64>) -> Option<f64> {
-    match (api, page_api) {
+/// missing or the total is zero, never a made-up 0 %. A share, ratio or percent
+/// is computed only from halves that are not partial (R3); a partial half is a
+/// lower bound, so it gives no share.
+fn share_of(values: &Values, page: Option<&Values>) -> Option<f64> {
+    let (api, _) = full_half(
+        values.api,
+        values.api_partial,
+        values.api_missing.as_deref(),
+    );
+    let (total, _) = page
+        .map(|page| full_half(page.api, page.api_partial, page.api_missing.as_deref()))
+        .unwrap_or((None, None));
+    match (api, total) {
         (Some(api), Some(total)) if total > 0.0 => Some(api / total * 100.0),
         _ => None,
     }
@@ -906,7 +914,10 @@ fn org_cells(org: &OrgRow, accounts: &[&Account]) -> Vec<Option<f64>> {
         .collect()
 }
 
-/// The sentences of one organization that has accounts of its own.
+/// The sentences of one organization that has accounts of its own. A share,
+/// ratio or percent is computed only from halves that are not partial (R3): a
+/// sentence whose figure would come from a partial value is left out, as it was
+/// before R3 when the value was missing.
 fn org_sentences<Tz: TimeZone + Copy>(
     ctx: &Ctx<Tz>,
     org: &OrgRow,
@@ -922,7 +933,13 @@ fn org_sentences<Tz: TimeZone + Copy>(
     if known.accounts.is_empty() {
         return Vec::new();
     }
-    let Some(total) = org.sums.values().subscription else {
+    let values = org.sums.values();
+    let (total, _) = full_half(
+        values.subscription,
+        values.subscription_partial,
+        values.subscription_missing.as_deref(),
+    );
+    let Some(total) = total else {
         return Vec::new();
     };
     let own: BTreeSet<AccountRef> = known.accounts.iter().cloned().collect();
@@ -933,7 +950,13 @@ fn org_sentences<Tz: TimeZone + Copy>(
     let own_sub = if own_parts.is_empty() {
         0.0
     } else {
-        match Values::sum(&own_parts).subscription {
+        let sum = Values::sum(&own_parts);
+        let (value, _) = full_half(
+            sum.subscription,
+            sum.subscription_partial,
+            sum.subscription_missing.as_deref(),
+        );
+        match value {
             Some(value) => value,
             None => return Vec::new(),
         }
@@ -973,7 +996,13 @@ fn org_sentences<Tz: TimeZone + Copy>(
             let amount = if other_parts.is_empty() {
                 Some(0.0)
             } else {
-                Values::sum(&other_parts).subscription
+                let sum = Values::sum(&other_parts);
+                full_half(
+                    sum.subscription,
+                    sum.subscription_partial,
+                    sum.subscription_missing.as_deref(),
+                )
+                .0
             };
             if let Some(amount) = amount.filter(|amount| *amount > 0.0) {
                 let mut others: Vec<(&AccountRef, f64)> = others
@@ -1002,6 +1031,7 @@ fn org_sentences<Tz: TimeZone + Copy>(
     if let Some(currency) = currency {
         let mut other_orgs: Vec<String> = Vec::new();
         let mut carried_parts: Vec<&Values> = Vec::new();
+        let mut carried_partial = false;
         for other in orgs {
             if other.identity == org.identity {
                 continue;
@@ -1013,18 +1043,31 @@ fn org_sentences<Tz: TimeZone + Copy>(
             if parts.is_empty() {
                 continue;
             }
-            match Values::sum(&parts).subscription {
-                Some(value) if value > 0.0 => {
-                    carried_parts.extend(parts);
-                    other_orgs.push(other.name.clone());
-                }
-                _ => {}
+            let sum = Values::sum(&parts);
+            if sum.subscription_partial {
+                carried_partial = true;
+                continue;
+            }
+            let (value, _) = full_half(
+                sum.subscription,
+                sum.subscription_partial,
+                sum.subscription_missing.as_deref(),
+            );
+            if value.is_some_and(|value| value > 0.0) {
+                carried_parts.extend(parts);
+                other_orgs.push(other.name.clone());
             }
         }
-        let carried = if carried_parts.is_empty() {
-            Some(0.0)
+        let carried = if carried_partial || carried_parts.is_empty() {
+            None
         } else {
-            Values::sum(&carried_parts).subscription
+            let sum = Values::sum(&carried_parts);
+            full_half(
+                sum.subscription,
+                sum.subscription_partial,
+                sum.subscription_missing.as_deref(),
+            )
+            .0
         };
         if let Some(carried) = carried.filter(|carried| *carried > 0.0) {
             if !other_orgs.is_empty() {
@@ -1456,9 +1499,14 @@ mod tests {
         let page = projects_page_in(&tiny.ctx(), &range, &all()).unwrap();
         let atlas = node(&page, "atlas");
         assert_eq!(atlas.tokens.out, 7_000_000);
-        assert_eq!(
-            atlas.values.subscription, None,
-            "the record without an account makes the subscription sum unknown"
+        assert!(
+            atlas.values.subscription.is_some(),
+            "the known part of the subscription stays: {:?}",
+            atlas.values
+        );
+        assert!(
+            atlas.values.subscription_partial,
+            "the record without an account makes the subscription sum partial"
         );
         assert_eq!(
             atlas.values.subscription_missing.as_deref(),
@@ -1493,16 +1541,25 @@ mod tests {
         assert_eq!(page.without_price, vec!["claude-x".to_string()]);
         let atlas = node(&page, "atlas");
         assert_eq!(atlas.tokens.out, 7_000_000);
-        assert_eq!(
-            atlas.values.api, None,
-            "one record without a price makes the sum unknown"
+        assert!(
+            atlas.values.api.is_some(),
+            "the priced records' known part stays: {:?}",
+            atlas.values
+        );
+        assert!(
+            atlas.values.api_partial,
+            "one record without a price makes the sum partial"
         );
         assert_eq!(
             atlas.values.api_missing.as_deref(),
             Some("no price for claude-x")
         );
-        assert_eq!(
-            atlas.values.subscription, None,
+        assert!(
+            atlas.values.subscription.is_some(),
+            "the priced records' known part stays"
+        );
+        assert!(
+            atlas.values.subscription_partial,
             "the unpriced record's week has no subscription value either"
         );
         assert!(
@@ -2075,8 +2132,9 @@ mod tests {
 
     // ---- proof tests of the fix of T-5 ----
 
-    /// A project whose model has no price has no API value, so its share of all
-    /// use is unknown, never a made-up 0 %: the page writes "—".
+    /// A project whose model has no price keeps the known part of its API value
+    /// (R3), but a share divides only full halves, so its share of all use is
+    /// unknown, never a made-up 0 %: the page writes "—".
     #[test]
     fn a_project_without_a_price_has_no_share() {
         let tiny = tiny();
@@ -2093,14 +2151,19 @@ mod tests {
 
         let page = projects_page_in(&tiny.ctx(), &two_weeks(), &all()).unwrap();
         let atlas_row = node(&page, "atlas");
-        assert_eq!(atlas_row.values.api, None, "one part without a price");
+        assert!(
+            atlas_row.values.api.is_some(),
+            "the priced part stays known"
+        );
+        assert!(atlas_row.values.api_partial, "one part without a price");
         assert_eq!(
             atlas_row.share, None,
             "an unknown share is unknown, not 0 %"
         );
 
         let detail = project_detail_in(&tiny.ctx(), &two_weeks(), &all(), &atlas()).unwrap();
-        assert_eq!(detail.values.api, None, "one part without a price");
+        assert!(detail.values.api.is_some(), "the priced part stays known");
+        assert!(detail.values.api_partial, "one part without a price");
         assert_eq!(detail.share, None, "an unknown share is unknown, not 0 %");
 
         // The page reads the JSON `null`: a tree row's `share` and the detail's.
@@ -2114,6 +2177,85 @@ mod tests {
         assert!(atlas_json["share"].is_null());
         let detail_json = serde_json::to_value(&detail).expect("the detail's JSON shape");
         assert!(detail_json["share"].is_null());
+    }
+
+    /// A host's share and the organizations' sentences divide a value; a partial
+    /// half is a lower bound, so neither is a figure and both are left out (R3).
+    #[test]
+    fn a_partial_value_leaves_out_a_host_share_and_the_sentences() {
+        let tiny = tiny();
+        tiny.history
+            .append(&record(
+                "2026-11-15T09:00:00Z",
+                "s5",
+                "/home/sam/projects/atlas/engine",
+                atlas(),
+                "claude-x",
+                1_000_000,
+            ))
+            .expect("a record without a price");
+
+        let detail = project_detail_in(&tiny.ctx(), &two_weeks(), &all(), &atlas()).unwrap();
+        assert!(detail.values.api_partial, "{:?}", detail.values);
+        assert!(
+            detail.hosts.is_empty(),
+            "a host's share of a partial value is no figure: {:?}",
+            detail.hosts
+        );
+
+        let projects = with_acme_account(&tiny);
+        let ctx = Ctx {
+            projects: &projects,
+            ..tiny.ctx()
+        };
+        let full = |amount: f64| Values {
+            api: Some(0.0),
+            api_currency: Some("EUR".to_string()),
+            api_missing: None,
+            api_partial: false,
+            subscription: Some(amount),
+            currency: Some("EUR".to_string()),
+            subscription_missing: None,
+            subscription_partial: false,
+        };
+        let partial = |amount: f64| Values {
+            api: Some(0.0),
+            api_currency: Some("EUR".to_string()),
+            api_missing: None,
+            api_partial: false,
+            subscription: Some(amount),
+            currency: Some("EUR".to_string()),
+            subscription_missing: Some("no price for claude-x".to_string()),
+            subscription_partial: true,
+        };
+        let mut sums = Sums {
+            values: Some(full(100.0)),
+            ..Sums::default()
+        };
+        sums.sub_by_account.insert(tiny.ac_ref(), full(29.0));
+        sums.sub_by_account.insert(tiny.lb_ref(), partial(71.0));
+        let acme = OrgRow {
+            identity: Some("acme".to_string()),
+            name: "acme".to_string(),
+            members: Vec::new(),
+            sums,
+        };
+        let mut sam_sums = Sums::default();
+        sam_sums.sub_by_account.insert(tiny.ac_ref(), partial(71.0));
+        let sam = OrgRow {
+            identity: Some("sam".to_string()),
+            name: "sam".to_string(),
+            members: Vec::new(),
+            sums: sam_sums,
+        };
+
+        let orgs = vec![acme, sam];
+        let sentences = org_sentences(&ctx, &orgs[0], &orgs, Some("EUR"));
+        assert_eq!(
+            sentences,
+            vec!["AC is acme's subscription. It covered 29 % of the work for acme.".to_string()],
+            "a sentence whose figure would come from a partial value is left out"
+        );
     }
 
     /// The rate says which currency it converts into, so the page does not take
