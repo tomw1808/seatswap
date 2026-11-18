@@ -16,9 +16,14 @@ seatswap handles Claude login tokens, so it is built to keep them where they bel
   such modes, so there they are protected only by the permissions of the user's own folder.
 - **Each token goes only to its own provider, over HTTPS.** Claude logins go only to the usage
   endpoint (`api.anthropic.com`) and Claude Code's token endpoint (`platform.claude.com`). With
-  the Codex card on, Codex's own access token goes only to `chatgpt.com`, read from Codex's
-  `auth.json`, which seatswap never writes or refreshes. The Codex card itself reads nothing and
-  sends nothing while it is off. The Sessions area is separate: with *Read Claude Code's session files*
+  the Codex card on (or a price set for an OpenAI subscription), each saved Codex login's access
+  token goes only to `chatgpt.com`, and its refresh token only to OpenAI's own token endpoint
+  (`auth.openai.com`), to renew a saved login that is not live; a login from any other issuer is
+  never renewed. seatswap never renews Codex's live login, and writes Codex's `auth.json` only to
+  switch to another saved login. Saved Codex logins are kept like Claude logins (keyring, or the
+  `0600` files). While the card is off and no OpenAI subscription has a price, the tray app
+  reads nothing of Codex's login and sends nothing; only `seatswap codex list` or `codex switch`,
+  run by you, read it then. The Sessions area is separate: with *Read Claude Code's session files*
   on, it reads Codex's rollout files whatever the card says. The Ollama card asks the Ollama server
   (by default the local one) with no secret.
 - **The other network calls carry nothing about you.** While *Look up prices and the dollar rate*
@@ -29,13 +34,15 @@ seatswap handles Claude login tokens, so it is built to keep them where they bel
   the last four characters of a refresh token.
 - **Minimal writes to Claude Code's files.** A switch rewrites only the login entries of
   `.credentials.json` and the `oauthAccount` entry of `.claude.json`. *Use in Claude Code* (the
-  status line) writes only the `statusLine` key of Claude Code's `settings.json`. Every other key
-  stays exactly as it was, in the same order. Every write is atomic (temporary file, then rename),
+  status line) writes only the `statusLine` key of Claude Code's `settings.json`. A Codex switch
+  writes the saved login's whole `auth.json` object back as Codex wrote it, holding Codex's own
+  locks. Every other key stays exactly as it was, in the same order. Every write is atomic (temporary file, then rename),
   and the first write to each file keeps a `.seatswap-backup` copy.
 - **Reading sessions, not conversations.** To show running sessions and count tokens, seatswap
   reads Claude Code's session files and transcripts (on by default; *Read Claude Code's session
   files* turns it off). It also reads DeepSeek Harness's session files (`$DSH_HOME/sessions` or
-  `~/.dsh/sessions`), flash-agents' job reports (`$XDG_STATE_HOME/flash-agents` or
+  `~/.dsh/sessions`), flash-agents' job reports (`$FLASH_DATA_DIR`; else on Windows
+  `%LOCALAPPDATA%\flash-agents`, elsewhere `$XDG_STATE_HOME/flash-agents` or
   `~/.local/state/flash-agents`) and Codex's rollout files
   (`<codex folder>/sessions/YYYY/MM/DD/rollout-*.jsonl`) and thread names
   (`<codex folder>/session_index.jsonl`). From a Harness session it takes the
@@ -51,7 +58,7 @@ seatswap handles Claude login tokens, so it is built to keep them where they bel
   the report other hosts read. No file among them is ever written. It never opens the secret `.key`
   files that sit next to Claude Code's session files.
 - **What a shared history folder holds.** The history (usage readings, switches, tokens per
-  project and hour, session records with their titles) and the live report other hosts read
+  project, model and 5 minutes, session records with their titles) and the live report other hosts read
   (`sessions-now.json`: session names and titles, folders, models and token counts, never an agent's
   task text) are written to the history folder.
   If you point that folder at a synced service, those records travel with it. No token and no

@@ -1870,8 +1870,9 @@ The four cards:
   `estimated` (a striped bar); the main model needs a token mix, not a price of its own. A figure
   whose factor still leans on its plan-size prior says `assumed` instead of a range. Bars
   compare within a column. An empty cell is `—` titled with its reason: `not offered by {company}`,
-  `no price for {model}`, or why the estimate could not be made. The note reads `Refit every week as new work comes in; the range is how far a figure may
-  still be off.`
+  `no price for {model}`, or why the estimate could not be made. The note reads `Fitted from all work up to now each time the page opens; the range is how
+  far a figure may still be off.` (The fit runs on every load of the page; an open page does not reload
+  by itself.)
 
 The what-if replay is gone: no page replays a week without a subscription, and there is no
 `stats_what_if` command.
@@ -2483,6 +2484,7 @@ Run on 2026-11-10 with two real accounts in a separate config folder. Evidence a
 | A switch moves all running sessions (§6.5) | A long agent run continues on the other account, with its settings and limits. | The pop-up says so before the switch. Per-terminal accounts are a non-goal (§1). |
 | Claude Code can move the Windows login into Windows Credential Manager (`docs/windows.md` §13) | Version 2.1.322 has this store behind a server-side flag (`tengu_windows_credman`, off on the test machine on 2026-11-11). With it on, Claude Code reads the login from Credential Manager and deletes `.credentials.json` after its first save there; a switch on Windows then changes nothing. | seatswap reports "no login" instead of failing silently. Support for that store is not built; it is the Windows counterpart of the macOS Keychain work (§2.2). |
 | The Codex usage endpoint is internal and not documented by OpenAI (§7.9) | OpenAI can change or remove it in any release; the card would then stop showing numbers. | The endpoint lives in `api.rs` beside seatswap's other endpoints; it is the only Codex endpoint. A changed answer shows the API error text on that card, and nothing else — no switch, no stored account, no Claude reading — is affected. The card is off by default. |
+| A Codex login does not fit one Windows Credential Manager entry (`docs/windows.md` §15) | Credential Manager holds 2560 bytes per entry; a Codex login is about 7,800 bytes as UTF-16, so on Windows the save fails and Codex cannot be switched (worked out from the sizes, not run on Windows). | The OpenAI card still shows the live login's usage, and its row says `This login is not saved: {error}`. How to store it on Windows is not decided. |
 | Linux tray limits (§8.3, §9.2) | A desktop without a StatusNotifierItem host shows no icon at all; on Wayland the pop-up cannot sit at the icon. | The menu and `seatswap panel` reach the pop-up too. Native applets later (§9.3). |
 
 ## 17. Known issues

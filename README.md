@@ -7,20 +7,25 @@ A tray app and command line tool for Linux and Windows that switches
 one click. Only the login is swapped. Your `~/.claude` (on Windows `%USERPROFILE%\.claude`) stays
 the same for every account: memory, skills, plugins, hooks, settings and history are shared.
 
-The tray icon shows the active account's abbreviation with a ring for how much of its limit is
-used. A click opens a pop-up with the session and weekly usage of every stored account, so you can
-see at a glance which one still has room. Beyond that, seatswap can switch by itself so that as
-little quota as possible expires (auto-burn), shows the running Claude Code sessions, keeps a
-history with statistics of what each subscription was used for, and builds Claude Code's status
-line.
+The tray icon shows the active account's abbreviation (or, if you choose, its usage percent) with a
+ring for how much of its limit is used. A click opens a pop-up with the session and weekly usage of
+every stored account, so you can see at a glance which one still has room. Beyond that, seatswap
+can switch by itself so that as little quota as possible expires (auto-burn), switches Codex between
+saved OpenAI logins, shows the running Claude Code, Codex and DeepSeek Harness sessions, keeps a
+history with statistics of what each subscription was used for and what it gives, and builds Claude
+Code's status line.
 
 <p>
-  <img src="docs/images/panel-dark.png" alt="The pop-up in the dark theme: auto-burn's line with account chips and a waiting switch, the sessions line with links to Sessions, the plan and Statistics, three accounts with usage rings, bars and reset times, and the Codex and Ollama cards" width="380">
+  <img src="docs/images/panel-dark.png" alt="The pop-up in the dark theme: a login warning, auto-burn's line with account chips and a waiting switch, the sessions line, three Claude accounts with usage rings, bars and reset times, the OpenAI (Codex) card with two saved logins, the live one marked, and the Ollama card" width="380">
   <img src="docs/images/panel-light.png" alt="The same pop-up in the light theme" width="380">
 </p>
 
 <p>
-  <img src="docs/images/window-sessions.png" alt="The large window's Sessions area: Claude Code, Codex and DeepSeek Harness sessions grouped by project and provider, with their agents, tokens, last hour and values, and cards for the models, what a switch would cost and the last hour by project" width="760">
+  <img src="docs/images/window-sessions.png" alt="The large window's Sessions area: Claude Code and DeepSeek Harness sessions grouped by project and provider, with their agents, a flash job, tokens, last hour and values, and cards for the models, what a switch would cost and the last hour by project" width="760">
+</p>
+
+<p>
+  <img src="docs/images/window-subscriptions.png" alt="Statistics, Subscriptions page over 90 days: what each plan gives in hours of typical work per model, the plan sizes measured against Max, what is used of what is paid per company, what 1 % of a limit buys over the weeks with a note that it fell by 20 % since 19 Oct, and the tokens a week per subscription and model" width="760">
 </p>
 
 <p>
@@ -35,12 +40,12 @@ line.
 
 ## Status
 
-Built and used daily on **Linux Mint 22 Cinnamon (X11)**. On Windows 11 it builds
-and passes its tests (Claude Code keeps its login in the same file there), and the tray app of
-1.0 had its first run there on 2026-11-11. The parts new in 1.1 (sessions, history, statistics,
-auto-burn, the status line, the large window) have passed their tests on Windows but have not run
-on a Windows desktop yet. macOS is not supported yet: Claude Code keeps its login in the Keychain
-there, and seatswap does not read or write that yet.
+Built and used daily on **Linux Mint 22 Cinnamon (X11)**. On **Windows 11** version 1.2.2 was
+checked by hand on 2026-11-18: the tray icon and pop-up, a switch that a running Claude Code session
+follows, the notifications, start at login, settings shared with a Linux machine, the status line
+and the Sessions area all work (Claude Code keeps its login in the same file there). The parts new in
+1.3 pass their tests on Windows but have not run on a Windows desktop yet. macOS is not supported
+yet: Claude Code keeps its login in the Keychain there, and seatswap does not read or write that yet.
 
 ## Features
 
@@ -93,7 +98,8 @@ there, and seatswap does not read or write that yet.
   folder, so every host shows the same names once the folder has synced. History can be exported as
   CSV or JSON, and another history folder's files imported by hand.
 - **Usage at a glance.** The icon ring shows the active account's binding limit, coloured green,
-  amber or red. The pop-up shows every account's session (5 h) and weekly limits, with the time
+  amber or red. Inside the ring the icon shows the account's letters, or with *Settings → General →
+  The tray icon shows* the ring's percent (100 % shown as 99, so it stays two digits). The pop-up shows every account's session (5 h) and weekly limits, with the time
   until each one resets — and its plan, such as "Team Premium".
 - **OpenAI (Codex) and Ollama cards.** With a switch in *Settings → Providers*, the pop-up shows an
   OpenAI card and an Ollama card. The OpenAI card lists every saved Codex login, marks the live one
@@ -101,17 +107,24 @@ there, and seatswap does not read or write that yet.
   Ollama card shows credits left, reset date, spend in the last 24 h, or session and weekly limits on
   an old plan. Both are off by default; while one is off, seatswap sends no request for that card.
   seatswap writes Codex's `auth.json` only when switching between saved logins; sign-in and sign-out
-  stay Codex's own (`codex login`).
+  stay Codex's own (`codex login`). Codex reads that file only when a session starts, so a switch
+  reaches new Codex sessions; running ones keep their login until they restart. On Windows a Codex
+  login is most likely too large for one Credential Manager entry (2,560 bytes), so seatswap cannot
+  save it there and Codex switching does not work yet; the card still shows the usage and says why.
+  This follows from the sizes and has not been tried on Windows.
 - **Auto-burn.** Switched on, seatswap moves between accounts by itself so that as little work as
   possible is blocked; it switches before an account is full only when the measured gain is worth
-  the switch. Switched off, it suggests the same switch instead.
+  the switch. Switched off, it suggests the same switch instead. It measures work in API dollars:
+  each account learns how many percent of a limit one dollar of work at API prices uses, starting
+  from a figure assumed from its plan.
 - **Status line for Claude Code.** `seatswap statusline` prints the live account and its limits in
   Claude Code's status line, and hands the live numbers back to the tray app without an extra
   request. The large window's Status line area builds the line, previews it at three terminal
   widths, and turns it on in Claude Code with one button that can be undone.
 - **History.** Every usage reading, finished window, switch and agent call is kept in an
-  append-only history folder, one JSON Lines file per month and kind, with tokens per project and
-  hour, and Ollama's hourly usage. Several hosts can share it through a synced folder; each writes
+  append-only history folder, one JSON Lines file per month and kind, with tokens per project,
+  model and 5 minutes, and Ollama's hourly usage. Update every machine that shares a history
+  folder to 1.3 together: older versions read the 5-minute token lines as hours. Several hosts can share it through a synced folder; each writes
   only its own subfolder.
 - **A second computer.** Point both computers' history folder at the same synced folder, and the
   second one gets more than the shared history: each account's label, abbreviation, colour, price
@@ -337,29 +350,34 @@ the tray app, and `seatswap.exe` for everything you want to read in a terminal.
 - **One backup:** before seatswap writes to one of these two files for the first time, it keeps a
   copy next to it, named `<file>.seatswap-backup`. The copy contains the login of that moment and
   is never updated.
-- **Where stored logins live:** in your system keyring (Secret Service on Linux, Credential
-  Manager on Windows). If no keyring is available, in files in the data folder, and the pop-up
+- **Where stored logins live:** the saved Claude logins and the saved Codex logins are in your
+  system keyring (Secret Service on Linux, Credential Manager on Windows). If no keyring is available, in files in the data folder, and the pop-up
   says so. On Linux those files have mode `0600`; on Windows they are protected only by the
   permissions of your user folder.
 - **What else it writes:** its own data folder (including `feed.json`, the status line's live
   numbers, `burn-next.json` and `notification-icon.png`, the picture its notifications show), the
   one key `statusLine` of Claude Code's `settings.json` when you press *Use in Claude
-  Code*, and the entry that starts it at login
+  Code*, Codex's `auth.json` when you switch Codex to another saved login, and the entry that starts it at login
   (`~/.config/autostart/seatswap.desktop` on Linux, the value `seatswap` under
   `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` on Windows). On Windows it also registers
   the name its notifications are shown under
   (`HKCU\Software\Classes\AppUserModelId\dev.seatswap.app`).
-- **Codex and Ollama:** with the Codex card on, seatswap reads Codex's `auth.json` for the access
-  token and account id it sends to `chatgpt.com`; it never writes that file, never refreshes the
-  token and never reads the OS keyring. With the Ollama card on it only asks the Ollama server for
-  the balance and the last 24 h's spend. Both cards are off by default, and neither card sends a
-  request that generates text.
+- **Codex and Ollama:** with the Codex card on, or a price set for an OpenAI subscription,
+  seatswap reads Codex's `auth.json` for the access token and account id it sends to `chatgpt.com`,
+  and keeps a copy of every ChatGPT login it sees there, so it can switch back to it. It writes
+  `auth.json` only for a switch, holding Codex's own two locks (`auth.lock`, `auth.json.lock`), and
+  every key stays as Codex wrote it. It never renews the live login; that stays Codex's job. A saved
+  login that is not live is renewed once at OpenAI's own token endpoint when its token has run out.
+  A login Codex keeps in the OS keyring, or an API key, is not saved or switched. With the Ollama
+  card on, seatswap only asks the Ollama server for the balance and the last 24 h's spend. Both
+  cards are off by default, and neither sends a request that generates text.
 - **Sessions and the files behind them:** with *Read Claude Code's session files* on, seatswap also
   reads Codex's rollout files (`<codex folder>/sessions/YYYY/MM/DD/rollout-*.jsonl`) and thread
   names (`<codex folder>/session_index.jsonl`; the folder is the *Codex folder* setting,
   `$CODEX_HOME` or `~/.codex`), DeepSeek Harness's sessions
-  (`$DSH_HOME/sessions` or `~/.dsh/sessions`) and flash-agents' job reports
-  (`$XDG_STATE_HOME/flash-agents` or `~/.local/state/flash-agents`). While the saved settings name
+  (`$DSH_HOME/sessions` or `~/.dsh/sessions`) and flash-agents' job reports (`$FLASH_DATA_DIR`;
+  else on Windows `%LOCALAPPDATA%\flash-agents`, elsewhere `$XDG_STATE_HOME/flash-agents` or
+  `~/.local/state/flash-agents`). While the saved settings name
   no history folder, it reads Dropbox's `info.json` (macOS and Linux `~/.dropbox/info.json`; Windows
   `%APPDATA%\Dropbox\info.json`, then `%LOCALAPPDATA%\Dropbox\info.json`) only to suggest
   `<Dropbox>/seatswap` as the history folder; a file it cannot read is shown with its path and why.
@@ -369,15 +387,16 @@ the tray app, and `seatswap.exe` for everything you want to read in a terminal.
   title or task text (shown in the window and cleared before the report other hosts read).
 - **Network:** the usage endpoint (`api.anthropic.com/api/oauth/usage`) and Claude Code's token
   endpoint (`platform.claude.com/v1/oauth/token`, with Claude Code's own client id) to refresh
-  stored logins. While the Codex card is on, `chatgpt.com/backend-api/wham/usage` with Codex's own
-  access token and account id; while the Ollama card is on, the server at `ollamaUrl` (default
+  stored logins. While the Codex card is on or an OpenAI subscription has a price,
+  `chatgpt.com/backend-api/wham/usage` with each login's own access token and account id, and
+  `auth.openai.com/oauth/token` to renew a saved login that is not live; while the Ollama card is on, the server at `ollamaUrl` (default
   `http://127.0.0.1:11434`) for `/api/balance` and `/api/usage?range=24h`, with no secret. And, only
   while *Look up prices and the dollar rate* is on, `models.dev` for API prices and
   `api.frankfurter.dev` for the dollar rate; those two send a User-Agent and nothing about you, your
   accounts or this machine. Nothing else.
 - **Logs and output** never contain a token; at most the last four characters of a refresh token.
 - **What it records:** the history (every usage reading, finished window, switch and agent call,
-  the tokens each session used per project folder, hour and model, Ollama's hourly usage, and each
+  the tokens each session used per project folder, 5 minutes and model, Ollama's hourly usage, and each
   edit of an account's label, abbreviation, colour or price and of a shared setting) and,
   for your other hosts, a live report of this host's running sessions (`sessions-now.json`: session
   names and titles, folders, models and token counts, never an agent's task text or a worker's title). Both go
@@ -388,7 +407,8 @@ the tray app, and `seatswap.exe` for everything you want to read in a terminal.
   and the Codex and Harness files.
 - **Locks:** a switch holds Claude Code's own lock files (the renewal locks of the main and the two
   secondary logins, credentials write, identity write) and its own app lock, so it never
-  overwrites a login Claude Code is writing.
+  overwrites a login Claude Code is writing. A Codex switch likewise holds the app lock and Codex's
+  two lock files.
 
 Whether using a subscription login this way is within Anthropic's terms is for you to judge; see
 [Anthropic's terms](https://www.anthropic.com/legal/consumer-terms).
@@ -401,7 +421,7 @@ Whether using a subscription login this way is within Anthropic's terms is for y
 | KDE Plasma, Xfce, MATE | Expected to work (StatusNotifierItem) |
 | GNOME | Needs the AppIndicator extension |
 | Wayland sessions | Expected to work; the pop-up is centred, the compositor places it |
-| Windows 11 | Builds and passes its tests; 1.0's first run on 2026-11-11 (tray app, start at login); a switch and the notifications are not confirmed yet, and the parts new in 1.1 have not run on a desktop yet. `seatswap.exe` is the CLI, `seatswap-tray.exe` the same program without a console window (autostart, Start menu). Works while Claude Code keeps its login in `.credentials.json`; a newer Claude Code can move it into Windows Credential Manager, which is not supported yet |
+| Windows 11 | **Checked by hand with 1.2.2** on 2026-11-18: tray icon, pop-up, a switch a running session follows, notifications, start at login, shared settings, status line, Sessions. The parts new in 1.3 pass their tests there but have not run on a desktop yet; Codex switching most likely does not work there yet (a Codex login does not fit one Credential Manager entry). `seatswap.exe` is the CLI, `seatswap-tray.exe` the same program without a console window (autostart, Start menu). Works while Claude Code keeps its login in `.credentials.json`; a newer Claude Code can move it into Windows Credential Manager, which is not supported yet |
 | Windows 10 (1803 or later) | Expected to work; not run yet |
 | macOS | Not yet: needs Keychain support for Claude Code's login |
 

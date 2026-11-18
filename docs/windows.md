@@ -386,7 +386,7 @@ What it means for seatswap: with the flag on, a switch that only rewrites `.cred
 
 1.2.0 reads the Harness's and flash-agents' folders and, while the saved settings name no history
 folder, looks for Dropbox's `info.json`; Codex's folder was already read in 1.1.0. Every one is read
-only; seatswap never writes there. As on Linux, `HOME` does not move the Codex or Harness folders on
+only; seatswap never writes there, except Codex's `auth.json` for a Codex switch since 1.3.0 (section 15). As on Linux, `HOME` does not move the Codex or Harness folders on
 Windows: they come from `dirs::home_dir()`, which is `%USERPROFILE%`, or from the variable named
 beside them.
 
@@ -414,3 +414,20 @@ Code session once its result is in that session's transcript; before that it is 
 under its own Harness id and folder. Codex's running rule keeps its other half on Windows: a session
 whose last event is younger than the Harness quiet time is running. A running job whose result no
 transcript holds yet is not shown as its session's agent on Windows.
+
+## 15. Codex logins on Windows (1.3.0, 2026-11-18)
+
+1.3.0 keeps a copy of every ChatGPT login it sees in Codex's `auth.json`, in the secrets store, so it
+can switch Codex between them (`docs/spec.md` §7.9). On Windows the store is Credential Manager,
+which holds 2560 bytes per entry (section 3). A Codex login (the whole `auth.json` object: id token,
+access token, refresh token, account id) is about 3,900 characters, about 7,800 bytes as UTF-16, so
+the save fails there. Worked out from the sizes; not run on Windows yet.
+
+What happens then: the OpenAI card still reads and shows the live login's usage, and the login's row
+says `This login is not saved: {error}`. A switch away from it fails, because a switch saves the live
+login first. Without a keyring (the `0600`-file fallback) the save is not limited by size.
+
+Not decided: keep Codex copies in the file store on Windows, split one copy over several keyring
+entries (as Claude Code does for its own Credential Manager login, section 13), or leave Windows
+without Codex switching. Each of the first two is a second way to store a secret and needs the owner's
+word.

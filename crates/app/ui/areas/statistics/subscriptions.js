@@ -1186,7 +1186,7 @@ function tokensWeekCard(tokensWeek, plans, env) {
   body.appendChild(
     h("p", {
       class: "stats-sub-token-note",
-      text: "Refit every week as new work comes in; the range is how far a figure may still be off.",
+      text: "Fitted from all work up to now each time the page opens; the range is how far a figure may still be off.",
     })
   );
   card.appendChild(body);

@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Subscriptions → Tokens a week: the note says the figures are fitted from all work up to now each
+  time the page opens; it said "Refit every week", which they never were.
+
 ## [1.3.0] - 2026-11-18
 
 ### Added
@@ -69,6 +74,12 @@ All notable changes to this project are documented here. The format follows
 - Statistics' "What if without it", its `WhatIf` type and the `stats_what_if` command. A keep/drop
   verdict misses what a subscription saves elsewhere.
 - Work units and their constants in auto-burn; every figure is in API dollars now.
+
+### Known issues
+
+- Windows: a Codex login is most likely too large for one Credential Manager entry (2,560 bytes), so
+  seatswap cannot save it there and Codex switching does not work yet; the OpenAI card still shows
+  the usage and says why the login is not saved. Worked out from the sizes, not tried on Windows.
 
 ## [1.2.2] - 2026-11-17
 
