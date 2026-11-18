@@ -298,7 +298,6 @@ pub(crate) fn run(
             window::stats_projects,
             window::stats_project_detail,
             window::stats_subscriptions,
-            window::stats_what_if,
             window::stats_forecast,
             window::stats_rhythm,
             window::stats_activity,

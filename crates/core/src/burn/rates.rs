@@ -10,8 +10,11 @@ use crate::api::LimitKind;
 use crate::history::{
     is_early_reset, same_reset, AccountRef, Event, EventKind, Hosted, Sample, TokenRecord,
 };
-use crate::money::{api_usd, is_plan_model, Company, Prices};
-use crate::store::Account;
+use crate::money::{
+    api_usd, is_plan_model, ollama_subscription, openai_subscription_at, openai_subscriptions,
+    provider_switch_timelines, Company, Prices,
+};
+use crate::store::{Account, ProviderSubscription};
 
 use crate::stats::{local_hour_of_week, local_hour_start};
 
@@ -131,25 +134,50 @@ pub fn account_at(events: &[Hosted<Event>], host: &str, t: DateTime<Utc>) -> Opt
     Timeline::of(events, host).at(t).cloned()
 }
 
-/// One account the factors are learned for: how the history names it, the
-/// capacity of its plan ([`Account::capacity`]: 5 for Max, 20 for Ultra, 1 for
-/// Pro; `None` when its tier names no multiplier) and its plan's name
-/// ([`Account::plan`], compared exactly when one account takes another's
-/// factor).
+/// One subscription the factors are learned for: how the history names it, the
+/// company whose models are its work, the capacity of its plan
+/// ([`Account::capacity`]: 5 for Max, 20 for Ultra, 1 for Pro; `None` when its
+/// tier names no multiplier) and its plan's name ([`Account::plan`], compared
+/// exactly when one subscription takes another's factor, within its company
+/// only).
 #[derive(Debug, Clone, PartialEq)]
 pub struct RateAccount {
     pub account: AccountRef,
+    pub company: Company,
     pub capacity: Option<f64>,
     pub plan: Option<String>,
 }
 
 impl RateAccount {
+    /// A Claude account: its models are Anthropic's.
     pub fn of(account: &Account) -> RateAccount {
         RateAccount {
             account: AccountRef::of(account),
+            company: Company::Anthropic,
             capacity: account.capacity(),
             plan: account.plan.clone(),
         }
+    }
+
+    /// A provider subscription (decision 1 of M-2): its company is the one its
+    /// account's org names, its plan the stored plan's. A provider has no
+    /// capacity by name: its week is learned from its own readings only.
+    pub fn of_provider(subscription: &ProviderSubscription) -> RateAccount {
+        RateAccount {
+            account: subscription.account.clone(),
+            company: Company::of_account(&subscription.account),
+            capacity: None,
+            plan: subscription.plan.clone(),
+        }
+    }
+}
+
+/// The limit whose percent is the main factor `c` of a company (decision 1 of
+/// M-2): `weekly_all` for Anthropic and OpenAI, Ollama's `monthly_credits`.
+pub(crate) fn main_limit(company: Company) -> LimitKind {
+    match company {
+        Company::Anthropic | Company::OpenAI => LimitKind::WeeklyAll,
+        Company::Ollama => LimitKind::Other("monthly_credits".to_string()),
     }
 }
 
@@ -176,7 +204,7 @@ impl LearnedRates {
 /// The one wording of a model without a price, shared by [`LearnedRates`] and
 /// [`super::live::learn`] so the warning is said the same way with and without
 /// session reading.
-pub(super) fn unpriced_warning(model: &str) -> String {
+pub(crate) fn unpriced_warning(model: &str) -> String {
     format!("no price for {model}: its work is left out of auto-burn's rates and rhythm")
 }
 
@@ -216,11 +244,136 @@ pub fn rates(
     prices: &Prices,
     now: DateTime<Utc>,
 ) -> LearnedRates {
-    let timelines = timelines(events);
-    let measured: Vec<(&RateAccount, Measured)> = accounts
+    rates_in(
+        accounts,
+        samples,
+        tokens,
+        events,
+        &[],
+        prices,
+        now - Duration::days(RATES_DAYS),
+        now,
+    )
+}
+
+/// [`rates`] with an explicit span and provider subscriptions (decision 1 of
+/// M-2): the one estimator of every subscription's factors. Auto-burn calls
+/// [`rates`] with Claude accounts and no provider subscriptions, so its rates
+/// are exactly what they were; the Subscriptions page calls this over its range
+/// for every stored subscription, whatever chips the page shows, so a chip
+/// never changes a factor or a prior.
+///
+/// A provider subscription's work is its company's records that belong to it:
+/// an OpenAI record belongs to the subscription
+/// [`openai_subscription_at`] gives it, an Ollama record to
+/// [`ollama_subscription`]. A provider pair counts only when every record of
+/// that company inside the pair's span belongs to this subscription (the
+/// providers' version of [`MIN_LIVE_SHARE`], documented rule). A record of
+/// another company never counts.
+///
+/// The priors stay within a company: rule 1 (same plan name) pools only
+/// subscriptions of the same company, and rules 2 and 3 (capacity, assumed
+/// factor) exist for Anthropic only. A provider without a same-plan measured
+/// subscription gets a factor only once it is measured.
+/// The timelines and stored OpenAI logins a page builds once for all its
+/// windows and subscriptions (decision 16 of M-2's fix): [`window_pairs`] and
+/// [`rates_in_with`] take them instead of rebuilding them per window.
+pub(crate) struct WindowPools {
+    pub(crate) timelines: HashMap<String, Timeline>,
+    pub(crate) provider_timelines: HashMap<String, Timeline>,
+    pub(crate) openai: BTreeSet<AccountRef>,
+}
+
+impl WindowPools {
+    pub(crate) fn of(
+        events: &[Hosted<Event>],
+        provider_subscriptions: &[ProviderSubscription],
+    ) -> WindowPools {
+        WindowPools {
+            timelines: timelines(events),
+            provider_timelines: provider_switch_timelines(events),
+            openai: openai_subscriptions(provider_subscriptions),
+        }
+    }
+}
+
+/// One subscription's samples, sorted by time then host, so a page builds the
+/// list once and every window cuts it (decision 16 of M-2's fix).
+pub(crate) fn sample_lines<'a>(
+    account: &AccountRef,
+    samples: &'a [Hosted<Sample>],
+) -> Vec<&'a Hosted<Sample>> {
+    let mut lines: Vec<&Hosted<Sample>> = samples
+        .iter()
+        .filter(|hosted| &hosted.record.account == account)
+        .collect();
+    lines.sort_by(|a, b| {
+        a.record
+            .t
+            .cmp(&b.record.t)
+            .then_with(|| a.host.cmp(&b.host))
+    });
+    lines
+}
+
+/// [`sample_lines`] for every subscription, built once per page (decision 16
+/// of M-2's fix).
+pub(crate) fn sample_lines_by_account<'a>(
+    subjects: &[RateAccount],
+    samples: &'a [Hosted<Sample>],
+) -> BTreeMap<AccountRef, Vec<&'a Hosted<Sample>>> {
+    subjects
+        .iter()
+        .map(|subject| {
+            (
+                subject.account.clone(),
+                sample_lines(&subject.account, samples),
+            )
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rates_in(
+    subjects: &[RateAccount],
+    samples: &[Hosted<Sample>],
+    tokens: &[Hosted<TokenRecord>],
+    events: &[Hosted<Event>],
+    provider_subscriptions: &[ProviderSubscription],
+    prices: &Prices,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> LearnedRates {
+    let pools = WindowPools::of(events, provider_subscriptions);
+    let lines = sample_lines_by_account(subjects, samples);
+    rates_in_with(subjects, &lines, samples, tokens, &pools, prices, from, to)
+}
+
+/// [`rates_in`] with the timelines, logins and sorted samples a page already
+/// built (decision 16 of M-2's fix).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rates_in_with(
+    subjects: &[RateAccount],
+    lines: &BTreeMap<AccountRef, Vec<&Hosted<Sample>>>,
+    samples: &[Hosted<Sample>],
+    tokens: &[Hosted<TokenRecord>],
+    pools: &WindowPools,
+    prices: &Prices,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> LearnedRates {
+    let measured: Vec<(&RateAccount, Measured)> = subjects
         .iter()
         .map(|entry| {
-            let measured = measure(&entry.account, samples, tokens, &timelines, prices, now);
+            let empty = Vec::new();
+            let lines = lines.get(&entry.account).unwrap_or(&empty);
+            let has_session = samples
+                .iter()
+                .filter(|hosted| hosted.record.account == entry.account)
+                .filter(|hosted| hosted.record.t >= from && hosted.record.t <= to)
+                .max_by_key(|hosted| hosted.record.t)
+                .is_some_and(|hosted| hosted.record.limit(&LimitKind::Session).is_some());
+            let measured = measure(entry, lines, tokens, pools, prices, from, to, has_session);
             (entry, measured)
         })
         .collect();
@@ -279,10 +432,9 @@ fn prior(
 
     if let Some(plan) = &entry.plan {
         let (mut gain, mut usd) = (0.0, 0.0);
-        for (_, pairs) in others
-            .iter()
-            .filter(|(other, _)| other.plan.as_deref() == Some(plan.as_str()))
-        {
+        for (_, pairs) in others.iter().filter(|(other, _)| {
+            other.company == entry.company && other.plan.as_deref() == Some(plan.as_str())
+        }) {
             for pair in *pairs {
                 gain += pair.gain;
                 usd += pair.usd;
@@ -293,6 +445,11 @@ fn prior(
         }
     }
 
+    // The capacity rules are Anthropic's only: an OpenAI or Ollama
+    // subscription has no capacity by name, so it waits to be measured.
+    if entry.company != Company::Anthropic {
+        return None;
+    }
     let capacity = entry.capacity?;
     let (mut gain, mut usd) = (0.0, 0.0);
     for (other, pairs) in &others {
@@ -322,35 +479,29 @@ pub(super) fn unpriced_models(tokens: &[Hosted<TokenRecord>], prices: &Prices) -
         .collect()
 }
 
-/// One account's usable pairs (see [`rates`]), as the fit takes them.
+/// One subscription's usable pairs (see [`rates_in`]), as the fit takes them.
 struct Measured {
     week: Vec<fit::Pair>,
     session: Vec<fit::Pair>,
-    /// The account's latest sample in the range has a session limit.
+    /// The subscription's latest sample in `[from, to]` has a session limit.
     has_session: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn measure(
-    account: &AccountRef,
-    samples: &[Hosted<Sample>],
+    subject: &RateAccount,
+    lines: &[&Hosted<Sample>],
     tokens: &[Hosted<TokenRecord>],
-    timelines: &HashMap<String, Timeline>,
+    pools: &WindowPools,
     prices: &Prices,
-    now: DateTime<Utc>,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    has_session: bool,
 ) -> Measured {
-    let pairs: Vec<SamplePair> = pairs(account, samples, now)
-        .into_iter()
-        .filter(|pair| {
-            live_seconds(timelines, account, pair.from, pair.to)
-                >= MIN_LIVE_SHARE * seconds_between(pair.from, pair.to)
-        })
-        .collect();
-    let spans: Vec<(DateTime<Utc>, DateTime<Utc>)> =
-        pairs.iter().map(|pair| (pair.from, pair.to)).collect();
-    let work = work_in(timelines, tokens, account, &spans, prices);
+    let owned = owned_pairs(subject, lines, tokens, pools, prices, from, to);
     let mut week = Vec::new();
     let mut session = Vec::new();
-    for (pair, work) in pairs.iter().zip(&work) {
+    for (pair, work) in owned {
         if work.unpriced {
             continue;
         }
@@ -365,18 +516,105 @@ fn measure(
             });
         }
     }
-    let from = now - Duration::days(RATES_DAYS);
-    let has_session = samples
-        .iter()
-        .filter(|hosted| &hosted.record.account == account)
-        .filter(|hosted| hosted.record.t >= from && hosted.record.t <= now)
-        .max_by_key(|hosted| hosted.record.t)
-        .is_some_and(|hosted| hosted.record.limit(&LimitKind::Session).is_some());
     Measured {
         week,
         session,
         has_session,
     }
+}
+
+/// The limits [`window_pairs`] can pool a window's pairs for (decision 6 of
+/// M-2): the main limit's percent, or the 5 h session's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PairLimit {
+    Main,
+    Session,
+}
+
+/// The pairs of one subscription inside one window, through the same ownership
+/// and work rules as [`rates_in`] (decisions 1 and 6 of M-2): the fit is
+/// [`fit::factor`] with no prior. The page's per-window points and their pooled
+/// "before"/"after" factors come from here, never from a second pair or work
+/// function. `lines` are [`sample_lines`] of the subscription and `pools` the
+/// page's [`WindowPools`], both built once (decision 16 of M-2's fix).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn window_pairs(
+    subject: &RateAccount,
+    lines: &[&Hosted<Sample>],
+    tokens: &[Hosted<TokenRecord>],
+    pools: &WindowPools,
+    prices: &Prices,
+    limit: PairLimit,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Vec<fit::Pair> {
+    owned_pairs(subject, lines, tokens, pools, prices, from, to)
+        .into_iter()
+        .filter_map(|(pair, work)| {
+            if work.unpriced {
+                return None;
+            }
+            match limit {
+                PairLimit::Main => Some(fit::Pair {
+                    gain: pair.week,
+                    usd: work.usd,
+                }),
+                PairLimit::Session => pair.session.map(|gain| fit::Pair {
+                    gain,
+                    usd: work.usd,
+                }),
+            }
+        })
+        .collect()
+}
+
+/// The pairs of one subscription whose work belongs to it, with that work.
+/// Claude pairs keep auto-burn's rule (live for [`MIN_LIVE_SHARE`] of the
+/// pair); a provider pair is kept only when a record of its company inside the
+/// pair's span belongs to this subscription and none belongs to another.
+#[allow(clippy::too_many_arguments)]
+fn owned_pairs(
+    subject: &RateAccount,
+    lines: &[&Hosted<Sample>],
+    tokens: &[Hosted<TokenRecord>],
+    pools: &WindowPools,
+    prices: &Prices,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Vec<(SamplePair, SpanWork)> {
+    let raw = pairs(lines, from, to, &main_limit(subject.company));
+    let spans: Vec<(DateTime<Utc>, DateTime<Utc>)> =
+        raw.iter().map(|pair| (pair.from, pair.to)).collect();
+    let ollama = ollama_subscription();
+    let provider = ProviderWork {
+        company: subject.company,
+        subscription: match subject.company {
+            Company::Ollama => &ollama,
+            Company::Anthropic | Company::OpenAI => &subject.account,
+        },
+        timelines: &pools.provider_timelines,
+        openai: &pools.openai,
+    };
+    let owner = match subject.company {
+        Company::Anthropic => Ownership::Claude(&subject.account),
+        Company::OpenAI | Company::Ollama => Ownership::Provider(&provider),
+    };
+    let work = work_for(&pools.timelines, tokens, owner, &spans, prices);
+    raw.into_iter()
+        .zip(work)
+        .filter(|(pair, work)| {
+            if work.foreign {
+                return false;
+            }
+            match subject.company {
+                Company::Anthropic => {
+                    live_seconds(&pools.timelines, &subject.account, pair.from, pair.to)
+                        >= MIN_LIVE_SHARE * seconds_between(pair.from, pair.to)
+                }
+                Company::OpenAI | Company::Ollama => work.own,
+            }
+        })
+        .collect()
 }
 
 /// The timeline of every host that has an event. `pub(crate)` so `money` reads
@@ -401,26 +639,24 @@ struct SamplePair {
     session: Option<f64>,
 }
 
-/// The pairs of the account's samples of every host in the last [`RATES_DAYS`]
-/// days, sorted by time: consecutive, at most 6 h apart, the same weekly reset
-/// ([`same_reset`]). A pair whose earlier sample is already at 100 % cannot rise
-/// and is left out. A pair whose weekly percent fell by the reset rule
-/// ([`is_early_reset`]) is a reset and is left out too, as a changed reset time
-/// already is. A pair that goes down by less stays in, so the sum of the
-/// differences is the last percent minus the first.
-fn pairs(account: &AccountRef, samples: &[Hosted<Sample>], now: DateTime<Utc>) -> Vec<SamplePair> {
-    let from = now - Duration::days(RATES_DAYS);
-    let mut lines: Vec<&Hosted<Sample>> = samples
+/// The pairs of the subscription's sorted `lines` in `[from, to]`: consecutive,
+/// at most 6 h apart, the same `main` limit's reset ([`same_reset`]). A pair
+/// whose earlier sample is already at 100 % cannot rise and is left out. A pair
+/// whose main percent fell by the reset rule ([`is_early_reset`]) is a reset and
+/// is left out too, as a changed reset time already is. A pair that goes down by
+/// less stays in, so the sum of the differences is the last percent minus the
+/// first.
+fn pairs(
+    lines: &[&Hosted<Sample>],
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    main: &LimitKind,
+) -> Vec<SamplePair> {
+    let lines: Vec<&Hosted<Sample>> = lines
         .iter()
-        .filter(|hosted| &hosted.record.account == account)
-        .filter(|hosted| hosted.record.t >= from && hosted.record.t <= now)
+        .copied()
+        .filter(|hosted| hosted.record.t >= from && hosted.record.t <= to)
         .collect();
-    lines.sort_by(|a, b| {
-        a.record
-            .t
-            .cmp(&b.record.t)
-            .then_with(|| a.host.cmp(&b.host))
-    });
 
     let mut pairs = Vec::new();
     for pair in lines.windows(2) {
@@ -429,20 +665,19 @@ fn pairs(account: &AccountRef, samples: &[Hosted<Sample>], now: DateTime<Utc>) -
         if span <= Duration::zero() || span > Duration::hours(6) {
             continue;
         }
-        let (Some(week_before), Some(week_after)) = (
-            before.record.limit(&LimitKind::WeeklyAll),
-            after.record.limit(&LimitKind::WeeklyAll),
-        ) else {
+        let (Some(main_before), Some(main_after)) =
+            (before.record.limit(main), after.record.limit(main))
+        else {
             continue;
         };
-        let (Some(reset_before), Some(reset_after)) = (week_before.r, week_after.r) else {
+        let (Some(reset_before), Some(reset_after)) = (main_before.r, main_after.r) else {
             continue;
         };
         if !same_reset(reset_before, reset_after)
-            || week_before.p >= 100.0
+            || main_before.p >= 100.0
             || is_early_reset(
-                week_before.p,
-                week_after.p,
+                main_before.p,
+                main_after.p,
                 Some(reset_before),
                 after.record.t,
             )
@@ -452,7 +687,7 @@ fn pairs(account: &AccountRef, samples: &[Hosted<Sample>], now: DateTime<Utc>) -
         pairs.push(SamplePair {
             from: before.record.t,
             to: after.record.t,
-            week: week_after.p - week_before.p,
+            week: main_after.p - main_before.p,
             session: session_gain(&before.record, &after.record),
         });
     }
@@ -650,23 +885,51 @@ fn seconds_between(from: DateTime<Utc>, to: DateTime<Utc>) -> f64 {
 pub(super) struct SpanWork {
     /// The API dollars of the priced records.
     pub(super) usd: f64,
-    /// A record of a Claude model without a price lay in the span while the
-    /// account was live: its work is not in `usd`.
+    /// A record of the subscription's company without a price lay in the span:
+    /// its work is not in `usd`.
     pub(super) unpriced: bool,
+    /// A provider record of the span's company belongs to another
+    /// subscription (or to none): the span is not this subscription's work.
+    pub(super) foreign: bool,
+    /// A provider record of the span's company belongs to this subscription:
+    /// a provider pair needs one, so a pair no record touches says nothing
+    /// about the plan (decision 10 of M-2's fix).
+    pub(super) own: bool,
 }
 
-/// The work of `account` in each of the given disjoint, time-sorted spans, one
-/// [`SpanWork`] per span in the same order. Each Claude record (a Codex or
-/// Ollama record uses no Claude account and is left out) counts only while
-/// `account` was live on the record's host, spread evenly over its own
-/// [`TokenRecord::span`], at its [`api_usd`]. A record without a price is not
+/// Whose records count as work in [`work_for`]: a Claude account's live time,
+/// or a provider subscription's records.
+enum Ownership<'a> {
+    Claude(&'a AccountRef),
+    Provider(&'a ProviderWork<'a>),
+}
+
+/// The provider side of [`work_for`]: the company's records that belong to one
+/// subscription.
+struct ProviderWork<'a> {
+    company: Company,
+    subscription: &'a AccountRef,
+    /// The `providerSwitch` timelines, per host: which OpenAI login a record
+    /// belongs to.
+    timelines: &'a HashMap<String, Timeline>,
+    openai: &'a BTreeSet<AccountRef>,
+}
+
+/// The work of one subscription in each of the given disjoint, time-sorted
+/// spans, one [`SpanWork`] per span in the same order. A Claude record (a
+/// Codex or Ollama record uses no Claude account and is left out) counts only
+/// while `account` was live on the record's host, spread evenly over its own
+/// [`TokenRecord::span`], at its [`api_usd`]. A provider record counts when
+/// its company is the subscription's and it belongs to it, spread the same way
+/// and without a live rule; a record of that company inside the span that
+/// belongs elsewhere marks the span `foreign`. A record without a price is not
 /// valued: it marks the spans it counts for as `unpriced`. `tokens` are sorted
 /// by time, as a history read returns them, so only the records whose longest
 /// possible span reaches into the spans are looked at.
-pub(super) fn work_in(
+fn work_for(
     timelines: &HashMap<String, Timeline>,
     tokens: &[Hosted<TokenRecord>],
-    account: &AccountRef,
+    owner: Ownership<'_>,
     spans: &[(DateTime<Utc>, DateTime<Utc>)],
     prices: &Prices,
 ) -> Vec<SpanWork> {
@@ -676,7 +939,7 @@ pub(super) fn work_in(
     };
     debug_assert!(
         tokens.is_sorted_by_key(|hosted| hosted.record.t),
-        "work_in needs the token records sorted by time"
+        "work_for needs the token records sorted by time"
     );
     // A record whose longest span ends at or before the first span, or that
     // starts at or after the last span's end, has no part inside a span. The
@@ -687,38 +950,99 @@ pub(super) fn work_in(
     let to = tokens.partition_point(|hosted| hosted.record.t < last_span.1);
     for hosted in &tokens[from..to.max(from)] {
         let record = &hosted.record;
-        // Another provider's work uses no Claude account.
-        if !is_plan_model(&record.model) {
-            continue;
-        }
-        let start = record.t;
-        let end = start + record.span();
-        let span_seconds = seconds_between(start, end);
-        let usd = api_usd(record, prices);
-        let Some(timeline) = timelines.get(&hosted.host) else {
-            continue;
-        };
-        let first = spans.partition_point(|span| span.1 <= start);
-        for (index, span) in spans.iter().enumerate().skip(first) {
-            if span.0 >= end {
-                break;
+        let company = Company::of_model(&record.model);
+        match &owner {
+            Ownership::Claude(account) => {
+                // Another provider's work uses no Claude account.
+                if company != Company::Anthropic {
+                    continue;
+                }
+                let start = record.t;
+                let end = start + record.span();
+                let span_seconds = seconds_between(start, end);
+                let usd = api_usd(record, prices);
+                let Some(timeline) = timelines.get(&hosted.host) else {
+                    continue;
+                };
+                let first = spans.partition_point(|span| span.1 <= start);
+                for (index, span) in spans.iter().enumerate().skip(first) {
+                    if span.0 >= end {
+                        break;
+                    }
+                    let from = span.0.max(start);
+                    let to = span.1.min(end);
+                    if from >= to {
+                        continue;
+                    }
+                    let live = timeline.seconds(account, from, to);
+                    if live <= 0.0 {
+                        continue;
+                    }
+                    match usd {
+                        Some(usd) => work[index].usd += usd * live / span_seconds,
+                        None => work[index].unpriced = true,
+                    }
+                }
             }
-            let from = span.0.max(start);
-            let to = span.1.min(end);
-            if from >= to {
-                continue;
-            }
-            let live = timeline.seconds(account, from, to);
-            if live <= 0.0 {
-                continue;
-            }
-            match usd {
-                Some(usd) => work[index].usd += usd * live / span_seconds,
-                None => work[index].unpriced = true,
+            Ownership::Provider(provider) => {
+                if company != provider.company {
+                    continue;
+                }
+                let start = record.t;
+                let end = start + record.span();
+                let span_seconds = seconds_between(start, end);
+                let usd = api_usd(record, prices);
+                let belongs = match company {
+                    Company::Ollama => provider.subscription == &ollama_subscription(),
+                    Company::Anthropic | Company::OpenAI => {
+                        openai_subscription_at(
+                            provider.timelines,
+                            provider.openai,
+                            &hosted.host,
+                            record.t,
+                        )
+                        .ok()
+                        .as_ref()
+                            == Some(provider.subscription)
+                    }
+                };
+                let first = spans.partition_point(|span| span.1 <= start);
+                for (index, span) in spans.iter().enumerate().skip(first) {
+                    if span.0 >= end {
+                        break;
+                    }
+                    let from = span.0.max(start);
+                    let to = span.1.min(end);
+                    if from >= to {
+                        continue;
+                    }
+                    if !belongs {
+                        work[index].foreign = true;
+                        continue;
+                    }
+                    work[index].own = true;
+                    match usd {
+                        Some(usd) => {
+                            work[index].usd += usd * seconds_between(from, to) / span_seconds;
+                        }
+                        None => work[index].unpriced = true,
+                    }
+                }
             }
         }
     }
     work
+}
+
+/// [`work_for`] for a Claude account: auto-burn's one work function.
+pub(super) fn work_in(
+    timelines: &HashMap<String, Timeline>,
+    tokens: &[Hosted<TokenRecord>],
+    account: &AccountRef,
+    spans: &[(DateTime<Utc>, DateTime<Utc>)],
+    prices: &Prices,
+) -> Vec<SpanWork> {
+    work_for(timelines, tokens, Ownership::Claude(account), spans, prices)
 }
 
 #[cfg(test)]
@@ -1664,6 +1988,7 @@ mod tests {
     fn with_capacity(account: AccountRef, capacity: Option<f64>) -> RateAccount {
         RateAccount {
             account,
+            company: Company::Anthropic,
             capacity,
             plan: None,
         }
@@ -1672,9 +1997,213 @@ mod tests {
     fn on_plan(account: AccountRef, capacity: Option<f64>, plan: &str) -> RateAccount {
         RateAccount {
             account,
+            company: Company::Anthropic,
             capacity,
             plan: Some(plan.to_string()),
         }
+    }
+
+    #[test]
+    fn an_openai_pair_counts_only_when_all_its_work_is_that_subscriptions() {
+        let openai = Company::OpenAI;
+        let first = AccountRef {
+            acc: "3c1e7a94-6d2b-4f08-9a51-2e7c4b6d8f10".to_string(),
+            org: crate::providers::CODEX_ORG.to_string(),
+        };
+        let second = AccountRef {
+            acc: "9b4d2e61-7c3a-4f85-8d09-1a6e5c3b7f24".to_string(),
+            org: crate::providers::CODEX_ORG.to_string(),
+        };
+        let subscriptions = [
+            crate::stats::tests::provider_subscription(&first, "OA", None),
+            crate::stats::tests::provider_subscription(&second, "OB", None),
+        ];
+        let samples = vec![
+            sample(
+                "atlas",
+                "2026-11-10T08:00:00Z",
+                first.clone(),
+                vec![weekly(0.0, "2026-11-16T00:00:00Z")],
+            ),
+            sample(
+                "atlas",
+                "2026-11-10T09:00:00Z",
+                first.clone(),
+                vec![weekly(10.0, "2026-11-16T00:00:00Z")],
+            ),
+            sample(
+                "atlas",
+                "2026-11-10T10:00:00Z",
+                first.clone(),
+                vec![weekly(50.0, "2026-11-16T00:00:00Z")],
+            ),
+        ];
+        let events = vec![Hosted {
+            host: "atlas".to_string(),
+            record: Event {
+                t: utc("2026-11-10T09:30:00Z"),
+                kind: EventKind::ProviderSwitch {
+                    from: Some(first.clone()),
+                    to: second.clone(),
+                    by: By::User,
+                },
+            },
+        }];
+        let mut prices = prices();
+        crate::stats::tests::codex_prices(&mut prices);
+        let mut first_token =
+            crate::stats::tests::codex_token("2026-11-10T08:10:00Z", "gpt-6.2-codex", 12_000_000);
+        first_token.t = utc("2026-11-10T08:10:00Z");
+        let mut second_token =
+            crate::stats::tests::codex_token("2026-11-10T09:40:00Z", "gpt-6.2-codex", 12_000_000);
+        second_token.t = utc("2026-11-10T09:40:00Z");
+        let tokens = vec![
+            Hosted {
+                host: "atlas".to_string(),
+                record: first_token,
+            },
+            Hosted {
+                host: "atlas".to_string(),
+                record: second_token,
+            },
+        ];
+        let subject = RateAccount {
+            account: first.clone(),
+            company: openai,
+            capacity: None,
+            plan: None,
+        };
+        let pools = WindowPools::of(&events, &subscriptions);
+        let pairs = window_pairs(
+            &subject,
+            &sample_lines(&first, &samples),
+            &tokens,
+            &pools,
+            &prices,
+            PairLimit::Main,
+            utc("2026-11-10T08:00:00Z"),
+            utc("2026-11-10T10:00:00Z"),
+        );
+        assert_eq!(pairs.len(), 1, "{pairs:?}");
+        assert_eq!(pairs[0].gain, 10.0);
+        assert!((pairs[0].usd - 100.0).abs() < 0.001, "{}", pairs[0].usd);
+    }
+
+    #[test]
+    fn a_plan_name_prior_stays_within_its_company() {
+        // An OpenAI subscription on "Pro" with 120 USD of measured work, and an
+        // Anthropic account on "Pro" with no capacity and no samples. Without
+        // the company guard the Anthropic account would take the OpenAI plan's
+        // measured pairs as its prior; it has no learned rate of its own.
+        let openai = AccountRef {
+            acc: "3c1e7a94-6d2b-4f08-9a51-2e7c4b6d8f10".to_string(),
+            org: crate::providers::CODEX_ORG.to_string(),
+        };
+        let mut subscription = crate::stats::tests::provider_subscription(&openai, "OA", None);
+        subscription.plan = Some("Pro".to_string());
+        let provider = RateAccount::of_provider(&subscription);
+        let subjects = [on_plan(ac(), None, "Pro"), provider];
+        let samples = vec![
+            sample(
+                "atlas",
+                "2026-11-10T08:00:00Z",
+                openai.clone(),
+                vec![weekly(0.0, "2026-11-16T00:00:00Z")],
+            ),
+            sample(
+                "atlas",
+                "2026-11-10T09:00:00Z",
+                openai.clone(),
+                vec![weekly(10.0, "2026-11-16T00:00:00Z")],
+            ),
+        ];
+        let mut prices = prices();
+        crate::stats::tests::codex_prices(&mut prices);
+        let tokens = vec![Hosted {
+            host: "atlas".to_string(),
+            record: crate::stats::tests::codex_token(
+                "2026-11-10T08:00:00Z",
+                "gpt-6.2-codex",
+                12_000_000,
+            ),
+        }];
+        let learned = rates_in(
+            &subjects,
+            &samples,
+            &tokens,
+            &[],
+            std::slice::from_ref(&subscription),
+            &prices,
+            utc("2026-11-10T08:00:00Z"),
+            utc("2026-11-10T10:00:00Z"),
+        );
+        let openai_rates = learned.rates.get(&openai).expect("OA's measured factor");
+        assert!(openai_rates.c.measured);
+        assert!(
+            !learned.rates.contains_key(&ac()),
+            "an OpenAI Pro says nothing about an Anthropic Pro: {:?}",
+            learned.rates
+        );
+    }
+
+    #[test]
+    fn a_provider_pair_with_no_record_of_its_own_is_left_out() {
+        // A pair of OA readings with no OpenAI record in its span says nothing
+        // about the plan (Codex on another machine, the web).
+        let openai = AccountRef {
+            acc: "3c1e7a94-6d2b-4f08-9a51-2e7c4b6d8f10".to_string(),
+            org: crate::providers::CODEX_ORG.to_string(),
+        };
+        let subscription = crate::stats::tests::provider_subscription(&openai, "OA", None);
+        let subject = RateAccount::of_provider(&subscription);
+        let samples = vec![
+            sample(
+                "atlas",
+                "2026-11-10T08:00:00Z",
+                openai.clone(),
+                vec![weekly(0.0, "2026-11-16T00:00:00Z")],
+            ),
+            sample(
+                "atlas",
+                "2026-11-10T09:00:00Z",
+                openai.clone(),
+                vec![weekly(10.0, "2026-11-16T00:00:00Z")],
+            ),
+        ];
+        let mut prices = prices();
+        crate::stats::tests::codex_prices(&mut prices);
+        let pools = WindowPools::of(&[], std::slice::from_ref(&subscription));
+        let without = window_pairs(
+            &subject,
+            &sample_lines(&openai, &samples),
+            &[],
+            &pools,
+            &prices,
+            PairLimit::Main,
+            utc("2026-11-10T08:00:00Z"),
+            utc("2026-11-10T10:00:00Z"),
+        );
+        assert!(without.is_empty(), "{without:?}");
+
+        let tokens = vec![Hosted {
+            host: "atlas".to_string(),
+            record: crate::stats::tests::codex_token(
+                "2026-11-10T08:00:00Z",
+                "gpt-6.2-codex",
+                12_000_000,
+            ),
+        }];
+        let with = window_pairs(
+            &subject,
+            &sample_lines(&openai, &samples),
+            &tokens,
+            &pools,
+            &prices,
+            PairLimit::Main,
+            utc("2026-11-10T08:00:00Z"),
+            utc("2026-11-10T10:00:00Z"),
+        );
+        assert_eq!(with.len(), 1, "{with:?}");
     }
 
     #[test]

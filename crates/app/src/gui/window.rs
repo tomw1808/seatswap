@@ -45,8 +45,7 @@ use seatswap_core::project::ProjectKey;
 use seatswap_core::projects::{self, ProjectId};
 #[cfg(feature = "gui")]
 use seatswap_core::stats::{
-    self, activity, forecast, overview, projects as stats_projects, subscriptions, weeks, Ctx,
-    Empty, Query,
+    self, activity, forecast, overview, plans, projects as stats_projects, weeks, Ctx, Empty, Query,
 };
 #[cfg(feature = "gui")]
 use seatswap_core::store::{
@@ -919,23 +918,9 @@ pub(crate) fn stats_subscriptions_at<Tz: TimeZone + Copy>(
     now: DateTime<Utc>,
     zone: Tz,
     query: &Query,
-) -> Result<Page<subscriptions::SubscriptionsPage>, String> {
+) -> Result<Page<plans::SubscriptionsPage>, String> {
     stats_page(parts, history, now, zone, query, |ctx| {
-        subscriptions::subscriptions(ctx, query)
-    })
-}
-
-#[cfg(feature = "gui")]
-pub(crate) fn stats_what_if_at<Tz: TimeZone + Copy>(
-    parts: &StatsParts,
-    history: &HistoryDir,
-    now: DateTime<Utc>,
-    zone: Tz,
-    query: &Query,
-    without: &str,
-) -> Result<Page<subscriptions::WhatIf>, String> {
-    stats_page(parts, history, now, zone, query, |ctx| {
-        subscriptions::what_if(ctx, query, without)
+        plans::subscriptions_page(ctx, query)
     })
 }
 
@@ -1149,22 +1134,9 @@ pub(crate) async fn stats_project_detail(
 pub(crate) async fn stats_subscriptions(
     state: State<'_, super::GuiState>,
     query: Query,
-) -> Result<Page<subscriptions::SubscriptionsPage>, String> {
+) -> Result<Page<plans::SubscriptionsPage>, String> {
     stats_command(state, move |parts, history, now, offset| {
         stats_subscriptions_at(parts, history, now, offset, &query)
-    })
-    .await
-}
-
-#[cfg(feature = "gui")]
-#[tauri::command]
-pub(crate) async fn stats_what_if(
-    state: State<'_, super::GuiState>,
-    query: Query,
-    without: String,
-) -> Result<Page<subscriptions::WhatIf>, String> {
-    stats_command(state, move |parts, history, now, offset| {
-        stats_what_if_at(parts, history, now, offset, &query, &without)
     })
     .await
 }
@@ -3231,15 +3203,6 @@ mod tests {
         )
         .is_ok());
         assert!(stats_subscriptions_at(&parts, &tiny.history, now, offset, &query).is_ok());
-        assert!(stats_what_if_at(
-            &parts,
-            &tiny.history,
-            now,
-            offset,
-            &query,
-            &tiny.accounts[1].id
-        )
-        .is_ok());
         assert!(stats_rhythm_at(&parts, &tiny.history, now, offset, &query).is_ok());
         assert!(stats_activity_at(&parts, &tiny.history, now, offset, &query).is_ok());
 
@@ -3575,6 +3538,16 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "gui")]
+    #[test]
+    fn stats_what_if_is_gone() {
+        let commands = include_str!("mod.rs");
+        assert!(
+            !commands.contains("stats_what_if"),
+            "the what-if command is gone"
+        );
+    }
+
     /// The This-week card ignores the range: on the accounts' first day, last
     /// week holds no record and the Overview says "nothing recorded yet", but
     /// the card still lists the two weekly windows running now.
@@ -3704,17 +3677,6 @@ mod tests {
         assert_empty(
             stats_subscriptions_at(&parts, &tiny.history, now, offset, &query)
                 .expect("the subscriptions command"),
-        );
-        assert_empty(
-            stats_what_if_at(
-                &parts,
-                &tiny.history,
-                now,
-                offset,
-                &query,
-                &tiny.accounts[1].id,
-            )
-            .expect("the what-if command"),
         );
         assert_empty(
             stats_rhythm_at(&parts, &tiny.history, now, offset, &query)
