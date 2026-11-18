@@ -230,26 +230,87 @@ impl CodexPaths {
     }
 }
 
-/// The DeepSeek Harness sessions folder and the flash-agents reports folder,
-/// from values given explicitly (for tests): `$DSH_HOME/sessions` or
-/// `<home>/.dsh/sessions`, and `$XDG_STATE_HOME/flash-agents` or
-/// `<home>/.local/state/flash-agents`. A relative `$DSH_HOME` or
-/// `$XDG_STATE_HOME` is [`PathsError::RelativeHarnessFolder`], never resolved
+/// The environment variables that place the Harness's sessions folder and
+/// flash-agents' state folder. Only `HarnessPaths::resolve` fills it from the
+/// process environment; tests build one by hand.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HarnessEnv {
+    pub dsh_home: Option<OsString>,
+    pub flash_data_dir: Option<OsString>,
+    pub xdg_state_home: Option<OsString>,
+    pub local_app_data: Option<OsString>,
+}
+
+/// The operating system whose rule places flash-agents' state folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Platform {
+    Windows,
+    MacOs,
+    /// Linux and every other Unix.
+    Unix,
+}
+
+impl Platform {
+    const CURRENT: Platform = if cfg!(windows) {
+        Platform::Windows
+    } else if cfg!(target_os = "macos") {
+        Platform::MacOs
+    } else {
+        Platform::Unix
+    };
+}
+
+/// The DeepSeek Harness sessions folder and the flash-agents state folder
+/// (whose `<key>/patches/` hold the job reports), from `env` and `home`:
+/// `$DSH_HOME/sessions` or `<home>/.dsh/sessions`, and flash-agents' own rule
+/// (its `durableBaseDir`): `$FLASH_DATA_DIR` as it is; else on Windows
+/// `%LOCALAPPDATA%\flash-agents` or `<home>\AppData\Local\flash-agents`, on
+/// macOS `<home>/Library/Application Support/flash-agents`, elsewhere
+/// `$XDG_STATE_HOME/flash-agents` or `<home>/.local/state/flash-agents`. A
+/// relative variable is [`PathsError::RelativeHarnessFolder`], never resolved
 /// against the current folder.
-pub fn harness_folders(
-    env_dsh_home: Option<OsString>,
-    env_xdg_state_home: Option<OsString>,
+pub fn harness_folders(env: &HarnessEnv, home: &Path) -> Result<(PathBuf, PathBuf), PathsError> {
+    harness_folders_on(Platform::CURRENT, env, home)
+}
+
+fn harness_folders_on(
+    platform: Platform,
+    env: &HarnessEnv,
     home: &Path,
 ) -> Result<(PathBuf, PathBuf), PathsError> {
-    let dsh = folder_from(None, env_dsh_home, home, &[".dsh"], FolderSource::DshHome)?;
-    let state = folder_from(
+    let dsh = folder_from(
         None,
-        env_xdg_state_home,
+        env.dsh_home.clone(),
         home,
-        &[".local", "state"],
-        FolderSource::XdgStateHome,
+        &[".dsh"],
+        FolderSource::DshHome,
     )?;
-    Ok((dsh.join("sessions"), state.join("flash-agents")))
+    let flash = match named_folder(None, env.flash_data_dir.clone(), FolderSource::FlashDataDir)? {
+        Some(folder) => folder,
+        None => match platform {
+            Platform::Windows => folder_from(
+                None,
+                env.local_app_data.clone(),
+                home,
+                &["AppData", "Local"],
+                FolderSource::LocalAppData,
+            )?
+            .join("flash-agents"),
+            Platform::MacOs => home
+                .join("Library")
+                .join("Application Support")
+                .join("flash-agents"),
+            Platform::Unix => folder_from(
+                None,
+                env.xdg_state_home.clone(),
+                home,
+                &[".local", "state"],
+                FolderSource::XdgStateHome,
+            )?
+            .join("flash-agents"),
+        },
+    };
+    Ok((dsh.join("sessions"), flash))
 }
 
 /// The variable or setting a folder comes from, so a relative folder names it.
@@ -257,22 +318,21 @@ pub fn harness_folders(
 enum FolderSource {
     Codex,
     DshHome,
+    FlashDataDir,
+    LocalAppData,
     XdgStateHome,
 }
 
 impl FolderSource {
     fn relative(self, value: PathBuf) -> PathsError {
-        match self {
-            FolderSource::Codex => PathsError::RelativeCodexHome(value),
-            FolderSource::DshHome => PathsError::RelativeHarnessFolder {
-                variable: "DSH_HOME",
-                value,
-            },
-            FolderSource::XdgStateHome => PathsError::RelativeHarnessFolder {
-                variable: "XDG_STATE_HOME",
-                value,
-            },
-        }
+        let variable = match self {
+            FolderSource::Codex => return PathsError::RelativeCodexHome(value),
+            FolderSource::DshHome => "DSH_HOME",
+            FolderSource::FlashDataDir => "FLASH_DATA_DIR",
+            FolderSource::LocalAppData => "LOCALAPPDATA",
+            FolderSource::XdgStateHome => "XDG_STATE_HOME",
+        };
+        PathsError::RelativeHarnessFolder { variable, value }
     }
 }
 
@@ -287,19 +347,29 @@ fn folder_from(
     default: &[&str],
     source: FolderSource,
 ) -> Result<PathBuf, PathsError> {
+    Ok(named_folder(explicit, env, source)?.unwrap_or_else(|| {
+        default
+            .iter()
+            .fold(home.to_path_buf(), |folder, part| folder.join(part))
+    }))
+}
+
+/// The folder `explicit` or a non-empty `env` names, or `None` when neither
+/// does. A relative one is an error naming its source and the value.
+fn named_folder(
+    explicit: Option<&Path>,
+    env: Option<OsString>,
+    source: FolderSource,
+) -> Result<Option<PathBuf>, PathsError> {
     let folder = match (explicit, env) {
         (Some(folder), _) => folder.to_path_buf(),
         (None, Some(value)) if !value.is_empty() => PathBuf::from(value),
-        _ => {
-            return Ok(default
-                .iter()
-                .fold(home.to_path_buf(), |folder, part| folder.join(part)))
-        }
+        _ => return Ok(None),
     };
     if !folder.is_absolute() {
         return Err(source.relative(folder));
     }
-    Ok(folder)
+    Ok(Some(folder))
 }
 
 /// seatswap's own files (spec §5).
@@ -823,6 +893,134 @@ mod tests {
             matches!(&error, PathsError::RelativeCodexHome(path) if path == Path::new("codex")),
             "expected RelativeCodexHome for codex, got {error:?}"
         );
+    }
+
+    /// flash-agents places its state folder (and so its job reports) by its own
+    /// rule, `durableBaseDir` in flash-mcp's `isolation.js` (0.1.12): a set
+    /// `$FLASH_DATA_DIR` as it is, else one folder per platform. On Windows it
+    /// is `%LOCALAPPDATA%\flash-agents` (seen 18 Nov 2026), and
+    /// `$XDG_STATE_HOME` plays no part there.
+    #[test]
+    fn the_flash_agents_folder_follows_flash_agents_rule_on_every_platform() {
+        let root = Path::new(if cfg!(windows) { r"C:\" } else { "/" });
+        let home = root.join("home").join("sam");
+        let local = root.join("Users").join("sam").join("AppData").join("Local");
+        let xdg = root.join("state").join("xdg");
+        let data = root.join("state").join("flash");
+        let env = HarnessEnv {
+            xdg_state_home: Some(xdg.clone().into_os_string()),
+            local_app_data: Some(local.clone().into_os_string()),
+            ..HarnessEnv::default()
+        };
+        let reports = |platform, env: &HarnessEnv| {
+            harness_folders_on(platform, env, &home)
+                .expect("absolute folders are fine")
+                .1
+        };
+
+        assert_eq!(reports(Platform::Windows, &env), local.join("flash-agents"));
+        assert_eq!(
+            reports(Platform::MacOs, &env),
+            home.join("Library")
+                .join("Application Support")
+                .join("flash-agents")
+        );
+        assert_eq!(reports(Platform::Unix, &env), xdg.join("flash-agents"));
+
+        // Unset or empty variables: the home folder's defaults.
+        let unset = HarnessEnv {
+            xdg_state_home: Some("".into()),
+            local_app_data: Some("".into()),
+            ..HarnessEnv::default()
+        };
+        assert_eq!(
+            reports(Platform::Windows, &unset),
+            home.join("AppData").join("Local").join("flash-agents")
+        );
+        assert_eq!(
+            reports(Platform::Unix, &HarnessEnv::default()),
+            home.join(".local").join("state").join("flash-agents")
+        );
+
+        // `$FLASH_DATA_DIR` wins everywhere, as it is (no `flash-agents` added).
+        let named = HarnessEnv {
+            flash_data_dir: Some(data.clone().into_os_string()),
+            ..env.clone()
+        };
+        for platform in [Platform::Windows, Platform::MacOs, Platform::Unix] {
+            assert_eq!(reports(platform, &named), data, "{platform:?}");
+        }
+    }
+
+    /// A relative variable must not become a folder relative to the current
+    /// one, as for `$CODEX_HOME`; only the variables a platform reads count.
+    #[test]
+    fn a_relative_harness_variable_is_an_error_naming_it() {
+        let home = Path::new(if cfg!(windows) {
+            r"C:\home\sam"
+        } else {
+            "/home/sam"
+        });
+        let cases = [
+            (
+                Platform::Unix,
+                HarnessEnv {
+                    dsh_home: Some("dsh".into()),
+                    ..HarnessEnv::default()
+                },
+                "DSH_HOME",
+                "dsh",
+            ),
+            (
+                Platform::Unix,
+                HarnessEnv {
+                    flash_data_dir: Some("flash".into()),
+                    ..HarnessEnv::default()
+                },
+                "FLASH_DATA_DIR",
+                "flash",
+            ),
+            (
+                Platform::Unix,
+                HarnessEnv {
+                    xdg_state_home: Some("state".into()),
+                    ..HarnessEnv::default()
+                },
+                "XDG_STATE_HOME",
+                "state",
+            ),
+            (
+                Platform::Windows,
+                HarnessEnv {
+                    local_app_data: Some("Local".into()),
+                    ..HarnessEnv::default()
+                },
+                "LOCALAPPDATA",
+                "Local",
+            ),
+        ];
+        for (platform, env, name, given) in cases {
+            let error = harness_folders_on(platform, &env, home).expect_err(name);
+            assert!(
+                matches!(
+                    &error,
+                    PathsError::RelativeHarnessFolder { variable, value }
+                        if *variable == name && value == Path::new(given)
+                ),
+                "expected a relative {name} error, got {error:?}"
+            );
+            assert_eq!(
+                error.to_string(),
+                format!("${name} must be an absolute path, got {given}")
+            );
+        }
+
+        // A variable the platform does not read is not checked.
+        let relative_xdg = HarnessEnv {
+            xdg_state_home: Some("state".into()),
+            ..HarnessEnv::default()
+        };
+        assert!(harness_folders_on(Platform::Windows, &relative_xdg, home).is_ok());
     }
 
     #[test]

@@ -394,7 +394,7 @@ beside them.
 |---|---|---|
 | Codex's login and rollouts | `%USERPROFILE%\.codex`, or `$CODEX_HOME`, or the `codexHome` setting; rollouts below `<home>\sessions\YYYY\MM\DD\rollout-*.jsonl` | `paths::CodexPaths::resolve` (`resolve_with` for tests) |
 | DeepSeek Harness sessions | `%USERPROFILE%\.dsh\sessions`, or `$DSH_HOME/sessions` | `paths::harness_folders`, through `HarnessPaths::resolve` (`resolve_with` for tests) |
-| flash-agents job reports | `%USERPROFILE%\.local\state\flash-agents`, or `$XDG_STATE_HOME\flash-agents`; a report is `<state>\flash-agents\<key>\patches\job-<id>.report.json` | `paths::harness_folders`, through `HarnessPaths::resolve` (`resolve_with` for tests) |
+| flash-agents job reports | `%LOCALAPPDATA%\flash-agents` (else `%USERPROFILE%\AppData\Local\flash-agents`), or `$FLASH_DATA_DIR`; `$XDG_STATE_HOME` plays no part on Windows (flash-agents' own rule, seen 18 Nov 2026); a report is `<state>\<key>\patches\job-<id>.report.json` | `paths::harness_folders`, through `HarnessPaths::resolve` (`resolve_with` for tests) |
 | Dropbox's `info.json` | `%APPDATA%\Dropbox\info.json` first, then `%LOCALAPPDATA%\Dropbox\info.json`; the first one that exists is used | `paths::dropbox_folder` |
 
 A missing Dropbox `info.json` is no suggestion; a broken one is an error naming the file, shown on the
@@ -403,7 +403,7 @@ Settings page.
 A setting or a variable that names a Codex or Harness folder must be an absolute path; a relative one
 is an error naming its source and value, never resolved against the current folder. Codex's is
 `PathsError::RelativeCodexHome` (`the Codex folder (codexHome or $CODEX_HOME) must be an absolute
-path, got …`); `$DSH_HOME` and `$XDG_STATE_HOME` give
+path, got …`); `$DSH_HOME`, `$FLASH_DATA_DIR`, `%LOCALAPPDATA%` and `$XDG_STATE_HOME` give
 `PathsError::RelativeHarnessFolder { variable, value }` (`${variable} must be an absolute path, got
 {value}`).
 

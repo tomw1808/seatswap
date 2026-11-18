@@ -19,7 +19,6 @@
 //! appears once its result is collected in a transcript.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -28,7 +27,7 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::paths::PathsError;
+use crate::paths::{HarnessEnv, PathsError};
 use crate::transcripts::{ClosedJob, SessionSeen, Tokens};
 
 /// The folder a flash worker's copy was made from, for a session whose
@@ -161,7 +160,11 @@ pub const HARNESS_QUIET_MINUTES: i64 = 30;
 pub struct HarnessPaths {
     /// `$DSH_HOME/sessions` or `~/.dsh/sessions`.
     pub sessions: PathBuf,
-    /// `$XDG_STATE_HOME/flash-agents` or `~/.local/state/flash-agents`.
+    /// flash-agents' state folder, placed by its own rule
+    /// ([`crate::paths::harness_folders`]): `$FLASH_DATA_DIR`, else
+    /// `%LOCALAPPDATA%\flash-agents` on Windows, `~/Library/Application
+    /// Support/flash-agents` on macOS, `$XDG_STATE_HOME/flash-agents` or
+    /// `~/.local/state/flash-agents` elsewhere.
     pub reports: PathBuf,
 }
 
@@ -171,23 +174,20 @@ impl HarnessPaths {
     /// [`HarnessPaths::resolve_with`].
     pub fn resolve() -> Result<HarnessPaths, PathsError> {
         let home = dirs::home_dir().ok_or(PathsError::NoHome)?;
-        Self::resolve_with(
-            std::env::var_os("DSH_HOME"),
-            std::env::var_os("XDG_STATE_HOME"),
-            &home,
-        )
+        let env = HarnessEnv {
+            dsh_home: std::env::var_os("DSH_HOME"),
+            flash_data_dir: std::env::var_os("FLASH_DATA_DIR"),
+            xdg_state_home: std::env::var_os("XDG_STATE_HOME"),
+            local_app_data: std::env::var_os("LOCALAPPDATA"),
+        };
+        Self::resolve_with(&env, &home)
     }
 
     /// Same as [`resolve`](Self::resolve) without reading the process
     /// environment (for tests). The folder rules live in
     /// [`crate::paths::harness_folders`], beside Codex's resolver.
-    pub fn resolve_with(
-        env_dsh_home: Option<OsString>,
-        env_xdg_state_home: Option<OsString>,
-        home: &Path,
-    ) -> Result<HarnessPaths, PathsError> {
-        let (sessions, reports) =
-            crate::paths::harness_folders(env_dsh_home, env_xdg_state_home, home)?;
+    pub fn resolve_with(env: &HarnessEnv, home: &Path) -> Result<HarnessPaths, PathsError> {
+        let (sessions, reports) = crate::paths::harness_folders(env, home)?;
         Ok(HarnessPaths { sessions, reports })
     }
 
@@ -1207,7 +1207,11 @@ mod tests {
     fn a_relative_dsh_home_is_an_error_naming_the_variable_and_the_value() {
         let tmp = tempfile::tempdir().expect("tempdir");
 
-        let error = HarnessPaths::resolve_with(Some("dsh".into()), None, tmp.path())
+        let env = HarnessEnv {
+            dsh_home: Some("dsh".into()),
+            ..HarnessEnv::default()
+        };
+        let error = HarnessPaths::resolve_with(&env, tmp.path())
             .expect_err("a relative DSH_HOME is refused");
 
         assert!(
@@ -1224,49 +1228,27 @@ mod tests {
         );
     }
 
+    /// The variables reach the folder rules of `paths::harness_folders`, whose
+    /// tests cover every platform's default.
     #[test]
-    fn a_relative_xdg_state_home_is_an_error_naming_the_variable_and_the_value() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-
-        let error = HarnessPaths::resolve_with(None, Some("state".into()), tmp.path())
-            .expect_err("a relative XDG_STATE_HOME is refused");
-
-        assert!(
-            matches!(
-                &error,
-                PathsError::RelativeHarnessFolder { variable: "XDG_STATE_HOME", value }
-                    if value == Path::new("state")
-            ),
-            "expected a relative XDG_STATE_HOME error, got {error:?}"
-        );
-        assert_eq!(
-            error.to_string(),
-            "$XDG_STATE_HOME must be an absolute path, got state"
-        );
-    }
-
-    #[test]
-    fn absolute_harness_folders_are_used_and_the_default_follows_the_home_folder() {
+    fn absolute_harness_folders_are_used() {
         let root = Path::new(if cfg!(windows) { r"C:\" } else { "/" });
         let home = root.join("home").join("sam");
         let dsh = root.join("state").join("dsh");
-        let state = root.join("state").join("xdg");
+        let data = root.join("state").join("flash");
 
-        let paths = HarnessPaths::resolve_with(
-            Some(dsh.clone().into_os_string()),
-            Some(state.clone().into_os_string()),
-            &home,
-        )
-        .expect("absolute folders are fine");
+        let env = HarnessEnv {
+            dsh_home: Some(dsh.clone().into_os_string()),
+            flash_data_dir: Some(data.clone().into_os_string()),
+            ..HarnessEnv::default()
+        };
+        let paths = HarnessPaths::resolve_with(&env, &home).expect("absolute folders are fine");
         assert_eq!(paths.sessions, dsh.join("sessions"));
-        assert_eq!(paths.reports, state.join("flash-agents"));
+        assert_eq!(paths.reports, data);
 
-        let paths = HarnessPaths::resolve_with(None, None, &home).expect("the defaults");
+        let paths =
+            HarnessPaths::resolve_with(&HarnessEnv::default(), &home).expect("the defaults");
         assert_eq!(paths.sessions, home.join(".dsh").join("sessions"));
-        assert_eq!(
-            paths.reports,
-            home.join(".local").join("state").join("flash-agents")
-        );
     }
 
     fn header(id: &str, parent: Option<&str>, depth: u32, created: i64) -> String {

@@ -749,10 +749,14 @@ impl AppPaths {
 /// folder: a named folder (Codex's setting, or an environment variable) must be absolute;
 /// a relative one is an error naming the variable and its value, never resolved against the
 /// current folder. Codex: `codexHome` or `$CODEX_HOME`, else `~/.codex`. Harness:
-/// `$DSH_HOME/sessions`, else `~/.dsh/sessions`; flash-agents: `$XDG_STATE_HOME/flash-agents`,
-/// else `~/.local/state/flash-agents`.
-pub fn harness_folders(env_dsh_home: Option<OsString>, env_xdg_state_home: Option<OsString>,
-    home: &Path) -> Result<(PathBuf, PathBuf), PathsError>;
+/// `$DSH_HOME/sessions`, else `~/.dsh/sessions`; flash-agents (its own rule, `durableBaseDir`):
+/// `$FLASH_DATA_DIR` as it is, else `%LOCALAPPDATA%\flash-agents` (or `<home>\AppData\Local\
+/// flash-agents`) on Windows, `<home>/Library/Application Support/flash-agents` on macOS,
+/// `$XDG_STATE_HOME/flash-agents` or `~/.local/state/flash-agents` elsewhere. The platform's rule
+/// is chosen by a private `Platform::CURRENT`, so every platform's rule is tested on any machine.
+pub struct HarnessEnv { pub dsh_home: Option<OsString>, pub flash_data_dir: Option<OsString>,
+    pub xdg_state_home: Option<OsString>, pub local_app_data: Option<OsString> }  // Default
+pub fn harness_folders(env: &HarnessEnv, home: &Path) -> Result<(PathBuf, PathBuf), PathsError>;
 // PathsError gains RelativeHarnessFolder { variable, value }: "${variable} must be an absolute
 // path, got {value}". Codex keeps RelativeCodexHome for codexHome and $CODEX_HOME.
 /// A `historyDir` must be absolute; a relative one is PathsError::HistoryDir, never resolved
@@ -5040,13 +5044,12 @@ running job's process to the Claude Code session that started it.
 pub const HARNESS_QUIET_MINUTES: i64 = 30;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessPaths { pub sessions: PathBuf,   // $DSH_HOME/sessions, else ~/.dsh/sessions
-                          pub reports: PathBuf }   // $XDG_STATE_HOME/flash-agents, else
-                                                   // ~/.local/state/flash-agents
+                          pub reports: PathBuf }   // flash-agents' state folder, by
+                                                   // paths::harness_folders' rule
 impl HarnessPaths {
     pub fn resolve() -> Result<HarnessPaths, PathsError>;           // the app only
-    pub fn resolve_with(env_dsh_home: Option<OsString>,
-                        env_xdg_state_home: Option<OsString>,
-                        home: &Path) -> Result<HarnessPaths, PathsError>; // tests, one resolver
+    pub fn resolve_with(env: &HarnessEnv, home: &Path)
+        -> Result<HarnessPaths, PathsError>;                        // tests, one resolver
     pub fn at(sessions: PathBuf, reports: PathBuf) -> HarnessPaths; // tests
 }
 pub struct HarnessSession { pub id: String, pub file: PathBuf, pub parent: Option<String>,

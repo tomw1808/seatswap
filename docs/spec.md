@@ -2411,7 +2411,7 @@ the past too, because the history stores the repository's identity, not the show
 - **What seatswap reads for the Sessions area.** Claude Code's session files and transcripts
   (session id, folder, model, times, token counts, agents and states); DeepSeek Harness's session
   files (`$DSH_HOME/sessions` or `~/.dsh/sessions`: job id, folder, model, tokens, state) and
-  flash-agents' state (`$XDG_STATE_HOME/flash-agents` or `~/.local/state/flash-agents`: the report
+  flash-agents' state (`$FLASH_DATA_DIR`, else `%LOCALAPPDATA%\flash-agents` on Windows, `~/Library/Application Support/flash-agents` on macOS, `$XDG_STATE_HOME/flash-agents` or `~/.local/state/flash-agents` elsewhere (flash-agents' own rule, its `durableBaseDir`): the report
   that links a short job id to its flash task); and Codex's rollout files under the Codex folder
   (`$CODEX_HOME` or `~/.codex`: session id, model, token totals, event times) and its
   `session_index.jsonl` beside them (only each thread's `id`, `thread_name` and `updated_at`). None of these files is

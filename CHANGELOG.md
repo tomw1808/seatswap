@@ -42,6 +42,9 @@ All notable changes to this project are documented here. The format follows
 
 - A price typed at most 15 minutes before a plan change belongs to the new plan's period, so it no
   longer makes a minutes-long period at the new price.
+- Windows: Sessions now shows a flash job's task. flash-agents keeps its job reports in
+  `%LOCALAPPDATA%\flash-agents` there, and seatswap looked in `~/.local/state/flash-agents`; it now
+  follows flash-agents' own rule on every system, `$FLASH_DATA_DIR` included.
 - Codex token growth is counted once: a repeated total records nothing, a total below the highest
   one is a warning, and a missing `cache_write_input_tokens` counts as 0.
 - The OpenAI card keeps showing the live login's usage when seatswap cannot save that login (for
