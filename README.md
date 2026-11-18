@@ -60,21 +60,24 @@ there, and seatswap does not read or write that yet.
   what they are worth, and the sessions that closed in the last 24 hours, 7 or 30 days. Codex
   sessions and DeepSeek Harness sessions sit beside them, and a flash job hangs under the Claude
   Code session that started it, with its workers below; a job already named in a transcript is
-  linked there, and on Windows a running job appears once its result is collected. Numbers on top,
+  linked there, and on Windows a running job appears once its result is collected. A closed Codex
+  session is not a row of its own yet, though its tokens are kept and counted in Statistics. Numbers on top,
   two groupings and a card for what a switch would cost the running sessions. It updates by itself
   (at most twice a second) and needs *Read Claude Code's session files* (on by default); turning it
   on takes effect after a restart.
 - **The Statistics area.** Seven pages over the recorded history, for a range from this week to
   all of it, with account chips and a host choice: Overview (what was used, expired, blocked and
   switched), Weeks (a grid of every account's week, with a summary per week and the detail of one
-  window), Projects and organizations (where the subscriptions went), Subscriptions with "what if"
-  (what dropping an account would have changed), Forecast (the latest plan for the next 7 days),
-  Rhythm (when your week is worked) and Activity (when each host worked, idled or was off).
+  window), Projects and organizations (where the subscriptions went), Subscriptions (what each plan
+  gives, what is used of what is paid, what 1 % of a limit buys over the weeks, and the tokens a week
+  per subscription and model), Forecast (the latest plan for the next 7 days), Rhythm (when your week
+  is worked) and Activity (when each host worked, idled or was off). Claude accounts and OpenAI and
+  Ollama subscriptions are shown together; blocked hours are shown per company.
 - **Money.** seatswap shows what tokens and subscriptions are worth: API prices from
   [models.dev](https://models.dev) and the dollar rate from the European Central Bank via
   [Frankfurter](https://frankfurter.dev), each kept with its dates and fetched time, so past days
-  keep the price of that day. Set a currency and each account's monthly price; the weekly percentage
-  then has a money value. The model list under *Settings → Providers* is read-only. Claude Code's
+  keep the price of that day. Set a currency and each account's or provider subscription's monthly
+  price; the weekly percentage then has a money value. The model list under *Settings → Providers* is read-only. Claude Code's
   own reported cost beats a models.dev price; a model with neither has no API value rather than a
   guessed one, and a Claude Code model without a price is asked for from models.dev at once, at
   most once per model and hour. The rate is fetched once per Frankfurt day while it is older than today, and on working
@@ -92,11 +95,13 @@ there, and seatswap does not read or write that yet.
 - **Usage at a glance.** The icon ring shows the active account's binding limit, coloured green,
   amber or red. The pop-up shows every account's session (5 h) and weekly limits, with the time
   until each one resets — and its plan, such as "Team Premium".
-- **Two read-only provider cards.** With a switch in *Settings → Providers*, the pop-up shows a
-  Codex card (its 5 h and weekly limits, or whatever window lengths Codex sends) and an Ollama card
-  (credits left, reset date, spend in the last 24 h, or session and weekly limits on an old plan).
-  Both are off by default; while one is off, seatswap reads no Codex login file and sends no request
-  for that card. The cards never switch, sign in or refresh a token.
+- **OpenAI (Codex) and Ollama cards.** With a switch in *Settings → Providers*, the pop-up shows an
+  OpenAI card and an Ollama card. The OpenAI card lists every saved Codex login, marks the live one
+  and can switch Codex to another; an inactive login renews itself when its token expires. The
+  Ollama card shows credits left, reset date, spend in the last 24 h, or session and weekly limits on
+  an old plan. Both are off by default; while one is off, seatswap sends no request for that card.
+  seatswap writes Codex's `auth.json` only when switching between saved logins; sign-in and sign-out
+  stay Codex's own (`codex login`).
 - **Auto-burn.** Switched on, seatswap moves between accounts by itself so that as little work as
   possible is blocked; it switches before an account is full only when the measured gain is worth
   the switch. Switched off, it suggests the same switch instead.
@@ -306,6 +311,8 @@ seatswap statusline             Claude Code's status line (reads its JSON from s
 seatswap burn plan [--json]     the early-switching regime and the plan auto-burn follows
 seatswap burn simulate --from YYYY-MM-DD --to YYYY-MM-DD [--without ABBR]
                                 replay the recorded work for the lazy and eager policies
+seatswap codex list [--json]    the saved Codex logins, live first
+seatswap codex switch <ABBR>    switch Codex to a saved login
 seatswap panel [main|add|settings]   open the running app's pop-up; settings opens the large window
 seatswap window [AREA]          open or focus the large window (sessions|statistics|statusline|settings)
 seatswap prices [--refresh]     the stored API prices, USD per million tokens; --refresh asks models.dev

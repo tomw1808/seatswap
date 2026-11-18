@@ -5,7 +5,7 @@
 //! - `paths`    where Claude Code's files and seatswap's own files live
 //! - `atomic`   the one way to write a file (temp file + fsync + rename, mode kept)
 //!   and the only module that knows file modes and private files and folders
-//! - `burn`     auto-burn: work units, rhythm, rates, slack, plans, the decision (spec §2)
+//! - `burn`     auto-burn: work in API dollars, rhythm, rates, slack, plans, the decision (spec §2)
 //! - `claude_settings` the one key seatswap writes in Claude Code's settings.json
 //! - `codex_sessions` Codex's session files
 //! - `duration` every duration as one text: `2h 31min`, `12min`, `3d 4h` (review item 42)
@@ -22,7 +22,7 @@
 //! - `live_sessions` the rows of the Sessions area: running and closed sessions, their agents and values
 //! - `money`    API prices with their dates, the dollar rate, the value of tokens
 //! - `projects` projects and organizations: names, joins, the shared log (spec §3.6)
-//! - `providers` one reader per other provider (Codex, Ollama), read-only, into the usage types here
+//! - `providers` one reader per company (OpenAI's Codex, Ollama) and Codex's saved logins, into the usage types here
 //! - `store`    accounts.json (no secrets) + secrets (OS keyring, or 0600 files)
 //! - `api`      the HTTP endpoints: usage, token refresh, Codex, prices, the dollar rate
 //! - `switcher` the switch algorithm (spec §6.2) and saving the current login

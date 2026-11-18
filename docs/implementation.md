@@ -329,15 +329,29 @@ impl Settings { pub fn validate(&self) -> Result<(), StoreError>; } // percents 
 // an absolute claudeConfigDir, an absolute historyDir, a hostName that passes paths::host_name,
 // and validate_statusline (below)
 
-pub struct AccountsFile { pub version: u32, pub accounts: Vec<Account>, pub settings: Settings,
-                          #[serde(default)] pub secrets_backend: Option<SecretsBackend> }
+pub struct AccountsFile { pub version: u32, pub accounts: Vec<Account>,
+    #[serde(default)] pub provider_subscriptions: Vec<ProviderSubscription>,
+    pub settings: Settings,
+    #[serde(default)] pub secrets_backend: Option<SecretsBackend> }
 // version must be 1; anything else is UnsupportedVersion, never silently upgraded.
 
+/// An OpenAI or Ollama subscription (R4). `account` is the provider's `AccountRef`; its look and
+/// price are the account's own fields. Serde camelCase; company is derived, never stored.
+pub struct ProviderSubscription { pub account: AccountRef, pub label: String, pub abbr: String,
+    pub color: String, #[serde(default)] pub plan: Option<String>,
+    #[serde(default)] pub price: Option<f64>, #[serde(default)] pub price_currency: Option<String> }
+impl ProviderSubscription { pub fn company(&self) -> Company; } // Company::of_account
+
 pub trait SecretStore: Send + Sync {
-    fn get(&self, id: &str) -> Result<Option<Login>, StoreError>;
-    fn set(&self, id: &str, login: &Login) -> Result<(), StoreError>;
+    fn get_value(&self, id: &str) -> Result<Option<Value>, StoreError>;
+    fn set_value(&self, id: &str, value: &Value) -> Result<(), StoreError>;
     fn delete(&self, id: &str) -> Result<(), StoreError>;   // missing is fine
     fn encrypted(&self) -> bool;                             // false → UI warns (§5)
+    // Provided, through the value methods:
+    fn get(&self, id: &str) -> Result<Option<Login>, StoreError>;
+    fn set(&self, id: &str, login: &Login) -> Result<(), StoreError>;
+    fn get_codex(&self, id: &str) -> Result<Option<CodexLogin>, StoreError>;
+    fn set_codex(&self, id: &str, login: &CodexLogin) -> Result<(), StoreError>;
 }
 pub struct KeyringSecrets;            // keyring crate, service "seatswap", user = account id, JSON value
 pub struct FileSecrets { dir: PathBuf } // <data>/secrets/<id>.json; folder 0700, files 0600, via write_atomic
@@ -379,6 +393,13 @@ impl AccountsFile {
     pub fn find_by_identity(&self, account_uuid: &str, organization_uuid: &str) -> Option<&Account>;
     /// Look up by id or by abbreviation (case-insensitive) — what the CLI accepts.
     pub fn find_by_key(&self, key: &str) -> Option<&Account>;
+    pub fn provider_subscription(&self, account: &AccountRef) -> Option<&ProviderSubscription>;
+    /// Create or update a provider subscription; a new one's look is "OpenAI"/`OA`/`#db2777`
+    /// or "Ollama"/`OL`/`#ea580c`, its abbr the base or the base's first letter with the first
+    /// free digit 2–9 (`O2`, `O3`, …) when the base is taken, all through `validate_abbr`.
+    /// Returns whether it was created, and the warnings (a plan that changed).
+    pub fn ensure_provider_subscription(&mut self, account: &AccountRef, plan: Option<&str>)
+        -> (bool, Vec<String>);
 }
 
 pub const PALETTE: [&str; 10] = ["#3b82f6", "#f59e0b", "#10b981", "#ef4444", "#8b5cf6",
@@ -386,7 +407,8 @@ pub const PALETTE: [&str; 10] = ["#3b82f6", "#f59e0b", "#10b981", "#ef4444", "#8
 /// "Acme Team" → "AT", "Acme" → "AC", "Private" → "PR", "x" → "X".
 /// Letters/digits only; words split on whitespace and punctuation. No letter or digit → InvalidLabel.
 pub fn default_abbr(label: &str) -> Result<String, StoreError>;
-/// Trim, upper-case, 1–2 of A–Z0–9, not used by another account (`others` = their abbrs).
+/// Trim, upper-case, 1–2 of A–Z0–9, not used by another account or provider subscription
+/// (`others` = their abbrs).
 pub fn validate_abbr(abbr: &str, others: &[&str]) -> Result<String, StoreError>;
 /// "#rrggbb" (any case) → lower case; anything else InvalidColor.
 pub fn validate_color(color: &str) -> Result<String, StoreError>;
@@ -776,6 +798,10 @@ pub struct SessionCounts { pub running: u32, pub busy: u32, pub tied: Option<u32
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum EventKind {
     Switch { from, to, by, reason, cwd, sessions, waited_secs },
+    /// A switch between two saved Codex logins (1.3, R8): the `switch` event's field shapes, its
+    /// own type. A `switch` stays Claude-only; every timeline, rate and switch count reads
+    /// `Switch` only, and `read_claude` leaves a `providerSwitch` out too.
+    ProviderSwitch { from: Option<AccountRef>, to: AccountRef, by: By },
     Blocked { account, k, m }, Unblocked { account, k, m }, AllBlocked, AnyUsable,
     AccountAdded { account, plan }, AccountRemoved { account }, PlanChanged { account, from, to },
     PriceChanged { account, amount, currency },
@@ -788,9 +814,12 @@ pub enum EventKind {
 }
 pub struct Event { pub t: DateTime<Utc>, #[serde(flatten)] pub kind: EventKind }
 #[serde(rename_all = "camelCase")]
-pub struct TokenRecord { pub t: DateTime<Utc>, pub session: String, pub cwd: String, pub project: ProjectKey,
+pub struct TokenRecord { pub t: DateTime<Utc>,
+    #[serde(rename = "min", default = "sixty", skip_serializing_if = "is_sixty")] pub minutes: u32,
+    pub session: String, pub cwd: String, pub project: ProjectKey,
     pub model: String, #[serde(rename = "in")] pub input: u64, pub out: u64, pub cw: u64, pub cr: u64,
     pub answers: u32, pub agent_answers: u32 }                // agentAnswers in the file
+impl TokenRecord { pub fn span(&self) -> chrono::Duration; }    // its minutes; a line without `min` is 60
 #[serde(rename_all = "camelCase")]
 pub struct SessionRecord { pub t: DateTime<Utc>, pub session: String, pub cwd: String, pub project: ProjectKey,
     pub entrypoint: Option<String>,
@@ -1040,9 +1069,13 @@ pub fn scan(claude: &ClaudePaths, state: &ScanState, budget_bytes: u64)
 pub struct Agents { pub metas: Vec<AgentMeta>, pub warnings: Vec<String> }
 pub fn agents_of(claude: &ClaudePaths, session: &str,
     spawns: &BTreeMap<String, Option<String>>) -> Agents;
-/// One TokenRecord per (session, hour, model); an agent's answers go to its parent session and use
-/// the parent's folder when known. The group's cwd is that of its earliest answer.
+/// One TokenRecord per (session, 5-minute bucket, model); an agent's answers go to its parent session
+/// and use the parent's folder when known. The group's cwd is that of its earliest answer.
 pub fn token_records(answers: &[Answer], state: &ScanState, home: &Path) -> Vec<TokenRecord>;
+/// The length of a token line's bucket (spec R3); its `min` field is this.
+pub const TOKEN_BUCKET_MINUTES: i64 = 5;
+/// The start of the 5-minute bucket `at` falls in, in UTC.
+pub fn bucket_start(at: DateTime<Utc>) -> DateTime<Utc>;
 ```
 
 Only numbers and names leave the parser: time, folder, model, block kinds, token counts, session
@@ -1143,7 +1176,8 @@ of one event kind never clears the other kind's failure.
 | `status` | The live account in one line: `AC 97% · 1h 12min` (binding limit, time to its reset; format §11: `35min`, `1h 5min`, `1d 18h`, beyond 48 h `Sun 02:00` — `format::format_reset_at`; reset times are rounded up to the full minute first, `format::reset_minute`). `--json` prints `views` + `active` + `suggestion` + `autoBurn` + `next` + `burnError` (§7.8 of the spec); each view carries `usable`, the one definition of §7.2, and `slackHours` when known. `--waybar` prints one JSON line `{"text":"AC 97%","tooltip":"…","class":"fine|close|critical|locked|none","percentage":97}`; `--i3blocks` prints three lines (full text, short text, colour). `--refresh` polls first (PollReason::Timer). Only `--json` reads the history. |
 | `statusline` | Claude Code's status line: reads its JSON from stdin, prints the one line and exits 0 (even when it prints `seatswap: <reason>`). Never gated, never recorded, no lock, no network. |
 | `burn plan [--json]` | The regime and the plan auto-burn follows (eager while early switching is on; §7.7 of the spec). |
-| `burn simulate --from D --to D [--without KEY]…` | Replays the two local days for `Lazy` and `Eager`. |
+| `burn simulate --from D --to D [--without KEY]…` | Replays the two local days for `Lazy` and `Eager`, Anthropic work only (R7). |
+| `codex list [--json]` / `codex switch <ABBR>` | `codex list` reads the saved Codex logins and prints one line each, live first then by abbreviation: `* OA  Plus  live` (`*` and `live` on the live one, abbr, plan or `—`; a saved login has neither mark); `--json` prints `{account, abbr, label, color, plan, live}` per login, no usage and no poll. `codex switch` switches Codex's live login to the saved login with that abbreviation through `ops::switch_codex`, prints its note and warnings, and records `providerSwitch`; an unknown abbr is a usage error, and a Claude account's abbr is named as such. `codex list` follows `agentsRead`; `codex switch` follows `agentsSwitch`. |
 
 ### Agent gate and skill (step A)
 
@@ -1210,6 +1244,8 @@ Files: `crates/app/src/gui/{mod.rs, worker.rs, tray.rs, panel.rs, notify.rs, aut
 ```rust
 pub struct Snapshot {
     pub views: Vec<AccountView>,          // engine::views, active first
+    pub accounts: Vec<AccountRow>,        // the stored fields the cards do not need
+    pub provider_subscriptions: Vec<ProviderSubscriptionRow>,
     pub active_id: Option<String>,
     pub live: LiveView,                   // { kind: "noLogin"|"ended"|"known"|"unknown", accountId?, email?, orgName? }
     pub burn: Option<BurnView>,           // step B: auto-burn's line, plan, waiting switch, suggestion
@@ -1218,12 +1254,15 @@ pub struct Snapshot {
     pub secrets_warning: Option<String>,  // from open_store: logins stored unencrypted
     pub last_poll_at: Option<DateTime<Utc>>,
     pub error: Option<String>,            // last engine-wide error (store/cache unreadable)
+    pub sessions: Option<SessionsSummary>, // None = readSessions off
+    pub providers: Vec<ProviderView>,    // switched-on cards, filled by the provider thread
+    pub codex_logins: Vec<CodexLoginView>, // saved Codex logins, live first; empty while the card is off
     pub settings: Option<Settings>,      // None when accounts.json cannot be read: the panel disables Save
 }
 ```
 
 **Tauri commands** (all `Result<T, String>`, the error is the human message of the core error):
-`get_snapshot() -> Snapshot` · `refresh_now()` (Poll(Wake)) · `switch_account(key, unsaved: "refuse"|"discard"|"save", label: Option<String>) -> String` (the success sentence; `CurrentNotSaved` sets `pending` and returns Err "not saved") · `cancel_pending()` · `save_current(label: Option<String>)` (sync_live with create) · `edit_account(key, label?, abbr?, color?)` · `remove_account(key)` · `save_setting(field: String, value: serde_json::Value) -> SavedSetting` (one field merged under the app lock, validated, applies startAtLogin) · `set_auto_burn(on)` (`SaveSetting { field: "autoBurn", value: on }`: the same save path, writes `autoBurnSet` only on a change) · `pause_burn(hours: Option<i64>)` (Some = pause, None = resume) · `icon_preview(abbr, color) -> Vec<IconPx { size, rgba: Vec<u8> }>` for 16, 22, 32 (the panel draws them with `ImageData`) · `fit_panel(height: f64)` · `hide_panel()`.
+`get_snapshot() -> Snapshot` · `app_version() -> String` (`env!("CARGO_PKG_VERSION")`, for Settings → General's *Version* line) · `refresh_now()` (Poll(Wake)) · `switch_account(key, unsaved: "refuse"|"discard"|"save", label: Option<String>) -> String` (the success sentence; `CurrentNotSaved` sets `pending` and returns Err "not saved") · `cancel_pending()` · `save_current(label: Option<String>)` (sync_live with create) · `edit_account(key, label?, abbr?, color?)` · `remove_account(key)` · `save_setting(field: String, value: serde_json::Value) -> SavedSetting` (one field merged under the app lock, validated, applies startAtLogin) · `set_auto_burn(on)` (`SaveSetting { field: "autoBurn", value: on }`: the same save path, writes `autoBurnSet` only on a change) · `pause_burn(hours: Option<i64>)` (Some = pause, None = resume) · `switch_codex(account: AccountRef) -> Result<String, String>` (the action thread's `SwitchCodex`, the note; the provider thread is poked through `codex_changed`) · `remove_codex_login(account: AccountRef) -> Result<(), String>` (the action thread's `RemoveCodexLogin`; the live copy is refused) · `icon_preview(abbr, color) -> Vec<IconPx { size, rgba: Vec<u8> }>` for 16, 22, 32 (the panel draws them with `ImageData`) · `fit_panel(height: f64)` · `hide_panel()`.
 Event `navigate` (payload `"main"|"add"`) when the panel is shown for a menu item. The pop-up has no
 settings view; its gear, `,` and the CLI's `panel settings` open the large window at Settings.
 
@@ -1347,6 +1386,22 @@ pub(crate) fn record_switch(recorder: &Recorder, from: Option<AccountRef>, to: A
     sessions: Option<SessionCounts>, at: DateTime<Utc>) -> Result<(), HistoryError>;
 // saved_new = the account SwitchOutcome.saved_new created: its accountAdded is written before the switch.
 // Both lines are tried even when the first fails; the first error is returned.
+
+/// Create or update the provider subscription for an OpenAI or Ollama account seen in a reading.
+/// OpenAI keeps its plan current at every reading; Ollama's plan is typed. Returns the warnings to
+/// print (a store write failure is one, never a failed reading).
+pub(crate) fn ensure_provider_subscription(app: &AppPaths, recorder: Option<&Recorder>,
+    account: &AccountRef, plan: Option<&str>, now: DateTime<Utc>) -> Vec<String>;
+
+pub(crate) struct CodexSwitch { pub note: String, pub warnings: Vec<String> }
+/// Switch Codex's live login and record the `providerSwitch` event. The event follows a successful
+/// write, with the old live login as `from` (None when auth.json was missing) and `by` the action's
+/// `By`. `note` is `Codex now uses {abbr}. Codex sessions already running keep {from} until they
+/// restart.` (without the second sentence when nothing was live); a history failure is a warning,
+/// never a failed switch.
+pub(crate) fn switch_codex(app: &AppPaths, codex_paths: &CodexPaths, store: &Store,
+    recorder: Option<&Recorder>, to: &AccountRef, now: DateTime<Utc>)
+    -> Result<CodexSwitch, String>;
 
 // notify.rs
 pub(crate) enum Notification { Suggestion(SwitchSuggestion), LoginWarning(..), UnknownLogin { .. },
@@ -1489,81 +1544,146 @@ it lasts. A converted cost that is not finite is not used: the row keeps the val
 the thread names the session. With a currency and no stored rate the cost is not converted: it stays
 in USD and is labelled USD, and `take_provider_cost` returns no warning for that.
 
-## burn/mod.rs — constants and shared types (step B)
+## burn/mod.rs — constants and shared types (step B, 1.3)
 
 ```rust
-pub const LEARN_MIN_WU: f64 = 20.0;    // rates are known from this much work on an account
-pub const RHYTHM_WEEKS: i64 = 4;       // the rhythm averages 4 weeks; the newer two count double
-pub const RATES_DAYS: i64 = 14;        // rates are learned from this many days of samples
-pub const STEP_MIN: i64 = 15;          // the plan's step
-pub const HORIZON_H: i64 = 168;        // the plan's horizon
-pub const MIN_DWELL_MIN: i64 = 30;     // shortest time between two switches
-pub const SLACK_MARGIN_H: f64 = 2.0;   // S2's margin, in typical working hours
-pub const MANUAL_HOLD_H: i64 = 4;      // a manual switch holds early switching this long
-pub const MIN_GAIN_H: f64 = 0.5;       // early switching must save at least this
-pub const GAIN_FACTOR: f64 = 2.0;      // and at least this many times its extra switches' cost
-pub const MIN_COST_SAMPLES: u32 = 3;   // a measured switch cost needs this many switches
-pub const FRESH_MIN: i64 = 20;         // a decision needs readings at most this old
-pub const SWITCH_RELEARN_MIN: i64 = 1; // a switch event that lands late is learned at the next tick
-pub const STALE_ASK_SECS: i64 = 60;    // stale readings ask for a poll at most this often
-pub const LEARN_RETRY_MIN: i64 = 5;    // a failed history read is tried again this much later
-pub const SWITCH_RETRY_MIN: i64 = 10;  // the same switch decision is sent again this much later
+pub const LEARN_MIN_USD: f64 = 100.0;   // a factor is measured from this much of its own work,
+                                        // in API dollars; a prior weighs as much
+pub const ASSUMED_WEEK_PERCENT_PER_USD_AT_1X: f64 = 0.75; // a plan of capacity n assumes this / n
+pub const MIN_LIVE_SHARE: f64 = 0.9;    // a Claude pair needs the account live for this share
+pub const RHYTHM_WEEKS: i64 = 4;        // the rhythm averages 4 weeks; the newer two count double
+pub const RATES_DAYS: i64 = 14;         // rates are learned from this many days of samples
+pub const STEP_MIN: i64 = 15;           // the plan's step
+pub const HORIZON_H: i64 = 168;         // the plan's horizon
+pub const MIN_DWELL_MIN: i64 = 30;      // shortest time between two switches
+pub const SLACK_MARGIN_H: f64 = 2.0;    // S2's margin, in typical working hours
+pub const MANUAL_HOLD_H: i64 = 4;       // a manual switch holds early switching this long
+pub const MIN_GAIN_H: f64 = 0.5;        // early switching must save at least this
+pub const GAIN_FACTOR: f64 = 2.0;       // and at least this many times its extra switches' cost
+pub const MIN_COST_SAMPLES: u32 = 3;    // a measured switch cost needs this many switches
+pub const FRESH_MIN: i64 = 20;          // a decision needs readings at most this old
+pub const SWITCH_RELEARN_MIN: i64 = 1;  // a switch event that lands late is learned at the next tick
+pub const STALE_ASK_SECS: i64 = 60;     // stale readings ask for a poll at most this often
+pub const LEARN_RETRY_MIN: i64 = 5;     // a failed history read is tried again this much later
+pub const SWITCH_RETRY_MIN: i64 = 10;   // the same switch decision is sent again this much later
 
-const OUTPUT_WEIGHT: f64 = 5.0;        // the four weights of a work unit, nowhere else
-const CACHE_WRITE_WEIGHT: f64 = 1.25;
-const CACHE_READ_WEIGHT: f64 = 0.1;
-const HOURS: usize = 168;
+pub const HOURS: usize = 168;            // private
 
-pub fn work_units(input: u64, output: u64, cache_write: u64, cache_read: u64) -> f64;
-/// Work units as hours at `typical_wu`; None when that is 0.0. The one conversion
+pub fn switches_per_day(switches: u32) -> f64;   // switches / (HORIZON_H / 24)
+/// API dollars as hours at `typical_usd`; None when that is 0.0. The one conversion
 /// used by the regime, `burn status`, `burn plan` and `burn_text::hours`.
-pub fn wu_hours(wu: f64, typical_wu: f64) -> Option<f64>;
-#[derive(Debug, Clone, PartialEq)] pub struct Rhythm { pub wu: [f64; HOURS] }
+pub fn usd_hours(usd: f64, typical_usd: f64) -> Option<f64>;
+#[derive(Debug, Clone, PartialEq)] pub struct Rhythm { pub usd: [f64; HOURS] }
 impl Rhythm { pub fn at(&self, t: DateTime<Utc>, offset: FixedOffset) -> f64;
-              pub fn typical_hour(&self) -> f64; } // mean over hours with wu > 0; 0.0 if none
-#[derive(Debug, Clone, Copy)] pub struct Rates { pub c: f64, pub s: Option<f64> }
+              pub fn typical_hour(&self) -> f64; } // mean over hours with work; 0.0 if none
+#[derive(Debug, Clone, Copy, PartialEq)] pub struct Rates { pub c: Factor, pub s: Option<Factor> }
 ```
 
-## burn/burn_next.rs — the status line's next account (step B)
+`Rates` holds the fitted factors of the account's week (`c`) and 5 h window (`s`), each a
+`burn::fit::Factor`; `s` is `None` without a session limit or before it can be measured or
+assumed. The plan uses each factor's `value`; neither is ever 0 or below. In tests and fixtures
+`Rates::given(c, s)` makes factors with no range, measured on `LEARN_MIN_USD`.
+
+## burn/fit.rs — the one estimator of a factor and its range (1.3, R2)
 
 ```rust
-pub const REWRITE_AFTER_MIN: i64 = FRESH_MIN / 2;
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)] #[serde(rename_all = "camelCase")]
-pub struct BurnNext { pub account: String, pub at: DateTime<Utc>, pub written: DateTime<Utc> }
-pub fn write(app: &AppPaths, next: &BurnNext) -> io::Result<()>; // atomic, private, mode 0600
-pub fn read(app: &AppPaths, now: DateTime<Utc>) -> io::Result<Option<BurnNext>>;
-pub fn remove(app: &AppPaths) -> io::Result<()>;                 // a missing file is success
+const Z_80: f64 = 1.2816;               // the two-sided 80 % range of a normal distribution
+#[derive(Debug, Clone, Copy, PartialEq)] pub struct Pair { pub gain: f64, pub usd: f64 }
+#[derive(Debug, Clone, Copy, PartialEq)] pub struct Factor {
+    pub value: f64, pub low: f64, pub high: f64, pub basis_usd: f64, pub measured: bool,
+}
+pub fn factor(pairs: &[Pair], prior: Option<f64>) -> Option<Factor>;
 ```
 
-`AppPaths::burn_next_file()` is `<data_dir>/burn-next.json`. `read` returns `None` when the file is
-missing or its `written` is older than `FRESH_MIN`; an unparsable file is `InvalidData`, which the
-status line prints as its `seatswap: <reason>` line. `REWRITE_AFTER_MIN` is the tray app's
-heartbeat: it rewrites the same account and time at least this often so a running app stays fresh.
+`value = (Σ gain + prior × LEARN_MIN_USD) / (Σ usd + LEARN_MIN_USD)` while a prior exists and
+`Σ gain / Σ usd` without one. `se = sqrt(Σ (gain_i − value · usd_i)² + (prior · w − value · w)²) /
+(Σ usd + w)` with `w` the prior's weight; `low = max(0, value − 1.2816 · se)`, `high = value +
+1.2816 · se`. `basis_usd = Σ usd`; `measured = Σ usd ≥ LEARN_MIN_USD`. `None` without pairs and
+without a prior, when the dollars are 0 and there is no prior, or when the value is not above 0.
+Whether a factor that is neither measured nor has a prior may be used is the caller's rule. Every
+factor in auto-burn and the statistics comes from here.
 
-## burn/rates.rs — rhythm, live account, rates (step B)
+## burn/rates.rs — rhythm, live account, rates (step B, 1.3)
 
 ```rust
 pub fn rhythm<Tz: TimeZone + Copy>(tokens: &[Hosted<TokenRecord>], now: DateTime<Utc>,
-                                   zone: &Tz) -> Rhythm;
+                                   zone: &Tz, prices: &Prices) -> Rhythm;
+pub(crate) fn rhythm_of_company<Tz: TimeZone + Copy>(tokens: &[Hosted<TokenRecord>],
+    now: DateTime<Utc>, zone: &Tz, prices: &Prices, company: Company) -> Rhythm;
+pub(crate) fn hour_shares(record: &TokenRecord,
+    hour_of: impl Fn(DateTime<Utc>) -> DateTime<Utc>) -> Vec<(DateTime<Utc>, f64)>;
 pub fn account_at(events: &[Hosted<Event>], host: &str, t: DateTime<Utc>) -> Option<AccountRef>;
-pub struct RateAccount { pub account: AccountRef, pub capacity: Option<f64> }
-impl RateAccount { pub fn of(account: &Account) -> RateAccount; }   // Account::capacity()
-pub fn rates(accounts: &[RateAccount], samples: &[Hosted<Sample>], tokens: &[Hosted<TokenRecord>],
-             events: &[Hosted<Event>], now: DateTime<Utc>) -> BTreeMap<AccountRef, Rates>;
+#[derive(Debug, Clone, PartialEq)] pub struct RateAccount {
+    pub account: AccountRef, pub company: Company,
+    pub capacity: Option<f64>, pub plan: Option<String> }
+impl RateAccount { pub fn of(account: &Account) -> RateAccount;
+                   pub fn of_provider(subscription: &ProviderSubscription) -> RateAccount; }
+pub(crate) fn main_limit(company: Company) -> LimitKind;
+#[derive(Debug, Clone, PartialEq)] pub struct LearnedRates {
+    pub rates: BTreeMap<AccountRef, Rates>, pub unpriced: BTreeSet<String> }
+impl LearnedRates { pub fn warnings(&self) -> Vec<String>; }
+pub fn rates(accounts: &[RateAccount], samples: &[Hosted<Sample>],
+             tokens: &[Hosted<TokenRecord>], events: &[Hosted<Event>],
+             prices: &Prices, now: DateTime<Utc>) -> LearnedRates;
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rates_in(subjects: &[RateAccount], samples: &[Hosted<Sample>],
+    tokens: &[Hosted<TokenRecord>], events: &[Hosted<Event>],
+    provider_subscriptions: &[ProviderSubscription], prices: &Prices,
+    from: DateTime<Utc>, to: DateTime<Utc>) -> LearnedRates;
+pub(crate) struct WindowPools {
+    pub(crate) timelines: HashMap<String, Timeline>,
+    pub(crate) provider_timelines: HashMap<String, Timeline>,
+    pub(crate) openai: BTreeSet<AccountRef> }
+impl WindowPools { pub(crate) fn of(events: &[Hosted<Event>],
+    provider_subscriptions: &[ProviderSubscription]) -> WindowPools; }
+pub(crate) fn sample_lines<'a>(account: &AccountRef, samples: &'a [Hosted<Sample>])
+    -> Vec<&'a Hosted<Sample>>;
+pub(crate) fn sample_lines_by_account<'a>(subjects: &[RateAccount],
+    samples: &'a [Hosted<Sample>]) -> BTreeMap<AccountRef, Vec<&'a Hosted<Sample>>>;
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rates_in_with(subjects: &[RateAccount],
+    lines: &BTreeMap<AccountRef, Vec<&Hosted<Sample>>>, samples: &[Hosted<Sample>],
+    tokens: &[Hosted<TokenRecord>], pools: &WindowPools, prices: &Prices,
+    from: DateTime<Utc>, to: DateTime<Utc>) -> LearnedRates;
+pub(crate) enum PairLimit { Main, Session }
+pub(crate) fn window_pairs(subject: &RateAccount, lines: &[&Hosted<Sample>],
+    tokens: &[Hosted<TokenRecord>], pools: &WindowPools, prices: &Prices,
+    limit: PairLimit, from: DateTime<Utc>, to: DateTime<Utc>) -> Vec<fit::Pair>;
+pub(crate) struct Timeline { /* changes, before */ }
+impl Timeline { pub(crate) fn provider_switches(events: &[Hosted<Event>], host: &str) -> Timeline; }
 ```
 
-`rhythm` spreads a record's hour over the local clock hours it covers with the zone's offset at
-each instant. `rates` pairs consecutive
-samples of the same weekly window at most 6 h apart in the last 14 days, drops a pair in which the
-account was live on no host, and counts the work of token records whose host had the account live.
-An account with a capacity starts from `ASSUMED_WEEK_PERCENT_PER_WU` (1.235, % per work unit at
-capacity 1) joined with every capacity account's measurement (gain × capacity over work), divided
-by its capacity and weighed as `LEARN_MIN_WU` work units next to its own measurement; `s` likewise
-from the measured windows only, for an account whose latest sample has a session limit. Without a
-capacity an account has rates only once its work reaches `LEARN_MIN_WU`. A pair whose earlier sample
-is at 100 % is left out; a rate at or below 0 is unknown, never a number. `Account::capacity()`
-reads `oauthAccount.userRateLimitTier`, else `organizationRateLimitTier` (`store::tier_capacity`:
-`_<n>x` → n). `rates_known` needs only `c`: an unknown `s` plays as 0.
+`rhythm` is `rhythm_of_company` with `Company::Anthropic`, so auto-burn counts Anthropic records
+only. A record's span is spread over the local clock hours it covers, by the minutes each holds
+(`hour_shares`), so an offset that is not a whole hour splits it and a daylight-saving change is
+followed. `rates` is `rates_in` over the last `RATES_DAYS` days with no provider subscriptions, so
+auto-burn's factors are unchanged. `rates_in` fits every subscription over an explicit range, with
+provider subscriptions and an explicit `from`/`to`; the Subscriptions page calls it over its range
+for every stored subscription whatever chips it shows. `WindowPools` builds the timelines, the
+`providerSwitch` timelines and the stored OpenAI subscriptions once per page, and `rates_in_with`
+takes them with the sorted `sample_lines`. `RateAccount.company` is `Anthropic` for a Claude
+account, and the company of the subscription's org for a provider; a provider has no capacity, so
+its week is learned from its own readings. `main_limit` is `weekly_all` for Anthropic and OpenAI,
+and `monthly_credits` for Ollama.
+
+`rates` pairs consecutive samples of the same weekly window at most 6 h apart in the last 14 days,
+keeps a pair only when the account was live for at least `MIN_LIVE_SHARE` of it (union over hosts),
+and counts the work of token records whose host had the account live. A pair that holds an
+Anthropic record without a price is left out whole; `LearnedRates::unpriced` names each such model
+once and `warnings()` gives the words. A pair whose earlier sample is at 100 % is left out. The
+prior of an account and a limit, from the factors of the other accounts measured from their own
+pairs alone:
+1. pooled over those with the same plan name, `Σ gain / Σ usd`;
+2. else pooled over those with a capacity, `Σ (gain × capacity) / Σ usd`, divided by this account's
+   capacity;
+3. else, week only, `ASSUMED_WEEK_PERCENT_PER_USD_AT_1X` divided by this account's capacity;
+4. else no prior: the account has a factor only once it is measured.
+A provider pair counts only when every record of its company inside the pair belongs to that
+subscription and at least one does (through `openai_subscription_at` or Ollama's one
+subscription); a pair no record touches says nothing. Priors stay within a company; rules 2 and 3
+are Anthropic's only. `Account::capacity()` reads
+`oauthAccount.userRateLimitTier`, else `organizationRateLimitTier` (`store::tier_capacity`:
+`_<n>x` → n); plan "Pro" gives 1. `rates_known` needs only `c`: an unknown `s` plays as 0.
 
 ## burn/plan.rs — slack, choice and the two plans (step B)
 
@@ -1591,7 +1711,7 @@ pub fn choose(inputs: &Inputs, at: DateTime<Utc>) -> Option<String>;
     pub from: DateTime<Utc>, pub to: DateTime<Utc> }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum Fill { Window, Week }
 #[derive(Debug, Clone, PartialEq)] pub struct Plan { pub segments: Vec<Segment>,
-    pub blocked_wu: f64, pub switches: u32, pub left_at_reset: BTreeMap<String, f64>,
+    pub blocked_usd: f64, pub switches: u32, pub left_at_reset: BTreeMap<String, f64>,
     pub full_at: BTreeMap<String, DateTime<Utc>>, pub full_by: BTreeMap<String, Fill> }
 pub fn follow(inputs: &Inputs, policy: Policy) -> Plan;
 pub fn followed(inputs: &Inputs, regime: &Regime) -> Plan; // eager while `regime.early`, else lazy
@@ -1618,7 +1738,7 @@ Forecast's planned plan, `live::assess` and everything that reads its plan take 
 ## burn/decide.rs — the regime and the decision (step B)
 
 ```rust
-#[derive(Debug, Clone, Copy, PartialEq)] pub struct SwitchCost { pub wu: f64, pub samples: u32 }
+#[derive(Debug, Clone, Copy, PartialEq)] pub struct SwitchCost { pub usd: f64, pub samples: u32 }
 #[derive(Clone)] pub struct Situation { pub inputs: Inputs, pub cost: Option<SwitchCost>,
     pub tied_busy: u32, pub oldest_reading: DateTime<Utc>, pub sessions_off: bool }
 impl Situation { pub fn check(&self) -> Result<(), PlanError>; }
@@ -1666,33 +1786,37 @@ is tied.
 ```rust
 pub fn switch_cost(events: &[Hosted<Event>], samples: &[Hosted<Sample>],
                    tokens: &[Hosted<TokenRecord>], rates: &BTreeMap<AccountRef, Rates>,
-                   range: &Range) -> Option<SwitchCost>;
+                   prices: &Prices, range: &Range) -> Option<SwitchCost>;
 ```
 
 For each `Switch` event in `range`: the target's weekly percent gained between its first and last
-sample in the 10 minutes after the switch, minus `c` × the work units done between those samples,
-divided by `c` (extra work units). Switches without two samples or without the target's rates are
-left out; a negative result counts as 0. The result is the mean and its sample count, `None` when
-none remains.
+sample in the 10 minutes after the switch, minus `c` × the API dollars of work done between those
+samples, divided by `c` (the extra dollars the switch cost). A switch whose window holds a record
+without a price is left out whole (documented rule), never measured with that work missing; switches
+without two samples or without the target's rates are left out too, and a negative result counts as
+0. The result is the mean and its sample count, `None` when none remains.
 
 ## burn/replay.rs — replay recorded work (step B)
 
 ```rust
 #[derive(Debug, Clone, PartialEq)] pub struct ReplayResult { pub policy: Policy,
-    pub worked_wu: f64, pub blocked_wu: f64, pub switches: u32,
-    pub expired: BTreeMap<AccountRef, f64>, pub typical_wu: f64, pub warnings: Vec<String> }
+    pub worked_usd: f64, pub blocked_usd: f64, pub switches: u32,
+    pub expired: BTreeMap<AccountRef, f64>, pub typical_usd: f64, pub warnings: Vec<String> }
 #[derive(Debug, thiserror::Error)] pub enum ReplayError {
     History(#[from] HistoryError), Plan(#[from] PlanError),
     Unplayable { account: String, at: DateTime<Utc>, missing: &'static str } }
 pub fn replay(history: &HistoryDir, range: &Range, rates: &BTreeMap<AccountRef, Rates>,
-              without: &[AccountRef], policy: Policy) -> Result<ReplayResult, ReplayError>;
+              without: &[AccountRef], policy: Policy, prices: &Prices)
+    -> Result<ReplayResult, ReplayError>;
 ```
 
 The replay reads the token and sample records of `range` from all hosts. Each account starts from
 its first sample in the range; a sample without a weekly limit or a weekly reset is
-`ReplayError::Unplayable`. Work is recorded per UTC hour and spread evenly over its four steps.
+`ReplayError::Unplayable`. Work is read as API dollars of Anthropic records only (R7): an OpenAI or
+Ollama line is left out, and a Claude line without a price makes its hour unknown, never 0. Each
+line is spread over the UTC hours its `span` covers by `hour_shares`, then over the play's steps.
 `without` leaves accounts out; the replay starts with no active account. Ids inside the play are
-`"<acc>/<org>"`; `expired` names the full `AccountRef` again. `typical_wu` is the mean of the
+`"<acc>/<org>"`; `expired` names the full `AccountRef` again. `typical_usd` is the mean of the
 recorded hours with work (0.0 when none); the reads' warnings are kept for the caller.
 
 ## burn/live.rs — one history read into one situation (step B)
@@ -1932,13 +2056,14 @@ backend, takes no lock and writes no history. The other additions:
   command. The plain, waybar and i3blocks forms do not read the history.
 - `seatswap burn plan [--json]` uses the same read and `live::assess` with `tied_busy = 0` and no
   thinking (the CLI has no session count and does not know the running sessions). Blocked hours come
-  from `wu_hours` on the lazy and eager `blocked_wu`. An
+  from `usd_hours` on the lazy and eager `blocked_usd`. An
   account auto-burn may use (or the active one) with a login and no reading is an error
   `no reading for …`; no account at all is `no account has a login with a reading`.
 - `seatswap burn simulate --from D --to D [--without ABBR]…` maps the two local days to a range
   ending at the local midnight after `--to`, learns the rates from the history as of now, and
   replays `Policy::Lazy` and `Policy::Eager`. Both replays read the same files; each warning is
-  printed once on standard error.
+  printed once on standard error. Only Anthropic records are replayed: `replay_records` reads the
+  work of `Company::Anthropic` and leaves an OpenAI or Ollama line out (R7).
 - `seatswap next` by an agent with `auto_burn` on returns
   `seatswap: auto-burn is on and decides` and exit code 0 without switching or touching a login;
   the agent call is recorded like any other.
@@ -2272,7 +2397,7 @@ const MONEY_VERSION: u32 = 1;
 
 pub enum MoneyError { Io { path, source }, Json { path, source }, UnsupportedVersion { path, version },
     ModelsDev(String), Api(ApiError), Lock(LockError), BadRate { currency: String, rate: f64 },
-    History(HistoryError) }
+    MonthStart { end: DateTime<Utc> }, History(HistoryError) }
 
 /// USD per million tokens.
 pub struct ModelPrice { pub input: f64, pub output: f64, pub cache_write: f64,
@@ -2287,7 +2412,9 @@ pub struct ModelsDevList { pub prices: BTreeMap<String, ModelPrice>, pub left_ou
 /// Why a value is missing; Display is the text a page shows.
 pub enum Missing { NoCurrency, NoPrice { model: String }, NoAccount, NoAccountPrice,
     PriceInOtherCurrency { currency: String }, PriceWithoutCurrency, NoReading,
-    UnpricedInWeek { model: String } }
+    UnpricedInWeek { model: String }, NoMonthlyAllowance, NoWeekReading, NoMonthReading }
+// Display is the page's text: "no monthly allowance in Ollama's reading", "no reading of this
+// week's usage", "no reading of this month's usage".
 
 pub struct Prices { pub version: u32, pub checked_at: Option<DateTime<Utc>>,
     pub etag: Option<String>, pub last_change: Option<PriceChange>,
@@ -2298,10 +2425,10 @@ impl Prices {
     pub fn save(&self, app: &AppPaths) -> Result<(), MoneyError>; // pretty, atomic, mode 0600
     /// The price of `key` at `at`: the last point at or before `at`, else the first point.
     pub fn at(&self, key: &str, at: DateTime<Utc>) -> Option<&ModelPrice>;
-    /// The price of a model as the valuer looks it up: [`price_key`]`("anthropic", model)`, then
-    /// [`Prices::at`]. Every token record the valuer prices — a Claude Code, Harness or Codex
-    /// row's — is priced in models.dev's `anthropic` list; a provider's own cost replaces a
-    /// Claude Code row's API value only through `take_provider_cost`, and only from the feed.
+    /// The price of a model under its company's key ([`model_price_key`]), then [`Prices::at`]:
+    /// `anthropic/<id>` for a Claude model, `openai/<id>` for any other (Codex's), and
+    /// `ollama-cloud/<id>` for an Ollama cloud id. A provider's own cost replaces a Claude Code
+    /// row's API value only through `take_provider_cost`, and only from the feed.
     pub fn of_model(&self, model: &str, at: DateTime<Utc>) -> Option<&ModelPrice>;
     /// The current price of every key: its last point, sorted by key.
     pub fn current(&self) -> Vec<CurrentPrice>;
@@ -2356,22 +2483,33 @@ pub fn look_up_rate(api: &Api, app: &AppPaths, currency: &str, now: DateTime<Utc
 pub fn prices_from_models_dev(body: &serde_json::Value) -> Result<ModelsDevList, MoneyError>;
 pub fn price_key(provider: &str, model_id: &str) -> String; // "<provider>/<model id>"
 
-/// Who a record's model belongs to (serde camelCase). `of_model` is the one rule: `claude-*` →
-/// Claude, `<name>:cloud` / `<name>:<tag>-cloud` (name and tag not empty) → Ollama, any other id
-/// → Codex; `model_price_key` and `is_plan_model` both follow it (one private decision,
-/// `priced_as`, gives the provider and its id in the provider's models.dev list). `name()` is
-/// "Claude", "Codex" or "Ollama".
-pub enum Provider { Claude, Codex, Ollama }
-impl Provider { pub fn of_model(model: &str) -> Provider; pub fn name(&self) -> &'static str; }
-/// The one plan-model rule: `Provider::of_model(model) == Provider::Claude`. Only such a record
-/// enters a Claude account's week; any other model id (Codex's, Harness's, flash's, a non-Claude
-/// model) gets the subscription value 0, adds nothing to the week's split and never makes the
-/// week's subscription value unknown. Its API value still follows the price rule.
+/// The company a record's model or an account belongs to (serialised as its lowercase name:
+/// `anthropic`, `openai`, `ollama`). `of_model` is the
+/// one rule: `claude-*` → Anthropic, `<name>:cloud` / `<name>:<tag>-cloud` (name and tag not
+/// empty) → Ollama, any other id → OpenAI; `of_account` maps org `codex` → OpenAI, `ollama` →
+/// Ollama, every other org (a Claude organization id) → Anthropic. `model_price_key` and
+/// `is_plan_model` both follow it (one private decision, `priced_as`, gives the company and its id
+/// in the company's models.dev list). `name()` is "Anthropic", "OpenAI" or "Ollama"; `price_list()`
+/// is `anthropic`, `openai` or `ollama-cloud`.
+#[derive(Serialize)] #[serde(rename_all = "lowercase")]
+pub enum Company { Anthropic, OpenAI, Ollama }
+impl Company { pub fn of_model(model: &str) -> Company; pub fn of_account(account: &AccountRef) -> Company;
+               pub fn name(&self) -> &'static str; pub fn price_list(&self) -> &'static str; }
+/// The one plan-model rule: `Company::of_model(model) == Company::Anthropic`. Only such a record
+/// enters a Claude account's week; any other model id (OpenAI's, Ollama's) gets its own
+/// subscription's value instead, adds nothing to the Claude week's split and never makes the
+/// Claude week's subscription value unknown. Its API value still follows the price rule.
 pub fn is_plan_model(model: &str) -> bool;
-/// One record at API prices, in USD; None when its model has no price. Of_model, so the model is
-/// priced as an Anthropic model. A record with four zero counts costs 0 even with no price.
+/// One record at API prices, in USD: the work of auto-burn and the statistics. None when its model
+/// has no price. Of_model, so the model is priced under its company's key at `at`; the base price
+/// of a tiered model, with the long-context premium left out (documented rule). A record with four
+/// zero counts costs 0 even with no price.
+pub fn work_usd(model: &str, input: u64, output: u64, cache_write: u64, cache_read: u64,
+                prices: &Prices, at: DateTime<Utc>) -> Option<f64>;
+/// [`work_usd`] of a token record at its own time.
 pub fn api_usd(record: &TokenRecord, prices: &Prices) -> Option<f64>;
 pub fn percent_value(monthly_price: f64) -> f64; // monthly × 12 / 52 / 100
+pub(crate) fn month_money(price: f64, percent: f64) -> WindowMoney; // used = percent / 100 × price
 
 /// One weekly window's money in the display currency.
 pub(crate) struct WindowMoney { pub(crate) used: f64, pub(crate) paid: f64, pub(crate) expired: f64 }
@@ -2380,19 +2518,27 @@ pub(crate) struct WindowMoney { pub(crate) used: f64, pub(crate) paid: f64, pub(
 /// percent) × pv, used = paid − expired.
 pub(crate) fn window_money(price: f64, percent: f64) -> WindowMoney;
 
-/// `account` is the Claude account live on the record's host at its time, always `None` for a
-/// Codex or Ollama record (it uses no Claude account); `provider` is `Provider::of_model`.
+/// `account` is the Claude account live on the record's host at its time, or the record's provider
+/// subscription (an OpenAI record by `openai_subscription_at`, every Ollama record by
+/// `ollama_subscription`); `company` is `Company::of_model`. A record whose OpenAI subscription
+/// cannot be named has `account: None`.
 pub struct Valued { pub api: Option<f64>, pub subscription: Option<f64>,
-    pub account: Option<AccountRef>, pub provider: Provider, pub api_currency: Option<String>,
+    pub account: Option<AccountRef>, pub company: Company, pub api_currency: Option<String>,
     pub api_missing: Option<Missing>, pub subscription_missing: Option<Missing> }
+pub(crate) fn openai_subscription_at(timelines: &HashMap<String, Timeline>,
+    stored: &BTreeSet<AccountRef>, host: &str, t: DateTime<Utc>)
+    -> Result<AccountRef, Missing>;
+pub(crate) fn ollama_subscription() -> AccountRef;   // acc and org both "ollama"
 
 pub struct Valuer { … }
 impl Valuer {
     /// Reads samples, windows and tokens of the range widened by 7 days, and every event over all
-    /// history (a record's account is the last Live/Switch at or before it; a window's price is
-    /// the last PriceChanged at or before its midpoint).
+    /// history (a Claude record's account is the last Live/Switch at or before it, an OpenAI
+    /// record's subscription the last providerSwitch; a window's price is the last PriceChanged at
+    /// or before its midpoint). It also takes the stored provider subscriptions.
     pub fn build(history: &HistoryDir, range: &Range, prices: &Prices, fx: &Fx,
                  settings: &Settings, accounts: &[Account],
+                 provider_subscriptions: &[ProviderSubscription],
                  warnings: &RefCell<Vec<String>>) -> Result<Valuer, MoneyError>;
     /// The price of the window from `start` to `end`: the account's price at its midpoint
     /// `start + (end − start) / 2`, through price_at. A window a reset shortened or began is
@@ -2400,14 +2546,16 @@ impl Valuer {
     pub(crate) fn window_price(&self, account: &AccountRef, start: DateTime<Utc>,
         end: DateTime<Utc>) -> Result<f64, Missing>;
     pub fn price_at(&self, account: &AccountRef, at: DateTime<Utc>) -> Result<f64, Missing>;
-    /// api = api_usd × rate of the record's day (USD, labelled, when there is no rate; None with
+    /// api = work_usd × rate of the record's day (USD, labelled, when there is no rate; None with
     /// its reason when the model has no price or no currency is set);
-    /// subscription = usd / the week's api_sum × the window's used money (at most what was paid)
-    /// at the window's price, a known 0 for a model outside the Claude plan (`is_plan_model`), and
-    /// None with its reason when the account or its price is missing, the week has no reading, an
-    /// unpriced plan model is in the week, or the week has no API value to split. A running
-    /// window's use is its latest reading's percent − `from` (`from` 0 when absent), never the
-    /// latest percent alone.
+    /// subscription = usd / the window's api_sum × the window's used money (at most what was paid)
+    /// at the window's price. A Claude record uses its weekly window; an OpenAI record its
+    /// subscription's `weekly_all` week; an Ollama record its `monthly_credits` month, whose used
+    /// money is `month_money(price, used)`. A record whose window has no reading, no price, an
+    /// unpriced model or no API value gives None with the reason (`NoWeekReading`,
+    /// `NoMonthReading`, `NoMonthlyAllowance`); a provider subscription without a price has no
+    /// subscription value while its API value stays. A running window's use is its latest reading's
+    /// percent − `from` (`from` 0 when absent), never the latest percent alone.
     pub fn value(&self, host: &str, record: &TokenRecord) -> Valued;
 }
 ```
@@ -2419,7 +2567,10 @@ so the oldest price counts for the past. A window's price is the last `PriceChan
 the window's midpoint; a stored price without an event uses `Account.price_currency` like an event's
 currency: it counts only while that currency is the settings' currency, and a price whose currency
 is `None` does not count (`Missing::PriceWithoutCurrency`). There are no own prices and no own rate
-any more (Removed): every price comes from models.dev, and every rate from Frankfurter.
+any more (Removed): every price comes from models.dev, and every rate from Frankfurter. An Ollama
+month starts one calendar month before its reset (`Months::new(1)`); a month that cannot be computed
+that far back is `MoneyError::MonthStart`, never 30 days. A stored provider subscription's price
+counts exactly like an account's, in the currency it was entered in.
 
 ## lookup_rt (step C1)
 
@@ -2697,7 +2848,8 @@ pub(crate) enum ExportFormat { Csv, Json }
 
 The gate for an agent: `window` is refused like `panel` (`AGENTS_MAY_NOT_CHANGE`); `prices` follows
 `agentsRead`, and `--refresh` is refused even with it on (it writes `prices.json`); `history export`
-follows `agentsRead`, `history import` is refused (`AGENTS_MAY_NOT_CHANGE`). `seatswap panel
+follows `agentsRead`, `history import` is refused (`AGENTS_MAY_NOT_CHANGE`); `codex list` follows
+`agentsRead` and `codex switch` follows `agentsSwitch`. `seatswap panel
 settings` sends `window settings` instead of a pop-up view.
 
 ## Files step C1 writes
@@ -3028,8 +3180,8 @@ an unknown last hour, never a sum over the rest; `Sum.last_hour_values` and `Sum
 not added; `agents_running` and `agents_done` add the row counts, and a total row with no agent data
 shows `—`. A model total row carries the `tied` bubble when its thinking is tied to the account.
 `switch_effect` counts only rows whose provider is `Claude Code` and whose model is absent or a plan
-model (`money::is_plan_model`, the id starts with `claude-`); Codex, Harness, flash and other models
-are left out.
+model (`money::is_plan_model`, the id starts with `claude-`); OpenAI, Ollama, Harness, flash and
+other models are left out.
 `LiveSession` carries `project_id: ProjectId` beside `project`: the post-join key groups two
 projects with the same name apart, while `project` is only the shown name.
 
@@ -3125,9 +3277,12 @@ pub struct Query { pub range: RangeKey, pub accounts: Vec<String>, pub host: Opt
 // write the short `ctx: &Ctx<Tz>` for space. `Ctx`'s zone defaults to `FixedOffset` for
 // the fixture; the app passes `chrono::Local`.
 pub struct Ctx<'a, Tz: TimeZone + Copy = FixedOffset> { pub history: &'a HistoryDir,
-    pub accounts: &'a [Account], pub settings: &'a Settings, pub prices: &'a Prices,
+    pub accounts: &'a [Account], pub provider_subscriptions: &'a [ProviderSubscription],
+    pub settings: &'a Settings, pub prices: &'a Prices,
     pub fx: &'a Fx, pub projects: &'a Projects,
     pub warnings: &'a RefCell<Vec<String>>, pub now: DateTime<Utc>, pub zone: Tz }
+// The provider subscriptions come from `accounts.json` and are inputs of every page: the
+// subscriptions page, This week's provider rows, the blocked hours and the Sessions values.
 
 /// ThisWeek: this week's Monday .. now. LastWeek: the Monday before .. this Monday.
 /// Days30/Days90/Months12: the Monday of the week holding now − 30/90/365 days .. now.
@@ -3163,6 +3318,25 @@ pub struct AccountWeek { pub week: DateTime<Utc>, pub account: AccountRef,
     pub price: Option<f64>, pub price_missing: Option<Missing> }
 pub fn account_weeks(ctx: &Ctx<Tz>, range: &Range, q: &Query)
     -> Result<Vec<AccountWeek>, StatsError>;
+pub struct MonthValued { pub start: DateTime<Utc>, pub end: DateTime<Utc>,
+    /// The share of the credits used: the newest reading's percent − the reading the month
+    /// began at.
+    pub used_percent: f64,
+    /// `used_percent / 100 × the month's price`; `None` without a price, never 0.
+    pub money: Option<f64>,
+    /// What the finished month left unused; `Some(0.0)` while it runs; `None` without a price.
+    pub expired: Option<f64> }
+/// The finished and running months of the Ollama subscription `account` overlapping `range`,
+/// oldest end first.
+pub fn subscription_months(ctx: &Ctx<Tz>, range: &Range, account: &AccountRef)
+    -> Result<Vec<MonthValued>, StatsError>;
+/// The working rhythm of one company in the range, learned from that company's records alone.
+pub(crate) fn working_rhythm(ctx: &Ctx<Tz>, range: &Range, company: Company)
+    -> Result<Rhythm, StatsError>;
+/// The spans one company was blocked in the range, inside that company's own working hours.
+pub fn blocked_spans(ctx: &Ctx<Tz>, range: &Range, q: &Query, company: Company)
+    -> Result<Vec<BlockedSpan>, StatsError>;
+
 pub(crate) fn account_weeks_valued(ctx: &Ctx<Tz>, range: &Range, q: &Query, valuer: &Valuer)
     -> Result<Vec<AccountWeek>, StatsError>;
 /// `account_weeks_valued` with the windows running at `ctx.now`, each placed by its midpoint.
@@ -3238,7 +3412,7 @@ The shared helpers, used by more than one page:
 | `week_columns` | Monday 00:00 local of the week holding `range.from`, then each following Monday 00:00 local while the start is before `range.to` |
 | `blocked_by_week`, `blocked_by_weekday` | spans split at every week start or local midnight; each part counts its working hours |
 | `week_of_record`, `output_by_account_week` | the account week whose window holds an instant; output tokens per `(account, calendar week)` for the records inside those windows |
-| `account_chosen` | empty `q.accounts` = every account; otherwise only a named account; a record without a known account is never chosen by a filter |
+| `account_chosen` | empty `q.accounts` = every account and provider subscription; otherwise only a named one; a Claude record without a known account is never chosen by a filter |
 | `stored_account`, `account_id`, `account_abbr`, `account_position` | the stored account behind a reference or its id/abbr when it is no longer stored; the store's order, removed accounts last |
 | `top_three` | the three largest `(name, value)` by value, ties by name, then `("other", rest)` only when a rest is left |
 | `money_text`, `hours_text`, `percent_text`, `thousands`, `join_names`, `date_text` | the pages' exact formats; `money_text` matches `ui/common.js`'s `money` |
@@ -3254,18 +3428,23 @@ taking a `Range` for their tests; each produces one serde camelCase struct:
 pub struct Overview { pub without_price: Vec<String>,
     pub kpis: Kpis, pub weeks: Vec<OverviewWeek>, pub marks: Vec<Mark>, pub findings: Vec<String> }
 /// One entry per chosen account with a running weekly window (`running_account_weeks`), stored
-/// accounts' order then others by id; one per other provider with records this calendar week, in
-/// `Provider` order; `projects` is the API-value split of all listed accounts and providers
-/// together (`api_shares`).
+/// accounts' order then others by id; one per other provider subscription with records this
+/// calendar week, `Company` order then stored order; `projects` is the API-value split of all
+/// listed accounts and providers together (`api_shares`).
 pub struct ThisWeek { pub accounts: Vec<ThisWeekAccount>, pub providers: Vec<ThisWeekProvider>,
     pub projects: Vec<(String, f64)> }
-/// A Codex or Ollama row: its records of `[week_start(now), now]`, host filter applied, account
-/// chips ignored, summed with `Values::of` / `Values::sum`. `api` is `None` with `api_missing` when
-/// a record has no price; `api_currency` is the sum's (the settings' currency, "USD" without a
-/// rate). `projects` is `api_shares` of the provider's records.
-pub struct ThisWeekProvider { pub name: String, pub api: Option<f64>,
+/// A provider subscription's row: its records of `[week_start(now), now]` (Ollama: its current
+/// month), host filter applied, account chips ignored, summed with `Values::of` / `Values::sum`.
+/// `api` is `None` with `api_missing` when a record has no price; `api_currency` is the sum's (the
+/// settings' currency, "USD" without a rate). `projects` is `api_shares` of its records; `used` is
+/// its window's use (`None` with `resets_at` absent for a finished month), `money` the
+/// subscription value with `money_missing` its reason.
+/// `name` is the subscription's abbr.
+pub struct ThisWeekProvider { pub name: String, pub company: Company, pub api: Option<f64>,
     pub api_currency: Option<String>, pub api_missing: Option<String>,
-    pub projects: Vec<(String, f64)> }
+    pub projects: Vec<(String, f64)>, pub used: Option<f64>,
+    pub money: Option<f64>, pub money_missing: Option<String>,
+    pub resets_at: Option<DateTime<Utc>> }
 pub struct ThisWeekAccount { pub id: String,
     /// Use so far, `final − from` (`window_used`); `now` is the newest reading's percent.
     pub used: f64, pub now: f64,
@@ -3280,11 +3459,15 @@ pub struct Kpis { pub used: f64, pub paid: f64, pub expired: f64,
     /// offers one week of its account's price, so a reset week offers two. A window above 100 %
     /// counts its whole use, so the two shares can pass 100 % together; nothing is cut.
     pub used_percent: Option<f64>, pub expired_percent: Option<f64>,
-    pub expired_by_account: Vec<(String, f64)>, pub blocked_hours: f64,
+    pub expired_by_account: Vec<(String, f64)>,
+    /// One entry per company with working hours in the range, Anthropic first: a provider's
+    /// blocked hours are not Anthropic's and are never added into them.
+    pub blocked_by_company: Vec<BlockedByCompany>,
     pub blocked_before_added: Option<BlockedBefore>,
     pub avoidable_hours: f64, pub switches: SwitchCounts, pub switches_total: u32,
     pub switch_cost_percent_of_window: Option<f64>, pub weeks: u32 }
 pub struct BlockedBefore { pub name: String, pub hours: f64 }
+pub struct BlockedByCompany { pub company: Company, pub hours: f64 }
 pub struct OverviewWeek { pub week: DateTime<Utc>, pub accounts: Vec<WeekAccount>,
     pub projects: Vec<(String, f64)>, pub blocked_hours: f64, pub expired_share: Option<f64> }
 pub struct WeekAccount { pub id: String, pub used_percent: f64, pub used: Option<f64>,
@@ -3347,8 +3530,8 @@ pub struct Node { pub kind: NodeKind, pub level: u8, pub name: String,
     pub key: Option<ProjectKey>, pub org_accounts: Vec<String>, pub tokens: Tokens,
     pub share: f64, pub subscription: Option<f64>, pub api: Option<f64>,
     /// Claude accounts only (`None`: a Claude record without a known account); `by_provider`
-    /// is each other provider's share by `Provider::name`, largest first. Together they make up
-    /// the node's API value.
+    /// is each company's share by `Company::name`, largest first. Together they make up the
+    /// node's API value.
     pub by_account: Vec<(Option<String>, f64)>, pub by_provider: Vec<(String, f64)>,
     pub sessions: u32 }
 pub struct ProjectsPage { pub nodes: Vec<Node>, pub matrix: Matrix,
@@ -3363,32 +3546,93 @@ pub fn projects_page(ctx: &Ctx<Tz>, q: &Query) -> Result<ProjectsPage, StatsErro
 pub fn project_detail(ctx: &Ctx<Tz>, q: &Query, key: &ProjectKey)
     -> Result<ProjectDetail, StatsError>;
 
-// subscriptions.rs
+// plans.rs (the Subscriptions page, R6 of 1.3)
+pub struct SubscriptionsPage { pub totals: Totals, pub plans: Vec<PlanRow>, pub sizes: Sizes,
+    pub usage: Vec<UsageGroup>, #[serde(rename = "usageTotal")] pub usage_total: UsageRow,
+    #[serde(rename = "perPercent")] pub per_percent: Vec<PerPercent>,
+    #[serde(rename = "tokensWeek")] pub tokens_week: TokensWeek,
+    pub currency: Option<String> }
+/// A sum with a missing part is None, never 0 (M-2 decision 9).
+pub struct Totals { pub count: u32, pub price_month: Option<f64>, pub api_month: Option<f64>,
+    pub times_paid: Option<f64>, pub tokens_used_month: Option<f64>, pub weeks: u32,
+    pub partial: Vec<Partial> }
+pub struct Partial { pub id: String, pub weeks: u32 }
+pub struct PlanRow { pub id: String, pub company: Company, pub plan: Option<String>,
+    pub models: Vec<PlanModel>, pub trend: Option<Change>, pub basis_hours: Option<f64>,
+    pub thin: bool,
+    /// Why the row has no models, no basis and no cells; None when it has them.
+    pub missing: Option<String> }
+pub struct PlanModel { pub model: String, pub hours: Option<f64> }
+/// Against the most measured Anthropic plan; `reference` is None when none is measured.
+pub struct Sizes { pub reference: Option<String>, pub rows: Vec<SizeRow> }
+pub struct SizeRow { pub id: String, pub plan: Option<String>,
+    pub of_reference: Option<f64>, pub low: Option<f64>, pub high: Option<f64>,
+    /// The ratio its name gives; None when either name has no capacity or no reference.
+    pub by_name: Option<f64>, pub measured: bool }
+pub struct UsageGroup { pub company: Company, pub count: u32,
+    pub price_month: Option<f64>, pub rows: Vec<UsageRow> }
+pub struct UsageRow { pub id: String, pub plan: Option<String>, pub since: Option<DateTime<Utc>>,
+    pub price_month: Option<f64>, pub entered: Option<EnteredPrice>,
+    pub used_percent: Option<f64>, pub expired: Option<f64>, pub api: Option<f64>,
+    pub times_paid: Option<f64>, pub missing: Option<String> }
+/// A stored price entered in a currency other than the display currency.
+pub struct EnteredPrice { pub amount: f64, pub currency: Option<String> }
+pub struct PerPercent { pub id: String, pub limit: String, pub model: String,
+    pub points: Vec<Point>, pub change: Option<Change>, pub now: Vec<Now>,
+    pub window_holds_minutes: Option<f64> }
+pub struct Point { pub week: DateTime<Utc>, pub tokens: f64, pub low: f64,
+    pub high: Option<f64> }
+pub struct Now { pub model: String, pub tokens: f64, pub minutes: Option<f64> }
+pub struct Change { pub model: String, pub since: DateTime<Utc>, pub percent: f64,
+    pub before: f64, pub after: f64 }
+pub struct TokensWeek { pub models: Vec<TokenModel>, pub rows: Vec<TokensWeekRow> }
+pub struct TokenModel { pub model: String, pub company: Company }
+pub struct TokensWeekRow { pub id: String, pub cells: Vec<Option<TokensWeekCell>>,
+    pub missing: Option<String> }
+pub struct TokensWeekCell { pub tokens: f64, pub low: f64, pub high: Option<f64>,
+    pub estimated: bool, pub thin: bool }
+const THIN_SHARE: f64 = 0.2;          // a thin figure: half its range over 20 % of its value
+const POINTS_BEFORE_CHANGE: usize = 8; // the weeks before a change that set its range
+const NO_FACTOR_REASON: &str = "not measured yet: no pair with priced work in this range";
+const NO_PRICED_MODEL_REASON: &str = "no priced model it ran in this range";
+pub fn subscriptions_page(ctx: &Ctx<Tz>, q: &Query) -> Result<SubscriptionsPage, StatsError>;
+pub(crate) fn subscriptions_in(ctx: &Ctx<Tz>, range: &Range, q: &Query)
+    -> Result<SubscriptionsPage, StatsError>;
+
+/// A stored price typed close to a plan change belongs to the new plan (documented rule).
+pub const PRICE_BEFORE_PLAN_MIN: i64 = 15;
+pub const NO_FINISHED_WEEK: &str = "no finished week yet in this range";
+pub const NO_FINISHED_MONTH: &str = "no finished month yet in this range";
 pub struct Period { pub id: String, pub plan: Option<String>, pub price: Option<f64>,
     pub from: DateTime<Utc>, pub to: Option<DateTime<Utc>> }
-pub enum Verdict { MostlyUnused, RegularlyFull, WellUsed, TooEarly }
-pub struct SubRow { pub id: String, pub plan: Option<String>, pub price: Option<f64>,
-    pub since: DateTime<Utc>, pub weeks: u32, pub avg_used: Option<f64>,
-    pub expired_percent: Option<f64>, pub expired: Option<f64>, pub full_weeks: u32,
-    pub blocked_hours_on_it: f64, pub api_value: Option<f64>, pub times_paid: Option<f64>,
-    pub verdict: Verdict, pub tokens_per_percent: Vec<(DateTime<Utc>, f64)> }
-pub struct SubscriptionsPage { pub periods: Vec<Period>, pub rows: Vec<SubRow>,
-    pub without_price: Vec<String> }
-pub struct WhatIf { pub without: String, pub blocked_hours: Option<f64>,
-    pub blocked_hours_was: f64, pub expired: Option<f64>, pub expired_was: Option<f64>,
-    pub saved_price: Option<f64>, pub sentence: String,
-    pub weekly: Vec<(DateTime<Utc>, f64, f64)> }
-pub fn subscriptions(ctx: &Ctx<Tz>, q: &Query) -> Result<SubscriptionsPage, StatsError>;
-pub fn what_if(ctx: &Ctx<Tz>, q: &Query, without: &str) -> Result<WhatIf, StatsError>;
+pub(crate) struct HistoryReads<'a> { pub events: &'a [Hosted<Event>],
+    pub samples: &'a [Hosted<Sample>], pub windows: &'a [Hosted<WindowRecord>] }
+pub(crate) fn periods_for_chosen_from(ctx: &Ctx<Tz>, q: &Query, valuer: &Valuer,
+    reads: HistoryReads<'_>) -> Result<BTreeMap<AccountRef, Vec<Period>>, StatsError>;
+pub(crate) fn removed_periods(ctx: &Ctx<Tz>, range: &Range, q: &Query, valuer: &Valuer,
+    reads: HistoryReads<'_>) -> Result<BTreeMap<AccountRef, Vec<Period>>, StatsError>;
+#[cfg(test)] pub(crate) fn periods_for_chosen(ctx: &Ctx<Tz>, q: &Query, valuer: &Valuer)
+    -> Result<BTreeMap<AccountRef, Vec<Period>>, StatsError>;
+pub(crate) struct UsageInput<'a> { pub id: String, pub plan: Option<String>,
+    pub since: Option<DateTime<Utc>>, pub price: Option<f64>, pub price_missing: Option<String>,
+    pub stored_price: Option<(f64, Option<String>)>, pub currency: Option<&'a str>,
+    pub weeks: &'a [&'a AccountWeek], pub months: &'a [MonthValued], pub values: Values,
+    pub ollama: bool, pub now: DateTime<Utc>, pub finished_periods: u32 }
+pub(crate) fn usage_row(input: UsageInput<'_>)
+    -> Result<(UsageRow, Option<f64>), StatsError>;
 
 // forecast.rs
-pub struct Forecast { pub basis_weeks: u32, pub learning: Vec<String>,
+// forecast.rs
+pub struct Forecast { pub basis_weeks: u32,
+    /// The accounts auto-burn may use whose week factor exists but is not measured (assumed
+    /// from the plan), and those with no factor yet, in account order.
+    pub assumed: Vec<String>, pub unknown: Vec<String>,
     pub kpis: ForecastKpis, pub accounts: Vec<ForecastAccount>, pub lanes: Vec<Lane>,
     pub blocked: Vec<(DateTime<Utc>, DateTime<Utc>)>, pub from: DateTime<Utc>,
     pub to: DateTime<Utc>, pub sentence: String }
 pub struct ForecastKpis { pub expire_planned: Option<f64>,
     pub expire_only_when_full: Option<f64>, pub blocked_hours: f64, pub switches: u32,
-    pub switches_only_when_full: u32 }
+    pub switches_per_day: f64, pub switches_only_when_full: u32 }
 pub struct ForecastAccount { pub id: String, pub now: f64, pub expected: Option<f64>,
     pub low: Option<f64>, pub full_at: Option<DateTime<Utc>>, pub resets_at: DateTime<Utc>,
     pub only_when_full_expected: Option<f64>, pub only_when_full_expires: Option<f64> }
@@ -3443,13 +3687,15 @@ Page details that are easy to miss:
   Overview's `Valuer` covers only the range. The card's project split reads the token records of `[min(earliest running start, this week's
   Monday), now]`, keeps the query's host, values each with `Valuer::value` and `Values::of` as the
   Weeks summary does, and shares them with `api_shares`: a Claude record in its account's running
-  window, a Codex or Ollama record (`Valued.provider`) from `week_start(now)` on in its provider's
-  `ThisWeekProvider`.
+  window, an OpenAI or Ollama record (`Valued.company`) from `week_start(now)` on in its provider
+  subscription's `ThisWeekProvider`, with its own `used`, `money`, `money_missing` and
+  `resets_at`.
 - Pages of project work (Projects, project detail, Weeks summary, Activity) choose a record with
-  `stats::record_chosen(ctx, q, &Valued)`: a Claude record by `account_chosen`, another provider's
-  always. Pages about a Claude account's week (Subscriptions, tokens per percent, the matrix, the
-  Overview's weekly project chart) need `Valued.account` and so leave other providers out.
-  `burn::rates::rhythm` and `work_in` (rates, switch cost) count `is_plan_model` records only.
+  `stats::record_chosen(ctx, q, &Valued)`: a Claude record by `account_chosen`, a provider record by
+  its subscription. Pages about a subscription's own window (the Subscriptions page, tokens per
+  percent, the matrix, the Overview's weekly project chart) need `Valued.account` and so leave a
+  record whose subscription cannot be named out. `burn::rates::rhythm` and `work_in` (rates, switch
+  cost) count Anthropic records only.
 - `WeeksRow.cells` is one entry per `week_starts`; `None` means no finished window that week.
   A cell's `used` is the sum of its `parts`, one per window of the account week; a reset week has
   two parts and the page draws one bar with both. `WeeksPage.running` has one flag per column:
@@ -3467,17 +3713,11 @@ Page details that are easy to miss:
   weeks total 0 %, is left out. `notes` always carries the "use that leaves no transcript" text and
   adds the unknown-account and no-subscription-value sentences when they have counts, and
   `{providers} work is valued at API prices only; it uses no Claude account.` when the page has
-  Codex or Ollama records. `unknown_account_tokens` counts Claude records only.
+  OpenAI or Ollama records. `unknown_account_tokens` counts Claude records only.
   `project_detail` filters by `q.host`, so a folder key's detail counts every host's folder of that
   name only with all hosts chosen.
 - `subscriptions`' `since` is the first period of the whole history, not of the range; `plan` and
-  `price` are the latest visible period's. `WhatIf` replays each calendar week with `Policy::Lazy`;
-  the week's extra blocked work is converted with `wu_hours` and the recorded hours are the floor.
-  `expired = expired_was + replay_without − replay_with`, each replay's expired money priced at the
-  range's end; an account with a reading in the range but no learned rate returns the
-  "Not enough history" sentence with `blocked_hours`, `expired` and `weekly` empty/`None`, and a
-  reading from an account no longer stored returns `{abbr} is no longer stored, so this range
-  cannot be replayed.`
+  `price` are the latest visible period's.
 - `forecast` uses `regime.early` to choose the planned policy (`Eager`/`Lazy`), always computes the
   lazy plan, takes `HORIZON_H = 168` hours from `inputs.now`, reads the last eight finished windows
   and the samples that name their resets, and returns an error if a plan account is not stored.
@@ -3501,7 +3741,8 @@ Page details that are easy to miss:
 
 ```rust
 pub(crate) enum Page<T> { Empty(Empty), Data(T) }        // serde: {"empty":{…}} | {"data":{…}}
-pub(crate) struct StatsParts { accounts: Vec<Account>, settings: Settings, prices: Prices,
+pub(crate) struct StatsParts { accounts: Vec<Account>,
+    provider_subscriptions: Vec<ProviderSubscription>, settings: Settings, prices: Prices,
     fx: Fx, projects: projects::Projects }
 impl StatsParts {
     pub(crate) fn ctx<'a, Tz: TimeZone + Copy>(&'a self, history: &'a HistoryDir,
@@ -3516,7 +3757,7 @@ fn stats_page<T, Tz: TimeZone + Copy>(parts: &StatsParts, history: &HistoryDir,
     -> Result<Page<T>, String>;
 ```
 
-`stats_ctx_parts` loads `accounts.json`, the prices and the dollar rate through the one
+`stats_ctx_parts` loads `accounts.json` (with its provider subscriptions), the prices and the dollar rate through the one
 `load_prices_and_fx` that `sessions_rt::build_pricing` also uses, and the project log. Every history read of a statistics page goes through
 `history::keep_warnings`, which adds the read's warnings to `Ctx::warnings` (`StatsParts` holds the
 `RefCell`, seeded with the projects' warnings); after the command the app prints the new ones
@@ -3549,9 +3790,7 @@ pub(crate) fn stats_projects_at<Tz: TimeZone + Copy>(parts, history, now, zone, 
 pub(crate) fn stats_project_detail_at<Tz: TimeZone + Copy>(parts, history, now, zone, query,
     key: &ProjectKey) -> Result<Page<stats_projects::ProjectDetail>, String>;
 pub(crate) fn stats_subscriptions_at<Tz: TimeZone + Copy>(parts, history, now, zone, query)
-    -> Result<Page<subscriptions::SubscriptionsPage>, String>;
-pub(crate) fn stats_what_if_at<Tz: TimeZone + Copy>(parts, history, now, zone, query, without: &str)
-    -> Result<Page<subscriptions::WhatIf>, String>;
+    -> Result<Page<plans::SubscriptionsPage>, String>;
 pub(crate) fn stats_forecast_at<Tz: TimeZone + Copy>(parts, history, now, zone,
     kept: Option<KeptForecast>, no_plan: String) -> Result<Page<forecast::Forecast>, String>;
 // no_plan = no_plan_text(burn, views): NO_PLAN, plus `: {abbrs} has/have none yet; it comes/they
@@ -3585,7 +3824,7 @@ It clones the app paths and the history handle, and inside `spawn_blocking` load
 takes `Utc::now()` and `Local`, the computer's time zone, and runs the page's function. The files are thus
 read on the blocking thread, not on the async one. The async commands `stats_overview`,
 `stats_this_week`, `stats_weeks`, `stats_week_summary`, `stats_window_detail`, `stats_projects`,
-`stats_project_detail`, `stats_subscriptions`, `stats_what_if`, `stats_forecast`, `stats_rhythm`,
+`stats_project_detail`, `stats_subscriptions`, `stats_forecast`, `stats_rhythm`,
 `stats_activity` and `stats_frame` are registered in `gui/mod.rs`'s handler list; `stats_forecast`
 reads the kept `(Inputs, Regime)` from `GuiState` before it enters the helper; `stats_frame` needs
 only `state.history`.
@@ -3764,8 +4003,9 @@ of their own:
 - **Projects** draws the tree (By organization · Plain folder tree, rows open and close), the
   organization × account matrix and its sentences, the project detail and the notes; it opens the
   first project's detail.
-- **Subscriptions** draws the period bars, the row table and, for the chosen row, "What if without
-  it" with the blocked hours per week and the tokens-per-percent line; it opens the first row.
+- **Subscriptions** draws the totals line and the four cards in their order: *What does each plan
+  give me?*, *Am I using what I pay for?*, *What 1 % of a limit buys, over the weeks* and *Tokens a
+  week, per subscription and model*. There is no what-if replay and no row's period bars any more.
 - **Forecast** draws the four numbers, the sentence, the per-account rows and the seven-day lanes.
   It shows `the forecast needs a reading of every account first` as a plain line, every other
   failure as the area's banner.
@@ -4212,31 +4452,36 @@ the app's renderer.
 
 ---
 
-## Step D: Codex and Ollama cards
+## Step D: OpenAI (Codex) and Ollama cards
 
-Two read-only providers. One reader per provider turns the provider's answer into the `Usage` and
-`Limit` types an account already uses, so a card, its colours and the history need no second
-implementation. A provider thread in the tray app polls each switched-on card; nothing of Codex or
-Ollama is ever written, no token is refreshed and no request generates text.
+Two more companies. One reader per company turns the answer into the `Usage` and `Limit` types an
+account already uses, so a card, its colours and the history need no second implementation. A
+provider thread in the tray app polls each switched-on card and every provider subscription with a
+price. It reads Codex's `auth.json` at every poll, saves the live login in the secrets store and
+writes `auth.json` only when switching between saved logins; a saved inactive login may renew itself.
+No request generates text.
 
 | Module | Job |
 |---|---|
 | `core::paths` (extended) | `CodexPaths`: the Codex folder and its `auth.json` |
 | `core::store` (extended) | the four settings and `validate_ollama_url` |
-| `core::providers` | one reader per provider into `ProviderReading` |
-| `core::api` (extended) | Codex's usage and Ollama's balance and usage; `NoConnection` |
+| `core::providers` | one reader per company into `ProviderReading`; Codex's saved logins, renewal and switch |
+| `core::api` (extended) | Codex's usage and token renewal, Ollama's balance and usage; `NoConnection` |
 | `core::history` (extended) | `is_claude`, `read_claude`, `finished_claude_windows`: provider records out of every Claude reader |
-| `app::gui::providers_rt` | the provider thread, its client and the snapshot's `providers` |
-| `app::ui/panel.js` | the pop-up's card under "Other providers" |
-| `app::ui/areas/settings.js` | the Providers group |
+| `app::gui::providers_rt` | the provider thread, its client, the snapshot's `providers` and `codexLogins` |
+| `app::ops` | `ensure_provider_subscription`, `switch_codex` |
+| `app::ui/panel.js` | the pop-up's cards and the saved-login switch |
+| `app::ui/areas/settings.js` | the Providers group and the Accounts subscription rows |
 
 ## paths.rs additions — `CodexPaths` (step D)
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexPaths {
-    pub home: PathBuf,      // the Codex folder; seatswap only reads here
-    pub auth_file: PathBuf, // <home>/auth.json
+    pub home: PathBuf,          // the Codex folder; seatswap writes only auth.json, only on a switch
+    pub auth_file: PathBuf,     // <home>/auth.json
+    pub auth_lock: PathBuf,     // <home>/auth.lock: Codex's first write lock
+    pub auth_json_lock: PathBuf, // <home>/auth.json.lock: taken after auth_lock
 }
 impl CodexPaths {
     pub fn resolve(explicit: Option<&Path>) -> Result<CodexPaths, PathsError>;
@@ -4296,7 +4541,7 @@ user-info text is fixed (`ollamaUrl must not contain a user name or password`) b
 hold a password. There is no fallback. `providers::ollama::read` calls the same function again before
 it asks the server.
 
-## providers — the one reading type and its errors (step D)
+## providers — the one reading type and its errors (step D, 1.3)
 
 ```rust
 pub const CODEX_ORG: &str = "codex";
@@ -4306,92 +4551,109 @@ pub const OLLAMA_ORG: &str = "ollama";
 pub enum ProviderError {
     #[error("No Codex login found in {path}. If Codex keeps its login in the system keyring, seatswap cannot read it.")]
     NoLogin { path: PathBuf },
-    #[error("Codex keeps its login in the system keyring. seatswap reads the login file only.")]
+    #[error("Codex keeps its login in the system keyring. To switch Codex logins, set cli_auth_credentials_store = \"file\" in Codex's config.toml and sign in again.")]
     KeyringLogin,
+    #[error("Codex is signed in with an API key. An API key is no subscription; seatswap neither saves nor switches it.")]
+    ApiKeyLogin,
+    #[error("No saved Codex login for {acc}. Sign in with codex login once while seatswap runs.")]
+    NotSaved { acc: String },
+    #[error("{0}")] RenewFailed(String),       // "Sign in again with codex login."
+    #[error(transparent)] Lock(#[from] LockError),
+    #[error("the Codex login store: {0}")] Store(#[from] crate::store::StoreError),
     #[error("Codex's login has expired. Run codex once to renew it.")]
     LoginExpired,
     #[error("Ollama is not running on {url}.")]
     NotRunning { url: String },
     #[error("Ollama on {url} refused the request (HTTP {status}). Is it signed in?")]
     OllamaRefused { url: String, status: u16 },
-    #[error("{0}")]
-    Setting(String),
-    #[error(transparent)]
-    Api(ApiError),
-    #[error("Unexpected answer: {0}")]
-    Shape(String),
-    #[error("cannot read {path}: {source}")]
-    Io { path: PathBuf, #[source] source: io::Error },
+    #[error("{0}")] Setting(String),
+    #[error(transparent)] Api(ApiError),
+    #[error("Unexpected answer: {0}")] Shape(String),
+    #[error("cannot read {path}: {source}")] Io { path: PathBuf, #[source] source: io::Error },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Credits {
-    pub left: f64,                 // USD
-    pub allowance: Option<f64>,   // USD
-    pub until: Option<DateTime<Utc>>,
-    pub purchased: Option<f64>,   // USD, only when the answer names it
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ProviderReading {
-    pub account: AccountRef,      // org CODEX_ORG or OLLAMA_ORG
-    pub plan: Option<String>,
-    pub usage: Option<Usage>,     // None when the answer has no limit to record
-    pub credits: Option<Credits>, // Ollama's new plan only
-    /// None for Codex; for Ollama the 24 h spend, `Err` when its own request or
-    /// answer could not be read (the balance is still in the reading).
+pub struct Credits { pub left: f64, pub allowance: Option<f64>,
+    pub until: Option<DateTime<Utc>>, pub purchased: Option<f64> }
+pub struct ProviderReading { pub account: AccountRef, pub plan: Option<String>,
+    pub usage: Option<Usage>, pub credits: Option<Credits>,
     pub spend_24h: Option<Result<f64, String>>,
-    /// Ollama's hourly buckets of the same usage answer: `None` for Codex,
-    /// `Some(Err)` when the buckets could not be read (the balance and the 24 h
-    /// spend are still in the reading). Their lines go to `Kind::Ollama`.
-    pub hours: Option<Result<Vec<OllamaHourRecord>, String>>,
-}
+    pub hours: Option<Result<Vec<OllamaHourRecord>, String>> }
 ```
 
 `api::mark_highest_active` (in the api.rs section below) sets `is_active` on exactly one limit: the
 one with the highest percent, the first of equals. `ProviderError::Setting` carries the text of the
 setting or path that refused the reading; it is not a second setting error. The `Api` variant is
-transparent, so the card prints the API error's own text.
+transparent, so the card prints the API error's own text. The keyring and API-key sentences are
+exact: the card shows them as its error, and neither login is saved or switched.
 
-## codex — `auth.json` and the usage answer (step D)
+## codex — `auth.json`, its saved logins and the usage answer (step D, 1.3 R8)
 
 ```rust
+pub const CODEX_LOCK_TIMEOUT_SECS: u64 = 10;      // Codex's two locks together
+const CODEX_ISSUER: &str = "https://auth.openai.com"; // the only issuer a saved login is renewed at
+const SIGN_IN_AGAIN: &str = "Sign in again with codex login.";
+
+pub fn secret_id(account: &AccountRef) -> String; // first 32 hex of SHA-256 of "codex:<acc>"
+pub struct LiveCodex { pub account: AccountRef, pub saved: bool }
+pub fn sync_live(app: &AppPaths, paths: &CodexPaths, secrets: &dyn SecretStore)
+    -> Result<LiveCodex, ProviderError>;
 pub fn read(paths: &CodexPaths, api: &Api) -> Result<ProviderReading, ProviderError>;
+pub fn live_account(paths: &CodexPaths) -> Result<Option<AccountRef>, ProviderError>;
+pub fn read_saved(app: &AppPaths, secrets: &dyn SecretStore, account: &AccountRef, api: &Api)
+    -> Result<ProviderReading, ProviderError>;
+pub fn forget(app: &AppPaths, secrets: &dyn SecretStore, account: &AccountRef)
+    -> Result<(), ProviderError>;
+pub struct CodexSwitched { pub from: Option<AccountRef>, pub to: AccountRef }
+pub fn switch_to(app: &AppPaths, paths: &CodexPaths, secrets: &dyn SecretStore,
+                 to: &AccountRef) -> Result<CodexSwitched, ProviderError>;
 pub fn usage_from(answer: &Value) -> Result<(Usage, Option<String>, AccountRef), ProviderError>;
 fn window_kind(seconds: i64, additional: bool) -> LimitKind;
 fn plan_type(value: Option<&Value>) -> Result<Option<String>, ProviderError>;
 ```
 
-`read` reads `paths.auth_file` once. A missing file is `NoLogin`, whose text also says that a login
-kept in the system keyring cannot be read. A file that is not JSON, or whose `tokens` is not an
-object, is `Shape` with a sentence that never quotes a token. `tokens` absent or `null` with
-`auth_mode == "chatgpt"` is `KeyringLogin`; otherwise `NoLogin`. `tokens.access_token` and
+`read` reads `paths.auth_file` once and never writes it. A missing file is `NoLogin`; a file that
+is not a JSON object, or whose `tokens` is not an object, is `Shape` with a sentence that never
+quotes a token. `tokens` absent or `null` with `auth_mode == "chatgpt"` is `KeyringLogin`, with
+`auth_mode == "apikey"` is `ApiKeyLogin`, otherwise `NoLogin`. `tokens.access_token` and
 `tokens.account_id` must be non-empty strings (`Shape` with the field's name only). It then calls
 `api.codex_usage(access_token, account_id)`; HTTP 401 is `LoginExpired`, every other API error stays
-`Api`. The request carries both values; the file is not changed.
+`Api`. The live login is Codex's own; seatswap never renews it.
 
-`usage_from` reads `rate_limit.primary_window` and `.secondary_window` as the account's limits:
-`used_percent` is the percent, `limit_window_seconds` picks the kind, `reset_at` (seconds since the
-epoch) is the reset when present; absent or `null` is no reset. `rate_limit` missing is a shape error;
-`null` carries no limits; either window may be absent or `null`. `additional_rate_limits` may be
-absent, `null` or an array; an entry's `rate_limit` may be `null` (skipped), and its `limit_name` is
-required and becomes the limit's `model`. `window_kind` is the one mapping:
+`sync_live` takes seatswap's app lock, reads the live file and saves its whole object under
+`secret_id`, when there is no copy or its `tokens` differ, so a login Codex renewed or the user just
+signed in with is saved at the next poll and an unchanged poll writes nothing. A live ChatGPT login
+is saved only with non-empty `account_id`, `access_token` and `refresh_token`; otherwise `Shape`
+names the first missing field and the copy stays. `live_account` is the one read-only way to know
+which saved login is live (`codex list`, and the guard against removing the live copy).
 
-| `limit_window_seconds` | additional entry | Kind |
-|---|---|---|
-| 18000 | no | `Session` |
-| 604800 | no | `WeeklyAll` |
-| 604800 | yes | `WeeklyScoped` |
-| a multiple of 3600 | either | `Other("{h}h limit")` |
-| a multiple of 60 | either | `Other("{m}min limit")` |
-| anything else | either | `Other("{s}s limit")` |
+`read_saved` asks the stored copy's usage. A 401 renews it once at `CODEX_TOKEN_URL`, its own
+issuer only (`api.codex_refresh`, through the no-redirect agent), then asks again; a failed renewal
+or a second 401 is `RenewFailed(SIGN_IN_AGAIN)`, and the copy stays, so `codex login` is the next
+step. A successful renewal is written under the app lock, which re-reads the copy first: it replaces
+the copy only when the copy still holds the tokens the renewal started from
+(`CodexLogin::same_tokens`), and the second ask uses the newer copy. There is no second renewal. A
+login whose stored `tokens.oauth_provenance.issuer` is not `CODEX_ISSUER` is not renewed at all (`RenewFailed`, same sentence:
+`Sign in again with codex login.`). `forget` deletes the stored copy under the app lock; Codex's
+`auth.json` is not touched, so a live login keeps working and a missing copy is not an error.
 
-Every limit's `severity` is `Normal`; the load level comes from the percent. The account is the
-answer's non-empty `account_id` with `org` `codex`; `plan_type` is `None` when absent, `null` or the
-empty string, otherwise a string with its first character uppercased, and a shape error for any other
-type. `api::mark_highest_active` runs last. `ProviderReading.credits` stays `None`, and `spend_24h` and
-`hours` are `None` for Codex.
+`switch_to` writes `auth.json` from the stored copy of `to`, and writes nothing when the live login
+already is `to` (`from == Some(to)`). Locks are taken in this order: seatswap's app lock
+(`APP_LOCK_TIMEOUT`), Codex's `auth.lock`, `auth.json.lock`, the last two within one
+`CODEX_LOCK_TIMEOUT_SECS` deadline; a busy lock is `Lock` naming the file. Only after all locks does
+it read the target copy, then reads and saves the live login first (so a login seatswap cannot save
+stops the switch, never overwrites it), then writes the stored object whole, key order included and
+mode 0600, atomic. A missing `auth.json` is no `from`. It writes no history; the caller records
+`ProviderSwitch`.
+
+`usage_from` reads `rate_limit.primary_window` and `.secondary_window`: `used_percent` is the
+percent, `limit_window_seconds` picks the kind, `reset_at` is the reset when present. An entry of
+`additional_rate_limits` has its own `rate_limit` (a `null` one skipped) and a required
+`limit_name` that becomes the limit's `model`. `window_kind` is the one mapping: 18000 no → `Session`,
+604800 no → `WeeklyAll`, 604800 yes → `WeeklyScoped`, a multiple of 3600 → `Other("{h}h limit")`, a
+multiple of 60 → `Other("{m}min limit")`, else `Other("{s}s limit")`. `plan_type` is `None` when
+absent, `null` or the empty string, otherwise its first character is uppercased; any other type is a
+shape error. Every limit's `severity` is `Normal`; `api::mark_highest_active` runs last. Codex leaves
+`credits`, `spend_24h` and `hours` `None`.
 
 ## ollama — the balance and the last 24 h (step D)
 
@@ -4448,9 +4710,16 @@ text too. The account is `AccountRef { acc: "ollama", org: "ollama" }`, the plan
 
 ```rust
 pub const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+pub const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 impl Api {
     pub fn with_codex_url(mut self, url: &str) -> Api;                                  // tests
+    pub fn with_codex_token_url(mut self, url: &str) -> Api;                           // tests
     pub fn codex_usage(&self, access_token: &str, account_id: &str)
+        -> Result<serde_json::Value, ApiError>;
+    /// POST CODEX_TOKEN_URL with `grant_type=refresh_token`, the client id and the copy's
+    /// refresh token; the no-redirect agent keeps it at Codex's issuer. A 401 or 400 is the
+    /// caller's to map; no token enters an error text.
+    pub fn codex_refresh(&self, client_id: &str, refresh_token: &str)
         -> Result<serde_json::Value, ApiError>;
     pub fn ollama_balance(&self, base_url: &str) -> Result<serde_json::Value, ApiError>;
     pub fn ollama_usage_24h(&self, base_url: &str) -> Result<serde_json::Value, ApiError>;
@@ -4476,7 +4745,9 @@ pub enum ApiError {
 
 `codex_usage` sends `GET CODEX_USAGE_URL` with `User-Agent: seatswap/<version>`,
 `Authorization: Bearer <access token>` and `chatgpt-account-id: <account id>`; it returns the parsed
-JSON and knows nothing about `auth.json`. `ollama_balance` asks `<base>/api/balance` and
+JSON and knows nothing about `auth.json`. `codex_refresh` posts the refresh grant to
+`CODEX_TOKEN_URL` only, with no `Authorization` and no redirect; it is the one call that may renew a
+saved Codex login. `ollama_balance` asks `<base>/api/balance` and
 `ollama_usage_24h` asks `<base>/api/usage?range=24h`, both with only the User-Agent. All three use
 the `lookup_agent` (the agent of the two look-ups too): `redirects(0)` plus `no_redirect` makes a 3xx
 answer an `ApiError::Http` naming where it pointed, and nothing is asked there. `get_json_no_redirect`
@@ -4492,7 +4763,7 @@ from the base and appends the endpoint's own path, so a base with a path keeps i
 The one highest-limit rule lives here too: `highest_limit_index` is the index of the highest percent,
 the first of equals. `mark_highest_active` sets that limit's `is_active` for a provider reading, and
 `Usage::binding` uses the same index for its fallback when no limit is active, so a Claude reply and a
-Codex or Ollama reading choose the same limit when two are equal.
+a Claude reply and an OpenAI or Ollama reading choose the same limit when two are equal.
 
 `transport_error` maps a transport failure: `ConnectionFailed` whose source chain holds an
 `io::Error` of kind `ConnectionRefused` becomes `ApiError::NoConnection` (displayed as `cannot
@@ -4523,7 +4794,8 @@ impl HistoryDir {
 
 `Sample` and `WindowRecord` implement `Record::is_claude` through their `AccountRef`; the other
 record kinds keep the default `true`. `Event` is Claude's when the event names no account or at
-least one Claude account; an event about a provider alone is not. `read_claude` is `read` followed by
+least one Claude account; an event about a provider alone is not, and a `providerSwitch` is never
+Claude's (both of its accounts are OpenAI logins). `read_claude` is `read` followed by
 `retain(record.is_claude())` and keeps the warnings; `finished_claude_windows` is
 `finished_windows` followed by the same filter. Every reader that serves Claude's accounts uses
 these — auto-burn's live situation and replay, money, and all `stats` pages. `read` and
@@ -4549,21 +4821,28 @@ pub(crate) const PROVIDER_POLL_SECS: u64 = 300;
 pub(crate) struct ProviderView {
     pub provider: String,  // "codex" | "ollama"
     pub title: String,     // "Codex" | "Ollama"
-    pub plan: Option<String>,
-    pub usage: Option<Usage>,
-    pub credits: Option<Credits>,
-    pub spend_24h: Option<f64>,
-    pub spend_24h_error: Option<String>, // why the 24 h spend could not be read
-    pub fetched_at: Option<DateTime<Utc>>,
-    pub error: Option<String>,
-}
+    pub plan: Option<String>, pub usage: Option<Usage>, pub credits: Option<Credits>,
+    pub spend_24h: Option<f64>, pub spend_24h_error: Option<String>,
+    pub fetched_at: Option<DateTime<Utc>>, pub error: Option<String> }
+/// One saved Codex login as the pop-up lists it (R8).
+#[derive(Serialize)] #[serde(rename_all = "camelCase")]
+pub(crate) struct CodexLoginView {
+    pub account: AccountRef, pub abbr: String, pub label: String, pub color: String,
+    pub plan: Option<String>, pub live: bool, pub usage: Option<Usage>,
+    pub state: CodexLoginState, pub message: Option<String> }
+#[derive(Serialize)] #[serde(rename_all = "lowercase")]
+pub(crate) enum CodexLoginState { Ok, Expired, Error }
+/// The cards and the saved logins, handed to the UI in one event.
+pub(crate) struct ProviderLists { pub cards: Vec<ProviderView>,
+    pub codex_logins: Vec<CodexLoginView> }
 
-enum ProvidersCommand { Opened, SettingsSaved, Stop }
+enum ProvidersCommand { Opened, SettingsSaved, CodexChanged, Stop }
 #[derive(Clone)]
 pub(crate) struct ProvidersClient { commands: Sender<ProvidersCommand> }
 impl ProvidersClient {
     pub(crate) fn opened(&self) -> Result<(), String>;
     pub(crate) fn settings_saved(&self) -> Result<(), String>;
+    pub(crate) fn codex_changed(&self) -> Result<(), String>;
 }
 pub(crate) struct ProvidersHandle { /* client, stop flag, JoinHandle */ }
 impl ProvidersHandle { pub(crate) fn client(&self) -> ProvidersClient; pub(crate) fn stop(&mut self); }
@@ -4575,17 +4854,24 @@ pub(crate) type SettingsLookup = Box<dyn Fn(&Settings) -> Result<Settings, Strin
 pub(crate) type ReportError = Box<dyn Fn(&str) + Send>;
 
 pub(crate) fn spawn(app: AppPaths, history: Result<HistoryDir, String>, api: Api,
-                    ui: Sender<UiEvent>) -> Result<ProvidersHandle, String>;
+                    ui: Sender<UiEvent>, reported_errors: Arc<ReportedErrors>,
+                    printed_warnings: Arc<Mutex<PrintedWarnings>>)
+    -> Result<ProvidersHandle, String>;
 
-pub(crate) struct ProvidersRuntime { /* api, ui, codex_paths, settings_lookup, recorder, report, … */ }
+pub(crate) struct ProvidersRuntime { /* api, ui, app, store_opener, codex_paths, recorder, … */ }
 impl ProvidersRuntime {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(history: Result<HistoryDir, String>, api: Api, ui: Option<Sender<UiEvent>>,
-                      codex_paths: CodexPathsLookup, settings_lookup: SettingsLookup,
-                      report: ReportError) -> ProvidersRuntime;
+                      app: AppPaths, store_opener: StoreOpener, codex_paths: CodexPathsLookup,
+                      settings_lookup: SettingsLookup, report: ReportError,
+                      printed_warnings: Arc<Mutex<PrintedWarnings>>) -> ProvidersRuntime;
     pub(crate) fn views(&self) -> Vec<ProviderView>;
+    pub(crate) fn codex_logins(&self) -> Vec<CodexLoginView>;   // #[cfg(test)]
     pub(crate) fn poll_round(&mut self, settings: &Settings, now: DateTime<Utc>) -> Vec<ProviderView>;
     pub(crate) fn opened(&mut self, settings: &Settings, now: DateTime<Utc>) -> Vec<ProviderView>;
     pub(crate) fn settings_saved(&mut self, settings: &Settings, now: DateTime<Utc>)
+        -> Vec<ProviderView>;
+    pub(crate) fn codex_changed(&mut self, settings: &Settings, now: DateTime<Utc>)
         -> Vec<ProviderView>;
     pub(crate) fn report_error(&mut self, text: &str);
 }
@@ -4593,8 +4879,8 @@ impl ProvidersRuntime {
 
 `spawn` always starts one named thread (`seatswap-providers`), whatever the two switches say. `run`
 sets `next = now`, so the first round happens at once, then waits on the command channel until
-`next`; a timeout is `poll_round` and the next wait is 300 s. `Opened`, `SettingsSaved` and a save do
-not move the five-minute instant. `settings_of` reads `accounts.json` again for every command and
+`next`; a timeout is `poll_round` and the next wait is 300 s. `Opened`, `SettingsSaved`,
+`CodexChanged` and a save do not move the five-minute instant. `settings_of` reads `accounts.json` again for every command and
 round, and `poll` uses the same load through `SettingsLookup` after each request. So a switch, a Codex
 folder or an Ollama URL counts without a restart; a load failure is reported through `ReportedErrors` (once per text per
 run) and the round is skipped.
@@ -4604,12 +4890,20 @@ the order Codex, Ollama. `poll_round` calls `settle(settings, previous)`: a card
 its view and its last attempt; a card whose `codexHome`/`ollamaUrl` changed drops its old view,
 because those numbers belong to another login or server, and is polled. `opened` and `settings_saved`
 run the same check, so a folder or URL changed by hand in `accounts.json` drops the old numbers before
-the next round just like a save. `poll_round` then polls every switched-on card. `opened` polls a
-switched-on card whose place changed, or whose last *attempt* is more than 60 s old (exactly 60 s is
-not older). `settings_saved` polls a card that was just switched on, or whose `codexHome`/`ollamaUrl`
-changed; a card that is now off is dropped at once, and any other save does not poll.
+the next round just like a save. `poll_round` polls every switched-on card and every provider whose
+subscription has a price, even with its card off (R4), so a priced OpenAI subscription learns its
+plan and week. `opened` polls a switched-on card whose place changed, or whose last *attempt* is
+more than 60 s old (exactly 60 s is not older). `settings_saved` polls a card that was just switched
+on, or whose `codexHome`/`ollamaUrl` changed; a card that is now off is dropped at once, and any
+other save does not poll. `codex_changed` polls Codex at once after a switch or a removal, so the
+live mark and the rows follow it before the next round.
 
-`poll` marks the attempt time before the reading, runs `read_codex` or `providers::ollama::read`,
+`poll` marks the attempt time before the reading. Codex runs one round: `sync_live`, then the live
+`read`, then `read_saved` for each stored login in `accounts.json`, and
+`ops::ensure_provider_subscription` for each answer's account so an OpenAI plan stays current; a
+failed renewal keeps its copy and is listed as `expired` with `SIGN_IN_AGAIN`, and any other failure
+as `error`. Ollama runs `providers::ollama::read`. It then reads the settings again through the
+`SettingsLookup`:
 then reads the settings again through the `SettingsLookup`: an answer for a card that is now off, or
 whose folder/URL changed while the request ran, is neither recorded nor shown. A failed settings read
 is reported once and drops the answer too. Otherwise a success becomes `ProviderView { fetched_at:
@@ -4623,13 +4917,19 @@ already the snapshot's error and was notified there.
 `publish` compares the list with the one sent last and sends `UiEvent::Providers(list)` only when it
 changes.
 
-`Snapshot.providers: Vec<ProviderView>` is always present (empty when no card is on). The main thread
-keeps it in `GuiState.providers`, fills it on `UiEvent::Providers`, and `apply_snapshot` copies it into
-every snapshot, so the pop-up and the large window see the same list. The JSON is camelCase:
+`Snapshot.providers: Vec<ProviderView>` is always present (empty when no card is on), and
+`Snapshot.codexLogins: Vec<CodexLoginView>` lists the saved logins (empty while the card is off).
+`Snapshot.providerSubscriptions: Vec<ProviderSubscriptionRow>` is the stored provider subscriptions
+with their look and price (`ProviderSubscriptionRow`: `{account, company, label, abbr, color,
+plan, price, priceCurrency}`); its JSON company key is lowercase, from `Company::of_account`. The main thread keeps them in
+`GuiState`, fills them on `UiEvent::Providers`, and `apply_snapshot` copies them into every snapshot,
+so the pop-up and the large window see the same lists. The JSON is camelCase:
 `provider`, `title`, `plan`, `usage`, `credits`, `spend24h`, `spend24hError`, `fetchedAt`, `error`.
 `Usage` is `{limits: [{kind, percent, severity, resetsAt, model, isActive}], extraUsageEnabled}`; a
 `LimitKind::Other("monthly_credits")` is `{"other":"monthly_credits"}`; `Credits` is
-`{left, allowance, until, purchased}`. Example:
+`{left, allowance, until, purchased}`. A `CodexLoginView` is
+`{account, abbr, label, color, plan, live, usage, state, message}`, with `state` one of `ok`,
+`expired`, `error`. Example:
 
 ```json
 "providers": [
@@ -4695,13 +4995,14 @@ to null and `spend24hError` to the text.
 
 `settings.js`'s `GROUPS` gains `{ id: "providers", label: "Providers" }` after Agents and before
 History and hosts; the alias `prov` is accepted, and `#providers` in the address opens the group.
-`providersCard()` is the panel `Providers` with the subtitle `read-only cards for Codex and Ollama's
+`providersCard()` is the panel `Providers` with the subtitle `cards for OpenAI (Codex) and Ollama's
 cloud plan` and two sections:
 
-- **Codex**: `Show a Codex card` (toggle `codexCard`, note `read only · every 5 minutes`), the note
-  `seatswap reads Codex's login file and asks chatgpt.com for your usage every 5 minutes. It never
-  changes Codex's files.`, and `Codex folder` (text field `codexHome`, note
-  `empty: $CODEX_HOME or ~/.codex`).
+- **OpenAI (Codex)**: `Show a Codex card` (toggle `codexCard`, note `every 5 minutes`), the note
+  `seatswap reads Codex's login file and asks chatgpt.com for your usage every 5 minutes. It writes
+  auth.json only when you switch between saved logins.`, and `Codex folder` (text field `codexHome`,
+  note `empty: $CODEX_HOME or ~/.codex`). The OpenAI card lists the saved logins, each with *Switch*
+  and *Remove saved login*; the live one's removal is refused.
 - **Ollama**: `Show an Ollama card` (toggle `ollamaCard`, note `asks the Ollama server on this machine
   for your cloud balance every 5 minutes`) and `Ollama server` (text field `ollamaUrl`).
 
@@ -4785,10 +5086,17 @@ pub struct CodexSession { pub id: String, pub cwd: PathBuf, pub model: Option<St
     pub started: DateTime<Utc>, pub last: DateTime<Utc>, pub tokens: Tokens,
     pub last_hour: Option<Tokens>, pub busy: bool,
     pub title: Option<String>,   // newest `thread_name` for the id in `session_index.jsonl`
-    pub(crate) file: PathBuf }                          // not part of the page's shape
+    pub(crate) file: PathBuf,    // not part of the page's shape
+    pub(crate) series: Vec<CodexTokenPoint> }            // every token_count total, in time order
 pub struct CodexRead { pub sessions: Vec<CodexSession>, pub warnings: Vec<String> }
 /// Every Codex session whose rollout file was last written at or after `since`.
 pub fn sessions(codex_home: &Path, since: DateTime<Utc>, now: DateTime<Utc>) -> CodexRead;
+#[derive(Default)] pub struct CodexLines { pub lines: Vec<TokenRecord>, pub warnings: Vec<String> }
+/// The token lines of the Codex sessions, and what could not be recorded. `recorded` is the scan
+/// state's `codex_recorded`, keyed by session id; on return it holds the high-water mark, the
+/// time the pass reached and the rollout file (`transcripts::CodexRecorded`).
+pub fn codex_token_lines(sessions: &[CodexSession],
+    recorded: &mut BTreeMap<String, CodexRecorded>, home: &Path, since: DateTime<Utc>) -> CodexLines;
 ```
 
 A rollout is `<codex_home>/sessions/YYYY/MM/DD/rollout-<time>-<uuid>.jsonl`; every day folder is
@@ -4807,6 +5115,20 @@ session id are one session: the file whose last event is newer gives the model, 
 without a total changes no token. `last_hour` is the newest total minus the newest total at or before
 `now - 60 min`, or the whole newest total when there is none; when the newest total is lower than
 that baseline in any field, `last_hour` is `None` and the read warns, naming the session.
+
+`codex_token_lines` writes the growth of `info.total_token_usage` between `token_count` lines, per
+`transcripts::bucket_start` bucket and the `turn_context` model in force at each line:
+`input = input_tokens − cached_input_tokens`, `cr = cached_input_tokens`, `out = output_tokens`,
+`cw = cache_write_input_tokens` or 0 when absent (documented rule), and `answers` the number of grown
+lines. Growth counts only above the highest total the session has reached, per kind, so a repeated
+total records nothing and a total below the mark is a warning, never a negative line. A session not
+recorded before starts at the newest total before `since`; one that started inside the window starts
+at zero. A grown line without a model is a warning and keeps its total back for a later pass; a
+session not seen within 24 h of its end is not recorded. `ScanState::set_codex_recorded` saves the
+map, `prune_codex_recorded(sessions, read_ids)` removes an entry whose file is gone, and the state
+file is `codex.json` (`codex_recorded`, `codex_changed`). The sessions thread writes them in the
+Harness order: save the recorded totals, `recorder.tokens`, roll back on error, then count the lines
+as written.
 
 ### duration.rs — the one spelling of a duration
 

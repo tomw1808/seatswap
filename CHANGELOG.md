@@ -6,6 +6,51 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-18
+
+### Added
+
+- Auto-burn measures work in API dollars: every token line is priced at its model's models.dev
+  price, and each account and limit learns one factor (percent per API dollar) with an 80 % range.
+  An account on Max, Team Premium, Ultra or Pro starts from a factor assumed from its plan.
+- OpenAI (Codex) logins are saved as they are seen and can be switched in the pop-up, in Settings →
+  Accounts and with `seatswap codex list` / `seatswap codex switch`. An inactive saved login renews
+  itself once at OpenAI's token endpoint. Codex sessions already running keep the login they started
+  with.
+- OpenAI and Ollama subscriptions are stored beside the Claude accounts, with their own look, plan
+  and monthly price. Statistics → Subscriptions is rebuilt around four questions: what each plan
+  gives, what is used of what is paid, what 1 % of a limit buys over the weeks, and the tokens a week
+  per subscription and model.
+- Codex sessions write token lines too, from the growth of their rollout files' running totals, so
+  their work is counted at API prices in the statistics.
+- Settings → General shows `seatswap <version>`.
+
+### Changed
+
+- Token lines are written per 5-minute bucket and model, with `"min": 5`. A line without `min` is
+  still an hour, so the history of older versions keeps its meaning.
+- Update every machine: older versions read the new 5-minute token lines as hours.
+- Statistics names the companies Anthropic, OpenAI and Ollama. Blocked hours are shown per company
+  and never added across companies; the This-week card has one row per provider subscription; the
+  account chips include the provider subscriptions.
+- A session on the Sessions page unfolds while its agents run and folds again when they finish,
+  unless the user folded or unfolded it by hand.
+- A provider is polled while its card is on or its subscription has a price. The OpenAI card lists
+  the saved logins and writes Codex's `auth.json` only when switching.
+
+### Fixed
+
+- A price typed at most 15 minutes before a plan change belongs to the new plan's period, so it no
+  longer makes a minutes-long period at the new price.
+- Codex token growth is counted once: a repeated total records nothing, a total below the highest
+  one is a warning, and a missing `cache_write_input_tokens` counts as 0.
+
+### Removed
+
+- Statistics' "What if without it", its `WhatIf` type and the `stats_what_if` command. A keep/drop
+  verdict misses what a subscription saves elsewhere.
+- Work units and their constants in auto-burn; every figure is in API dollars now.
+
 ## [1.2.2] - 2026-11-17
 
 1.2.1 was tagged but not released: its Windows check failed. 1.2.2 holds every change of 1.2.1
@@ -478,7 +523,8 @@ All notable changes to this project are documented here. The format follows
   starts later): it says so and shows the icon as soon as a tray appears; `seatswap panel` opens
   the pop-up meanwhile.
 
-[Unreleased]: https://github.com/ymihere/seatswap/compare/v1.2.2...HEAD
+[Unreleased]: https://github.com/ymihere/seatswap/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/ymihere/seatswap/compare/v1.2.2...v1.3.0
 [1.2.2]: https://github.com/ymihere/seatswap/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/ymihere/seatswap/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/ymihere/seatswap/compare/v1.1.0...v1.2.0
