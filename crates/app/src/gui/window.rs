@@ -1034,7 +1034,7 @@ where
         let parts = stats_ctx_parts(&app, &history)?;
         let result = run(&parts, &history, Utc::now(), Local);
         let warnings = parts.take_warnings();
-        super::lock(&printed).print(&warnings);
+        super::lock(&printed).print(Some("history"), &warnings);
         result
     })
     .await
@@ -3132,7 +3132,7 @@ mod tests {
                     .any(|warning| warning.contains("events-2026-11.jsonl line")),
                 "the statistics read kept no warning: {warnings:?}"
             );
-            crate::gui::lock(&printed).print(&warnings);
+            crate::gui::lock(&printed).print(Some("history"), &warnings);
         }
 
         assert_eq!(

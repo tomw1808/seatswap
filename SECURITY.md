@@ -19,14 +19,14 @@ seatswap handles Claude login tokens, so it is built to keep them where they bel
   login it finds into that folder as Codex keeps its own `auth.json`.
 - **Each token goes only to its own provider, over HTTPS.** Claude logins go only to the usage
   endpoint (`api.anthropic.com`) and Claude Code's token endpoint (`platform.claude.com`). With
-  the Codex card on (or a price set for an OpenAI subscription), each saved Codex login's access
+  the Codex card on or a Codex login found, each saved Codex login's access
   token goes only to `chatgpt.com`, and its refresh token only to OpenAI's own token endpoint
   (`auth.openai.com`), to renew a saved login that is not live; a login from any other issuer is
   never renewed. seatswap never renews Codex's live login, and writes Codex's `auth.json` only to
   switch to another saved login. Saved Codex logins are kept like Claude logins (keyring, or the
-  `0600` files; on Windows always the private files above). While the card is off and no OpenAI
-  subscription has a price, the tray app still reads a Codex login file it finds in the Codex
-  folder, saves that login and may poll it (§7.9); it reads nothing when no login file is there.
+  `0600` files; on Windows always the private files above). While the card is off, the tray app
+  still reads a Codex login file it finds in the Codex folder, saves that login and may poll it
+  (§7.9); it reads nothing when no login file is there.
   Only `seatswap codex list` or `codex switch`, run by you, read it otherwise. The Sessions area
   is separate: with *Read Claude Code's session files*
   on, it reads Codex's rollout files whatever the card says. The Ollama card asks the Ollama server
@@ -34,9 +34,9 @@ seatswap handles Claude login tokens, so it is built to keep them where they bel
   has an Ollama subscription, seatswap still asks that server while the card is off.
 - **A found provider is read, not trusted.** The Codex login found in the Codex folder is copied
   into seatswap's store so it can be counted and, if needed, switched to; it is never written back
-  to Codex except by an explicit switch. When the `ollama` program is found on `PATH`, the server
-  at `ollamaUrl` is asked only for its balance (`/api/balance`) and the last 24 h's usage
-  (`/api/usage?range=24h`), with no login and no secret.
+  to Codex except by an explicit switch. When the `ollama` program is found on `PATH` or this host
+  stores an Ollama subscription, the server at `ollamaUrl` is asked only for its balance
+  (`/api/balance`) and the last 24 h's usage (`/api/usage?range=24h`), with no login and no secret.
 - **The other network calls carry nothing about you.** While *Look up prices and the dollar rate*
   is on, seatswap fetches API prices from `models.dev` and the dollar rate from
   `api.frankfurter.dev`. Those requests send a User-Agent and no account, token or machine data;

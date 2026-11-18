@@ -1143,9 +1143,16 @@ impl ProvidersRuntime {
         match provider {
             Provider::Codex => match (self.codex_paths)(settings.codex_home.as_deref()) {
                 Ok(paths) => paths.auth_file.is_file(),
-                // A folder that cannot be resolved is not found; with the card
-                // on the same error is the card's own text.
-                Err(_) => false,
+                Err(error) => {
+                    // A folder that cannot be resolved is not found. With the
+                    // card on, the same error is the card's own text; with it
+                    // off there is no card, so the error is printed once through
+                    // the one warning printer (R6 review).
+                    if !settings.codex_card {
+                        self.report_provider_error(false, &error.to_string());
+                    }
+                    false
+                }
             },
             Provider::Ollama => {
                 let in_path = self
@@ -1223,7 +1230,7 @@ impl ProvidersRuntime {
             .read::<Event>(&Range::ALL, &Hosts::One(recorder.dir().host().to_string()));
         match read {
             Ok(read) => {
-                super::lock(&self.printed_warnings).print(&read.warnings);
+                super::lock(&self.printed_warnings).print(Some("history"), &read.warnings);
                 Ok(read
                     .records
                     .iter()
@@ -1311,7 +1318,7 @@ impl ProvidersRuntime {
         if let Ok(recorder) = &mut self.recorder {
             let warnings = recorder.take_warnings();
             if !warnings.is_empty() {
-                super::lock(&self.printed_warnings).print(&warnings);
+                super::lock(&self.printed_warnings).print(Some("history"), &warnings);
             }
         }
     }
@@ -1332,7 +1339,7 @@ impl ProvidersRuntime {
         if on {
             self.report_error(text);
         } else {
-            super::lock(&self.printed_warnings).print(&[text.to_string()]);
+            super::lock(&self.printed_warnings).print(None, &[text.to_string()]);
         }
     }
 
@@ -2798,7 +2805,7 @@ mod tests {
             path_var,
         );
         let settings = Settings {
-            ollama_url: url,
+            ollama_url: url.clone(),
             ..Settings::default()
         };
 
@@ -2814,10 +2821,16 @@ mod tests {
             texts.is_empty(),
             "a found provider's not-running error with the card off was notified: {texts:?}"
         );
+        let printed = super::super::lock(&runtime.printed_warnings);
         assert_eq!(
-            super::super::lock(&runtime.printed_warnings).len(),
+            printed.len(),
             1,
             "the not-running error was not printed once on stderr"
+        );
+        assert_eq!(
+            printed.lines(),
+            vec![format!("seatswap: Ollama is not running on {url}.")],
+            "the card-off error must print without the history label"
         );
     }
 
@@ -2860,6 +2873,39 @@ mod tests {
             super::super::lock(&runtime.printed_warnings).len(),
             1,
             "the unreadable login was not printed once on stderr"
+        );
+    }
+
+    /// R6 review: a Codex folder that cannot be resolved is not found, and with
+    /// the card off its error is printed once without the history label.
+    #[test]
+    fn an_unresolvable_codex_folder_is_printed_once_with_the_card_off() {
+        let dir = tempdir().expect("tempdir");
+        let error = PathsError::RelativeCodexHome(std::path::PathBuf::from("codex"));
+        let expected = format!("seatswap: {error}");
+        let mut runtime = test_runtime_with(
+            dir.path(),
+            offline_api(),
+            Box::new(|_| {
+                Err(PathsError::RelativeCodexHome(std::path::PathBuf::from(
+                    "codex",
+                )))
+            }),
+            same_settings(),
+            Box::new(|_| {}),
+        );
+
+        let views = runtime.poll_round(&Settings::default(), utc("2026-11-14T09:00:00Z"));
+
+        assert!(
+            views.is_empty(),
+            "a folder that cannot be resolved is not found: {views:?}"
+        );
+        let printed = super::super::lock(&runtime.printed_warnings);
+        assert_eq!(
+            printed.lines(),
+            vec![expected],
+            "the resolution error was not printed once without the history label"
         );
     }
 
@@ -3178,11 +3224,11 @@ mod tests {
         );
     }
 
-    /// A provider whose subscription has a price is polled with its card off:
-    /// the price turns its work into money even when the card is hidden. The
-    /// reading is recorded, the subscription kept, and no card is shown.
+    /// A stored Ollama subscription makes Ollama found, so it is polled with its
+    /// card off; the subscription's price does not decide the poll. The reading
+    /// is recorded, the subscription kept, and no card is shown.
     #[test]
-    fn a_provider_is_polled_while_its_price_is_set_with_the_card_off() {
+    fn a_stored_ollama_subscription_is_polled_with_its_card_off() {
         let dir = tempdir().expect("tempdir");
         let app = test_app(dir.path());
         let store = test_store(dir.path());

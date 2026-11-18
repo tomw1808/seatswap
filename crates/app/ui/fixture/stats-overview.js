@@ -187,10 +187,6 @@ const PROJECTS = [
   },
 ];
 
-// The provider rows' API values this week, in EUR. OA has a weekly price, O2
-// has no price and no running window here, OL's month has no price.
-const PROVIDER_API = { OA: 34.1, O2: 3.05, OL: 6.85 };
-
 // The chip id of an abbreviation: a provider subscription's `account.acc` or a
 // stored Claude account's id. The ids come from the built-in snapshot, filled
 // in by `resolveIds` before an answer is built.
@@ -292,19 +288,12 @@ function runningWindow(account) {
 // without a running window, OL's running month without a price.
 function providerRows(subscriptions) {
   return subscriptions.map((subscription) => {
-    const api = PROVIDER_API[subscription.abbr];
-    if (typeof api !== "number") {
-      throw new Error(`no provider API value for ${subscription.abbr}`);
-    }
     const used = subscription.abbr === "O2" ? null : subscription.now;
     const priced = subscription.price !== null;
     const money = used === null ? null : priced ? (used / 100) * weeklyPrice(subscription) : null;
     return {
       name: subscription.abbr,
       company: subscription.company,
-      api,
-      apiCurrency: "EUR",
-      apiMissing: null,
       used,
       money,
       moneyMissing:
@@ -504,7 +493,9 @@ export function overview(query) {
     finished.length > 0 ? findingExpired(finished, chosen, currency) : null,
     findingBlocked(indexes, blockedHours, avoidableHours),
     finished.length > 0 ? findingAutoBurn(finished, chosen) : null,
-    findingFull(finished, chosen),
+    // The full weeks finding counts every weekly window of the range, the
+    // running ones included (R5).
+    findingFull(indexes, chosen),
   ].filter((text) => text !== null);
   return {
     withoutPrice: [],

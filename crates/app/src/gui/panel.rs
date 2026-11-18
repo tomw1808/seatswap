@@ -1005,7 +1005,7 @@ pub(crate) async fn projects_view(state: State<'_, GuiState>) -> Result<Projects
         &state.claude.home,
         &stored_accounts(&state)?,
     )?;
-    super::lock(&state.printed_warnings).print(&warnings);
+    super::lock(&state.printed_warnings).print(Some("history"), &warnings);
     Ok(projects)
 }
 
@@ -1023,7 +1023,7 @@ pub(crate) async fn projects_edit(
         Utc::now(),
         edit,
     )?;
-    super::lock(&state.printed_warnings).print(&warnings);
+    super::lock(&state.printed_warnings).print(Some("history"), &warnings);
     Ok(projects)
 }
 

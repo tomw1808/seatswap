@@ -4,7 +4,7 @@
 //! here only reads.
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde::Serialize;
@@ -127,15 +127,13 @@ pub struct ThisWeekProject {
     pub by_subscription: Vec<(Option<String>, f64)>,
 }
 
-/// One provider subscription's work on the This-week card: its records from its
-/// running window's start (OpenAI: its `weekly_all` week; Ollama: its
-/// `monthly_credits` month) to now, exactly as an account row sums from its
-/// window's start (decision P-2 6). The window's use, money and reset are the
-/// subscription row's, filled like an account row's when it has a price; without
-/// one `money_missing` says why while the API value stays. Its records belong to
-/// its subscription, so the account chips choose them like an account's
-/// (decision P-2 8). A record whose subscription cannot be named is one more row
-/// per company, named by the company, with its API value and the reason.
+/// One provider subscription's row on the This-week card: its running window's
+/// use, money and reset. Its records count from the calendar week's start for
+/// Ollama (documented rule, so its work and its paid share cover the same week)
+/// and from its running window's start for OpenAI (its `weekly_all` week),
+/// exactly as an account row sums from its window's start (decision P-2 6). The
+/// values the records make are on the card's project and total rows; this row
+/// only names the subscription and its running window.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThisWeekProvider {
@@ -144,14 +142,6 @@ pub struct ThisWeekProvider {
     pub name: String,
     /// The subscription's company: `openai` or `ollama`.
     pub company: Company,
-    /// The records' API value, summed with [`Values::sum`]; `None` when a
-    /// record's is unknown.
-    pub api: Option<f64>,
-    /// The currency `api` is in: the settings' currency with a stored rate,
-    /// "USD" without one; `None` when `api` is.
-    pub api_currency: Option<String>,
-    /// Why `api` is `None`; `None` when it has a value.
-    pub api_missing: Option<String>,
     /// The running window's use so far, in percent: OpenAI's `weekly_all` week
     /// or Ollama's `monthly_credits` month; `None` while the subscription has
     /// no running window.
@@ -540,16 +530,16 @@ pub(crate) fn overview_in<Tz: TimeZone + Copy>(
 
 /// The This-week card: the chosen accounts' running weekly windows, each with
 /// its use so far and its money, from the window's start to now; the work of
-/// every other provider (Codex, Ollama) from its running window's start, or
-/// from Monday 00:00 of the current calendar week to now, valued at API prices;
-/// and the same records by project, with the three totals on top.
+/// every other provider (Codex, Ollama) in the current calendar week, valued at
+/// API prices; and the same records by project, with the three totals on top.
 ///
 /// The host filter applies to the token records, as the Weeks summary filters
 /// them; the range in `q` does not apply, so a range that holds no record still
 /// has the card. A Claude record counts in its account's running window, or,
-/// without a known account, from the calendar week's Monday 00:00; a provider
-/// record counts in its subscription's running window, or from the calendar
-/// week's start when it has none. A record of another provider uses no
+/// without a known account, from the calendar week's Monday 00:00; an OpenAI
+/// record counts in its subscription's running week, and an Ollama record from
+/// the calendar week's start (documented rule, so its work and its paid share
+/// of the month cover the same week). A record of another provider uses no
 /// account's week and is not filtered by the account chips.
 pub fn this_week_card<Tz: TimeZone + Copy>(
     ctx: &Ctx<Tz>,
@@ -627,12 +617,10 @@ pub fn this_week_card<Tz: TimeZone + Copy>(
         )
     })?;
 
-    // One pass over the records: each provider subscription's API value, the
-    // records no subscription can be named for by company, and the same over
-    // all of them by project. Everything is a `Values` sum, so a missing part
-    // keeps its reason (R3).
-    let mut by_provider: BTreeMap<AccountRef, Option<Values>> = BTreeMap::new();
-    let mut unassigned: BTreeMap<Company, Option<Values>> = BTreeMap::new();
+    // One pass over the records: the records no subscription can be named for
+    // by company, and every counted record by project. Everything is a `Values`
+    // sum, so a missing part keeps its reason (R3).
+    let mut unassigned: BTreeSet<Company> = BTreeSet::new();
     let mut unassigned_missing: BTreeMap<Company, crate::money::Missing> = BTreeMap::new();
     let mut total: Option<Values> = None;
     let mut tokens_out = 0u64;
@@ -646,11 +634,6 @@ pub fn this_week_card<Tz: TimeZone + Copy>(
             continue;
         }
         let value = valuer.value(&hosted.host, record);
-        // The row a record counts in besides its project: a provider
-        // subscription's API sum. A Claude record without a known account counts
-        // from the calendar week's start and has no such row; a Claude record of
-        // a known account counts only in its running window.
-        let mut own: Option<&mut Option<Values>> = None;
         match value.company {
             Company::Anthropic => match value.account.as_ref() {
                 None => {
@@ -677,21 +660,28 @@ pub fn this_week_card<Tz: TimeZone + Copy>(
                             .entry(company)
                             .or_insert_with(|| missing.clone());
                     }
-                    own = Some(unassigned.entry(company).or_default());
+                    unassigned.insert(company);
                 }
                 Some(account) => {
-                    let start = provider_runs
-                        .get(account)
-                        .and_then(|(_, run)| run.as_ref())
-                        .map(|run| run.start)
-                        .unwrap_or(calendar_week);
+                    // An Ollama record counts from the calendar week's start,
+                    // the same start as Claude work without a known account, so
+                    // its work and its 12/52 paid share of the month cover the
+                    // same week (documented rule). An OpenAI record keeps its
+                    // running week's start.
+                    let start = match company {
+                        Company::Ollama => calendar_week,
+                        _ => provider_runs
+                            .get(account)
+                            .and_then(|(_, run)| run.as_ref())
+                            .map(|run| run.start)
+                            .unwrap_or(calendar_week),
+                    };
                     if record.t < start {
                         continue;
                     }
                     provider_runs
                         .entry(account.clone())
                         .or_insert((company, None));
-                    own = Some(by_provider.entry(account.clone()).or_default());
                 }
             },
         }
@@ -699,9 +689,6 @@ pub fn this_week_card<Tz: TimeZone + Copy>(
             .projects
             .of(&ProjectId::of(&record.project, &hosted.host));
         let record_values = Values::of(std::slice::from_ref(&value), ctx.settings, ctx.fx, ctx.now);
-        if let Some(own) = own {
-            add_opt_value(own, &record_values);
-        }
         add_opt_value(&mut total, &record_values);
         tokens_out += record.out;
         let project_row = by_project
@@ -754,7 +741,6 @@ pub fn this_week_card<Tz: TimeZone + Copy>(
     let mut providers: Vec<(usize, String, ThisWeekProvider)> =
         Vec::with_capacity(provider_runs.len());
     for (account, (company, run)) in &provider_runs {
-        let own_total = by_provider.remove(account).flatten();
         let row = provider_row(&valuer, *company, account, run.as_ref());
         match row.week_paid {
             Some(week_paid) => paid = Some(paid.unwrap_or(0.0) + week_paid),
@@ -771,13 +757,6 @@ pub fn this_week_card<Tz: TimeZone + Copy>(
             ThisWeekProvider {
                 name,
                 company: *company,
-                api: own_total.as_ref().and_then(|total| total.api),
-                api_currency: own_total
-                    .as_ref()
-                    .and_then(|total| total.api_currency.clone()),
-                api_missing: own_total
-                    .as_ref()
-                    .and_then(|total| total.api_missing.clone()),
                 used: row.used,
                 money: row.money,
                 money_missing: row.money_missing,
@@ -786,11 +765,10 @@ pub fn this_week_card<Tz: TimeZone + Copy>(
         ));
     }
     // A record whose subscription cannot be named is one row per company,
-    // named by the company, with its API value and the reason (decision P-2 6).
-    for (company, own_total) in unassigned {
-        let Some(own_total) = own_total else {
-            continue;
-        };
+    // named by the company, with the reason its window is unknown (decision
+    // P-2 6). It has no running window, so the page's subscription lines skip
+    // it; the record still counts in its project and in the totals.
+    for company in unassigned {
         let money_missing = unassigned_missing
             .get(&company)
             .map(ToString::to_string)
@@ -802,9 +780,6 @@ pub fn this_week_card<Tz: TimeZone + Copy>(
             ThisWeekProvider {
                 name,
                 company,
-                api: own_total.api,
-                api_currency: own_total.api_currency.clone(),
-                api_missing: own_total.api_missing.clone(),
                 used: None,
                 money: None,
                 money_missing,
@@ -1993,6 +1968,108 @@ mod tests {
         );
     }
 
+    /// An Ollama record counts on the This-week card from the calendar week's
+    /// start, the same start as Claude work without a known account, so its work
+    /// and its paid share (12/52 of the month price) cover the same week. A
+    /// record of an earlier calendar week in the same Ollama month is not on the
+    /// card.
+    #[test]
+    fn proof_z2_this_week_counts_an_ollama_month_against_one_week_paid() {
+        let mut tiny = tiny();
+        price_flash_and_codex(&mut tiny);
+        let ollama = crate::money::ollama_subscription();
+        tiny.provider_subscriptions = vec![provider_subscription(&ollama, "OL", Some(20.0))];
+        let atlas = crate::project::ProjectKey::Repo("github.com/sam/atlas".to_string());
+        tiny.history
+            .append(&Sample {
+                t: utc("2026-11-18T00:00:00Z"),
+                account: ollama,
+                src: Source::Poll,
+                l: vec![crate::history::LimitSample {
+                    k: LimitKind::Other("monthly_credits".to_string()),
+                    m: None,
+                    p: 60.0,
+                    r: Some(utc("2026-12-01T00:00:00Z")),
+                    b: false,
+                }],
+            })
+            .expect("November's reading");
+        tiny.history
+            .append_many(&[week_token(
+                "2026-11-05T09:00:00Z",
+                &atlas,
+                "deepseek-v4.1-flash:cloud",
+                1_000_000,
+            )])
+            .expect("a record of 5 Nov");
+        let query = Query {
+            range: RangeKey::All,
+            accounts: vec!["no such account".to_string()],
+            host: None,
+        };
+        let card = this_week_card(&tiny.ctx(), &query).unwrap();
+        assert_eq!(
+            card.totals.tokens_out, 0,
+            "a record of 5 Nov is on this week's card: {:#?}",
+            card.totals
+        );
+    }
+
+    /// The positive half of the proof above: the same Ollama subscription counts
+    /// a record inside the current calendar week, with its month percent and
+    /// money on the subscription line as before.
+    #[test]
+    fn this_week_counts_an_ollama_record_inside_the_calendar_week() {
+        let mut tiny = tiny();
+        price_flash_and_codex(&mut tiny);
+        let ollama = crate::money::ollama_subscription();
+        tiny.provider_subscriptions = vec![provider_subscription(&ollama, "OL", Some(20.0))];
+        let atlas = crate::project::ProjectKey::Repo("github.com/sam/atlas".to_string());
+        tiny.history
+            .append(&Sample {
+                t: utc("2026-11-18T00:00:00Z"),
+                account: ollama,
+                src: Source::Poll,
+                l: vec![crate::history::LimitSample {
+                    k: LimitKind::Other("monthly_credits".to_string()),
+                    m: None,
+                    p: 60.0,
+                    r: Some(utc("2026-12-01T00:00:00Z")),
+                    b: false,
+                }],
+            })
+            .expect("November's reading");
+        tiny.history
+            .append_many(&[week_token(
+                "2026-11-18T09:00:00Z",
+                &atlas,
+                "deepseek-v4.1-flash:cloud",
+                1_000_000,
+            )])
+            .expect("a record of this week");
+        let query = Query {
+            range: RangeKey::All,
+            accounts: vec!["no such account".to_string()],
+            host: None,
+        };
+        let card = this_week_card(&tiny.ctx(), &query).unwrap();
+        assert_eq!(card.totals.tokens_out, 1_000_000);
+        assert_eq!(card.projects.len(), 1, "{:#?}", card.projects);
+        assert_eq!(card.projects[0].name, "atlas");
+        assert_eq!(card.projects[0].values.api, Some(2.0));
+        let row = card
+            .providers
+            .iter()
+            .find(|row| row.name == "OL")
+            .expect("the Ollama subscription line");
+        assert_eq!(row.used, Some(60.0), "the month's use so far");
+        assert!(close(row.money.expect("60 % of 20 EUR"), 12.0));
+        assert!(close(
+            card.totals.paid.expect("a week's share"),
+            4.615_384_6
+        ));
+    }
+
     /// A running window without a price makes `paid` a lower bound: AC's
     /// running week is priced and OA's running week is not, so `paid` holds AC's
     /// week only and `paid_partial` says one listed window is missing. A percent
@@ -2400,9 +2477,6 @@ mod tests {
         assert_eq!(card.providers.len(), 1, "providers: {:?}", card.providers);
         let ollama = &card.providers[0];
         assert_eq!(ollama.name, "Ollama");
-        assert!(close(ollama.api.expect("the flash price"), 18.0));
-        assert_eq!(ollama.api_currency.as_deref(), Some("EUR"));
-        assert_eq!(ollama.api_missing, None);
 
         assert_eq!(card.totals.tokens_out, 15_000_000);
         assert_eq!(card.totals.projects, 2);
@@ -2527,12 +2601,6 @@ mod tests {
             assert_eq!(card.providers.len(), 1, "providers: {:?}", card.providers);
             let codex = &card.providers[0];
             assert_eq!(codex.name, "OpenAI");
-            assert!(
-                close(codex.api.expect("Codex's price"), 40.0),
-                "4 M output at 10 USD per million: {:?}",
-                codex.api
-            );
-            assert_eq!(codex.api_missing, None);
             let ledger_row = card
                 .projects
                 .iter()
@@ -2600,11 +2668,38 @@ mod tests {
         assert!(card.providers.is_empty(), "the host filter applies");
     }
 
-    /// A provider's model without a price leaves its row's API value unknown,
-    /// with the model named; its project row keeps the unknown API value and
-    /// has no subscription share.
+    /// A provider row carries its subscription and running window only: the
+    /// removed API sum is not in its JSON (no page read it; the project and
+    /// total rows carry the values).
     #[test]
-    fn an_unpriced_provider_row_names_its_reason() {
+    fn a_provider_row_carries_no_api_value() {
+        let tiny = tiny();
+        let atlas = crate::project::ProjectKey::Repo("github.com/sam/atlas".to_string());
+        tiny.history
+            .append(&week_token(
+                "2026-11-18T09:00:00Z",
+                &atlas,
+                "glm-5:cloud",
+                1_000_000,
+            ))
+            .expect("an Ollama record");
+        let card = this_week_card(&tiny.ctx(), &all()).unwrap();
+        assert_eq!(card.providers.len(), 1);
+        let provider = serde_json::to_value(&card.providers[0]).expect("the provider's JSON");
+        for field in ["api", "apiCurrency", "apiMissing"] {
+            assert!(
+                provider.get(field).is_none(),
+                "the provider row still has {field}: {provider}"
+            );
+        }
+    }
+
+    /// A provider's model without a price leaves its project's API value
+    /// unknown, with the model named, and the project has no subscription
+    /// share. The provider row still names the company; the API value is on the
+    /// project and total rows now.
+    #[test]
+    fn an_unpriced_provider_record_leaves_its_project_api_unknown() {
         let tiny = tiny();
         let atlas = crate::project::ProjectKey::Repo("github.com/sam/atlas".to_string());
         tiny.history
@@ -2619,12 +2714,6 @@ mod tests {
         assert_eq!(card.providers.len(), 1);
         let ollama = &card.providers[0];
         assert_eq!(ollama.name, "Ollama");
-        assert_eq!(ollama.api, None);
-        assert_eq!(ollama.api_currency, None);
-        assert_eq!(
-            ollama.api_missing.as_deref(),
-            Some("no price for glm-5:cloud")
-        );
         assert_eq!(
             card.projects.len(),
             1,
@@ -3147,7 +3236,6 @@ mod tests {
             "the used share of the week's 23 EUR: {:?}",
             openai.money
         );
-        assert_eq!(openai.api, Some(10.0), "the API value stays");
     }
 
     /// Each OpenAI login gets its own This-week row, summing its own records
@@ -3218,7 +3306,6 @@ mod tests {
             .find(|row| row.name == "OA")
             .expect("the OA row");
         assert_eq!(oa_row.used, Some(50.0));
-        assert_eq!(oa_row.api, Some(10.0), "OA's own 12:00 record");
         assert!(
             close(oa_row.money.expect("money"), 50.0 * percent_value(23.0)),
             "OA's used share: {:?}",
@@ -3230,7 +3317,6 @@ mod tests {
             .find(|row| row.name == "OA2")
             .expect("the OA2 row");
         assert_eq!(oa2_row.used, Some(20.0));
-        assert_eq!(oa2_row.api, Some(10.0), "OA2's own 14:00 record");
         assert!(
             close(oa2_row.money.expect("money"), 20.0 * percent_value(30.0)),
             "OA2's used share: {:?}",

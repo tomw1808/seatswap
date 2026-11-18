@@ -1,7 +1,7 @@
 // The Overview page (spec §3.1): the weekly windows running now, the five
-// numbers, each finished week by account and by project, what the numbers
-// say, and the share that expired per week. The page formats and draws the
-// struct; it adds no sum, share or sentence of its own.
+// numbers, each week by account and by project (the running windows counted
+// too), what the numbers say, and the share that expired per week. The page
+// formats and draws the struct; it adds no sum, share or sentence of its own.
 
 import {
   accountName,
@@ -555,7 +555,7 @@ export async function show(container, env) {
         amountNode(data.kpis.paid, currency),
         ` paid for ${data.kpis.weeks} ${weeks}`,
       ]),
-      "Used | money used of the priced weekly windows that finished; an account without a price is left out"
+      "Used | money used of the priced weekly windows in the range, the running ones included; an account without a price is left out"
     )
   );
   kpis.appendChild(

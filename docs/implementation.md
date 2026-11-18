@@ -3257,8 +3257,9 @@ each provider, project, project's provider and model, provider's model and model
 provider's model (the "By model" total row), while `Model` is the Models card's total over every
 provider. `Sum.tokens` adds the token counts; `Sum.last_hour` is `None` when any row of the group has
 an unknown last hour, never a sum over the rest; `Sum.last_hour_values` and `Sum.values` are
-`Values::sum` over the group's row values, so each half is all or nothing and two API currencies are
-not added; `agents_running` and `agents_done` add the row counts, and a total row with no agent data
+`Values::sum` over the group's row values: each half adds its known parts and stays partial with the
+first missing part's reason when another part is missing (R3); two API currencies are not added;
+`agents_running` and `agents_done` add the row counts, and a total row with no agent data
 shows `—`. A model total row carries the `tied` bubble when its thinking is tied to the account.
 `switch_effect` counts only rows whose provider is `Claude Code` and whose model is absent or a plan
 model (`money::is_plan_model`, the id starts with `claude-`); OpenAI, Ollama, Harness, flash and
@@ -3462,12 +3463,12 @@ pub fn empty(ctx: &Ctx<Tz>, range: &Range) -> Result<Option<Empty>, StatsError>;
 - `account_weeks_so_far` adds `Valuer::running_windows(ctx.now)` to the finished windows. A running
   window goes into the week of its midpoint like a finished one (its start is seven days before its
   reset), so it never moves when it ends; its week is `running`, it offers one week's price and it
-  expires nothing (`week_lost_percent` leaves the running window out). The Weeks page's summary and
-  Overview's figures and weekly chart use it; the Expired share and the findings leave the running
-  windows out. `running_account_weeks` builds the account weeks of the running
-  windows alone, over every week (Overview's This-week card). `running_elsewhere` names the running
-  windows whose midpoint lies in last or next week when the range holds now and does not show that
-  week.
+  expires nothing (`week_lost_percent` leaves the running window out). The Weeks page's summary,
+  Overview's figures and weekly chart, and the full-weeks finding use it; the Expired share and the
+  expired finding leave the running windows out. `running_account_weeks` builds the account weeks of
+  the running windows alone, over every week (Overview's This-week card). `running_elsewhere` names
+  the running windows whose midpoint lies in last or next week when the range holds now and does not
+  show that week.
 - `blocked_spans` reads all events, builds each host's blocked intervals for every limit kind and
   each host's account timeline (the last `Live` or `Switch`), and cuts every interval at the range,
   at every change of the account in use and at an `Unblocked`. Only a piece with
@@ -3508,9 +3509,9 @@ taking a `Range` for their tests; each produces one serde camelCase struct:
 
 ```rust
 // overview.rs
-/// `kpis`, `weeks`, `marks` and the weekly chart count every weekly window of the range, the
-/// running ones included (`account_weeks_so_far`); the Expired share and the findings use finished
-/// windows only. The card on top is `this_week_card`.
+/// `kpis`, `weeks`, `marks`, the weekly chart and the full-weeks finding count every weekly window
+/// of the range, the running ones included (`account_weeks_so_far`); the Expired share and the
+/// expired finding use finished windows only. The card on top is `this_week_card`.
 pub struct Overview { pub without_price: Vec<String>,
     pub kpis: Kpis, pub weeks: Vec<OverviewWeek>, pub marks: Vec<Mark>, pub findings: Vec<String> }
 /// The three totals over every record the card counts, one row per project in the counted
@@ -3549,15 +3550,14 @@ pub struct ThisWeekProject { pub name: String, pub key: Option<ProjectKey>,
 /// by id; one per stored provider subscription and one per unnamed company with records this week,
 /// `Company` order then stored order. A provider row without a running window has `used: None` and
 /// the page does not draw it.
-/// A provider subscription's row: its records of `[week_start(now), now]` (Ollama: its current
-/// month), host filter applied, account chips ignored, summed with `Values::of` / `Values::sum`.
-/// `api` is `None` with `api_missing` when a record has no price; `api_currency` is the sum's (the
-/// settings' currency, "USD" without a rate). `used` is
-/// its window's use (`None` with `resets_at` absent for a finished month), `money` the
-/// subscription value with `money_missing` its reason.
+/// A provider subscription's row: its records from its running window's start to now — OpenAI:
+/// its `weekly_all` week; Ollama: `week_start(now)`, the calendar week's start, like Claude work
+/// without a known account — host filter applied, account chips ignored, summed with `Values::of`
+/// / `Values::sum`. `used` is its running window's use (`None` with `resets_at` absent for a
+/// finished month); an Ollama row's percent and `money` are its current month's, so its work and
+/// its paid share cover the same week. `money_missing` is the reason when it has no price.
 /// `name` is the subscription's abbr.
-pub struct ThisWeekProvider { pub name: String, pub company: Company, pub api: Option<f64>,
-    pub api_currency: Option<String>, pub api_missing: Option<String>,
+pub struct ThisWeekProvider { pub name: String, pub company: Company,
     pub used: Option<f64>,
     pub money: Option<f64>, pub money_missing: Option<String>,
     pub resets_at: Option<DateTime<Utc>> }
@@ -3827,9 +3827,10 @@ Page details that are easy to miss:
   Overview's `Valuer` covers only the range. The card's project split reads the token records of `[min(earliest running start, this week's
   Monday), now]`, keeps the query's host, values each with `Valuer::value` and `Values::of` as the
   Weeks summary does, and shares them with `subscription_shares`: a Claude record in its account's
-  running window, an OpenAI or Ollama record (`Valued.company`) from `week_start(now)` on in its
-  provider subscription's `ThisWeekProvider`, with its own `used`, `money`, `money_missing` and
-  `resets_at`. The card's totals `Values::sum` the same records, and its project rows use
+  running window; an OpenAI record in its subscription's running `weekly_all` week; an Ollama record
+  from `week_start(now)` on. Each provider record belongs to its subscription's `ThisWeekProvider`,
+  whose own `used`, `money`, `money_missing` and `resets_at` are the running window's (for Ollama,
+  the current month's). The card's totals `Values::sum` the same records, and its project rows use
   `subscription_shares` on each project's records.
 - Pages of project work (Projects, project detail, Weeks summary, Activity) choose a record with
   `stats::record_chosen(ctx, q, &Valued)`: a Claude record by `account_chosen`, a provider record by
@@ -4606,8 +4607,8 @@ the app's renderer.
 
 Two more companies. One reader per company turns the answer into the `Usage` and `Limit` types an
 account already uses, so a card, its colours and the history need no second implementation. A
-provider thread in the tray app polls each switched-on card and every provider subscription with a
-price. It reads Codex's `auth.json` at every poll, saves the live login in the secrets store and
+provider thread in the tray app polls each switched-on card and every provider found by itself (R6).
+It reads Codex's `auth.json` at every poll, saves the live login in the secrets store and
 writes `auth.json` only when switching between saved logins; a saved inactive login may renew itself.
 No request generates text.
 

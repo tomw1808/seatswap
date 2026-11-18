@@ -1287,12 +1287,11 @@ export function hours({ lanes, days, marks } = {}) {
     return typeof lane.label === "string" ? lane.label : lane.label.textContent;
   }
 
-  // A missing session count is none; any other non-number or a negative count
-  // is an error, never a silently drawn 0.
+  // A missing cell or session count is an error, never a silently drawn 0.
+  // Rust always sends the count; an unreadable one names its hour.
   function stripSessions(lane, index) {
     const cell = Array.isArray(lane.cells) ? lane.cells[index] : undefined;
     const sessions = cell ? cell.strip : undefined;
-    if (sessions === undefined || sessions === null) return 0;
     if (!finite(sessions) || sessions < 0) {
       throw new Error(
         `an hour cell has no session count: ${String(sessions)} (lane ${JSON.stringify(

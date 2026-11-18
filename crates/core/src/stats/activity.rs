@@ -189,8 +189,9 @@ pub struct ActivityPage {
     pub peak_hour: Tokens,
     /// The tokens of the whole range, summed over all chosen hosts.
     pub total_tokens: Tokens,
-    /// The two values of the whole range, summed over all chosen hosts. A sum
-    /// is all or nothing, like every [`Values::sum`].
+    /// The two values of the whole range, summed over all chosen hosts with
+    /// [`Values::sum`]: each half adds the known parts and stays partial with
+    /// the first missing part's reason when another part is missing (R3).
     pub total_values: Values,
     /// All chosen hosts' output tokens of the last 7 days over their working
     /// hours of those days; `None` without a working hour in the lanes.

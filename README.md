@@ -379,9 +379,8 @@ the tray app, and `seatswap.exe` for everything you want to read in a terminal.
   `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` on Windows). On Windows it also registers
   the name its notifications are shown under
   (`HKCU\Software\Classes\AppUserModelId\dev.seatswap.app`).
-- **Codex and Ollama:** while the Codex card is on, when seatswap finds a Codex login file, or when
-  a price is set for an OpenAI subscription, seatswap reads Codex's `auth.json` for the access token
-  and account id it sends to `chatgpt.com`,
+- **Codex and Ollama:** while the Codex card is on or when seatswap finds a Codex login file,
+  seatswap reads Codex's `auth.json` for the access token and account id it sends to `chatgpt.com`,
   and keeps a copy of every ChatGPT login it sees there, so it can switch back to it. It writes
   `auth.json` only for a switch, holding Codex's own two locks (`auth.lock`, `auth.json.lock`), and
   every key stays as Codex wrote it. It never renews the live login; that stays Codex's job. A saved
@@ -406,13 +405,12 @@ the tray app, and `seatswap.exe` for everything you want to read in a terminal.
   title or task text (shown in the window and cleared before the report other hosts read).
 - **Network:** the usage endpoint (`api.anthropic.com/api/oauth/usage`) and Claude Code's token
   endpoint (`platform.claude.com/v1/oauth/token`, with Claude Code's own client id) to refresh
-  stored logins. While the Codex card is on, a Codex login file is found, or an OpenAI subscription
-  has a price,
+  stored logins. While the Codex card is on or a Codex login file is found,
   `chatgpt.com/backend-api/wham/usage` with each login's own access token and account id, and
   `auth.openai.com/oauth/token` to renew a saved login that is not live; while the Ollama card is on,
-  or the `ollama` program is found, the server at `ollamaUrl` (default
-  `http://127.0.0.1:11434`) for `/api/balance` and `/api/usage?range=24h`, with no secret. And, only
-  while *Look up prices and the dollar rate* is on, `models.dev` for API prices and
+  the `ollama` program is found, or this host stores an Ollama subscription, the server at
+  `ollamaUrl` (default `http://127.0.0.1:11434`) for `/api/balance` and `/api/usage?range=24h`, with
+  no secret. And, only while *Look up prices and the dollar rate* is on, `models.dev` for API prices and
   `api.frankfurter.dev` for the dollar rate; those two send a User-Agent and nothing about you, your
   accounts or this machine. Nothing else.
 - **Logs and output** never contain a token; at most the last four characters of a refresh token.

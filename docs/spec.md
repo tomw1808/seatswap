@@ -888,7 +888,8 @@ cli_auth_credentials_store = "file" in Codex's config.toml and sign in again.`; 
 `apikey` says `Codex is signed in with an API key. An API key is no subscription; seatswap neither
 saves nor switches it.` Nothing in the keyring is read.
 
-With the card on, seatswap sends `GET https://chatgpt.com/backend-api/wham/usage` with
+With the card on or a Codex login found, seatswap sends
+`GET https://chatgpt.com/backend-api/wham/usage` with
 `Authorization: Bearer <access token>`, `chatgpt-account-id: <account id>` and its own
 `User-Agent: seatswap/<version>`. The token goes only to that host, the service that issued it, and
 is never logged. The request follows no redirect: a 3xx answer is an error naming where it pointed,
@@ -1131,8 +1132,9 @@ is 256 px (`crates/app/icons/icon.png`, drawn from `icon.svg`); `icon.ico` carri
 `$XDG_DATA_HOME/icons/hicolor/256x256/apps/seatswap.png` beside it, when they are missing or differ.
 The entry has a line `X-seatswap-managed=true`, starts the same command and flags as the autostart
 entry, and names the icon's full path; a path or argument with a line break is refused. A symbolic
-link at either path is left alone and named once on standard error, and so is an entry without that
-managed line. The icon is seatswap's own file and is still written when the entry is left alone. A
+link at either path is left alone, and so is an entry without that managed line; each such path
+gets one line on standard error: `seatswap: {path} was not made by seatswap; it is left as it is.`
+The icon is seatswap's own file and is still written when the entry is left alone. A
 write failure is named on standard error and never stops the start. Nothing is written on Windows.
 
 ---
@@ -1681,8 +1683,8 @@ first reading. A history whose accounts were all removed since stays on show.
   like a finished window, so it never moves to another week when it ends; that midpoint can lie in
   last week or next week. A page counts it where it shows the range's windows: it offers one week's
   price like any window, it has expired nothing yet, and its week is marked "so far". The Expired
-  share and auto-burn's averages use finished windows only; the This-week card counts the running
-  ones.
+  share, the expired finding and the expired part of auto-burn's averages use finished windows only;
+  the This-week card and the other findings count the running ones.
 - **The price of a window** is the account's monthly price at the window's midpoint: the last
   `PriceChanged` at or before it, or the first change when the midpoint lies before all of them, or
   the stored price when there is no change. It counts only in the currency it was entered in, as in
@@ -1741,8 +1743,10 @@ note says `Percent of each subscription's weekly limit; its window resets at the
 account rows stand in the stored accounts' order, then the provider subscriptions in the chips'
 order. A Claude account's row counts its token records of its running window from its start to now,
 and work without a known account from the start of the calendar week; the host filter applies. A
-provider row counts its records from its running window's start (OpenAI: its `weekly_all` week;
-Ollama: its `monthly_credits` month) to now; its subscription's chip chooses it like an account's.
+provider row counts its records from its running window's start to now — OpenAI: its `weekly_all`
+week; Ollama: the start of the calendar week, like Claude work without a known account, so its work
+and its paid share cover the same week. Its line under **Subscriptions this week** keeps its
+month's percent and money. Its subscription's chip chooses it like an account's.
 Before the first usage reading the card says `No usage reading
 yet: this card fills in with the next usage poll.`
 
@@ -1756,7 +1760,10 @@ so**: five numbers for the range,
 - **Used**: the money used of the priced account weeks, the running ones included, with the money
   paid for them below it; its
   percent is the used money over the money the windows offered, one week's price per window, so a
-  reset week offers two and a running window offers one.
+  reset week offers two and a running window offers one. The figures row counts weekly windows alone:
+  Claude accounts' and OpenAI subscriptions' `weekly_all` weeks. A priced week adds its money; a week
+  without a price is left out, and a stored Claude account with such a week is named under "No price
+  for …". An Ollama month is not a weekly window and is not counted there (documented rule).
 - **Expired unused**: the money that expired and its percent of the finished windows' offered money,
   split per
   account, largest first. A window above 100 % counts all its use, so Used and Expired together can
@@ -1778,10 +1785,10 @@ subscription value among the projects (the three largest, the rest as *other*). 
 stand under each week, and the marks say when an account was added and when auto-burn was switched
 on or off. Beside them, "Share that expired, per week" is one line: the expired money over the money
 the week's finished windows offered, by the same rule as the Expired share; a week without a priced
-finished window has no point. When no weekly window of the range has finished yet, the chart card says `No weekly window
-has finished in this range yet. The card above shows the running ones.` instead of a chart; the
-numbers stay. A subscription has the same colour on the card, in the project rows and in the matrix.
-"What the numbers say"
+finished window has no point. When the range holds no weekly window at all, the chart card says
+`No weekly window in this range yet.` instead of a chart; the numbers stay. A range whose only weekly
+windows still run has its chart, because the chart counts the running ones (R5). A subscription has
+the same colour on the card, in the project rows and in the matrix. "What the numbers say"
 holds at most four sentences, in this order, each only when it has data:
 
 1. `{abbr} is where most money expired: {amount} in {n} weeks.` — the account with the largest
@@ -1791,8 +1798,9 @@ holds at most four sentences, in this order, each only when it has data:
    `AutoBurnSet { on: true }` in the range that stayed on, with a full week before and after it.
 4. `{abbr} was full in {n} of {m} weeks.` — the account with the most weeks at 100 %.
 
-The sentences and the Expired share use finished windows only; the Used figure, its paid line and
-the weekly chart count the running ones too.
+The findings count every weekly window of the range, the running ones included, except the expired
+finding; it and the Expired share use finished windows only, because a running window has expired
+nothing. The Used figure, its paid line and the weekly chart count the running ones too.
 
 **Weeks.** Every window as a grid under the heading "Every weekly window": one row per account, one
 column per calendar week, the weeks' dates above, and the chosen week's detail in the card on the
@@ -2543,8 +2551,8 @@ apply to the past too, because the history stores the repository's identity, not
 - Network traffic goes only to `api.anthropic.com` and `platform.claude.com` for an account's usage
   and login; to `chatgpt.com/backend-api/wham/usage` while the Codex card is on or a Codex login is
   found, and to `auth.openai.com/oauth/token` for a saved login that needs renewal; to the Ollama server
-  at `ollamaUrl` for `/api/balance` and `/api/usage?range=24h` while the Ollama card is on or the
-  `ollama` program is found on `PATH`; and — only
+  at `ollamaUrl` for `/api/balance` and `/api/usage?range=24h` while the Ollama card is on, the
+  `ollama` program is found on `PATH`, or this host stores an Ollama subscription; and — only
   while `lookUpPrices` is on — to `models.dev` for API prices and `api.frankfurter.dev` for the dollar
   rate (§11.5). The two look-ups send the User-Agent `seatswap/<version>` and no account, token or
   machine data. The provider requests follow no redirect: a 3xx answer is an error naming where it

@@ -1017,7 +1017,7 @@ impl EngineRuntime {
             .and_then(|engine| engine.recorder())
             .map(|recorder| recorder.take_warnings());
         if let Some(warnings) = warnings {
-            super::lock(&self.printed_warnings).print(&warnings);
+            super::lock(&self.printed_warnings).print(Some("history"), &warnings);
         }
     }
 
@@ -1185,7 +1185,7 @@ impl EngineRuntime {
         if let Some(error) = report.error {
             self.snapshot.error = combine(self.snapshot.error.take(), error);
         }
-        super::lock(&self.printed_warnings).print(&report.warnings);
+        super::lock(&self.printed_warnings).print(Some("history"), &report.warnings);
         if let Some(text) = report.notification {
             if settings.notify_on_switch {
                 notify::send_switch(&self.app, &text);
@@ -1625,7 +1625,7 @@ impl ActionRuntime {
         };
         match shared::sync(store, recorder, Utc::now()) {
             Ok(applied) => {
-                super::lock(&self.printed_warnings).print(&applied.warnings);
+                super::lock(&self.printed_warnings).print(Some("history"), &applied.warnings);
                 if !applied.settings.is_empty() {
                     self.settings_changed();
                 }
@@ -2026,9 +2026,10 @@ fn settings_change_events(previous: &Settings, next: &Settings) -> Result<Vec<Ev
     Ok(events)
 }
 
-/// The history read warnings this run of the app has already printed. A month
-/// file is read again at every live-account change, so its torn lines would
-/// otherwise be printed again each time.
+/// The stderr lines this run of the app has already printed: history read
+/// warnings and a found provider's error. A month file is read again at every
+/// live-account change, so its torn lines would otherwise be printed again each
+/// time.
 #[derive(Debug, Default)]
 pub(crate) struct PrintedWarnings {
     seen: BTreeSet<String>,
@@ -2041,29 +2042,32 @@ impl PrintedWarnings {
         }
     }
 
-    /// The warnings in `warnings` this run has not printed yet; they are
-    /// remembered so the next call returns none of them.
-    pub(crate) fn new_texts(&mut self, warnings: &[String]) -> Vec<String> {
-        let mut texts = Vec::new();
-        for warning in warnings {
-            if self.seen.insert(warning.clone()) {
-                texts.push(warning.clone());
+    /// Print each text this run has not printed yet with its label: history
+    /// warnings read `seatswap: history: <warning>` (spec §1.2), and a found
+    /// provider's error reads `seatswap: <error>` as `ReportedErrors::report`
+    /// prints it with the card on. `None` is no label. Each line is remembered,
+    /// so the next call with the same line prints nothing.
+    pub(crate) fn print(&mut self, label: Option<&str>, texts: &[String]) {
+        for text in texts {
+            let line = match label {
+                Some(label) => format!("seatswap: {label}: {text}"),
+                None => format!("seatswap: {text}"),
+            };
+            if self.seen.insert(line.clone()) {
+                eprintln!("{line}");
             }
-        }
-        texts
-    }
-
-    /// Print the warnings this run has not printed yet, in the spec's one form
-    /// (`seatswap: history: <warning>`, spec §1.2).
-    pub(crate) fn print(&mut self, warnings: &[String]) {
-        for warning in self.new_texts(warnings) {
-            eprintln!("seatswap: history: {warning}");
         }
     }
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.seen.len()
+    }
+
+    /// The lines this run printed, for the tests that check a label.
+    #[cfg(test)]
+    pub(crate) fn lines(&self) -> Vec<String> {
+        self.seen.iter().cloned().collect()
     }
 }
 
@@ -2094,7 +2098,7 @@ fn record_external_switch(
         },
         &Hosts::One(recorder.dir().host().to_string()),
     )?;
-    super::lock(printed).print(&read.warnings);
+    super::lock(printed).print(Some("history"), &read.warnings);
     let already = read
         .records
         .iter()
