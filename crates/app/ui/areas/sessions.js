@@ -1672,7 +1672,7 @@ function agentNameNode(agent) {
   return name;
 }
 
-function agentCells(agent, children, depth) {
+function agentCells(agent, children, depth, details) {
   const now = Date.now();
   const view = state.view;
   const name = agentNameNode(agent);
@@ -1686,7 +1686,7 @@ function agentCells(agent, children, depth) {
     h(
       "span",
       { class: "sess-name", style: { paddingLeft: `${depth * 14}px` } },
-      [h("span", { class: children.length ? "sess-car" : "sess-car0" }), name]
+      [h("span", { class: details ? "sess-car" : "sess-car0" }), name]
     ),
     h("span", { class: "sess-model" }, modelName(agent.model)),
     agentStatus(agent, now),
@@ -1705,9 +1705,21 @@ function agentNode(session, agent, children, depth) {
   const row = h("div", {
     class: "sess-row sess-agent",
   });
-  for (const cell of agentCells(agent, children, depth)) row.appendChild(cell);
+  // N-1: a flash job with exactly one worker, and that worker has no agents of
+  // its own, is a leaf. Its lone worker gets no row and the job row folds
+  // nothing; its cells, the agents cell included, still come from the same
+  // children, so the row says "1 running" (or "1 done") as it did before. An
+  // agent of any other kind, or a lone worker with agents below it, keeps its
+  // fold and is drawn as before.
+  const loneWorker =
+    agent.kind === "flash" &&
+    children.length === 1 &&
+    childAgents(session, children[0].agent).length === 0;
+  for (const cell of agentCells(agent, children, depth, children.length > 0 && !loneWorker)) {
+    row.appendChild(cell);
+  }
   row.dataset.agent = key;
-  if (children.length === 0) return row;
+  if (children.length === 0 || loneWorker) return row;
 
   const container = h("details", { class: "sess-details sess-agent-details", open });
   container.appendChild(h("summary", { class: "sess-summary-wrap" }, row));

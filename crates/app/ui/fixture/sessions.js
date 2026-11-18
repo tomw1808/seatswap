@@ -25,9 +25,8 @@ const SESSION_PROJECTS = {
   notes: "github.com/sam/notes",
 };
 
-// The page-shot hook below marks both running agents of the one session that
-// has exactly two of them as done; every view built afterwards carries them
-// done.
+// The page-shot hook below marks both running agents of session `dsh-b7` as
+// done; every view built afterwards carries them done.
 let agentsFinished = false;
 let lastFinishedSession = null;
 // The options of the last `sessions_view`, so a pushed view lists what the page
@@ -427,6 +426,37 @@ function fixtureSessionRows() {
       "DeepSeek Harness"
     ),
   ];
+  // A second flash job with exactly one worker (N-1), in a session of project
+  // `ledger`: it is a leaf, so the job row keeps its figures and its "1
+  // running" agents cell while the worker has no row of its own.
+  const oneWorkerFlashAgents = [
+    fixtureAgent(
+      "ledger-4a",
+      "flash-one",
+      null,
+      "flash",
+      "ledger import: one worker",
+      "deepseek-v4.1-flash:cloud",
+      true,
+      isoIn(-5 * 60000),
+      null,
+      0.6,
+      "DeepSeek Harness"
+    ),
+    fixtureAgent(
+      "ledger-4a",
+      "flash-one-worker",
+      "flash-one",
+      null,
+      null,
+      "deepseek-v4.1-flash:cloud",
+      true,
+      isoIn(-3 * 60000),
+      null,
+      0.3,
+      "DeepSeek Harness"
+    ),
+  ];
   // A Harness session of its own (no Claude session owns it): its agents are
   // its workers, not flash jobs.
   const harnessAgents = [
@@ -557,6 +587,9 @@ function fixtureSessionRows() {
     make("notes-62", "notes", "atlas", "busy", "claude-fable-5-2", isoIn(-20 * 1000), 1.8, 0.5, 3, 0, flashAgents, {
       title: "Patch the release notes",
     }),
+    make("ledger-4a", "ledger", "vega", "busy", "claude-opus-5-5", isoIn(-20 * 1000), 1.3, 0.3, 2, 0, oneWorkerFlashAgents, {
+      title: "Ledger import with one flash worker",
+    }),
     make("notes-47", "notes", "atlas", "busy", "claude-fable-5-2", isoIn(-6 * 60000), 5.3, 1.2, 0, 2, s47Agents, {
       title: "Research a usage endpoint",
       tied: true,
@@ -585,16 +618,11 @@ function fixtureSessionRows() {
 }
 
 // The fixture hook's change, made on every view built after it was called: the
-// one session with exactly two running agents gets them done, so the page sees
-// `agentsRunning` drop from 2 to 0 as a live view would show it.
+// session `dsh-b7`, which has exactly two running agents, gets them done, so
+// the page sees `agentsRunning` drop from 2 to 0 as a live view would show it.
 function fixtureFinishTwoAgents(rows) {
-  const sessions = rows.filter((row) => row.agentsRunning === 2);
-  if (sessions.length !== 1) {
-    throw new Error(
-      `the fixture needs one session with 2 running agents, got ${sessions.length}`
-    );
-  }
-  const session = sessions[0];
+  const session = rows.find((row) => row.session === "dsh-b7");
+  if (!session) throw new Error("the fixture session dsh-b7 is missing");
   const agents = Array.isArray(session.agents) ? session.agents : [];
   const running = agents.filter((agent) => agent.running === true);
   if (running.length !== 2) {
