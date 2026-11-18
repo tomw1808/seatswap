@@ -1671,6 +1671,52 @@ impl SecretStore for FileSecrets {
     }
 }
 
+/// The store used on Windows when the recorded backend is the keyring: Claude
+/// logins stay in Credential Manager (`main`), Codex logins go to private files
+/// in the secrets folder (`codex`). A Codex login is the whole `auth.json`,
+/// past Credential Manager's 2560 bytes per entry (about 3,900 characters in
+/// docs/windows.md §15, R7).
+///
+/// Built on every platform so its tests run everywhere; only
+/// [`open_secrets_with`] chooses it, and only on Windows. The typed methods are
+/// the trait's own, so a login is the same JSON whichever store holds it.
+pub struct RoutedSecrets {
+    /// Claude logins and every other value: the backend the user recorded.
+    pub main: Box<dyn SecretStore>,
+    /// Codex logins: private files in the secrets folder, as the 0600 fallback.
+    pub codex: FileSecrets,
+}
+
+impl SecretStore for RoutedSecrets {
+    fn get_value(&self, id: &str) -> Result<Option<Value>, StoreError> {
+        self.main.get_value(id)
+    }
+
+    fn set_value(&self, id: &str, value: &Value) -> Result<(), StoreError> {
+        self.main.set_value(id, value)
+    }
+
+    /// Deletes in `codex` first, then in `main`; the other is still attempted
+    /// when one fails, and the first error is the one returned.
+    fn delete(&self, id: &str) -> Result<(), StoreError> {
+        let codex = self.codex.delete(id);
+        let main = self.main.delete(id);
+        codex.and(main)
+    }
+
+    fn encrypted(&self) -> bool {
+        self.main.encrypted()
+    }
+
+    fn get_codex(&self, id: &str) -> Result<Option<crate::types::CodexLogin>, StoreError> {
+        self.codex.get_codex(id)
+    }
+
+    fn set_codex(&self, id: &str, login: &crate::types::CodexLogin) -> Result<(), StoreError> {
+        self.codex.set_codex(id, login)
+    }
+}
+
 /// Open the secrets for the backend recorded in `accounts.json` (`recorded`) or,
 /// on first use (`None`), choose one by probing the keyring and report it so the
 /// caller can record it. The second value is the backend to record; the third is
@@ -1699,7 +1745,7 @@ fn open_secrets_with(
 ) -> Result<(Box<dyn SecretStore>, SecretsBackend, Option<String>), StoreError> {
     match recorded {
         Some(SecretsBackend::Keyring) => match probe() {
-            Ok(()) => Ok((Box::new(KeyringSecrets), SecretsBackend::Keyring, None)),
+            Ok(()) => Ok((keyring_store(app), SecretsBackend::Keyring, None)),
             Err(reason) => Err(StoreError::Keyring(format!(
                 "the OS keyring is not available: {reason}; the logins are stored in the keyring"
             ))),
@@ -1709,7 +1755,7 @@ fn open_secrets_with(
             Ok((secrets, SecretsBackend::File, Some(warning)))
         }
         None => match probe() {
-            Ok(()) => Ok((Box::new(KeyringSecrets), SecretsBackend::Keyring, None)),
+            Ok(()) => Ok((keyring_store(app), SecretsBackend::Keyring, None)),
             Err(reason) => {
                 let (secrets, warning) = file_secrets(app);
                 Ok((
@@ -1721,6 +1767,25 @@ fn open_secrets_with(
                 ))
             }
         },
+    }
+}
+
+/// The keyring-backed store. On Windows a Codex login cannot be saved in
+/// Credential Manager — 2560 bytes per entry, a Codex login about 7,800 bytes as
+/// UTF-16 (docs/windows.md §15) — so the keyring keeps the Claude logins and
+/// Codex logins go to private files in the secrets folder (R7).
+fn keyring_store(app: &AppPaths) -> Box<dyn SecretStore> {
+    #[cfg(windows)]
+    {
+        Box::new(RoutedSecrets {
+            main: Box::new(KeyringSecrets),
+            codex: FileSecrets::new(app.secrets_dir()),
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = app;
+        Box::new(KeyringSecrets)
     }
 }
 
@@ -2244,6 +2309,29 @@ mod tests {
             "organizationUuid": ONE_ORG_UUID
         });
         Login::from_credentials(credentials.as_object().unwrap()).unwrap()
+    }
+
+    /// A Codex `auth.json` as Codex writes it: the whole object with the three
+    /// tokens, their real lengths, and the account id. It is about 3,800
+    /// characters, about 7,600 bytes as UTF-16, past Credential Manager's 2560
+    /// bytes per entry (docs/windows.md §15).
+    fn sample_codex_login() -> crate::types::CodexLogin {
+        let value = json!({
+            "OPENAI_API_KEY": null,
+            "tokens": {
+                "id_token": "x".repeat(1_600),
+                "access_token": "x".repeat(1_900),
+                "refresh_token": "x".repeat(90),
+                "account_id": ONE_ACCOUNT_UUID,
+            },
+            "last_refresh": "2026-11-18T12:00:00.000000Z",
+        });
+        crate::types::CodexLogin(
+            value
+                .as_object()
+                .expect("the fixture login is an object")
+                .clone(),
+        )
     }
 
     fn identity(
@@ -3595,6 +3683,78 @@ mod tests {
         let path = dir.join(format!("{ONE_ID}.json"));
         assert_eq!(fs::read_to_string(&path).unwrap(), expected);
         assert_eq!(secrets.get(ONE_ID).unwrap(), Some(login));
+    }
+
+    /// On Windows with the keyring backend, Claude logins stay in the keyring
+    /// (`main`) and Codex logins go to files (`codex`) because a Codex login is
+    /// past Credential Manager's 2560 bytes per entry (R7, docs/windows.md §15).
+    /// Two `FileSecrets` folders stand in for the two stores.
+    #[test]
+    fn routed_secrets_keep_codex_logins_apart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main_dir = tmp.path().join("keyring");
+        let codex_dir = tmp.path().join("codex");
+        let routed = RoutedSecrets {
+            main: Box::new(FileSecrets::new(main_dir.clone())),
+            codex: FileSecrets::new(codex_dir.clone()),
+        };
+
+        let claude = sample_login();
+        let codex = sample_codex_login();
+        routed.set(ONE_ID, &claude).unwrap();
+        routed.set_codex(TWO_ID, &codex).unwrap();
+
+        // Each reads back through the routed store.
+        assert_eq!(routed.get(ONE_ID).unwrap(), Some(claude.clone()));
+        assert_eq!(routed.get_codex(TWO_ID).unwrap(), Some(codex.clone()));
+
+        // Each lives in its own store only.
+        let main = FileSecrets::new(main_dir.clone());
+        let codex_store = FileSecrets::new(codex_dir.clone());
+        assert_eq!(main.get(ONE_ID).unwrap(), Some(claude));
+        assert_eq!(main.get(TWO_ID).unwrap(), None);
+        assert_eq!(codex_store.get_codex(TWO_ID).unwrap(), Some(codex.clone()));
+        assert_eq!(codex_store.get(ONE_ID).unwrap(), None);
+        assert!(main_dir.join(format!("{ONE_ID}.json")).exists());
+        assert!(!main_dir.join(format!("{TWO_ID}.json")).exists());
+        assert!(codex_dir.join(format!("{TWO_ID}.json")).exists());
+        assert!(!codex_dir.join(format!("{ONE_ID}.json")).exists());
+
+        // The Codex login really is the size Credential Manager cannot take.
+        let text = serde_json::to_string(&Value::Object(codex.0)).unwrap();
+        let chars = text.chars().count();
+        assert!(
+            (3_500..4_000).contains(&chars),
+            "the fixture Codex login is {chars} characters, not the real size"
+        );
+        assert_eq!(routed.encrypted(), main.encrypted());
+    }
+
+    #[test]
+    fn removing_a_codex_login_deletes_its_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main_dir = tmp.path().join("keyring");
+        let codex_dir = tmp.path().join("codex");
+        let routed = RoutedSecrets {
+            main: Box::new(FileSecrets::new(main_dir.clone())),
+            codex: FileSecrets::new(codex_dir.clone()),
+        };
+        routed.set_codex(TWO_ID, &sample_codex_login()).unwrap();
+        // The same id in `main` too: a delete removes it from both stores.
+        routed.set(TWO_ID, &sample_login()).unwrap();
+        let codex_path = codex_dir.join(format!("{TWO_ID}.json"));
+        let main_path = main_dir.join(format!("{TWO_ID}.json"));
+        assert!(codex_path.exists());
+        assert!(main_path.exists());
+
+        routed.delete(TWO_ID).unwrap();
+
+        assert!(!codex_path.exists());
+        assert!(!main_path.exists());
+        assert_eq!(routed.get_codex(TWO_ID).unwrap(), None);
+        assert_eq!(routed.get(TWO_ID).unwrap(), None);
+        // Deleting a login that is not there is fine.
+        routed.delete(TWO_ID).unwrap();
     }
 
     #[test]
