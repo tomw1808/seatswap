@@ -1,5 +1,5 @@
 // The Projects page (spec §3.6): the tree of organizations, projects and
-// folders, the organization × account matrix with its sentences, and one
+// folders, the organization × subscription matrix with its sentences, and one
 // project's detail. The page formats and draws the struct; it adds no sum,
 // share or sentence of the struct's own.
 
@@ -14,19 +14,30 @@ import {
   dateText,
   emptyLine,
   errorMessage,
+  foldMemory,
   h,
   isColor,
   isObject,
   modelColor,
   modelName,
   percentText,
-  providerName,
   shortDate,
   showTokens,
+  subscriptionSplit,
   tokens,
-  valueTip,
+  valueNode,
 } from "../../common.js";
 import { lines } from "../../charts.js";
+
+// The user's folds, made once so they last while the window is open (rule R7):
+// an organization is open until folded, a project is folded until unfolded.
+const folds = foldMemory();
+
+// A matrix cell is `null` when a record of it has no subscription value and
+// `null` also when only some of its records have one; its row and column totals
+// keep the known part (rule R3), which the page's fixed reason says.
+const CELL_UNKNOWN =
+  "some of this work has no subscription value; the totals keep the known part";
 
 function sameKey(first, second) {
   return Boolean(
@@ -41,13 +52,36 @@ function hasChildren(nodes, index) {
   return index + 1 < nodes.length && nodes[index + 1].level > nodes[index].level;
 }
 
-function visibleRows(nodes, mode, collapsed) {
+// A row's stable fold key, the same across ranges: an organization by its name,
+// a project by its key. Folders are leaves.
+function foldKey(node) {
+  if (node.kind === "org") return `org:${node.name}`;
+  if (node.kind === "project") {
+    if (!isObject(node.key)) {
+      throw new Error(`a project row needs its key, not ${JSON.stringify(node.key)}`);
+    }
+    return `project:${JSON.stringify(node.key)}`;
+  }
+  throw new Error(`a ${JSON.stringify(node.kind)} row has no fold of its own`);
+}
+
+function defaultOpen(node) {
+  if (node.kind === "org") return true;
+  if (node.kind === "project") return false;
+  throw new Error(`a ${JSON.stringify(node.kind)} row has no fold of its own`);
+}
+
+function isNodeOpen(node) {
+  return folds.isOpen(foldKey(node), defaultOpen(node));
+}
+
+function visibleRows(nodes, mode) {
   const rows = [];
   const stack = [];
   for (let index = 0; index < nodes.length; index += 1) {
     const node = nodes[index];
-    while (stack.length > 0 && stack[stack.length - 1].level >= node.level) stack.pop();
-    const hidden = stack.some((entry) => collapsed.has(entry.index));
+    while (stack.length > 0 && stack[stack.length - 1].node.level >= node.level) stack.pop();
+    const hidden = stack.some((entry) => !isNodeOpen(entry.node));
     if (!hidden && !(mode === "plain" && node.kind === "org")) {
       rows.push({
         node,
@@ -55,51 +89,21 @@ function visibleRows(nodes, mode, collapsed) {
         level: mode === "plain" ? Math.max(0, node.level - 1) : node.level,
       });
     }
-    if (hasChildren(nodes, index)) stack.push({ index, level: node.level });
+    if (hasChildren(nodes, index)) stack.push({ node });
   }
   return rows;
 }
 
-// What a row stands for, in a provider tag's tooltip.
+// What a row stands for, in a bar part's tooltip.
 const NODE_NOUN = { org: "organization", project: "project", folder: "folder" };
 
-// What a provider's part of a row says: its share of the row's API value. The
-// work belongs to the provider's subscription when that has a price (its value
-// is in the Subscr. column), and is valued at API prices only when it has none.
-function providerTip(node, name, percent) {
+// The tree's bar split by subscription (rule R2): the one helper every page
+// uses, so the unknown part is grey and striped here as on the Overview.
+function splitBar(node, env) {
   const noun = NODE_NOUN[node.kind];
   if (!noun) throw new Error(`unknown row kind ${JSON.stringify(node.kind)}`);
-  return `${name} · ${percentText(percent)} of this ${noun}'s API value · its provider subscription when it has a price, otherwise API prices only`;
-}
-
-// The tree's by-account bar. Every account's part is in its account's own
-// colour from the snapshot, through the helper the other statistics pages use
-// (`accountView` and `isColor`); an account the snapshot does not know is the
-// muted colour. Another company's part (OpenAI, Ollama) follows, neutral and
-// faded: it is no account's.
-function splitBar(node, env) {
-  const bar = h("span", { class: "stats-split" });
-  for (const [id, percent] of node.byAccount) {
-    const view = id === null ? null : accountView(env.accounts, id);
-    const color = view && isColor(view.color) ? view.color : "var(--muted)";
-    const name =
-      id === null ? "unknown account" : accountNameText(env.accounts, id);
-    const part = h("i", {
-      style: { width: `${Math.min(100, Math.max(0, percent))}%`, background: color },
-      title: `${name}: ${percentText(percent)}`,
-    });
-    bar.appendChild(part);
-  }
-  for (const [name, percent] of node.byProvider) {
-    bar.appendChild(
-      h("i", {
-        class: "stats-split-provider",
-        style: { width: `${Math.min(100, Math.max(0, percent))}%` },
-        title: providerTip(node, name, percent),
-      })
-    );
-  }
-  return bar;
+  return subscriptionSplit(node.bySubscription, env.accounts, (name, percent) =>
+    `${name} · ${percentText(percent)} of this ${noun}'s API value`);
 }
 
 // The reason a share is unknown: projects.rs sends `null` when the project's
@@ -150,7 +154,6 @@ export async function show(container, env) {
 
   const state = {
     mode: "org",
-    collapsed: new Set(),
     detail: null,
     detailKey: null,
     detailError: null,
@@ -201,12 +204,12 @@ export async function show(container, env) {
       h("span", {}),
       h("span", { class: "n", text: "Subscr." }),
       h("span", { class: "n", text: "API value" }),
-      h("span", { text: "By account" }),
+      h("span", { text: "By subscription" }),
       h("span", { class: "n", text: "Sess." }),
     ]);
     list.appendChild(head);
 
-    for (const { node, index, level } of visibleRows(data.nodes, state.mode, state.collapsed)) {
+    for (const { node, index, level } of visibleRows(data.nodes, state.mode)) {
       const group = hasChildren(data.nodes, index);
       const selected = node.key !== null && sameKey(node.key, state.detailKey);
       const classes = ["stats-tree-row", node.kind === "org" ? "stats-tree-row-org" : "", selected ? "stats-tree-row-selected" : ""];
@@ -215,16 +218,16 @@ export async function show(container, env) {
       const nameCell = h("span", { class: "stats-tree-name" });
       nameCell.style.paddingLeft = `${level * 16}px`;
       if (group) {
+        const open = isNodeOpen(node);
         const caret = h("button", {
           type: "button",
           class: "stats-caret",
-          "aria-label": state.collapsed.has(index) ? "Open" : "Close",
-          text: state.collapsed.has(index) ? "▸" : "▾",
+          "aria-label": open ? "Close" : "Open",
+          text: open ? "▾" : "▸",
         });
         caret.addEventListener("click", (event) => {
           event.stopPropagation();
-          if (state.collapsed.has(index)) state.collapsed.delete(index);
-          else state.collapsed.add(index);
+          folds.set(foldKey(node), !open);
           paint();
         });
         nameCell.appendChild(caret);
@@ -241,9 +244,6 @@ export async function show(container, env) {
         if (node.orgAccounts.length === 0) {
           nameCell.appendChild(h("span", { class: "stats-tree-none", text: "· no organization" }));
         }
-      }
-      for (const [name, percent] of node.byProvider) {
-        nameCell.appendChild(providerName(name, providerTip(node, name, percent)));
       }
       row.appendChild(nameCell);
 
@@ -264,12 +264,12 @@ export async function show(container, env) {
         })
       );
       row.appendChild(usage);
-      const subscription = amountNode(node.values.subscription, node.values.currency);
-      subscription.title = valueTip(node.values, "subscription", "in the range");
-      const api = amountNode(node.values.api, node.values.apiCurrency);
-      api.title = valueTip(node.values, "api", "in the range");
-      row.appendChild(h("span", { class: "n" }, [subscription]));
-      row.appendChild(h("span", { class: "n mf" }, [api]));
+      row.appendChild(
+        h("span", { class: "n" }, [valueNode(node.values, "subscription", env.currency)])
+      );
+      row.appendChild(
+        h("span", { class: "n mf" }, [valueNode(node.values, "api", env.currency)])
+      );
       row.appendChild(splitBar(node, env));
       row.appendChild(h("span", { class: "n", text: String(node.sessions) }));
 
@@ -349,22 +349,22 @@ export async function show(container, env) {
     clear(matrixCard);
     matrixCard.appendChild(
       h("div", { class: "ch" }, [
-        h("span", { class: "t", text: "Organization × account" }),
+        h("span", { class: "t", text: "Organization × subscription" }),
         h("span", { class: "s", text: "subscription value" }),
       ])
     );
     const body = h("div", { class: "stats-matrix-body" });
-    if (data.matrix.accounts.length === 0) {
+    if (data.matrix.subscriptions.length === 0) {
       body.appendChild(emptyLine("no session in the range"));
       matrixCard.appendChild(body);
       return;
     }
     const table = h("div", { class: "stats-matrix" });
-    const width = `minmax(84px, 1fr) repeat(${data.matrix.accounts.length}, minmax(0, 1fr)) minmax(46px, auto)`;
+    const width = `minmax(84px, 1fr) repeat(${data.matrix.subscriptions.length}, minmax(0, 1fr)) minmax(46px, auto)`;
     table.style.setProperty("--stats-matrix-columns", width);
     const head = h("div", { class: "stats-matrix-row stats-matrix-row-head" });
     head.appendChild(h("span", { text: "Organization" }));
-    for (const id of data.matrix.accounts) {
+    for (const id of data.matrix.subscriptions) {
       head.appendChild(h("span", { class: "stats-matrix-head-cell" }, [accountName(env.accounts, id)]));
     }
     head.appendChild(
@@ -375,49 +375,68 @@ export async function show(container, env) {
     );
     table.appendChild(head);
     for (const [rowIndex, org] of data.matrix.orgs.entries()) {
+      const cells = data.matrix.cells[rowIndex];
+      if (!Array.isArray(cells) || cells.length !== data.matrix.subscriptions.length) {
+        throw new Error(
+          `the matrix row ${JSON.stringify(org)} does not match the subscriptions`
+        );
+      }
       const row = h("div", { class: "stats-matrix-row" });
       row.appendChild(h("span", { class: "stats-matrix-org", text: org, title: org }));
-      for (const [column, id] of data.matrix.accounts.entries()) {
-        const value = data.matrix.cells[rowIndex][column];
+      for (const [column, id] of data.matrix.subscriptions.entries()) {
+        const value = cells[column];
         const view = accountView(env.accounts, id);
         const color = view && isColor(view.color) ? view.color : "var(--muted)";
-        const cell = h("span", {
-          class: "stats-matrix-cell",
-          title: `${org} on ${accountNameText(env.accounts, id)}: ${amountTip(
-            value,
-            env.currency
-          )}`,
-          style: { "--stats-matrix-color": color },
-        }, [amountNode(value, env.currency)]);
-        row.appendChild(cell);
+        const style = { "--stats-matrix-color": color };
+        if (value === null) {
+          row.appendChild(
+            h("span", {
+              class: "stats-matrix-cell stats-matrix-cell-none",
+              text: "—",
+              title: CELL_UNKNOWN,
+              style,
+            })
+          );
+        } else if (typeof value === "number" && Number.isFinite(value)) {
+          row.appendChild(
+            h("span", {
+              class: "stats-matrix-cell",
+              title: `${org} on ${accountNameText(env.accounts, id)}: ${amountTip(
+                value,
+                env.currency
+              )}`,
+              style,
+            }, [amountNode(value, env.currency)])
+          );
+        } else {
+          throw new Error(
+            `the matrix cell of ${JSON.stringify(org)} and ${JSON.stringify(id)} is not a number or null: ${JSON.stringify(value)}`
+          );
+        }
       }
       row.appendChild(
         h("span", {
           class: "stats-matrix-total",
-          title: `${org}: ${amountTip(data.matrix.rowTotals[rowIndex], env.currency)}`,
-        }, [amountNode(data.matrix.rowTotals[rowIndex], env.currency)])
+        }, [valueNode(data.matrix.rowTotals[rowIndex], "subscription", env.currency)])
       );
       table.appendChild(row);
     }
     if (data.matrix.orgs.length > 0) {
       const foot = h("div", { class: "stats-matrix-row stats-matrix-row-foot" });
       foot.appendChild(h("span", { class: "stats-matrix-org", text: "Used" }));
-      for (const [column, id] of data.matrix.accounts.entries()) {
+      for (const [column, id] of data.matrix.subscriptions.entries()) {
         foot.appendChild(
           h("span", {
-            class: "stats-matrix-foot-cell",
-            title: `${accountNameText(env.accounts, id)}: used ${amountTip(
-              data.matrix.columnTotals[column],
-              env.currency
-            )}`,
-          }, [amountNode(data.matrix.columnTotals[column], env.currency)])
+            class: "stats-matrix-total",
+            title: `${accountNameText(env.accounts, id)}: used in the range`,
+          }, [valueNode(data.matrix.columnTotals[column], "subscription", env.currency)])
         );
       }
       foot.appendChild(
         h("span", {
-          class: "stats-matrix-foot-total",
-          title: `every organization: used ${amountTip(data.matrix.total, env.currency)}`,
-        }, [amountNode(data.matrix.total, env.currency)])
+          class: "stats-matrix-total",
+          title: "every organization: used in the range",
+        }, [valueNode(data.matrix.total, "subscription", env.currency)])
       );
       table.appendChild(foot);
     }
@@ -460,18 +479,49 @@ export async function show(container, env) {
         h("span", { class: "stats-kpi-sub", text: `written ${tokens(detail.tokens.cw)}` }),
       ])
     );
-    const subscription = amountNode(detail.values.subscription, detail.values.currency);
-    subscription.title = valueTip(detail.values, "subscription", "in the range");
-    const api = amountNode(detail.values.api, detail.values.apiCurrency);
-    api.title = valueTip(detail.values, "api", "in the range");
     kpis.appendChild(
       h("div", { class: "stats-mini-kpi" }, [
         h("span", { class: "stats-kpi-label", text: "Value" }),
-        h("span", { class: "stats-kpi-value" }, [subscription]),
-        h("span", { class: "stats-kpi-sub" }, ["at API prices ", api]),
+        h("span", { class: "stats-kpi-value" }, [
+          valueNode(detail.values, "subscription", env.currency),
+        ]),
+        h("span", { class: "stats-kpi-sub" }, [
+          "at API prices ",
+          valueNode(detail.values, "api", env.currency),
+        ]),
       ])
     );
     card.appendChild(kpis);
+
+    // The detail's subscriptions as the mock-up lays them out: the tag, a bar
+    // as long as the share, its percent. projects.rs carries shares, not
+    // amounts, so this card has no amount column (a default of this run).
+    card.appendChild(h("p", { class: "stats-detail-label", text: "By subscription" }));
+    if (detail.bySubscription.length === 0) {
+      card.appendChild(emptyLine("no subscription share for this project"));
+    } else {
+      const subs = h("div", { class: "stats-detail-subs" });
+      for (const [id, percent] of detail.bySubscription) {
+        const name = id === null ? "unknown account" : accountNameText(env.accounts, id);
+        const tag =
+          id === null
+            ? h("span", {
+                class: "stats-acc stats-acc-unknown",
+                text: "unknown account",
+                title: "work without a known subscription",
+              })
+            : accountName(env.accounts, id);
+        subs.appendChild(
+          h("div", { class: "stats-detail-sub" }, [
+            tag,
+            subscriptionSplit([[id, percent]], env.accounts, () =>
+              `${name} · ${percentText(percent)} of this project's API value`),
+            h("span", { class: "n", text: percentText(percent) }),
+          ])
+        );
+      }
+      card.appendChild(subs);
+    }
 
     card.appendChild(h("p", { class: "stats-detail-label", text: "Hosts" }));
     if (detail.hosts.length === 0) {

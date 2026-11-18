@@ -102,6 +102,31 @@
   background: var(--focus);
 }
 
+/* A bar split by subscription (common.js `subscriptionSplit`): each part in its
+   subscription's colour; work without a known subscription is grey and
+   striped, like the hours chart's "off" hatch. */
+.stats-split {
+  display: flex;
+  height: 8px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--track);
+}
+
+.stats-split i {
+  display: block;
+  height: 100%;
+}
+
+.stats-split i.stats-split-unknown {
+  background: repeating-linear-gradient(
+    135deg,
+    color-mix(in oklab, var(--muted) 45%, transparent) 0 1px,
+    transparent 1px 3px
+  );
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+
 .stats-host {
   height: 26px;
   min-width: 105px;

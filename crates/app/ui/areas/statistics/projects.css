@@ -123,25 +123,6 @@
   min-width: 0;
 }
 
-.stats-split {
-  display: flex;
-  height: 8px;
-  border-radius: 4px;
-  overflow: hidden;
-  background: var(--track);
-}
-
-.stats-split i {
-  display: block;
-  height: 100%;
-}
-
-/* Another provider's part (Codex, Ollama): neutral and faded, no account's. */
-.stats-split i.stats-split-provider {
-  background: var(--muted);
-  opacity: 0.45;
-}
-
 .stats-tree-none {
   margin-left: 5px;
   color: var(--muted);
@@ -226,7 +207,7 @@
 .stats-matrix-row-foot > span {
   display: flex;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-end;
   min-width: 0;
   overflow: hidden;
   white-space: nowrap;
@@ -235,14 +216,6 @@
 
 .stats-matrix-row-foot > .stats-matrix-org {
   justify-content: flex-start;
-}
-
-.stats-matrix-row-foot > .stats-matrix-foot-cell {
-  justify-content: center;
-}
-
-.stats-matrix-row-foot > .stats-matrix-foot-total {
-  justify-content: flex-end;
 }
 
 .stats-matrix-cell {
@@ -257,12 +230,35 @@
   overflow: hidden;
 }
 
+.stats-matrix-cell-none {
+  background: transparent;
+  color: var(--muted);
+}
+
 .stats-matrix-sentences {
   margin-top: 10px;
 }
 
 .stats-model-chart {
   height: 170px;
+}
+
+.stats-detail-subs {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.stats-detail-sub {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) 44px;
+  gap: 8px;
+  align-items: center;
+  font-size: 11px;
+}
+
+.stats-acc-unknown {
+  color: var(--muted);
 }
 
 .stats-host-share {

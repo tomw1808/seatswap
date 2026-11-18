@@ -647,6 +647,34 @@ function writeChoice(key, value) {
   }
 }
 
+// The folds the user set by hand in one page: a key the user never folded
+// answers its default, and a fold lasts while the window is open. A page
+// creates one at module level; neither a render nor leaving the area clears it
+// (rule R7; Sessions' folds and Statistics → Projects' folders both use it).
+function foldMemory() {
+  const folds = new Map();
+  return {
+    isOpen(key, defaultOpen) {
+      if (typeof key !== "string" || key === "") {
+        throw new Error(`a fold needs a key, not ${JSON.stringify(key)}`);
+      }
+      if (typeof defaultOpen !== "boolean") {
+        throw new Error(`the fold of ${JSON.stringify(key)} needs a default, not ${JSON.stringify(defaultOpen)}`);
+      }
+      return folds.has(key) ? folds.get(key) : defaultOpen;
+    },
+    set(key, open) {
+      if (typeof key !== "string" || key === "") {
+        throw new Error(`a fold needs a key, not ${JSON.stringify(key)}`);
+      }
+      if (typeof open !== "boolean") {
+        throw new Error(`the fold of ${JSON.stringify(key)} needs true or false, not ${JSON.stringify(open)}`);
+      }
+      folds.set(key, open);
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // times and statistics numbers: one way to write them on every page
 // ---------------------------------------------------------------------------
@@ -822,6 +850,26 @@ function valueText(values, unit, viewCurrency) {
       partial: false,
     };
   }
+  // A known 0 without a currency is nothing used, not a currency the settings
+  // lack (a sum of no part): write it in the page's view currency when there is
+  // one, else as a plain 0, with no reason.
+  if (
+    part.amount === 0 &&
+    !part.partial &&
+    (typeof part.currency !== "string" || !/^[A-Z]{3}$/.test(part.currency))
+  ) {
+    if (typeof viewCurrency === "string" && /^[A-Z]{3}$/.test(viewCurrency)) {
+      const zero = amountText(0, viewCurrency);
+      return {
+        text: zero.endsWith(` ${viewCurrency}`)
+          ? zero.slice(0, -(viewCurrency.length + 1))
+          : zero,
+        title: "",
+        partial: false,
+      };
+    }
+    return { text: "0", title: "", partial: false };
+  }
   if (hasReason && !part.partial) {
     return { text: "—", title: String(part.missing), partial: false };
   }
@@ -929,6 +977,56 @@ function accountName(views, id, className) {
     title: spec.title,
     style: spec.style,
   });
+}
+
+// The one bar split by subscription (rule R2): one `i` per part of a
+// `bySubscription` list, each as wide as its percent and in its subscription's
+// colour (`accountView` and `isColor`; the muted colour for an id the chips do
+// not know). The `null` part is work without a known subscription: grey and
+// striped, named "unknown account". `tip(name, percent)` gives each part its
+// title. A part that is not `[string|null, finite number >= 0]` is an error.
+function subscriptionSplit(parts, views, tip) {
+  if (!Array.isArray(parts)) {
+    throw new Error(`a subscription bar needs its parts, not ${JSON.stringify(parts)}`);
+  }
+  if (!Array.isArray(views)) {
+    throw new Error(`a subscription bar needs the account views, not ${JSON.stringify(views)}`);
+  }
+  if (typeof tip !== "function") {
+    throw new Error("a subscription bar needs its tooltip text");
+  }
+  const bar = h("span", { class: "stats-split" });
+  for (const part of parts) {
+    if (!Array.isArray(part) || part.length !== 2) {
+      throw new Error(`a subscription part is [id, percent], not ${JSON.stringify(part)}`);
+    }
+    const [id, percent] = part;
+    if (id !== null && (typeof id !== "string" || id === "")) {
+      throw new Error(`a subscription part needs an id or null, not ${JSON.stringify(id)}`);
+    }
+    if (typeof percent !== "number" || !Number.isFinite(percent) || percent < 0) {
+      throw new Error(
+        `the share of ${JSON.stringify(id)} is a finite number of 0 or more, not ${JSON.stringify(percent)}`
+      );
+    }
+    const unknown = id === null;
+    const name = unknown ? "unknown account" : accountNameText(views, id);
+    const view = unknown ? null : accountView(views, id);
+    const color = view && isColor(view.color) ? view.color : "var(--muted)";
+    const title = tip(name, percent);
+    if (typeof title !== "string") {
+      throw new Error(`the part ${JSON.stringify(name)} needs its title text`);
+    }
+    const node = h("i", {
+      class: unknown ? "stats-split-unknown" : undefined,
+      style: unknown
+        ? { width: `${percent}%` }
+        : { width: `${percent}%`, background: color },
+      title,
+    });
+    bar.appendChild(node);
+  }
+  return bar;
 }
 
 // The company names the JSON writes, by the company key of `Company` (serde
@@ -1271,6 +1369,7 @@ export {
   showTokens,
   readChoice,
   writeChoice,
+  foldMemory,
   dateText,
   dateTimeText,
   weekdayTimeText,
@@ -1290,6 +1389,7 @@ export {
   accountLabel,
   accountNameText,
   accountName,
+  subscriptionSplit,
   accountPlan,
   providerName,
   textInput,

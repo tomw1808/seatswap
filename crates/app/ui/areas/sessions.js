@@ -11,6 +11,7 @@ import {
   clear,
   durationText,
   errorMessage,
+  foldMemory,
   h,
   isActiveView,
   isObject,
@@ -86,9 +87,6 @@ const state = {
   subscribeError: null,
   error: null,
   linkMessage: null,
-  // The user's own folds by session: kept while the window's page is open
-  // (rule R7). Neither a render nor a leave of the Sessions area clears it.
-  userFolds: new Map(),
   openAgents: new Set(),
   departed: new Map(),
   marked: null,
@@ -101,6 +99,10 @@ const state = {
   sub: null,
   pendingLink: null,
 };
+
+// The user's own folds by session: made once, kept while the window's page is
+// open (rule R7). Neither a render nor a leave of the Sessions area clears it.
+const sessionFolds = foldMemory();
 
 // ---------------------------------------------------------------------------
 // the three kept choices (the one reader and writer live in common.js)
@@ -503,7 +505,7 @@ export function unmount() {
   state.apiHead = null;
   state.rowNodes = new Map();
   state.sums = new Map();
-  // `state.userFolds` stays: the user's fold lasts while the window's page is
+  // `sessionFolds` stays: the user's fold lasts while the window's page is
   // open (rule R7), not only while the Sessions area is shown.
   state.openAgents.clear();
   state.departed.clear();
@@ -690,7 +692,7 @@ function applyLink(id) {
     return;
   }
   state.linkMessage = null;
-  state.userFolds.set(id, true);
+  sessionFolds.set(id, true);
   if (state.marked && state.marked.id === id) {
     const old = state.rowNodes.get(id);
     if (old) old.classList.remove("sess-marked");
@@ -1518,9 +1520,7 @@ function agentSignature(row, now) {
 // set by hand keeps that session's choice while the window is open. The map is
 // the only record of the user's choice; there is no second set of open rows.
 function sessionOpen(row) {
-  return state.userFolds.has(row.session)
-    ? state.userFolds.get(row.session)
-    : row.agentsRunning > 0;
+  return sessionFolds.isOpen(row.session, row.agentsRunning > 0);
 }
 
 // The user's fold, if the row shows one: a click changes `details.open` at
@@ -1532,7 +1532,7 @@ function sessionOpen(row) {
 function noteUserFold(entry) {
   const open = entry.node.open;
   if (open === entry.shownOpen) return;
-  state.userFolds.set(entry.row.session, open);
+  sessionFolds.set(entry.row.session, open);
   entry.shownOpen = open;
 }
 
