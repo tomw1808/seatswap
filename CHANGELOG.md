@@ -6,6 +6,16 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.4.3] - 2026-11-19
+
+### Changed
+
+- Sessions: a session's agents are listed directly under it, without the line "Claude Code · Sonnet
+  5.5 · 1 agent" per provider and model; each agent row already shows its model. An agent's own
+  agents are shown unless you fold them; the completed agents stay folded.
+- A session with a title shows the title alone, without its label (`atlas-a6`) as a grey tag; the
+  label is in the hover text. The same on Statistics → Activity's largest sessions.
+
 ## [1.4.2] - 2026-11-19
 
 ### Fixed
@@ -617,7 +627,8 @@ All notable changes to this project are documented here. The format follows
   starts later): it says so and shows the icon as soon as a tray appears; `seatswap panel` opens
   the pop-up meanwhile.
 
-[Unreleased]: https://github.com/ymihere/seatswap/compare/v1.4.2...HEAD
+[Unreleased]: https://github.com/ymihere/seatswap/compare/v1.4.3...HEAD
+[1.4.3]: https://github.com/ymihere/seatswap/compare/v1.4.2...v1.4.3
 [1.4.2]: https://github.com/ymihere/seatswap/compare/v1.4.1...v1.4.2
 [1.4.1]: https://github.com/ymihere/seatswap/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/ymihere/seatswap/compare/v1.3.0...v1.4.0

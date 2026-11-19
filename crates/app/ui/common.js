@@ -1293,10 +1293,10 @@ function showTokens(node, n) {
 }
 
 // The one way a session is named on a page (the Sessions rows, Activity's
-// largest sessions): Claude Code's own title when the data has one, with the
-// label (`atlas-a6`) as a small grey tag after it; the label alone otherwise.
-// A long title is cut by CSS (window.css) and its whole text is the hover text.
-// Returns the nodes to put inside the name's element.
+// largest sessions): Claude Code's own title when the data has one, else the
+// label (`atlas-a6`). A long title is cut by CSS (window.css); the hover text
+// is its whole text with the label on the next line. Returns the nodes to put
+// inside the name's element.
 function sessionName(item) {
   if (typeof item.label !== "string" || item.label === "") {
     throw new Error(`a session without a label: ${String(item.session)}`);
@@ -1307,8 +1307,11 @@ function sessionName(item) {
     return [h("span", { class: "session-title", title: label }, label)];
   }
   return [
-    h("span", { class: "session-title", title, dataset: { title: "true" } }, title),
-    h("span", { class: "session-label-tag", title: `session label ${label}` }, label),
+    h(
+      "span",
+      { class: "session-title", title: `${title}\n${label}`, dataset: { title: "true" } },
+      title
+    ),
   ];
 }
 

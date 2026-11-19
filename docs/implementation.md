@@ -2294,9 +2294,10 @@ session, and an id that is not listed says "that session is no longer listed". A
 leaves the live list is held grey for 60 s, then removed; closed rows are not held. Numbers come
 from `SessionsView.sums` by key, values follow `values`' missing reasons and currency, and times and
 ages come from `time_texts`; the page never adds values. One function, common.js's `sessionName(item)`, names a
-session wherever a page names one (the Sessions rows, Activity's largest sessions): its `title` with
-the `label` as a grey tag (`.session-label-tag`, window.css) after it, or the label alone; the title's
-text is cut by CSS and is the hover text in full. An item without a label is an error. The row signature holds the
+session wherever a page names one (the Sessions rows, Activity's largest sessions): its `title`, or
+the `label` when it has none; the title is cut by CSS, and its hover text is the whole title with the
+label on the next line. One fold memory (`folds`, common.js's `foldMemory`) holds the user's folds of
+sessions, agents and completed lines; an agent is open by default, a completed line folded. An item without a label is an error. The row signature holds the
 title, so a new title redraws the row.
 
 ## The Settings page and its save queue (step C1)

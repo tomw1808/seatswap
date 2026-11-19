@@ -485,16 +485,3 @@ code,
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-
-/* The session's own label (`atlas-a6`) after its title: a small grey tag. */
-.session-label-tag {
-  flex-shrink: 0;
-  padding: 0 4px;
-  border: 1px solid var(--border);
-  border-radius: 5px;
-  color: var(--muted);
-  font-size: 9.5px;
-  font-weight: 500;
-  line-height: 15px;
-  white-space: nowrap;
-}

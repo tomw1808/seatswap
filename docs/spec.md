@@ -1464,7 +1464,7 @@ provider do not repeat it; a model total row carries the `tied` bubble, and a to
 
 | Column | Content |
 |---|---|
-| Name | Claude Code's own title of the session (the one VS Code and `/resume` show), with the session's label (`atlas-a6`) as a small grey tag after it; a DeepSeek Harness row likewise by the title of its last `session/title` event, except a flash job's row, whose title is the job's label (below); a Codex row by its thread name, the newest line for its id in Codex's `session_index.jsonl`; the label alone when the session has no title. A long title is cut with `…` and its whole text is the hover text. Opens to its agents |
+| Name | Claude Code's own title of the session (the one VS Code and `/resume` show); a DeepSeek Harness row likewise by the title of its last `session/title` event, except a flash job's row, whose title is the job's label (below); a Codex row by its thread name, the newest line for its id in Codex's `session_index.jsonl`; the session's label (`atlas-a6`) when it has no title. A long title is cut with `…`; the hover text is its whole text with the label on the next line. Opens to its agents |
 | Model | the model of its last answer, or `no answers yet`, with the `tied` bubble when its thinking is tied to the account |
 | Status | busy · idle · waiting for you, with how long; for a closed session, when it closed |
 | Agents | running · completed, the running number in the busy colour (grey at zero), completed always grey; `—` when a session has no agent data |
@@ -1494,11 +1494,10 @@ numbers stand out; a bold total stays bold. The lighter colour keeps at least 3:
 the card and every tinted row it sits on. A count inside a sentence or a hover text uses the same
 spelling.
 
-A session opens to its agents. Its running agents are grouped by each agent's own provider and
-model under a line "<provider> · <model> · N agents", so a flash job under a Claude Code session reads
-"DeepSeek Harness · deepseek-v4.1-flash:cloud · 1 agent"; an agent that has not answered yet reads
-`no answers yet` in place of the model, and an agent without a provider is an error line naming the
-session. An agent in a report from an older seatswap, which has no provider, takes its session's. A
+A session opens to its agents. Its running agents are listed directly under it, each row with its
+own model, with no line per provider and model (1.4.3): a flash job under a Claude Code session shows
+its DeepSeek model on its own row. An agent that has not answered yet reads `no answers yet` in place of
+the model, and an agent without a provider shows an error naming the session in its model cell. An agent in a report from an older seatswap, which has no provider, takes its session's. A
 row's kind is left out for Claude Code's default `general-purpose` and for an agent without a kind:
 the row then shows only the task, in the normal text colour; every other kind (`Explore`, `Plan`, a
 custom agent) is shown in bold before the task in grey, a flash job has the tag `flash`, and an agent
@@ -1506,7 +1505,8 @@ with neither kind nor task reads "agent". A flash job's task is the `label` of i
 (`<flash-agents state>/<key>/patches/<id>.report.json`), absent while it runs without a report; its
 workers have no task. The label is shown live only and never written to any file. One row per agent
 has kind, task, the model of its last answer (`no answers yet` before its first), running or completed with when it finished, tokens and both values, and its own agents as "1 running ·
-2 done". An agent that started agents opens the same way, to any depth. A flash job is an agent with
+2 done". An agent that started agents is open, to any depth, unless the user folded it; that choice
+holds while the window is open. A flash job is an agent with
 the tag `flash`, its workers below it. A flash job with exactly one worker, and that worker has no
 agents of its own, draws no worker row and no fold (N-1); the job row's running and completed counts
 stay as they were. Completed agents are folded into one "38 completed" row that opens and that
@@ -2067,7 +2067,7 @@ and *Largest sessions*, and its switch sits inside the card's frame, which lines
 above. *Per week*: one row per calendar week with its working hours per host, tokens and their two
 values, sessions, and the project and folder that used most, the current week tagged `running`.
 *Largest sessions*: at most 20, by output tokens, each named as the Sessions area names a session (its
-title with the label as a tag, from its newest session record), with project, host, model, hours worked, tokens and
+title, else its label, from its newest session record), with project, host, model, hours worked, tokens and
 their two values, and the agents it started once the session has ended (a running session has none
 yet). The minutes sessions waited for you per local day come from the `Waited` events; they follow
 the host choice but no account chip, because a wait names no account.

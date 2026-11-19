@@ -87,7 +87,6 @@ const state = {
   subscribeError: null,
   error: null,
   linkMessage: null,
-  openAgents: new Set(),
   departed: new Map(),
   marked: null,
   markTimer: null,
@@ -100,9 +99,11 @@ const state = {
   pendingLink: null,
 };
 
-// The user's own folds by session: made once, kept while the window's page is
-// open (rule R7). Neither a render nor a leave of the Sessions area clears it.
-const sessionFolds = foldMemory();
+// The user's own folds, by session and by agent: made once, kept while the
+// window's page is open (rule R7). Neither a render nor a leave of the
+// Sessions area clears it. An agent's key is `<session>\u0000<agent>`, a
+// completed line's `<parent key>\u0000completed`, so no key meets a session's.
+const folds = foldMemory();
 
 // ---------------------------------------------------------------------------
 // the three kept choices (the one reader and writer live in common.js)
@@ -414,7 +415,6 @@ export async function render(container, context) {
   state.linkMessage = null;
   state.sub = typeof context.sub === "string" ? context.sub : null;
   state.pendingLink = state.sub;
-  state.openAgents.clear();
   state.departed.clear();
   state.treeNodes = new Map();
   state.rowNodes = new Map();
@@ -505,9 +505,8 @@ export function unmount() {
   state.apiHead = null;
   state.rowNodes = new Map();
   state.sums = new Map();
-  // `sessionFolds` stays: the user's fold lasts while the window's page is
-  // open (rule R7), not only while the Sessions area is shown.
-  state.openAgents.clear();
+  // `folds` stays: the user's fold lasts while the window's page is open
+  // (rule R7), not only while the Sessions area is shown.
   state.departed.clear();
   state.sub = null;
   state.pendingLink = null;
@@ -692,7 +691,7 @@ function applyLink(id) {
     return;
   }
   state.linkMessage = null;
-  sessionFolds.set(id, true);
+  folds.set(id, true);
   if (state.marked && state.marked.id === id) {
     const old = state.rowNodes.get(id);
     if (old) old.classList.remove("sess-marked");
@@ -1281,32 +1280,6 @@ function updateGroupItem(entry, item) {
 
 // A sub-row of an agent list (the running agents' provider · model line). It
 // carries text only; `error` marks a line that names an error of the view.
-function createSubItem(item) {
-  const textNode = h("span", { class: "mf" }, item.text);
-  const node = h("div", { class: "sess-row sess-subrow" }, textNode);
-  const entry = {
-    type: "sub",
-    node,
-    textNode,
-    text: null,
-    depth: -1,
-    error: false,
-  };
-  updateSubItem(entry, item);
-  return entry;
-}
-
-function updateSubItem(entry, item) {
-  const error = item.error === true;
-  if (entry.text === item.text && entry.depth === item.depth && entry.error === error) return;
-  entry.text = item.text;
-  entry.depth = item.depth;
-  entry.error = error;
-  entry.textNode.style.paddingLeft = `${Math.max(0, item.depth * 14 - 2)}px`;
-  if (entry.textNode.textContent !== item.text) entry.textNode.textContent = item.text;
-  entry.node.classList.toggle("sess-subrow-error", error);
-}
-
 // A session with no running and no done agent and no agent list has no agent
 // data at all: it says "—", never "0 · 0" (item 24). A session with no running
 // agent but a done one still says "0 · 3".
@@ -1520,7 +1493,7 @@ function agentSignature(row, now) {
 // set by hand keeps that session's choice while the window is open. The map is
 // the only record of the user's choice; there is no second set of open rows.
 function sessionOpen(row) {
-  return sessionFolds.isOpen(row.session, row.agentsRunning > 0);
+  return folds.isOpen(row.session, row.agentsRunning > 0);
 }
 
 // The user's fold, if the row shows one: a click changes `details.open` at
@@ -1532,7 +1505,7 @@ function sessionOpen(row) {
 function noteUserFold(entry) {
   const open = entry.node.open;
   if (open === entry.shownOpen) return;
-  sessionFolds.set(entry.row.session, open);
+  folds.set(entry.row.session, open);
   entry.shownOpen = open;
 }
 
@@ -1672,7 +1645,17 @@ function agentNameNode(agent) {
   return name;
 }
 
-function agentCells(agent, children, depth, details) {
+// The agent's model. An agent without a provider is an error naming its
+// session, never a guessed provider: a flash job under a Claude Code session
+// is a DeepSeek Harness agent, and the view says so.
+function agentModelNode(session, agent) {
+  const model = modelName(agent.model);
+  if (agentProvider(agent) !== null) return h("span", { class: "sess-model" }, model);
+  const text = `error: an agent of the session ${session.session} has no provider`;
+  return h("span", { class: "sess-model sess-model-error", title: text }, `${model} · ${text}`);
+}
+
+function agentCells(session, agent, children, depth, details) {
   const now = Date.now();
   const view = state.view;
   const name = agentNameNode(agent);
@@ -1688,7 +1671,7 @@ function agentCells(agent, children, depth, details) {
       { class: "sess-name", style: { paddingLeft: `${depth * 14}px` } },
       [h("span", { class: details ? "sess-car" : "sess-car0" }), name]
     ),
-    h("span", { class: "sess-model" }, modelName(agent.model)),
+    agentModelNode(session, agent),
     agentStatus(agent, now),
     children.length ? agentsCell(running, done, true) : h("span", {}, ""),
     tokenNode(agent.tokens ? agent.tokens.out : 0),
@@ -1701,7 +1684,8 @@ function agentCells(agent, children, depth, details) {
 
 function agentNode(session, agent, children, depth) {
   const key = `${session.session}\u0000${agent.agent}`;
-  const open = state.openAgents.has(key);
+  // An agent's own agents are shown unless the user folded them.
+  const open = folds.isOpen(key, true);
   const row = h("div", {
     class: "sess-row sess-agent",
   });
@@ -1715,7 +1699,7 @@ function agentNode(session, agent, children, depth) {
     agent.kind === "flash" &&
     children.length === 1 &&
     childAgents(session, children[0].agent).length === 0;
-  for (const cell of agentCells(agent, children, depth, children.length > 0 && !loneWorker)) {
+  for (const cell of agentCells(session, agent, children, depth, children.length > 0 && !loneWorker)) {
     row.appendChild(cell);
   }
   row.dataset.agent = key;
@@ -1732,19 +1716,16 @@ function agentNode(session, agent, children, depth) {
   };
   if (open) build();
   container.addEventListener("toggle", () => {
-    if (container.open) {
-      state.openAgents.add(key);
-      build();
-    } else {
-      state.openAgents.delete(key);
-    }
+    folds.set(key, container.open);
+    if (container.open) build();
   });
   return container;
 }
 
 function completedNode(session, agents, depth, parentKey, values) {
   const key = `${parentKey}\u0000completed`;
-  const open = state.openAgents.has(key);
+  // The completed agents stay folded unless the user opened them.
+  const open = folds.isOpen(key, false);
   const total = agents.reduce(
     (count, agent) => count + (agent.tokens && Number.isFinite(agent.tokens.out) ? agent.tokens.out : 0),
     0
@@ -1789,12 +1770,8 @@ function completedNode(session, agents, depth, parentKey, values) {
   };
   if (open) build();
   container.addEventListener("toggle", () => {
-    if (container.open) {
-      state.openAgents.add(key);
-      build();
-    } else {
-      state.openAgents.delete(key);
-    }
+    folds.set(key, container.open);
+    if (container.open) build();
   });
   return container;
 }
@@ -1819,30 +1796,10 @@ function renderAgentList(container, session, parentId, depth, parentKey) {
   );
   const running = children.filter((agent) => agent.running);
   const done = children.filter((agent) => !agent.running);
-  // Running agents are grouped by their own provider and model: a flash job
-  // under a Claude Code session is a DeepSeek Harness agent. An agent without a
-  // provider is an error line naming the session, never a guessed provider.
-  for (const group of groupsOf(
-    running,
-    (agent) => `${agentProvider(agent) || ""}\u0000${modelKey(agent.model)}`
-  )) {
-    const provider = agentProvider(group[0]);
-    const model = modelName(group[0].model);
-    const count = plural(group.length, "agent", "agents");
-    container.appendChild(
-      createSubItem({
-        text: provider
-          ? `${provider} · ${model} · ${count}`
-          : `error: an agent of the session ${session.session} has no provider · ${model} · ${count}`,
-        depth,
-        error: provider === null,
-      }).node
-    );
-    for (const agent of group) {
-      container.appendChild(
-        agentNode(session, agent, childAgents(session, agent.agent), depth)
-      );
-    }
+  // Running agents are listed in the view's order, each row with its own
+  // model; no line per provider and model (1.4.3).
+  for (const agent of running) {
+    container.appendChild(agentNode(session, agent, childAgents(session, agent.agent), depth));
   }
   // The view carries one summed value for all of a session's done agents. Only
   // the session's own completed line can show it, and only when that line holds
