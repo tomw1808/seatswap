@@ -45,6 +45,8 @@ const state = {
   unknownKey: null,
   unknownLabel: "",
   refreshing: false,
+  // A snapshot came while the pop-up was hidden and is not drawn yet.
+  undrawn: false,
   // The note a Codex switch left ("Codex now uses O2..."), shown under the
   // OpenAI card for ten seconds (R8); the timer clears it.
   codexNote: null,
@@ -1821,6 +1823,7 @@ async function openSettings() {
 function setView(view, options) {
   const wanted = view === "add" ? view : "main";
   state.view = wanted;
+  state.undrawn = false;
 
   const main = document.getElementById("view-main");
   const add = document.getElementById("view-add");
@@ -1953,10 +1956,24 @@ function wireStatic() {
   });
 }
 
+// A hidden pop-up only keeps the newest snapshot. WebKit runs no animation
+// frame in a hidden page, so each drawing would stay in memory until the next
+// opening, waiting for its ring and card animations (1.4.2: gigabytes a day).
+// Every opening draws through `navigate` → `setView`; a snapshot that comes
+// while the page is still hidden is drawn when it becomes visible.
 function handleSnapshot(snapshot) {
   if (!isObject(snapshot)) return;
   state.snapshot = snapshot;
   state.refreshing = false;
+  if (document.hidden) {
+    state.undrawn = true;
+    return;
+  }
+  drawSnapshot();
+}
+
+function drawSnapshot() {
+  state.undrawn = false;
   applyTheme(currentThemeSetting());
 
   if (state.view === "main") {
@@ -2002,7 +2019,12 @@ async function boot() {
     if (state.view === "main") renderMain();
   }
 
-  setInterval(updateAge, 1000);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && state.undrawn) drawSnapshot();
+  });
+  setInterval(() => {
+    if (!document.hidden) updateAge();
+  }, 1000);
   updateAge();
 }
 

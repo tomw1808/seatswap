@@ -128,6 +128,8 @@ struct Recheck {
 #[cfg(feature = "gui")]
 pub(crate) struct GuiState {
     snapshot: Mutex<Snapshot>,
+    /// The last snapshot the pages were sent ([`send_snapshot`]).
+    sent: Mutex<SentSnapshot>,
     /// The paths the app was started with, for the settings page's history and
     /// skill rows.
     pub(crate) app: AppPaths,
@@ -519,6 +521,7 @@ fn setup(
 
     tauri_app.manage(GuiState {
         snapshot: Mutex::new(initial.clone()),
+        sent: Mutex::new(SentSnapshot::default()),
         app: app.clone(),
         claude: claude.clone(),
         history,
@@ -559,7 +562,7 @@ fn setup(
     panel::preload(tauri_app.handle())?;
 
     // The page is not loaded yet; the engine's first snapshot follows shortly.
-    let _ = handle.emit("snapshot", &initial);
+    send_snapshot(&handle, &tauri_app.state::<GuiState>(), &initial);
 
     let event_handle = tauri_app.handle().clone();
     thread::Builder::new()
@@ -714,7 +717,7 @@ fn apply_snapshot(app: &AppHandle, shown: Shown) {
         (due, recheck)
     };
 
-    let _ = app.emit("snapshot", &snapshot);
+    send_snapshot(app, &state, &snapshot);
     if let Some(tray) = lock(&state.tray).as_ref() {
         tray::update(tray, &snapshot);
     }
@@ -928,6 +931,41 @@ fn keeps_running(code: Option<i32>) -> bool {
     code.is_none()
 }
 
+/// The last snapshot sent to the pages, as sent. The sessions thread can finish
+/// several passes a second while sessions work, and each pass made a snapshot
+/// that both pages drew again, mostly unchanged (1.4.2).
+#[cfg(feature = "gui")]
+#[derive(Debug, Default)]
+struct SentSnapshot(Option<serde_json::Value>);
+
+#[cfg(feature = "gui")]
+impl SentSnapshot {
+    /// The payload to send for `snapshot`, or `None` when it is the one sent last.
+    fn changed(&mut self, snapshot: &Snapshot) -> Result<Option<serde_json::Value>, String> {
+        let payload = serde_json::to_value(snapshot)
+            .map_err(|error| format!("cannot send the snapshot: {error}"))?;
+        if self.0.as_ref() == Some(&payload) {
+            return Ok(None);
+        }
+        self.0 = Some(payload.clone());
+        Ok(Some(payload))
+    }
+}
+
+/// Send `snapshot` to the pages (event `snapshot`) unless it equals the last one
+/// sent. The one way every snapshot reaches the pages; a page that loads later
+/// reads the stored one with `get_snapshot`.
+#[cfg(feature = "gui")]
+fn send_snapshot(app: &AppHandle, state: &GuiState, snapshot: &Snapshot) {
+    match lock(&state.sent).changed(snapshot) {
+        Ok(Some(payload)) => {
+            let _ = app.emit("snapshot", payload);
+        }
+        Ok(None) => {}
+        Err(error) => report_error(app, &error),
+    }
+}
+
 #[cfg(feature = "gui")]
 pub(crate) fn set_pending(
     app: &AppHandle,
@@ -939,7 +977,7 @@ pub(crate) fn set_pending(
         current.set_pending(pending);
         current.clone()
     };
-    let _ = app.emit("snapshot", &snapshot);
+    send_snapshot(app, state, &snapshot);
     let handle = app.clone();
     let _ = app.run_on_main_thread(move || show_panel(&handle, "main"));
     Ok(())
@@ -952,7 +990,7 @@ pub(crate) fn clear_pending(app: &AppHandle, state: &GuiState) -> Result<(), Str
         current.clear_pending();
         current.clone()
     };
-    let _ = app.emit("snapshot", &snapshot);
+    send_snapshot(app, state, &snapshot);
     Ok(())
 }
 
@@ -1016,6 +1054,37 @@ mod tests {
             .default_window_icon()
             .expect("the bundle icon is the default window icon");
         assert_eq!((icon.width(), icon.height()), (256, 256));
+    }
+
+    #[test]
+    fn only_a_changed_snapshot_is_sent_again() {
+        let mut sent = SentSnapshot::default();
+        let first = Snapshot::empty(None, None, None);
+        let payload = sent
+            .changed(&first)
+            .expect("serialises")
+            .expect("first is sent");
+        assert_eq!(payload["views"], serde_json::json!([]));
+        assert_eq!(
+            sent.changed(&first.clone()),
+            Ok(None),
+            "the same snapshot again"
+        );
+
+        let mut polled = first.clone();
+        polled.last_poll_at = Some(
+            DateTime::parse_from_rfc3339("2026-11-19T12:30:05Z")
+                .expect("a time")
+                .with_timezone(&Utc),
+        );
+        let payload = sent
+            .changed(&polled)
+            .expect("serialises")
+            .expect("a change is sent");
+        assert_eq!(payload["lastPollAt"], "2026-11-19T12:30:05Z");
+        assert_eq!(sent.changed(&polled), Ok(None));
+        // Back to the earlier one is a change against the last sent.
+        assert!(sent.changed(&first).expect("serialises").is_some());
     }
 
     #[test]

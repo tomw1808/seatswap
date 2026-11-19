@@ -6,6 +6,17 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.4.2] - 2026-11-19
+
+### Fixed
+
+- The tray app no longer grows to several gigabytes of memory over a day. The hidden pop-up drew
+  every update, and WebKit kept each drawing until the pop-up was next opened, waiting to run its
+  ring and card animations. The hidden pop-up now keeps only the newest figures and draws them when
+  it opens.
+- Updates are sent to the pop-up and the window only when something changed. While Claude sessions
+  work and the window shows Sessions, that was several identical updates a second.
+
 ## [1.4.1] - 2026-11-18
 
 ### Fixed
@@ -606,7 +617,8 @@ All notable changes to this project are documented here. The format follows
   starts later): it says so and shows the icon as soon as a tray appears; `seatswap panel` opens
   the pop-up meanwhile.
 
-[Unreleased]: https://github.com/ymihere/seatswap/compare/v1.4.1...HEAD
+[Unreleased]: https://github.com/ymihere/seatswap/compare/v1.4.2...HEAD
+[1.4.2]: https://github.com/ymihere/seatswap/compare/v1.4.1...v1.4.2
 [1.4.1]: https://github.com/ymihere/seatswap/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/ymihere/seatswap/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/ymihere/seatswap/compare/v1.2.2...v1.3.0
