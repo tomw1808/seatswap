@@ -1791,6 +1791,7 @@ mod tests {
             recorded: None,
             flash_jobs: BTreeSet::new(),
             title: None,
+            custom_title: None,
         }
     }
 

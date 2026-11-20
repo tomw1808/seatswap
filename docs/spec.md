@@ -2582,8 +2582,9 @@ apply to the past too, because the history stores the repository's identity, not
   that links a short job id to its flash task); and Codex's rollout files under the Codex folder
   (`$CODEX_HOME` or `~/.codex`: session id, model, token totals, event times) and its
   `session_index.jsonl` beside them (only each thread's `id`, `thread_name` and `updated_at`). None of these files is
-  written or created. A Claude Code session's title (the `aiTitle` of its transcript's `ai-title`
-  lines, the one VS Code and `/resume` show) is stored in its session records and the live report, so
+  written or created. A Claude Code session's title (the one VS Code and `/resume` show: the
+  `customTitle` of its transcript's last `custom-title` line, the name the user gave it with
+  `/rename`, else the `aiTitle` of its last `ai-title` line; a rename shows within a pass) is stored in its session records and the live report, so
   it travels with a shared history folder; a DeepSeek Harness session that is a row of its own, not
   a flash job, carries its title (its last `session/title` event) in the live report too, and a
   Codex row its thread name. A flash worker's task

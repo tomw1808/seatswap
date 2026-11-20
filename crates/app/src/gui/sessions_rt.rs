@@ -2625,7 +2625,7 @@ fn session_record(
         cwd: seen.cwd.clone(),
         project: memory.project_for(&seen.cwd),
         entrypoint,
-        title: seen.title.clone(),
+        title: seen.shown_title().cloned(),
         first: seen.first,
         last: seen.last,
         agents_started: started,
@@ -3141,6 +3141,7 @@ mod tests {
                 recorded: None,
                 flash_jobs: BTreeSet::new(),
                 title: None,
+                custom_title: None,
             },
         );
         let mut memory = SessionMemory::new(tmp.path().to_path_buf());
@@ -3308,6 +3309,7 @@ mod tests {
                 recorded: None,
                 flash_jobs: BTreeSet::new(),
                 title: None,
+                custom_title: None,
             },
         );
         let mut memory = SessionMemory::new(tmp.path().to_path_buf());
@@ -3866,7 +3868,7 @@ mod tests {
     /// The title a scan reads from a transcript reaches the session record the
     /// app writes.
     #[test]
-    fn a_session_record_carries_the_transcripts_title() {
+    fn a_session_record_carries_the_name_claude_code_shows() {
         let (_tmp, claude, _app) = fixture();
         let now = time("2026-11-16T10:00:00Z");
         let folder = claude.projects_dir().join("-home-sam-projects-atlas");
@@ -3886,7 +3888,14 @@ mod tests {
             "sessionId": SESSION,
         })
         .to_string();
-        fs::write(&transcript, format!("{first}\n{title}\n")).unwrap();
+        // `/rename` in Claude Code (1.4.4): the record carries the user's name.
+        let rename = serde_json::json!({
+            "type": "custom-title",
+            "customTitle": "tripwire",
+            "sessionId": SESSION,
+        })
+        .to_string();
+        fs::write(&transcript, format!("{first}\n{title}\n{rename}\n")).unwrap();
         let mut state = ScanState::default();
         let mut scan = transcripts::scan(&claude, &state, 64 * 1024 * 1024).unwrap();
         assert_eq!(scan.answers.len(), 1);
@@ -3908,7 +3917,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(record.title.as_deref(), Some("Fix the invoice export"));
+        assert_eq!(record.title.as_deref(), Some("tripwire"));
     }
 
     /// Review finding 1: upgrading from 1.1.0 must migrate its version-1 scan
@@ -4366,6 +4375,7 @@ mod tests {
                 recorded: None,
                 flash_jobs: BTreeSet::new(),
                 title: None,
+                custom_title: None,
             },
         );
         let mut memory = SessionMemory::new(claude.home().to_path_buf());
@@ -4439,6 +4449,7 @@ mod tests {
                 recorded: None,
                 flash_jobs: BTreeSet::new(),
                 title: None,
+                custom_title: None,
             },
         );
         state.sessions.insert(
@@ -4459,6 +4470,7 @@ mod tests {
                 recorded: None,
                 flash_jobs: BTreeSet::new(),
                 title: None,
+                custom_title: None,
             },
         );
         let mut memory = SessionMemory::new(claude.home().to_path_buf());
@@ -4522,6 +4534,7 @@ mod tests {
                 recorded: None,
                 flash_jobs: BTreeSet::new(),
                 title: None,
+                custom_title: None,
             },
         );
 
@@ -4594,6 +4607,7 @@ mod tests {
                 recorded: None,
                 flash_jobs: BTreeSet::new(),
                 title: None,
+                custom_title: None,
             },
         );
         state.sessions.insert(
@@ -4614,6 +4628,7 @@ mod tests {
                 recorded: None,
                 flash_jobs: BTreeSet::new(),
                 title: None,
+                custom_title: None,
             },
         );
 
@@ -4954,6 +4969,7 @@ mod tests {
                 recorded: None,
                 flash_jobs: BTreeSet::new(),
                 title: None,
+                custom_title: None,
             },
         );
         let mut memory = SessionMemory::new(tmp.path().to_path_buf());
@@ -6774,6 +6790,7 @@ mod tests {
             recorded: None,
             flash_jobs: jobs,
             title: None,
+            custom_title: None,
         }
     }
 

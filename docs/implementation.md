@@ -1037,14 +1037,19 @@ pub struct FileState { pub offset: u64, pub grew: DateTime<Utc>, pub recent: Vec
 pub struct SessionSeen { pub folder: String, pub cwd: String, pub first: DateTime<Utc>,
     pub last: DateTime<Utc>, pub last_model: Option<String>, pub last_user_turn: Option<DateTime<Utc>>,
     pub thinking: Vec<(DateTime<Utc>, u32)>, pub recorded: Option<RecordedSession>,
-    #[serde(default)] pub title: Option<String> }
+    #[serde(default)] pub title: Option<String>, #[serde(default)] pub custom_title: Option<String> }
 // `title` is the `aiTitle` of the last `ai-title` line of the session's own transcript (never of an
 // agent's), stored as written; an empty or all-space one is no title, a line without a string
 // `aiTitle` is an unreadable line. It is applied after the file's other lines, so a title line before
 // the first answer still names the session. No other text of the line is read. Absent in a state
 // file written before it means none: no transcript is read again for it, so an older session gets a
 // title only from its next `ai-title` line. The state version stays 2.
+// `custom_title` is the `customTitle` of the last `custom-title` line (the user's `/rename`, 1.4.4),
+// by the same rules; a pending one waits in `FileState.custom_title` as `title` does in `title`.
 impl SessionSeen { pub fn thinking_since_user(&self) -> u32; }  // the sum of `thinking`
+impl SessionSeen { pub fn shown_title(&self) -> Option<&String>; }
+// The name Claude Code shows (`customTitle ?? aiTitle`): the live row's `title` and the session
+// record's `title` are this, never `title` alone.
 // `thinking` is the answers with thinking since the last user turn: one entry per minute (its start
 // in UTC) and oldest first. A user turn empties it; every reader of the old number calls the sum.
 pub struct RecordedSession { pub last: DateTime<Utc>, pub closed: bool }

@@ -250,6 +250,9 @@ pub struct FileState {
     /// sees one. Absent means none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The same for a `custom-title` line (the user's `/rename`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_title: Option<String>,
 }
 
 /// What a main transcript says about its session.
@@ -304,9 +307,20 @@ pub struct SessionSeen {
     /// before this field means none, and no transcript is read again for it.
     #[serde(default)]
     pub title: Option<String>,
+    /// The `customTitle` of the last `custom-title` line of the session's own
+    /// transcript: the name the user gave it with `/rename`. Absent in a state
+    /// file written before this field means none (1.4.4).
+    #[serde(default)]
+    pub custom_title: Option<String>,
 }
 
 impl SessionSeen {
+    /// The session's title as Claude Code shows it: the user's own name
+    /// (`custom-title`) when it has one, else Claude Code's `ai-title`.
+    pub fn shown_title(&self) -> Option<&String> {
+        self.custom_title.as_ref().or(self.title.as_ref())
+    }
+
     /// The answers with thinking since the session's last user turn: the sum of
     /// [`Self::thinking`], the one count every reader uses.
     pub fn thinking_since_user(&self) -> u32 {
@@ -1450,6 +1464,7 @@ impl From<StateFileV1> for StateFile {
                             last_answer: file.last_answer,
                             flash_tools: BTreeSet::new(),
                             title: None,
+                            custom_title: None,
                         },
                     )
                 })
@@ -1479,6 +1494,7 @@ impl From<StateFileV1> for StateFile {
                             recorded: seen.recorded,
                             flash_jobs: BTreeSet::new(),
                             title: None,
+                            custom_title: None,
                         },
                     )
                 })
@@ -1717,6 +1733,8 @@ struct FileScan {
     /// its `None` when that title was empty. Applied after the lines, so a
     /// title line before the session's first answer still reaches it.
     title: Option<Option<String>>,
+    /// The `custom-title` of this scan, the same way.
+    custom_title: Option<Option<String>>,
 }
 
 /// An `Agent` or `Task` call of a `tool_use` block: the id its meta file names,
@@ -1751,6 +1769,7 @@ impl ScanRun<'_> {
                 last_answer: None,
                 flash_tools: BTreeSet::new(),
                 title: None,
+                custom_title: None,
             },
         };
         let mut file = match File::open(&candidate.path) {
@@ -1822,6 +1841,7 @@ impl ScanRun<'_> {
             ids: HashMap::new(),
             unreadable: 0,
             title: None,
+            custom_title: None,
         };
         let mut pending: Vec<u8> = Vec::new();
         // The file offset of pending[0].
@@ -1892,21 +1912,27 @@ impl ScanRun<'_> {
             ));
         }
         let title = file_scan.title.take();
+        let custom_title = file_scan.custom_title.take();
         self.apply_events(&candidate.session, file_scan.events);
-        // This scan's title, else one that waited in the file's state for its
-        // session to appear.
-        let title = title.or_else(|| file_state.title.take().map(Some));
-        if let Some(title) = title {
-            match self.state.sessions.get_mut(&candidate.session) {
-                Some(seen) => {
-                    file_state.title = None;
-                    if seen.title != title {
-                        seen.title = title;
-                        self.state.mark_changed(&candidate.folder);
-                    }
-                }
-                None => file_state.title = title,
+        let seen = self.state.sessions.get_mut(&candidate.session);
+        let changed = match seen {
+            Some(seen) => {
+                let ai = apply_title(&mut file_state.title, title, Some(&mut seen.title));
+                let custom = apply_title(
+                    &mut file_state.custom_title,
+                    custom_title,
+                    Some(&mut seen.custom_title),
+                );
+                ai || custom
             }
+            None => {
+                apply_title(&mut file_state.title, title, None);
+                apply_title(&mut file_state.custom_title, custom_title, None);
+                false
+            }
+        };
+        if changed {
+            self.state.mark_changed(&candidate.folder);
         }
         if self.state.files.get(&candidate.key) != Some(&file_state) {
             self.state.files.insert(candidate.key.clone(), file_state);
@@ -1957,8 +1983,8 @@ impl ScanRun<'_> {
             file.unreadable += 1;
             return;
         };
-        if head.kind == "ai-title" {
-            self.title(reading, text, file);
+        if head.kind == "ai-title" || head.kind == "custom-title" {
+            self.title(reading, text, &head.kind, file);
             return;
         }
         if head.kind != "assistant" && head.kind != "user" {
@@ -1976,11 +2002,13 @@ impl ScanRun<'_> {
         }
     }
 
-    /// An `ai-title` line: Claude Code's own title of the session, as written.
-    /// An agent's transcript never names its session; a line of this type
-    /// without a string `aiTitle` is unreadable like a broken answer. An empty
-    /// or all-space title is no title. No other text of the line is kept.
-    fn title(&mut self, reading: &Reading, text: &str, file: &mut FileScan) {
+    /// An `ai-title` line (Claude Code's own title of the session) or a
+    /// `custom-title` line (the name the user gave it with `/rename`), as
+    /// written. An agent's transcript never names its session; a line of
+    /// either type without its string (`aiTitle`, `customTitle`) is unreadable
+    /// like a broken answer. An empty or all-space title is no title. No other
+    /// text of the line is kept.
+    fn title(&mut self, reading: &Reading, text: &str, kind: &str, file: &mut FileScan) {
         if reading.agent.is_some() {
             return;
         }
@@ -1988,11 +2016,16 @@ impl ScanRun<'_> {
             file.unreadable += 1;
             return;
         };
-        let Some(title) = line.ai_title else {
+        let (title, slot) = if kind == "custom-title" {
+            (line.custom_title, &mut file.custom_title)
+        } else {
+            (line.ai_title, &mut file.title)
+        };
+        let Some(title) = title else {
             file.unreadable += 1;
             return;
         };
-        file.title = Some(session_title(title));
+        *slot = Some(session_title(title));
     }
 
     fn assistant(&mut self, reading: &Reading, line: &Line, file: &mut FileScan) {
@@ -2199,6 +2232,7 @@ impl ScanRun<'_> {
                 recorded: None,
                 flash_jobs: BTreeSet::new(),
                 title: None,
+                custom_title: None,
             });
         if at >= seen.last {
             if let Some(cwd) = cwd {
@@ -2611,12 +2645,43 @@ pub fn session_title(title: String) -> Option<String> {
     }
 }
 
-/// An `ai-title` line: only its `aiTitle` is read; every other field and text
-/// of the line is dropped as it is read.
+/// An `ai-title` or `custom-title` line: only its `aiTitle` or `customTitle`
+/// is read; every other field and text of the line is dropped as it is read.
 #[derive(Deserialize)]
 struct TitleLine {
     #[serde(rename = "aiTitle")]
     ai_title: Option<String>,
+    #[serde(rename = "customTitle")]
+    custom_title: Option<String>,
+}
+
+/// One kind of title after a file's scan: this scan's title (`Some(None)` for
+/// an empty one), else one that waited in the file's state for its session to
+/// appear. With the session (`seen`) it is set there and leaves the file's
+/// state; without, it waits in `pending`. True when the session's title
+/// changed.
+fn apply_title(
+    pending: &mut Option<String>,
+    scanned: Option<Option<String>>,
+    seen: Option<&mut Option<String>>,
+) -> bool {
+    let Some(title) = scanned.or_else(|| pending.take().map(Some)) else {
+        return false;
+    };
+    match seen {
+        Some(seen) => {
+            *pending = None;
+            if *seen == title {
+                return false;
+            }
+            *seen = title;
+            true
+        }
+        None => {
+            *pending = title;
+            false
+        }
+    }
 }
 
 /// A transcript line, as far as seatswap looks at it: never a message text.
@@ -3131,6 +3196,15 @@ mod tests {
         .to_string()
     }
 
+    fn custom_title(title: &str) -> String {
+        serde_json::json!({
+            "type": "custom-title",
+            "customTitle": title,
+            "sessionId": SESSION,
+        })
+        .to_string()
+    }
+
     fn meta_of(finished: Option<bool>, tool_use_id: &str, spawn_depth: u32) -> String {
         let mut value = serde_json::json!({
             "agentType": "general-purpose",
@@ -3523,6 +3597,92 @@ mod tests {
         assert_eq!(
             state.sessions[SESSION].title.as_deref(),
             Some("Fix the invoice export")
+        );
+    }
+
+    /// 1.4.4: a `/rename` writes a `custom-title` line. It names the session
+    /// over any `ai-title`, before or after it, as Claude Code shows it; a
+    /// later rename is picked up by the next scan, and an empty one gives the
+    /// name back to the `ai-title`.
+    #[test]
+    fn a_rename_names_the_session_over_the_ai_title() {
+        let (_tmp, claude, _app) = fixture();
+        let path = write_lines(
+            &folder(&claude, FOLDER),
+            &format!("{SESSION}.jsonl"),
+            &[
+                user_string("fix the failing tests", "2026-11-12T09:40:58.101Z"),
+                ai_title("Fix the invoice export"),
+                custom_title("tripwire"),
+                ai_title("Ledger import speed-up"),
+            ],
+        );
+        let (mut state, scan) = scan_run(&claude);
+        assert!(scan.warnings.is_empty(), "{:?}", scan.warnings);
+        let seen = &state.sessions[SESSION];
+        assert_eq!(seen.shown_title().map(String::as_str), Some("tripwire"));
+        assert_eq!(seen.title.as_deref(), Some("Ledger import speed-up"));
+
+        append(&path, &custom_title("tripwire-guard"));
+        scan_commit(&claude, &mut state, BUDGET);
+        assert_eq!(
+            state.sessions[SESSION].shown_title().map(String::as_str),
+            Some("tripwire-guard"),
+            "a later rename is picked up"
+        );
+
+        append(&path, &custom_title("  "));
+        scan_commit(&claude, &mut state, BUDGET);
+        assert_eq!(state.sessions[SESSION].custom_title, None);
+        assert_eq!(
+            state.sessions[SESSION].shown_title().map(String::as_str),
+            Some("Ledger import speed-up"),
+            "an empty name gives the name back to the ai-title"
+        );
+    }
+
+    #[test]
+    fn a_rename_before_the_first_answer_is_kept_after_a_later_scan() {
+        let (_tmp, claude, _app) = fixture();
+        let path = write_lines(
+            &folder(&claude, FOLDER),
+            &format!("{SESSION}.jsonl"),
+            &[custom_title("tripwire")],
+        );
+        let mut state = ScanState::default();
+        scan_commit(&claude, &mut state, BUDGET);
+        append(
+            &path,
+            &user_string("fix the failing tests", "2026-11-12T09:40:58.101Z"),
+        );
+        append(&path, &answer("msg_a", AT));
+        scan_commit(&claude, &mut state, BUDGET);
+
+        assert_eq!(
+            state.sessions[SESSION].custom_title.as_deref(),
+            Some("tripwire")
+        );
+        assert_eq!(state.sessions[SESSION].title, None);
+    }
+
+    #[test]
+    fn a_custom_title_without_a_title_is_unreadable() {
+        let (_tmp, claude, _app) = fixture();
+        write_lines(
+            &folder(&claude, FOLDER),
+            &format!("{SESSION}.jsonl"),
+            &[
+                user_string("fix the failing tests", "2026-11-12T09:40:58.101Z"),
+                serde_json::json!({"type": "custom-title", "sessionId": SESSION}).to_string(),
+            ],
+        );
+
+        let (state, scan) = scan_run(&claude);
+
+        assert_eq!(state.sessions[SESSION].custom_title, None);
+        assert_eq!(
+            scan.warnings,
+            vec![format!("{KEY}: 1 lines could not be read")]
         );
     }
 

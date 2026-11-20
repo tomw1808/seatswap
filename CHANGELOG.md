@@ -6,6 +6,16 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.4.4] - 2026-11-20
+
+### Fixed
+
+- A session renamed in Claude Code (`/rename`) shows its new name in Sessions, in the waiting
+  notification and, from its next session record on, in closed rows and Statistics → Activity.
+  seatswap read only Claude Code's automatic title; it now names a session as Claude Code does: the
+  name you gave it, else the automatic title. A rename shows within a minute, within seconds
+  while the window shows Sessions.
+
 ## [1.4.3] - 2026-11-19
 
 ### Changed
@@ -627,7 +637,8 @@ All notable changes to this project are documented here. The format follows
   starts later): it says so and shows the icon as soon as a tray appears; `seatswap panel` opens
   the pop-up meanwhile.
 
-[Unreleased]: https://github.com/ymihere/seatswap/compare/v1.4.3...HEAD
+[Unreleased]: https://github.com/ymihere/seatswap/compare/v1.4.4...HEAD
+[1.4.4]: https://github.com/ymihere/seatswap/compare/v1.4.3...v1.4.4
 [1.4.3]: https://github.com/ymihere/seatswap/compare/v1.4.2...v1.4.3
 [1.4.2]: https://github.com/ymihere/seatswap/compare/v1.4.1...v1.4.2
 [1.4.1]: https://github.com/ymihere/seatswap/compare/v1.4.0...v1.4.1

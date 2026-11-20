@@ -802,7 +802,7 @@ pub fn running(
             session: file.session_id.clone(),
             host: host.to_string(),
             label,
-            title: seen.and_then(|seen| seen.title.clone()),
+            title: seen.and_then(|seen| seen.shown_title().cloned()),
             project_id,
             project: project_name,
             org,
@@ -2154,6 +2154,7 @@ mod tests {
             recorded: None,
             flash_jobs: BTreeSet::new(),
             title: None,
+            custom_title: None,
         }
     }
 
@@ -2359,6 +2360,38 @@ mod tests {
 
         let row = &rows.sessions[0];
         assert_eq!(row.title.as_deref(), Some("Fix the invoice export"));
+        assert_eq!(row.label, "atlas-a6", "the label keeps its meaning");
+    }
+
+    #[test]
+    fn a_renamed_session_is_named_by_its_new_name() {
+        let dir = tempdir().expect("tempdir");
+        let history = HistoryDir::at(dir.path(), "atlas");
+        let settings = settings_eur();
+        let valuer = valuer(&history, &settings, &[]);
+        let mut seen = seen("claude-opus-5-5", 12_400_000);
+        seen.title = Some("Fix the invoice export".to_string());
+        // `/rename` in Claude Code: the user's name wins, as Claude Code shows it.
+        seen.custom_title = Some("tripwire".to_string());
+        let state = state_with(seen);
+        let rows = running(
+            &[session_file()],
+            &state,
+            &|_: &str| Vec::new(),
+            &BTreeMap::new(),
+            RowTokens::Recorded {
+                recorded: &RecordedTokens::default(),
+                pending: &[],
+            },
+            Some(&projects()),
+            &known_pricing(&valuer, &settings),
+            "atlas",
+            utc("2026-11-14T19:00:00Z"),
+            &|_: &str| project_key(),
+        );
+
+        let row = &rows.sessions[0];
+        assert_eq!(row.title.as_deref(), Some("tripwire"));
         assert_eq!(row.label, "atlas-a6", "the label keeps its meaning");
     }
 
