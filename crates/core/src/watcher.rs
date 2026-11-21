@@ -32,6 +32,10 @@ pub const DEBOUNCE_MAX: Duration = Duration::from_secs(1);
 /// How often a busy Claude Code lock is re-checked.
 pub const BUSY_RECHECK: Duration = Duration::from_millis(200);
 
+/// How often the login watch calls `on_change` without an event when the live
+/// login is a Keychain item (macOS), which cannot be watched (spec §6.4).
+pub const KEYCHAIN_POLL: Duration = Duration::from_secs(30);
+
 #[derive(Debug, thiserror::Error)]
 pub enum WatchError {
     #[error("file watch: {0}")]
@@ -106,6 +110,10 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// parent of every existing folder is watched as well, because on Windows the
 /// watch of a removed folder ends without an event. No folder is created. A path that exists but is not a folder, or that
 /// cannot be read, is an error.
+///
+/// When the live login is a Keychain item (`claude.login_keychain` is Some),
+/// which no event reports, `on_change` is also called every [`KEYCHAIN_POLL`]
+/// since the last call, likewise only while Claude Code's locks are free.
 pub fn watch(
     claude: &ClaudePaths,
     on_change: impl Fn() + Send + 'static,
@@ -152,6 +160,7 @@ pub fn watch(
                 thread_paths,
                 names,
                 layout,
+                KEYCHAIN_POLL,
                 on_change,
             )
         });
@@ -455,7 +464,8 @@ fn is_read_access(kind: &EventKind) -> bool {
 
 #[derive(Clone, Copy)]
 enum Phase {
-    /// No relevant event seen yet.
+    /// No relevant event seen yet. With a poll interval, the phase ends when the
+    /// next poll is due as if a quiet period had just ended.
     Idle,
     /// A relevant event was seen; wait until it has been quiet for [`DEBOUNCE`],
     /// but never past `deadline` (the burst's first change plus the loop's
@@ -468,16 +478,17 @@ enum Phase {
     WaitingForLocks,
 }
 
-/// How long the next wait may last. Idle has no timeout: the thread blocks on the
-/// event channel until an event arrives or the backend is dropped (which closes
-/// the channel and wakes it).
-fn wait_timeout(phase: Phase) -> Option<Duration> {
+/// How long the next wait may last. Idle waits until `next_poll` when the loop
+/// polls, and otherwise has no timeout: the thread blocks on the event channel
+/// until an event arrives or the backend is dropped (which closes the channel
+/// and wakes it).
+fn wait_timeout(phase: Phase, next_poll: Option<Instant>) -> Option<Duration> {
     match phase {
         Phase::Quiet { until, deadline } => {
             Some(fires_at(until, deadline).saturating_duration_since(Instant::now()))
         }
         Phase::WaitingForLocks => Some(BUSY_RECHECK),
-        Phase::Idle => None,
+        Phase::Idle => next_poll.map(|at| at.saturating_duration_since(Instant::now())),
     }
 }
 
@@ -487,14 +498,18 @@ fn fires_at(until: Instant, deadline: Option<Instant>) -> Instant {
     deadline.map_or(until, |deadline| until.min(deadline))
 }
 
+/// The login watch's loop. `keychain_poll` is the poll interval used when the
+/// live login is a Keychain item ([`KEYCHAIN_POLL`]; tests pass a short one).
 fn run(
     events: Receiver<notify::Result<Event>>,
     stop: Arc<AtomicBool>,
     claude: ClaudePaths,
     names: WatchedNames,
     mut layout: Layout,
+    keychain_poll: Duration,
     on_change: impl Fn() + Send + 'static,
 ) {
+    let poll = claude.login_keychain.as_ref().map(|_| keychain_poll);
     run_debounced(
         events,
         stop,
@@ -507,6 +522,7 @@ fn run(
         },
         || !locks::claude_locks_busy(&claude),
         None,
+        poll,
         on_change,
     );
 }
@@ -552,6 +568,7 @@ pub fn watch_folder(
                 |event| !is_read_access(&event.kind),
                 || true,
                 Some(DEBOUNCE_MAX),
+                None,
                 on_change,
             );
         });
@@ -574,16 +591,20 @@ pub fn watch_folder(
 /// The debounce loop shared by [`watch`] and [`watch_folder`]: wait for an event
 /// that `is_change` accepts, then after [`DEBOUNCE`] quiet (and at the latest
 /// `max_wait` after the burst's first change, when given) and while `ready`
-/// holds, call `on_change` once.
+/// holds, call `on_change` once. With `poll`, `on_change` is also due when
+/// that long has passed since the start or the last call without one (and
+/// still waits for `ready`).
 fn run_debounced(
     events: Receiver<notify::Result<Event>>,
     stop: Arc<AtomicBool>,
     mut is_change: impl FnMut(&Event) -> bool,
     ready: impl Fn() -> bool,
     max_wait: Option<Duration>,
+    poll: Option<Duration>,
     on_change: impl Fn(),
 ) {
     let mut phase = Phase::Idle;
+    let mut next_poll = poll.map(|every| Instant::now() + every);
     loop {
         if stop.load(Ordering::SeqCst) {
             return;
@@ -594,9 +615,10 @@ fn run_debounced(
             }
             on_change();
             phase = Phase::Idle;
+            next_poll = poll.map(|every| Instant::now() + every);
             continue;
         }
-        let received = match wait_timeout(phase) {
+        let received = match wait_timeout(phase, next_poll) {
             Some(timeout) => events.recv_timeout(timeout),
             None => events.recv().map_err(|_| RecvTimeoutError::Disconnected),
         };
@@ -618,13 +640,19 @@ fn run_debounced(
             }
             // An error inside the stream is not fatal: the next event still works.
             Ok(Err(_)) => {}
-            Err(RecvTimeoutError::Timeout) => {
-                if let Phase::Quiet { until, deadline } = phase {
+            Err(RecvTimeoutError::Timeout) => match phase {
+                Phase::Quiet { until, deadline } => {
                     if Instant::now() >= fires_at(until, deadline) {
                         phase = Phase::WaitingForLocks;
                     }
                 }
-            }
+                Phase::Idle => {
+                    if next_poll.is_some_and(|at| Instant::now() >= at) {
+                        phase = Phase::WaitingForLocks;
+                    }
+                }
+                Phase::WaitingForLocks => {}
+            },
             Err(RecvTimeoutError::Disconnected) => return,
         }
     }
@@ -1043,8 +1071,149 @@ mod tests {
 
     #[test]
     fn idle_waits_without_a_timeout() {
-        assert_eq!(wait_timeout(Phase::Idle), None);
-        assert_eq!(wait_timeout(Phase::WaitingForLocks), Some(BUSY_RECHECK));
+        assert_eq!(wait_timeout(Phase::Idle, None), None);
+        assert_eq!(
+            wait_timeout(Phase::WaitingForLocks, None),
+            Some(BUSY_RECHECK)
+        );
+    }
+
+    #[test]
+    fn idle_with_a_poll_waits_until_the_poll_is_due() {
+        let timeout = wait_timeout(Phase::Idle, Some(Instant::now() + KEYCHAIN_POLL)).unwrap();
+        assert!(timeout <= KEYCHAIN_POLL && timeout > KEYCHAIN_POLL - Duration::from_secs(1));
+        let overdue = Instant::now()
+            .checked_sub(Duration::from_millis(5))
+            .unwrap();
+        assert_eq!(
+            wait_timeout(Phase::Idle, Some(overdue)),
+            Some(Duration::ZERO)
+        );
+    }
+
+    /// The login watch's loop on its own thread, fed by a channel the test
+    /// holds, so no file event (and no FSEvents) is involved. `on_change`
+    /// sends on the returned receiver.
+    struct PolledLoop {
+        stop: Arc<AtomicBool>,
+        events: Option<mpsc::Sender<notify::Result<Event>>>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl PolledLoop {
+        fn start(paths: &ClaudePaths, every: Duration) -> (PolledLoop, Receiver<()>) {
+            let (events, received_events) = mpsc::channel();
+            let (calls, received) = mpsc::channel();
+            let stop = Arc::new(AtomicBool::new(false));
+            let layout = Layout {
+                folders: Vec::new(),
+                watched: Vec::new(),
+                spellings: Vec::new(),
+                backend: Arc::new(Mutex::new(None)),
+                state: Arc::new(Mutex::new(WatchState::Watching)),
+            };
+            let names = WatchedNames::of(paths).unwrap();
+            let thread_paths = paths.clone();
+            let thread_stop = Arc::clone(&stop);
+            let thread = thread::spawn(move || {
+                run(
+                    received_events,
+                    thread_stop,
+                    thread_paths,
+                    names,
+                    layout,
+                    every,
+                    move || {
+                        let _ = calls.send(());
+                    },
+                )
+            });
+            let polled = PolledLoop {
+                stop,
+                events: Some(events),
+                thread: Some(thread),
+            };
+            (polled, received)
+        }
+    }
+
+    impl Drop for PolledLoop {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            drop(self.events.take());
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+
+    /// A Keychain login that nothing here reads: the loop only calls back.
+    fn with_keychain_login(mut paths: ClaudePaths, tmp: &TempDir) -> ClaudePaths {
+        paths.login_keychain = Some(crate::paths::KeychainItem {
+            service: "seatswap-test-credentials-poll".to_string(),
+            account: "sam".to_string(),
+            keychain: Some(tmp.path().join("never-used.keychain-db")),
+        });
+        paths
+    }
+
+    const SHORT_POLL: Duration = Duration::from_millis(30);
+
+    #[test]
+    fn a_keychain_login_is_polled() {
+        let tmp = TempDir::new().unwrap();
+        let paths = with_keychain_login(config_paths(&tmp), &tmp);
+        let (polled, received) = PolledLoop::start(&paths, SHORT_POLL);
+        for call in 1..=3 {
+            received
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap_or_else(|_| panic!("poll {call} did not call on_change"));
+        }
+        drop(polled);
+    }
+
+    #[test]
+    fn a_file_login_is_not_polled() {
+        let tmp = TempDir::new().unwrap();
+        let paths = config_paths(&tmp);
+        assert_eq!(paths.login_keychain, None);
+        let (polled, received) = PolledLoop::start(&paths, SHORT_POLL);
+        assert!(
+            received.recv_timeout(SHORT_POLL * 10).is_err(),
+            "a file login is noticed by events only"
+        );
+        drop(polled);
+    }
+
+    #[test]
+    fn a_keychain_poll_waits_for_claude_codes_locks() {
+        let tmp = TempDir::new().unwrap();
+        let paths = with_keychain_login(config_paths(&tmp), &tmp);
+        let lock = paths.refresh_lock();
+        fs::create_dir(&lock).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let heartbeat_stop = Arc::clone(&stop);
+        let heartbeat_lock = lock.clone();
+        let heartbeat = thread::spawn(move || {
+            while !heartbeat_stop.load(Ordering::SeqCst) {
+                let _ = filetime::set_file_mtime(&heartbeat_lock, filetime::FileTime::now());
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+
+        let (polled, received) = PolledLoop::start(&paths, SHORT_POLL);
+        assert!(
+            received.recv_timeout(SHORT_POLL * 10).is_err(),
+            "no poll may call on_change while Claude Code renews the login"
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        heartbeat.join().unwrap();
+        fs::remove_dir(&lock).unwrap();
+        received
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the poll must run once the lock is gone");
+        drop(polled);
     }
 
     #[test]
