@@ -21,7 +21,7 @@ Code's status line.
 </p>
 
 <p>
-  <img src="docs/images/window-sessions.png" alt="The large window's Sessions area: Claude Code and DeepSeek Harness sessions grouped by project and provider, with their agents, a flash job, tokens, last hour and values, and cards for the models, what a switch would cost and the last hour by project" width="760">
+  <img src="docs/images/window-sessions.png" alt="The large window's Sessions area by project: each project's Claude Code and DeepSeek Harness sessions with their model and status, their agents listed directly under them, a flash job, tokens, last hour and values, and cards for the models, what a switch would cost and the last hour by project" width="760">
 </p>
 
 <p>
@@ -40,7 +40,7 @@ Code's status line.
   <img src="docs/images/window-statusline.png" alt="The large window's Status line area: the segment palette, the Left and Right zones with the margin, the options card, and a preview of the line at three terminal widths" width="760">
 </p>
 
-*Screenshots show the app's built-in demo data; every name in them is made up.*
+*Screenshots show the app's built-in demo data and the made-up worlds of its test bench; every name in them is made up.*
 
 > **Not affiliated with Anthropic.** seatswap works with Claude Code's own login files and
 > the same endpoints Claude Code uses. They are undocumented and can change with any Claude Code
@@ -77,8 +77,11 @@ write that yet.
   sessions and DeepSeek Harness sessions sit beside them, and a flash job hangs under the Claude
   Code session that started it, with its workers below; a job already named in a transcript is
   linked there, and on Windows a running job appears once its result is collected. A closed Codex
-  session is not a row of its own yet, though its tokens are kept and counted in Statistics. Numbers on top,
-  two groupings and a card for what a switch would cost the running sessions. It updates by itself
+  session is not a row of its own yet, though its tokens are kept and counted in Statistics. A
+  session goes by the name Claude Code shows for it, so a `/rename` shows within a minute; its
+  agents are listed directly under it, each with its model. Numbers on top, two orders (by project →
+  session, or by provider → model → session) and a card for what a switch would cost the running
+  sessions. It updates by itself
   (at most twice a second) and needs *Read Claude Code's session files* (on by default); turning it
   on takes effect after a restart.
 - **The Statistics area.** Seven pages over the recorded history, for a range from this week to
