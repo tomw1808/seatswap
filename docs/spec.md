@@ -1448,8 +1448,8 @@ restart, and with it off the area says so. Every row names its provider: `Claude
 - The sessions whose thinking is tied to the account (§7.4.2), and how many of them are busy.
 - The account in use, with its week; its name wraps inside its box instead of being cut.
 
-**The tree.** Two orders, switched at the top and remembered: by project → provider and model →
-session, or by provider → model → session with the project after the session's name. A session with
+**The tree.** Two orders, switched at the top and remembered: by project → session (each session row
+shows its model, so there is no provider or model row under a project; 1.4.5), or by provider → model → session with the project after the session's name. A session with
 running agents is open, and closes again when they finish, unless the user folded or unfolded it by
 hand; that choice holds while the window is open, also when the user visits another area. Every
 top-level
@@ -1457,8 +1457,8 @@ group row stands on the mock-up's highlighted background and shows how many runn
 sessions it holds, how many are busy, how many agents are running, and the totals of its tokens and
 their two values; every total counts exactly the sessions in the view — a grey row that has left is
 shown but no longer counted. Every total row fills the same columns as a session row — Agents, Tokens, Last hour,
-subscription value and API value — and leaves Model and Status empty: in By project a project and
-its provider · model rows, in By model a provider and its model rows. The model rows under a
+subscription value and API value — and leaves Model and Status empty: in By project a project row,
+in By model a provider and its model rows. The model rows under a
 provider do not repeat it; a model total row carries the `tied` bubble, and a total's Agents shows
 `—` when every row it sums has no agent data. A session's row has:
 

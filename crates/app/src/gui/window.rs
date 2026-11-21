@@ -436,15 +436,14 @@ pub(crate) struct SwitchEffect {
 /// Which group a [`Sum`] belongs to (spec §3.8). The page looks a row's or a
 /// card's numbers up by this key; it never adds values itself. The page shows
 /// the provider group and the provider's model rows too, so those keys are here
-/// beside the brief's four (`All`, `Project`, `ProjectModel`, `Model`).
+/// beside `All`, `Project` and `Model`. By project lists its sessions directly
+/// under the project, with no row per model (1.4.5).
 #[cfg(feature = "gui")]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum SumOf {
     All,
     Provider(String),
     Project(ProjectId),
-    /// One project's provider and model: the project's model row (item 43).
-    ProjectModel(ProjectId, String, Option<String>),
     /// One provider's model: the total row of "By model" (item 43). `Model`
     /// stays the Models card's total over every provider.
     ProviderModel(String, Option<String>),
@@ -465,12 +464,6 @@ impl Serialize for SumOf {
             SumOf::Project(project) => {
                 map.serialize_entry("kind", "project")?;
                 map.serialize_entry("project", project)?;
-            }
-            SumOf::ProjectModel(project, provider, model) => {
-                map.serialize_entry("kind", "projectModel")?;
-                map.serialize_entry("project", project)?;
-                map.serialize_entry("provider", provider)?;
-                map.serialize_entry("model", model)?;
             }
             SumOf::ProviderModel(provider, model) => {
                 map.serialize_entry("kind", "providerModel")?;
@@ -666,11 +659,6 @@ fn sums_of(sessions: &[LiveSession]) -> Vec<Sum> {
             SumOf::All,
             SumOf::Provider(row.provider.clone()),
             SumOf::Project(row.project_id.clone()),
-            SumOf::ProjectModel(
-                row.project_id.clone(),
-                row.provider.clone(),
-                row.model.clone(),
-            ),
             SumOf::ProviderModel(row.provider.clone(), row.model.clone()),
             SumOf::Model(row.model.clone()),
         ];
@@ -2343,7 +2331,7 @@ mod tests {
             &SessionsOptions::default(),
         );
 
-        assert_eq!(view.sums.len(), 15, "{:?}", view.sums);
+        assert_eq!(view.sums.len(), 11, "{:?}", view.sums);
         assert_eq!(find(&view, &SumOf::All).sessions, 4);
         assert_eq!(find(&view, &SumOf::All).tokens.out, 15_000_000);
         assert_eq!(
@@ -2369,54 +2357,6 @@ mod tests {
             find(&view, &SumOf::Project(second.clone())).sessions,
             1,
             "two projects with the same name are two groups"
-        );
-        assert_eq!(
-            find(
-                &view,
-                &SumOf::ProjectModel(
-                    first.clone(),
-                    "Claude Code".to_string(),
-                    Some("claude-opus-5-5".to_string())
-                )
-            )
-            .tokens
-            .out,
-            1_000_000
-        );
-        assert_eq!(
-            find(
-                &view,
-                &SumOf::ProjectModel(
-                    first.clone(),
-                    "Claude Code".to_string(),
-                    Some("claude-fable-5-2".to_string())
-                )
-            )
-            .tokens
-            .out,
-            4_000_000
-        );
-        assert_eq!(
-            find(
-                &view,
-                &SumOf::ProjectModel(first.clone(), "Codex".to_string(), None)
-            )
-            .tokens
-            .out,
-            8_000_000
-        );
-        assert_eq!(
-            find(
-                &view,
-                &SumOf::ProjectModel(
-                    second.clone(),
-                    "Claude Code".to_string(),
-                    Some("claude-opus-5-5".to_string())
-                )
-            )
-            .tokens
-            .out,
-            2_000_000
         );
         assert_eq!(
             find(&view, &SumOf::Model(Some("claude-opus-5-5".to_string())))
@@ -2963,39 +2903,6 @@ mod tests {
             &SessionsOptions::default(),
         );
 
-        // The project's provider · model rows are two sums too, one per
-        // provider, each over its own session.
-        let project_sums: Vec<&Sum> = view
-            .sums
-            .iter()
-            .filter(|sum| {
-                matches!(
-                    &sum.of,
-                    SumOf::ProjectModel(of_project, of_provider, of_model)
-                        if of_project == &project
-                            && of_provider == "Claude Code"
-                            && of_model.as_deref() == Some(FLASH)
-                )
-            })
-            .collect();
-        assert_eq!(project_sums.len(), 1, "{:?}", view.sums);
-        assert_eq!(project_sums[0].sessions, 1);
-        let harness_project_sums: Vec<&Sum> = view
-            .sums
-            .iter()
-            .filter(|sum| {
-                matches!(
-                    &sum.of,
-                    SumOf::ProjectModel(of_project, of_provider, of_model)
-                        if of_project == &project
-                            && of_provider == "DeepSeek Harness"
-                            && of_model.as_deref() == Some(FLASH)
-                )
-            })
-            .collect();
-        assert_eq!(harness_project_sums.len(), 1, "{:?}", view.sums);
-        assert_eq!(harness_project_sums[0].sessions, 1);
-
         let under_claude = sums_for(&view, "Claude Code", FLASH);
         let under_harness = sums_for(&view, "DeepSeek Harness", FLASH);
         assert_eq!(under_claude.len(), 1, "{:?}", view.sums);
@@ -3051,20 +2958,13 @@ mod tests {
             serde_json::json!({"kind": "providerModel", "provider": "Codex", "model": null})
         );
         assert_eq!(
-            serde_json::to_value(SumOf::ProjectModel(
-                project,
-                "DeepSeek Harness".to_string(),
-                Some(FLASH.to_string())
-            ))
-            .expect("a project model key as JSON"),
+            serde_json::to_value(SumOf::Project(project)).expect("a project key as JSON"),
             serde_json::json!({
-                "kind": "projectModel",
+                "kind": "project",
                 "project": {
                     "kind": "repo",
                     "id": "github.com/acme/acme-kb",
                 },
-                "provider": "DeepSeek Harness",
-                "model": FLASH,
             })
         );
     }

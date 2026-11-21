@@ -6,6 +6,16 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.4.5] - 2026-11-21
+
+### Changed
+
+- Sessions, By project: a project's sessions are listed directly under it, without the line
+  "Claude Code · Opus 5.5 · 2 sessions" per provider and model; each session row already shows its
+  model. By model is unchanged.
+- Sessions: the name column's heading names the levels of the order shown, "Project · session ·
+  agent" or "Provider · model · session · agent", instead of one heading for both.
+
 ## [1.4.4] - 2026-11-20
 
 ### Fixed
@@ -638,6 +648,7 @@ All notable changes to this project are documented here. The format follows
   the pop-up meanwhile.
 
 [Unreleased]: https://github.com/ymihere/seatswap/compare/v1.4.4...HEAD
+[1.4.5]: https://github.com/ymihere/seatswap/compare/v1.4.4...v1.4.5
 [1.4.4]: https://github.com/ymihere/seatswap/compare/v1.4.3...v1.4.4
 [1.4.3]: https://github.com/ymihere/seatswap/compare/v1.4.2...v1.4.3
 [1.4.2]: https://github.com/ymihere/seatswap/compare/v1.4.1...v1.4.2

@@ -3233,11 +3233,10 @@ pub(crate) struct HostState { pub host: String, pub at: DateTime<Utc>, pub stale
 pub(crate) struct SwitchEffect { pub loses_thinking: u32, pub loses_thinking_busy: u32,
                                  pub loses_thinking_models: Vec<String>,
                                  pub resend: u32, pub free: u32 }
-/// `kind` in JSON: all/provider/project/projectModel/providerModel/model, with `project`,
+/// `kind` in JSON: all/provider/project/providerModel/model, with `project`,
 /// `provider` and `model` as their fields.
 pub(crate) enum SumOf { All, Provider(String), Project(ProjectId),
-    ProjectModel(ProjectId, String, Option<String>), ProviderModel(String, Option<String>),
-    Model(Option<String>) }
+    ProviderModel(String, Option<String>), Model(Option<String>) }
 pub(crate) struct Sum { pub of: SumOf, pub sessions: u32, pub agents_running: u32,
     pub agents_done: u32, pub tokens: Tokens, pub last_hour: Option<Tokens>,
     pub last_hour_values: Values, pub values: Values }
@@ -3265,8 +3264,8 @@ is not part of the view: the page reads it from the snapshot, like the pop-up do
 
 `sums` is built over exactly the sessions the view lists, by `sums_of`, so a group's total and the
 rows agree and the page never adds values. It has `All` (even for an empty list) and one key for
-each provider, project, project's provider and model, provider's model and model that has a session.
-`ProjectModel` is one project's provider and model (the project's model row); `ProviderModel` is one
+each provider, project, provider's model and model that has a session. (1.4.5 removed `ProjectModel`:
+By project lists sessions directly under the project.) `ProviderModel` is one
 provider's model (the "By model" total row), while `Model` is the Models card's total over every
 provider. `Sum.tokens` adds the token counts; `Sum.last_hour` is `None` when any row of the group has
 an unknown last hour, never a sum over the rest; `Sum.last_hour_values` and `Sum.values` are

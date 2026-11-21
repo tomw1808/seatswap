@@ -70,6 +70,7 @@ const state = {
   errorHost: null,
   linkHost: null,
   controls: null,
+  nameHead: null,
   valueHead: null,
   apiHead: null,
   sums: new Map(),
@@ -168,8 +169,6 @@ function sumKey(of) {
       return `provider\u0000${of.provider || ""}`;
     case "project":
       return `project\u0000${projectKey(of.project)}`;
-    case "projectModel":
-      return `projectModel\u0000${projectKey(of.project)}\u0000${of.provider || ""}\u0000${modelKey(of.model)}`;
     case "providerModel":
       return `providerModel\u0000${of.provider || ""}\u0000${modelKey(of.model)}`;
     case "model":
@@ -501,6 +500,7 @@ export function unmount() {
   state.errorHost = null;
   state.linkHost = null;
   state.controls = null;
+  state.nameHead = null;
   state.valueHead = null;
   state.apiHead = null;
   state.rowNodes = new Map();
@@ -795,10 +795,11 @@ function buildShell(container) {
   state.kpis = null;
   const body = h("div", { class: "sess-body" });
   const tree = h("div", { class: "hcard sess-tree" });
+  state.nameHead = h("span", {});
   state.valueHead = h("span", { class: "n sess-value-head" }, "value");
   state.apiHead = h("span", { class: "n sess-api-head" }, "API value");
   const treeHead = h("div", { class: "sess-cols sess-cols-head" }, [
-    h("span", {}, "Project · provider and model · session · agent"),
+    state.nameHead,
     h("span", {}, "Model"),
     h("span", {}, "Status"),
     h("span", { class: "n" }, "Agents"),
@@ -1278,8 +1279,6 @@ function updateGroupItem(entry, item) {
   setValueText(entry.valueNodes[1], sum.values, "api", state.view.currency, "n b6");
 }
 
-// A sub-row of an agent list (the running agents' provider · model line). It
-// carries text only; `error` marks a line that names an error of the view.
 // A session with no running and no done agent and no agent list has no agent
 // data at all: it says "—", never "0 · 0" (item 24). A session with no running
 // agent but a done one still says "0 · 3".
@@ -1866,8 +1865,8 @@ function insertDeparted(entries, entry, index) {
   entries.splice(at, 0, entry);
 }
 
-// By project: project → "provider · model" → session. Only the project row has
-// numbers; its sub-text counts the view's rows, never a grey one.
+// By project: project → session. The project row's sub-text counts the view's
+// rows, never a grey one.
 function projectTreeItems() {
   const now = Date.now();
   const groups = new Map();
@@ -1921,35 +1920,16 @@ function projectTreeItems() {
       tied: false,
       depth: 0,
     });
+    // The sessions sit directly under their project, in provider and model
+    // order, each row with its own model; no total row per model (1.4.5).
     for (const providerRows of providerGroups(group.entries.map((entry) => entry.row))) {
       const provider = providerRows[0].provider || "";
       for (const modelRows of modelGroups(providerRows)) {
         const model = modelRows[0].model;
-        const leaf = group.entries.filter(
-          (entry) =>
-            (entry.row.provider || "") === provider &&
-            modelKey(entry.row.model) === modelKey(model)
-        );
-        const viewLeafRows = leaf.filter((entry) => !entry.departed).map((entry) => entry.row);
-        const sampleLeafRows = leaf.map((entry) => entry.row);
-        items.push({
-          type: "group",
-          key: `projectModel\u0000${group.key}\u0000${provider}\u0000${modelKey(model)}`,
-          name: model === null ? modelName(model) : `${provider} · ${modelName(model)}`,
-          sub: modelSubDetail(viewLeafRows, model, sampleLeafRows),
-          sum: sumFor("projectModel", {
-            project: group.projectId,
-            provider,
-            model,
-          }),
-          rows: viewLeafRows.length ? viewLeafRows : sampleLeafRows,
-          tied: modelSubTied(viewLeafRows, model, sampleLeafRows),
-          depth: 1,
-        });
         for (const entry of group.entries) {
           if ((entry.row.provider || "") !== provider) continue;
           if (modelKey(entry.row.model) !== modelKey(model)) continue;
-          items.push(sessionTreeItem(entry));
+          items.push(sessionTreeItem(entry, 1));
         }
       }
     }
@@ -2017,20 +1997,20 @@ function modelTreeItems() {
         tied: modelSubTied(viewLeafRows, model, sampleLeafRows),
         depth: 1,
       });
-      for (const entry of leaf) items.push(sessionTreeItem(entry));
+      for (const entry of leaf) items.push(sessionTreeItem(entry, 2));
     }
   }
   return items;
 }
 
-function sessionTreeItem(entry) {
+function sessionTreeItem(entry, depth) {
   return {
     type: "session",
     key: `session\u0000${entry.row.session}`,
     row: entry.row,
     options: {
       wide: state.choices.grouping === "model",
-      depth: 2,
+      depth,
       departed: entry.departed,
     },
   };
@@ -2093,8 +2073,14 @@ function entryForItem(item) {
 // there before is inserted. The scroll stays where the user left it.
 function renderTree() {
   if (!state.treeScroll || !state.view) return;
-  let items =
-    state.choices.grouping === "model" ? modelTreeItems() : projectTreeItems();
+  const byModel = state.choices.grouping === "model";
+  // The name column's heading names the levels of the order shown.
+  if (state.nameHead) {
+    state.nameHead.textContent = byModel
+      ? "Provider · model · session · agent"
+      : "Project · session · agent";
+  }
+  let items = byModel ? modelTreeItems() : projectTreeItems();
   if (items.length === 0) items = [{ type: "empty", key: "empty" }];
   // A row inserted above the visible part must not move what the user looks
   // at: the scroll is put back where it was.

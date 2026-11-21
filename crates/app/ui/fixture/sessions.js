@@ -716,7 +716,6 @@ function fixtureSums(rows) {
       { kind: "all" },
       { kind: "provider", provider: row.provider },
       { kind: "project", project: row.projectId },
-      { kind: "projectModel", project: row.projectId, provider: row.provider, model: row.model },
       { kind: "providerModel", provider: row.provider, model: row.model },
       { kind: "model", model: row.model },
     ];
