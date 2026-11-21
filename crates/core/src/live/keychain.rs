@@ -11,8 +11,10 @@
 //! (see [`INTERACTIVE_LINE_LIMIT`]), so a value that does not fit is passed on
 //! the command line instead, as Claude Code does.
 //!
-//! The names, the command line and the hex coding are compiled and tested on
-//! every OS; only macOS runs `security`. Elsewhere every use is
+//! The names, the command line and the hex coding are compiled on every OS
+//! and tested on every OS, except the tests that need a Unix path for the
+//! keychain file (a Windows path holds backslashes, which are refused); only
+//! macOS runs `security`. Elsewhere every use is
 //! [`LiveError::KeychainUnsupported`].
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
@@ -399,6 +401,8 @@ pub(super) mod tests {
     }
 
     /// An existing file that stands for a keychain where nothing runs `security`.
+    /// Unix only: a Windows temp path holds backslashes, which `names` refuses.
+    #[cfg(unix)]
     fn fake_keychain(tmp: &tempfile::TempDir) -> PathBuf {
         let path = tmp.path().join("fake.keychain-db");
         fs::write(&path, b"").unwrap();
@@ -415,6 +419,9 @@ pub(super) mod tests {
         }
     }
 
+    // Unix only: a Windows temp path holds backslashes, and `"` is not
+    // allowed in a Windows file name.
+    #[cfg(unix)]
     #[test]
     fn a_short_value_goes_on_stdin_as_one_quoted_line() {
         let tmp = tempfile::tempdir().unwrap();
@@ -431,6 +438,9 @@ pub(super) mod tests {
         );
     }
 
+    // Unix only: a Windows temp path holds backslashes, and `"` is not
+    // allowed in a Windows file name.
+    #[cfg(unix)]
     #[test]
     fn the_line_limit_decides_between_stdin_and_arguments() {
         let tmp = tempfile::tempdir().unwrap();
@@ -516,6 +526,9 @@ pub(super) mod tests {
         }
     }
 
+    // Unix only: a Windows temp path holds backslashes, and `"` is not
+    // allowed in a Windows file name.
+    #[cfg(unix)]
     #[test]
     fn a_keychain_path_must_be_absolute_quotable_and_exist() {
         let tmp = tempfile::tempdir().unwrap();
