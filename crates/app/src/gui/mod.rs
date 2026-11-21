@@ -358,6 +358,13 @@ fn setup(
     claude_override: Option<PathBuf>,
     data_override: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // macOS: a menu-bar app, without a Dock icon or a place in the app
+    // switcher, like the tray app on Linux and Windows.
+    #[cfg(target_os = "macos")]
+    tauri_app
+        .handle()
+        .set_activation_policy(tauri::ActivationPolicy::Accessory)?;
+
     // Read the settings without opening the secret store: the main thread never
     // probes the keyring. A file that cannot be read is reported in the snapshot
     // and the tray keeps running.
