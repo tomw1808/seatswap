@@ -135,6 +135,7 @@ pub fn watch(
 
     let stop = Arc::new(AtomicBool::new(false));
     let layout = Layout {
+        spellings: spellings_of(&folders),
         folders,
         watched,
         backend: Arc::clone(&backend),
@@ -174,10 +175,12 @@ pub fn watch(
 
 /// Where the login watch looks: the folders that hold the login files, the
 /// paths watched for them now (each folder, or its nearest existing parent while
-/// it is missing), and the state the GUI reads.
+/// it is missing), the spellings an event may use for them ([`spellings_of`]),
+/// and the state the GUI reads.
 struct Layout {
     folders: Vec<PathBuf>,
     watched: Vec<PathBuf>,
+    spellings: Vec<PathBuf>,
     backend: Arc<Mutex<Option<RecommendedWatcher>>>,
     state: Arc<Mutex<WatchState>>,
 }
@@ -186,10 +189,11 @@ impl Layout {
     /// An event about one of the login folders or a parent of one may have
     /// created, removed or renamed it.
     fn touches(&self, event: &Event) -> bool {
-        event
-            .paths
-            .iter()
-            .any(|path| self.folders.iter().any(|folder| folder.starts_with(path)))
+        event.paths.iter().any(|path| {
+            self.spellings
+                .iter()
+                .any(|spelling| spelling.starts_with(path))
+        })
     }
 
     /// Plan the watches again after such an event. Returns true when the
@@ -207,6 +211,7 @@ impl Layout {
                 Err(error) => WatchState::Failed(error.to_string()),
             }
         };
+        self.spellings = spellings_of(&self.folders);
         let mut current = lock(&self.state);
         let changed = *current != state || !same_paths(&before, &self.watched);
         *current = state;
@@ -361,8 +366,76 @@ impl WatchedNames {
     }
 
     fn is_watched(&self, path: &Path) -> bool {
-        path == self.credentials || path == self.identity
+        same_place(path, &self.credentials) || same_place(path, &self.identity)
     }
+}
+
+/// Whether the event path `event` names `ours`: the same path, or the same
+/// name in the same folder once links are resolved. macOS (FSEvents) reports
+/// the real path, `/private/var/…` for a folder under `/var/…` or the target
+/// of a linked config folder. Only a path with the same name costs a look at
+/// the disk.
+fn same_place(event: &Path, ours: &Path) -> bool {
+    if event == ours {
+        return true;
+    }
+    if event.file_name().is_none() || event.file_name() != ours.file_name() {
+        return false;
+    }
+    match (event.parent(), ours.parent()) {
+        (Some(theirs), Some(mine)) => {
+            let theirs = resolved(theirs);
+            theirs.is_some() && theirs == resolved(mine)
+        }
+        _ => false,
+    }
+}
+
+/// `path` with every link in the part of it that exists resolved: the real
+/// path of its nearest existing ancestor (or of itself) with the missing rest
+/// appended. `None` when not even an ancestor can be resolved.
+fn resolved(path: &Path) -> Option<PathBuf> {
+    let mut rest = Vec::new();
+    let mut candidate = path;
+    loop {
+        if let Ok(mut real) = fs::canonicalize(candidate) {
+            real.extend(rest.iter().rev());
+            return Some(real);
+        }
+        rest.push(candidate.file_name()?);
+        candidate = candidate
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())?;
+    }
+}
+
+/// The spellings an event may use for `folders` and the folders above them:
+/// each folder as given, its real path, and for the folder and every ancestor
+/// the entry itself (a link stays a link) in its real parent. Refreshed when
+/// the layout follows the folders, so a folder that has gone since is still
+/// known by the path the system reported for it.
+fn spellings_of(folders: &[PathBuf]) -> Vec<PathBuf> {
+    let mut spellings: Vec<PathBuf> = Vec::new();
+    let mut add = |path: PathBuf| {
+        if !spellings.contains(&path) {
+            spellings.push(path);
+        }
+    };
+    for folder in folders {
+        add(folder.clone());
+        if let Some(real) = resolved(folder) {
+            add(real);
+        }
+        for entry in folder.ancestors() {
+            let (Some(parent), Some(name)) = (entry.parent(), entry.file_name()) else {
+                continue;
+            };
+            if let Some(real_parent) = resolved(parent) {
+                add(real_parent.join(name));
+            }
+        }
+    }
+    spellings
 }
 
 fn file_name(path: &Path) -> Result<&OsStr, WatchError> {
@@ -884,6 +957,88 @@ mod tests {
             "the error names the path: {error}"
         );
         assert!(error.to_string().contains("ermission denied"), "{error}");
+    }
+
+    /// A config folder that is a link to the real one, as with dotfiles kept
+    /// elsewhere: `tmp/real` and `tmp/cfg -> real`.
+    #[cfg(unix)]
+    fn linked_config_paths(tmp: &TempDir) -> (ClaudePaths, PathBuf) {
+        let real = tmp.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let config = tmp.path().join("cfg");
+        std::os::unix::fs::symlink(&real, &config).unwrap();
+        (ClaudePaths::for_config_dir(&config, tmp.path()), real)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_login_named_by_its_real_path_is_the_login() {
+        let tmp = TempDir::new().unwrap();
+        let (paths, real) = linked_config_paths(&tmp);
+        let names = WatchedNames::of(&paths).unwrap();
+        // macOS reports the real path; tempdirs there sit under the /var link too.
+        let real = fs::canonicalize(&real).unwrap();
+        assert!(names.is_watched(&paths.credentials_file));
+        assert!(names.is_watched(&real.join(".credentials.json")));
+        assert!(names.is_watched(&real.join(".claude.json")));
+        assert!(!names.is_watched(&real.join("settings.json")));
+        let real_tmp = fs::canonicalize(tmp.path()).unwrap();
+        assert!(
+            !names.is_watched(&real_tmp.join(".claude.json")),
+            "the parent's file of the same name is not the login"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_folder_named_by_its_real_parent_touches_the_layout() {
+        let tmp = TempDir::new().unwrap();
+        let link = tmp.path().join("home");
+        std::os::unix::fs::symlink(tmp.path(), &link).unwrap();
+        let folder = link.join("work").join("cfg");
+        let layout = Layout {
+            spellings: spellings_of(std::slice::from_ref(&folder)),
+            folders: vec![folder],
+            watched: Vec::new(),
+            backend: Arc::new(Mutex::new(None)),
+            state: Arc::new(Mutex::new(WatchState::NotSetUp)),
+        };
+        let real_tmp = fs::canonicalize(tmp.path()).unwrap();
+        let about = |path: PathBuf| {
+            Event::new(EventKind::Create(notify::event::CreateKind::Folder)).add_path(path)
+        };
+        assert!(layout.touches(&about(link.join("work"))));
+        assert!(layout.touches(&about(real_tmp.join("work"))));
+        assert!(layout.touches(&about(real_tmp.join("work").join("cfg"))));
+        assert!(!layout.touches(&about(real_tmp.join("other"))));
+        assert!(!layout.touches(&about(real_tmp.join("work").join("cfg2"))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_config_folder_is_watched_through_the_link() {
+        let tmp = TempDir::new().unwrap();
+        let (paths, _real) = linked_config_paths(&tmp);
+        let (watcher, count, received) = watched(&paths);
+        assert_eq!(watcher.state(), WatchState::Watching);
+
+        atomic::write_atomic(&paths.credentials_file, b"{}", atomic::Access::Private).unwrap();
+        expect_one(&received, &count);
+        drop(watcher);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_config_folder_whose_target_goes_is_followed() {
+        let tmp = TempDir::new().unwrap();
+        let (paths, real) = linked_config_paths(&tmp);
+        let (watcher, _count, received) = watched(&paths);
+        assert_eq!(watcher.state(), WatchState::Watching);
+
+        fs::remove_dir(&real).unwrap();
+        expect_some(&received, "the link's target was removed");
+        assert_eq!(watcher.state(), WatchState::NotSetUp);
+        drop(watcher);
     }
 
     #[test]

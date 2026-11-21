@@ -1048,8 +1048,10 @@ mod tests {
     #[test]
     fn the_bundle_icon_is_the_default_window_icon() {
         // Every window is built without its own icon, so Tauri's default window
-        // icon (the bundle's icons/icon.png) must be there.
-        let context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+        // icon (the bundle's icons/icon.png) must be there. `test = true`: on
+        // macOS every other context would embed a second Info.plist symbol
+        // beside the app's own.
+        let context: tauri::Context<tauri::Wry> = tauri::generate_context!(test = true);
         let icon = context
             .default_window_icon()
             .expect("the bundle icon is the default window icon");
@@ -1103,7 +1105,7 @@ mod tests {
     #[test]
     #[cfg(not(windows))]
     fn the_default_window_icon_is_the_app_icon() {
-        let context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+        let context: tauri::Context<tauri::Wry> = tauri::generate_context!(test = true);
         let icon = context
             .default_window_icon()
             .expect("the bundle icon is the default window icon");

@@ -612,7 +612,8 @@ fn dropbox_info_files() -> Result<Vec<PathBuf>, PathsError> {
 }
 
 /// The name this host writes its history under: `explicit` if set, else the
-/// machine's host name (Linux: /proc/sys/kernel/hostname; Windows: %COMPUTERNAME%).
+/// machine's host name (Linux: /proc/sys/kernel/hostname; macOS: the Bonjour
+/// name from `scutil --get LocalHostName`; Windows: %COMPUTERNAME%).
 /// 1..=63 characters of [A-Za-z0-9._-] whose first character is a letter or a
 /// digit; anything else is [`PathsError::HostName`] with the text "set hostName
 /// in the settings". The first character rules out `.` and `..`, which would
@@ -674,7 +675,57 @@ fn machine_host_name() -> Result<String, PathsError> {
     })
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+/// macOS: the Bonjour local host name the person sets in System Settings →
+/// General → Sharing. Not `gethostname`/`uname`, which on a Mac follow the
+/// network (DHCP names, `.local`) and would move this host's history folder.
+#[cfg(target_os = "macos")]
+fn machine_host_name() -> Result<String, PathsError> {
+    let output = std::process::Command::new(SCUTIL)
+        .args(["--get", "LocalHostName"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| {
+            PathsError::HostName(format!(
+                "cannot run {SCUTIL} to read the machine's host name: {e}"
+            ))
+        })?;
+    local_host_name(output.status.success(), &output.stdout, &output.stderr)
+}
+
+#[cfg(any(target_os = "macos", test))]
+const SCUTIL: &str = "/usr/sbin/scutil";
+
+/// The name in the output of `scutil --get LocalHostName`: its one line
+/// without the line end. A failed run (scutil prints `LocalHostName: not set`
+/// when there is none) or an empty name is an error naming what scutil said;
+/// [`host_name`] puts the name in lower case and checks its characters.
+#[cfg(any(target_os = "macos", test))]
+fn local_host_name(success: bool, stdout: &[u8], stderr: &[u8]) -> Result<String, PathsError> {
+    let said = |bytes: &[u8]| String::from_utf8_lossy(bytes).trim().to_string();
+    if !success {
+        let message = [said(stderr), said(stdout)]
+            .into_iter()
+            .find(|text| !text.is_empty())
+            .unwrap_or_else(|| "no output".to_string());
+        return Err(PathsError::HostName(format!(
+            "{SCUTIL} --get LocalHostName failed: {message}"
+        )));
+    }
+    let text = std::str::from_utf8(stdout).map_err(|_| {
+        PathsError::HostName(format!(
+            "{SCUTIL} --get LocalHostName gave a name that is not UTF-8"
+        ))
+    })?;
+    let name = text.strip_suffix('\n').unwrap_or(text);
+    if name.is_empty() {
+        return Err(PathsError::HostName(format!(
+            "{SCUTIL} --get LocalHostName gave no name"
+        )));
+    }
+    Ok(name.to_string())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn machine_host_name() -> Result<String, PathsError> {
     Err(PathsError::HostName(
         "the machine's host name cannot be read on this system".to_string(),
@@ -810,6 +861,50 @@ mod tests {
         }
         for name in ["atlas", "9vega", "vega-2.lan", "a"] {
             assert_eq!(host_name(Some(name)).unwrap(), name);
+        }
+    }
+
+    #[test]
+    fn the_local_host_name_is_scutils_line() {
+        assert_eq!(
+            local_host_name(true, b"Sams-MacBook-Pro\n", b"").unwrap(),
+            "Sams-MacBook-Pro"
+        );
+        assert_eq!(local_host_name(true, b"atlas", b"").unwrap(), "atlas");
+        // host_name then puts it in lower case and checks its characters.
+        let name = local_host_name(true, b"Sams-MacBook-Pro\n", b"").unwrap();
+        assert_eq!(host_name(Some(&name)).unwrap(), "sams-macbook-pro");
+    }
+
+    #[test]
+    fn a_missing_local_host_name_is_an_error_naming_scutil() {
+        for (success, stdout, stderr, said) in [
+            (
+                false,
+                &b"LocalHostName: not set\n"[..],
+                &b""[..],
+                "failed: LocalHostName: not set",
+            ),
+            (
+                false,
+                b"",
+                b"scutil: permission denied\n",
+                "failed: scutil: permission denied",
+            ),
+            (false, b"", b"", "failed: no output"),
+            (true, b"\n", b"", "gave no name"),
+            (true, b"", b"", "gave no name"),
+            (true, b"\xff\xfe\n", b"", "not UTF-8"),
+        ] {
+            let error = local_host_name(success, stdout, stderr).unwrap_err();
+            let text = error.to_string();
+            assert!(matches!(error, PathsError::HostName(_)), "{text}");
+            assert!(
+                text.contains("/usr/sbin/scutil --get LocalHostName"),
+                "{text}"
+            );
+            assert!(text.contains(said), "{text}");
+            assert!(text.ends_with("; set hostName in the settings"), "{text}");
         }
     }
 
