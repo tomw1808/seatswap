@@ -896,9 +896,31 @@ pub fn runtime_dir() -> Option<PathBuf> {
 }
 
 /// The autostart desktop file the GUI writes with [`crate::atomic::write_atomic`]
-/// (spec §9.4, §10).
+/// (spec §9.4, §10). Linux; macOS uses [`launch_agent_file`].
 pub fn autostart_file(xdg_config_home: &Path) -> PathBuf {
     xdg_config_home.join("autostart").join("seatswap.desktop")
+}
+
+/// The label of the macOS LaunchAgent that starts the tray app at login: the
+/// Tauri identifier (`crates/app/tauri.conf.json`), which also names its file.
+pub const LAUNCH_AGENT_LABEL: &str = "dev.seatswap.app";
+
+/// The per-user LaunchAgent the GUI writes on macOS with
+/// [`crate::atomic::write_atomic`] for "Start at login"
+/// (`<home>/Library/LaunchAgents/dev.seatswap.app.plist`). launchd reads that
+/// folder at the next login.
+pub fn launch_agent_file(home: &Path) -> PathBuf {
+    home.join("Library")
+        .join("LaunchAgents")
+        .join(format!("{LAUNCH_AGENT_LABEL}.plist"))
+}
+
+/// [`launch_agent_file`] in this user's home folder. Only macOS has one; tests
+/// pass a home folder to [`launch_agent_file`] instead and never call this.
+#[cfg(target_os = "macos")]
+pub fn user_launch_agent_file() -> Result<PathBuf, PathsError> {
+    let home = dirs::home_dir().ok_or(PathsError::NoHome)?;
+    Ok(launch_agent_file(&home))
 }
 
 /// The Linux menu entry the tray app writes at start
@@ -1392,6 +1414,14 @@ mod tests {
         assert_eq!(
             app_icon(Path::new("/home/u/.local/share")),
             Path::new("/home/u/.local/share/icons/hicolor/256x256/apps/seatswap.png")
+        );
+    }
+
+    #[test]
+    fn the_launch_agent_lives_in_the_users_launch_agents_folder() {
+        assert_eq!(
+            launch_agent_file(Path::new("/Users/u")),
+            Path::new("/Users/u/Library/LaunchAgents/dev.seatswap.app.plist")
         );
     }
 

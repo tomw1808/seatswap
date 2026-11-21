@@ -485,8 +485,9 @@ fn setup(
     }
 
     // The Linux menu entry and its icon are written at every start, whatever
-    // `startAtLogin` says. A path that is not seatswap's own is left alone with
-    // one line; a failure is reported and never stops the start.
+    // `startAtLogin` says (Windows and macOS have none; the outcome is empty).
+    // A path that is not seatswap's own is left alone with one line; a failure
+    // is reported and never stops the start.
     match desktop_entry::apply_at_start(&autostart_args) {
         Ok(outcome) => {
             for path in &outcome.left_alone {
